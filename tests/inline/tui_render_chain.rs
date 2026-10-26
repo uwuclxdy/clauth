@@ -855,7 +855,10 @@ fn max_spend_hint_covers_every_spend_state() {
     );
     // 4. spend unknown → the ceiling statement, never an invented $0 room
     let unknown = hint(true, Some(10.0), Some(billing(true, None)));
-    assert!(unknown.contains("spends at most $10.00"), "{unknown}");
+    assert!(
+        unknown.contains("the most this account may spend here once every account is spent"),
+        "{unknown}"
+    );
     // 5. armed → the real room: 0.9 * min(20, 10) - 1 = $8.00
     let armed = hint(true, Some(10.0), Some(billing(true, Some(1.0))));
     assert!(armed.contains("$8.00 left to spend"), "{armed}");
@@ -4649,5 +4652,35 @@ fn lam_alef_pill_fits_the_pane_it_renders_in() {
     assert!(
         row.contains("لالالالالا") && row.contains("95%"),
         "the pill keeps its whole label and reading when it fits: {row:?}"
+    );
+}
+
+/// The `max spend` hint says what the ceiling does without restating the
+/// figure the row beside it already shows; the live room left stays a figure.
+#[test]
+fn max_spend_hint_never_restates_the_ceiling() {
+    use crate::usage::SpendInfo;
+    let hint = |spend: Option<SpendInfo>| -> String {
+        let (mut a, mut a_readings) = profile("a", 95.0, 40.0, 7200);
+        a.max_auto_spend = Some(10.0);
+        a_readings.usage.get_mut("a").unwrap().spend = spend;
+        let (mut cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+        cfg.state.spend_budget_switching = true;
+        max_spend_hint(&cfg, 10.0, readings.usage.get("a"))
+    };
+    let billing = |used: Option<f64>| SpendInfo {
+        enabled: true,
+        used,
+        limit: Some(20.0),
+        percent: None,
+        currency: None,
+    };
+    let want = "the most this account may spend here once every account is spent";
+    assert_eq!(hint(Some(billing(None))), want, "spend unknown");
+    assert_eq!(hint(None), want, "no spend reading");
+    assert_eq!(
+        hint(Some(billing(Some(1.0)))),
+        "$8.00 left to spend here before it stops",
+        "armed"
     );
 }

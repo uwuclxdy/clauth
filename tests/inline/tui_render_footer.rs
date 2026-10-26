@@ -2888,3 +2888,85 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
         "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
     );
 }
+
+/// An empty Models list advertises no row key: `↑↓` moves nothing there.
+#[test]
+fn an_empty_models_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_view = crate::tui::app::TokenView::Models;
+    app.token_stats = Some(crate::tokens::TokenStats::default());
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("c", "count cache"),
+            ("t", "period"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ]
+    );
+}
+
+/// An unreadable token cache advertises the keys that act on it: `↵` shows
+/// the cause and `r` reloads.
+#[test]
+fn an_unreadable_token_cache_advertises_its_cause_and_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("↵", "cause"),
+            ("r", "reload"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}
+
+/// `x` leaves an unreadable token cache's failure in place (it is state, not
+/// a notification); `r` turns it back into a load in flight.
+#[test]
+fn r_reloads_an_unreadable_token_cache_and_x_leaves_it() {
+    use crate::testutil::key;
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    handle_key(&mut app, key(KeyCode::Char('x')));
+    assert!(app.tokens_failed, "x keeps the failure");
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    assert!(
+        !app.tokens_failed,
+        "r clears the failure while the reload runs"
+    );
+    assert!(app.tokens_topping_up, "r starts the reload");
+}
+
+/// An empty Services list advertises no row key: `↑↓` moves nothing and `↵`
+/// descends into nothing there, from the same count the key handler gates on.
+#[test]
+fn an_empty_services_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.focus = crate::tui::app::ServicesFocus::List;
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}

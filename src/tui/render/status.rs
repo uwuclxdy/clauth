@@ -57,12 +57,11 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.status.selector.total.set(0);
         // The widget already renders the `r to retry` action line, so the hint
         // line only states the condition.
-        let widget = if app.status.error.is_some() {
-            empty_state("fetch failed", "r", "to retry")
+        if app.status.error.is_some() {
+            empty_state(frame, inner, "fetch failed", "r", "to retry")
         } else {
-            empty_state("no status data yet", "r", "to fetch")
+            empty_state(frame, inner, "no status data yet", "r", "to fetch")
         };
-        frame.render_widget(widget, inner);
         return;
     }
 

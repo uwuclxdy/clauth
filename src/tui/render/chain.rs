@@ -1422,9 +1422,9 @@ fn max_spend_hint(
         // which stays true either way rather than inventing a $0 room.
         Some(spend) => match spend_room(spend, ceiling) {
             Some(room) => format!("${room:.2} left to spend here before it stops"),
-            None => format!("spends at most ${ceiling:.2} here once every account is spent"),
+            None => "the most this account may spend here once every account is spent".to_string(),
         },
-        None => format!("spends at most ${ceiling:.2} here once every account is spent"),
+        None => "the most this account may spend here once every account is spent".to_string(),
     }
 }
 

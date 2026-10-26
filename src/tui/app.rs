@@ -5262,7 +5262,7 @@ pub(crate) struct App {
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<SeededInput>,
-    /// The selected account's note (the usage tab's `notes:` row). Loaded on
+    /// The selected account's note (the usage tab's `notes` row). Loaded on
     /// cursor moves, tab switches with a clamped cursor, and saves — never per
     /// frame.
     pub(crate) note_text: Option<String>,
@@ -5428,6 +5428,10 @@ pub(crate) struct App {
     /// Set when the loader reported a failure and no stats are cached — the tab
     /// shows an error instead of a perpetual "parsing stats-cache.json".
     pub(crate) tokens_failed: bool,
+    /// The typed cause behind `tokens_failed`, set alongside the flag.
+    pub(crate) tokens_failed_cause: Option<crate::tokens::TokensLoadError>,
+    /// Whether `↵` expanded the failed dashboard's cause line.
+    pub(crate) tokens_failed_expanded: bool,
     /// True while the JSONL transcript top-up is known to be in flight: set when
     /// a `Base` first seeds the tab or on a manual reload, cleared on the next
     /// `Loaded`/`Failed`. Silent periodic refreshes never light it (their `Base`
@@ -6247,6 +6251,8 @@ impl App {
             services: ServicesState::default(),
             token_stats: None,
             tokens_failed: false,
+            tokens_failed_cause: None,
+            tokens_failed_expanded: false,
             tokens_topping_up: false,
             tokens_progress: None,
             token_view: TokenView::Dashboard,
@@ -9023,6 +9029,11 @@ fn reload_token_stats(app: &mut App) {
     // spinners until the loader's next `Loaded`/`Failed` clears them.
     app.tokens_topping_up = true;
     app.tokens_progress = None;
+    // The reload clears the failure: its loading bar stands in until the next
+    // result lands (a second failure sets the flag again with its new cause).
+    app.tokens_failed = false;
+    app.tokens_failed_cause = None;
+    app.tokens_failed_expanded = false;
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
@@ -9036,6 +9047,9 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     }
     match app.token_view {
         TokenView::Dashboard => match key.code {
+            KeyCode::Enter if app.tokens_failed => {
+                app.tokens_failed_expanded = !app.tokens_failed_expanded;
+            }
             KeyCode::Enter if token_model_count(app) > 0 => {
                 app.token_view = TokenView::Models;
                 app.model_detail_focus = StatusFocus::List;
@@ -28837,6 +28851,8 @@ fn drain_tokens_events(app: &mut App) {
             // never flickers the tab back to base-only data.
             crate::tokens::TokensEvent::Base(stats) => {
                 app.tokens_failed = false;
+                app.tokens_failed_cause = None;
+                app.tokens_failed_expanded = false;
                 if app.token_stats.is_none() {
                     app.token_stats = Some(*stats);
                     // First paint from the cache: the transcript top-up is now in
@@ -28849,6 +28865,8 @@ fn drain_tokens_events(app: &mut App) {
             }
             crate::tokens::TokensEvent::Loaded(stats) => {
                 app.tokens_failed = false;
+                app.tokens_failed_cause = None;
+                app.tokens_failed_expanded = false;
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
                 app.token_stats = Some(*stats);
@@ -28857,11 +28875,16 @@ fn drain_tokens_events(app: &mut App) {
             }
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
-            crate::tokens::TokensEvent::Failed => {
+            crate::tokens::TokensEvent::Failed(cause) => {
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
                 if app.token_stats.is_none() {
+                    let was_failed = app.tokens_failed;
                     app.tokens_failed = true;
+                    app.tokens_failed_cause = Some(cause);
+                    if !was_failed {
+                        app.tokens_failed_expanded = false;
+                    }
                 }
             }
         }

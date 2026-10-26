@@ -715,15 +715,49 @@ struct TranscriptUsage {
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
+/// Why the stats-cache base read failed: each failure maps to its own lowercase
+/// cause line, without exposing an upstream error body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokensLoadError {
+    Missing,
+    PermissionDenied,
+    InvalidJson(String),
+    ReadFailed(String),
+}
+
+impl TokensLoadError {
+    /// The one cause line the TUI renders under the failed pill.
+    pub(crate) fn cause_line(&self) -> String {
+        match self {
+            TokensLoadError::Missing => "no such file".to_string(),
+            TokensLoadError::PermissionDenied => "permission denied".to_string(),
+            TokensLoadError::InvalidJson(e) => format!("not valid stats json: {e}"),
+            TokensLoadError::ReadFailed(kind) => format!("read failed: {kind}"),
+        }
+    }
+}
+
 /// Parse `stats-cache.json` into the base view-model — the fast first phase of
 /// the load. No transcript sweep, so it returns in well under a millisecond; the
 /// background loader emits this for an instant first paint, then merges the live
-/// transcript top-up ([`merge_topup`]). Returns `None` when the cache file is
-/// missing or unparseable.
-pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
+/// transcript top-up ([`merge_topup`]). Fails with the typed cause the tab
+/// surfaces.
+pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError> {
     let cache_path = claude_dir.join("stats-cache.json");
-    let raw = std::fs::read_to_string(&cache_path).ok()?;
-    let wire: StatsCacheFile = serde_json::from_str(&raw).ok()?;
+    let raw = match std::fs::read_to_string(&cache_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TokensLoadError::Missing);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(TokensLoadError::PermissionDenied);
+        }
+        Err(e) => return Err(TokensLoadError::ReadFailed(e.kind().to_string())),
+    };
+    let wire: StatsCacheFile = match serde_json::from_str(&raw) {
+        Ok(wire) => wire,
+        Err(e) => return Err(TokensLoadError::InvalidJson(e.to_string())),
+    };
 
     let mut models: Vec<ModelTokens> = wire
         .model_usage
@@ -824,7 +858,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         today: None,
     };
 
-    Some(stats)
+    Ok(stats)
 }
 
 /// Full synchronous load: parse the stats-cache, sweep transcripts once, merge.
@@ -832,7 +866,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
 /// directly so it can paint the base instantly and reuse its per-file cache.
 #[cfg(test)]
 pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
-    let mut base = load_base(claude_dir)?;
+    let mut base = load_base(claude_dir).ok()?;
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
@@ -1831,7 +1865,7 @@ pub(crate) enum TokensEvent {
     /// Phase 2: the live transcript top-up merged in (today card, recent days,
     /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
-    Failed,
+    Failed(TokensLoadError),
 }
 
 /// Spawn the token-stats background worker. Each run emits two events: `Base`
@@ -1855,9 +1889,12 @@ pub(crate) fn spawn(
         let mut cache = TopUpCache::default();
 
         let run = |cache: &mut TopUpCache| {
-            let Some(mut base) = load_base(&claude_dir) else {
-                let _ = tx.send(TokensEvent::Failed);
-                return;
+            let mut base = match load_base(&claude_dir) {
+                Ok(base) => base,
+                Err(cause) => {
+                    let _ = tx.send(TokensEvent::Failed(cause));
+                    return;
+                }
             };
             let lcd = base.last_computed_date.clone();
             // Fold durably-recorded days (past the frozen base, before the

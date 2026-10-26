@@ -3252,16 +3252,20 @@ fn the_empty_delegates_detail_keeps_its_frame_when_pinned() {
     let _home = crate::testutil::HomeSandbox::new();
     let steer = "manage delegates in clauth app on web or mobile (coming soon)";
     let pad = |s: &str| format!("{s:<70}");
-    let boxed = |s: &str| format!("│{s:<68}│");
-    let top = format!("╭{}╮", "─".repeat(68));
-    let bottom = format!("╰{}╯", "─".repeat(68));
+    // The frame is sized to its copy (14 cells) and centred in the 70-cell
+    // scroll area: 28 cells of gap on each side.
+    let g = " ".repeat(28);
+    let frame_top = format!("{g}╭{}╮{g}", "─".repeat(12));
+    let frame_hint = format!("{g}│no delegates│{g}");
+    let frame_action = format!("{g}│r to refresh│{g}");
+    let frame_bottom = format!("{g}╰{}╯{g}", "─".repeat(12));
     // 70x6: one steer row and one margin row leave a 4-row scroll area, the
     // smallest that holds the framed box whole.
     let framed_6 = vec![
-        top.clone(),
-        boxed("no delegates"),
-        boxed("r to refresh"),
-        bottom.clone(),
+        frame_top.clone(),
+        frame_hint.clone(),
+        frame_action.clone(),
+        frame_bottom.clone(),
         pad(""),
         pad(steer),
     ];
@@ -3274,27 +3278,36 @@ fn the_empty_delegates_detail_keeps_its_frame_when_pinned() {
         pad(""),
         pad(steer),
     ];
-    let mut framed_12 = vec![top.clone(), boxed("no delegates"), boxed("r to refresh")];
-    framed_12.extend(std::iter::repeat_n(boxed(""), 6));
-    framed_12.extend([bottom.clone(), pad(""), pad(steer)]);
+    // 70x12: a 10-row scroll area centres the 4-row frame at row 3.
+    let blank = pad("");
+    let mut framed_12 = vec![blank.clone(), blank.clone(), blank.clone()];
+    framed_12.extend([
+        frame_top.clone(),
+        frame_hint.clone(),
+        frame_action.clone(),
+        frame_bottom.clone(),
+    ]);
+    framed_12.extend([blank.clone(), blank.clone(), blank.clone(), blank.clone()]);
+    framed_12.push(pad(steer));
     for (h, want) in [(6u16, framed_6), (5, bare_5), (12, framed_12)] {
         let mut app = app_with_delegates(Vec::new());
         handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         assert_eq!(render_delegates_detail(&app, 70, h), want, "70x{h}");
     }
 
-    // 100x24 keeps the frame too.
+    // 100x24 keeps the frame, centred in the 22-row scroll area (rows 9-12).
     let mut app = app_with_delegates(Vec::new());
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let rows = render_delegates_detail(&app, 100, 24);
+    let g100 = " ".repeat(43);
     assert_eq!(
-        rows[0],
-        format!("╭{}╮", "─".repeat(98)),
+        rows[9],
+        format!("{g100}╭{}╮{g100}", "─".repeat(12)),
         "100x24 top border"
     );
     assert_eq!(
-        rows[21],
-        format!("╰{}╯", "─".repeat(98)),
+        rows[12],
+        format!("{g100}╰{}╯{g100}", "─".repeat(12)),
         "100x24 bottom border"
     );
     assert_eq!(rows[23], format!("{steer:<100}"), "100x24 steer row");

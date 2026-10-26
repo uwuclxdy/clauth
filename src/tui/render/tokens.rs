@@ -30,8 +30,8 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_scrollbar, draw_selector_list, master_detail, meta_line, picker_row, section_box,
-    section_box_loading, section_box_verbatim,
+    danger_hint_lines, draw_scrollbar, draw_selector_list, empty_state, master_detail, meta_line,
+    picker_row, section_box, section_box_loading, section_box_verbatim,
 };
 use crate::format::{format_pct, group_thousands};
 use crate::pricing::{HourTokens, PriceTable, SpeedMode};
@@ -880,17 +880,31 @@ fn stack_vertical(area: Rect, heights: &[u16]) -> Vec<Rect> {
         .collect()
 }
 
+/// The dashboard card's failed pill row: path and brackets dim, the word
+/// `failed` danger + bold.
+fn failed_cache_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("~/.claude/stats-cache.json", theme::dim()),
+        Span::styled("  [ ", theme::dim()),
+        Span::styled("failed", theme::danger().add_modifier(Modifier::BOLD)),
+        Span::styled(" ]", theme::dim()),
+    ])
+}
+
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
         let area = clamp_width(area, DASH_MAX_W);
         let block = section_box("tokens", false, true, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let line = if app.tokens_failed {
-            Line::from(Span::styled(
-                "~/.claude/stats-cache.json unreadable",
-                theme::danger(),
-            ))
+        let lines = if app.tokens_failed {
+            let mut out = vec![failed_cache_line()];
+            if app.tokens_failed_expanded
+                && let Some(cause) = app.tokens_failed_cause.as_ref()
+            {
+                out.extend(danger_hint_lines(&cause.cause_line(), inner.width as usize));
+            }
+            out
         } else {
             // Pre-first-paint: only the stats-cache parse runs before `Base`
             // seeds the tab, so the label names that stage. Reserve the `[ ]`,
@@ -899,9 +913,9 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let track = inner_w(area)
                 .saturating_sub(2 + 2 + LABEL.chars().count())
                 .clamp(INDET_BLOCK, 40);
-            indeterminate_bar(app.tick_count, track, LABEL)
+            vec![indeterminate_bar(app.tick_count, track, LABEL)]
         };
-        frame.render_widget(Paragraph::new(line).style(theme::base()), inner);
+        frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
         return;
     };
 
@@ -2053,7 +2067,8 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     // A lens can empty the list mid-view (menu on the Models view) —
     // `draw_selector_list`'s shared empty state talks about accounts, so
-    // render the lens-specific message instead.
+    // render the lens-specific framed empty state instead, with the key that
+    // can change what it shows.
     if grouped.is_empty() {
         app.models_selector.offset.set(0);
         app.models_selector.viewport.set(0);
@@ -2065,13 +2080,17 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let block = section_box(&title, true, true, cols[0].width);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                empty_models_msg(app.token_filter),
-                theme::faint(),
-            )))
-            .style(theme::base()),
+        let (hotkey, action) = if app.token_filter == TokenFilter::All {
+            ("t", "to change the period")
+        } else {
+            ("a", "to change the filter")
+        };
+        empty_state(
+            frame,
             inner,
+            empty_models_msg(app.token_filter),
+            hotkey,
+            action,
         );
         draw_model_detail(
             frame,

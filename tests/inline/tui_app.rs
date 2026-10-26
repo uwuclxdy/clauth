@@ -17920,10 +17920,89 @@ fn tokens_topping_up_tracks_the_load_lifecycle() {
         app.tokens_progress, None,
         "manual reload drops stale sweep counts"
     );
-    tx.send(TokensEvent::Failed).unwrap();
+    tx.send(TokensEvent::Failed(crate::tokens::TokensLoadError::Missing))
+        .unwrap();
     drain_tokens_events(&mut app);
     assert!(!app.tokens_topping_up, "Failed clears the loading flag");
     assert_eq!(app.tokens_progress, None, "Failed clears the sweep counts");
+}
+
+/// A reload clears the failure and its cause; a second failure then sets the
+/// flag again with the NEW cause, so a stale cause can never outlive its reload.
+#[test]
+fn a_second_failed_after_reload_sets_the_new_cause() {
+    use super::{drain_tokens_events, reload_token_stats};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{TokensEvent, TokensLoadError};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+
+    tx.send(TokensEvent::Failed(TokensLoadError::Missing))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(app.tokens_failed);
+    assert_eq!(app.tokens_failed_cause, Some(TokensLoadError::Missing));
+
+    reload_token_stats(&mut app);
+    assert!(!app.tokens_failed, "reload clears the failure");
+    assert_eq!(app.tokens_failed_cause, None);
+
+    tx.send(TokensEvent::Failed(TokensLoadError::PermissionDenied))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(app.tokens_failed, "a second failure sets it again");
+    assert_eq!(
+        app.tokens_failed_cause,
+        Some(TokensLoadError::PermissionDenied),
+        "the new cause replaces the old one"
+    );
+}
+
+/// The periodic loader re-sends `Failed` while the cache stays unreadable; the
+/// enter arm's toggle (`tokens_failed_expanded`) must survive that repeat
+/// failure, so the cause line the user opened does not close on its own timer.
+#[test]
+fn a_periodic_refailure_keeps_the_open_cause_line() {
+    use super::drain_tokens_events;
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{TokensEvent, TokensLoadError};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+
+    tx.send(TokensEvent::Failed(TokensLoadError::Missing))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(app.tokens_failed);
+    assert!(
+        !app.tokens_failed_expanded,
+        "a fresh failure starts collapsed"
+    );
+
+    app.tokens_failed_expanded = true;
+    tx.send(TokensEvent::Failed(TokensLoadError::PermissionDenied))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(
+        app.tokens_failed_expanded,
+        "a periodic re-failure keeps the opened cause line"
+    );
+    assert_eq!(
+        app.tokens_failed_cause,
+        Some(TokensLoadError::PermissionDenied),
+        "the new cause replaces the old one"
+    );
 }
 
 /// Pins `parse_weekly_pct`'s band edges: both bounds accepted verbatim,
@@ -28141,7 +28220,7 @@ fn draft(app: &App) -> String {
     app.note_editor.as_ref().unwrap().buf.text()
 }
 
-/// ↓ on the usage tab re-reads the note: the `notes:` row must never show the
+/// ↓ on the usage tab re-reads the note: the `notes` row must never show the
 /// previous account's note under the newly selected header.
 #[test]
 fn stepping_the_cursor_reloads_the_note() {

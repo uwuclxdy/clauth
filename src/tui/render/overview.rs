@@ -199,7 +199,7 @@ fn draw_overview_accounts(
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        empty_state(frame, inner, "no accounts yet", "n", "to create one");
         return;
     }
 

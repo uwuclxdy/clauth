@@ -241,7 +241,7 @@ fn draw_usage_detail(
     let Some(profile) = profile else {
         app.usage_detail_max_scroll.set(0);
         app.usage_detail_viewport.set(0);
-        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        empty_state(frame, inner, "no accounts yet", "n", "to create one");
         return;
     };
 
@@ -2541,7 +2541,7 @@ fn key_value_span(
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         format!("  {}", key_cell(key, TP_KEY_W, KEY_GUTTER)),
-        theme::faint(),
+        theme::label(),
     )];
     let pad = value_w.saturating_sub(Span::raw(value).width());
     if pad > 0 {
@@ -2555,20 +2555,20 @@ fn key_span(key: &str) -> Span<'static> {
     Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::label())
 }
 
-/// The value column the `notes:` row opens at. `notes:` (6) is shorter than
+/// The value column the `notes` row opens at. `notes` (5) is shorter than
 /// `KEY_W` (8), so the key cell always pads to `KEY_W + KEY_GUTTER`.
 const NOTES_VALUE_LEAD: usize = KEY_W + KEY_GUTTER;
 
-/// The `notes:` row: the faint add-hint while the account has none, the full
-/// note wrapped to the value column once it does. Copy is cloudy's (lowercase
-/// `notes:`, full-note display); styling is contract-clean — accent key, faint
-/// hint, no italic (the contract reserves italic for titles).
+/// The `notes` row: the faint add-hint while the account has none, the full
+/// note wrapped to the value column once it does. Static key/value row — dim +
+/// bold colonless key, faint hint, no italic (the contract reserves italic for
+/// titles).
 fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
     let value_w = (inner_w as usize).saturating_sub(NOTES_VALUE_LEAD).max(8);
     let pad = " ".repeat(NOTES_VALUE_LEAD);
     match note.filter(|t| !t.is_empty()) {
         None => {
-            let lead = Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent());
+            let lead = Span::styled(key_cell("notes", KEY_W, KEY_GUTTER), theme::label());
             let hint = prose::wrap(
                 concat!("press ", key_lit!("n"), " to add notes"),
                 value_w,
@@ -2595,7 +2595,7 @@ fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
                     let value = Span::styled(seg, theme::body());
                     if i == 0 && j == 0 {
                         lines.push(Line::from(vec![
-                            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
+                            Span::styled(key_cell("notes", KEY_W, KEY_GUTTER), theme::label()),
                             value,
                         ]));
                     } else {

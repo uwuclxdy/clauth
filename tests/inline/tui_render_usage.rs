@@ -1729,7 +1729,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     );
     // Notes close the pane (cloudy's placement): after the usage blocks, never
     // between header and body.
-    let at_notes = body.find("notes:").expect("notes row present");
+    let at_notes = body.find("notes").expect("notes row present");
     let at_empty = body
         .find("can't read usage, an api key has no usage windows")
         .expect("empty message present");
@@ -5208,19 +5208,19 @@ fn fitting_usage_detail_has_no_scrollbar() {
     );
 }
 
-/// The `notes:` row: accent key + faint hint while the account has none; the
+/// The `notes` row: label key + faint hint while the account has none; the
 /// full note wrapped to the value column, continuation lines aligned under it.
 #[test]
 fn the_notes_row_hints_when_empty_and_renders_the_full_note() {
-    // No note: the hint line, key in accent, hint in faint.
+    // No note: the hint line, key in label, hint in faint.
     let lines = notes_lines(None, 60);
     let all: String = lines
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
         .collect();
-    assert!(all.contains("notes:"), "lowercase key copy, got {all:?}");
+    assert_eq!(lines[0].spans[0].content, "notes     ");
     assert!(all.contains("press n to add notes"));
-    assert_eq!(lines[0].spans[0].style.fg, Some(theme::accent_color()));
+    assert_eq!(lines[0].spans[0].style, theme::label());
     assert_eq!(lines[0].spans[1].style.fg, Some(theme::text_faint_color()));
 
     // A note renders IN FULL: every line, wrapped to the value column, with
@@ -5231,7 +5231,7 @@ fn the_notes_row_hints_when_empty_and_renders_the_full_note() {
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .collect();
-    assert_eq!(lines[0].spans[0].content, "notes:    ");
+    assert_eq!(lines[0].spans[0].content, "notes     ");
     assert_eq!(lines[0].spans[1].content, "first line");
     assert_eq!(lines[1].spans[0].content, " ".repeat(NOTES_VALUE_LEAD));
     assert_eq!(lines[1].spans[1].content, "second line that is quite long");
@@ -5437,7 +5437,7 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
     );
 }
 
-/// The `notes:` add-hint wraps on a narrow pane instead of clipping its tail.
+/// The `notes` add-hint wraps on a narrow pane instead of clipping its tail.
 #[test]
 fn the_notes_hint_wraps_on_a_narrow_pane() {
     let lines = notes_lines(None, 24);
@@ -5445,7 +5445,7 @@ fn the_notes_hint_wraps_on_a_narrow_pane() {
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
-    assert_eq!(texts, ["notes:    press n to add", "          notes"]);
+    assert_eq!(texts, ["notes     press n to add", "          notes"]);
 }
 
 /// The kick pill's right pad is `avail − cells`, not `avail − chars`, so a wide
@@ -6153,4 +6153,24 @@ fn a_stale_snapshot_shows_no_usage_peak() {
         tps_line_text(&rows[0]),
         "speed     live — · 5m — · 1h — · today — · peak —"
     );
+}
+
+/// The notes row is a static key/value row: its key carries no colon and
+/// renders dim + bold like every other static key, with or without a note.
+#[test]
+fn the_notes_key_is_a_colonless_static_key() {
+    for note in [None, Some("first line")] {
+        let lines = notes_lines(note, 60);
+        let key = &lines[0].spans[0];
+        assert_eq!(key.content, "notes     ", "note {note:?}");
+        assert_eq!(key.style, theme::label(), "note {note:?}");
+    }
+}
+
+/// A third-party stat row's key is a static key: dim + bold, never faint.
+#[test]
+fn a_third_party_stat_key_renders_dim_and_bold() {
+    let spans = key_value_span("remaining", "$4.20", Style::default(), 8);
+    assert_eq!(spans[0].content.trim(), "remaining");
+    assert_eq!(spans[0].style, theme::label());
 }

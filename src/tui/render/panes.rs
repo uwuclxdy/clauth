@@ -4,11 +4,11 @@
 use std::cell::Cell;
 
 use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 
 use super::super::app::InputState;
 use super::super::theme;
@@ -530,17 +530,69 @@ pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<L
     ]
 }
 
-/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
-/// hotkey `ACCENT` + action on second line.
-pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
-    Paragraph::new(empty_state_lines(hint, hotkey, action))
-        .block(
-            Block::bordered()
-                .border_set(border::ROUNDED)
-                .border_style(Style::default().fg(theme::line_color())),
-        )
-        .style(theme::base())
-        .wrap(Wrap { trim: false })
+/// Empty-state widget: rounded frame in `LINE`, hint on the first line
+/// `TEXT_DIM`, hotkey `ACCENT` + action on the second. Each line wraps to the
+/// pane's inner width at its spaces (a marked key stays whole); the frame is
+/// sized to the wrapped copy — height = rows + 2, width = widest row + 2 — and
+/// centred in the pane, never stretched to fill it. When the pane cannot hold
+/// the frame, the wrapped copy renders bare and centred, no frame.
+pub(super) fn empty_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hint: &str,
+    hotkey: &str,
+    action: &str,
+) {
+    let base = theme::dim();
+    let action_text = format!("{} {action}", prose::key(hotkey));
+    let inner_w = usize::from(area.width.saturating_sub(2));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for text in [hint, action_text.as_str()] {
+        for wrapped in prose::wrap(text, inner_w, base) {
+            lines.push(Line::from(wrapped));
+        }
+    }
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let frame_w = widest.saturating_add(2);
+    let frame_h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    if area.width < frame_w || area.height < frame_h {
+        let rows = u16::try_from(lines.len())
+            .unwrap_or(area.height)
+            .min(area.height);
+        let y = area.y + area.height.saturating_sub(rows) / 2;
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(base)
+                .alignment(Alignment::Center),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: rows,
+            },
+        );
+        return;
+    }
+    let x = area.x + (area.width - frame_w) / 2;
+    let y = area.y + (area.height - frame_h) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: frame_w,
+        height: frame_h,
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::default().fg(theme::line_color())),
+            )
+            .style(theme::base()),
+        rect,
+    );
 }
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
@@ -927,7 +979,7 @@ pub(super) fn draw_selector_list(
         list.starts.replace(Vec::new());
         list.block_ends.replace(Vec::new());
         list.tips.replace(Vec::new());
-        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        empty_state(frame, inner, "no accounts yet", "n", "to create one");
         return;
     }
 
@@ -1025,6 +1077,14 @@ pub(super) fn help_tooltip_lines_at(
 /// reason render in `DANGER`.
 pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     tooltip_lines(text, width, 1, theme::danger(), theme::danger())
+}
+
+/// A card-body error reason: `└ ` leader stays `LINE`, the reason renders
+/// `DANGER`, wrapped like the other tooltip lines. The `└` sits one cell right
+/// of the failed pill row's first character (the path's `~`), so the cause
+/// reads indented under the row it explains.
+pub(super) fn danger_hint_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, 1, theme::line(), theme::danger())
 }
 
 fn tooltip_lines(

@@ -270,12 +270,9 @@ struct RowTunables {
 
 fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Option<String> {
     let RowTunables {
-        refresh_interval_ms,
-        weekly_pct,
-        burn_floor_pct,
-        burn_horizon_ms,
         default_divergence,
         context_nudge_tokens,
+        ..
     } = tunables;
     // The default + units live on the row as a faint span (only when the value
     // is off its default), so the hint states behavior alone, interpolating the
@@ -315,22 +312,17 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "a /design-login is dropped at the next switch, and outside macOS at any relink"
         }),
         GlobalConfigRow::RefreshInterval => {
-            format!(
-                "check every account's usage every {}s",
-                refresh_interval_ms / 1000
-            )
+            String::from("how often clauth checks every account's usage")
         }
         GlobalConfigRow::ContextNudge => match context_nudge_tokens {
             None => String::from("no context nudge is sent"),
-            Some(v) => format!(
-                "tells a running session when its context usage crosses {}",
-                format_threshold_tokens(v)
-            ),
+            Some(_) => {
+                String::from("tells a running session when its context grows past this size")
+            }
         },
-        GlobalConfigRow::WeeklyThreshold => format!(
-            "don't send new work to an account past {}% of its weekly limit",
-            format_weekly_pct(weekly_pct)
-        ),
+        GlobalConfigRow::WeeklyThreshold => {
+            String::from("don't send new work to an account past this share of its weekly limit")
+        }
         GlobalConfigRow::SwitchOffWhenSpent => String::from(if rows.switch_off_when_spent {
             "sign every account out once they're all spent, unless one is marked last resort"
         } else {
@@ -350,14 +342,12 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
                 "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
             }
         }),
-        GlobalConfigRow::BurnFloor => format!(
-            "never switch away before {}% used, however fast the burn",
-            format_weekly_pct(burn_floor_pct)
-        ),
-        GlobalConfigRow::BurnHorizon => format!(
-            "look at most {}s ahead when guessing the next switch",
-            burn_horizon_ms / 1000
-        ),
+        GlobalConfigRow::BurnFloor => {
+            String::from("never switch away before this share is used, however fast the burn")
+        }
+        GlobalConfigRow::BurnHorizon => {
+            String::from("how far ahead to look when guessing the next switch")
+        }
         GlobalConfigRow::SpendBudget => String::from(if rows.spend_budget {
             "let a spent account keep working on paid usage, up to its max spend"
         } else {

@@ -77,12 +77,11 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.services.selector.starts.replace(Vec::new());
         app.services.selector.block_ends.replace(Vec::new());
         app.services.selector.total.set(0);
-        let widget = if app.services.error.is_some() {
-            empty_state("check failed", "r", "to retry")
+        if app.services.error.is_some() {
+            empty_state(frame, inner, "check failed", "r", "to retry")
         } else {
-            empty_state("no services yet", "r", "to run")
+            empty_state(frame, inner, "no services yet", "r", "to run")
         };
-        frame.render_widget(widget, inner);
         return;
     }
 
@@ -2112,7 +2111,7 @@ fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
     if let Some(area) = foot_area
         && scroll_area.height >= 4
     {
-        frame.render_widget(empty_state("no delegates", "r", "to refresh"), scroll_area);
+        empty_state(frame, scroll_area, "no delegates", "r", "to refresh");
         frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
     } else {
         let lines = empty_state_lines("no delegates", "r", "to refresh");

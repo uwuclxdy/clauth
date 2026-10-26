@@ -425,6 +425,12 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         ],
         Tab::Usage => &[], // handled above: its hints derive per row
         Tab::Tokens => match app.token_view {
+            TokenView::Dashboard if app.tokens_failed => &[
+                ("↵", "cause"),
+                ("r", "reload"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             TokenView::Dashboard if token_model_count(app) == 0 => &[
                 ("r", "reload"),
                 ("c", "count cache"),
@@ -448,7 +454,6 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("?", "help"),
             ],
             TokenView::Models if token_model_count(app) == 0 => &[
-                ("↑↓", "model"),
                 ("c", "count cache"),
                 ("t", "period"),
                 ("a", "actions"),
@@ -861,11 +866,14 @@ fn essential_hint_width(hints: &[(&str, &str)]) -> usize {
 pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.services.focus {
         ServicesFocus::List => {
-            let mut hints = vec![("↑↓", "row")];
-            // `↵` descends only where the handler descends (a job-less
-            // delegates row advertises no inert `↵`) — one shared predicate.
-            if app.services.enter_descends() {
-                hints.push(("↵", "detail"));
+            let mut hints = Vec::new();
+            // `↑↓`/`↵` act only while the list holds a row; the key handler
+            // gates both on the same `row_count() > 0` predicate this reads.
+            if app.services.row_count() > 0 {
+                hints.push(("↑↓", "row"));
+                if app.services.enter_descends() {
+                    hints.push(("↵", "detail"));
+                }
             }
             hints.push(("r", "refresh"));
             if app.services.f_moves() {

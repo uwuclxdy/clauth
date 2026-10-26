@@ -602,10 +602,10 @@ fn context_nudge_default_reminder_appears_only_when_set() {
     );
 }
 
-/// The hint states what the row does per live value, byte-pinned: off names
-/// the absence of a nudge, a set threshold names the number it crosses.
+/// The context-nudge hint states behavior alone: off names the absence of a
+/// nudge, a set threshold names the size it crosses, never that size itself.
 #[test]
-fn context_nudge_hint_tracks_the_live_value() {
+fn the_context_nudge_hint_states_behavior_not_the_size() {
     assert_eq!(
         row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
         Some("no context nudge is sent"),
@@ -614,7 +614,7 @@ fn context_nudge_hint_tracks_the_live_value() {
     set.context_nudge_tokens = Some(600_000);
     assert_eq!(
         row_hint(GlobalConfigRow::ContextNudge, toggles(), set).as_deref(),
-        Some("tells a running session when its context usage crosses 600k"),
+        Some("tells a running session when its context grows past this size"),
     );
 }
 
@@ -848,10 +848,11 @@ fn non_login_keys_renders_the_toggle_and_exact_hints() {
     );
 }
 
-/// Value rows fold the live value into their hint, so cycling a row re-explains
-/// what it now does with the real number.
+/// The refresh and weekly hints state behavior alone, never restating the row's
+/// own value: cycling the row re-explains what it does without repeating the
+/// number the value column already shows.
 #[test]
-fn value_rows_interpolate_the_live_value_into_their_hint() {
+fn value_row_hints_state_behavior_not_the_value() {
     let refresh = row_hint(
         GlobalConfigRow::RefreshInterval,
         toggles(),
@@ -862,7 +863,10 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
         },
     )
     .expect("refresh row has a hint");
-    assert!(refresh.contains("every 30s"), "{refresh}");
+    assert_eq!(
+        refresh, "how often clauth checks every account's usage",
+        "refresh hint states the behavior, never the value"
+    );
     let weekly = row_hint(
         GlobalConfigRow::WeeklyThreshold,
         toggles(),
@@ -872,7 +876,10 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
         },
     )
     .expect("weekly row has a hint");
-    assert!(weekly.contains("95%"), "{weekly}");
+    assert_eq!(
+        weekly, "don't send new work to an account past this share of its weekly limit",
+        "weekly hint states the behavior, never the value"
+    );
 }
 
 // ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────
@@ -1362,15 +1369,14 @@ fn an_over_wide_refresh_buffer_scrolls_inside_its_row() {
     );
 }
 
-/// S10 (cloudy's range rule, 2026-10-14): typing in `refresh` swaps the
-/// preset run and its hint for the edit line and its range tooltip, and the
-/// rows below move by exactly the height difference: at 28 columns the run
-/// takes 3 lines and the hint 2 (edit form 1 + 1), at 45 the run 2 and the
-/// hint 1, at 80 one each.
+/// Typing in `refresh` swaps the preset run and its hint for the edit line
+/// and its range tooltip, and the rows below move by exactly the height
+/// difference: at 28 columns the run takes 3 lines and the hint 3 (edit form
+/// 1 + 1), at 45 the run 2 and the hint 2, at 80 one each.
 #[test]
 fn the_refresh_editor_swaps_its_hint_for_its_range_while_typing() {
     let _home = crate::testutil::HomeSandbox::new();
-    for (w, delta) in [(28u16, -3isize), (45, -1), (80, 0)] {
+    for (w, delta) in [(28u16, -4isize), (45, -2), (80, 0)] {
         let frame = |app: &crate::tui::app::App| {
             let mut term =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 100)).unwrap();
@@ -1489,4 +1495,61 @@ fn config_toggles_paint_their_parts_in_split_colours() {
             false,
         );
     }
+}
+
+/// A value row's hint states what the setting does and never restates the
+/// value its own row already shows, whatever that value is.
+#[test]
+fn value_row_hints_state_what_the_setting_does() {
+    let mut on = toggles();
+    on.burn_aware = true;
+    for live in [
+        tunables(),
+        RowTunables {
+            refresh_interval_ms: 30_000,
+            weekly_pct: 80.0,
+            burn_floor_pct: 60.0,
+            burn_horizon_ms: 30_000,
+            default_divergence: None,
+            context_nudge_tokens: Some(600_000),
+        },
+    ] {
+        for (row, want) in [
+            (
+                GlobalConfigRow::RefreshInterval,
+                "how often clauth checks every account's usage",
+            ),
+            (
+                GlobalConfigRow::WeeklyThreshold,
+                "don't send new work to an account past this share of its weekly limit",
+            ),
+            (
+                GlobalConfigRow::BurnFloor,
+                "never switch away before this share is used, however fast the burn",
+            ),
+            (
+                GlobalConfigRow::BurnHorizon,
+                "how far ahead to look when guessing the next switch",
+            ),
+        ] {
+            assert_eq!(
+                row_hint(row, on, live).as_deref(),
+                Some(want),
+                "{row:?} at refresh {}ms",
+                live.refresh_interval_ms
+            );
+        }
+    }
+    let nudge = RowTunables {
+        context_nudge_tokens: Some(600_000),
+        ..tunables()
+    };
+    assert_eq!(
+        row_hint(GlobalConfigRow::ContextNudge, toggles(), nudge).as_deref(),
+        Some("tells a running session when its context grows past this size")
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
+        Some("no context nudge is sent")
+    );
 }

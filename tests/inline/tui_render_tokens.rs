@@ -2774,7 +2774,7 @@ fn a_day_in_the_ledger_and_the_cache_merges_per_model_total() {
     let stats = loop {
         match rx.recv_timeout(std::time::Duration::from_secs(60)) {
             Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
-            Ok(crate::tokens::TokensEvent::Failed) => panic!("the tokens worker failed"),
+            Ok(crate::tokens::TokensEvent::Failed(_)) => panic!("the tokens worker failed"),
             Ok(_) => {}
             Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
         }
@@ -3215,5 +3215,42 @@ fn the_today_peak_never_shows_past_a_shed_today_part() {
     for w in 20..=60usize {
         let line = super::today_speed_line_within(&app, Some(today), w);
         assert_eq!(line_text(&line), widest_fitting(&ladder, w), "w={w}");
+    }
+}
+
+/// The typed stats-cache failures map to their lowercase cause lines, driven
+/// from a real `load_base` on a sandboxed dir.
+#[test]
+fn each_stats_cache_failure_maps_to_its_cause_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let missing = crate::tokens::load_base(&dir).expect_err("missing file fails");
+    assert_eq!(missing.cause_line(), "no such file");
+
+    std::fs::write(dir.join("stats-cache.json"), "{not json").unwrap();
+    let invalid = crate::tokens::load_base(&dir).expect_err("invalid json fails");
+    assert_eq!(
+        invalid.cause_line(),
+        "not valid stats json: key must be a string at line 1 column 2"
+    );
+
+    std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
+    std::fs::create_dir(dir.join("stats-cache.json")).unwrap();
+    let unreadable = crate::tokens::load_base(&dir).expect_err("a directory fails");
+    assert_eq!(unreadable.cause_line(), "read failed: is a directory");
+    std::fs::remove_dir(dir.join("stats-cache.json")).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = dir.join("stats-cache.json");
+        std::fs::write(&cache, "{}").unwrap();
+        let mut perms = std::fs::metadata(&cache).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&cache, perms).unwrap();
+        let denied = crate::tokens::load_base(&dir).expect_err("unreadable file fails");
+        assert_eq!(denied.cause_line(), "permission denied");
     }
 }

@@ -622,7 +622,7 @@ fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
         (
             "empty model selector",
             &empty,
-            " ←→ tabs   ↑↓ model   c count cache   t period   a actions   ? help   q back ",
+            " ←→ tabs   c count cache   t period   a actions   ? help   q back ",
         ),
         (
             "populated model selector",

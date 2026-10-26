@@ -3025,7 +3025,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
         ..Default::default()
     });
 
-    let out = dump(&app, 100, 30);
+    let out = dump(&app, 140, 30);
     assert!(
         out.contains("no models match the filter"),
         "filtered-empty models view must name the filter:\n{out}"
@@ -7265,7 +7265,7 @@ fn the_tokens_total_badge_and_top_models_render_whole_at_narrow_widths() {
     }
 }
 
-/// The usage eyebrow figures (5h/7d) and the `notes:` hint stay whole at every
+/// The usage eyebrow figures (5h/7d) and the `notes` hint stay whole at every
 /// width — a narrow pane drops the trailing figure to its own line rather than
 /// clipping it. Pinned whole-row.
 #[test]
@@ -7279,7 +7279,7 @@ fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
             &[
                 "│ 5h                  12% │",
                 "│ 7d                   8% │",
-                "│ notes:    press n to    │",
+                "│ notes     press n to    │",
                 "│           add notes     │",
             ],
         ),
@@ -7288,7 +7288,7 @@ fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
             &[
                 "│ 5h                   12% │",
                 "│ 7d                    8% │",
-                "│ notes:    press n to add │",
+                "│ notes     press n to add │",
                 "│           notes          │",
             ],
         ),
@@ -7297,7 +7297,7 @@ fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
             &[
                 "│ 5h                         12% │",
                 "│ 7d                          8% │",
-                "│ notes:    press n to add notes │",
+                "│ notes     press n to add notes │",
             ],
         ),
         (
@@ -7305,7 +7305,7 @@ fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
             &[
                 "│ 5h                                    12% │",
                 "│ 7d                                     8% │",
-                "│ notes:    press n to add notes            │",
+                "│ notes     press n to add notes            │",
             ],
         ),
     ];
@@ -7453,7 +7453,7 @@ fn the_tokens_total_badge_and_top_models_desktop_rows_measure_by_cells() {
     );
 }
 
-/// Desktop pin: the usage eyebrow figures and `notes:` hint render byte-identical
+/// Desktop pin: the usage eyebrow figures and `notes` hint render byte-identical
 /// to the pre-S9 render at 80/160.
 #[test]
 fn the_usage_eyebrow_and_notes_desktop_rows_match_the_pre_s9_render() {
@@ -7466,7 +7466,7 @@ fn the_usage_eyebrow_and_notes_desktop_rows_match_the_pre_s9_render() {
             &[
                 "│                      ││ 5h                                               12% │",
                 "│                      ││ 7d                                                8% │",
-                "│                      ││ notes:    press n to add notes                       │",
+                "│                      ││ notes     press n to add notes                       │",
             ],
         ),
         (
@@ -7474,7 +7474,7 @@ fn the_usage_eyebrow_and_notes_desktop_rows_match_the_pre_s9_render() {
             &[
                 "│                                      ││ 5h                                                                                                               12% │",
                 "│                                      ││ 7d                                                                                                                8% │",
-                "│                                      ││ notes:    press n to add notes                                                                                       │",
+                "│                                      ││ notes     press n to add notes                                                                                       │",
             ],
         ),
     ];
@@ -8873,4 +8873,385 @@ fn an_editing_config_row_keeps_the_selection_tint() {
             "the editing row keeps the selection tint over the same cells ({tier:?})"
         );
     }
+}
+
+/// A box as (top, bottom, left, right) char indices into a frame's rows.
+type CharBox = (usize, usize, usize, usize);
+
+/// The empty-state frame inside the pane titled `title`: the frame's corners
+/// plus the pane's content box, the pane's interior inside its one-cell
+/// padding columns.
+fn empty_frame_in_pane(rows: &[Vec<char>], title: &str) -> (CharBox, CharBox) {
+    let title_row = rows
+        .iter()
+        .position(|r| r.iter().collect::<String>().contains(title))
+        .unwrap_or_else(|| panic!("a pane titled {title:?}"));
+    let title_at = rows[title_row]
+        .iter()
+        .collect::<String>()
+        .find(title)
+        .map(|byte| {
+            rows[title_row].iter().collect::<String>()[..byte]
+                .chars()
+                .count()
+        })
+        .unwrap_or_default();
+    let pane_left = (0..title_at)
+        .rev()
+        .find(|&c| rows[title_row][c] == '╭')
+        .expect("the pane's top-left corner");
+    let pane_right = (title_at..rows[title_row].len())
+        .find(|&c| rows[title_row][c] == '╮')
+        .expect("the pane's top-right corner");
+    let pane_bottom = (title_row + 1..rows.len())
+        .find(|&r| rows[r][pane_left] == '╰')
+        .expect("the pane's bottom edge");
+    let (top, left) = (title_row + 1..pane_bottom)
+        .find_map(|r| {
+            (pane_left + 1..pane_right)
+                .find(|&c| rows[r][c] == '╭')
+                .map(|c| (r, c))
+        })
+        .expect("an empty-state frame inside the pane");
+    let right = (left + 1..pane_right)
+        .find(|&c| rows[top][c] == '╮')
+        .expect("the frame's top-right corner");
+    let bottom = (top + 1..pane_bottom)
+        .find(|&r| rows[r][left] == '╰')
+        .expect("the frame's bottom edge");
+    (
+        (top, bottom, left, right),
+        (
+            title_row + 1,
+            pane_bottom - 1,
+            pane_left + 2,
+            pane_right - 2,
+        ),
+    )
+}
+
+/// Assert the empty-state frame in pane `title` holds exactly `lines` and sits
+/// centred in the pane, sized to its copy rather than filling the pane.
+fn assert_centred_empty_state(app: &App, w: u16, h: u16, title: &str, lines: &[&str]) {
+    let rows: Vec<Vec<char>> = dump(app, w, h)
+        .lines()
+        .map(|r| r.chars().collect())
+        .collect();
+    let ((top, bottom, left, right), (box_top, box_bottom, box_left, box_right)) =
+        empty_frame_in_pane(&rows, title);
+    let inside: Vec<String> = (top + 1..bottom)
+        .map(|r| {
+            rows[r][left + 1..right]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(inside, lines, "{title} at {w}x{h}");
+    let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let span = right - left + 1;
+    assert!(
+        span <= widest + 8,
+        "{title} at {w}x{h}: the frame spans {span} cells for {widest}-cell copy"
+    );
+    let (gap_l, gap_r) = (left - box_left, box_right - right);
+    let (gap_t, gap_b) = (top - box_top, box_bottom - bottom);
+    assert!(
+        gap_l.abs_diff(gap_r) <= 1 && gap_t.abs_diff(gap_b) <= 1,
+        "{title} at {w}x{h}: gaps left {gap_l} right {gap_r} top {gap_t} bottom {gap_b}"
+    );
+}
+
+/// An empty accounts list draws its frame centred in the pane, sized to the
+/// copy, at several terminal sizes.
+#[test]
+fn the_empty_accounts_frame_sits_centred_in_its_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    for (w, h) in [(90, 20), (120, 30), (60, 24)] {
+        assert_centred_empty_state(
+            &app,
+            w,
+            h,
+            "ACCOUNTS",
+            &["no accounts yet", "n to create one"],
+        );
+    }
+}
+
+/// An empty Models list draws the framed empty state with the key that can
+/// change what it shows: the period lens, or the action menu under a filter.
+#[test]
+fn an_empty_models_list_draws_a_centred_frame_with_a_working_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tokens::TokenStats;
+    use crate::tui::app::{TokenFilter, TokenView};
+    let profiles = vec![oauth("uwuclxdy", true)];
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Tokens;
+    app.token_view = TokenView::Models;
+    app.token_stats = Some(TokenStats::default());
+    assert_centred_empty_state(
+        &app,
+        100,
+        24,
+        "MODELS",
+        &["no model usage yet", "t to change the period"],
+    );
+    app.token_filter = TokenFilter::Claude;
+    assert_centred_empty_state(
+        &app,
+        140,
+        24,
+        "MODELS",
+        &["no models match the filter", "a to change the filter"],
+    );
+    // A selector too narrow for the copy keeps the frame inside the pane and
+    // wraps the copy at its spaces inside the frame.
+    assert_centred_empty_state(
+        &app,
+        100,
+        24,
+        "MODELS",
+        &["no models match the", "filter", "a to change the filter"],
+    );
+}
+
+/// An unreadable token cache renders as its path with a `[ failed ]` pill:
+/// the path dim, the brackets dim, the word danger + bold.
+#[test]
+fn an_unreadable_token_cache_renders_a_failed_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("stats-cache.json"))
+        .expect("the cache row");
+    let row: String = rows[y]
+        .trim()
+        .trim_start_matches('│')
+        .trim_end_matches('│')
+        .trim()
+        .to_string();
+    assert_eq!(row, "~/.claude/stats-cache.json  [ failed ]");
+    let x_of = |needle: &str| -> u16 {
+        let byte = rows[y].find(needle).expect("needle on the row");
+        u16::try_from(rows[y][..byte].chars().count()).unwrap()
+    };
+    let cell = |x: u16| buf.cell((x, u16::try_from(y).unwrap())).unwrap().clone();
+    let path = cell(x_of("~/.claude"));
+    assert_eq!(path.fg, crate::tui::theme::text_dim_color(), "path");
+    let open = cell(x_of("[ failed"));
+    assert_eq!(open.fg, crate::tui::theme::text_dim_color(), "open bracket");
+    let word = cell(x_of("failed"));
+    assert_eq!(word.fg, crate::tui::theme::danger_color(), "pill word");
+    assert!(
+        word.modifier.contains(ratatui::style::Modifier::BOLD),
+        "pill word bold"
+    );
+}
+
+/// `↵` toggles the failed cache's cause line on and off, one line below the
+/// pill; the cause reads ` └ <cause>` one cell right of the path, with the
+/// `└ ` leader in `LINE` and the cause in `DANGER`.
+#[test]
+fn enter_toggles_the_failed_cache_cause_line() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    app.tokens_failed_cause = Some(crate::tokens::TokensLoadError::Missing);
+
+    let draw = |app: &App| -> (ratatui::buffer::Buffer, Vec<String>) {
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| super::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = crate::testutil::buffer_rows(&buf);
+        (buf, rows)
+    };
+    let cache_row = |rows: &[String]| {
+        rows.iter()
+            .position(|r| r.contains("stats-cache.json"))
+            .expect("the cache row")
+    };
+
+    let (_, rows) = draw(&app);
+    assert!(
+        !rows[cache_row(&rows) + 1].contains("no such file"),
+        "cause hidden before enter"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let (buf, rows) = draw(&app);
+    let cache_y = cache_row(&rows);
+    let content_start = rows[cache_y].find('~').expect("the pill path");
+    let cause_y = cache_y + 1;
+    let cause = rows[cause_y][content_start..]
+        .trim_end_matches([' ', '│'])
+        .to_string();
+    assert_eq!(cause, " └ no such file");
+    let y = u16::try_from(cause_y).unwrap();
+    let x_of = |needle: &str| -> u16 {
+        let byte = rows[cause_y].find(needle).expect("needle on the cause row");
+        u16::try_from(rows[cause_y][..byte].chars().count()).unwrap()
+    };
+    let leader = buf.cell((x_of("└"), y)).unwrap().clone();
+    assert_eq!(leader.fg, crate::tui::theme::line_color(), "leader LINE");
+    let word = buf.cell((x_of("no such file"), y)).unwrap().clone();
+    assert_eq!(word.fg, crate::tui::theme::danger_color(), "cause DANGER");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let (_, rows) = draw(&app);
+    assert!(
+        !rows[cache_row(&rows) + 1].contains("no such file"),
+        "cause hidden after the second enter"
+    );
+}
+
+/// The empty-state frame is sized to its copy: an exact fit fills a 17x4 pane
+/// corner to corner, a pane one cell wider and taller centres it, and a pane
+/// one cell too narrow falls back to the bare centred copy with the action
+/// line still showing.
+#[test]
+fn the_empty_state_frame_fits_exactly_and_clamps_on_a_small_pane() {
+    let draw = |w: u16, h: u16| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            super::panes::empty_state(f, f.area(), "no accounts yet", "n", "to create one")
+        })
+        .unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+
+    let rows = draw(17, 4);
+    assert_eq!(rows[0], "╭───────────────╮");
+    assert_eq!(rows[1], "│no accounts yet│");
+    assert_eq!(rows[2], "│n to create one│");
+    assert_eq!(rows[3], "╰───────────────╯");
+
+    let rows = draw(18, 5);
+    assert_eq!(rows[0], "╭───────────────╮ ");
+    assert_eq!(rows[1], "│no accounts yet│ ");
+    assert_eq!(rows[2], "│n to create one│ ");
+    assert_eq!(rows[3], "╰───────────────╯ ");
+    assert_eq!(rows[4], " ".repeat(18));
+
+    let rows = draw(16, 4);
+    assert_eq!(rows[0], "   no accounts  ");
+    assert_eq!(rows[1], "       yet      ");
+    assert_eq!(rows[2], "   n to create  ");
+    assert_eq!(rows[3], "       one      ");
+}
+
+/// The Status, Services and Fallback framed empties sit centred in their
+/// selector panes, the copy wrapping inside the frame where the pane is narrow;
+/// the delegates empty's centred frame is pinned in the services render suite.
+#[test]
+fn the_framed_empty_states_sit_centred_in_their_panes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut status = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    status.tab = Tab::Status;
+    assert_centred_empty_state(
+        &status,
+        100,
+        24,
+        "INCIDENTS",
+        &["no status data yet", "r to fetch"],
+    );
+    assert_centred_empty_state(
+        &status,
+        70,
+        24,
+        "INCIDENTS",
+        &["no status data", "yet", "r to fetch"],
+    );
+
+    let mut services = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    services.tab = Tab::Services;
+    assert_centred_empty_state(
+        &services,
+        100,
+        24,
+        "SERVICES",
+        &["no services yet", "r to run"],
+    );
+    assert_centred_empty_state(
+        &services,
+        64,
+        24,
+        "SERVICES",
+        &["no services", "yet", "r to run"],
+    );
+
+    let mut fallback = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    fallback.tab = Tab::Fallback;
+    assert_centred_empty_state(
+        &fallback,
+        64,
+        24,
+        "CHAIN",
+        &["no accounts", "yet", "n to create", "one"],
+    );
+}
+
+/// On a phone-width stacked selector the pane is too short for its frame: the
+/// copy renders bare and centred, and the action line still shows.
+#[test]
+fn the_empty_state_keeps_its_action_line_on_a_short_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let action_in =
+        |app: &App, needle: &str| dump(app, 45, 20).lines().any(|row| row.contains(needle));
+
+    let mut status = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    status.tab = Tab::Status;
+    assert!(action_in(&status, "r to fetch"), "status action line");
+
+    let mut services = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    services.tab = Tab::Services;
+    assert!(action_in(&services, "r to run"), "services action line");
 }
