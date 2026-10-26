@@ -14971,8 +14971,8 @@ fn no_item_leg_folds_in_a_carry_or_a_flock() {
         }
     }
     assert_eq!(
-        calls, 6,
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out and the seed's retry each call `owned_keychain_leg` once"
+        calls, 7,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the MCP login sync's item write each call `owned_keychain_leg` once"
     );
     assert!(
         offenders.is_empty(),
