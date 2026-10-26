@@ -1632,7 +1632,13 @@ pub(crate) fn keychain_hand_off_for_config_dir(
     let landed = match crate::claude::carried_keys_of(&blob) {
         None => true,
         Some(carried) => match crate::claude::carry_item_keys_into_store(store, &carried) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Every other account's store too: an MCP login belongs to no
+                // Claude account, and the next swap may land the session on
+                // any of them. Best effort, never failing the hand-off.
+                crate::claude::fan_out_carried_mcp_logins(&carried);
+                true
+            }
             Err(e) => {
                 logline!(
                     "clauth: could not save the per-session Keychain item's MCP server logins \
