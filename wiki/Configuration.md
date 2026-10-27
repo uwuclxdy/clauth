@@ -179,7 +179,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
 | `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
 | `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
-| `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
+| `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all, herdr panes and background sessions alike; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
 | `[update]` | table | `{}` | the auto-updater toggle (Config tab) |
 | `[update] auto_update` | bool | `true` | the background update check when the TUI opens and the daemon's remote herdr-plugin reinstall; the whole table is omitted while on, and `CLAUTH_NO_UPDATE=1` disables both even when this is on |
 
