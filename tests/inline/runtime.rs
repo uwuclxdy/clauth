@@ -17448,3 +17448,86 @@ fn mcp_sync_reads_live_credential_files_as_sources() {
     let winners = crate::claude::mcp_sync_winners(&sources);
     assert_eq!(winners["sentry"]["accessToken"], "fresh");
 }
+
+/// A login held only in a live credential file, a live session's own or the
+/// global one, reaches every account's store through one sync pass, and
+/// neither live file is ever written, not even to add a server it lacks.
+#[test]
+fn mcp_sync_pass_carries_a_live_file_login_into_every_store() {
+    let _home = HomeSandbox::new();
+    let names = ["mithra", "support"];
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        ..crate::profile::AppState::default()
+    })
+    .expect("save state");
+    let store = |name: &str| {
+        crate::profile::profile_dir(&ProfileName::from(name))
+            .expect("dir")
+            .join("credentials.json")
+    };
+    let sentry =
+        serde_json::json!({ "accessToken": "global", "refreshToken": "r", "expiresAt": 9 });
+    let github =
+        serde_json::json!({ "accessToken": "session", "refreshToken": "r", "expiresAt": 9 });
+    let linear = serde_json::json!({ "accessToken": "store", "refreshToken": "r", "expiresAt": 9 });
+    for name in names {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save profile");
+        // A server only a store holds: a pass that wrote a live file would add it.
+        let mcp = if name == "support" {
+            serde_json::json!({ "linear": linear })
+        } else {
+            serde_json::json!({})
+        };
+        fs::write(
+            store(name),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "login" }, "mcpOAuth": mcp })
+                .to_string(),
+        )
+        .expect("store");
+    }
+    let sid = "4242-0";
+    crate::live_sessions::register(&crate::testutil::live_row(sid, "mithra")).expect("register");
+    let _marker = hold_session_row_marker(&ProfileName::from("mithra"), false, sid)
+        .expect("hold the live session's marker");
+    let [tree, _] = session_runtime_trees(&ProfileName::from("mithra"), false, sid).expect("trees");
+    fs::create_dir_all(&tree).expect("tree");
+    let session_file = tree.join(".credentials.json");
+    let session_bytes = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "login" },
+        "mcpOAuth": { "github": github }
+    })
+    .to_string();
+    fs::write(&session_file, &session_bytes).expect("session file");
+    let global = crate::claude::claude_credentials_path().expect("live path");
+    fs::create_dir_all(global.parent().expect("parent")).expect("live dir");
+    let global_bytes = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "login" },
+        "mcpOAuth": { "sentry": sentry }
+    })
+    .to_string();
+    fs::write(&global, &global_bytes).expect("global file");
+
+    sync_mcp_logins_once();
+
+    for name in names {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(store(name)).expect("read store")).expect("json");
+        assert_eq!(
+            value["mcpOAuth"],
+            serde_json::json!({ "sentry": sentry, "github": github, "linear": linear }),
+            "{name}'s store gets both live files' logins"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&session_file).expect("read session file"),
+        session_bytes,
+        "the session's live file is read, never written"
+    );
+    assert_eq!(
+        fs::read_to_string(&global).expect("read global"),
+        global_bytes,
+        "the global live file is read, never written"
+    );
+}
