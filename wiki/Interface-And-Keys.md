@@ -151,7 +151,7 @@ A saved Claude Code account's rows:
 | `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services` | `overview` |
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `non-login keys` | keep a `/design-login` with the account it was made on | on |
-| `sync MCP logins` | every account and live session gets the newest login to each MCP server; off, each account keeps its own MCP server logins | on |
+| `sync MCP logins` | every account and live session gets the newest login to each MCP server (on Linux and Windows: every account gets the newest login to each MCP server, a running session at its next switch); off, each account keeps its own MCP server logins | on |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
