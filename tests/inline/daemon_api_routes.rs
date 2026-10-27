@@ -71,6 +71,7 @@ fn ctx_with_stores(
         panes::absent_probe(),
         std::sync::Arc::new(|| None),
         super::super::terminal::unspawnable_terminal(),
+        super::super::create::unspawnable_session(),
         #[cfg(unix)]
         None,
     )
@@ -1899,6 +1900,202 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             "/sessions",
             403,
             &no_grant,
+            &mut driven,
+            &mut produced,
+        );
+
+        // The background arm, driven through the session-spawn seam: the new
+        // 200 oneOf arm and every new refusal code.
+        let bg_id = "3fde53e3";
+        let bg_stdout =
+            "Starting background service…\nbackgrounded · 3fde53e3\n  claude attach 3fde53e3\n";
+        let status_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json");
+        let bg_ctx = |spawn: super::super::create::SessionSpawn| {
+            ApiContext::for_tests_with_spawn(
+                std::sync::Arc::clone(&config),
+                status_path.clone(),
+                Box::new(|_, _| panes::HerdrProbeOut::Ran(None)),
+                spawn,
+            )
+        };
+        let answer = |success: bool, stdout: &'static str, stderr: &'static str| {
+            let spawn: super::super::create::SessionSpawn =
+                std::sync::Arc::new(move |_launcher, _args, _cwd| {
+                    Some(super::super::create::LaunchOut {
+                        success,
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: stderr.as_bytes().to_vec(),
+                    })
+                });
+            spawn
+        };
+
+        crate::testutil::write_claude_job(
+            &crate::profile::home_dir().expect("home"),
+            bg_id,
+            &crate::profile::claude_dir().expect("claude dir"),
+        );
+        let background_ok = call(
+            &bg_ctx(answer(true, bg_stdout, "")),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            200,
+            &background_ok,
+            &mut driven,
+            &mut produced,
+        );
+
+        {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::create_blank_profile(
+                &mut cfg,
+                "off".to_string(),
+                None,
+                None,
+                Default::default(),
+            )
+            .expect("create profile");
+            crate::actions::disable_profile(&mut cfg, &"off".into()).expect("disable");
+        }
+        let disabled = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"off"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &disabled,
+            &mut driven,
+            &mut produced,
+        );
+
+        let fallback_refused = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"delta","with_fallback":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &fallback_refused,
+            &mut driven,
+            &mut produced,
+        );
+
+        {
+            let _fake = crate::runtime::ForcedFakeLinkMode::new();
+            let copy_host = call(
+                &bg_ctx(super::super::create::unspawnable_session()),
+                &req(
+                    "POST",
+                    "/api/v1/sessions",
+                    Some(TOKEN),
+                    r#"{"cwd":"/","profile":"alpha","background":true}"#,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions",
+                409,
+                &copy_host,
+                &mut driven,
+                &mut produced,
+            );
+        }
+
+        crate::testutil::write_codex_roster(&["cx"]);
+        crate::testutil::write_codex_store(
+            "cx",
+            &crate::testutil::codex_auth_body("at.cx", "rt.cx"),
+        );
+        crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
+        let quarantined = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"cx"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &quarantined,
+            &mut driven,
+            &mut produced,
+        );
+
+        let refused = call(
+            &bg_ctx(answer(
+                false,
+                "",
+                "'--bg' is disabled by the 'disableAgentView' setting.",
+            )),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            502,
+            &refused,
+            &mut driven,
+            &mut produced,
+        );
+
+        let busy = call(
+            &bg_ctx(answer(
+                false,
+                "",
+                "Error: clauth is stopping Claude Code's background service in \
+                 /home/u/.clauth/profiles/acme/runtime-bg; retry in a moment\n",
+            )),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            503,
+            &busy,
             &mut driven,
             &mut produced,
         );
@@ -4145,7 +4342,7 @@ fn a_refused_switch_reflects_the_authored_sentence() {
     assert_eq!(body["error"], serde_json::json!("switch_refused"));
     assert_eq!(
         body["reason"],
-        serde_json::json!("'beta': account is disabled, run `clauth enable beta`")
+        serde_json::json!("'beta': account is disabled")
     );
 }
 
@@ -4370,6 +4567,23 @@ fn proxy_slot_requires_the_fields_it_shipped_with() {
             "version",
         ],
         "ProxySlot's required set"
+    );
+}
+
+/// The background answer's `session_id` is required AND nullable, so a client
+/// generated from the served schema always parses the field but types it as
+/// optional.
+#[test]
+fn background_session_created_requires_a_nullable_session_id() {
+    assert_eq!(
+        served_required("BackgroundSessionCreated"),
+        ["background_id", "ok", "session_id"],
+        "BackgroundSessionCreated's required set"
+    );
+    assert_eq!(
+        served_schema("BackgroundSessionCreated")["properties"]["session_id"]["type"],
+        serde_json::json!(["string", "null"]),
+        "session_id is documented nullable"
     );
 }
 

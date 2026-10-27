@@ -250,9 +250,7 @@ fn ensure_switch_target_ok(
     // read is on disk alone.
     let fresh = crate::profile::read_profile(name)?;
     if profile.is_disabled() || fresh.is_disabled() {
-        bail!(DeepRefusal(format!(
-            "'{name}': account is disabled, run `clauth enable {name}`"
-        )));
+        bail!(DeepRefusal(crate::disabled_account_refusal(name)));
     }
     Ok(fresh)
 }
@@ -1247,8 +1245,8 @@ pub(crate) fn switch_profile_noninteractive(
     // authoritative `ensure_switch_target_ok` gate inside `switch_profile`
     // stays the backstop, this only prevents the spurious rotation.
     if target_disabled {
-        return Err(SwitchError::Refused(format!(
-            "'{target}': account is disabled, run `clauth enable {target}`"
+        return Err(SwitchError::Refused(crate::disabled_account_refusal(
+            target,
         )));
     }
 

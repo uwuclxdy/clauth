@@ -553,14 +553,15 @@ pub(crate) fn clear_quarantine(name: &str) {
 /// mint. The bare capture is a no-op for an adopted slot (it finds the link
 /// already naming this profile and captures nothing), and no refresh can
 /// revive a chain the server declared dead.
-pub(crate) fn refuse_if_quarantined(name: &str) -> Result<()> {
+pub(crate) fn refuse_if_quarantined(
+    name: &str,
+) -> std::result::Result<(), crate::start::StartRefusal> {
     if let Some(q) = read_quarantine(name) {
-        anyhow::bail!(
-            "'{name}': codex chain is broken ({} since {}), run `clauth login {name} --codex \
-             --browser`",
-            q.kind,
-            q.at
-        );
+        return Err(crate::start::StartRefusal::CodexQuarantined {
+            name: name.to_string(),
+            kind: q.kind,
+            at: q.at,
+        });
     }
     Ok(())
 }

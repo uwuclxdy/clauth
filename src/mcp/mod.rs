@@ -3498,7 +3498,7 @@ enum WaitEnd {
 /// True when the caller pins its own `--output-format` in `args`. clauth then
 /// spawns no format flag of its own, and the child's output shape is unknown.
 fn sets_output_format(extra_args: &[String]) -> bool {
-    extra_args
+    crate::start::claude_option_args(extra_args)
         .iter()
         .any(|a| a == "--output-format" || a.starts_with("--output-format="))
 }
@@ -3507,7 +3507,7 @@ fn sets_output_format(extra_args: &[String]) -> bool {
 /// equals spelling (`--flag=value`). The typed-arg shadow rules refuse on this
 /// rather than guessing precedence between a typed flag and its raw twin.
 fn args_carry_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| {
+    crate::start::claude_option_args(args).iter().any(|a| {
         a.strip_prefix(flag)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
     })
@@ -4918,9 +4918,7 @@ fn preflight_target(
     credit_billed: &[String],
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
-        return Err(format!(
-            "profile is disabled: {name} (run `clauth enable {name}`)"
-        ));
+        return Err(crate::disabled_account_refusal(name));
     }
     // BEFORE the quarantine arm, and that order is the whole of what the
     // deleted quarantined+keyless arm used to say: this target's spawn is

@@ -163,7 +163,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         handoff: None,
     })
     .expect_err("a disabled target must be refused");
-    assert_eq!(err, "profile is disabled: off (run `clauth enable off`)");
+    assert_eq!(err, "'off': account is disabled");
 
     assert!(
         !home
@@ -1015,10 +1015,7 @@ fn a_disabled_and_capped_target_refuses_with_the_disabled_sentence() {
     crate::profile::save_profile(&profile).expect("save profile");
 
     let err = delegate_to_capped(Some("fable"), &cwd).expect_err("a disabled target is refused");
-    assert_eq!(
-        err,
-        "profile is disabled: capped (run `clauth enable capped`)"
-    );
+    assert_eq!(err, "'capped': account is disabled");
 }
 
 /// A quarantined AND capped OAuth target still refuses with the quarantine
@@ -2021,7 +2018,7 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
         None,
     )
     .expect_err("a disabled member refuses the fan-out");
-    assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
+    assert_eq!(err, "'both': account is disabled");
 }
 
 /// Gate ORDER, second pinned case: a target that is quarantined AND a keyless

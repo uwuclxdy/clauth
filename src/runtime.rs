@@ -612,6 +612,12 @@ pub(crate) fn copy_host_background_refusal(name: &str, flag: &str) -> String {
     )
 }
 
+/// The marker both stop-in-flight refusals write and the sessions route's
+/// `background_busy` classifier matches: the child is clauth itself, so its
+/// stderr carries this verbatim. The tree path never reaches a response body.
+pub(crate) const BACKGROUND_STOP_MARKER: &str =
+    "clauth is stopping Claude Code's background service in";
+
 /// Every path one session addresses, resolved as a unit once its [`LinkMode`] is
 /// known — the mode decides the dir names, so nothing here can be computed
 /// before the probe.
@@ -7019,8 +7025,7 @@ impl ProfileRuntime {
                 // end. The next retry adopts once it settles.
                 if stop_in_flight(&start_paths.runtime)? {
                     anyhow::bail!(
-                        "clauth is stopping Claude Code's background service in {}; \
-                         retry in a moment",
+                        "{BACKGROUND_STOP_MARKER} {}; retry in a moment",
                         start_paths.runtime.display()
                     );
                 }
@@ -7330,8 +7335,7 @@ impl ProfileRuntime {
                 if stop_in_flight(&paths.runtime)? {
                     if fixed_runtime {
                         anyhow::bail!(
-                            "clauth is stopping Claude Code's background service in {}; \
-                             retry in a moment",
+                            "{BACKGROUND_STOP_MARKER} {}; retry in a moment",
                             paths.runtime.display()
                         );
                     }

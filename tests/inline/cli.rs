@@ -1720,10 +1720,7 @@ mod disabled_target_refusal {
         seed_disabled_profile("off");
 
         let err = cmd_switch("off").expect_err("a disabled target must be refused");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
 
         let reloaded = crate::profile::load_config().expect("reload");
         assert_eq!(
@@ -1744,7 +1741,7 @@ mod disabled_target_refusal {
         let err = crate::dispatch(cli).expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`",
+            "'off': account is disabled",
             "the refusal copy is the bare form's, byte for byte"
         );
 
@@ -1768,10 +1765,7 @@ mod disabled_target_refusal {
             false,
         )
         .expect_err("a disabled target must be refused");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
 
         assert!(
             !home
@@ -1798,10 +1792,7 @@ mod disabled_target_refusal {
             true,
         )
         .expect_err("explain must run the same refusals as a launch");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
     }
 }
 
@@ -2700,10 +2691,7 @@ mod oauth_token_helper_tests {
         let _endpoints = EndpointSandbox::new(&home, &base);
 
         let err = dispatch_oauth_token("parked").expect_err("a disabled profile must fail");
-        assert_eq!(
-            err.to_string(),
-            "'parked': account is disabled, run `clauth enable parked`"
-        );
+        assert_eq!(err.to_string(), "'parked': account is disabled");
         crate::testutil::assert_nothing_sent(&listener);
     }
 

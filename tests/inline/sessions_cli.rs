@@ -1140,10 +1140,7 @@ fn resume_refuses_an_explicit_disabled_profile_before_any_spawn() {
 
     let err =
         run_resume("known-session", Some("off")).expect_err("a disabled target must be refused");
-    assert_eq!(
-        err.to_string(),
-        "'off': account is disabled, run `clauth enable off`"
-    );
+    assert_eq!(err.to_string(), "'off': account is disabled");
     assert!(
         !sb.home().join(".clauth/profiles/off/runtime").exists(),
         "the refusal must happen before any runtime is acquired"

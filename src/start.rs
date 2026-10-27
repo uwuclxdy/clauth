@@ -67,6 +67,79 @@ pub(crate) fn rescue_teardown(
     (transcripts.moved, sidecars.moved)
 }
 
+/// A typed start refusal: the one sentence `admit` and its gates answer, so the
+/// sessions route classifies by variant, never by string. `Display` is exactly
+/// the sentence every CLI caller prints.
+#[derive(Debug)]
+pub(crate) enum StartRefusal {
+    /// `'{name}': account is disabled`
+    Disabled { name: ProfileName },
+    /// A `--with-fallback` refusal. The anyhow carries the sentence and, for
+    /// the "could not be checked" arm, the daemon-lock cause.
+    WithFallback(anyhow::Error),
+    /// The copy-host background refusal (`background_unavailable`).
+    CopyHostBackground { reason: String },
+    /// `--with-fallback` on a codex profile, refused the way `clauth start`
+    /// refuses it; codex reads its auth once at start, so a chain lands at the
+    /// NEXT start.
+    CodexWithFallback,
+    /// A quarantined codex login, refused the way `clauth start` refuses it.
+    CodexQuarantined {
+        name: String,
+        kind: String,
+        at: String,
+    },
+    /// Any other background-start refusal (the `--isolated` arm), which the
+    /// sessions route never reaches.
+    Background { reason: String },
+}
+
+impl StartRefusal {
+    /// The sessions-route error code, `None` for a refusal the route never
+    /// reaches (the isolated background arm).
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            StartRefusal::Disabled { .. } => Some("profile_disabled"),
+            StartRefusal::WithFallback(_) => Some("with_fallback_unavailable"),
+            StartRefusal::CopyHostBackground { .. } => Some("background_unavailable"),
+            StartRefusal::CodexWithFallback => Some("with_fallback_unavailable"),
+            StartRefusal::CodexQuarantined { .. } => Some("login_quarantined"),
+            StartRefusal::Background { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartRefusal::Disabled { name } => f.write_str(&crate::disabled_account_refusal(name)),
+            StartRefusal::WithFallback(e) => std::fmt::Display::fmt(e, f),
+            StartRefusal::CopyHostBackground { reason } | StartRefusal::Background { reason } => {
+                f.write_str(reason)
+            }
+            StartRefusal::CodexWithFallback => f.write_str(
+                "--with-fallback is not available on a codex profile: codex reads \
+                 auth.json once at start, so a chain lands at the NEXT start, not \
+                 mid-session. Start without the flag",
+            ),
+            StartRefusal::CodexQuarantined { name, kind, at } => write!(
+                f,
+                "'{name}': codex chain is broken ({kind} since {at}), run `clauth login {name} \
+                 --codex --browser`",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StartRefusal::WithFallback(e) => e.source(),
+            _ => None,
+        }
+    }
+}
+
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot
 /// execute a per-session credential swap. Split from the gate so the render is
 /// exercisable from any run: [`LinkMode::Fake`] is unreachable on a real-symlink
@@ -96,53 +169,65 @@ fn refuse_unless_chain_eligible(
     // it: `chain_opt_in_survives` drops an isolated opt-in silently, which is the
     // one outcome every gate here exists to prevent.
     if isolation == Isolation::Isolated {
-        anyhow::bail!(
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
             "'{name}': --with-fallback cannot be combined with --isolated, since an \
              isolated session follows no chain"
-        );
+        ))
+        .into());
     }
     // The decision leg's freshness gate reads only the OAuth status store. That
     // is sound because a third-party-launched session gets a chain the walk
     // cannot move it off — so an opted-in one would follow nothing, in silence.
     if !profile.is_oauth() {
-        anyhow::bail!(
-            "'{name}': --with-fallback needs an OAuth account, but this one carries \
-             a custom endpoint; start without it"
-        );
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
+            "'{name}': --with-fallback needs an OAuth account, but this one has a custom base url"
+        ))
+        .into());
     }
     // `snapshot_session_chain` returns `None` for a member outside the chain, so
     // the row is skipped every tick with nothing said.
     if !config.state.fallback_chain.iter().any(|n| n == name) {
-        anyhow::bail!(
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
             "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on \
              the fallback tab of the `clauth` TUI, or start without it"
-        );
+        ))
+        .into());
     }
     // Membership alone is not enough: a chain holding only this profile gives
     // `next_auto_switch_target` nowhere to point, and both `Off` and a stay-put
     // `None` write nothing on the session path. Same silence as a non-member.
     if !config.state.fallback_chain.iter().any(|n| n != name) {
-        anyhow::bail!(
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
             "'{name}': --with-fallback needs a second account in the fallback chain to \
              move to; add one on the fallback tab of the `clauth` TUI, or start without it"
-        );
+        ))
+        .into());
     }
     // Only the daemon's decision leg writes `intended_member`, so with no daemon
     // the flag is inert. `singleton_held` is the decision-side reader: it
     // separates "nobody there" from "can't tell", and a host that cannot be
     // checked cannot run the decider on it either, so both refuse.
-    let held = crate::daemon::singleton_held().with_context(|| {
-        format!("'{name}': --with-fallback needs a running daemon and this host could not be checked for one")
-    })?;
+    let held = crate::daemon::singleton_held()
+        .with_context(|| {
+            format!(
+                "'{name}': --with-fallback needs a running daemon and this host could not be checked for one"
+            )
+        })
+        .map_err(StartRefusal::WithFallback)?;
     if !held {
-        anyhow::bail!(
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
             "'{name}': --with-fallback needs a running daemon to decide switches, \
              run `clauth daemon`"
-        );
+        ))
+        .into());
     }
     // Last, because it is the only gate that touches disk.
     if let Some(why) = crate::runtime::unsupported_swap_transport(name)? {
-        anyhow::bail!("{}", unsupported_host_refusal(name, why));
+        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
+            "{}",
+            unsupported_host_refusal(name, why)
+        ))
+        .into());
     }
     Ok(())
 }
@@ -208,6 +293,15 @@ pub(crate) enum EnvLeg {
     Caller,
 }
 
+/// The slice of `claude_args` claude reads as options: everything before the
+/// `--` that ends claude's option parsing (one a flag takes as its value is
+/// that flag's value). What follows the separator is prompt text, which no
+/// passthrough reader may scan (a `--model=` in a prompt is a prompt, not a
+/// model). The one cut every passthrough reader shares.
+pub(crate) fn claude_option_args(claude_args: &[String]) -> &[String] {
+    &claude_args[..crate::cc_exempt::options_end(claude_args)]
+}
+
 /// The last `--model` value, the last RAW `--model` value, and the last
 /// `--fallback-model` value in a passthrough arg list, in both spellings, read
 /// in ONE walk. A `--model` consumes the next word as its value whatever it
@@ -227,7 +321,7 @@ pub(crate) fn parsed_model_args(
     let mut headline = None;
     let mut last_raw_model = None;
     let mut fallback = None;
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--model=") {
             headline = (!v.trim().is_empty()).then(|| v.to_owned());
@@ -506,7 +600,7 @@ fn member_launch_demand_with(
 /// absent: it never clears an earlier flag.
 pub(crate) fn parsed_agent_arg(claude_args: &[String]) -> Option<String> {
     let mut agent = None;
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--agent=")
             && !v.trim().is_empty()
@@ -572,6 +666,7 @@ pub(crate) fn resumed_agent(claude_args: &[String]) -> ResumedAgent {
 /// else the next token; a `c` in the same cluster is `--continue` with getopt
 /// semantics.
 fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
+    let claude_args = claude_option_args(claude_args);
     let mut values = Vec::new();
     let mut unpinnable = false;
     let mut i = 0;
@@ -802,7 +897,7 @@ fn passthrough_settings_sources(
 /// already skips, so the `user` tier is not judged here.
 fn project_setting_sources(claude_args: &[String]) -> (bool, bool) {
     let mut enabled = (true, true);
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         let value = if let Some(v) = a.strip_prefix("--setting-sources=") {
             Some(v)
@@ -906,7 +1001,7 @@ pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]
 /// as a WHOLE argv word: its value is the flag itself, never a prefix of a
 /// model name or a prompt.
 fn background_flag(claude_args: &[String]) -> Option<&str> {
-    claude_args
+    claude_option_args(claude_args)
         .iter()
         .map(String::as_str)
         .find(|arg| *arg == "--bg" || *arg == "--background")
@@ -930,10 +1025,13 @@ fn refuse_background_start(
     if isolation == Isolation::Isolated
         && let Some(flag) = background_flag(claude_args)
     {
-        anyhow::bail!(
-            "'{name}': {flag} cannot be combined with --isolated, since background sessions \
-             run in the account's shared background tree"
-        );
+        return Err(StartRefusal::Background {
+            reason: format!(
+                "'{name}': {flag} cannot be combined with --isolated, since background sessions \
+                 run in the account's shared background tree"
+            ),
+        }
+        .into());
     }
 
     // The fixed background pair is a COPY on a host that cannot symlink, and a
@@ -948,10 +1046,10 @@ fn refuse_background_start(
         && let Some(flag) = background_flag(claude_args)
         && crate::runtime::background_copy_host(name)?
     {
-        anyhow::bail!(
-            "{}",
-            crate::runtime::copy_host_background_refusal(name.as_str(), flag)
-        );
+        return Err(StartRefusal::CopyHostBackground {
+            reason: crate::runtime::copy_host_background_refusal(name.as_str(), flag),
+        }
+        .into());
     }
     Ok(())
 }

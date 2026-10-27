@@ -559,45 +559,44 @@ pub(crate) fn fold_settings_args(
             }
             continue;
         }
-        if VALUE_FLAGS.contains(&arg) {
-            // the flag and its value stay in the passthrough: only a
-            // `--settings` flag itself is folded out
-            clean.push(arg.to_string());
-            i += match passthrough.get(i + 1) {
-                Some(next) => {
-                    clean.push(next.clone());
-                    2
-                }
-                None => 1,
-            };
-            continue;
-        }
-        if OPTIONAL_VALUE_FLAGS.contains(&arg) {
-            clean.push(arg.to_string());
-            i += match passthrough.get(i + 1) {
-                // an optional value is never a `-`-led word
-                Some(next) if !next.starts_with('-') => {
-                    clean.push(next.clone());
-                    2
-                }
-                _ => 1,
-            };
-            continue;
-        }
-        if short_cluster_takes_value(arg) {
-            clean.push(arg.to_string());
-            if let Some(next) = passthrough.get(i + 1) {
-                clean.push(next.clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        clean.push(arg.to_string());
-        i += 1;
+        // any other flag and its value stay in the passthrough: only a
+        // `--settings` flag itself is folded out
+        let span = option_span(passthrough, i);
+        clean.extend_from_slice(&passthrough[i..i + span]);
+        i += span;
     }
     Ok((value, clean))
+}
+
+/// The index of the `--` that ends claude's option parsing, else
+/// `passthrough.len()`: the first `--` in a flag position, walked as
+/// [`fold_settings_args`] walks, so a `--` a flag takes as its value
+/// (`--name -- --bg`) never ends it.
+pub(crate) fn options_end(passthrough: &[String]) -> usize {
+    let mut i = 0;
+    while i < passthrough.len() {
+        if passthrough[i] == "--" {
+            return i;
+        }
+        i += option_span(passthrough, i);
+    }
+    passthrough.len()
+}
+
+/// How many words the word at `passthrough[i]` spans as claude parses argv: 2
+/// when it takes the next word (a [`VALUE_FLAGS`] member whatever that word
+/// holds, a short cluster ending in a value-taking `n`, an
+/// [`OPTIONAL_VALUE_FLAGS`] member only before a word without a leading `-`),
+/// else 1.
+fn option_span(passthrough: &[String], i: usize) -> usize {
+    let arg = passthrough[i].as_str();
+    let Some(next) = passthrough.get(i + 1) else {
+        return 1;
+    };
+    let takes_next = VALUE_FLAGS.contains(&arg)
+        || short_cluster_takes_value(arg)
+        || (OPTIONAL_VALUE_FLAGS.contains(&arg) && !next.starts_with('-'));
+    if takes_next { 2 } else { 1 }
 }
 
 /// Whether a short cluster takes the next word: `-n` is claude's only

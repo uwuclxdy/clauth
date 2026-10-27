@@ -394,6 +394,11 @@ pub(crate) struct ApiContext {
     /// test spawns a fixture script, and the default refuses so no test ever
     /// runs a real herdr.
     pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
+    /// Spawns a background session launch (`clauth start … -- --bg` or
+    /// `claude --bg`). The daemon passes [`super::create::real_session_spawn`];
+    /// a test records the launch and answers a fixture, and the default panics
+    /// so no test ever runs a real `clauth`/`claude`.
+    pub(crate) session_spawn: super::create::SessionSpawn,
     /// The mod bridge hub, when a `--listen` daemon bound the socket and built
     /// this context with it. `None` in tests without a bridge and on platforms
     /// with no bridge (Windows).
@@ -418,6 +423,7 @@ impl ApiContext {
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
+        session_spawn: super::create::SessionSpawn,
         #[cfg(unix)] bridge: Option<Arc<crate::daemon::bridge::Hub>>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -429,6 +435,7 @@ impl ApiContext {
             herdr_probe,
             herdr,
             terminal_spawn,
+            session_spawn,
             #[cfg(unix)]
             bridge,
             terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
@@ -453,6 +460,7 @@ impl ApiContext {
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
+            super::create::unspawnable_session(),
             #[cfg(unix)]
             None,
         )
@@ -475,7 +483,32 @@ impl ApiContext {
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
+            super::create::unspawnable_session(),
             Some(bridge),
+        )
+    }
+
+    /// The test constructor with an explicit session spawn: the pane probe and
+    /// the launch seam are both whatever the test hands over. Unix-gated: its
+    /// only callers are the unix-gated sessions test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_tests_with_spawn(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        herdr_probe: PaneProbe,
+        session_spawn: super::create::SessionSpawn,
+    ) -> Arc<Self> {
+        Self::new(
+            config,
+            status_path,
+            None,
+            None,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+            session_spawn,
+            #[cfg(unix)]
+            None,
         )
     }
 }
@@ -1136,7 +1169,8 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
-    modifiers(&BearerScheme)
+    components(schemas(create::BackgroundSessionCreated)),
+    modifiers(&BearerScheme, &SessionsCreateOneOf)
 )]
 struct ApiDoc;
 
@@ -1156,6 +1190,37 @@ impl utoipa::Modify for BearerScheme {
                 ),
             );
         }
+    }
+}
+
+/// `POST /sessions`' 200 is `oneOf` the unchanged pane [`super::create::SessionCreated`]
+/// and the new background [`super::create::BackgroundSessionCreated`], so the
+/// two arms stay two schemas rather than one with optional fields.
+struct SessionsCreateOneOf;
+
+impl utoipa::Modify for SessionsCreateOneOf {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::{OneOfBuilder, RefBuilder};
+
+        let Some(path_item) = openapi.paths.paths.get_mut("/api/v1/sessions") else {
+            return;
+        };
+        let Some(operation) = path_item.post.as_mut() else {
+            return;
+        };
+        let Some(RefOr::T(response)) = operation.responses.responses.get_mut("200") else {
+            return;
+        };
+        let Some(content) = response.content.get_mut("application/json") else {
+            return;
+        };
+        content.schema = Some(
+            OneOfBuilder::new()
+                .item(RefBuilder::new().ref_location_from_schema_name("SessionCreated"))
+                .item(RefBuilder::new().ref_location_from_schema_name("BackgroundSessionCreated"))
+                .into(),
+        );
     }
 }
 

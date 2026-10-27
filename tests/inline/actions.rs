@@ -564,10 +564,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
         switch_profile(h, &crate::profile::ProfileName::from("target"))
             .expect_err("a disabled target must be refused")
     });
-    assert_eq!(
-        err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
-    );
+    assert_eq!(err.to_string(), "'target': account is disabled");
     assert!(
         config.is_active(&crate::profile::ProfileName::from("active")),
         "active profile must be unchanged"
@@ -15063,10 +15060,7 @@ fn a_switch_refuses_a_target_a_peer_disabled_meanwhile() {
     .expect("on roster");
     let link_before = std::fs::read_link(live_credentials_path()).expect("a is linked");
     let err = switch_profile_locked(&mut stale, &b).expect_err("the switch must refuse");
-    assert_eq!(
-        err.to_string(),
-        "'b': account is disabled, run `clauth enable b`"
-    );
+    assert_eq!(err.to_string(), "'b': account is disabled");
     assert_eq!(
         std::fs::read_link(live_credentials_path()).expect("still linked"),
         link_before,

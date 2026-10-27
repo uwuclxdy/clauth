@@ -778,11 +778,7 @@ fn cmd_start(
                 // rather than silently not doing what they promise.
                 if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(raw) {
                     if follows_chain {
-                        anyhow::bail!(
-                            "--with-fallback is not available on a codex profile: codex reads \
-                             auth.json once at start, so a chain lands at the NEXT start, not \
-                             mid-session. Start without the flag"
-                        );
+                        return Err(crate::start::StartRefusal::CodexWithFallback.into());
                     }
                     // Before `--explain` too, for the reason the claude arm runs
                     // `admit` there: an explained start names what a real one
@@ -2222,14 +2218,20 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
     Ok(())
 }
 
-/// Refuse `name` as a switch/start target when it's user-disabled, naming the
-/// fix. Called by [`cmd_switch`] and [`cmd_start`] as a friendly early check,
-/// and by `start::run` — the authoritative chokepoint every session-spawn path
+/// The one disabled-account sentence every refusal renders: `clauth switch`,
+/// `POST /api/v1/switch`, `clauth start`, and the sessions route all answer it.
+pub(crate) fn disabled_account_refusal(name: &ProfileName) -> String {
+    format!("'{name}': account is disabled")
+}
+
+/// Refuse `name` as a switch/start target when it's user-disabled. Called by
+/// [`cmd_switch`] and [`cmd_start`] as a friendly early check, and by
+/// `start::run` — the authoritative chokepoint every session-spawn path
 /// (`cmd_start`, `sessions_cli::run_resume`) funnels through — so all three
 /// callers share one message instead of drifting.
 fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {
-        anyhow::bail!("'{name}': account is disabled, run `clauth enable {name}`");
+        return Err(crate::start::StartRefusal::Disabled { name: name.clone() }.into());
     }
     Ok(())
 }

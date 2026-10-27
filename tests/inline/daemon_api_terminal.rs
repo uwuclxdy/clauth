@@ -76,6 +76,7 @@ fn ctx(script: &str) -> Arc<ApiContext> {
         }),
         Arc::new(|| None),
         spawn,
+        super::super::create::unspawnable_session(),
         #[cfg(unix)]
         None,
     )
@@ -224,6 +225,7 @@ fn absent_herdr_answers_503() {
         Box::new(|_, _| HerdrProbeOut::NotInstalled),
         Arc::new(|| None),
         super::unspawnable_terminal(),
+        super::super::create::unspawnable_session(),
         #[cfg(unix)]
         None,
     );
@@ -1019,6 +1021,7 @@ fn a_forged_device_name_cannot_write_audit_lines() {
         }),
         Arc::new(|| None),
         sh_spawn(&script),
+        super::super::create::unspawnable_session(),
         #[cfg(unix)]
         None,
     );

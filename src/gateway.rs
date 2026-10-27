@@ -4081,6 +4081,9 @@ pub(crate) struct Exited {
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
     deadline: Instant,
+    /// When the child's exit was observed; the drain windows are measured from
+    /// here, not from whenever a caller happens to collect.
+    exit_at: Instant,
 }
 
 impl Exited {
@@ -4100,6 +4103,30 @@ impl Exited {
             .as_ref()
             .map(|chunks| collect_output(chunks, self.deadline))
             .unwrap_or_default()
+    }
+
+    /// The stdout that arrived within `drain` of the child's exit (or the
+    /// run's deadline, whichever is sooner), up to the limit the run was
+    /// given. A descendant holding the pipe open past the child's exit can
+    /// hold the answer only until this shorter deadline, not to the run's
+    /// bound.
+    pub(crate) fn stdout_within(&self, drain: Duration) -> Vec<u8> {
+        self.stdout
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    /// [`stdout_within`] for stderr.
+    pub(crate) fn stderr_within(&self, drain: Duration) -> Vec<u8> {
+        self.stderr
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    fn drain_deadline(&self, drain: Duration) -> Instant {
+        std::cmp::min(self.deadline, self.exit_at + drain)
     }
 }
 
@@ -4197,6 +4224,7 @@ fn run_bounded_impl(
         stdout,
         stderr,
         deadline,
+        exit_at: Instant::now(),
     }))
 }
 

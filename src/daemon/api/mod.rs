@@ -300,6 +300,7 @@ pub(crate) fn build_context(
         panes::real_probe(),
         events::production_herdr_resolver(),
         terminal::real_terminal_spawn(),
+        create::real_session_spawn(),
         bridge,
     )
 }
@@ -345,6 +346,7 @@ pub(crate) fn serve_prepared(
                 panes::real_probe(),
                 events::production_herdr_resolver(),
                 terminal::real_terminal_spawn(),
+                create::real_session_spawn(),
             )
         }
     };

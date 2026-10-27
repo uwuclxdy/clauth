@@ -1200,7 +1200,7 @@ fn a_resume_without_profiles_resolves_the_account_from_the_conversation_record()
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: solo"]);
+    assert_refusal(&result, &["'solo': account is disabled"]);
 }
 
 /// An id no record exists for cannot be attributed: the refusal names the fix,
@@ -1261,7 +1261,7 @@ fn an_explicit_profiles_wins_over_the_record_for_a_resume() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: other"]);
+    assert_refusal(&result, &["'other': account is disabled"]);
     assert!(
         !first_text(&result).contains("solo"),
         "the record's account is not consulted: {}",
@@ -1436,10 +1436,7 @@ fn background_single_disabled_target_refuses_before_reserving_a_job() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
-    );
+    assert_refusal(&result, &["'zzbg-off': account is disabled"]);
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -1530,10 +1527,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
-    );
+    assert_refusal(&result, &["'zzbg-off': account is disabled"]);
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -2262,7 +2256,7 @@ fn the_disabled_sentence_outranks_the_unfunded_one() {
         prompt: Some("hi".to_string()),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled", "clauth enable"]);
+    assert_refusal(&result, &["'broke': account is disabled"]);
     let text = first_text(&result);
     assert!(
         !text.contains("failed: cannot fund a run"),
@@ -2270,4 +2264,20 @@ fn the_disabled_sentence_outranks_the_unfunded_one() {
          name the verdict beside its figure, but the reason is not the \
          unfunded one: {text}"
     );
+}
+
+/// `args_carry_flag` stops at the first `--`: a flag after it is the child's
+/// prompt text, never an option the typed-arg shadow rule must see.
+#[test]
+fn args_carry_flag_stops_at_the_separator() {
+    let svec = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert!(args_carry_flag(&svec(&["--agent", "x"]), "--agent"));
+    assert!(args_carry_flag(&svec(&["--agent=x"]), "--agent"));
+    assert!(args_carry_flag(
+        &svec(&["--agent", "x", "--", "prompt"]),
+        "--agent"
+    ));
+    assert!(!args_carry_flag(&svec(&["--", "--agent", "x"]), "--agent"));
+    assert!(!args_carry_flag(&svec(&["--", "--agent=x"]), "--agent"));
 }

@@ -367,8 +367,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .expect_err("a custom endpoint must refuse");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     let oauth = chain_ready_config("thirdparty");
@@ -1667,8 +1666,7 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
     .expect_err("a custom endpoint must refuse under --with-fallback");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     admit(
@@ -3541,5 +3539,99 @@ fn a_default_without_member_default_stays_literal() {
             None
         ),
         ["haiku", "default"]
+    );
+}
+
+/// Every passthrough reader stops at claude's `--` separator: what follows it is
+/// claude's prompt text, never an option (a background create sends its prompt
+/// as `--bg -- <prompt>`), while the same option before the `--` still reads.
+#[test]
+fn passthrough_readers_stop_at_the_separator() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model", "opus"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model=claude-opus-4-1"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--model", "haiku", "--", "--model=opus"])).0,
+        Some("haiku".to_string())
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--bg", "--", "--agent", "x"])),
+        None
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--agent", "y", "--", "--agent=x"])),
+        Some("y".to_string())
+    );
+    assert_eq!(
+        resume_forms(&args(&["--bg", "--", "-c", "--resume", "abc"])),
+        (Vec::<&str>::new(), false)
+    );
+    assert_eq!(background_flag(&args(&["--", "--bg"])), None);
+    assert_eq!(background_flag(&args(&["--bg", "--", "x"])), Some("--bg"));
+    assert_eq!(
+        project_setting_sources(&args(&["--bg", "--", "--setting-sources", "user"])),
+        project_setting_sources(&args(&["--bg"]))
+    );
+    assert_eq!(
+        parsed_model_args(&args(&[
+            "--model",
+            "haiku",
+            "--fallback-model",
+            "sonnet",
+            "--",
+            "--model=opus",
+            "--fallback-model=x",
+        ])),
+        (
+            Some("haiku".to_string()),
+            Some("haiku".to_string()),
+            Some("sonnet".to_string())
+        )
+    );
+}
+
+/// A `--` that a value-taking flag takes as its value is that flag's value,
+/// never the separator, so the readers keep reading options past it; only a
+/// `--` in a flag position ends them. The same walk decides where
+/// `fold_settings_args` stops.
+#[test]
+fn a_separator_taken_as_a_flag_value_ends_no_reader() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        claude_option_args(&args(&["--name", "--", "--bg"])),
+        args(&["--name", "--", "--bg"]).as_slice()
+    );
+    assert_eq!(
+        background_flag(&args(&["--name", "--", "--bg"])),
+        Some("--bg")
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--name", "--", "--model", "opus"])),
+        (Some("opus".to_string()), Some("opus".to_string()), None)
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["-pn", "--", "--agent", "x"])),
+        Some("x".to_string())
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--name", "x", "--", "--bg"])),
+        args(&["--name", "x"]).as_slice()
+    );
+    assert_eq!(
+        claude_option_args(&args(&["-r", "--", "--bg"])),
+        args(&["-r"]).as_slice(),
+        "an optional value never takes a `-`-led word, so this `--` is the separator"
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--bg", "--", "--model", "opus"])),
+        args(&["--bg"]).as_slice()
     );
 }

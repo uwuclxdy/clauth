@@ -122,6 +122,44 @@ struct JobCore {
     session_id: String,
 }
 
+/// A job record reduced to its `sessionId`, read leniently: a missing,
+/// unreadable or unparseable record, or a `sessionId` that is not a Claude
+/// Code session id (a lowercase uuid, `8-4-4-4-12` hex), reads `None`.
+#[derive(Deserialize)]
+struct JobSessionRecord {
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// `~/.claude/jobs/<id>/state.json`'s `sessionId`, `None` when the record or
+/// the field is missing or unreadable, or when the id is not a Claude Code
+/// session id — a lowercase uuid (`8-4-4-4-12` hex). The value is a
+/// best-effort convenience the sessions route carries; a non-matching id is
+/// never relayed.
+pub(crate) fn job_session_id(id: &str) -> Option<String> {
+    let record = std::fs::read(
+        crate::profile::claude_dir()
+            .ok()?
+            .join("jobs")
+            .join(id)
+            .join("state.json"),
+    )
+    .ok()?;
+    serde_json::from_slice::<JobSessionRecord>(&record)
+        .ok()
+        .and_then(|record| record.session_id)
+        .filter(|sid| is_session_uuid(sid))
+}
+
+/// Whether `sid` is a Claude Code session id: 8-4-4-4-12 lowercase hex.
+fn is_session_uuid(sid: &str) -> bool {
+    sid.len() == 36
+        && sid.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
 /// Claude Code's terminal agent states. `stopped` measured on 2.1.304
 /// (`claude stop`); `done`/`failed` from `claude agents --json`'s state list,
 /// never seen in a record; any other string reads unfinished.
@@ -953,3 +991,7 @@ fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
     }
     Ok(RecordlessJobDir::Unknown)
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/claude_jobs.rs"]
+mod tests;

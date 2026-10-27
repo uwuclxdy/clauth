@@ -498,10 +498,7 @@ fn non_diverged_switch_refuses_a_disabled_target() {
         None,
     )
     .expect_err("a disabled target must be refused");
-    assert_eq!(
-        err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
-    );
+    assert_eq!(err.to_string(), "'target': account is disabled");
     assert!(
         config
             .lock()
@@ -566,10 +563,7 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
         None,
     )
     .expect_err("a disabled target must be refused");
-    assert_eq!(
-        err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
-    );
+    assert_eq!(err.to_string(), "'target': account is disabled");
     assert!(
         !called.load(std::sync::atomic::Ordering::SeqCst),
         "the refresher must never run for a disabled target"
