@@ -9061,10 +9061,6 @@ pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
 /// items the MCP login sync may touch. A row is live by the same probe the
 /// tally uses (`current_member` first, then `start_profile`); its tree must
 /// exist. Items of sessions that are not live are the orphan GC's, never this.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
-)]
 fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
     let mut out: Vec<LiveRuntime> = Vec::new();
     for row in crate::live_sessions::list() {
@@ -9098,11 +9094,29 @@ fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
     out
 }
 
+/// The live credential files the MCP login sync reads as sources (and never
+/// writes): each live session's `<runtime>/.credentials.json` and the global
+/// `~/.claude/.credentials.json`. A symlink into a store is read through; the
+/// read skips anything absent or unparseable.
+fn mcp_sync_live_files(live: &[LiveRuntime]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = live
+        .iter()
+        .map(|l| l.runtime.join(".credentials.json"))
+        .collect();
+    if let Ok(global) = crate::claude::claude_credentials_path() {
+        files.push(global);
+    }
+    files
+}
+
 /// One live session's runtime tree, with what adopting its per-session item
 /// would record: the member it is on and its session id.
 #[cfg_attr(
     not(target_os = "macos"),
-    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+    allow(
+        dead_code,
+        reason = "the adoption fields are read only by the macOS per-session item legs"
+    )
 )]
 struct LiveRuntime {
     runtime: PathBuf,
@@ -9160,7 +9174,9 @@ pub(crate) fn sync_mcp_logins_detached() {
 }
 
 /// One MCP login sync pass: collect `mcpOAuth` from every account's carrier
-/// store and, on macOS, every live session's per-session Keychain item, pick
+/// store, every live session's `.credentials.json` and the global one (read
+/// only, [`mcp_sync_live_files`]) and, on macOS, every live session's
+/// per-session Keychain item, pick
 /// each server's winner ([`crate::claude::mcp_sync_winners`]), and write it
 /// into every store and live item that holds an older, signed-out or no copy.
 /// The store legs run on every platform; the item legs are macOS-only
@@ -9171,8 +9187,13 @@ fn sync_mcp_logins_once() {
         return;
     }
     let store_paths = crate::claude::mcp_carrier_store_paths();
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut sources = crate::claude::read_mcp_carrier_stores(&store_paths);
+    // Read, never written: a live `.credentials.json` Claude Code has turned
+    // into a regular file holds a login made inside that running session, and
+    // writing it would race Claude Code's own refresh of the same file.
+    sources.extend(crate::claude::read_mcp_carrier_stores(
+        &mcp_sync_live_files(&live_session_runtime_dirs()),
+    ));
     #[cfg(target_os = "macos")]
     let items = mcp_sync_item_sources(&mut sources);
     let winners = crate::claude::mcp_sync_winners(&sources);

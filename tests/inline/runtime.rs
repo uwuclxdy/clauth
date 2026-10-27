@@ -17414,3 +17414,37 @@ fn mcp_sync_adopts_an_unowned_live_item_once() {
             .expect("stamp");
     assert!(namespaced_keychain_ledger::authorize_live_write(&other, &profile, "702-3").is_err());
 }
+
+/// The sync reads every live session's `.credentials.json` and the global one
+/// as sources: a regular file Claude Code wrote inside a running session counts.
+#[test]
+fn mcp_sync_reads_live_credential_files_as_sources() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-703-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let live = vec![LiveRuntime {
+        runtime: runtime.clone(),
+        profile: crate::profile::ProfileName::from("acct"),
+        session: "703-1".to_string(),
+        background: false,
+    }];
+    let files = mcp_sync_live_files(&live);
+    assert_eq!(files[0], runtime.join(".credentials.json"));
+    assert_eq!(
+        files.last().cloned(),
+        crate::claude::claude_credentials_path().ok()
+    );
+    fs::write(
+        runtime.join(".credentials.json"),
+        serde_json::json!({
+            "claudeAiOauth": { "accessToken": "login" },
+            "mcpOAuth": { "sentry": { "accessToken": "fresh", "expiresAt": 9 } }
+        })
+        .to_string(),
+    )
+    .expect("live file");
+    let sources = crate::claude::read_mcp_carrier_stores(&files);
+    assert_eq!(sources.len(), 1, "an absent global file is skipped");
+    let winners = crate::claude::mcp_sync_winners(&sources);
+    assert_eq!(winners["sentry"]["accessToken"], "fresh");
+}
