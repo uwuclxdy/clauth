@@ -999,12 +999,12 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, `token rejected`, `credit cap spent` or \
-`subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
-fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
-account that has its own `host` and api key, which delegates on that key. `org refused` stops no \
-delegate on its own either: the account still answers or refuses each request itself. \
-`credit cap spent` \
+can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, \
+`token rejected`, `credit cap spent` or `subscription canceled`; when `delegate` refuses an \
+account, its refusal names the state, and the fix wherever a command can fix it. `subscription \
+canceled` never means a refusal, and `login expired` does not mean one on an account that has its \
+own `host` and api key, which delegates on that key. `org refused` stops no delegate on its own \
+either: the account still answers or refuses each request itself. `credit cap spent` \
 refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none \
 named, one it cannot place, or an agent run with no model named."
     )]
@@ -4879,8 +4879,8 @@ fn delegate_families(
 /// console session that authenticates the quota gateway only. `is_third_party`
 /// scopes the check: an OAuth account has no provider.
 ///
-/// Every refusal names its fix, because the reader is a model that can run the
-/// command: an unnamed one costs a turn to look up.
+/// A refusal a command can fix names that command, because the reader is a
+/// model that can run it: an unnamed one costs a turn to look up.
 ///
 /// The quarantine gate is `config.is_auth_broken`, a pure in-memory read of
 /// `AppState::auth_broken`, and it is deliberately NOT a refresh attempt: the
