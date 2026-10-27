@@ -2335,6 +2335,13 @@ pub(crate) fn sync_mcp_into_stores(
             if !is_mcp_carrier_store(&value) {
                 return Ok(Vec::new());
             }
+            // A rotation staged beside the store: every writer of the file
+            // stands down, since a store written after the stage reads as the
+            // newer commit and the staged pair would be discarded. The next
+            // pass retries it.
+            if crate::profile::rotation_staged_beside(store) {
+                return Ok(Vec::new());
+            }
             let servers = mcp_sync_apply(&mut value, winners);
             if servers.is_empty() {
                 return Ok(servers);
