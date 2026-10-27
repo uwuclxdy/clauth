@@ -2151,6 +2151,273 @@ pub(crate) fn merge_carried_into_store(
     ))
 }
 
+/// The credential-store key holding Claude Code's MCP-server logins, one
+/// entry per server. The one key of [`CARRIED_CREDENTIAL_KEYS`].
+const MCP_OAUTH_KEY: &str = "mcpOAuth";
+
+/// Whether one MCP server login can authenticate: an object holding a
+/// non-empty `accessToken` or `refreshToken`. Claude Code leaves an entry
+/// with neither after a refresh the server refused (a signed-out entry), and
+/// that entry must never travel: it would sign every other copy out too. PURE.
+pub(crate) fn mcp_entry_usable(entry: &serde_json::Value) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return false;
+    };
+    ["accessToken", "refreshToken"].iter().any(|key| {
+        obj.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    })
+}
+
+/// The best MCP login per server across `sources` (credential stores and
+/// per-session Keychain items, each the whole JSON object): per server the
+/// usable entry that expires latest, picked by [`fresher_copy`] like every
+/// switch carry (on a tie the later source's copy); an entry that cannot
+/// authenticate never wins. A source that is not an object, an `mcpOAuth` that is
+/// not an object, and an entry that cannot authenticate contribute nothing, so
+/// a server only signed-out copies hold has no winner and nothing is written
+/// for it. PURE.
+pub(crate) fn mcp_sync_winners<'a>(
+    sources: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut winners = serde_json::Map::new();
+    for source in sources {
+        let Some(entries) = source
+            .get(MCP_OAUTH_KEY)
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (server, entry) in entries {
+            if !mcp_entry_usable(entry) {
+                continue;
+            }
+            let replace = winners
+                .get(server)
+                .is_none_or(|held| fresher_copy(held, entry) == *entry);
+            if replace {
+                winners.insert(server.clone(), entry.clone());
+            }
+        }
+    }
+    winners
+}
+
+/// Write `winners` into one target's `mcpOAuth`, returning the servers it
+/// changed (empty: nothing to write). A server's entry is replaced only when
+/// the target lacks it, holds a signed-out copy, or holds one the winner
+/// does not outlast, by [`fresher_copy`]; every other server and every other
+/// key of the target (`claudeAiOauth` among them) is left exactly as it was. A
+/// target that is not an object, or whose `mcpOAuth` is present but not an
+/// object, is not a store this can merge into and is left alone. PURE.
+pub(crate) fn mcp_sync_apply(
+    target: &mut serde_json::Value,
+    winners: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let Some(obj) = target.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut entries = match obj.get(MCP_OAUTH_KEY) {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(entries)) => entries.clone(),
+        Some(_) => return Vec::new(),
+    };
+    let mut changed = Vec::new();
+    for (server, winner) in winners {
+        let kept = match entries.get(server) {
+            Some(held) => fresher_copy(held, winner),
+            None => winner.clone(),
+        };
+        if entries.get(server) != Some(&kept) {
+            entries.insert(server.clone(), kept);
+            changed.push(server.clone());
+        }
+    }
+    if !changed.is_empty() {
+        obj.insert(
+            MCP_OAUTH_KEY.to_string(),
+            serde_json::Value::Object(entries),
+        );
+    }
+    changed
+}
+
+/// Whether a credential store file takes part in the MCP login sync: a JSON
+/// object holding a Claude login or MCP logins. Anything else (an api-key
+/// profile's leftovers, an empty object) is not a store a session reads its
+/// MCP logins from, so nothing is added to it. PURE.
+pub(crate) fn is_mcp_carrier_store(store: &serde_json::Value) -> bool {
+    store
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("claudeAiOauth") || obj.contains_key(MCP_OAUTH_KEY))
+}
+
+/// Whether the MCP login sync runs (`sync_mcp_logins` in profiles.toml,
+/// default on). Read off disk where it is used, like
+/// [`preserve_non_login_keys`]; a profiles.toml that does not load reads ON.
+pub(crate) fn sync_mcp_logins() -> bool {
+    crate::profile::load_app_state().map_or(true, |state| state.sync_mcp_logins)
+}
+
+/// The credential stores every account's sessions read their MCP logins from:
+/// each configured account's `credentials.json`, `session-token.json` and
+/// `session-token.static.json` that exists. A session's `.credentials.json`
+/// points at the first or second; the third is the mint backup a restore puts
+/// back as the second, so it travels too. Disabled accounts are included: a
+/// session can still sit on one, and a re-enable then starts with fresh logins.
+/// Whether each file is a carrier is [`is_mcp_carrier_store`]'s call, made on
+/// the bytes read under the lock. An unreadable roster yields nothing.
+pub(crate) fn mcp_carrier_store_paths() -> Vec<PathBuf> {
+    let Ok(names) = crate::profile::claude_roster_names() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in names {
+        let Ok(dir) = profile_dir(&name) else {
+            continue;
+        };
+        for file in [
+            "credentials.json",
+            "session-token.json",
+            "session-token.static.json",
+        ] {
+            let path = dir.join(file);
+            if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Read every store of `paths` that parses as a carrier
+/// ([`is_mcp_carrier_store`]), for [`mcp_sync_winners`]. A store that cannot
+/// be read or parsed contributes nothing and is skipped by the write too.
+pub(crate) fn read_mcp_carrier_stores(paths: &[PathBuf]) -> Vec<serde_json::Value> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            is_mcp_carrier_store(&value).then_some(value)
+        })
+        .collect()
+}
+
+/// Write `winners` into every carrier store of `stores`
+/// ([`mcp_sync_apply`]), each read and written under its own state-flock hold
+/// so a concurrent writer is never reverted, and written only when something
+/// changed. Returns the stores changed with their servers. A store that is
+/// absent, unreadable, not JSON or not a carrier is skipped; a failure on one
+/// is logged and the rest still run. Names only on the event line, never
+/// values.
+pub(crate) fn sync_mcp_into_stores(
+    stores: &[PathBuf],
+    winners: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(PathBuf, Vec<String>)> {
+    let mut changed = Vec::new();
+    if winners.is_empty() {
+        return changed;
+    }
+    for store in stores {
+        let outcome = crate::lock::with_state_lock(|_held| {
+            let bytes = match std::fs::read(store) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("failed to read {}", store.display())));
+                }
+            };
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("{} is not valid JSON", store.display()))?;
+            if !is_mcp_carrier_store(&value) {
+                return Ok(Vec::new());
+            }
+            // A rotation staged beside the store: every writer of the file
+            // stands down, since a store written after the stage reads as the
+            // newer commit and the staged pair would be discarded. The next
+            // pass retries it.
+            if crate::profile::rotation_staged_beside(store) {
+                return Ok(Vec::new());
+            }
+            let servers = mcp_sync_apply(&mut value, winners);
+            if servers.is_empty() {
+                return Ok(servers);
+            }
+            let out = serde_json::to_vec_pretty(&value).context("failed to serialize the store")?;
+            crate::profile::atomic_write_600(store, out)
+                .with_context(|| format!("failed to write {}", store.display()))?;
+            Ok(servers)
+        });
+        match outcome {
+            Ok(servers) if servers.is_empty() => {}
+            Ok(servers) => changed.push((store.clone(), servers)),
+            Err(e) => logline!(
+                "clauth: could not bring the MCP server logins in {} up to date: {e:#}. The \
+                 other stores were still updated",
+                store.display()
+            ),
+        }
+    }
+    changed
+}
+
+/// Fan a handed-off item's MCP logins out to every account's carrier store
+/// ([`mcp_carrier_store_paths`]), not only the incoming member's: an MCP login
+/// belongs to no Claude account, and a swap that later lands the session on
+/// another account must find the fresh login there, not a copy whose rotating
+/// refresh token was already spent. Same per-server rule as the daemon's sync
+/// ([`mcp_sync_winners`], [`mcp_sync_apply`]), so a signed-out entry never
+/// travels. Off with `sync_mcp_logins`. Never fails: the hand-off and the
+/// item delete do not wait on it.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the fan-out is pinned on every platform"
+    )
+)]
+pub(crate) fn fan_out_carried_mcp_logins(carried: &serde_json::Map<String, serde_json::Value>) {
+    if !sync_mcp_logins() {
+        return;
+    }
+    let item = serde_json::Value::Object(carried.clone());
+    let winners = mcp_sync_winners([&item]);
+    let changed = sync_mcp_into_stores(&mcp_carrier_store_paths(), &winners);
+    if let Some(line) = mcp_sync_line("a swap hand-off", &changed, &[]) {
+        logline!("{line}");
+    }
+}
+
+/// The one event line an MCP login sync pass owes, or `None` when it changed
+/// nothing. Names the servers and the targets only, never a value. PURE.
+pub(crate) fn mcp_sync_line(
+    cause: &str,
+    stores: &[(PathBuf, Vec<String>)],
+    items: &[(String, Vec<String>)],
+) -> Option<String> {
+    if stores.is_empty() && items.is_empty() {
+        return None;
+    }
+    let mut servers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut targets: Vec<String> = Vec::new();
+    for (path, names) in stores {
+        servers.extend(names.iter().map(String::as_str));
+        targets.push(path.display().to_string());
+    }
+    for (service, names) in items {
+        servers.extend(names.iter().map(String::as_str));
+        targets.push(format!("Keychain item {service}"));
+    }
+    Some(format!(
+        "clauth: synced MCP server logins ({}) after {cause} into {}",
+        servers.into_iter().collect::<Vec<_>>().join(", "),
+        targets.join(", ")
+    ))
+}
+
 /// What the refreshless swap hand-off does with the per-session item once the
 /// carry into the incoming member's store has run (or had nothing to carry).
 /// Either way the item goes: Claude Code resolves the item before any file, so
@@ -2600,6 +2867,14 @@ fn fresher_token(
         // A token is never replaced by something that is none (an emptied
         // object), which would drop a login no copy replaced.
         (true, false) => return Some(held.clone()),
+        _ => {}
+    }
+    // A signed-out copy (no access or refresh token left, what Claude Code
+    // keeps after a refresh the server refused) never replaces one that can
+    // still authenticate, and is always replaced by one, whatever the clocks.
+    match (mcp_entry_usable(held), mcp_entry_usable(source)) {
+        (true, false) => return Some(held.clone()),
+        (false, true) => return Some(source.clone()),
         _ => {}
     }
     let expiry = |value: &serde_json::Value| {

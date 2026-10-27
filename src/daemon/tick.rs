@@ -88,6 +88,10 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+        // Keep MCP server logins in step across every account's store and
+        // every live session's per-session Keychain item. Throttled and
+        // detached inside, so it never spends this tick's window.
+        crate::runtime::sync_mcp_logins_detached();
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every

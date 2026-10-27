@@ -14971,8 +14971,8 @@ fn no_item_leg_folds_in_a_carry_or_a_flock() {
         }
     }
     assert_eq!(
-        calls, 6,
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out and the seed's retry each call `owned_keychain_leg` once"
+        calls, 7,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the MCP login sync's item write each call `owned_keychain_leg` once"
     );
     assert!(
         offenders.is_empty(),
@@ -17265,5 +17265,269 @@ fn a_gc_pass_spares_a_chain_row_whose_job_lands_after_its_snapshot() {
     assert!(
         crate::live_sessions::get(sid).is_some(),
         "the job re-read spares the handed-off row"
+    );
+}
+
+// ── MCP login sync: the daemon's leg ────────────────────────────────────────
+
+/// The sync's throttle: a first pass is always due, a later one only once the
+/// interval has passed.
+#[test]
+fn mcp_sync_runs_at_most_once_per_interval() {
+    assert!(mcp_sync_due(1_000, 0), "a first pass is due");
+    assert!(!mcp_sync_due(1_000 + MCP_SYNC_INTERVAL_MS - 1, 1_000));
+    assert!(mcp_sync_due(1_000 + MCP_SYNC_INTERVAL_MS, 1_000));
+    assert!(!mcp_sync_due(500, 1_000), "a clock step back is not due");
+}
+
+/// The daemon's sync writes only items a session already owns: no row, no
+/// witness, and the ledger is left untouched either way.
+#[test]
+fn mcp_sync_authorizes_only_an_item_a_session_owns() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/ledgered/runtime-701-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+
+    assert!(
+        namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err(),
+        "an item no row names is the orphan GC's, never the sync's"
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty(),
+        "a refused authorization records nothing"
+    );
+
+    let profile = crate::profile::ProfileName::from("ledgered");
+    let session = SessionId::for_test("701-1");
+    let seeded = namespaced_keychain_ledger::authorize_write(&runtime, &profile, &session)
+        .expect("owning session's row");
+    let before = namespaced_keychain_ledger::load().expect("ledger").owners;
+    let owned = namespaced_keychain_ledger::authorize_owned_write(&runtime).expect("owned item");
+    assert_eq!(owned.service(), seeded.service());
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        before,
+        "the sync never rewrites the owning session's row"
+    );
+}
+
+/// Only a live session's own per-session tree is adoptable: the dir name must
+/// carry exactly that session's id, never the background pair, never a dir
+/// clauth did not build.
+#[test]
+fn mcp_sync_adopts_only_a_live_sessions_own_tree() {
+    let root = Path::new("/h/.clauth/profiles/acct");
+    assert!(mcp_sync_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(mcp_sync_may_adopt(
+        &root.join("runtime-isolated-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-34181-1"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        true
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        true
+    ));
+    assert!(!mcp_sync_may_adopt(
+        Path::new("/work/my-claude"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(&root.join("runtime"), "34181-0", false));
+    assert!(!mcp_sync_may_adopt(&root.join("runtime-x"), "x", false));
+}
+
+/// An unowned item of a live session's own tree is adopted: the row the seed
+/// would have written is recorded, an existing row is left as it is, a dir
+/// that is not that session's is refused with nothing recorded, and a delete
+/// in flight refuses the adoption.
+#[test]
+fn mcp_sync_adopts_an_unowned_live_item_once() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-702-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("acct");
+
+    let foreign = home.home().join("my-claude");
+    fs::create_dir_all(&foreign).expect("foreign dir");
+    assert!(namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "702-1").is_err());
+    assert!(namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-2").is_err());
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+
+    let owned = namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-1")
+        .expect("adopted");
+    let owners = namespaced_keychain_ledger::load().expect("ledger").owners;
+    assert_eq!(
+        owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile: profile.clone(),
+            session: "702-1".to_string(),
+        }]
+    );
+    // Adopted rows are what the owned path and the session's own legs see.
+    namespaced_keychain_ledger::authorize_owned_write(&runtime).expect("owned now");
+    namespaced_keychain_ledger::authorize_live_write(
+        &runtime,
+        &crate::profile::ProfileName::from("other"),
+        "702-1",
+    )
+    .expect("again");
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        owners,
+        "an existing row is left as it is"
+    );
+    let session = SessionId::for_test("702-1");
+    namespaced_keychain_ledger::authorize_write(&runtime, &profile, &session)
+        .expect("the session's own swap leg accepts the adopted row");
+
+    // A delete in flight refuses an adoption.
+    let other = home.home().join(".clauth/profiles/acct/runtime-702-3");
+    fs::create_dir_all(&other).expect("runtime dir");
+    let service =
+        crate::claude::namespaced_keychain_service(&other.canonicalize().expect("canonical"));
+    let _in_flight =
+        with_state_lock(|_held| namespaced_keychain_ledger::record_in_flight_locked(&service))
+            .expect("stamp");
+    assert!(namespaced_keychain_ledger::authorize_live_write(&other, &profile, "702-3").is_err());
+}
+
+/// The sync reads every live session's `.credentials.json` and the global one
+/// as sources: a regular file Claude Code wrote inside a running session counts.
+#[test]
+fn mcp_sync_reads_live_credential_files_as_sources() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-703-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let live = vec![LiveRuntime {
+        runtime: runtime.clone(),
+        profile: crate::profile::ProfileName::from("acct"),
+        session: "703-1".to_string(),
+        background: false,
+    }];
+    let files = mcp_sync_live_files(&live);
+    assert_eq!(files[0], runtime.join(".credentials.json"));
+    assert_eq!(
+        files.last().cloned(),
+        crate::claude::claude_credentials_path().ok()
+    );
+    fs::write(
+        runtime.join(".credentials.json"),
+        serde_json::json!({
+            "claudeAiOauth": { "accessToken": "login" },
+            "mcpOAuth": { "sentry": { "accessToken": "fresh", "expiresAt": 9 } }
+        })
+        .to_string(),
+    )
+    .expect("live file");
+    let sources = crate::claude::read_mcp_carrier_stores(&files);
+    assert_eq!(sources.len(), 1, "an absent global file is skipped");
+    let winners = crate::claude::mcp_sync_winners(&sources);
+    assert_eq!(winners["sentry"]["accessToken"], "fresh");
+}
+
+/// A login held only in a live credential file, a live session's own or the
+/// global one, reaches every account's store through one sync pass, and
+/// neither live file is ever written, not even to add a server it lacks.
+#[test]
+fn mcp_sync_pass_carries_a_live_file_login_into_every_store() {
+    let _home = HomeSandbox::new();
+    let names = ["mithra", "support"];
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        ..crate::profile::AppState::default()
+    })
+    .expect("save state");
+    let store = |name: &str| {
+        crate::profile::profile_dir(&ProfileName::from(name))
+            .expect("dir")
+            .join("credentials.json")
+    };
+    let sentry =
+        serde_json::json!({ "accessToken": "global", "refreshToken": "r", "expiresAt": 9 });
+    let github =
+        serde_json::json!({ "accessToken": "session", "refreshToken": "r", "expiresAt": 9 });
+    let linear = serde_json::json!({ "accessToken": "store", "refreshToken": "r", "expiresAt": 9 });
+    for name in names {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save profile");
+        // A server only a store holds: a pass that wrote a live file would add it.
+        let mcp = if name == "support" {
+            serde_json::json!({ "linear": linear })
+        } else {
+            serde_json::json!({})
+        };
+        fs::write(
+            store(name),
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "login" }, "mcpOAuth": mcp })
+                .to_string(),
+        )
+        .expect("store");
+    }
+    let sid = "4242-0";
+    crate::live_sessions::register(&crate::testutil::live_row(sid, "mithra")).expect("register");
+    let _marker = hold_session_row_marker(&ProfileName::from("mithra"), false, sid)
+        .expect("hold the live session's marker");
+    let [tree, _] = session_runtime_trees(&ProfileName::from("mithra"), false, sid).expect("trees");
+    fs::create_dir_all(&tree).expect("tree");
+    let session_file = tree.join(".credentials.json");
+    let session_bytes = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "login" },
+        "mcpOAuth": { "github": github }
+    })
+    .to_string();
+    fs::write(&session_file, &session_bytes).expect("session file");
+    let global = crate::claude::claude_credentials_path().expect("live path");
+    fs::create_dir_all(global.parent().expect("parent")).expect("live dir");
+    let global_bytes = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "login" },
+        "mcpOAuth": { "sentry": sentry }
+    })
+    .to_string();
+    fs::write(&global, &global_bytes).expect("global file");
+
+    sync_mcp_logins_once();
+
+    for name in names {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(store(name)).expect("read store")).expect("json");
+        assert_eq!(
+            value["mcpOAuth"],
+            serde_json::json!({ "sentry": sentry, "github": github, "linear": linear }),
+            "{name}'s store gets both live files' logins"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&session_file).expect("read session file"),
+        session_bytes,
+        "the session's live file is read, never written"
+    );
+    assert_eq!(
+        fs::read_to_string(&global).expect("read global"),
+        global_bytes,
+        "the global live file is read, never written"
     );
 }
