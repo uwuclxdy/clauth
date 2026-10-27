@@ -1535,7 +1535,15 @@ fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
     }
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, toggles(), tunables()).expect("hint"),
+        sync_mcp_logins_on_hint(cfg!(target_os = "macos"))
+    );
+    assert_eq!(
+        sync_mcp_logins_on_hint(true),
         "every account and live session gets the newest login to each MCP server"
+    );
+    assert_eq!(
+        sync_mcp_logins_on_hint(false),
+        "every account gets the newest login to each MCP server, a running session at its next switch"
     );
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, off_state, tunables()).expect("hint"),

@@ -317,7 +317,7 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "a /design-login is dropped at the next switch, and outside macOS at any relink"
         }),
         GlobalConfigRow::SyncMcpLogins => String::from(if rows.sync_mcp_logins {
-            "every account and live session gets the newest login to each MCP server"
+            sync_mcp_logins_on_hint(cfg!(target_os = "macos"))
         } else {
             "each account keeps its own MCP server logins"
         }),
@@ -1031,3 +1031,14 @@ fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> 
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_global_config.rs"]
 mod tests;
+
+/// The `sync MCP logins` row's on-hint. On macOS the sync writes a running
+/// session's per-session Keychain item; elsewhere it writes only the account
+/// stores, so a running session takes a new login at its next switch.
+pub(crate) fn sync_mcp_logins_on_hint(macos: bool) -> &'static str {
+    if macos {
+        "every account and live session gets the newest login to each MCP server"
+    } else {
+        "every account gets the newest login to each MCP server, a running session at its next switch"
+    }
+}
