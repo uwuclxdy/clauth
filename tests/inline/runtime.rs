@@ -17233,8 +17233,8 @@ fn no_item_leg_folds_in_a_carry_or_a_flock() {
         }
     }
     assert_eq!(
-        calls, 6,
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out and the seed's retry each call `owned_keychain_leg` once"
+        calls, 7,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the copied-bearer re-point each call `owned_keychain_leg` once"
     );
     assert!(
         offenders.is_empty(),
@@ -20274,4 +20274,111 @@ fn the_mirror_never_copies_a_chain_another_store_holds() {
         Some("rt-B"),
         "b's login flows back over the session file"
     );
+}
+
+// ── copied rolling bearers: who gets re-pointed ─────────────────────────────
+
+/// Adoption reaches a session's own per-session tree and, for a background
+/// row, the account's shared `runtime-bg` tree; never another session's tree,
+/// a malformed id or a directory clauth did not build.
+#[test]
+fn session_item_adoption_is_limited_to_a_live_sessions_own_tree() {
+    let root = Path::new("/h/.clauth/profiles/acct");
+    assert!(session_item_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(session_item_may_adopt(
+        &root.join("runtime-isolated-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-34181-1"),
+        "34181-0",
+        false
+    ));
+    assert!(session_item_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        true
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        true
+    ));
+    assert!(!session_item_may_adopt(
+        Path::new("/work/my-claude"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(&root.join("runtime-bg"), "x", true));
+}
+
+/// Only sessions on the stamped member are candidates.
+#[test]
+fn a_stamp_concerns_only_its_members_sessions() {
+    let live = |p: &str, sid: &str| LiveRuntime {
+        runtime: PathBuf::from(format!("/h/{p}/runtime-{sid}")),
+        profile: crate::profile::ProfileName::from(p),
+        session: sid.to_string(),
+        background: false,
+    };
+    let all = vec![live("a", "1-0"), live("b", "2-0"), live("a", "3-0")];
+    let on_a = sessions_on_member(all, &crate::profile::ProfileName::from("a"));
+    assert_eq!(
+        on_a.iter().map(|l| l.session.as_str()).collect::<Vec<_>>(),
+        vec!["1-0", "3-0"]
+    );
+}
+
+/// An item no row names is adopted with the background flag the row carries:
+/// a background row's `runtime-bg` is accepted, a per-session id on it is not.
+#[test]
+fn a_background_sessions_item_is_adopted_on_its_own_tree() {
+    let home = HomeSandbox::new();
+    let tree = home.home().join(".clauth/profiles/acct/runtime-bg");
+    fs::create_dir_all(&tree).expect("tree");
+    let profile = crate::profile::ProfileName::from("acct");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", false).is_err()
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+    let owned = namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", true)
+        .expect("adopted");
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile,
+            session: "704-1".to_string(),
+        }]
+    );
+    namespaced_keychain_ledger::authorize_owned_write(&tree).expect("owned now");
+}
+
+/// An item the ledger does not name refuses the owned witness.
+#[test]
+fn the_owned_witness_needs_a_row() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-705-1");
+    fs::create_dir_all(&runtime).expect("runtime");
+    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
 }
