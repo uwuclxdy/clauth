@@ -7840,3 +7840,157 @@ fn an_owner_lookup_that_cannot_start_names_what_failed() {
         "could not start the macOS Keychain owner lookup: Resource temporarily unavailable"
     );
 }
+
+// ── copied rolling bearers ──────────────────────────────────────────────────
+
+fn rolled(access: &str, expires_at: i64) -> serde_json::Value {
+    serde_json::json!({ "claudeAiOauth": {
+        "accessToken": access,
+        "expiresAt": expires_at,
+        "scopes": ["user:inference", "user:profile"],
+        "subscriptionType": "max"
+    }})
+}
+
+fn item_with(access: &str) -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": { "accessToken": access, "expiresAt": 5, "subscriptionType": "max" },
+        "mcpOAuth": { "sentry": { "accessToken": "mcp", "expiresAt": 9 } }
+    })
+}
+
+#[test]
+fn a_stamp_revokes_only_a_rolling_bearer_it_replaces() {
+    let token =
+        |access: &str, sub: Option<&str>, refresh: Option<&str>| crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: Some(5),
+            scopes: Some(vec![
+                "user:inference".into(),
+                "user:sessions:claude_code".into(),
+            ]),
+            subscription_type: sub.map(str::to_string),
+            ..crate::profile::OAuthToken::default_extra()
+        };
+    assert_eq!(
+        revoked_by_stamp(Some(&token("old", Some("max"), None)), "new"),
+        Some("old".to_string())
+    );
+    assert_eq!(
+        revoked_by_stamp(Some(&token("new", Some("max"), None)), "new"),
+        None
+    );
+    assert_eq!(
+        revoked_by_stamp(Some(&token("mint", None, None)), "new"),
+        None,
+        "a mint"
+    );
+    assert_eq!(
+        revoked_by_stamp(Some(&token("old", Some("max"), Some("r"))), "new"),
+        None,
+        "a mis-fill"
+    );
+    assert_eq!(revoked_by_stamp(None, "new"), None, "the arming stamp");
+}
+
+#[test]
+fn a_copied_bearer_is_repointed_only_when_it_is_the_revoked_one() {
+    let now = 1_000;
+    let live = rolled("new", now + 60_000);
+    let mut item = item_with("old");
+    assert!(copied_bearer_repoint(&item, "old", &live, now, false));
+    assert!(repoint_copied_bearer(&mut item, "old", &live, now, false));
+    assert_eq!(item["claudeAiOauth"], live["claudeAiOauth"]);
+    assert_eq!(
+        item["mcpOAuth"]["sentry"]["accessToken"], "mcp",
+        "other keys kept"
+    );
+    assert!(
+        !repoint_copied_bearer(&mut item, "old", &live, now, false),
+        "then caught up"
+    );
+
+    // A static mint on a member later flipped to rolling: not the revoked bearer.
+    let mint = serde_json::json!({ "claudeAiOauth": {
+        "accessToken": "mint", "expiresAt": 9,
+        "scopes": ["user:inference", "user:sessions:claude_code"] } });
+    assert!(!copied_bearer_repoint(&mint, "old", &live, now, false));
+    // Another account's bearer (a row whose member lags the item): not this one.
+    assert!(!copied_bearer_repoint(
+        &item_with("other-account"),
+        "old",
+        &live,
+        now,
+        false
+    ));
+    // A real login, and `refreshToken: ""`, which classifies as a mis-fill.
+    for refresh in ["r", ""] {
+        let login = serde_json::json!({ "claudeAiOauth": {
+            "accessToken": "old", "refreshToken": refresh, "expiresAt": 5 } });
+        assert!(
+            !copied_bearer_repoint(&login, "old", &live, now, false),
+            "{refresh:?}"
+        );
+    }
+    // A sidecar behind its own chain holds a bearer the rotation revoked too.
+    assert!(!copied_bearer_repoint(
+        &item_with("old"),
+        "old",
+        &live,
+        now,
+        true
+    ));
+    // A dead sidecar, a mint sidecar, one still on the revoked bearer.
+    assert!(!copied_bearer_repoint(
+        &item_with("old"),
+        "old",
+        &rolled("new", now),
+        now,
+        false
+    ));
+    assert!(!copied_bearer_repoint(
+        &item_with("old"),
+        "old",
+        &mint,
+        now,
+        false
+    ));
+    assert!(!copied_bearer_repoint(
+        &item_with("old"),
+        "old",
+        &rolled("old", now + 60_000),
+        now,
+        false
+    ));
+    // Nothing revoked.
+    assert!(!copied_bearer_repoint(
+        &item_with(""),
+        "",
+        &live,
+        now,
+        false
+    ));
+    // Garbage on either side.
+    for garbage in [
+        serde_json::json!("torn"),
+        serde_json::json!(null),
+        serde_json::json!({}),
+        serde_json::json!({ "claudeAiOauth": "torn" }),
+    ] {
+        assert!(
+            !copied_bearer_repoint(&garbage, "old", &live, now, false),
+            "{garbage}"
+        );
+        assert!(!copied_bearer_repoint(
+            &item_with("old"),
+            "old",
+            &garbage,
+            now,
+            false
+        ));
+        let mut copy = garbage.clone();
+        assert!(!repoint_copied_bearer(&mut copy, "old", &live, now, false));
+        assert_eq!(copy, garbage);
+    }
+}
