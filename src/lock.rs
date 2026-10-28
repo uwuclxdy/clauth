@@ -240,6 +240,18 @@ pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
 /// the daemon's tick shares between flock waits and keychain shell-outs.
 /// `None` when no budget is armed (an unscoped acquisition has yet to arm its
 /// own).
+/// Whether this thread holds the state flock right now (any depth).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn state_lock_held() -> bool {
+    DEPTH.get() > 0
+}
+
 pub(crate) fn armed_budget_remaining() -> Option<Duration> {
     HOLD_DEADLINE
         .get()

@@ -2702,6 +2702,83 @@ pub(crate) mod namespaced_keychain_ledger {
         Ok(OwnedKeychainWrite { service })
     }
 
+    /// Mint the write witness for a per-session item ANOTHER process owns:
+    /// only when the ledger already holds a row for the item `runtime`
+    /// derives, and no sweep's delete of it is in flight, checked in one
+    /// state-lock hold. The row is left exactly as it is: the writer works
+    /// beside the owning session, it never takes the item over, and an item
+    /// nobody owns is the orphan GC's, never this.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the only caller is the macOS copied-bearer re-point"
+        )
+    )]
+    pub(crate) fn authorize_owned_write(runtime: &Path) -> Result<OwnedKeychainWrite> {
+        let service = crate::claude::namespaced_keychain_service(
+            &crate::canonical::identity(runtime).with_context(|| {
+                format!("failed to canonicalize config dir: {}", runtime.display())
+            })?,
+        );
+        with_state_lock(|_held| {
+            refuse_while_in_flight_locked(&service)?;
+            anyhow::ensure!(
+                load()?.owners.iter().any(|owner| owner.service == service),
+                "no ownership row names the per-session Keychain item `{service}`"
+            );
+            Ok(())
+        })?;
+        Ok(OwnedKeychainWrite { service })
+    }
+
+    /// [`authorize_owned_write`] for an item no row names yet: Claude Code
+    /// created it itself in a live session's own runtime tree. ADOPTS it by
+    /// recording the `(service, profile, session)` row the session's seed
+    /// would have, so the orphan GC collects it like any seeded item once the
+    /// tree goes, and the session's own swap legs ([`authorize_write`]) take
+    /// the row over unchanged. A row that exists by now is left as it is.
+    /// Refused unless [`super::session_item_may_adopt`] holds, and while a
+    /// delete is in flight.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the only caller is the macOS copied-bearer re-point"
+        )
+    )]
+    pub(crate) fn authorize_live_write(
+        runtime: &Path,
+        profile: &ProfileName,
+        session: &str,
+        background: bool,
+    ) -> Result<OwnedKeychainWrite> {
+        anyhow::ensure!(
+            super::session_item_may_adopt(runtime, session, background),
+            "{} is not live session {session}'s own runtime tree",
+            runtime.display()
+        );
+        let service = crate::claude::namespaced_keychain_service(
+            &crate::canonical::identity(runtime).with_context(|| {
+                format!("failed to canonicalize config dir: {}", runtime.display())
+            })?,
+        );
+        with_state_lock(|_held| {
+            refuse_while_in_flight_locked(&service)?;
+            let mut owners = load()?;
+            if !owners.owners.iter().any(|owner| owner.service == service) {
+                owners.owners.push(Owner {
+                    service: service.clone(),
+                    profile: profile.clone(),
+                    session: session.to_string(),
+                });
+                save(&owners)?;
+            }
+            Ok(())
+        })?;
+        Ok(OwnedKeychainWrite { service })
+    }
+
     /// Proof that a namespaced Keychain write is durably owned: minted only by
     /// [`authorize_write`] AFTER the `(service, profile, session)` row persisted
     /// under the state flock, and the field is private to this module so nothing
@@ -10381,6 +10458,290 @@ fn owned_keychain_leg<T>(
     );
     let owned = authorize()?;
     crate::lock::with_keychain_budget(budget, || leg(&owned))
+}
+
+/// One live session's runtime tree, with what adopting its per-session item
+/// would record: the member it is on and its session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) struct LiveRuntime {
+    pub(crate) runtime: PathBuf,
+    pub(crate) profile: ProfileName,
+    pub(crate) session: String,
+    pub(crate) background: bool,
+}
+
+/// The runtime trees of every live `clauth start` session (and background
+/// pair) of the Claude harness: the config dirs whose per-session Keychain
+/// items a daemon-side writer may touch. A row is live by the same probe the
+/// tally uses (`current_member` first, then `start_profile`), which is also
+/// the member recorded; its tree must exist. Items of sessions that are not
+/// live are the orphan GC's, never this.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
+    let mut out: Vec<LiveRuntime> = Vec::new();
+    for row in crate::live_sessions::list() {
+        if row.harness != crate::harness::Harness::Claude || !is_session_id(&row.session_id) {
+            continue;
+        }
+        let member = row.current_member.as_deref().unwrap_or(&row.start_profile);
+        let probe = ProfileName::from(member);
+        if !session_row_is_live(&probe, row.isolated, &row.session_id) {
+            continue;
+        }
+        let start = ProfileName::from(row.start_profile.as_str());
+        let tree = if row.background {
+            background_runtime_tree(&start).ok()
+        } else {
+            session_runtime_trees(&start, row.isolated, &row.session_id)
+                .ok()
+                .and_then(|trees| trees.into_iter().find(|tree| tree.is_dir()))
+        };
+        if let Some(tree) = tree.filter(|tree| tree.is_dir())
+            && !out.iter().any(|live| live.runtime == tree)
+        {
+            out.push(LiveRuntime {
+                runtime: tree,
+                profile: probe,
+                session: row.session_id.clone(),
+                background: row.background,
+            });
+        }
+    }
+    out
+}
+
+/// Whether a daemon-side writer may adopt the unowned per-session item of
+/// `runtime`: a per-session tree whose dir name carries exactly the live
+/// session's id `sid`, or, for a background row, the account's fixed
+/// `runtime-bg` tree, which every job on that account shares and which the
+/// orphan GC collects like any tree. Anything else, a foreign
+/// `CLAUDE_CONFIG_DIR` among them (#81), is never adopted. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn session_item_may_adopt(runtime: &Path, sid: &str, background: bool) -> bool {
+    let name = runtime.file_name().and_then(|n| n.to_str());
+    if !is_session_id(sid) {
+        return false;
+    }
+    if background {
+        return name.is_some_and(|n| n == background_dir_names().0);
+    }
+    name.and_then(sid_of_runtime_dir_name)
+        .is_some_and(|own| own == sid)
+}
+
+/// The live sessions a stamp of `member`'s sidecar concerns: those whose
+/// member is `member`. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn sessions_on_member(live: Vec<LiveRuntime>, member: &ProfileName) -> Vec<LiveRuntime> {
+    live.into_iter().filter(|l| &l.profile == member).collect()
+}
+
+/// Rolling bearers a stamp revoked, waiting for [`repoint_copied_bearers`]:
+/// `(member, revoked bearer)`. A process-wide queue, so a stamp made inside a
+/// state-flock hold or an armed subprocess budget is re-pointed by the next
+/// drain that runs outside both. Per thread under test, so sibling tests do
+/// not see each other's stamps.
+#[cfg(not(test))]
+static REVOKED_BEARERS: std::sync::Mutex<Vec<(ProfileName, String)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+thread_local! {
+    static REVOKED_BEARERS: std::cell::RefCell<Vec<(ProfileName, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_revoked_bearers<R>(f: impl FnOnce(&mut Vec<(ProfileName, String)>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        let mut queue = REVOKED_BEARERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut queue)
+    }
+    #[cfg(test)]
+    {
+        REVOKED_BEARERS.with(|q| f(&mut q.borrow_mut()))
+    }
+}
+
+/// Record that a stamp of `member`'s sidecar revoked `revoked`
+/// ([`crate::claude::revoked_by_stamp`]). Only macOS keeps per-session items,
+/// so elsewhere nothing is queued outside tests.
+pub(crate) fn note_revoked_rolling_bearer(member: &ProfileName, revoked: String) {
+    if !(cfg!(target_os = "macos") || cfg!(test)) {
+        return;
+    }
+    with_revoked_bearers(|q| {
+        if !q.iter().any(|(m, r)| m == member && *r == revoked) {
+            q.push((member.clone(), revoked));
+        }
+    });
+}
+
+/// Take the queued `(member, revoked bearer)` pairs. For the drain and tests.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn take_revoked_bearers() -> Vec<(ProfileName, String)> {
+    with_revoked_bearers(std::mem::take)
+}
+
+/// How long one drain may spend on Keychain legs, across every session.
+/// Sessions it does not reach are queued again for the next drain.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only reader is the macOS copied-bearer re-point"
+    )
+)]
+const REPOINT_DRAIN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Re-point the per-session Keychain items that hold a copy of a rolling
+/// bearer a stamp just revoked (see `wiki/Auto-Switch.md`). Called right
+/// after the stamp's callers release their locks: a drain inside a state-flock
+/// hold or an armed subprocess budget does nothing and leaves the queue for
+/// the next one, so no Keychain leg ever runs under either. macOS only; a
+/// no-op elsewhere and under `cfg(test)`, where `keychain::enabled()` is
+/// false.
+pub(crate) fn repoint_copied_bearers() {
+    #[cfg(target_os = "macos")]
+    {
+        if !crate::keychain::enabled()
+            || crate::lock::state_lock_held()
+            || crate::lock::armed_budget_remaining().is_some()
+        {
+            return;
+        }
+        let queued = take_revoked_bearers();
+        if queued.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + REPOINT_DRAIN_BUDGET;
+        let live = live_session_runtime_dirs();
+        for (member, revoked) in queued {
+            let targets = sessions_on_member(live.clone(), &member);
+            if !repoint_member_sessions(&member, &revoked, targets, deadline) {
+                note_revoked_rolling_bearer(&member, revoked);
+            }
+        }
+    }
+}
+
+/// [`repoint_copied_bearers`] on a detached thread, for the daemon's run
+/// loop: only when something is queued, and never two at once.
+pub(crate) fn repoint_copied_bearers_detached() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if cfg!(test) || with_revoked_bearers(|q| q.is_empty()) || IN_FLIGHT.swap(true, O::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("clauth-bearer-repoint".into())
+        .spawn(|| {
+            repoint_copied_bearers();
+            IN_FLIGHT.store(false, O::Release);
+        });
+    if spawned.is_err() {
+        IN_FLIGHT.store(false, O::Release);
+    }
+}
+
+/// macOS: re-point each of `targets`' items holding `revoked`, returning
+/// `false` when the drain's deadline cut it short (the caller queues the pair
+/// again; the sessions already re-pointed then read as caught up).
+#[cfg(target_os = "macos")]
+fn repoint_member_sessions(
+    member: &ProfileName,
+    revoked: &str,
+    targets: Vec<LiveRuntime>,
+    deadline: Instant,
+) -> bool {
+    let Ok(sidecar) = crate::profile::profile_dir(member).map(|d| d.join("session-token.json"))
+    else {
+        return true;
+    };
+    let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
+    for live in targets {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let Ok(service) = crate::keychain::keychain_service_for_config_dir(&live.runtime) else {
+            continue;
+        };
+        let is_owned = owned.contains(&service);
+        if !is_owned && !session_item_may_adopt(&live.runtime, &live.session, live.background) {
+            continue;
+        }
+        let outcome = owned_keychain_leg(
+            KEYCHAIN_MIRROR_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+            || {
+                if is_owned {
+                    namespaced_keychain_ledger::authorize_owned_write(&live.runtime)
+                } else {
+                    namespaced_keychain_ledger::authorize_live_write(
+                        &live.runtime,
+                        &live.profile,
+                        &live.session,
+                        live.background,
+                    )
+                }
+            },
+            |owned| {
+                crate::keychain::repoint_config_dir_item_bearer(
+                    &live.runtime,
+                    owned,
+                    revoked,
+                    &sidecar,
+                    member,
+                )
+            },
+        );
+        match outcome {
+            Ok(true) => logline!(
+                "clauth: session {} held a copy of '{member}' rolling bearer that its last \
+                 re-stamp replaced; its per-session Keychain item now holds the current one",
+                live.session
+            ),
+            Ok(false) => {}
+            Err(e) if crate::keychain::failed_on_locked_keychain(&e) => {}
+            Err(e) => logline!(
+                "clauth: could not re-point session {}'s per-session Keychain item at \
+                 '{member}' current rolling bearer: {e:#}",
+                live.session
+            ),
+        }
+    }
+    true
 }
 
 /// Which Keychain arm a session start takes, derived from the install source
