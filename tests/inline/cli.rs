@@ -4047,6 +4047,63 @@ mod armed_report_copy {
         );
         assert!(w.contains("read-only file system"), "{w}");
         assert!(w.contains("`clauth static-token acme` to clear it"), "{w}");
+        assert_eq!(
+            w,
+            "clauth: warning: could not roll the rolling-token flag back for 'acme' \
+             (read-only file system). Once ~/.clauth is writable, run \
+             `clauth static-token acme` to clear it"
+        );
+    }
+
+    /// A rollback the writer refused over a line it cannot read names that
+    /// line and says to fix it, never "once ~/.clauth is writable": the
+    /// directory is writable, the file's shape is what stopped the save.
+    #[test]
+    fn the_stranded_rollback_warning_names_a_refused_line() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let profile = crate::profile::Profile::new("acme".to_string(), None, None);
+        let dir = crate::profile::profile_dir(&profile.name).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "env = \"x\"\n").unwrap();
+        let save_err = crate::profile::save_profile_config(&profile).expect_err("refused");
+        assert_eq!(
+            rollback_stranded_warning("acme", &save_err),
+            "clauth: warning: could not roll the rolling-token flag back for 'acme': \
+             config.toml has `env` in a shape clauth cannot read. Fix or remove that \
+             line, then run `clauth static-token acme` to clear it"
+        );
+    }
+
+    /// A rollback the writer refused because `config.toml` is not TOML names
+    /// the parse position and says to fix it, never "once ~/.clauth is
+    /// writable".
+    #[test]
+    fn the_stranded_rollback_warning_names_a_parse_position() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let profile = crate::profile::Profile::new("acme".to_string(), None, None);
+        let dir = crate::profile::profile_dir(&profile.name).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "# notes\nfallback_threshold = 9 0\n",
+        )
+        .unwrap();
+        let load_err = crate::profile::load_profile(&profile.name).expect_err("the load refuses");
+        let position = load_err
+            .to_string()
+            .strip_prefix("failed to parse acme/config.toml at ")
+            .map(str::to_string)
+            .expect("the load names a position");
+        assert!(position.starts_with("line 2, column "), "{position}");
+        let save_err = crate::profile::save_profile_config(&profile).expect_err("refused");
+        assert_eq!(
+            rollback_stranded_warning("acme", &save_err),
+            format!(
+                "clauth: warning: could not roll the rolling-token flag back for 'acme': \
+                 config.toml does not parse ({position}). Fix that line, then run \
+                 `clauth static-token acme` to clear it"
+            )
+        );
     }
 }
 

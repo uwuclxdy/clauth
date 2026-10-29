@@ -2526,6 +2526,8 @@ fn a_stale_entry_is_not_fetched_until_the_token_list_is_rebuilt() {
 
     // Repair `b`'s config: the next reload succeeds and rebuilds the token list
     // with `a`'s NEW credential, which matches the snapshot half.
+    // A save refuses a file that is not TOML, so the repair removes it first.
+    std::fs::remove_file(&b_cfg).expect("remove the broken file");
     save_profile(&blank_profile(&b)).expect("repair b");
     daemon.reload_if_changed();
     crate::usage::tick(&state);

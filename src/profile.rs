@@ -4552,6 +4552,40 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
     (profile, config_path, raw_config)
 }
 
+/// The canonical typed [`ProfileConfig`] for a loaded [`Profile`] — what the
+/// save writer persists and what the load's drift comparison compares against.
+/// One construction, so the two paths cannot drift.
+fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
+    ProfileConfig {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        auto_start: profile.auto_start,
+        usage_probe: profile.usage_probe,
+        usage_probe_interval_ms: (profile.usage_probe_interval_ms
+            != DEFAULT_USAGE_PROBE_INTERVAL_MS)
+            .then_some(profile.usage_probe_interval_ms),
+        env: profile.env.clone(),
+        models: profile.models.clone(),
+        effort: profile.effort.clone(),
+        fallback_threshold: profile.fallback_threshold,
+        weekly_threshold: profile.weekly_threshold,
+        last_resort: profile.last_resort,
+        preferred: profile.preferred,
+        preferred_days: render_preferred_days(&profile.preferred_days),
+        rolling_token: profile.rolling_token,
+        max_auto_spend: profile.max_auto_spend,
+        // Default-on booleans render as commented examples when on, so the
+        // canonical form is `None` (unset) — an explicit `= true` on disk
+        // normalizes away on the next rewrite.
+        check_weekly: (!profile.check_weekly).then_some(false),
+        check_scoped: (!profile.check_scoped).then_some(false),
+        check_credit_cap: (!profile.check_credit_cap).then_some(false),
+        bell_threshold: profile.bell_threshold,
+        disabled: profile.disabled,
+        console: console_config(profile.console.as_ref()),
+    }
+}
+
 /// Rewrite config.toml only when the canonical render of the loaded profile does
 /// not parse back to it. The parsed comparison never reads the raw file: a hand
 /// edit that parses stays on disk as written until the next save, so the TUI's
@@ -4560,37 +4594,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
 fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
     let rendered = render_config_toml(profile);
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
-        Ok(canonical) => {
-            let on_disk = ProfileConfig {
-                base_url: profile.base_url.clone(),
-                api_key: profile.api_key.clone(),
-                auto_start: profile.auto_start,
-                usage_probe: profile.usage_probe,
-                usage_probe_interval_ms: (profile.usage_probe_interval_ms
-                    != DEFAULT_USAGE_PROBE_INTERVAL_MS)
-                    .then_some(profile.usage_probe_interval_ms),
-                env: profile.env.clone(),
-                models: profile.models.clone(),
-                effort: profile.effort.clone(),
-                fallback_threshold: profile.fallback_threshold,
-                weekly_threshold: profile.weekly_threshold,
-                last_resort: profile.last_resort,
-                preferred: profile.preferred,
-                preferred_days: render_preferred_days(&profile.preferred_days),
-                rolling_token: profile.rolling_token,
-                max_auto_spend: profile.max_auto_spend,
-                // Default-on booleans render as commented examples when on, so
-                // the canonical form is `None` (unset) — an explicit `= true`
-                // on disk normalizes away on the next rewrite.
-                check_weekly: (!profile.check_weekly).then_some(false),
-                check_scoped: (!profile.check_scoped).then_some(false),
-                check_credit_cap: (!profile.check_credit_cap).then_some(false),
-                bell_threshold: profile.bell_threshold,
-                disabled: profile.disabled,
-                console: console_config(profile.console.as_ref()),
-            };
-            canonical != on_disk
-        }
+        Ok(canonical) => canonical != canonical_profile_config(profile),
         Err(_) => raw_config != rendered,
     };
     if needs_rewrite {
@@ -4907,6 +4911,83 @@ pub(crate) fn update_profile_config<T>(
     })
 }
 
+/// A save over a modelled key whose on-disk shape the writer does not edit: an
+/// inline table, a dotted or implicit table, a multi-line string, a multi-line
+/// array, a value of the wrong type, a table where a value belongs or a value
+/// where a table belongs, or the `kick_timer` alias beside `auto_start`.
+/// Nothing is written; the key is named and the file is left byte for byte. A
+/// distinct type so a caller can `downcast_ref` the refusal instead of matching
+/// its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigEditRefusal {
+    profile: String,
+    key: String,
+}
+
+impl ConfigEditRefusal {
+    fn new(profile: &str, key: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    /// The key whose on-disk shape stopped the save, for a caller wording its
+    /// own message around it.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Display for ConfigEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: config.toml has `{}` in a shape clauth cannot read; fix or remove that line, then try again",
+            self.profile, self.key
+        )
+    }
+}
+
+impl std::error::Error for ConfigEditRefusal {}
+
+/// A save refused because `config.toml` does not parse as TOML. Its `Display`
+/// is the load's own `failed to parse <profile>/config.toml at line L, column
+/// C` text byte for byte; the position rides on the type so a caller can name
+/// it without matching the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigParseRefusal {
+    message: String,
+    position: Option<crate::format::ParsePosition>,
+}
+
+impl ConfigParseRefusal {
+    fn new(profile: &str, raw: &str) -> Self {
+        let label = format!("{profile}/config.toml");
+        let position = on_disk_profile_config(raw)
+            .err()
+            .and_then(|e| crate::format::toml_parse_position(raw, &e));
+        let message = match crate::format::parse_position(position) {
+            Some(pos) => format!("failed to parse {label} at {pos}"),
+            None => format!("failed to parse {label}"),
+        };
+        Self { message, position }
+    }
+
+    /// The parse position the load named, for a caller wording its own message.
+    pub(crate) fn position(&self) -> Option<crate::format::ParsePosition> {
+        self.position
+    }
+}
+
+impl std::fmt::Display for ConfigParseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigParseRefusal {}
+
 /// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
     let id = profile_id_at(&profile_config_path(&profile.name)?);
@@ -4926,11 +5007,54 @@ fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
 fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
     let rendered = with_profile_id(render_config_toml(profile), id);
-    atomic_write_600(
-        &config_path,
-        preserving_config_render(&rendered, &config_path),
-    )
-    .context("failed to write config.toml")
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return atomic_write_600(&config_path, rendered).context("failed to write config.toml");
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}/config.toml", profile.name));
+        }
+    };
+    let lf = raw.replace("\r\n", "\n");
+    let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
+        // A file that is not TOML refuses with the load's own parse error: the
+        // user's bytes are never replaced by the template, and the position
+        // rides on a typed error the rollback warning names without matching
+        // text.
+        return Err(ConfigParseRefusal::new(profile.name.as_str(), &raw).into());
+    };
+    let on_disk = on_disk_profile_config(&raw);
+    let canonical = canonical_profile_config(profile);
+    if let Some(key) = non_plain_edit(&doc, on_disk.as_ref().ok(), &canonical) {
+        return Err(ConfigEditRefusal::new(profile.name.as_str(), key).into());
+    }
+    let on_disk = match on_disk {
+        Ok(on_disk) => on_disk,
+        // A typed-parse failure no key's shape explains refuses as the load
+        // does, so the edit step only ever runs over a file that parsed.
+        Err(e) => {
+            return Err(crate::format::parse_error(
+                format!("{}/config.toml", profile.name),
+                crate::format::toml_parse_position(&raw, &e),
+            ));
+        }
+    };
+    apply_config_edits(&mut doc, &on_disk, &canonical);
+    if let Some(id) = id
+        && doc.get("id").and_then(|v| v.as_str()) != Some(id.0.as_str())
+    {
+        doc["id"] = toml_edit::value(id.0.clone());
+    }
+    let mut out = doc.to_string();
+    if raw.contains("\r\n") {
+        // toml_edit normalizes line endings to `\n` on parse; a CRLF file stays
+        // CRLF through the save, inserted lines included. A multi-line string's
+        // own `\r\n` survives the parse, so normalize first, then expand, or the
+        // blanket replace writes a bare `\r` the file no longer parses.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    atomic_write_600(&config_path, out).context("failed to write config.toml")
 }
 
 /// `rendered` with `id = "…"` as its first key, under the header comment.
@@ -5370,6 +5494,248 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
         .collect()
 }
 
+/// Every modelled top-level scalar key, read by the completeness test and
+/// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
+/// added to the model without a doc block and example fails a test.
+#[cfg(test)]
+const MODELLED_SCALARS: [&str; 15] = [
+    "base_url",
+    "api_key",
+    "auto_start",
+    "fallback_threshold",
+    "weekly_threshold",
+    "last_resort",
+    "preferred",
+    "preferred_days",
+    "rolling_token",
+    "max_auto_spend",
+    "check_weekly",
+    "check_scoped",
+    "check_credit_cap",
+    "bell_threshold",
+    "disabled",
+];
+
+/// The template shape of one modelled top-level scalar key: the comment block
+/// `render_config_toml` emits above it and the commented example line it emits
+/// when the key is unset. The doc text is pushed through `out.push_str("# …")`
+/// lines so the in-place writer and the render share one source and the glyph
+/// test's exemption keeps covering the config-template prose.
+#[rustfmt::skip]
+fn push_scalar_doc(out: &mut String, key: &str) {
+    match key {
+        "base_url" => {
+            out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
+            out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
+        }
+        "api_key" => {
+            out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+        }
+        "auto_start" => {
+            out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
+            out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
+            out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+            out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+        }
+        "fallback_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth will auto-switch\n",
+            );
+            out.push_str("# off this profile, provided the profile is also a member of the\n");
+            out.push_str(
+                "# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n",
+            );
+        }
+        "weekly_threshold" => {
+            out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
+            out.push_str(
+                "# Config tab's `weekly limit`, default 98). Governs when auto-switching\n",
+            );
+            out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
+            out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+        }
+        "last_resort" => {
+            out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
+            out.push_str(
+                "# auto-switch walk lands here with no other member having headroom, it\n",
+            );
+            out.push_str("# parks instead of turning off all accounts. Independent of\n");
+            out.push_str("# fallback_threshold, this profile still switches away at its own\n");
+            out.push_str("# threshold whenever another chain member has headroom.\n");
+        }
+        "preferred" => {
+            out.push_str(
+                "# Marks this profile as the fallback chain's preferred (home) account.\n",
+            );
+            out.push_str(
+                "# At most one member is preferred; the toggle is a radio. Once live work\n",
+            );
+            out.push_str(
+                "# has drifted off it and it reads clear and fresh again, the daemon walks\n",
+            );
+            out.push_str("# the active account — and every following session — back to it. Mutually\n");
+            out.push_str("# exclusive with last_resort.\n");
+        }
+        "preferred_days" => {
+            out.push_str(
+                "# Weekdays this account is the home account, in local time. Empty (the\n",
+            );
+            out.push_str(
+                "# default) leaves `preferred` above in charge every day. A non-empty list\n",
+            );
+            out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
+            out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
+            out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
+            out.push_str(
+                "# serve claim: a list on a removed, disabled or auth-broken account is\n",
+            );
+            out.push_str(
+                "# inert. Full names and three-letter forms both parse, and an entry that\n",
+            );
+            out.push_str("# does not is dropped on the next rewrite.\n");
+        }
+        "rolling_token" => {
+            out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
+            out.push_str("# chain's current access token on every rotation (plan-gated models\n");
+            out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
+            out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+        }
+        "max_auto_spend" => {
+            out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
+            out.push_str(
+                "# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n",
+            );
+            out.push_str(
+                "# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n",
+            );
+            out.push_str("# default) never spends. The chain stops using this account once its\n");
+            out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
+            out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
+            out.push_str("# per `switch_off_when_budget_spent`.\n");
+        }
+        "check_weekly" => {
+            out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
+            out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
+            out.push_str(
+                "# rotation across the soft weekly band; the 100% hard cap always blocks.\n",
+            );
+        }
+        "check_scoped" => {
+            out.push_str(
+                "# Whether auto-switching checks this account's per-model weekly windows\n",
+            );
+            out.push_str(
+                "# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n",
+            );
+            out.push_str("# and keep this account in rotation for use with other models.\n");
+        }
+        "check_credit_cap" => {
+            out.push_str(
+                "# Whether auto-switching keeps off this account while its usage-credit cap\n",
+            );
+            out.push_str(
+                "# is spent (Claude Code then refuses credit-billed models such as Fable).\n",
+            );
+            out.push_str("# Set false to keep it in rotation for other models.\n");
+        }
+        "bell_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n",
+            );
+            out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
+        }
+        "disabled" => {
+            out.push_str(
+                "# Disable this account: it becomes invisible to the fallback chain, the\n",
+            );
+            out.push_str(
+                "# usage/rotation scheduler, and the daemon status feed (by default), while\n",
+            );
+            out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+        }
+        _ => unreachable!("no doc block for modelled scalar {key}"),
+    }
+}
+
+fn scalar_example(key: &str) -> &'static str {
+    match key {
+        "base_url" => "# base_url = \"https://api.anthropic.com\"\n",
+        "api_key" => "# api_key = \"sk-ant-...\"\n",
+        "auto_start" => "# auto_start = true\n",
+        "fallback_threshold" => "# fallback_threshold = 95.0\n",
+        "weekly_threshold" => "# weekly_threshold = 98.0\n",
+        "last_resort" => "# last_resort = true\n",
+        "preferred" => "# preferred = true\n",
+        "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n",
+        "rolling_token" => "# rolling_token = true\n",
+        "max_auto_spend" => "# max_auto_spend = 5.0\n",
+        "check_weekly" => "# check_weekly = false\n",
+        "check_scoped" => "# check_scoped = false\n",
+        "check_credit_cap" => "# check_credit_cap = false\n",
+        "bell_threshold" => "# bell_threshold = 95.0\n",
+        "disabled" => "# disabled = true\n",
+        _ => unreachable!("no example for modelled scalar {key}"),
+    }
+}
+
+fn scalar_doc(key: &str) -> String {
+    let mut out = String::new();
+    push_scalar_doc(&mut out, key);
+    out
+}
+
+#[rustfmt::skip]
+fn push_console_doc(out: &mut String) {
+    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
+    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
+    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
+    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
+    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
+    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
+    out.push_str("# site: domestic | international.\n");
+}
+
+fn console_doc() -> String {
+    let mut out = String::new();
+    push_console_doc(&mut out);
+    out
+}
+
+const CONSOLE_EXAMPLE: &str =
+    "# [console]\n# token = \"...\"\n# site = \"international\"\n# region = \"ap-southeast-1\"\n";
+
+#[rustfmt::skip]
+fn push_models_doc(out: &mut String) {
+    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
+    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
+    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
+    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+}
+
+fn models_doc() -> String {
+    let mut out = String::new();
+    push_models_doc(&mut out);
+    out
+}
+
+const MODELS_EXAMPLE: &str = "# [models]\n# default = \"opusplan\"\n";
+
+#[rustfmt::skip]
+fn push_env_doc(out: &mut String) {
+    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
+    out.push_str("# this profile is active. A switch to another profile removes each one,\n");
+    out.push_str("# or puts back the value ~/.claude/settings.json held before it.\n");
+}
+
+fn env_doc() -> String {
+    let mut out = String::new();
+    push_env_doc(&mut out);
+    out
+}
+
+const ENV_EXAMPLE: &str = "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n";
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
@@ -5378,30 +5744,25 @@ fn render_config_toml(profile: &Profile) -> String {
 
     let mut out = String::from("# clauth profile configuration\n\n");
 
-    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
-    out.push_str("# (Pro / Max / Ultra / Team / Enterprise) profile.\n");
+    push_scalar_doc(&mut out, "base_url");
     match profile.base_url.as_deref() {
         Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
-        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
+        None => out.push_str(scalar_example("base_url")),
     }
     out.push('\n');
 
-    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+    push_scalar_doc(&mut out, "api_key");
     match profile.api_key.as_deref() {
         Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
-        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
+        None => out.push_str(scalar_example("api_key")),
     }
     out.push('\n');
 
-    out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
-    out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
-    out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
-    out.push_str("# A plan with no 5-hour limit gets no ping.\n");
-    out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+    push_scalar_doc(&mut out, "auto_start");
     if profile.auto_start {
         out.push_str("auto_start = true\n");
     } else {
-        out.push_str("# auto_start = true\n");
+        out.push_str(scalar_example("auto_start"));
     }
     out.push('\n');
 
@@ -5433,59 +5794,39 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
-    out.push_str("# off this profile, provided the profile is also a member of the\n");
-    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "fallback_threshold");
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
-        None => out.push_str("# fallback_threshold = 95.0\n"),
+        None => out.push_str(scalar_example("fallback_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
-    out.push_str("# Config tab's `weekly limit`, default 98). Governs when auto-switching\n");
-    out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
-    out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "weekly_threshold");
     match profile.weekly_threshold {
         Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
-        None => out.push_str("# weekly_threshold = 98.0\n"),
+        None => out.push_str(scalar_example("weekly_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
-    out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
-    out.push_str("# parks instead of turning off all accounts. Independent of\n");
-    out.push_str("# fallback_threshold, this profile still switches away at its own\n");
-    out.push_str("# threshold whenever another chain member has headroom.\n");
+    push_scalar_doc(&mut out, "last_resort");
     if profile.last_resort {
         out.push_str("last_resort = true\n");
     } else {
-        out.push_str("# last_resort = true\n");
+        out.push_str(scalar_example("last_resort"));
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's preferred (home) account.\n");
-    out.push_str("# At most one member is preferred; the toggle is a radio. Once live work\n");
-    out.push_str("# has drifted off it and it reads clear and fresh again, the daemon walks\n");
-    out.push_str("# the active account — and every following session — back to it. Mutually\n");
-    out.push_str("# exclusive with last_resort.\n");
+    push_scalar_doc(&mut out, "preferred");
     if profile.preferred {
         out.push_str("preferred = true\n");
     } else {
-        out.push_str("# preferred = true\n");
+        out.push_str(scalar_example("preferred"));
     }
     out.push('\n');
 
-    out.push_str("# Weekdays this account is the home account, in local time. Empty (the\n");
-    out.push_str("# default) leaves `preferred` above in charge every day. A non-empty list\n");
-    out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
-    out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
-    out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
-    out.push_str("# serve claim: a list on a removed, disabled or auth-broken account is\n");
-    out.push_str("# inert. Full names and three-letter forms both parse, and an entry that\n");
-    out.push_str("# does not is dropped on the next rewrite.\n");
+    push_scalar_doc(&mut out, "preferred_days");
     if profile.preferred_days.is_empty() {
-        out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
+        out.push_str(scalar_example("preferred_days"));
     } else {
         out.push_str("preferred_days = [");
         for (i, day) in render_preferred_days(&profile.preferred_days)
@@ -5503,74 +5844,57 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
-    out.push_str("# chain's current access token on every rotation (plan-gated models\n");
-    out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
-    out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+    push_scalar_doc(&mut out, "rolling_token");
     if profile.rolling_token {
         out.push_str("rolling_token = true\n");
     } else {
-        out.push_str("# rolling_token = true\n");
+        out.push_str(scalar_example("rolling_token"));
     }
     out.push('\n');
 
-    out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
-    out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
-    out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
-    out.push_str("# default) never spends. The chain stops using this account once its\n");
-    out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
-    out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
-    out.push_str("# per `switch_off_when_budget_spent`.\n");
+    push_scalar_doc(&mut out, "max_auto_spend");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
-        None => out.push_str("# max_auto_spend = 5.0\n"),
+        None => out.push_str(scalar_example("max_auto_spend")),
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
-    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
-    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
+    push_scalar_doc(&mut out, "check_weekly");
     if profile.check_weekly {
-        out.push_str("# check_weekly = false\n");
+        out.push_str(scalar_example("check_weekly"));
     } else {
         out.push_str("check_weekly = false\n");
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
-    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
-    out.push_str("# and keep this account in rotation for use with other models.\n");
+    push_scalar_doc(&mut out, "check_scoped");
     if profile.check_scoped {
-        out.push_str("# check_scoped = false\n");
+        out.push_str(scalar_example("check_scoped"));
     } else {
         out.push_str("check_scoped = false\n");
     }
     out.push('\n');
-    out.push_str("# Whether auto-switching keeps off this account while its usage-credit cap\n");
-    out.push_str("# is spent (Claude Code then refuses credit-billed models such as Fable).\n");
-    out.push_str("# Set false to keep it in rotation for other models.\n");
+
+    push_scalar_doc(&mut out, "check_credit_cap");
     if profile.check_credit_cap {
-        out.push_str("# check_credit_cap = false\n");
+        out.push_str(scalar_example("check_credit_cap"));
     } else {
         out.push_str("check_credit_cap = false\n");
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n");
-    out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "bell_threshold");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
-        None => out.push_str("# bell_threshold = 95.0\n"),
+        None => out.push_str(scalar_example("bell_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Disable this account: it becomes invisible to the fallback chain, the\n");
-    out.push_str("# usage/rotation scheduler, and the daemon status feed (by default), while\n");
-    out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+    push_scalar_doc(&mut out, "disabled");
     if profile.disabled {
         out.push_str("disabled = true\n");
     } else {
-        out.push_str("# disabled = true\n");
+        out.push_str(scalar_example("disabled"));
     }
     out.push('\n');
 
@@ -5586,13 +5910,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     // Tables last: every key after a `[table]` header belongs to that table, so
     // this block and the two below must follow every scalar key above.
-    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
-    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
-    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
-    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
-    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
-    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
-    out.push_str("# site: domestic | international.\n");
+    push_console_doc(&mut out);
     match profile.console.as_ref() {
         Some(c) => {
             out.push_str("[console]\n");
@@ -5600,21 +5918,11 @@ fn render_config_toml(profile: &Profile) -> String {
             out.push_str(&format!("site = {}\n", toml_str(c.site.as_str())));
             out.push_str(&format!("region = {}\n", toml_str(&c.region)));
         }
-        None => {
-            out.push_str("# [console]\n");
-            out.push_str("# token = \"...\"\n");
-            out.push_str("# site = \"international\"\n");
-            out.push_str("# region = \"ap-southeast-1\"\n");
-        }
+        None => out.push_str(CONSOLE_EXAMPLE),
     }
     out.push('\n');
 
-    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
-    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
-    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
-    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
-    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n");
-    out.push_str("# server-side advisor model (the `advisorModel` setting).\n");
+    push_models_doc(&mut out);
     let m = &profile.models;
     let scalars = [
         ("default", &m.default),
@@ -5626,8 +5934,7 @@ fn render_config_toml(profile: &Profile) -> String {
         ("advisor", &m.advisor),
     ];
     if scalars.iter().all(|(_, v)| v.is_none()) {
-        out.push_str("# [models]\n");
-        out.push_str("# default = \"opusplan\"\n");
+        out.push_str(MODELS_EXAMPLE);
     } else {
         out.push_str("[models]\n");
         for (k, v) in scalars {
@@ -5638,12 +5945,9 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
-    out.push_str("# this profile is active. A switch to another profile removes each one,\n");
-    out.push_str("# or puts back the value ~/.claude/settings.json held before it.\n");
+    push_env_doc(&mut out);
     if profile.env.is_empty() {
-        out.push_str("# [env]\n");
-        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
+        out.push_str(ENV_EXAMPLE);
     } else {
         out.push_str("[env]\n");
         for (k, v) in &profile.env {
@@ -5659,6 +5963,1125 @@ fn render_config_toml(profile: &Profile) -> String {
     }
 
     out
+}
+
+/// The site where a template example (or doc block) sits in a parsed document.
+enum ExampleSite {
+    /// The document's trailing comments, after the last table.
+    Trailing,
+    /// The leading comment of a root key (a scalar, or a table's header key).
+    KeyPrefix(String),
+    /// The leading comment above a root `[table]` header.
+    TablePrefix(String),
+}
+
+/// The byte offset of `example` where it sits directly under one of the key's
+/// doc blocks, the block starting a line of its own: only the example under a
+/// doc block clauth wrote for that key is the key's, so a lookalike line, or
+/// one under a doc block whose first line was edited, never matches.
+fn find_example_line(hay: &str, example: &str, doc_blocks: &[String]) -> Option<usize> {
+    hay.match_indices(example)
+        .map(|(i, _)| i)
+        .find(|&i| ends_with_any_doc_block(&hay[..i], doc_blocks))
+}
+
+/// Whether `text` ends with `doc_block` at the start of a line: the doc block
+/// must start the text or sit right after a `\n`, so a comment whose first
+/// line was prefixed (a longer line ending in the block's text) never matches.
+fn ends_with_doc_block(text: &str, doc_block: &str) -> bool {
+    text.strip_suffix(doc_block)
+        .is_some_and(|above| above.is_empty() || above.ends_with('\n'))
+}
+
+/// Whether `text` ends with any doc block clauth wrote for a key, each matched
+/// at the start of a line.
+fn ends_with_any_doc_block(text: &str, doc_blocks: &[String]) -> bool {
+    doc_blocks
+        .iter()
+        .any(|doc_block| ends_with_doc_block(text, doc_block))
+}
+
+/// The em dash older `config.toml` doc text used. Spelled as a char literal so
+/// the CLI's ASCII-only guard (which skips `'\u{...}'`) reads this source as
+/// ASCII while the generated comment keeps the typographic dash.
+const EM_DASH: char = '\u{2014}';
+
+/// Every `config.toml` doc block clauth has written for `key`, current first.
+/// A file last saved before a doc rewording carries the older block; it is
+/// still the key's own, so its example toggles in place. Set and unset both
+/// match against this list.
+fn known_doc_blocks(key: &str) -> Vec<String> {
+    let mut docs = vec![doc_block_for(key)];
+    match key {
+        // ce69b154 reworded the alert copy (90205d2d wrote the older block).
+        "bell_threshold" => docs.push(
+            "# 5-hour utilization percentage at/above which clauth fires a bell\n\
+             # notification in the overview tab. Range 0..=100.\n"
+                .to_string(),
+        ),
+        // d5ea42d5 added the fable tier to the alias list (5ab01076 wrote the
+        // three-model form).
+        "models" => docs.push(
+            "# Per-account Claude Code model configuration, written into this profile's\n\
+             # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+             # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n\
+             # those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n\
+             # subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                .to_string(),
+        ),
+        // 027afde6 renamed the wrap-off flag; 3076ec9b made the spend line a
+        // stop-using cap; 5f840f3c wrote the original stop-at-90% text.
+        "max_auto_spend" => {
+            docs.push(format!(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops using this account once its\n\
+                 # spend reaches 90% of this or of the account's own cap, whichever is\n\
+                 # lower {EM_DASH} parking on a `last_resort` member if the chain has one, else\n\
+                 # per `budget_wrap_off`.\n"
+            ));
+            docs.push(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops at 90% of this or the account's\n\
+                 # own cap, whichever is lower.\n"
+                    .to_string(),
+            );
+        }
+        // 300cc6bf turned the em-dash after fallback_threshold into a comma
+        // (d6b5bfa2 wrote the em-dash form).
+        "last_resort" => docs.push(format!(
+            "# Marks this profile as the fallback chain's last resort. Once the\n\
+             # auto-switch walk lands here with no other member having headroom, it\n\
+             # parks instead of turning off all accounts. Independent of\n\
+             # fallback_threshold {EM_DASH} this profile still switches away at its own\n\
+             # threshold whenever another chain member has headroom.\n"
+        )),
+        // 09a1dd3c reworded the switch-away clause (673a9be4 wrote the older
+        // block).
+        "env" => docs.push(
+            "# Extra env vars merged into ~/.claude/settings.json's env block while\n\
+             # this profile is active. Cleared on switch to another profile.\n"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    docs
+}
+
+fn doc_block_for(key: &str) -> String {
+    match key {
+        "console" => console_doc(),
+        "models" => models_doc(),
+        "env" => env_doc(),
+        k => scalar_doc(k),
+    }
+}
+
+/// The single search the in-place writer uses: root items in file order first,
+/// the document trailing last, matching only the example line that sits
+/// directly under a doc block clauth wrote for the key. Any other copy is the
+/// user's prose, never a site.
+fn locate_example(
+    doc: &toml_edit::DocumentMut,
+    example: &str,
+    doc_blocks: &[String],
+) -> Option<(ExampleSite, String, String)> {
+    let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+    for k in &keys {
+        let (key_prefix, table_prefix) = {
+            let Some((key_handle, item)) = doc.get_key_value(k) else {
+                continue;
+            };
+            let kp = key_handle
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            let tp = item
+                .as_table()
+                .and_then(|t| t.decor().prefix())
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            (kp, tp)
+        };
+        if let Some(p) = &key_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::KeyPrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+        if let Some(p) = &table_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::TablePrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+    }
+    let t = doc.trailing().as_str()?;
+    let i = find_example_line(t, example, doc_blocks)?;
+    Some((
+        ExampleSite::Trailing,
+        t[..i].to_string(),
+        t[i + example.len()..].to_string(),
+    ))
+}
+
+fn find_example(doc: &toml_edit::DocumentMut, example: &str, doc_blocks: &[String]) -> bool {
+    locate_example(doc, example, doc_blocks).is_some()
+}
+
+fn set_value_preserving_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+    value: toml_edit::Value,
+) {
+    let Some(item) = table.get_mut(key) else {
+        return;
+    };
+    let Some(old) = item.as_value() else { return };
+    let decor = old.decor().clone();
+    let mut v = value;
+    *v.decor_mut() = decor;
+    *item = toml_edit::Item::Value(v);
+}
+
+fn insert_root_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    doc.as_table_mut()
+        .insert_formatted(&k, toml_edit::Item::Value(value));
+}
+
+fn insert_root_value_before(
+    doc: &mut toml_edit::DocumentMut,
+    before_key: &str,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let table = doc.as_table_mut();
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+    let Some(pos) = keys.iter().position(|k| k == before_key) else {
+        let mut k = toml_edit::Key::new(key);
+        if let Some(p) = leaf_prefix {
+            k.leaf_decor_mut().set_prefix(p);
+        }
+        table.insert_formatted(&k, toml_edit::Item::Value(value));
+        return;
+    };
+    let mut tail: Vec<(toml_edit::Key, toml_edit::Item)> = Vec::new();
+    for k in &keys[pos..] {
+        if let Some(e) = table.remove_entry(k) {
+            tail.push(e);
+        }
+    }
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    table.insert_formatted(&k, toml_edit::Item::Value(value));
+    for (k, item) in tail {
+        table.insert_formatted(&k, item);
+    }
+}
+
+/// An appended root table goes after the document's trailing comments, never
+/// before them: the trailing text moves onto the table's header prefix so a
+/// root-level trailing comment stays above the new header instead of landing
+/// inside the table's body.
+fn append_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let tail = take_trailing_lines(doc);
+    insert_root_table(doc, key, build, (!tail.is_empty()).then_some(tail), None);
+}
+
+/// An appended root scalar goes at the end of its section, never above the
+/// document's trailing comments: with no header in the document, the trailing
+/// text moves onto the key's prefix so a root-level trailing comment stays
+/// above the new key; with a header, the root section ends before the first
+/// one and the trailing text belongs to the last table, so nothing moves.
+fn append_root_value(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    let tail = if doc.iter().any(|(_, item)| opens_a_header(item)) {
+        String::new()
+    } else {
+        take_trailing_lines(doc)
+    };
+    insert_root_value(doc, key, value, (!tail.is_empty()).then_some(tail));
+}
+
+/// Whether a root item opens a `[table]` or `[[array]]` header line; a table
+/// written as dotted keys (`env.A = "b"`) sits among the root keys and opens
+/// none.
+fn opens_a_header(item: &toml_edit::Item) -> bool {
+    item.is_array_of_tables() || item.as_table().is_some_and(|t| !t.is_dotted())
+}
+
+/// The document's trailing text, taken off the document as whole lines: a last
+/// comment with no final newline gets one, so an item placed after it never
+/// lands inside that comment.
+fn take_trailing_lines(doc: &mut toml_edit::DocumentMut) -> String {
+    let mut tail = doc.trailing().as_str().unwrap_or("").to_string();
+    doc.set_trailing("");
+    if !tail.is_empty() && !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    tail
+}
+
+fn insert_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+    header_prefix: Option<String>,
+    position: Option<isize>,
+) {
+    let mut t = toml_edit::Table::new();
+    build(&mut t);
+    if let Some(p) = header_prefix {
+        t.decor_mut().set_prefix(p);
+    }
+    t.set_position(position);
+    doc.insert(key, toml_edit::Item::Table(t));
+}
+
+fn replace_example_with_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    example: &str,
+) {
+    // A root key opens before the first table header: an example after any
+    // header (a later table's prefix, or the trailing text after a table)
+    // cannot become a key where it sits.
+    let first_header = doc
+        .iter()
+        .find(|(_, item)| opens_a_header(item))
+        .map(|(k, _)| k.to_string());
+    let site =
+        locate_example(doc, example, &known_doc_blocks(key)).filter(|(site, _, _)| match site {
+            ExampleSite::KeyPrefix(_) => true,
+            ExampleSite::TablePrefix(k) => first_header.as_deref() == Some(k.as_str()),
+            ExampleSite::Trailing => first_header.is_none(),
+        });
+    let Some((site, before, after)) = site else {
+        append_root_value(doc, key, value);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_value(doc, key, value, Some(before));
+        }
+        ExampleSite::KeyPrefix(k) => {
+            if let Some(mut km) = doc.as_table_mut().key_mut(&k) {
+                km.leaf_decor_mut().set_prefix(after);
+            }
+            insert_root_value_before(doc, &k, key, value, Some(before));
+        }
+        ExampleSite::TablePrefix(k) => {
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_value(doc, key, value, Some(before));
+        }
+    }
+}
+
+fn replace_example_with_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let Some((site, before, after)) = locate_example(doc, example, &known_doc_blocks(key)) else {
+        append_root_table(doc, key, build);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_table(doc, key, build, Some(before), None);
+        }
+        ExampleSite::KeyPrefix(_) => {
+            // The example block sits in a root scalar's prefix: a table cannot
+            // open above a root key, so the block stays as written and the
+            // table appends after the last table.
+            append_root_table(doc, key, build);
+        }
+        ExampleSite::TablePrefix(k) => {
+            let position = doc
+                .get(&k)
+                .and_then(toml_edit::Item::as_table)
+                .and_then(toml_edit::Table::position);
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_table(doc, key, build, Some(before), position.map(|p| p - 1));
+        }
+    }
+}
+
+/// The comment on the same line as `item`'s value or header, trimmed and kept
+/// as its own comment line; empty when there is none. A comment is a comment
+/// whether it trails a value or a table header, so an unset keeps it.
+fn same_line_comment(item: &toml_edit::Item) -> String {
+    let suffix = match item {
+        toml_edit::Item::Value(v) => v.decor().suffix(),
+        toml_edit::Item::Table(t) => t.decor().suffix(),
+        toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => None,
+    };
+    suffix
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with('#'))
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default()
+}
+
+fn remove_key_keeping_comments(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    doc_blocks: &[String],
+    example: &str,
+) {
+    let (lead, same_line) = {
+        let table = doc.as_table();
+        let Some((k, item)) = table.get_key_value(key) else {
+            return;
+        };
+        let lead = if let Some(t) = item.as_table() {
+            let lead = t
+                .decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            // A table appended by the writer carries toml_edit's default `\n`
+            // separator as its prefix; dropping the table must drop that blank
+            // line too, or the set-then-unset cycle leaves it behind.
+            if lead.trim().is_empty() {
+                String::new()
+            } else {
+                lead
+            }
+        } else {
+            k.leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (lead, same_line_comment(item))
+    };
+    let next = {
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    if ends_with_any_doc_block(&kept, doc_blocks) {
+        kept.push_str(example);
+    }
+    kept.push_str(&same_line);
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_dotted())
+    {
+        prepend_to_first_leaf(t, prefix);
+        return;
+    }
+    if doc.get(key).is_some_and(|i| i.as_table().is_some()) {
+        if let Some(tm) = doc.get_mut(key).and_then(|i| i.as_table_mut()) {
+            let existing = tm
+                .decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            tm.decor_mut().set_prefix(format!("{prefix}{existing}"));
+        }
+    } else if let Some(mut km) = doc.as_table_mut().key_mut(key) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+/// A dotted line (`env.A = "b"`) renders the prefix of its first leaf key,
+/// never its table's own decor, so a comment moved onto it goes there.
+fn prepend_to_first_leaf(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t.iter().next().map(|(k, _)| k.to_string()) else {
+        return;
+    };
+    if let Some(inner) = t
+        .get_mut(&first)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|inner| inner.is_dotted())
+    {
+        prepend_to_first_leaf(inner, prefix);
+        return;
+    }
+    if let Some(mut km) = t.key_mut(&first) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+fn remove_subkey_keeping_comments(doc: &mut toml_edit::DocumentMut, table_key: &str, subkey: &str) {
+    let lead = {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let Some((k, item)) = t.get_key_value(subkey) else {
+            return;
+        };
+        let mut lead = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        lead.push_str(&same_line_comment(item));
+        lead
+    };
+    let next_sub = {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let keys: Vec<String> = t.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == subkey)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    };
+    {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        t.remove(subkey);
+    }
+    if let Some(ns) = next_sub {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        if let Some(inner) = t
+            .get_mut(&ns)
+            .and_then(toml_edit::Item::as_table_mut)
+            .filter(|inner| inner.is_dotted())
+        {
+            prepend_to_first_leaf(inner, &lead);
+        } else if let Some(mut km) = t.key_mut(&ns) {
+            let existing = km
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            km.leaf_decor_mut().set_prefix(format!("{lead}{existing}"));
+        }
+    } else {
+        let root_keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        if let Some(pos) = root_keys.iter().position(|k| k == table_key)
+            && let Some(next_root) = root_keys.get(pos + 1)
+        {
+            prepend_prefix(doc, next_root, &lead);
+        } else {
+            let t = doc.trailing().as_str().unwrap_or("").to_string();
+            doc.set_trailing(format!("{lead}{t}"));
+        }
+    }
+}
+
+fn set_subkey_string_in_table(t: &mut dyn toml_edit::TableLike, key: &str, value: &str) {
+    let v = toml_edit::Value::from(value.to_string());
+    if t.contains_key(key) {
+        set_value_preserving_decor(t, key, v);
+    } else {
+        t.insert(key, toml_edit::Item::Value(v));
+    }
+}
+
+fn set_subkey_string(doc: &mut toml_edit::DocumentMut, table_key: &str, key: &str, value: &str) {
+    let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+        return;
+    };
+    set_subkey_string_in_table(t, key, value);
+}
+
+fn set_scalar(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    if doc.contains_key(key) {
+        set_value_preserving_decor(doc.as_table_mut(), key, value);
+        return;
+    }
+    let example = scalar_example(key);
+    replace_example_with_value(doc, key, value, example);
+}
+
+fn unset_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if !doc.contains_key(key) {
+        return;
+    }
+    let example = scalar_example(key);
+    remove_key_keeping_comments(doc, key, &known_doc_blocks(key), example);
+}
+
+fn set_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    if doc.contains_key(key) {
+        if let Some(t) = doc.get_mut(key).and_then(|i| i.as_table_like_mut()) {
+            build(t);
+        }
+    } else if find_example(doc, example, &known_doc_blocks(key)) {
+        replace_example_with_table(doc, key, example, build);
+    } else {
+        append_root_table(doc, key, build);
+    }
+}
+
+/// Remove every modelled subkey through the keep-the-comments removal, then
+/// drop the table only once it holds no key at all (an unknown subkey keeps
+/// it). The header's trailing comment and every comment inside stay, as lines,
+/// where the table was.
+fn unset_table(doc: &mut toml_edit::DocumentMut, key: &str, subkeys: &[&str], example: &str) {
+    for subkey in subkeys {
+        remove_subkey_keeping_comments(doc, key, subkey);
+    }
+    if doc
+        .get(key)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(toml_edit::TableLike::is_empty)
+    {
+        remove_key_keeping_comments(doc, key, &known_doc_blocks(key), example);
+    }
+}
+
+fn preferred_days_value(days: &[String]) -> toml_edit::Value {
+    let mut arr = toml_edit::Array::new();
+    for d in days {
+        arr.push(d.clone());
+    }
+    toml_edit::Value::from(arr)
+}
+
+const MODELS_FIELDS: [&str; 6] = ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+
+fn models_fields(m: &ModelSettings) -> [(&'static str, Option<&String>); 6] {
+    MODELS_FIELDS.map(|k| (k, m.field(k)))
+}
+
+fn build_models_table(t: &mut dyn toml_edit::TableLike, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        if let Some(v) = v {
+            set_subkey_string_in_table(t, k, v);
+        }
+    }
+}
+
+fn edit_models_existing(doc: &mut toml_edit::DocumentMut, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        match v {
+            Some(v) => set_subkey_string(doc, "models", k, v),
+            None => remove_subkey_keeping_comments(doc, "models", k),
+        }
+    }
+}
+
+fn edit_string_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: &Option<String>,
+    ca: &Option<String>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v.clone())),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_f64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<f64>, ca: Option<f64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_bool_scalar(doc: &mut toml_edit::DocumentMut, od: bool, ca: bool, key: &str) {
+    if od == ca {
+        return;
+    }
+    if ca {
+        set_scalar(doc, key, toml_edit::Value::from(true));
+    } else {
+        unset_scalar(doc, key);
+    }
+}
+
+fn edit_opt_bool_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<bool>,
+    ca: Option<bool>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(_) => set_scalar(doc, key, toml_edit::Value::from(false)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+const CONSOLE_FIELDS: [&str; 3] = ["token", "site", "region"];
+
+fn edit_console(doc: &mut toml_edit::DocumentMut, od: &ConsoleConfig, ca: &ConsoleConfig) {
+    if od == ca {
+        return;
+    }
+    if ca.token.is_some() || ca.site.is_some() || ca.region.is_some() {
+        if doc.contains_key("console") {
+            for (k, v) in [
+                ("token", ca.token.as_deref()),
+                ("site", ca.site.as_deref()),
+                ("region", ca.region.as_deref()),
+            ] {
+                if let Some(v) = v {
+                    set_subkey_string(doc, "console", k, v);
+                }
+            }
+        } else {
+            set_table(doc, "console", CONSOLE_EXAMPLE, |t| {
+                for (k, v) in [
+                    ("token", ca.token.as_deref()),
+                    ("site", ca.site.as_deref()),
+                    ("region", ca.region.as_deref()),
+                ] {
+                    if let Some(v) = v {
+                        set_subkey_string_in_table(t, k, v);
+                    }
+                }
+            });
+        }
+    } else {
+        unset_table(doc, "console", &CONSOLE_FIELDS, CONSOLE_EXAMPLE);
+    }
+}
+
+fn edit_models(doc: &mut toml_edit::DocumentMut, od: &ModelSettings, ca: &ModelSettings) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        unset_table(doc, "models", &MODELS_FIELDS, MODELS_EXAMPLE);
+    } else if doc.contains_key("models") {
+        edit_models_existing(doc, ca);
+    } else {
+        set_table(doc, "models", MODELS_EXAMPLE, |t| build_models_table(t, ca));
+    }
+}
+
+fn edit_env(
+    doc: &mut toml_edit::DocumentMut,
+    od: &BTreeMap<String, String>,
+    ca: &BTreeMap<String, String>,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        let keys: Vec<&str> = od.keys().map(String::as_str).collect();
+        unset_table(doc, "env", &keys, ENV_EXAMPLE);
+    } else if doc.contains_key("env") {
+        for k in od.keys() {
+            if !ca.contains_key(k) {
+                remove_subkey_keeping_comments(doc, "env", k);
+            }
+        }
+        for (k, v) in ca {
+            set_subkey_string(doc, "env", k, v);
+        }
+    } else {
+        set_table(doc, "env", ENV_EXAMPLE, |t| {
+            for (k, v) in ca {
+                set_subkey_string_in_table(t, k, v);
+            }
+        });
+    }
+}
+
+/// The on-disk config typed whole: `Ok` when the file parses into
+/// [`ProfileConfig`], `Err` when it holds a modelled key clauth cannot read
+/// (a wrong type, or the `kick_timer` alias beside `auto_start`, which serde
+/// counts as one field). An `Err` file still reaches the shape check, which
+/// then refuses on the first unreadable key and never runs the
+/// non-plain/`edited` comparison over a defaulted view; one the shape check
+/// cannot attribute to a key refuses with the load's own parse error.
+fn on_disk_profile_config(raw: &str) -> Result<ProfileConfig, toml::de::Error> {
+    toml::from_str::<ProfileConfig>(raw)
+}
+
+/// What a modelled key's on-disk shape means for the save writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyShape {
+    /// Plain: the writer edits it in place (a one-line scalar of the right
+    /// type, or a block table whose modelled subkeys are one-line strings).
+    Plain,
+    /// Readable but not plain: an inline table, a dotted or implicit table, a
+    /// multi-line string, or a multi-line array. The save refuses only when it
+    /// would edit this key.
+    NonPlain,
+    /// Clauth cannot read the key into its field type (the wrong kind or
+    /// type). The save refuses whenever this key sits in the file.
+    Unreadable,
+}
+
+/// The scalar type a modelled scalar field reads from TOML.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    Str,
+    F64,
+    Bool,
+    OptBool,
+    StrArray,
+}
+
+/// The modelled scalar a top-level key names, with its read type; the
+/// `kick_timer` alias reads as the bool `auto_start` does.
+fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
+    Some(match key {
+        "base_url" => (ScalarKind::Str, "base_url"),
+        "api_key" => (ScalarKind::Str, "api_key"),
+        "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
+        "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
+        "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
+        "bell_threshold" => (ScalarKind::F64, "bell_threshold"),
+        "auto_start" => (ScalarKind::Bool, "auto_start"),
+        "kick_timer" => (ScalarKind::Bool, "kick_timer"),
+        "last_resort" => (ScalarKind::Bool, "last_resort"),
+        "preferred" => (ScalarKind::Bool, "preferred"),
+        "rolling_token" => (ScalarKind::Bool, "rolling_token"),
+        "disabled" => (ScalarKind::Bool, "disabled"),
+        "check_weekly" => (ScalarKind::OptBool, "check_weekly"),
+        "check_scoped" => (ScalarKind::OptBool, "check_scoped"),
+        "check_credit_cap" => (ScalarKind::OptBool, "check_credit_cap"),
+        "preferred_days" => (ScalarKind::StrArray, "preferred_days"),
+        _ => return None,
+    })
+}
+
+/// Whether a string value is written in a multi-line `"""` or `'''` form. The
+/// decoded content is the same as a one-line string, so the form is read off
+/// the value's rendered representation, minus the whitespace the key/value
+/// separator leaves on its prefix.
+fn is_multiline_string(v: &toml_edit::Value) -> bool {
+    if !v.is_str() {
+        return false;
+    }
+    let repr = v.to_string();
+    let repr = repr.trim_start();
+    repr.starts_with("\"\"\"") || repr.starts_with("'''")
+}
+
+fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a table or array-of-tables where a value belongs
+    };
+    match kind {
+        ScalarKind::Str => {
+            if v.is_str() {
+                if is_multiline_string(v) {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::F64 => {
+            if v.is_integer() || v.is_float() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::Bool | ScalarKind::OptBool => {
+            if v.is_bool() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::StrArray => {
+            if v.as_array().is_some_and(|a| a.iter().all(|e| e.is_str())) {
+                // The form is read off the value's own representation, the way
+                // `is_multiline_string` reads a string's form: an array written
+                // across several lines is not a one-line value.
+                if v.to_string().contains('\n') {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+    }
+}
+
+/// The shape of a table's relevant subkeys: every relevant subkey must be a
+/// one-line string for the table to count as plain.
+fn table_shape(item: &toml_edit::Item, subkeys: &[&str], all: bool) -> KeyShape {
+    let Some(t) = item.as_table_like() else {
+        return KeyShape::Unreadable; // a value (or none) where a table belongs
+    };
+    let mut shape = KeyShape::Plain;
+    for (k, sub) in t.iter() {
+        if !all && !subkeys.contains(&k) {
+            continue;
+        }
+        match subkey_shape(sub) {
+            KeyShape::Unreadable => return KeyShape::Unreadable,
+            KeyShape::NonPlain => shape = KeyShape::NonPlain,
+            KeyShape::Plain => {}
+        }
+    }
+    shape
+}
+
+fn subkey_shape(item: &toml_edit::Item) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a nested table or array where a value belongs
+    };
+    if v.is_str() {
+        if is_multiline_string(v) {
+            KeyShape::NonPlain
+        } else {
+            KeyShape::Plain
+        }
+    } else {
+        KeyShape::Unreadable
+    }
+}
+
+/// The shape of a modelled top-level key, with its static name, or `None` for
+/// a key clauth does not model.
+fn key_shape(key: &str, item: &toml_edit::Item) -> Option<(KeyShape, &'static str)> {
+    if let Some((kind, name)) = modelled_scalar(key) {
+        return Some((scalar_shape(item, kind), name));
+    }
+    let (subkeys, all, name) = match key {
+        "console" => (CONSOLE_FIELDS.as_slice(), false, "console"),
+        "models" => (MODELS_FIELDS.as_slice(), false, "models"),
+        "env" => (&[][..], true, "env"), // every env subkey is a modelled variable
+        _ => return None,
+    };
+    let inner = table_shape(item, subkeys, all);
+    let shape = if item.is_inline_table() || item.as_table().is_some_and(|t| t.is_implicit()) {
+        // An inline table or a table with no `[table]` header (a dotted key, or
+        // the parent of a nested table) stays non-plain however plain its
+        // subkeys are.
+        match inner {
+            KeyShape::Unreadable => KeyShape::Unreadable,
+            _ => KeyShape::NonPlain,
+        }
+    } else {
+        inner
+    };
+    Some((shape, name))
+}
+
+/// Whether the save would edit `key`: the same comparison the edit step uses
+/// to decide, listed once per modelled field so the refusal mirrors the writer.
+fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool {
+    match key {
+        "base_url" => on_disk.base_url != canonical.base_url,
+        "api_key" => on_disk.api_key != canonical.api_key,
+        "auto_start" => on_disk.auto_start != canonical.auto_start,
+        "fallback_threshold" => on_disk.fallback_threshold != canonical.fallback_threshold,
+        "weekly_threshold" => on_disk.weekly_threshold != canonical.weekly_threshold,
+        "last_resort" => on_disk.last_resort != canonical.last_resort,
+        "preferred" => on_disk.preferred != canonical.preferred,
+        "preferred_days" => on_disk.preferred_days != canonical.preferred_days,
+        "rolling_token" => on_disk.rolling_token != canonical.rolling_token,
+        "max_auto_spend" => on_disk.max_auto_spend != canonical.max_auto_spend,
+        "check_weekly" => on_disk.check_weekly != canonical.check_weekly,
+        "check_scoped" => on_disk.check_scoped != canonical.check_scoped,
+        "check_credit_cap" => on_disk.check_credit_cap != canonical.check_credit_cap,
+        "bell_threshold" => on_disk.bell_threshold != canonical.bell_threshold,
+        "disabled" => on_disk.disabled != canonical.disabled,
+        "console" => on_disk.console != canonical.console,
+        "models" => on_disk.models != canonical.models,
+        "env" => on_disk.env != canonical.env,
+        _ => false,
+    }
+}
+
+/// The first modelled key, in file order, whose on-disk shape the save cannot
+/// leave as written: an unreadable key, or a readable-but-non-plain key the
+/// save would edit. When the typed parse failed (`on_disk` is `None`), only the
+/// unreadable arm and the `kick_timer` pair run — the non-plain/`edited` test
+/// never compares a defaulted view. `None` when every edit is over a plain shape.
+fn non_plain_edit(
+    doc: &toml_edit::DocumentMut,
+    on_disk: Option<&ProfileConfig>,
+    canonical: &ProfileConfig,
+) -> Option<&'static str> {
+    for (key, item) in doc.iter() {
+        if key == "kick_timer"
+            && doc.get("auto_start").is_some_and(|it| {
+                key_shape("auto_start", it).is_some_and(|(s, _)| s != KeyShape::Unreadable)
+            })
+        {
+            // The pre-rename alias beside a readable `auto_start`: serde counts
+            // the alias and the field as one `auto_start`, so a file holding both
+            // cannot parse. A mistyped `auto_start` is named on its own, in file
+            // order, since removing the alias alone would not fix the file.
+            return Some("kick_timer");
+        }
+        let Some((shape, name)) = key_shape(key, item) else {
+            continue;
+        };
+        match shape {
+            KeyShape::Unreadable => return Some(name),
+            KeyShape::NonPlain => {
+                if let Some(on_disk) = on_disk
+                    && edited(key, on_disk, canonical)
+                {
+                    return Some(name);
+                }
+            }
+            KeyShape::Plain => {}
+        }
+    }
+    None
+}
+
+fn apply_config_edits(
+    doc: &mut toml_edit::DocumentMut,
+    on_disk: &ProfileConfig,
+    canonical: &ProfileConfig,
+) {
+    let od = on_disk;
+    edit_string_scalar(doc, &od.base_url, &canonical.base_url, "base_url");
+    edit_string_scalar(doc, &od.api_key, &canonical.api_key, "api_key");
+    if od.auto_start != canonical.auto_start {
+        if doc.contains_key("kick_timer") {
+            remove_key_keeping_comments(doc, "kick_timer", &[], "");
+        }
+        if canonical.auto_start {
+            set_scalar(doc, "auto_start", toml_edit::Value::from(true));
+        } else {
+            unset_scalar(doc, "auto_start");
+        }
+    }
+    edit_f64_scalar(
+        doc,
+        od.fallback_threshold,
+        canonical.fallback_threshold,
+        "fallback_threshold",
+    );
+    edit_f64_scalar(
+        doc,
+        od.weekly_threshold,
+        canonical.weekly_threshold,
+        "weekly_threshold",
+    );
+    edit_bool_scalar(doc, od.last_resort, canonical.last_resort, "last_resort");
+    edit_bool_scalar(doc, od.preferred, canonical.preferred, "preferred");
+    if od.preferred_days != canonical.preferred_days {
+        if canonical.preferred_days.is_empty() {
+            unset_scalar(doc, "preferred_days");
+        } else {
+            set_scalar(
+                doc,
+                "preferred_days",
+                preferred_days_value(&canonical.preferred_days),
+            );
+        }
+    }
+    edit_bool_scalar(
+        doc,
+        od.rolling_token,
+        canonical.rolling_token,
+        "rolling_token",
+    );
+    edit_f64_scalar(
+        doc,
+        od.max_auto_spend,
+        canonical.max_auto_spend,
+        "max_auto_spend",
+    );
+    edit_opt_bool_scalar(doc, od.check_weekly, canonical.check_weekly, "check_weekly");
+    edit_opt_bool_scalar(doc, od.check_scoped, canonical.check_scoped, "check_scoped");
+    edit_opt_bool_scalar(
+        doc,
+        od.check_credit_cap,
+        canonical.check_credit_cap,
+        "check_credit_cap",
+    );
+    edit_f64_scalar(
+        doc,
+        od.bell_threshold,
+        canonical.bell_threshold,
+        "bell_threshold",
+    );
+    edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
+    edit_console(doc, &od.console, &canonical.console);
+    edit_models(doc, &od.models, &canonical.models);
+    edit_env(doc, &od.env, &canonical.env);
 }
 
 #[cfg(test)]

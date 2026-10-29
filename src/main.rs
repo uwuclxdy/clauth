@@ -2519,11 +2519,35 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
 
 /// The warning for a failed arm whose ROLLBACK also failed to save: the flag
 /// is durably on with nothing armed, and this line is the only thing telling
-/// the operator that state exists and how to leave it. A separate fn so the
-/// copy is unit-pinned and a deleted print orphans it into a dead-code error —
-/// the warning is best-effort by design (the arming error still propagates),
-/// which is exactly what made it silently deletable.
+/// the operator that state exists and how to leave it. A save the writer
+/// REFUSED over a line's shape is the file's problem, not the directory's, so
+/// it names the line instead of pointing at write permission. A separate fn so
+/// the copy is unit-pinned and a deleted print orphans it into a dead-code
+/// error — the warning is best-effort by design (the arming error still
+/// propagates), which is exactly what made it silently deletable.
 fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
+    if let Some(refusal) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<profile::ConfigEditRefusal>())
+    {
+        let key = refusal.key();
+        return format!(
+            "clauth: warning: could not roll the rolling-token flag back for \
+             '{canonical}': config.toml has `{key}` in a shape clauth cannot read. \
+             Fix or remove that line, then run `clauth static-token {canonical}` to clear it"
+        );
+    }
+    if let Some(parse) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<profile::ConfigParseRefusal>())
+        && let Some(position) = crate::format::parse_position(parse.position())
+    {
+        return format!(
+            "clauth: warning: could not roll the rolling-token flag back for \
+             '{canonical}': config.toml does not parse ({position}). Fix that line, then run \
+             `clauth static-token {canonical}` to clear it"
+        );
+    }
     format!(
         "clauth: warning: could not roll the rolling-token flag back for \
          '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \

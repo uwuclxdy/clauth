@@ -4,6 +4,7 @@
 //! test below fails.
 
 use super::*;
+use sha2::{Digest as _, Sha256};
 
 #[test]
 fn profile_config_reads_kick_timer_as_auto_start() {
@@ -5022,11 +5023,10 @@ fn a_default_serve_table_carries_a_stray_key() {
 }
 
 /// A config.toml an older clauth wrote spells `auto_start` as its pre-rename
-/// alias `kick_timer`. The round-trip that decides "modelled" parses the alias
-/// into `auto_start` and re-emits it under that name, so `kick_timer` reads as
-/// unmodelled and was carried beside the render's own `auto_start`. Serde
-/// counts an alias and its field as one field, so the next load failed with a
-/// duplicate `auto_start` and the profile was unloadable until hand-edited.
+/// alias `kick_timer`. Serde counts an alias and its field as one field, so a
+/// save that writes `auto_start` beside the alias would fail the next load with
+/// a duplicate field. The in-place writer leaves the alias untouched when
+/// `auto_start` is unchanged, so the file keeps exactly one spelling.
 #[test]
 fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -5048,8 +5048,8 @@ fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
     assert!(back.auto_start);
     let table: toml::Table = after.parse().expect("parses");
     assert!(
-        !table.contains_key("kick_timer"),
-        "the alias is rewritten under its field's name:\n{after}"
+        table.contains_key("kick_timer") && !table.contains_key("auto_start"),
+        "unchanged auto_start leaves the alias as the file's one spelling:\n{after}"
     );
 }
 
@@ -6811,5 +6811,1616 @@ fn a_theme_pick_writes_the_table_form() {
         );
         let reread: AppState = toml::from_str(&written).expect("reads back");
         assert_eq!(reread.theme_tier(), Some(ThemeName::Compatible));
+    }
+}
+
+/// A multi-line inline table is refused the same as a one-line one: adding a
+/// subkey (c62b's shape) and removing one (c63's shape) both refuse and write
+/// nothing.
+#[test]
+fn a_save_editing_a_multiline_inline_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "env = {\n  A = \"b\" # note\n}\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("mlinlineadd", body);
+    profile.env.insert("C".to_string(), "d".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let body = "env = {\n  # proxy\n  A = \"b\",\n  B = \"c\",\n}\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("mlinlineremove", body);
+    profile.env.remove("A");
+    assert_save_refused(&profile, &path, body, "env");
+}
+
+/// A value where a table belongs (`env = "x"`) refuses the save when the
+/// profile sets an env key; the value is never edited in place.
+#[test]
+fn a_save_over_env_written_as_a_value_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "# keep\nenv = \"x\"\nlast_resort = true\n";
+    let path = profile_config_path(&ProfileName::from("envvalue")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("envvalue".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+}
+
+/// `kick_timer` beside `auto_start` is one serde field written twice, so the
+/// typed parse fails while `key_shape` still reads `auto_start` as a plain
+/// bool. A readable inline table before it in file order must not be named:
+/// the refusal names `kick_timer`, never the inline table the save leaves alone.
+#[test]
+fn a_refusal_names_the_kick_timer_alias_not_a_readable_inline_table_before_it() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\nkick_timer = true\nauto_start = true\n";
+    let path = profile_config_path(&ProfileName::from("aliasinline")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("aliasinline".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "kick_timer");
+}
+
+/// Writes `body` as profile `name`'s `config.toml` and loads it back.
+fn hand_written_config(name: &str, body: &str) -> (Profile, PathBuf) {
+    let name = ProfileName::from(name);
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    (load_profile(&name).unwrap(), path)
+}
+
+/// A save edits `config.toml` in place: a changed value keeps the comment
+/// above its key and the comment trailing its value.
+#[test]
+fn a_save_keeps_the_keys_and_values_decor() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("decor", "# my note\nfallback_threshold = 80  # inline\n");
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my note\nfallback_threshold = 90.0  # inline\n"
+    );
+}
+
+/// A save rewrites only the key whose value changed: an unchanged key keeps
+/// its spelling (`80`, not `80.0`), an unknown key stays where it sits, and a
+/// key the file never named appends at the end of its section.
+#[test]
+fn a_save_leaves_unknown_and_unchanged_keys_where_they_sit() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "inplace",
+        "fallback_threshold = 80\nsome_future_knob = true\nlast_resort = true\n",
+    );
+    profile.bell_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "fallback_threshold = 80\nsome_future_knob = true\nlast_resort = true\nbell_threshold = 90.0\n"
+    );
+}
+
+/// A newly set scalar lands top-level, never inside a trailing table, and the
+/// hand comment above that table stays.
+#[test]
+fn a_new_scalar_lands_top_level_and_a_tables_comment_stays() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("toplevel", "# hand note about env\n[env]\nFOO = \"bar\"\n");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.disabled, "disabled is a top-level key:\n{after}");
+    assert_eq!(parsed.env.len(), 1, "[env] gained nothing:\n{after}");
+    assert!(
+        after.contains("# hand note about env\n[env]\nFOO = \"bar\"\n"),
+        "the table and its comment stay as written:\n{after}"
+    );
+}
+
+/// A table the file never held is written as a `[console]` block, never an
+/// inline `console = { ... }`, and the rest of the file stays byte for byte.
+#[test]
+fn a_new_console_table_is_a_block_and_the_rest_of_the_file_stays() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("consoleblock", "# hand note\nfallback_threshold = 80\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.starts_with("# hand note\nfallback_threshold = 80\n"),
+        "{after}"
+    );
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert!(
+        doc.get("console").is_some_and(toml_edit::Item::is_table),
+        "a block table, not an inline one:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// Writing `auto_start` deletes its pre-rename alias `kick_timer`: left
+/// behind, it would bring the old value back on the next load. The alias's
+/// comment stays, since clauth never deletes a comment.
+#[test]
+fn a_save_writing_auto_start_drops_the_kick_timer_alias_and_keeps_its_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("alias", "# my alias note\nkick_timer = true\n");
+    assert!(profile.auto_start, "the alias loads as auto_start");
+    profile.auto_start = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# my alias note\n");
+}
+
+/// Removing a key from a hand-trimmed file (no template example to return
+/// to) deletes the key line alone: every comment line stays, whether the key
+/// sat before another key or last in the file.
+#[test]
+fn removing_a_key_keeps_every_comment_line() {
+    let _home = HomeSandbox::new();
+    let body =
+        "# Threshold docs.\nfallback_threshold = 80\n# Last-resort docs.\nlast_resort = true\n";
+
+    let (mut profile, path) = hand_written_config("trimmed", body);
+    profile.fallback_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Threshold docs.\n# Last-resort docs.\nlast_resort = true\n"
+    );
+
+    let (mut profile, path) = hand_written_config("trimmedlast", body);
+    profile.last_resort = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Threshold docs.\nfallback_threshold = 80\n# Last-resort docs.\n"
+    );
+}
+
+/// On a file shaped like the new-profile template, setting a key uncomments
+/// its example where it sits, under its doc, and unsetting it turns it back
+/// into the example: set-then-unset gives back the exact bytes, a hand
+/// comment included.
+#[test]
+fn a_save_toggles_a_template_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("toggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("toggle")).unwrap();
+    let original = format!("# my own note\n{}", std::fs::read_to_string(&path).unwrap());
+    std::fs::write(&path, &original).unwrap();
+
+    for (set, example, real) in [
+        (
+            (|p: &mut Profile| p.disabled = true) as fn(&mut Profile),
+            "# disabled = true\n",
+            "disabled = true\n",
+        ),
+        (
+            |p: &mut Profile| p.fallback_threshold = Some(90.0),
+            "# fallback_threshold = 95.0\n",
+            "fallback_threshold = 90.0\n",
+        ),
+    ] {
+        let mut profile = load_profile(&ProfileName::from("toggle")).unwrap();
+        set(&mut profile);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen(example, real, 1),
+            "the set uncomments {example:?} in place"
+        );
+
+        let profile = Profile::new("toggle".to_string(), None, None);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the unset turns {real:?} back into its example"
+        );
+    }
+}
+
+/// A scalar example under its doc block that sits before a later real key is
+/// replaced in place: the new key lands before the key that followed it, never
+/// appended after every other root key.
+#[test]
+fn a_save_toggles_an_example_under_its_doc_sitting_before_a_real_key() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("fallback_threshold");
+    let (mut profile, path) = hand_written_config(
+        "a2doc",
+        &format!("{doc}# fallback_threshold = 95.0\ndisabled = true\n"),
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{doc}fallback_threshold = 90.0\ndisabled = true\n")
+    );
+}
+
+/// The same toggle for a table: setting `[console]` on a template-shaped file
+/// replaces its commented example block where it sits, and unsetting brings
+/// the example block back byte for byte.
+#[test]
+fn a_save_toggles_the_console_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("tabletoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("tabletoggle")).unwrap();
+    let original = format!("# my own note\n{}", std::fs::read_to_string(&path).unwrap());
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tabletoggle")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let example = "# [console]\n# token = \"...\"\n# site = \"international\"\n# region = \"ap-southeast-1\"\n";
+    let real =
+        "[console]\ntoken = \"t0k\"\nsite = \"international\"\nregion = \"ap-southeast-1\"\n";
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(example, real, 1)
+    );
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A save over a file that is not TOML refuses with the load's own parse
+/// error and writes nothing: the user's bytes are never replaced by the
+/// template.
+#[test]
+fn a_save_over_a_file_that_is_not_toml_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("garbage");
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = "# my notes\nfallback_threshold = 9 0\nsome_future_knob = true\n";
+    std::fs::write(&path, body).unwrap();
+    let load_err = load_profile(&name).expect_err("the load refuses the file");
+    let mut profile = Profile::new("garbage".to_string(), None, None);
+    profile.disabled = true;
+    let save_err = save_profile_config(&profile).expect_err("the save refuses the file");
+    assert_eq!(save_err.to_string(), load_err.to_string());
+    assert!(
+        save_err
+            .to_string()
+            .starts_with("failed to parse garbage/config.toml at line 2, column "),
+        "{save_err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A doc block whose first line the user edited by prefixing it is no longer
+/// the key's doc: the match must start a line, so `## Disable this account`
+/// never reads as `# Disable this account`, and the key appends at the end.
+#[test]
+fn a_doc_block_with_a_prefixed_first_line_is_not_the_keys_doc() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("prefixed".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("prefixed")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let first = "# Disable this account: it becomes invisible to the fallback chain, the\n";
+    assert_eq!(template.matches(first).count(), 1);
+    let original = template.replace(first, &format!("#{first}"));
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("prefixed")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{original}disabled = true\n")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A key with no example site appends at the end of its section: in a file of
+/// comments alone, that is after the last comment, never above the first.
+#[test]
+fn an_appended_root_key_goes_after_a_comment_only_file() {
+    let _home = HomeSandbox::new();
+    let body = "# header\n\n# my notes\n";
+    let (mut profile, path) = hand_written_config("commentsonly", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A doc block clauth itself wrote in an earlier version is still the key's
+/// own doc: the example under it toggles in place, and the unset puts it back.
+#[test]
+fn an_example_under_an_earlier_clauth_doc_toggles_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("olddoc".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("olddoc")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n\
+                   # plus the daemon's bell_command when one is set. Range 0..=100.\n\
+                   # bell_threshold = 95.0\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# 5-hour utilization percentage at/above which clauth fires a bell\n\
+                 # notification in the overview tab. Range 0..=100.\n\
+                 # bell_threshold = 95.0\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("olddoc")).unwrap();
+    profile.bell_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace(
+            "notification in the overview tab. Range 0..=100.\n# bell_threshold = 95.0\n",
+            "notification in the overview tab. Range 0..=100.\nbell_threshold = 90.0\n"
+        )
+    );
+    profile.bell_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// The current doc block of every modelled key is in that key's list of doc
+/// blocks clauth has written, so a reworded doc can never drop its own.
+#[test]
+fn every_current_doc_block_is_among_its_keys_known_doc_blocks() {
+    for key in MODELLED_SCALARS
+        .iter()
+        .copied()
+        .chain(["console", "models", "env"])
+    {
+        assert!(
+            known_doc_blocks(key)
+                .iter()
+                .any(|d| *d == doc_block_for(key)),
+            "{key}'s current doc block is not in its known list"
+        );
+    }
+}
+
+/// A table set beside a hand-added root key below its example block keeps
+/// that block as written (a table cannot open above a root key), and the
+/// unset gives the file back byte for byte.
+#[test]
+fn a_table_set_below_a_hand_added_root_key_keeps_its_example_block() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("tablebelow".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("tablebelow")).unwrap();
+    let original = format!(
+        "{}last_resort = true\n",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tablebelow")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let mut rest = after.lines();
+    for line in original.lines() {
+        assert!(
+            rest.any(|l| l == line),
+            "`{line}` is gone or out of order:\n{after}"
+        );
+    }
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "last_resort stays a root key:\n{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"));
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table appended beside a root key whose prefix holds a commented example
+/// block with an edited doc (no site) round-trips byte for byte: removing the
+/// appended table drops its default separator, never leaves a stray blank.
+#[test]
+fn an_appended_table_beside_a_root_key_round_trips_byte_for_byte() {
+    let _home = HomeSandbox::new();
+    let edited = console_doc().replacen("international.\n", "international. (edited)\n", 1);
+    assert_ne!(edited, console_doc(), "the console doc is edited");
+    let body = format!("{edited}{CONSOLE_EXAMPLE}last_resort = true\n");
+    let (mut profile, path) = hand_written_config("t3shape", &body);
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let mut profile = load_profile(&ProfileName::from("t3shape")).unwrap();
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// Unsetting a key whose value carries a comment on its own line keeps that
+/// comment, on its own line where the key was.
+#[test]
+fn unsetting_a_key_keeps_its_inline_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "inlinecomment",
+        "# c\nfallback_threshold = 80  # my inline\nlast_resort = true\n",
+    );
+    profile.fallback_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# c\n# my inline\nlast_resort = true\n"
+    );
+}
+
+/// Clearing every key of a hand-written table drops the table, never a
+/// comment: the comments inside it and the one after its header stay.
+#[test]
+fn clearing_a_table_keeps_every_comment_in_it() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "envcomments",
+        "last_resort = true\n[env]\n# proxy for work\nA = \"b\"  # trailing\n",
+    );
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "last_resort = true\n# proxy for work\n# trailing\n"
+    );
+
+    let (mut profile, path) = hand_written_config(
+        "consolecomment",
+        "last_resort = true\n[console] # my console note\ntoken = \"t\"\nsite = \"international\"\nregion = \"r\"\n",
+    );
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "last_resort = true\n# my console note\n"
+    );
+}
+
+/// The error a save over a key in a shape the writer does not edit returns,
+/// as the CLI prints it after `clauth: `.
+fn refusal(profile: &str, key: &str) -> String {
+    format!(
+        "{profile}: config.toml has `{key}` in a shape clauth cannot read; fix or remove that line, then try again"
+    )
+}
+
+/// Saves `profile` over `path` holding `body`, and asserts the save is
+/// refused naming `key` with the file left byte for byte.
+fn assert_save_refused(profile: &Profile, path: &Path, body: &str, key: &str) {
+    let err = save_profile_config(profile).expect_err("the save is refused");
+    assert_eq!(err.to_string(), refusal(profile.name.as_str(), key));
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        body,
+        "nothing written"
+    );
+}
+
+/// A save that would edit a table written inline (`env = { ... }`) is
+/// refused and writes nothing: changing, adding and removing a key alike.
+#[test]
+fn a_save_editing_an_inline_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\n";
+
+    let (mut profile, path) = hand_written_config("inlineenv", body);
+    profile.env.insert("A".to_string(), "c".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let (mut profile, path) = hand_written_config("inlineadd", body);
+    profile.env.insert("C".to_string(), "d".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let body = "models = { default = \"x\", opus = \"y\" }\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("inlineclear", body);
+    profile.models.default = None;
+    profile.models.opus = None;
+    assert_save_refused(&profile, &path, body, "models");
+}
+
+/// An inline table the save does not need to change stays as written while
+/// another key is set.
+#[test]
+fn an_inline_table_the_save_leaves_alone_stays_as_written() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }  # env note\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("inlinekeep", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A save that would edit a modelled key written as a multi-line string is
+/// refused and writes nothing.
+#[test]
+fn a_save_editing_a_multiline_string_value_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"\"\"https://a.example\"\"\"\n";
+    let (mut profile, path) = hand_written_config("multibase", body);
+    profile.base_url = Some("https://b.example".to_string());
+    assert_save_refused(&profile, &path, body, "base_url");
+}
+
+/// A key clauth cannot read (a wrong type, a table where a value belongs, the
+/// `kick_timer` alias beside `auto_start`) refuses the save and writes
+/// nothing; it is never repaired key by key.
+#[test]
+fn a_save_over_a_key_clauth_cannot_read_is_refused() {
+    let _home = HomeSandbox::new();
+    for (name, body, key) in [
+        (
+            "mistyped",
+            "# keep me\nfallback_threshold = \"90\"\nlast_resort = true\n",
+            "fallback_threshold",
+        ),
+        ("wrongshape", "[disabled]\nx = 1\n", "disabled"),
+        (
+            "aliasboth",
+            "kick_timer = true\nauto_start = true\n",
+            "kick_timer",
+        ),
+    ] {
+        let path = profile_config_path(&ProfileName::from(name)).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.fallback_threshold = Some(95.0);
+        profile.disabled = true;
+        assert_save_refused(&profile, &path, body, key);
+    }
+}
+
+/// Clearing every modelled key of `[models]` keeps a subkey clauth does not
+/// model, and the table holding it.
+#[test]
+fn clearing_modelled_models_keys_keeps_an_unknown_subkey() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "modelsunknown",
+        "[models]\ndefault = \"x\"\nfuture = \"y\"  # keep\n",
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\nfuture = \"y\"  # keep\n"
+    );
+}
+
+/// On a file shaped like the new-profile template, toggling one table leaves
+/// the file exactly as the template renders the new profile, whatever other
+/// table is already set: no table moves, no doc line lands under the wrong
+/// header, and unsetting gives the original back.
+#[test]
+fn toggling_a_table_beside_a_set_table_matches_the_template_render() {
+    let _home = HomeSandbox::new();
+    let mut base = Profile::new("tpltables".to_string(), None, None);
+    base.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&base).unwrap();
+    let path = profile_config_path(&ProfileName::from("tpltables")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tpltables")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile),
+        "console set beside env"
+    );
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile),
+        "models set beside env"
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A template example counts only as a whole comment line: the same text
+/// inside a longer comment is the user's prose, left as written, and the key
+/// appends at the end of its section.
+#[test]
+fn an_example_matches_only_as_a_whole_comment_line() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("disabled");
+    let prefixed = doc.replacen("# Disable", "## Disable", 1);
+    assert_ne!(prefixed, doc, "the first line is prefixed");
+    let body = format!("{prefixed}# disabled = true\nlast_resort = true\n");
+    let (mut profile, path) = hand_written_config("examplematch", &body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A file with CRLF line endings keeps them through a save.
+#[test]
+fn a_save_keeps_crlf_line_endings() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "crlf",
+        "# c\r\nfallback_threshold = 80\r\nlast_resort = true\r\n",
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# c\r\nfallback_threshold = 90.0\r\nlast_resort = true\r\n"
+    );
+}
+
+/// A CRLF file holding a multi-line string keeps that string's own line
+/// endings: a save never writes a bare carriage return, and a second save
+/// writes the same bytes.
+#[test]
+fn a_crlf_file_with_a_multiline_string_still_parses_after_a_save() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "crlfmulti",
+        "note = \"\"\"l1\r\nl2\"\"\"\r\nfallback_threshold = 80\r\n",
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    let expected = "note = \"\"\"l1\r\nl2\"\"\"\r\nfallback_threshold = 90.0\r\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+}
+
+/// A user's own comment line that reads like a template example is prose:
+/// the set uncomments the example under the key's doc block, never the
+/// user's line, and the unset gives the file back.
+#[test]
+fn a_set_uncomments_the_example_under_its_doc_not_a_users_copy() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("usercopy".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("usercopy")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let user = "# my notes:\n# disabled = true\n";
+    let original = format!("{user}{template}");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("usercopy")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!(
+            "{user}{}",
+            template.replacen("# disabled = true\n", "disabled = true\n", 1)
+        )
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table materialized from an example block that sits above a root key
+/// never takes the comments above that block with it: the file's header
+/// and the root key stay before the first table header.
+#[test]
+fn a_materialized_table_leaves_the_root_comments_at_the_root() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "rootcomments",
+        &format!(
+            "# header\n\n{}{}last_resort = true\n\n[env]\nA = \"b\"\n",
+            console_doc(),
+            CONSOLE_EXAMPLE
+        ),
+    );
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let root = after.split("\n[").next().unwrap();
+    assert!(after.starts_with("# header\n"), "{after}");
+    assert!(
+        root.lines().any(|l| l == "last_resort = true"),
+        "the root key stays before every table header:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "{after}");
+    assert_eq!(parsed.env.len(), 1, "{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// `[models]` toggles the same way `[console]` does: the template example
+/// block becomes the real table where it sits, and back.
+#[test]
+fn a_save_toggles_the_models_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("mtoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("mtoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("mtoggle")).unwrap();
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [models]\n# default = \"opusplan\"\n",
+            "[models]\ndefault = \"opusplan\"\n",
+            1
+        )
+    );
+
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// `[env]` toggles the same way: the template example block becomes the real
+/// table where it sits, and unsetting brings the example block back.
+#[test]
+fn a_save_toggles_the_env_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("etoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("etoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("etoggle")).unwrap();
+    profile.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n",
+            "[env]\nHTTP_PROXY = \"http://localhost:8080\"\n",
+            1
+        )
+    );
+
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table materialized without a template example is removed whole when every
+/// subkey goes unset, and the file's other bytes stay.
+#[test]
+fn a_save_removes_a_materialized_table_when_all_subkeys_go_unset() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("consoleno", "# hand note\nfallback_threshold = 80\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[console]\n"),
+        "{path:?}"
+    );
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert!(doc.get("console").is_none(), "{after}");
+    assert!(
+        after.starts_with("# hand note\nfallback_threshold = 80\n"),
+        "{after}"
+    );
+}
+
+/// Writing a key beside an unchanged `auto_start` leaves the pre-rename alias
+/// untouched: only a set/unset of `auto_start` itself drops it.
+#[test]
+fn a_save_leaves_kick_timer_when_auto_start_is_unchanged() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("aliasunch", "kick_timer = true\n");
+    assert!(profile.auto_start, "the alias loads as auto_start on");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    let table: toml::Table = after.parse().unwrap();
+    assert!(table.contains_key("kick_timer"), "{after}");
+    assert!(
+        table.get("disabled").and_then(toml::Value::as_bool) == Some(true),
+        "{after}"
+    );
+}
+
+/// An example line with no doc block above it is prose even when a real key
+/// follows it: the set appends the key at its section's end and leaves the
+/// commented line where it sits.
+#[test]
+fn an_example_without_its_doc_block_stays_before_a_real_key() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("a2", "# fallback_threshold = 95.0\ndisabled = true\n");
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# fallback_threshold = 95.0\ndisabled = true\nfallback_threshold = 90.0\n"
+    );
+}
+
+/// Env keys that TOML requires quoted (`A:B`, `A.B`, `has space`) round-trip
+/// through the writer's key encoder.
+#[test]
+fn an_env_key_with_special_chars_is_quoted() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("envquote", "");
+    profile.env.insert("A:B".to_string(), "v1".to_string());
+    profile.env.insert("A.B".to_string(), "v2".to_string());
+    profile
+        .env
+        .insert("has space".to_string(), "v3".to_string());
+    save_profile_config(&profile).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("\"A:B\" = \"v1\"\n"), "{after}");
+    assert!(after.contains("\"A.B\" = \"v2\"\n"), "{after}");
+    assert!(after.contains("\"has space\" = \"v3\"\n"), "{after}");
+}
+
+/// A save with no `config.toml` yet writes the plain template render.
+#[test]
+fn a_save_over_a_missing_file_writes_the_template() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("nofile");
+    let path = profile_config_path(&name).unwrap();
+    let mut profile = Profile::new("nofile".to_string(), None, None);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile)
+    );
+}
+
+/// An example line with no template doc block above it is the user's prose,
+/// however many copies the file holds: the set appends the key at the end of
+/// its section and leaves every copy as written.
+#[test]
+fn an_example_without_its_doc_block_is_never_uncommented() {
+    let _home = HomeSandbox::new();
+    let body = "# disabled = true\n# disabled = true\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("twice", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A lookalike example in another table's leading comments, with no doc block
+/// above it, stays where it is, blank line included; the new key lands at the
+/// root.
+#[test]
+fn a_lookalike_example_in_a_tables_comments_stays_prose() {
+    let _home = HomeSandbox::new();
+    let body = "[env]\nA = \"b\"\n\n# disabled = true\n[models]\ndefault = \"x\"\n";
+    let (mut profile, path) = hand_written_config("blankline", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("disabled = true\n{body}")
+    );
+}
+
+/// Once the user reworded a key's template doc block, no example line
+/// is the key's own any more: a lookalike line the user wrote above the
+/// template is never uncommented, nor is the template's own example; the set
+/// adds one live line, and the unset gives the file back byte for byte.
+#[test]
+fn a_reworded_doc_block_leaves_every_example_line_as_written() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("reworded".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("reworded")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let at = template
+        .find("\n# disabled = true\n")
+        .expect("the template carries the disabled example");
+    let doc_line_start = template[..at].rfind('\n').map_or(0, |i| i + 1);
+    let reworded = format!(
+        "{}{} (edited){}",
+        &template[..doc_line_start],
+        &template[doc_line_start..at],
+        &template[at..]
+    );
+    let original = format!("# my notes:\n# disabled = true\n{reworded}");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("reworded")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let live: Vec<&str> = after.lines().filter(|l| *l == "disabled = true").collect();
+    assert_eq!(live.len(), 1, "one live line:\n{after}");
+    let without_live: Vec<&str> = after.lines().filter(|l| *l != "disabled = true").collect();
+    assert_eq!(
+        without_live,
+        original.lines().collect::<Vec<_>>(),
+        "every other line as written:\n{after}"
+    );
+    assert!(
+        load_profile(&ProfileName::from("reworded"))
+            .unwrap()
+            .disabled
+    );
+
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table example whose doc block was reworded has no example site either:
+/// the set appends the table at the document's end and leaves the commented
+/// block as prose, as it does for a scalar.
+#[test]
+fn a_reworded_tables_doc_block_leaves_its_example_block_as_prose() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("rewordedtable".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("rewordedtable")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let original = template.replacen(
+        "# site: domestic | international.\n",
+        "# site: domestic | international. (edited)\n",
+        1,
+    );
+    assert_ne!(original, template, "the console doc block is edited");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("rewordedtable")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("# [console]\n# token = \"...\"\n"),
+        "the commented example stays prose:\n{after}"
+    );
+    assert!(
+        after.ends_with(
+            "[console]\ntoken = \"t0k\"\nsite = \"international\"\nregion = \"ap-southeast-1\"\n"
+        ),
+        "the table appends at the document's end:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"));
+}
+
+/// Every modelled scalar key owns a non-empty doc block and example line: the
+/// exhaustive lookup must never silently yield nothing for a key the model
+/// knows.
+#[test]
+fn every_modelled_scalar_has_a_doc_and_an_example() {
+    for key in MODELLED_SCALARS {
+        assert!(!scalar_doc(key).is_empty(), "{key}");
+        assert!(!scalar_example(key).is_empty(), "{key}");
+    }
+}
+
+/// Every scalar key a fully-set `ProfileConfig` serializes is in
+/// `MODELLED_SCALARS`: a scalar field added to the model without claiming a doc
+/// block and example fails this test.
+#[test]
+fn every_profile_config_scalar_is_modelled() {
+    let config = ProfileConfig {
+        base_url: Some("x".to_string()),
+        api_key: Some("x".to_string()),
+        auto_start: true,
+        usage_probe: true,
+        usage_probe_interval_ms: Some(120_000),
+        env: BTreeMap::new(),
+        models: ModelSettings::default(),
+        fallback_threshold: Some(0.0),
+        weekly_threshold: Some(0.0),
+        last_resort: true,
+        rolling_token: true,
+        preferred: true,
+        preferred_days: vec!["sat".to_string()],
+        max_auto_spend: Some(0.0),
+        check_weekly: Some(false),
+        check_scoped: Some(false),
+        check_credit_cap: Some(false),
+        bell_threshold: Some(0.0),
+        disabled: true,
+        console: ConsoleConfig::default(),
+    };
+    let serialized = toml::to_string(&config).unwrap();
+    let table: toml::Table = toml::from_str(&serialized).unwrap();
+    let unmodelled: Vec<&str> = table
+        .iter()
+        .filter(|(_, v)| !v.is_table())
+        .map(|(k, _)| k.as_str())
+        .filter(|k| !MODELLED_SCALARS.contains(k))
+        .collect();
+    assert!(
+        unmodelled.is_empty(),
+        "unmodelled scalar keys: {unmodelled:?}"
+    );
+}
+
+/// A template-shaped file saved with CRLF line endings toggles like an LF one:
+/// the set uncomments the example under its doc, the unset turns it back, and
+/// every line ending stays CRLF.
+#[test]
+fn a_crlf_template_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("crlftoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("crlftoggle")).unwrap();
+    let original = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("crlftoggle")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# disabled = true\r\n", "disabled = true\r\n", 1)
+    );
+
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table appended to a file that ends in a root comment goes after that
+/// comment: the comment stays at the root, above the new table's header.
+#[test]
+fn an_appended_table_goes_after_the_files_trailing_root_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("trailingroot", "last_resort = true\n# my end note\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.starts_with("last_resort = true\n# my end note\n"),
+        "{after}"
+    );
+    let note = after.find("# my end note").unwrap();
+    let header = after.find("[console]").unwrap();
+    assert!(
+        note < header,
+        "the root comment stays above [console]:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// A table field added to `ProfileConfig` without a writer arm fails: the
+/// modelled table key set is pinned against the model's serialized tables, so a
+/// 4th table the completeness test would otherwise never read reds here.
+#[test]
+fn every_profile_config_table_is_modelled() {
+    let config = ProfileConfig {
+        base_url: Some("x".to_string()),
+        api_key: Some("x".to_string()),
+        auto_start: true,
+        usage_probe: true,
+        usage_probe_interval_ms: Some(120_000),
+        env: BTreeMap::from([("A".to_string(), "b".to_string())]),
+        models: ModelSettings {
+            default: Some("d".to_string()),
+            opus: Some("o".to_string()),
+            sonnet: Some("s".to_string()),
+            haiku: Some("h".to_string()),
+            fable: Some("f".to_string()),
+            subagent: Some("g".to_string()),
+        },
+        fallback_threshold: Some(0.0),
+        weekly_threshold: Some(0.0),
+        last_resort: true,
+        rolling_token: true,
+        preferred: true,
+        preferred_days: vec!["sat".to_string()],
+        max_auto_spend: Some(0.0),
+        check_weekly: Some(false),
+        check_scoped: Some(false),
+        check_credit_cap: Some(false),
+        bell_threshold: Some(0.0),
+        disabled: true,
+        console: ConsoleConfig {
+            token: Some("t".to_string()),
+            site: Some("international".to_string()),
+            region: Some("ap-southeast-1".to_string()),
+        },
+    };
+    let serialized = toml::to_string(&config).unwrap();
+    let table: toml::Table = toml::from_str(&serialized).unwrap();
+    let mut tables: Vec<&str> = table
+        .iter()
+        .filter(|(_, v)| v.is_table())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    tables.sort_unstable();
+    assert_eq!(tables, ["console", "env", "models"]);
+}
+
+/// Every field the writer's edit step handles is pinned behaviourally: an empty
+/// file, a profile with every field off its default, one save, and the reloaded
+/// `ProfileConfig` equals the canonical one the writer builds from that profile.
+/// A field `apply_config_edits` skips stays absent on disk and the equality
+/// fails.
+#[test]
+fn a_save_writes_every_modelled_field_from_an_empty_file() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("fullyset");
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "").unwrap();
+
+    let mut profile = Profile::new(
+        "fullyset".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-ant-test".to_string()),
+    );
+    profile.auto_start = true;
+    profile.env = BTreeMap::from([
+        ("A".to_string(), "b".to_string()),
+        ("C".to_string(), "d".to_string()),
+    ]);
+    profile.models = ModelSettings {
+        default: Some("d".to_string()),
+        opus: Some("o".to_string()),
+        sonnet: Some("s".to_string()),
+        haiku: Some("h".to_string()),
+        fable: Some("f".to_string()),
+        subagent: Some("g".to_string()),
+    };
+    profile.fallback_threshold = Some(50.0);
+    profile.weekly_threshold = Some(70.0);
+    profile.last_resort = true;
+    profile.preferred = true;
+    profile.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    profile.rolling_token = true;
+    profile.max_auto_spend = Some(5.0);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    profile.check_credit_cap = false;
+    profile.bell_threshold = Some(90.0);
+    profile.disabled = true;
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let reloaded: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(reloaded, canonical_profile_config(&profile), "{after}");
+}
+
+/// A file holding a key clauth cannot read names that key, never a readable
+/// key before it the save leaves alone: an inline `env` the profile keeps as
+/// is is not the offender.
+#[test]
+fn a_refusal_names_the_unreadable_key_not_an_untouched_inline_table() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\nfallback_threshold = \"90\"\n";
+    let path = profile_config_path(&ProfileName::from("unreadablenext")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("unreadablenext".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "fallback_threshold");
+}
+
+/// A key clauth cannot read refuses the save even when the save leaves that
+/// key alone: the file's on-disk values are unknowable, as every load of it
+/// fails too.
+#[test]
+fn an_unreadable_key_refuses_a_save_that_leaves_it_alone() {
+    let _home = HomeSandbox::new();
+    let body = "# keep me\nfallback_threshold = \"90\"\nlast_resort = true\n";
+    let path = profile_config_path(&ProfileName::from("unreadablekeep")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("unreadablekeep".to_string(), None, None);
+    profile.last_resort = true;
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "fallback_threshold");
+}
+
+/// An array written across several lines is not a one-line value: a save
+/// that would change it is refused, so a comment inside it is never lost.
+#[test]
+fn a_save_editing_a_multiline_array_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "preferred_days = [\n  \"sat\", # weekend\n  \"sun\",\n]\n";
+    let (mut profile, path) = hand_written_config("multidays", body);
+    profile.preferred_days = vec![Weekday::Mon];
+    assert_save_refused(&profile, &path, body, "preferred_days");
+}
+
+/// A table written as dotted keys (`models.default = "x"`) is not a block
+/// table: a save that would change it is refused, and one that leaves it
+/// alone keeps it as written.
+#[test]
+fn a_save_editing_a_dotted_key_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "models.default = \"x\"\n";
+    let (mut profile, path) = hand_written_config("dottededit", body);
+    profile.models.default = Some("y".to_string());
+    assert_save_refused(&profile, &path, body, "models");
+
+    let (mut profile, path) = hand_written_config("dottedkeep", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A mistyped `auto_start` beside the `kick_timer` alias names `auto_start`,
+/// whichever comes first: removing the alias alone would not fix the file.
+#[test]
+fn a_mistyped_auto_start_beside_its_alias_names_auto_start() {
+    let _home = HomeSandbox::new();
+    for (name, body) in [
+        ("aliasfirst", "kick_timer = true\nauto_start = \"x\"\n"),
+        ("aliassecond", "auto_start = \"x\"\nkick_timer = true\n"),
+    ] {
+        let path = profile_config_path(&ProfileName::from(name)).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.disabled = true;
+        assert_save_refused(&profile, &path, body, "auto_start");
+    }
+}
+
+/// A mistyped `kick_timer` alias on its own names `kick_timer`, as a mistyped
+/// `auto_start` names `auto_start`.
+#[test]
+fn a_mistyped_kick_timer_alias_names_kick_timer() {
+    let _home = HomeSandbox::new();
+    let body = "kick_timer = \"x\"\n";
+    let path = profile_config_path(&ProfileName::from("aliasmistyped")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("aliasmistyped".to_string(), None, None);
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "kick_timer");
+}
+
+/// A file whose last line has no newline: an appended root key starts its own
+/// line instead of joining the last comment, and the reload reads it.
+#[test]
+fn an_appended_key_after_a_last_line_with_no_newline_starts_its_own_line() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("nonl", "# my config");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my config\ndisabled = true\n"
+    );
+    assert!(load_profile(&ProfileName::from("nonl")).unwrap().disabled);
+}
+
+/// The same for an appended table: its header starts its own line, and the
+/// reload reads the table.
+#[test]
+fn an_appended_table_after_a_last_line_with_no_newline_starts_its_own_line() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("nonltable", "# note");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.starts_with("# note\n"), "{after}");
+    assert!(after.lines().any(|l| l == "[console]"), "{after}");
+    let reloaded = load_profile(&ProfileName::from("nonltable")).unwrap();
+    assert_eq!(reloaded.console.map(|c| c.token), Some("t0k".to_string()));
+}
+
+/// An example whose doc block sits after a table header cannot hold a root
+/// key: the key appends at the root, the block stays as written, and the unset
+/// gives the file back byte for byte.
+#[test]
+fn an_example_inside_a_tables_area_is_no_site_for_a_root_key() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[env]\nA = \"b\"\n\n{}# disabled = true\n\n[models]\ndefault = \"x\"\n",
+        scalar_doc("disabled")
+    );
+    let (mut profile, path) = hand_written_config("intable", &body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("disabled = true\n{body}")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// Pins every key's and table's current doc block by digest. The list test
+/// above cannot catch a reword, since `known_doc_blocks` starts from the very
+/// `doc_block_for` it checks; a reword that forgets to keep the old text
+/// strands every file's example toggle, and turns this digest red.
+#[test]
+fn every_current_doc_block_matches_its_pinned_digest() {
+    let pinned: BTreeMap<&str, &str> = [
+        (
+            "base_url",
+            "4f7d51d85ca5c284c6f4c6ece92ae9fbe4f1605fcec0287c3fb42f276f0cce0f",
+        ),
+        (
+            "api_key",
+            "945c16add014d73d50c4020b935205f4ba666a25287a1c29808db1861714b9d6",
+        ),
+        (
+            "auto_start",
+            "084d495e4f87c5c5fd5cd7a2cfe3b25de4952706ced338e60708f5465de62266",
+        ),
+        (
+            "fallback_threshold",
+            "0c070a2c69a7845aa1f46af795972817494d8a4b3a8d5a1f5438b07c876de77c",
+        ),
+        (
+            "weekly_threshold",
+            "c15467bc285c5aa05a8623a2b62205de50e3cc2e687e56cc88a9beb4f49eccae",
+        ),
+        (
+            "last_resort",
+            "9eb0d826508b3f0c62713a70b7655fa3569ab01cc1eff2cdedafc68e3933cc8d",
+        ),
+        (
+            "preferred",
+            "21ab90245e81e1ee27e2aa344084166a32ad1e81025c9f6a7e05c702bb4cd31c",
+        ),
+        (
+            "preferred_days",
+            "fd83d4867fb64b1be1e65d7fb4b2f2e2de0a84cfe84abba1a2dc7b25b78a5cfc",
+        ),
+        (
+            "rolling_token",
+            "c46cddebec5c30ab676b4d85eaaa9bc8f271d6a538e6f7d2ad1d0b04d5b8b7f6",
+        ),
+        (
+            "max_auto_spend",
+            "97f6df3ff75bfcd230c82eb74ae4e47a59de928c80ddce12917ffb375546672c",
+        ),
+        (
+            "check_weekly",
+            "c8bc09f45420250ac4fae943518ae5a23c3d3255a7ece3d90bdbeab3322f669b",
+        ),
+        (
+            "check_scoped",
+            "83c495c4a4e4454eefd6aa21f2b3332af553a89b21ee1fac55793658f795425c",
+        ),
+        (
+            "check_credit_cap",
+            "2cb02778fc772da97e63225c5cbdac1e6bde2ceb02f1989ac78e154eb991a4f7",
+        ),
+        (
+            "bell_threshold",
+            "572f681c3db92cfd56a2be24ec132c722ab7262b7c27b11bb8861e35eede469e",
+        ),
+        (
+            "disabled",
+            "c7135e357c78e98ebb2da8705ee8a860c347dced15df33b4d9c331c0b7a098e6",
+        ),
+        (
+            "console",
+            "5c19e4ad7198513ecb3bb72ccdf09df4c4bb876409fc8c33f8ae07d3468095f2",
+        ),
+        (
+            "models",
+            "e78621e5af6280a96a02d27a4c6e7e36065aea5c534c0263c73dfb7bdf670267",
+        ),
+        (
+            "env",
+            "3c8dd7e97666430944d5448fc7aa02d9409393d25f9d3aeadb5b6bb4c305ced7",
+        ),
+    ]
+    .into_iter()
+    .collect();
+    for key in MODELLED_SCALARS
+        .iter()
+        .copied()
+        .chain(["console", "models", "env"])
+    {
+        let Some(&digest) = pinned.get(key) else {
+            panic!("`{key}` has no pinned doc digest: add its row");
+        };
+        let text = doc_block_for(key);
+        assert_eq!(
+            hex::encode(Sha256::digest(text.as_bytes())),
+            digest,
+            "the `{key}` doc block changed: push the previous text onto known_doc_blocks(\"{key}\"), then update this digest"
+        );
+    }
+}
+
+/// Sets `disabled` over `body`, asserts the file reads `expected`, then unsets
+/// it and asserts the file is `body` again, byte for byte.
+fn assert_disabled_round_trip(name: &str, body: &str, expected: &str) {
+    let (mut profile, path) = hand_written_config(name, body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// An example in the text after a table's last key sits in that table's
+/// area: no site for a root key, which appends at the root.
+#[test]
+fn an_example_after_a_tables_body_is_no_site_for_a_root_key() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[env]\nA = \"b\"\n\n{}# disabled = true\n",
+        scalar_doc("disabled")
+    );
+    assert_disabled_round_trip("aftertable", &body, &format!("disabled = true\n{body}"));
+}
+
+/// An array of tables is a header too: with `[[extra]]` first, an example
+/// above `[models]` sits in a table's area and the root key appends.
+#[test]
+fn an_array_of_tables_first_makes_the_next_tables_prefix_a_tables_area() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[[extra]]\nk = 1\n\n{}# disabled = true\n[models]\ndefault = \"x\"\n",
+        scalar_doc("disabled")
+    );
+    assert_disabled_round_trip("aotfirst", &body, &format!("disabled = true\n{body}"));
+}
+
+/// A dotted root key (`env.A = "b"`) opens no header: an example above the
+/// first real header is root level and toggles in place.
+#[test]
+fn a_dotted_root_key_is_not_the_first_table() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("disabled");
+    let body = format!("env.A = \"b\"\n\n{doc}# disabled = true\n[models]\ndefault = \"x\"\n");
+    let expected = format!("env.A = \"b\"\n\n{doc}disabled = true\n[models]\ndefault = \"x\"\n");
+    assert_disabled_round_trip("dottedfirst", &body, &expected);
+}
+
+/// A file whose only header is an array of tables: the comment after its body
+/// stays in the array's area and the key appends above the header.
+#[test]
+fn an_array_of_tables_only_file_keeps_its_trailing_comment_in_place() {
+    let _home = HomeSandbox::new();
+    let body = "[[extra]]\nk = 1\n# note\n";
+    assert_disabled_round_trip("aotonly", body, &format!("disabled = true\n{body}"));
+}
+
+/// A file whose only table is dotted keys opens no header: the key appends
+/// at the end, after the trailing comment.
+#[test]
+fn a_dotted_only_file_appends_the_key_after_its_trailing_comment() {
+    let _home = HomeSandbox::new();
+    let body = "env.A = \"b\"\n# note\n";
+    assert_disabled_round_trip("dottedonly", body, &format!("{body}disabled = true\n"));
+}
+
+/// Unsetting a key whose next root item is a dotted key keeps the comment
+/// above the unset key: it moves onto the dotted line, which renders it.
+#[test]
+fn an_unset_before_a_dotted_key_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "dottednext",
+            "# my note\ndisabled = true\nenv.A = \"b\"\n",
+            "# my note\nenv.A = \"b\"\n",
+        ),
+        (
+            "nesteddottednext",
+            "# my note\ndisabled = true\nx.y.z = 1\n",
+            "# my note\nx.y.z = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.disabled = false;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// Clearing a table subkey whose next subkey is dotted keeps the comment
+/// above the cleared one: it moves onto the dotted line, which renders it.
+#[test]
+fn clearing_a_subkey_before_a_dotted_subkey_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "dottedsub",
+            "[models]\n# my note\ndefault = \"x\"\nextra.x = 1\n",
+            "[models]\n# my note\nextra.x = 1\n",
+        ),
+        (
+            "nesteddottedsub",
+            "[models]\n# my note\ndefault = \"x\"\nextra.y.z = 1\n",
+            "[models]\n# my note\nextra.y.z = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.models.default = None;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
     }
 }
