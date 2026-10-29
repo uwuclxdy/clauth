@@ -16,6 +16,7 @@
 - [Daemon](Daemon)
 - [Claude Code plugin](Claude-Code-Plugin)
 - [herdr plugin](Herdr-Plugin)
+- [Rex plugin](Rex-Plugin)
 
 **Help**
 - [FAQ](FAQ)
