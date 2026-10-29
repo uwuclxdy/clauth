@@ -17,6 +17,7 @@ The [README](https://github.com/uwuclxdy/clauth#readme) is the tour. This wiki i
 | [Daemon](Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
 | [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its four tools, `delegate` in full, answering a session from your phone |
 | [herdr plugin](Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
+| [Rex plugin](Rex-Plugin) | Claude Code panes through clauth in Rex (beta), the dashboard, the per-pane account label |
 | [Tokens and cost](Tokens-And-Cost) | where the token dashboard reads from, what the cost figure means |
 | [Security](Security) | where credentials live, what a switch touches, the platform split |
 | [FAQ](FAQ) | common questions and what to check when something misbehaves |
