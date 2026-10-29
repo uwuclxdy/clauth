@@ -20382,3 +20382,131 @@ fn the_owned_witness_needs_a_row() {
     fs::create_dir_all(&runtime).expect("runtime");
     assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
 }
+
+/// The live-session walk keeps live Claude rows whose tree exists, records
+/// the member each is on, reaches a background row's `runtime-bg`, and skips
+/// codex rows, dead rows, rows without a tree and duplicates of one tree.
+#[test]
+fn live_session_runtime_dirs_lists_live_claude_trees_only() {
+    let _home = HomeSandbox::new();
+    let acct = crate::profile::ProfileName::from("acct");
+    let tree = |sid: &str| {
+        let [real, _] = session_runtime_trees(&acct, false, sid).expect("trees");
+        real
+    };
+
+    // Live, swapped onto another member, with a tree.
+    let mut swapped = crate::testutil::live_row("801-0", "acct");
+    swapped.current_member = Some("other".to_string());
+    crate::live_sessions::register(&swapped).expect("register");
+    let _swapped_marker =
+        hold_session_row_marker(&crate::profile::ProfileName::from("other"), false, "801-0")
+            .expect("marker");
+    fs::create_dir_all(tree("801-0")).expect("tree");
+
+    // Live but its tree was never built.
+    crate::live_sessions::register(&crate::testutil::live_row("802-0", "acct")).expect("register");
+    let _treeless = hold_session_row_marker(&acct, false, "802-0").expect("marker");
+
+    // A dead row with a tree.
+    crate::live_sessions::register(&crate::testutil::live_row("803-0", "acct")).expect("register");
+    fs::create_dir_all(tree("803-0")).expect("tree");
+
+    // A codex row.
+    let mut codex = crate::testutil::live_row("804-0", "acct");
+    codex.harness = crate::harness::Harness::Codex;
+    crate::live_sessions::register(&codex).expect("register");
+    let _codex_marker = hold_session_row_marker(&acct, false, "804-0").expect("marker");
+    fs::create_dir_all(tree("804-0")).expect("tree");
+
+    // A background row on the account's shared tree.
+    let mut bg = crate::testutil::live_row("805-0", "acct");
+    bg.background = true;
+    crate::live_sessions::register(&bg).expect("register");
+    let bg_tree = background_runtime_tree(&acct).expect("bg tree");
+    fs::create_dir_all(&bg_tree).expect("bg tree");
+    let _bg_marker = hold_background_row_marker(&acct, "805-0").expect("bg marker");
+
+    let mut live = live_session_runtime_dirs();
+    live.sort_by(|a, b| a.session.cmp(&b.session));
+    let sessions: Vec<&str> = live.iter().map(|l| l.session.as_str()).collect();
+    assert!(sessions.contains(&"801-0"), "{live:?}");
+    assert!(!sessions.contains(&"802-0"), "no tree: {live:?}");
+    assert!(!sessions.contains(&"803-0"), "dead: {live:?}");
+    assert!(!sessions.contains(&"804-0"), "codex: {live:?}");
+    let swapped = live.iter().find(|l| l.session == "801-0").expect("swapped");
+    assert_eq!(
+        swapped.profile.as_str(),
+        "other",
+        "the member, not the start profile"
+    );
+    assert!(!swapped.background);
+    let bg = live
+        .iter()
+        .find(|l| l.session == "805-0")
+        .expect("background row");
+    assert!(bg.background);
+    assert_eq!(bg.runtime, bg_tree);
+}
+
+/// The queue keeps one entry per revoked bearer and member, and a drain that
+/// cannot run (no Keychain under test, or off macOS) leaves it as it was; the
+/// daemon's detached drain is a no-op under test.
+#[test]
+fn the_revoked_bearer_queue_dedupes_and_survives_a_drain_that_cannot_run() {
+    let _ = take_revoked_bearers();
+    let a = crate::profile::ProfileName::from("a");
+    let b = crate::profile::ProfileName::from("b");
+    note_revoked_rolling_bearer(&a, "old".to_string());
+    note_revoked_rolling_bearer(&a, "old".to_string());
+    note_revoked_rolling_bearer(&b, "old".to_string());
+    note_revoked_rolling_bearer(&a, "older".to_string());
+    repoint_copied_bearers();
+    repoint_copied_bearers_detached();
+    assert_eq!(
+        take_revoked_bearers(),
+        vec![
+            (a.clone(), "old".to_string()),
+            (b, "old".to_string()),
+            (a, "older".to_string()),
+        ]
+    );
+    assert!(take_revoked_bearers().is_empty(), "taking empties it");
+}
+
+/// The adopting witness refuses a tree the session does not own, records
+/// nothing then, and refuses while a sweep's delete of the item is in flight.
+#[test]
+fn the_adopting_witness_refuses_foreign_trees_and_in_flight_deletes() {
+    let home = HomeSandbox::new();
+    let profile = crate::profile::ProfileName::from("acct");
+    let foreign = home.home().join("my-claude");
+    fs::create_dir_all(&foreign).expect("foreign");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "806-0", false)
+            .is_err()
+    );
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-806-0");
+    fs::create_dir_all(&runtime).expect("runtime");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "806-1", false)
+            .is_err(),
+        "another session's id"
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+    let service =
+        crate::claude::namespaced_keychain_service(&runtime.canonicalize().expect("canonical"));
+    let _in_flight =
+        with_state_lock(|_held| namespaced_keychain_ledger::record_in_flight_locked(&service))
+            .expect("stamp");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "806-0", false)
+            .is_err()
+    );
+    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
+}
