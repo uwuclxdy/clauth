@@ -15,7 +15,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
         codex=$(clauth __complete --codex 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr rex proxy presets completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -71,6 +71,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "rex" ]; then
+        COMPREPLY=( $(compgen -W "install uninstall" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "rex" ] && { [ "${COMP_WORDS[2]}" = "install" ] || [ "${COMP_WORDS[2]}" = "uninstall" ]; } && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "proxy" ]; then
         COMPREPLY=( $(compgen -W "list enable disable check" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "enable" ] && [ "${cur:0:2}" = "--" ]; then
@@ -150,6 +154,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
+            'rex[install the Rex plugin or uninstall it]' \
             'proxy[register clauth-compatible proxies and check them against the contract]' \
             'presets[built-in preset maintenance]' \
             'completions[emit shell completion script]'
@@ -194,6 +199,11 @@ _clauth() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == rex ]]; then
+        _values 'subcommand' 'install[write the plugin beside Rex'"'"'s init.lua and load it]' \
+            'uninstall[remove the plugin and the block install added]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == rex && "${words[3]}" == (install|uninstall) ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
         _values 'subcommand' 'list[show every clauth proxy on PATH or registered, with its live state]' \
             'enable[record a proxy found on PATH, for the daemon to run]' \
@@ -358,6 +368,10 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n __fish_is_first_token -a rex -d "Install the Rex plugin or uninstall it"
+complete -c clauth -f -n "__fish_seen_subcommand_from rex; and not __fish_seen_subcommand_from install uninstall" -a install -d "Write the plugin beside Rex's init.lua and load it"
+complete -c clauth -f -n "__fish_seen_subcommand_from rex; and not __fish_seen_subcommand_from install uninstall" -a uninstall -d "Remove the plugin and the block install added"
+complete -c clauth -f -n "__fish_seen_subcommand_from rex; and __fish_seen_subcommand_from install uninstall" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
 complete -c clauth -f -n __fish_is_first_token -a presets -d "Built-in preset maintenance"
 complete -c clauth -f -n "__fish_seen_subcommand_from presets" -a rebind -d "Move accounts onto the model ids the built-in presets bind now"

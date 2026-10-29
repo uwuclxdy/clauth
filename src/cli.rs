@@ -431,6 +431,19 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Set the Rex plugin up, or take it back out
+    ///
+    /// `clauth rex install` writes the plugin bundled in this binary to
+    /// `clauth/` beside Rex's `init.lua` and appends one marked
+    /// `require("clauth")` block that loads it. The plugin opens Claude Code
+    /// through `clauth start`, shows the dashboard in a floating pane, and
+    /// labels each pane with the account it spends. Rex is in beta.
+    /// `clauth rex uninstall` takes the block and the files back out.
+    Rex {
+        #[command(subcommand)]
+        cmd: RexCommand,
+    },
+
     /// Work with clauth-compatible proxies
     ///
     /// A clauth proxy is a separate `clauth-<service>-proxy` process that sits
@@ -762,6 +775,28 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth rex <cmd>`: install and uninstall the Rex plugin.
+#[derive(Subcommand, Debug)]
+pub(crate) enum RexCommand {
+    /// Write the plugin beside Rex's init.lua and load it
+    ///
+    /// Rerun it after upgrading clauth to refresh the plugin files. A plugin
+    /// directory clauth did not write, or a symlink onto a checkout, refuses
+    /// the install rather than being overwritten.
+    Install {
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Remove the plugin and the block install added to init.lua
+    Uninstall {
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

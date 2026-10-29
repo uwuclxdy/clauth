@@ -55,6 +55,7 @@ mod proxy;
 mod proxy_check;
 mod proxy_list;
 mod push;
+mod rex;
 mod runtime;
 mod session_record;
 mod sessions;
@@ -368,6 +369,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::OauthToken { profile } => cmd_oauth_token(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Rex { cmd } => match cmd {
+            cli::RexCommand::Install { yes } => rex::install(yes),
+            cli::RexCommand::Uninstall { yes } => rex::uninstall(yes),
+        },
         Command::Proxy { cmd } => cmd_proxy(cmd),
         Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
