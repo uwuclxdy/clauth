@@ -3128,3 +3128,492 @@ fn envelope_prose_names_denials_and_marks_the_unreadable() {
     let empty = serde_json::json!({"result": "ok", "permission_denials": []});
     assert!(!envelope_prose(&empty).contains("permission denials"));
 }
+
+// ── hook refusals vs permission denials ─────────────────────────────────────
+
+const SPLIT_SLUG: &str = "-w-split";
+
+/// Write a fixture transcript under the sandbox's `~/.claude/projects/` store,
+/// one JSON value per line. The lookup resolves it by the filename stem.
+fn write_transcript(home: &crate::testutil::HomeSandbox, session_id: &str, lines: &[Value]) {
+    let dir = home.home().join(".claude/projects").join(SPLIT_SLUG);
+    std::fs::create_dir_all(&dir).unwrap();
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(transcript_path(home, session_id), body).unwrap();
+}
+
+fn transcript_path(home: &crate::testutil::HomeSandbox, session_id: &str) -> std::path::PathBuf {
+    home.home()
+        .join(".claude/projects")
+        .join(SPLIT_SLUG)
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// A `tool_result` content as a string: the shape the child writes for a hook
+/// refusal.
+fn text(body: &str) -> Value {
+    Value::String(body.to_string())
+}
+
+/// One transcript `tool_result` line: the user message carrying the child's
+/// answer to a `tool_use` id. `content` is the block's own content value, so
+/// both a string and a `[{ "type": "text", … }]` array are expressible.
+fn tool_result_line(tool_use_id: &str, is_error: bool, content: Value) -> Value {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "is_error": is_error,
+                "content": content,
+            }]
+        }
+    })
+}
+
+fn denial_entry(tool_name: &str, tool_use_id: &str) -> Value {
+    serde_json::json!({
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "tool_input": {},
+    })
+}
+
+/// The `Edit` refusals a `PreToolUse` hook leaves behind are split out of the
+/// permission clause, and the split rides the envelope: the receipt still
+/// reads it after the transcript is gone.
+#[test]
+fn envelope_prose_splits_hook_refusals_from_permission_denials() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "split-session";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_hook_1",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+            tool_result_line(
+                "call_hook_2",
+                true,
+                text("PreToolUse:Edit hook error: refused once: clean-rust is not loaded"),
+            ),
+            // A deny-rule denial has no transcript row; these two rows pin what
+            // the match must not take: a non-error result, and an id no denial
+            // names.
+            tool_result_line(
+                "call_deny_1",
+                false,
+                text("PreToolUse:Grep hook error: a non-error result is not a refusal"),
+            ),
+            tool_result_line(
+                "call_other",
+                true,
+                text("PreToolUse:Bash hook error: an id no denial names"),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope[crate::mcp::render::HOOK_REFUSAL_IDS],
+        serde_json::json!(["call_hook_1", "call_hook_2"]),
+        "only the denial ids with an is_error `PreToolUse` row are stamped"
+    );
+    // The classification is stored, not re-read: the receipt still splits with
+    // no transcript left on disk.
+    std::fs::remove_file(transcript_path(&home, sid)).unwrap();
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `split-session`; hook refusals: Edit 2 times; \
+         permission denials: Grep"
+    );
+}
+
+/// No transcript for the session id: one permission clause.
+#[test]
+fn envelope_prose_keeps_one_permission_clause_without_a_transcript() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": "no-such-session",
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `no-such-session`; permission denials: Edit 2 \
+         times, Grep"
+    );
+}
+
+/// Every denial is a hook refusal: the permission clause drops rather than
+/// reading empty.
+#[test]
+fn envelope_prose_drops_the_permission_clause_when_only_hook_refusals_remain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "only-hooks";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_hook_1",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+            tool_result_line(
+                "call_hook_2",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `only-hooks`; hook refusals: Edit 2 times"
+    );
+}
+
+/// The classifier reads the transcript; the envelope's own
+/// `permission_denials` array is left exactly as the child reported it.
+#[test]
+fn classify_leaves_the_permission_denials_field_untouched() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "untouched";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_hook_1",
+            true,
+            text("PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call."),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    let original = envelope["permission_denials"].clone();
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(envelope["permission_denials"], original);
+}
+
+/// The text must START with the hook's own prefix: a tool error that merely
+/// quotes a whole hook message mid-text stays a permission denial. The fixture
+/// carries the full refusal shape — prefix and ` hook error:` wording — so a
+/// matcher that looks anywhere in the text reds.
+#[test]
+fn classify_requires_the_pretooluse_prefix_at_the_start() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "prefix-not-at-start";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_quoted",
+            true,
+            text("Error: rg exited 2 matching PreToolUse:Edit hook error: x"),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Grep", "call_quoted")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `prefix-not-at-start`; permission denials: Grep"
+    );
+}
+
+/// The prefix alone is not the refusal shape: a `PreToolUse:` line without the
+/// child's `<tool> hook error:` wording stays a permission denial.
+#[test]
+fn classify_requires_the_hook_error_wording() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "not-a-hook-error";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_warning",
+            true,
+            text("PreToolUse:Edit hook warning: not a refusal"),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_warning")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `not-a-hook-error`; permission denials: Edit"
+    );
+}
+
+/// ` hook error:` must follow the `PreToolUse:<tool>` token directly: wording
+/// that slips further along the text, and a lead that names no tool, are both
+/// something other than the refusal.
+#[test]
+fn classify_requires_the_hook_error_wording_directly_after_the_tool() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "wording-not-direct";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_warning_then_error",
+                true,
+                text("PreToolUse:Edit hook warning: the hook error: x"),
+            ),
+            tool_result_line(
+                "call_no_tool",
+                true,
+                text("PreToolUse: hook error: no tool named"),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_warning_then_error"),
+            denial_entry("Edit", "call_no_tool"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `wording-not-direct`; permission denials: Edit 2 \
+         times"
+    );
+}
+
+/// The child writes a hook error's `tool_result` content as text blocks too, not
+/// only as a string; both shapes classify.
+#[test]
+fn classify_reads_a_tool_result_content_block_array() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "content-blocks";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_hook_1",
+            true,
+            serde_json::json!([{
+                "type": "text",
+                "text": "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+            }]),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope[crate::mcp::render::HOOK_REFUSAL_IDS],
+        serde_json::json!(["call_hook_1"])
+    );
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `content-blocks`; hook refusals: Edit; permission \
+         denials: Grep"
+    );
+}
+
+/// Only a `tool_result` block answers a tool call: a text block carrying the
+/// same id, even beside a `tool_result` word, never classifies.
+#[test]
+fn classify_requires_the_tool_result_block_type() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "block-type";
+    write_transcript(
+        &home,
+        sid,
+        &[serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "tool_result PreToolUse: a note, not a block"},
+                    {
+                        "type": "text",
+                        "tool_use_id": "call_text",
+                        "is_error": true,
+                        "content": "PreToolUse:Edit hook error: not a tool_result block",
+                    },
+                ],
+            }
+        })],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_text")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `block-type`; permission denials: Edit"
+    );
+}
+
+/// An undecodable transcript line ends the scan: nothing is stamped and the
+/// single clause stands, rather than an error reaching the receipt.
+#[test]
+fn classify_returns_on_an_undecodable_transcript_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "undecodable-line";
+    std::fs::create_dir_all(home.home().join(".claude/projects").join(SPLIT_SLUG)).unwrap();
+    // An invalid-UTF-8 line, then a row that would classify: a scan that
+    // continued past the error would stamp, and a scan that returns does not.
+    let mut bytes = b"\xff\xfe\n".to_vec();
+    bytes.extend_from_slice(
+        tool_result_line(
+            "call_hook_1",
+            true,
+            text("PreToolUse:Edit hook error: after the bad line"),
+        )
+        .to_string()
+        .as_bytes(),
+    );
+    bytes.push(b'\n');
+    std::fs::write(transcript_path(&home, sid), bytes).unwrap();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `undecodable-line`; permission denials: Edit, Grep"
+    );
+}
+
+/// A read error that never clears ends the scan too: the classification returns
+/// instead of spinning on the same line.
+#[cfg(unix)]
+#[test]
+fn classify_returns_on_a_persistent_read_error() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "persistent-error";
+    let dir = home.home().join(".claude/projects").join(SPLIT_SLUG);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Opening a directory succeeds; reading it fails with `Is a directory`
+    // forever. `collect_jsonl` pushes the link because its name ends `.jsonl`.
+    let target = dir.join("a-directory");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, transcript_path(&home, sid)).unwrap();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_hook_1")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `persistent-error`; permission denials: Edit"
+    );
+}
+
+/// A reader whose `fill_buf` fails on every call gets one read attempt: the
+/// scan returns `None` on the first error, so the work it can do is bounded by
+/// the reader, not by the error clearing. The reader counts its calls and
+/// panics past the bound, so a `continue` on the error reds this test instead
+/// of spinning the suite forever.
+#[test]
+fn scan_returns_after_one_failed_read() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct AlwaysFailing {
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl std::io::Read for AlwaysFailing {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("persistent read error"))
+        }
+    }
+
+    impl std::io::BufRead for AlwaysFailing {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let reads = self.reads.get() + 1;
+            self.reads.set(reads);
+            assert!(
+                reads <= 2,
+                "a read error must end the scan, not re-read the line"
+            );
+            Err(std::io::Error::other("persistent read error"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    let reads = Rc::new(Cell::new(0));
+    let reader = AlwaysFailing {
+        reads: Rc::clone(&reads),
+    };
+    assert_eq!(
+        crate::mcp::scan_hook_refusal_ids(reader, &["call_hook_1"]),
+        None,
+        "a read error ends the scan"
+    );
+    assert_eq!(reads.get(), 1, "one read attempt, then the scan returns");
+}

@@ -4292,6 +4292,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(projects_dir) = projects_dir {
         crate::sessions::stamp_run_sessions(opts.profile, &projects_dir, isolated, run_start);
     }
+    // This rescue must stay ahead of the `classify_run` call below: that
+    // classification resolves the run's transcript through the global store,
+    // and for an isolated run the rescue is what puts it there. Swapping the two
+    // silently drops the hook-refusal split from the receipt.
     if isolated && let Ok(claude_home) = crate::profile::claude_dir() {
         crate::start::rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
@@ -4504,11 +4508,13 @@ fn classify_run_with(
         };
     }
     match parse_delegate_envelope(stdout.trim()) {
-        // The envelope is the delegate's own self-report; the one field clauth
-        // may add is the id it pinned, when the child's envelope did not carry
-        // one — the same id, so the reply is never without a resume handle.
+        // The envelope is the delegate's own self-report; what clauth adds is
+        // the id it pinned, when the child's envelope did not carry one — the
+        // same id, so the reply is never without a resume handle — and the
+        // hook-refusal split beside `permission_denials`.
         Ok(mut envelope) => {
             stamp_session_id(&mut envelope, session_id);
+            classify_hook_refusals(&mut envelope);
             RunOutcome::Envelope {
                 envelope,
                 throttle_scan,
@@ -4536,6 +4542,140 @@ fn stamp_session_id(envelope: &mut serde_json::Value, session_id: &str) {
     if envelope.get("session_id").is_none() {
         envelope["session_id"] = serde_json::Value::String(session_id.to_string());
     }
+}
+
+/// Split the envelope's `permission_denials` by layer for the receipt.
+///
+/// Under `--dangerously-skip-permissions` the child still refuses through user
+/// `PreToolUse` hooks and `permissions.deny` rules, and its result JSON lists
+/// both in `permission_denials` with no layer. A hook refusal leaves a
+/// transcript `tool_result` for its own `tool_use_id` — `is_error`, its text
+/// starting `PreToolUse:<tool> hook error:` — which the agent usually retries
+/// past; a deny-rule denial leaves no transcript row at all. This stamps the
+/// hook-refused ids beside the untouched array, so the receipt names the layers
+/// apart from data the run already produced, once, when it finalizes.
+///
+/// The transcript is resolved from the envelope's own `session_id` through the
+/// global store, where an isolated run's teardown rescues it before the run
+/// finalizes, so an isolated run splits when the file is found, exactly as a
+/// shared one does. No transcript, or a read error, leaves the field unstamped
+/// and the receipt on the single `permission denials` clause; the
+/// classification never errors.
+fn classify_hook_refusals(envelope: &mut serde_json::Value) {
+    // The field is clauth's own: a child envelope carrying a key of that name
+    // must never be trusted unclassified.
+    if let Some(map) = envelope.as_object_mut() {
+        map.remove(render::HOOK_REFUSAL_IDS);
+    }
+    let Some(session_id) = envelope
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let Some(denials) = envelope
+        .get("permission_denials")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let ids: Vec<&str> = denials
+        .iter()
+        .filter_map(|entry| entry.get("tool_use_id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Some(session) = crate::sessions::find_session_top_level(session_id) else {
+        return;
+    };
+    let Ok(file) = std::fs::File::open(&session.path) else {
+        return;
+    };
+    let Some(hook_ids) = scan_hook_refusal_ids(std::io::BufReader::new(file), &ids) else {
+        return;
+    };
+    if !hook_ids.is_empty() {
+        envelope[render::HOOK_REFUSAL_IDS] = serde_json::json!(hook_ids);
+    }
+}
+
+/// Scans a transcript line by line for the denial ids whose `tool_result` block
+/// is an error carrying the hook's own `PreToolUse:<tool> hook error:` lead.
+/// Memory is bounded per line, and only a line that could carry one of the
+/// denied `tool_use_id`s is parsed into JSON.
+///
+/// `None` when a read fails: the scan stops on the first error, so a reader
+/// that keeps failing costs one read attempt, never a spin.
+fn scan_hook_refusal_ids(reader: impl std::io::BufRead, ids: &[&str]) -> Option<Vec<String>> {
+    let mut hook_ids: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        if !line.contains("tool_result")
+            || !line.contains("PreToolUse:")
+            || !ids.iter().any(|id| line.contains(id))
+        {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(blocks) = record
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !ids.contains(&id) || hook_ids.iter().any(|seen| seen == id) {
+                continue;
+            }
+            if block.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+            if !tool_result_text(block).is_some_and(is_hook_refusal_text) {
+                continue;
+            }
+            hook_ids.push(id.to_string());
+        }
+        if ids.iter().all(|id| hook_ids.iter().any(|seen| seen == id)) {
+            break;
+        }
+    }
+    Some(hook_ids)
+}
+
+/// A `tool_result` block's text: its own string, or the first text part of a
+/// content-block array.
+fn tool_result_text(block: &serde_json::Value) -> Option<&str> {
+    match block.get("content")? {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        other => other
+            .as_array()?
+            .iter()
+            .find_map(|part| part.get("text").and_then(serde_json::Value::as_str)),
+    }
+}
+
+/// Whether a `tool_result` text is the child's own wording for a user
+/// `PreToolUse` hook refusal: `PreToolUse:<tool> hook error: <reason>`, where
+/// the ` hook error:` wording follows the tool token directly and the tool is
+/// one whitespace-free name. The tool's own error can quote that text anywhere;
+/// only the exact lead is the refusal.
+fn is_hook_refusal_text(text: &str) -> bool {
+    text.strip_prefix("PreToolUse:")
+        .and_then(|rest| rest.split_once(" hook error:"))
+        .is_some_and(|(tool, _)| !tool.is_empty() && !tool.contains(char::is_whitespace))
 }
 
 /// The live-delegate guard a profile switch runs BEFORE any mutation: a switch

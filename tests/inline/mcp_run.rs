@@ -13167,3 +13167,132 @@ fn run_delegate_refuses_a_refused_setup_token_target_before_acquiring_a_runtime(
         "the refusal must happen before any runtime is acquired"
     );
 }
+
+// ── refusal split at the finalize seam ──────────────────────────────────────
+
+/// One transcript `tool_result` line: the user message carrying the child's
+/// `PreToolUse` refusal for `tool_use_id`.
+#[cfg(unix)]
+fn split_transcript_line(tool_use_id: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "is_error": true,
+                "content": "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+            }]
+        }
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn write_split_transcript(session_id: &str, projects: &std::path::Path, lines: &[String]) {
+    std::fs::create_dir_all(projects).unwrap();
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(projects.join(format!("{session_id}.jsonl")), body).unwrap();
+}
+
+#[cfg(unix)]
+fn split_denials() -> serde_json::Value {
+    serde_json::json!([
+        {"tool_name": "Edit", "tool_use_id": "call_hook_1", "tool_input": {}},
+        {"tool_name": "Grep", "tool_use_id": "call_deny_1", "tool_input": {}},
+    ])
+}
+
+/// The finalize seam classifies: a clean run's envelope is split by the time
+/// `run_delegate` hands it back, so the receipt carries the split to the job
+/// record and every later render.
+#[cfg(unix)]
+#[test]
+fn a_clean_envelope_splits_hook_refusals_at_the_finalize_seam() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home = HomeSandbox::new();
+    let sid = "seam-session";
+    write_split_transcript(
+        sid,
+        &home.home().join(".claude/projects/-w-seam"),
+        &[split_transcript_line("call_hook_1")],
+    );
+    let envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": split_denials(),
+    });
+    let capture = super::StreamCapture::from_raw(envelope.to_string().as_bytes());
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &capture,
+        "work",
+        sid,
+        None,
+    );
+    let super::RunOutcome::Envelope { envelope, .. } = outcome else {
+        panic!("a clean exit carrying an envelope classifies as one");
+    };
+    assert_eq!(
+        render::envelope_prose(&envelope),
+        "finished: ok; resume with session id `seam-session`; hook refusals: Edit; permission \
+         denials: Grep"
+    );
+}
+
+/// An isolated run's transcript is rescued into the global store before the run
+/// finalizes, so its receipt gets the same split as a shared run's.
+///
+/// Residual: no test seam reaches `run_delegate`, so this drives the rescue and
+/// the classification in the same order by hand. The order they run in inside
+/// `run_delegate` is unpinned here; only the comment at the rescue call site
+/// states it.
+#[cfg(unix)]
+#[test]
+fn an_isolated_run_splits_its_receipt_after_the_rescue() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home = HomeSandbox::new();
+    let sid = "isolated-session";
+    // The isolated runtime tree at teardown: the run's transcript is still in
+    // its own store, and a rescue is what moves it global.
+    let iso_root = home.home().join(".clauth/runtime/isolated-test");
+    write_split_transcript(
+        sid,
+        &iso_root.join("projects/-w-isolated"),
+        &[split_transcript_line("call_hook_1")],
+    );
+    let claude_home = home.home().join(".claude");
+    // No marker: the teardown's liveness gate sees no live sibling.
+    let sessions = home.home().join(".clauth/sessions");
+    let (moved, _) = crate::start::rescue_teardown(&iso_root, &sessions, &claude_home);
+    assert_eq!(
+        moved, 1,
+        "the isolated run's transcript is rescued before it finalizes"
+    );
+    let envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": split_denials(),
+    });
+    let capture = super::StreamCapture::from_raw(envelope.to_string().as_bytes());
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &capture,
+        "work",
+        sid,
+        None,
+    );
+    let super::RunOutcome::Envelope { envelope, .. } = outcome else {
+        panic!("a clean exit carrying an envelope classifies as one");
+    };
+    assert_eq!(
+        render::envelope_prose(&envelope),
+        "finished: ok; resume with session id `isolated-session`; hook refusals: Edit; \
+         permission denials: Grep"
+    );
+}

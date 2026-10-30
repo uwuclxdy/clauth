@@ -1483,14 +1483,16 @@ fn fmt_cost(cost: f64) -> String {
         .to_string()
 }
 
-/// The `permission_denials` field as a clause body, or `None` when the clause
-/// drops (absent, null, an empty list, or an empty string). A string renders
-/// as its own text. A list renders named tools once in first-seen order with
-/// a `N times` count when repeated, then any nameless entries as `N unnamed
-/// entries` after the named ones — `unnamed` is a spellable tool name, so the
-/// count keeps the synthetic group out of that namespace, and `entry` /
-/// `entries` pluralizes the group's own count. A present value of any other
-/// shape reads `(unreadable)`, so a denial the envelope carried is never
+/// The envelope field the finalize-time classification stamps: the
+/// `tool_use_id`s whose transcript `tool_result` is a user `PreToolUse` hook
+/// refusal. It rides the stored job record, so rendering a collected envelope
+/// never re-reads a transcript.
+pub(crate) const HOOK_REFUSAL_IDS: &str = "hook_refusal_ids";
+
+/// A denial list as a clause body, or `None` when the clause drops (absent,
+/// null, an empty list, or an empty string). A string renders as its own text.
+/// A list renders through [`denial_entries_names`]. A present value of any
+/// other shape reads `(unreadable)`, so a denial the envelope carried is never
 /// invisible.
 fn denial_names(denials: Option<&Value>) -> Option<String> {
     let value = denials?;
@@ -1503,12 +1505,22 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
     let Some(arr) = value.as_array() else {
         return Some("(unreadable)".to_string());
     };
-    if arr.is_empty() {
+    denial_entries_names(&arr.iter().collect::<Vec<_>>())
+}
+
+/// A set of denial entries as a clause body, or `None` when the set is empty.
+/// Named tools render once in first-seen order with a `N times` count when
+/// repeated, then any nameless entries as `N unnamed entries` after the named
+/// ones — `unnamed` is a spellable tool name, so the count keeps the synthetic
+/// group out of that namespace, and `entry` / `entries` pluralizes the group's
+/// own count.
+fn denial_entries_names(entries: &[&Value]) -> Option<String> {
+    if entries.is_empty() {
         return None;
     }
     let mut named: Vec<(String, usize)> = Vec::new();
     let mut unnamed = 0usize;
-    for entry in arr {
+    for entry in entries {
         let name = entry
             .get("tool_name")
             .and_then(Value::as_str)
@@ -1534,6 +1546,45 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
         });
     }
     Some(parts.join(", "))
+}
+
+/// The receipt's denial clauses split by layer, as `(hook refusals, permission
+/// denials)`, each `None` when empty.
+///
+/// An entry whose `tool_use_id` sits in [`HOOK_REFUSAL_IDS`] was refused by a
+/// user `PreToolUse` hook — enforcement the `--dangerously-skip-permissions`
+/// flag does not bypass, and one the agent usually retried past. Every other
+/// entry, a `permissions.deny` rule's or one carrying no id to look up, stays a
+/// permission denial. Without the stamp (no transcript found, an unreadable
+/// one, or a denial value that is not a list) the whole list stays in the
+/// permission clause.
+fn denial_clauses(e: &Value) -> (Option<String>, Option<String>) {
+    let denials = e.get("permission_denials");
+    let hook_ids: Vec<&str> = e
+        .get(HOOK_REFUSAL_IDS)
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(arr) = denials.and_then(Value::as_array) else {
+        return (None, denial_names(denials));
+    };
+    if hook_ids.is_empty() {
+        return (None, denial_names(denials));
+    }
+    let mut hooks: Vec<&Value> = Vec::new();
+    let mut others: Vec<&Value> = Vec::new();
+    for entry in arr {
+        let is_hook = entry
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| hook_ids.contains(&id));
+        if is_hook {
+            hooks.push(entry);
+        } else {
+            others.push(entry);
+        }
+    }
+    (denial_entries_names(&hooks), denial_entries_names(&others))
 }
 
 /// The cost clause an envelope earns: ` (cost $X)`, ` (equivalent Anthropic API
@@ -1705,7 +1756,11 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
     if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
         out.push_str(&format!("; resume with session id `{sid}`"));
     }
-    if let Some(names) = denial_names(e.get("permission_denials")) {
+    let (hook_refusals, permission_denials) = denial_clauses(e);
+    if let Some(names) = hook_refusals {
+        out.push_str(&format!("; hook refusals: {names}"));
+    }
+    if let Some(names) = permission_denials {
         out.push_str(&format!("; permission denials: {names}"));
     }
     out
