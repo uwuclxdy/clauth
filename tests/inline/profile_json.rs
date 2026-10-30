@@ -238,12 +238,13 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
     // The fresh direction at a DATED body: a live fetch younger than the
     // threshold reads not-stale on the same surface that publishes the marker,
     // so the flag cannot flip to "always stale once dated" and pass.
+    let t0 = crate::usage::now_ms();
     seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(60));
     let fresh = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
     assert!(!fresh.stale(), "a body fetched a minute ago is current");
     let age = fresh.age_secs().expect("a dated body publishes its age");
     assert!(
-        (55..=65).contains(&age),
+        (55..=65 + (crate::usage::now_ms() - t0) / 1000).contains(&age),
         "the fresh direction is exercised at a real dated age: {age}s"
     );
 

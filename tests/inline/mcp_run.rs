@@ -5102,16 +5102,13 @@ fn a_heartbeat_reaches_a_running_check() {
     );
 
     // An EPOCH stamp, the same anchor `started_at` carries: 4s ago.
-    jobs::write_heartbeat(
-        &spec,
-        now_ms() - 4000,
-        "clippy clean, 0 warnings. moving on",
-    )
-    .unwrap();
+    let t0 = now_ms();
+    jobs::write_heartbeat(&spec, t0 - 4000, "clippy clean, 0 warnings. moving on").unwrap();
     let text = monitor_text("d-beat-0");
     let ago = rendered_secs(&text, "last output ");
+    let slack = (now_ms() - t0) / 1000;
     assert!(
-        (4..=5).contains(&ago),
+        (4..=5 + slack).contains(&ago),
         "the heartbeat's stamp reaches the check: 4s at the write, so 4 or 5 by \
          the read: {text}",
     );
@@ -5139,7 +5136,8 @@ fn a_heartbeat_reaches_a_running_check() {
 #[test]
 fn both_deadlines_reach_a_running_check() {
     let _home = HomeSandbox::new();
-    let started_at = now_ms() - 700_000;
+    let t0 = now_ms();
+    let started_at = t0 - 700_000;
     jobs::write_running(&jobs::RunningSpec {
         started_at,
         timeout_secs: 3600,
@@ -5148,9 +5146,10 @@ fn both_deadlines_reach_a_running_check() {
     })
     .unwrap();
     let text = monitor_text("d-dl-0");
+    let slack = (now_ms() - t0) / 1000;
     let wall = rendered_secs(&text, "wall-kill in ");
     assert!(
-        (2899..=2900).contains(&wall),
+        (2899 - slack..=2900).contains(&wall),
         "the wall clock counts down from the recorded 3600s ceiling, 700s in: {text}",
     );
     assert!(
@@ -5172,9 +5171,10 @@ fn both_deadlines_reach_a_running_check() {
         !text.contains("idle-kill"),
         "a record with no idle deadline renders no idle countdown: {text}",
     );
+    let slack = (now_ms() - t0) / 1000;
     let wall = rendered_secs(&text, "wall-kill in ");
     assert!(
-        (199..=200).contains(&wall),
+        (199 - slack..=200).contains(&wall),
         "the wall clock is still recorded, counting down from 900s: {text}",
     );
 
@@ -5215,17 +5215,19 @@ fn a_run_with_no_wall_clock_still_reports_its_idle_countdown_and_tail() {
         idle_secs: Some(300),
         ..running_spec("d-nowall-0", "DS0", started_at)
     };
-    jobs::write_heartbeat(&spec, now_ms() - 4000, "moving to the fallback tests").unwrap();
+    let t0 = now_ms();
+    jobs::write_heartbeat(&spec, t0 - 4000, "moving to the fallback tests").unwrap();
 
     let text = monitor_text("d-nowall-0");
+    let slack = (now_ms() - t0) / 1000;
     let idle = rendered_secs(&text, "idle-kill in ");
     assert!(
-        (295..=296).contains(&idle),
+        (295 - slack..=296).contains(&idle),
         "the idle guard is the only deadline left, and it still counts down: {text}",
     );
     let ago = rendered_secs(&text, "last output ");
     assert!(
-        (4..=5).contains(&ago),
+        (4..=5 + slack).contains(&ago),
         "the heartbeat's stamp still reaches the check: {text}",
     );
     assert!(

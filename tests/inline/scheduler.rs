@@ -1633,6 +1633,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
         REFRESH_INTERVAL_MS,
         |entry| cached_outcome(&entry.name),
     );
+    let after = super::now_ms();
     {
         let activity = oauth.activity.lock().unwrap();
         let state = activity.get("hybrid").expect("provider activity survives");
@@ -1644,7 +1645,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     }
     let oauth_next = oauth.next_refresh_per_profile.lock().unwrap()[&oauth_key("hybrid")];
     assert!(
-        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000).contains(&oauth_next),
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&oauth_next),
         "OAuth completion publishes its own cadence deadline: {oauth_next}"
     );
 
@@ -1656,6 +1657,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     );
     let before = super::now_ms();
     fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
+    let after = super::now_ms();
     {
         let activity = provider.activity.lock().unwrap();
         let state = activity.get("hybrid").expect("OAuth activity survives");
@@ -1667,8 +1669,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     }
     let provider_next = provider.next_refresh_per_profile.lock().unwrap()[&tp_key("hybrid")];
     assert!(
-        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000)
-            .contains(&provider_next),
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&provider_next),
         "provider completion publishes its own cadence deadline: {provider_next}"
     );
 }
@@ -4742,9 +4743,8 @@ fn row_on(member: &str, families: &str) -> crate::live_sessions::LiveSession {
     row
 }
 
-/// A successful turn `ms_ago` old, served under message id `id`.
-fn served_row(ms_ago: u64, id: &str) -> String {
-    let ms = crate::usage::now_ms().saturating_sub(ms_ago);
+/// A successful turn at exactly `ms` epoch ms, served under message id `id`.
+fn served_row_at(ms: u64, id: &str) -> String {
     let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
         .unwrap()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -4756,6 +4756,13 @@ fn served_row(ms_ago: u64, id: &str) -> String {
             "usage": {"input_tokens": 10, "output_tokens": 500}},
     })
     .to_string()
+}
+
+/// A successful turn `ms_ago` old, served under message id `id`. A test
+/// ordering this turn against another fixture stamp takes its own `now` and
+/// calls [`served_row_at`]: a stamp sampled here opens the pair to drift.
+fn served_row(ms_ago: u64, id: &str) -> String {
+    served_row_at(crate::usage::now_ms().saturating_sub(ms_ago), id)
 }
 
 /// Append `rows` to `conv`'s transcript and run the tailer over them.
@@ -5330,8 +5337,9 @@ fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
         "8600-0",
     )
     .expect("hold b's liveness marker");
+    let now = crate::usage::now_ms();
     seed_session_record(&home, "conv-a", child_pid);
-    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    append_and_tail(&home, "conv-a", &[spend_cap_row_at(now - 1_000)]);
     scan_sessions(&config, &store, &status);
     assert_eq!(
         decision_of("8600-0"),
@@ -5341,17 +5349,17 @@ fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
     // Put back on `a` by hand just now; a turn lands inside the grace.
     crate::live_sessions::update_as_session("8600-0", |f| {
         f.set_current_member("a".to_string());
-        f.set_last_swap_at(crate::usage::now_ms());
+        f.set_last_swap_at(now);
     })
     .expect("swap back");
-    append_and_tail(&home, "conv-a", &[served_row(0, "msg_in_flight")]);
+    append_and_tail(&home, "conv-a", &[served_row_at(now, "msg_in_flight")]);
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_some(), "the refusal stands");
     // The walk's pick off the record: back on `b`, the session is not walked
     // home to `a`.
     crate::live_sessions::update_as_session("8600-0", |f| {
         f.set_current_member("b".to_string());
-        f.set_last_swap_at(crate::usage::now_ms() - 600_000);
+        f.set_last_swap_at(now - 600_000);
     })
     .expect("swap to b");
     crate::live_sessions::update_as_daemon("8600-0", |f| {
@@ -5420,16 +5428,23 @@ fn refusal_on(name: &str) -> Option<crate::profile_cache::CreditRefusal> {
     crate::profile_cache::credit_refusal(&crate::profile::ProfileName::from(name))
 }
 
-/// Put a credit refusal on record for `name`, `ago_ms` back.
-fn record_refusal(name: &str, ago_ms: u64) {
+/// Put a credit refusal on record for `name`, stamped exactly `at_ms`.
+fn record_refusal_at(name: &str, at_ms: u64) {
     crate::profile_cache::write_credit_refusal(
         &crate::profile::ProfileName::from(name),
         &crate::profile_cache::CreditRefusal {
-            at_ms: crate::usage::now_ms() - ago_ms,
+            at_ms,
             file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
             uuid: None,
         },
     );
+}
+
+/// Put a credit refusal on record for `name`, `ago_ms` back. A test ordering
+/// this refusal against another fixture stamp takes its own `now` and calls
+/// [`record_refusal_at`].
+fn record_refusal(name: &str, ago_ms: u64) {
+    record_refusal_at(name, crate::usage::now_ms().saturating_sub(ago_ms));
 }
 
 /// A bare session's record: the live `child` holding `conv`, started at
@@ -5519,6 +5534,23 @@ fn refuse_bare_session(
     refuse_bare_session_with(home, child, conv, &rows, config, store, status);
 }
 
+/// [`refuse_bare_session`] deriving both the 429 and the record's start from
+/// the test's own `now`, so a turn the test stamps against them cannot drift.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_bare_session_at(
+    home: &crate::testutil::HomeSandbox,
+    child: &LiveChild,
+    conv: &str,
+    now: u64,
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    let rows = [spend_cap_row_at(now - 1_000)];
+    seed_bare_session_record(home, conv, child, Some(now - 60_000));
+    drain_bare_rows(home, conv, &rows, config, store, status);
+}
+
 /// [`refuse_bare_session`] with `rows`, holding the 429, as the one read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn refuse_bare_session_with(
@@ -5531,6 +5563,20 @@ fn refuse_bare_session_with(
     status: &super::StatusStore,
 ) {
     seed_bare_session_record(home, conv, child, Some(crate::usage::now_ms() - 60_000));
+    drain_bare_rows(home, conv, rows, config, store, status);
+}
+
+/// The tail [`refuse_bare_session_at`] and [`refuse_bare_session_with`] share:
+/// mark the active seen, run the tailer over `rows`, then scan.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn drain_bare_rows(
+    home: &crate::testutil::HomeSandbox,
+    conv: &str,
+    rows: &[String],
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
     active_seen_long_ago(config);
     append_and_tail(home, conv, rows);
     scan_sessions(config, store, status);
@@ -5547,12 +5593,21 @@ fn seed_transcripts(home: &crate::testutil::HomeSandbox, convs: &[&str]) {
     }
 }
 
-/// A successful turn `ms_ago` old on `model`, served under message id `id`.
+/// A successful turn at exactly `ms` epoch ms on `model`, served under message
+/// id `id`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn served_row_on(ms_ago: u64, id: &str, model: &str) -> String {
-    let mut row: serde_json::Value = serde_json::from_str(&served_row(ms_ago, id)).unwrap();
+fn served_row_on_at(ms: u64, id: &str, model: &str) -> String {
+    let mut row: serde_json::Value = serde_json::from_str(&served_row_at(ms, id)).unwrap();
     row["message"]["model"] = model.into();
     row.to_string()
+}
+
+/// A successful turn `ms_ago` old on `model`, served under message id `id`. A
+/// test ordering this turn against another fixture stamp takes its own `now`
+/// and calls [`served_row_on_at`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn served_row_on(ms_ago: u64, id: &str, model: &str) -> String {
+    served_row_on_at(crate::usage::now_ms().saturating_sub(ms_ago), id, model)
 }
 
 /// The target the global scan queues off these stores, if any.
@@ -6410,18 +6465,14 @@ fn a_429_on_a_conversation_two_bare_processes_hold_lands_on_no_one() {
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
     let child = LiveChild::spawn();
-    refuse_bare_session(&home, &child, "conv-2", &config, &store, &status);
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &child, "conv-2", now, &config, &store, &status);
     let placed = refusal_on("a")
         .expect("control: one process's 429 lands on the active")
         .at_ms;
     let other = LiveChild::spawn();
-    seed_bare_session_record(
-        &home,
-        "conv-2",
-        &other,
-        Some(crate::usage::now_ms() - 60_000),
-    );
-    append_and_tail(&home, "conv-2", &[spend_cap_row(500)]);
+    seed_bare_session_record(&home, "conv-2", &other, Some(now - 60_000));
+    append_and_tail(&home, "conv-2", &[spend_cap_row_at(now - 500)]);
     scan_sessions(&config, &store, &status);
     assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
 }
@@ -6513,26 +6564,22 @@ fn a_bare_session_started_before_a_switch_lands_on_the_new_active_past_the_grace
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-w"]);
     switch_global_active(&config, "b");
+    let now = crate::usage::now_ms();
     let seen_ago = |ago: u64| {
         super::GLOBAL_ACTIVE_SEEN.with(|seen| {
-            *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - ago));
+            *seen.borrow_mut() = Some((Some("b".into()), now - ago));
         });
     };
     let before = LiveChild::spawn();
-    seed_bare_session_record(
-        &home,
-        "conv-w",
-        &before,
-        Some(crate::usage::now_ms() - 60_000),
-    );
+    seed_bare_session_record(&home, "conv-w", &before, Some(now - 60_000));
     // The scans saw the switch to `b` ten seconds ago, so the second-old 429
     // lands inside its grace.
     seen_ago(10_000);
-    append_and_tail(&home, "conv-w", &[spend_cap_row(1_000)]);
+    append_and_tail(&home, "conv-w", &[spend_cap_row_at(now - 1_000)]);
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("b").is_none(), "inside the grace");
     seen_ago(40_000);
-    append_and_tail(&home, "conv-w", &[spend_cap_row(0)]);
+    append_and_tail(&home, "conv-w", &[spend_cap_row_at(now)]);
     scan_sessions(&config, &store, &status);
     assert!(
         refusal_on("b").is_some(),
@@ -6551,7 +6598,8 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
     let child = LiveChild::spawn();
-    refuse_bare_session(&home, &child, "conv-v", &config, &store, &status);
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &child, "conv-v", now, &config, &store, &status);
     assert!(
         refusal_on("a").is_some(),
         "fixture control: a refused the session"
@@ -6562,7 +6610,7 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
     append_and_tail(
         &home,
         "conv-v",
-        &[served_row_on(30_000, "msg_old", "claude-fable-5")],
+        &[served_row_on_at(now - 30_000, "msg_old", "claude-fable-5")],
     );
     scan_sessions(&config, &store, &status);
     assert!(
@@ -6572,7 +6620,7 @@ fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
     append_and_tail(
         &home,
         "conv-v",
-        &[served_row_on(0, "msg_ok", "claude-fable-5")],
+        &[served_row_on_at(now, "msg_ok", "claude-fable-5")],
     );
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_none());
@@ -6636,7 +6684,7 @@ fn a_turn_after_the_429_in_its_file_stamped_below_it_clears_a_refusal() {
     append_and_tail(
         &home,
         "conv-v",
-        &[served_row_on(3_000, "msg_ok", "claude-fable-5")],
+        &[served_row_on_at(now - 3_000, "msg_ok", "claude-fable-5")],
     );
     scan_sessions(&config, &store, &status);
     assert!(
@@ -6658,7 +6706,7 @@ fn a_turn_before_the_429_in_its_file_stamped_above_it_leaves_a_refusal() {
     let child = LiveChild::spawn();
     let now = crate::usage::now_ms();
     let rows = [
-        served_row_on(500, "msg_early", "claude-fable-5"),
+        served_row_on_at(now - 500, "msg_early", "claude-fable-5"),
         spend_cap_row_uuid_at(now - 1_000, "cap-v"),
     ];
     refuse_bare_session_with(&home, &child, "conv-v", &rows, &config, &store, &status);
@@ -6678,22 +6726,18 @@ fn refused_after_a_turn_in_another_bare_session(model: &str, served_ago: u64) ->
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-x", "conv-y"]);
     let first = LiveChild::spawn();
-    refuse_bare_session(&home, &first, "conv-x", &config, &store, &status);
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &first, "conv-x", now, &config, &store, &status);
     assert!(
         refusal_on("a").is_some(),
         "fixture control: a refused conv-x"
     );
     let second = LiveChild::spawn();
-    seed_bare_session_record(
-        &home,
-        "conv-y",
-        &second,
-        Some(crate::usage::now_ms() - 60_000),
-    );
+    seed_bare_session_record(&home, "conv-y", &second, Some(now - 60_000));
     append_and_tail(
         &home,
         "conv-y",
-        &[served_row_on(served_ago, "msg_y", model)],
+        &[served_row_on_at(now - served_ago, "msg_y", model)],
     );
     scan_sessions(&config, &store, &status);
     refusal_on("a").is_some()
@@ -6771,16 +6815,20 @@ fn an_isolated_run_ending_on_a_429_leaves_its_refusal_on_the_member() {
 fn an_isolated_run_whose_429_a_later_turn_followed_leaves_no_refusal() {
     let home = crate::testutil::HomeSandbox::new();
     let _config = session_config_models(&["a", "b"], &[], &[]);
-    let at = crate::usage::now_ms() - 5_000;
+    let now = crate::usage::now_ms();
+    let at = now - 5_000;
     let tree = isolated_tree_with(
         "a",
         "9101-0",
         "conv-iso",
-        &[spend_cap_row_at(at), served_row(1_000, "msg_after")],
+        &[
+            spend_cap_row_at(at),
+            served_row_at(now - 1_000, "msg_after"),
+        ],
     );
     tear_down_isolated(&home, &tree);
     assert!(refusal_on("a").is_none());
-    record_refusal("a", 3_000);
+    record_refusal_at("a", now - 3_000);
     assert!(refusal_on("a").is_none(), "the floor lies at the turn");
     let ended_on = isolated_tree_with("b", "9118-0", "conv-end", &[spend_cap_row_at(at)]);
     tear_down_isolated(&home, &ended_on);
@@ -6797,12 +6845,13 @@ fn an_isolated_run_whose_429_a_later_turn_followed_leaves_no_refusal() {
 #[test]
 fn an_isolated_run_served_after_its_429_in_another_transcript_leaves_no_refusal() {
     let refused = |turn_ago: u64, sid: &str| {
+        let now = crate::usage::now_ms();
         let home = crate::testutil::HomeSandbox::new();
         let _config = session_config_models(&["a", "b"], &[], &[]);
-        let tree = isolated_tree_with("a", sid, "conv-iso", &[spend_cap_row(3_000)]);
+        let tree = isolated_tree_with("a", sid, "conv-iso", &[spend_cap_row_at(now - 3_000)]);
         std::fs::write(
             tree.join("projects/-home-u-proj/conv-sub.jsonl"),
-            format!("{}\n", served_row(turn_ago, "msg_sub")),
+            format!("{}\n", served_row_at(now - turn_ago, "msg_sub")),
         )
         .unwrap();
         tear_down_isolated(&home, &tree);
@@ -6845,12 +6894,16 @@ fn an_isolated_run_served_past_the_refusal_on_record_clears_it() {
 fn an_isolated_run_served_past_its_recorded_429_clears_it_at_the_lift() {
     let home = crate::testutil::HomeSandbox::new();
     let _config = session_config_models(&["a", "b"], &[], &[]);
-    let at = crate::usage::now_ms() - 5_000;
+    let now = crate::usage::now_ms();
+    let at = now - 5_000;
     let tree = isolated_tree_with(
         "a",
         "9109-0",
         "conv-iso",
-        &[spend_cap_row_at(at), served_row(1_000, "msg_after")],
+        &[
+            spend_cap_row_at(at),
+            served_row_at(now - 1_000, "msg_after"),
+        ],
     );
     crate::profile_cache::write_credit_refusal(
         &crate::profile::ProfileName::from("a"),
@@ -6866,7 +6919,7 @@ fn an_isolated_run_served_past_its_recorded_429_clears_it_at_the_lift() {
     );
     tear_down_isolated(&home, &tree);
     assert!(refusal_on("a").is_none());
-    record_refusal("a", 2_000);
+    record_refusal_at("a", now - 2_000);
     assert!(refusal_on("a").is_none(), "the floor lies at the turn");
 }
 
@@ -7274,12 +7327,13 @@ fn a_429_from_under_a_rows_process_on_a_login_of_its_own_lands_on_no_one() {
     row.follows_chain = false;
     row.pid = std::process::id();
     let _marker = register_live_row(&row);
+    let now = crate::usage::now_ms();
     let plain = LiveChild::spawn();
-    refuse_bare_session_with(
+    refuse_bare_session_at(
         &home,
         &plain,
         "conv-p",
-        &[spend_cap_row(2_000)],
+        now - 1_000,
         &config,
         &store,
         &status,
@@ -7291,15 +7345,7 @@ fn a_429_from_under_a_rows_process_on_a_login_of_its_own_lands_on_no_one() {
     drop(plain);
     std::fs::remove_file(home.home().join(format!(".claude/sessions/{gone}.json"))).unwrap();
     let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
-    refuse_bare_session_with(
-        &home,
-        &child,
-        "conv-p",
-        &[spend_cap_row(1_000)],
-        &config,
-        &store,
-        &status,
-    );
+    refuse_bare_session_at(&home, &child, "conv-p", now, &config, &store, &status);
     assert_eq!(
         (refusal_on("b").map(|r| r.at_ms), refusal_on("a").is_some()),
         (Some(placed), false)
@@ -7391,20 +7437,21 @@ fn a_bare_session_on_a_login_of_its_own_lands_on_no_one() {
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-p", "conv-o"]);
     let plain = LiveChild::spawn();
-    refuse_bare_session(&home, &plain, "conv-p", &config, &store, &status);
-    let placed = refusal_on("a")
-        .expect("control: a session with no login of its own lands on the active")
-        .at_ms;
-    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
-    refuse_bare_session_with(
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(
         &home,
-        &child,
-        "conv-o",
-        &[spend_cap_row(500)],
+        &plain,
+        "conv-p",
+        now - 1_000,
         &config,
         &store,
         &status,
     );
+    let placed = refusal_on("a")
+        .expect("control: a session with no login of its own lands on the active")
+        .at_ms;
+    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    refuse_bare_session_at(&home, &child, "conv-o", now, &config, &store, &status);
     assert_eq!(
         (refusal_on("a").map(|r| r.at_ms), refusal_on("b").is_some()),
         (Some(placed), false)
@@ -7718,12 +7765,13 @@ fn a_refusal_stamped_before_the_clearing_turn_is_not_recorded_after_the_clear() 
     let store = session_store(&[("a", 10.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-x", "conv-y", "conv-z"]);
+    let now = crate::usage::now_ms();
     let first = LiveChild::spawn();
     refuse_bare_session_with(
         &home,
         &first,
         "conv-x",
-        &[spend_cap_row(3_000)],
+        &[spend_cap_row_at(now - 3_000)],
         &config,
         &store,
         &status,
@@ -7733,12 +7781,12 @@ fn a_refusal_stamped_before_the_clearing_turn_is_not_recorded_after_the_clear() 
         "fixture control: a refused conv-x"
     );
     let second = LiveChild::spawn();
-    let started = Some(crate::usage::now_ms() - 60_000);
+    let started = Some(now - 60_000);
     seed_bare_session_record(&home, "conv-y", &second, started);
     append_and_tail(
         &home,
         "conv-y",
-        &[served_row_on(1_000, "msg_y", "claude-fable-5")],
+        &[served_row_on_at(now - 1_000, "msg_y", "claude-fable-5")],
     );
     scan_sessions(&config, &store, &status);
     assert!(
@@ -7747,7 +7795,7 @@ fn a_refusal_stamped_before_the_clearing_turn_is_not_recorded_after_the_clear() 
     );
     let third = LiveChild::spawn();
     seed_bare_session_record(&home, "conv-z", &third, started);
-    append_and_tail(&home, "conv-z", &[spend_cap_row(2_000)]);
+    append_and_tail(&home, "conv-z", &[spend_cap_row_at(now - 2_000)]);
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_none());
 }
@@ -8048,11 +8096,12 @@ fn a_refusal_a_turn_disproved_stays_cleared_for_the_next_holder() {
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-r", "conv-p"]);
     let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
     let mut row = session_row("8493-0", "b");
     row.follows_chain = false;
     row.claude_pid = Some(child.pid());
     let _marker = register_live_row(&row);
-    refuse_bare_session(&home, &child, "conv-r", &config, &store, &status);
+    refuse_bare_session_at(&home, &child, "conv-r", now, &config, &store, &status);
     assert!(
         refusal_on("b").is_some(),
         "fixture control: b refused the session"
@@ -8062,16 +8111,11 @@ fn a_refusal_a_turn_disproved_stays_cleared_for_the_next_holder() {
     prover_row.follows_chain = false;
     prover_row.claude_pid = Some(prover.pid());
     let prover_marker = register_live_row(&prover_row);
-    seed_bare_session_record(
-        &home,
-        "conv-p",
-        &prover,
-        Some(crate::usage::now_ms() - 60_000),
-    );
+    seed_bare_session_record(&home, "conv-p", &prover, Some(now - 60_000));
     append_and_tail(
         &home,
         "conv-p",
-        &[served_row_on(0, "msg_p", "claude-fable-5")],
+        &[served_row_on_at(now, "msg_p", "claude-fable-5")],
     );
     scan_sessions(&config, &store, &status);
     assert!(
@@ -8757,7 +8801,9 @@ impl LiveChild {
             .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
             .spawn()
             .expect("spawn a live claude child");
-        Self(child)
+        let live = Self(child);
+        live.await_exec();
+        live
     }
 
     /// [`LiveChild::spawn`] with `key` set to `value` in its environment.
@@ -8767,11 +8813,47 @@ impl LiveChild {
             .env(key, value)
             .spawn()
             .expect("spawn a live claude child");
-        Self(child)
+        let live = Self(child);
+        live.await_exec();
+        live
     }
 
     fn pid(&self) -> u32 {
         self.0.id()
+    }
+
+    /// `spawn` can return before the child's exec: until then it shows the
+    /// test's own argv and environment, and mid-exec an empty environment;
+    /// either passes for a process with no login of its own. Wait until the
+    /// `sleep` image is in place; the deadline turns a child that never gets
+    /// there into a loud failure instead of a hang.
+    fn await_exec(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.exec_done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {} never finished its exec",
+                self.pid()
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// The `sleep` image is in place: its argv0 is `sleep` and its environ
+    /// reads non-empty.
+    #[cfg(target_os = "linux")]
+    fn exec_done(&self) -> bool {
+        let pid = self.pid();
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|argv| argv.split(|b| *b == 0).next() == Some(b"sleep".as_slice()))
+            && crate::runtime::process_environ(pid).is_some_and(|env| !env.is_empty())
+    }
+
+    /// Off linux the environ reader is the only probe: an unreadable environ
+    /// ends the wait, an empty one keeps it going.
+    #[cfg(not(target_os = "linux"))]
+    fn exec_done(&self) -> bool {
+        crate::runtime::process_environ(self.pid()).is_none_or(|env| !env.is_empty())
     }
 }
 
@@ -9248,11 +9330,12 @@ fn a_429_older_than_the_last_swap_does_not_move_the_session() {
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
-    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    let now = crate::usage::now_ms();
+    row.last_swap_at = Some(now - 3_600_000);
     let _marker = register_live_row(&row);
 
     seed_session_record(&home, "conv-a", child_pid);
-    write_conv(&home, "conv-a", &[spend_cap_row(7_200_000)]);
+    write_conv(&home, "conv-a", &[spend_cap_row_at(now - 7_200_000)]);
     tail_transcripts();
 
     scan_sessions(
@@ -13457,16 +13540,14 @@ fn stub_ok_stats(
     })
 }
 
-fn stamped_gap_ms(state: &super::SchedulerState, name: &str, before: u64) -> u64 {
-    stamped_gap_ms_at(state, name, before, REFRESH_INTERVAL_MS)
+/// `name`'s next-refresh stamp: `last_fetched` + `interval_ms`, absolute. A
+/// test asserting it against its own `before`/`after` samples brackets it
+/// `(before + interval..=after + interval)`, so a slow run cannot flip it.
+fn stamped_next_ms(state: &super::SchedulerState, name: &str) -> u64 {
+    stamped_next_ms_at(state, name, REFRESH_INTERVAL_MS)
 }
 
-fn stamped_gap_ms_at(
-    state: &super::SchedulerState,
-    name: &str,
-    before: u64,
-    interval_ms: u64,
-) -> u64 {
+fn stamped_next_ms_at(state: &super::SchedulerState, name: &str, interval_ms: u64) -> u64 {
     state
         .last_fetched
         .lock()
@@ -13476,7 +13557,6 @@ fn stamped_gap_ms_at(
         .unwrap()
         .as_millis()
         .saturating_add(interval_ms)
-        .saturating_sub(before)
 }
 
 #[test]
@@ -13501,10 +13581,11 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
     // Suppression, not the no-data floor: the stamp keeps the bare cadence.
-    let gap = stamped_gap_ms(&state, "generic-dead", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-dead");
     assert!(
-        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
-        "AuthExpired must not take the generic no-data floor, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "AuthExpired must not take the generic no-data floor, got stamp {stamp}"
     );
 }
 
@@ -13947,15 +14028,12 @@ fn fetch_third_party_due_generic_no_data_defers_to_floor() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-floor", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-floor");
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
     assert!(
-        gap >= floor,
-        "generic no-data must defer to the 5-minute floor, gap {gap}ms"
-    );
-    assert!(
-        gap < floor + 2_000,
-        "the floor is the exact gap, got {gap}ms"
+        (before + floor..=after + floor).contains(&stamp),
+        "generic no-data must defer to the 5-minute floor, stamp {stamp}"
     );
 }
 
@@ -13970,14 +14048,11 @@ fn fetch_third_party_due_typed_no_data_keeps_cadence() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "qwen-nodata", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "qwen-nodata");
     assert!(
-        gap >= REFRESH_INTERVAL_MS,
-        "typed no-data must keep the normal cadence, gap {gap}ms"
-    );
-    assert!(
-        gap < REFRESH_INTERVAL_MS + 2_000,
-        "typed no-data must not floor, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "typed no-data must keep the normal cadence and not floor, stamp {stamp}"
     );
 }
 
@@ -13989,11 +14064,12 @@ fn fetch_third_party_due_generic_no_hint_429_uses_the_floor() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![tp_entry("generic-limited")]);
-    let gap = stamped_gap_ms(&state, "generic-limited", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-limited");
     let expected = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
     assert!(
-        (expected..expected + 2_000).contains(&gap),
-        "generic no-hint 429 uses the rescan floor, got {gap}ms"
+        (before + expected..=after + expected).contains(&stamp),
+        "generic no-hint 429 uses the rescan floor, got stamp {stamp}"
     );
 }
 
@@ -14006,11 +14082,12 @@ fn fetch_third_party_due_typed_no_hint_429_keeps_the_flat_rung() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "qwen-limited", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "qwen-limited");
     let expected = REFRESH_INTERVAL_MS + super::RATE_LIMIT_MIN_BACKOFF_MS;
     assert!(
-        (expected..expected + 2_000).contains(&gap),
-        "typed no-hint 429 keeps its flat rung, got {gap}ms"
+        (before + expected..=after + expected).contains(&stamp),
+        "typed no-hint 429 keeps its flat rung, got stamp {stamp}"
     );
 }
 
@@ -14026,10 +14103,11 @@ fn fetch_third_party_due_generic_429_hint_stays_unfloored() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-hint", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-hint");
     assert!(
-        (240_000..242_000).contains(&gap),
-        "a server hint must stay unfloored, got gap {gap}ms"
+        (before + 240_000..=after + 240_000).contains(&stamp),
+        "a server hint must stay unfloored, got stamp {stamp}"
     );
 }
 
@@ -14044,10 +14122,11 @@ fn fetch_third_party_due_a_live_body_keeps_the_bare_cadence() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-live", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-live");
     assert!(
-        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
-        "a live body must keep the bare cadence, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "a live body must keep the bare cadence, got stamp {stamp}"
     );
 }
 
@@ -14063,10 +14142,11 @@ fn fetch_third_party_due_no_data_at_a_wide_interval_adds_nothing() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms_at(&state, "generic-wide", before, interval);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms_at(&state, "generic-wide", interval);
     assert!(
-        (interval..interval + 2_000).contains(&gap),
-        "a wide interval must not be extended, got gap {gap}ms"
+        (before + interval..=after + interval).contains(&stamp),
+        "a wide interval must not be extended, got stamp {stamp}"
     );
 }
 
