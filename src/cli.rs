@@ -560,9 +560,9 @@ pub(crate) struct StartArgs {
     pub(crate) with_fallback: bool,
     /// Pick the account instead of naming one: the fallback-chain member
     /// with headroom for the models this session will run (`--model`, the
-    /// model in your settings, the subagent model), taken in your
-    /// `walk_order`: chain position by default, else the soonest weekly
-    /// reset or the most weekly headroom.
+    /// model in your settings, the subagent model, the advisor model), taken
+    /// in your `walk_order`: chain position by default, else the soonest
+    /// weekly reset or the most weekly headroom.
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:
