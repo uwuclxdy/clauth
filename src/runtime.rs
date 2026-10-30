@@ -11617,9 +11617,12 @@ const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile
 ///
 /// Every branch lands owner-only: the copy sits in a tree the perms sweep
 /// stops short of, so the operator's own mode would otherwise be what it keeps.
-fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+///
+/// `hook_trust` is `(operator hooks.json, session hooks.json)` when the profile
+/// links the operator's hooks — see [`carry_hook_trust`].
+fn copy_codex_config(src: &Path, dst: &Path, hook_trust: Option<(&Path, &Path)>) -> Result<()> {
     let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let bytes = match stripped_codex_config(&raw) {
+    let bytes = match rewritten_codex_config(&raw, hook_trust) {
         Some(parsed) => toml::to_string(&parsed)
             .with_context(|| format!("failed to re-render {}", src.display()))?
             .into_bytes(),
@@ -11629,21 +11632,60 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("failed to write {}", dst.display()))
 }
 
-/// The parsed config with the escape keys removed, or `None` when there was
-/// nothing to strip or the bytes do not parse, so the copy goes verbatim.
-fn stripped_codex_config(raw: &[u8]) -> Option<toml::Value> {
+/// The parsed config with the escape keys removed and the operator's hook
+/// trust carried over, or `None` when neither changed anything or the bytes do
+/// not parse, so the copy goes verbatim.
+fn rewritten_codex_config(raw: &[u8], hook_trust: Option<(&Path, &Path)>) -> Option<toml::Value> {
     let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
     let table = parsed.as_table_mut()?;
-    let mut stripped = false;
+    let mut changed = false;
     for key in CODEX_CONFIG_STRIP_KEYS {
-        stripped |= table.remove(*key).is_some();
+        changed |= table.remove(*key).is_some();
     }
     for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
         if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
-            stripped |= sub.remove(*key).is_some();
+            changed |= sub.remove(*key).is_some();
         }
     }
-    stripped.then_some(parsed)
+    if let Some((from, to)) = hook_trust {
+        changed |= carry_hook_trust(table, from, to);
+    }
+    changed.then_some(parsed)
+}
+
+/// Codex keys a hook's trust by the path of the `hooks.json` it came from
+/// (`[hooks.state."<CODEX_HOME>/hooks.json:<event>:<i>:<j>"] trusted_hash`),
+/// and every session home is a new path — so a hook the operator trusted in
+/// `~/.codex` reads as new in each session and codex asks again. Re-key the
+/// entries for exactly that `hooks.json` onto the session home's link to it.
+/// The hash is copied, never computed: a hook changed since the operator
+/// trusted it still fails codex's check and still asks. The operator's own
+/// entries stay, and an entry already present under the session key wins.
+fn carry_hook_trust(table: &mut toml::Table, from: &Path, to: &Path) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let prefix = format!("{}:", from.display());
+    let carried: Vec<(String, toml::Value)> = state
+        .iter()
+        .filter_map(|(key, value)| {
+            let rest = key.strip_prefix(&prefix)?;
+            Some((format!("{}:{rest}", to.display()), value.clone()))
+        })
+        .collect();
+    let mut changed = false;
+    for (key, value) in carried {
+        if !state.contains_key(&key) {
+            state.insert(key, value);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
@@ -11847,9 +11889,13 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
     }
 
+    let link_hooks = isolation == Isolation::Shared && codex_profile_opts(name).hooks_json;
+    let (operator_hooks, session_hooks) = (operator.join("hooks.json"), home.join("hooks.json"));
+    let hook_trust = link_hooks.then_some((operator_hooks.as_path(), session_hooks.as_path()));
+
     let operator_config = operator.join("config.toml");
     if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
-        copy_codex_config(&operator_config, &home.join("config.toml"))?;
+        copy_codex_config(&operator_config, &home.join("config.toml"), hook_trust)?;
     }
     // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
     // base config, and CODEX_HOME is this session home — so without these the
@@ -11866,7 +11912,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
             }
             let dst = home.join(name);
             if dst.symlink_metadata().is_err() {
-                copy_codex_config(&entry.path(), &dst)?;
+                copy_codex_config(&entry.path(), &dst, None)?;
             }
         }
     }
@@ -11875,8 +11921,8 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         for entry in CODEX_OPERATOR_ENTRIES {
             place(&operator.join(entry), &home.join(entry))?;
         }
-        if codex_profile_opts(name).hooks_json {
-            place(&operator.join("hooks.json"), &home.join("hooks.json"))?;
+        if link_hooks {
+            place(&operator_hooks, &session_hooks)?;
         }
         if mode == LinkMode::Real {
             crate::profile::mkdir_700(&global)

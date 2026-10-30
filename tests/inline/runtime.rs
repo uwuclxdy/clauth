@@ -13603,8 +13603,9 @@ fn a_copied_config_is_owner_only_whatever_the_operators_mode() {
     let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
     let plain_dst = session_home.join("config.toml");
     let stripped_dst = session_home.join("work.config.toml");
-    copy_codex_config(&operator.join("config.toml"), &plain_dst).expect("copy plain");
-    copy_codex_config(&operator.join("work.config.toml"), &stripped_dst).expect("copy stripped");
+    copy_codex_config(&operator.join("config.toml"), &plain_dst, None).expect("copy plain");
+    copy_codex_config(&operator.join("work.config.toml"), &stripped_dst, None)
+        .expect("copy stripped");
 
     assert_eq!(
         fs::read_to_string(&plain_dst).expect("read copy"),
@@ -13728,6 +13729,91 @@ fn a_shared_codex_home_links_the_table() {
     assert!(
         session_home.join("hooks.json").symlink_metadata().is_ok(),
         "the per-profile opt-in links hooks.json"
+    );
+}
+
+/// Codex keys hook trust by the `hooks.json` path, and every session home is a
+/// new path. With the hooks opt-in, each home's config carries the operator's
+/// trust for exactly that `hooks.json`, re-keyed onto the home's own link with
+/// the hash untouched — so a changed hook still fails codex's check. Without
+/// the opt-in, or isolated, the copy is the operator's bytes.
+#[cfg(unix)]
+#[test]
+fn a_linked_hooks_json_carries_the_operators_trust_into_each_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::write(operator.join("hooks.json"), b"{\"hooks\":{}}").expect("write hooks");
+    let op_hooks = operator.join("hooks.json");
+    let config = format!(
+        "model = \"o3\"\n\
+         [hooks.state.\"{op}:session_start:0:0\"]\n\
+         trusted_hash = \"sha256:aaaa\"\n\
+         [hooks.state.\"/elsewhere/.codex/hooks.json:stop:0:0\"]\n\
+         trusted_hash = \"sha256:bbbb\"\n",
+        op = op_hooks.display()
+    );
+    fs::write(operator.join("config.toml"), &config).expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("config.toml"), b"hooks_json = true\n").expect("write opts");
+
+    let state_of = |session_home: &Path| -> toml::Table {
+        let parsed: toml::Value = toml::from_str(
+            &fs::read_to_string(session_home.join("config.toml")).expect("read copy"),
+        )
+        .expect("valid TOML");
+        parsed["hooks"]["state"]
+            .as_table()
+            .expect("hooks.state")
+            .clone()
+    };
+
+    for sid in ["4242-0", "4343-0"] {
+        let session_home = profile.join(format!("codex-home-{sid}"));
+        crate::profile::mkdir_700(&session_home).expect("mkdir home");
+        build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+        let state = state_of(&session_home);
+        let key = format!(
+            "{}:session_start:0:0",
+            session_home.join("hooks.json").display()
+        );
+        assert_eq!(
+            state[&key]["trusted_hash"].as_str(),
+            Some("sha256:aaaa"),
+            "{sid}: the trust follows the link, hash unchanged: {state:?}"
+        );
+        assert!(
+            state.contains_key(&format!("{}:session_start:0:0", op_hooks.display())),
+            "{sid}: the operator's own entry stays"
+        );
+        assert_eq!(
+            state.len(),
+            3,
+            "{sid}: only the linked hooks.json's entry is carried: {state:?}"
+        );
+    }
+
+    // Isolated links no hooks, so it carries no trust: the copy is verbatim.
+    let isolated = profile.join("codex-home-isolated-4444-0");
+    crate::profile::mkdir_700(&isolated).expect("mkdir isolated");
+    build_codex_home(&isolated, "cx", Isolation::Isolated, LinkMode::Real).expect("build isolated");
+    assert_eq!(
+        fs::read_to_string(isolated.join("config.toml")).expect("read copy"),
+        config
+    );
+
+    // Without the opt-in neither the link nor the trust reaches the home.
+    fs::write(profile.join("config.toml"), b"harness = \"codex\"\n").expect("drop opt-in");
+    let plain = profile.join("codex-home-4545-0");
+    crate::profile::mkdir_700(&plain).expect("mkdir plain");
+    build_codex_home(&plain, "cx", Isolation::Shared, LinkMode::Real).expect("build plain");
+    assert!(plain.join("hooks.json").symlink_metadata().is_err());
+    assert_eq!(
+        fs::read_to_string(plain.join("config.toml")).expect("read copy"),
+        config
     );
 }
 
