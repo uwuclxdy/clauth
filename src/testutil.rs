@@ -1217,6 +1217,20 @@ impl Drop for EnvPin<'_> {
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
 printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# Opt-in: a grandchild subshell inherits this child's stderr (the pipe clauth
+# reads) and stays alive for the named seconds while the child exits at once,
+# so a test can pin that the run finalizes on the child's exit without waiting
+# on the grandchild's pipe.
+if [ -n "${CLAUDE_SHIM_GRANDCHILD_HOLD-}" ]; then
+  ( sleep "$CLAUDE_SHIM_GRANDCHILD_HOLD" ) &
+  exit 0
+fi
+# Opt-in scripted failure: print the named stderr text and exit with the named
+# code, so a test drives a delegate's non-zero-exit path through a real spawn.
+if [ -n "${CLAUDE_SHIM_STDERR-}" ]; then
+  printf '%s\n' "$CLAUDE_SHIM_STDERR" >&2
+  exit "${CLAUDE_SHIM_EXIT-1}"
+fi
 # Opt-in: a delegate's row is registered by the mcp that spawns us and re-keyed
 # onto our pid once we exist. When this var names a file, wait for that re-key
 # (a row under the live-sessions registry whose pid is ours) and copy the row
@@ -1329,6 +1343,9 @@ pub(crate) struct FakeClaude<'a> {
     prev_log: Option<std::ffi::OsString>,
     prev_fail_install: Option<std::ffi::OsString>,
     prev_row_dump: Option<std::ffi::OsString>,
+    prev_stderr: Option<std::ffi::OsString>,
+    prev_exit: Option<std::ffi::OsString>,
+    prev_grandchild_hold: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1426,6 +1443,20 @@ impl<'a> FakeClaude<'a> {
         unsafe {
             std::env::remove_var("CLAUDE_SHIM_ROW_DUMP");
         }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the failure branch.
+        let prev_stderr = std::env::var_os("CLAUDE_SHIM_STDERR");
+        let prev_exit = std::env::var_os("CLAUDE_SHIM_EXIT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_STDERR");
+            std::env::remove_var("CLAUDE_SHIM_EXIT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the grandchild branch.
+        let prev_grandchild_hold = std::env::var_os("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1440,6 +1471,9 @@ impl<'a> FakeClaude<'a> {
             prev_log,
             prev_fail_install,
             prev_row_dump,
+            prev_stderr,
+            prev_exit,
+            prev_grandchild_hold,
         }
     }
 
@@ -1471,6 +1505,34 @@ impl<'a> FakeClaude<'a> {
         // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
         unsafe { std::env::set_var("CLAUDE_SHIM_ROW_DUMP", path) };
     }
+
+    /// Script the shim's failure: the named text printed to stderr and the
+    /// named exit code, so a test drives a delegate's non-zero-exit path
+    /// through a real spawn. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_scripted_failure(&mut self, stderr: &str, exit: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_STDERR", stderr);
+            std::env::set_var("CLAUDE_SHIM_EXIT", exit);
+        }
+    }
+
+    /// Make the shim exit at once while a grandchild subshell inherits stderr
+    /// and stays alive for the named seconds, so a test pins that the run
+    /// finalizes on the child's exit without waiting on the grandchild's pipe.
+    /// Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_grandchild_hold(&mut self, secs: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_GRANDCHILD_HOLD", secs) };
+    }
 }
 
 #[cfg(unix)]
@@ -1493,6 +1555,9 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
                 ("CLAUDE_SHIM_FAIL_INSTALL", &self.prev_fail_install),
                 ("CLAUDE_SHIM_ROW_DUMP", &self.prev_row_dump),
+                ("CLAUDE_SHIM_STDERR", &self.prev_stderr),
+                ("CLAUDE_SHIM_EXIT", &self.prev_exit),
+                ("CLAUDE_SHIM_GRANDCHILD_HOLD", &self.prev_grandchild_hold),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),

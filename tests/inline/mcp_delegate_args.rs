@@ -574,6 +574,39 @@ fn subagent_type_is_passed_as_the_agent_flag() {
     );
 }
 
+/// `subagent_type` reaches the spawn as the caller spelled it: clauth neither
+/// strips nor refuses a prefix — the child resolves the name and clauth holds
+/// no roster to map against — so the argv the child receives carries the
+/// call's value verbatim.
+#[cfg(unix)]
+#[test]
+fn a_prefixed_subagent_type_reaches_the_spawn_unchanged() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let fake = FakeClaude::new(&home);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        subagent_type: Some("agents:rev".to_string()),
+        ..base()
+    });
+    // The shim prints no stream-json, so the envelope may be an error: the run
+    // under test is the argv, not the result.
+    let _ = result;
+    let spawns = fake.spawns();
+    assert!(!spawns.is_empty(), "the delegate spawned claude");
+    for (dir, argv) in &spawns {
+        assert!(
+            argv.contains("--agent agents:rev"),
+            "the prefixed spelling reaches the child exactly as the call spelled it ({dir}): {argv}"
+        );
+    }
+}
+
 /// The session-identity flags are clauth-owned, not a typed-vs-raw duplicate:
 /// a raw spelling would land AFTER the pin (`args` run last) and move the
 /// child off the id `CLAUTH_DELEGATE_SESSION_ID` names. Every spelling that

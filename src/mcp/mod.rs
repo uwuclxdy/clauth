@@ -2085,6 +2085,12 @@ const DELEGATE_SESSION_ENV: &str = "CLAUTH_DELEGATE_SESSION_ID";
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long the post-exit take waits, in total, for the stdout and stderr
+/// readers' EOF signals: a live child's pipes drain in microseconds, so the
+/// grace only covers reader scheduling, never a grandchild still holding a
+/// pipe open.
+const PIPE_EOF_GRACE: Duration = Duration::from_millis(250);
+
 /// Everything a blocking `delegate` call needs from its own request: the peer
 /// plus the progress token it supplied, and the throttle clock and monotonic
 /// counter those need (rmcp's `progress` field must strictly increase across one
@@ -4164,35 +4170,47 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let capture_slot = std::sync::Arc::new(std::sync::Mutex::new(StreamCapture::default()));
     let stderr_slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let beat_handoff = handoff.clone();
-    let _stdout_reader = child.stdout.take().map(|h| {
+    // Each reader signals EOF once its slot is final: the bytes only mean
+    // something at EOF, and the take below must know whether it is reading a
+    // drained pipe or whatever was in flight.
+    let (stdout_eof_tx, stdout_eof_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_reader_eof = child.stdout.take().map(|h| {
         let capture = std::sync::Arc::clone(&capture_slot);
-        std::thread::spawn(move || match beat_handoff {
-            // A run that owns a job file rewrites it as it reads, so a `monitor`
-            // check sees liveness that would otherwise die with this task.
-            // Best-effort: a failed heartbeat costs one stale check, and must
-            // never end the capture.
-            //
-            // The record is resolved PER BEAT rather than once here, because a
-            // blocking run gets its file mid-run when its caller walks away and
-            // this thread was spawned before it existed. What keeps that record
-            // alive until the first beat lands — or forever, on a pinned
-            // `--output-format` run, which never beats at all — is its
-            // `recorded_at` mint stamp, not this closure.
-            Some(handoff) => {
-                let mut beat = |tail: String, session: Option<String>| {
-                    handoff.heartbeat(now_ms(), &tail, session.as_deref());
-                };
-                read_stdout(h, streaming, &capture, Some(&mut beat))
+        std::thread::spawn(move || {
+            match beat_handoff {
+                // A run that owns a job file rewrites it as it reads, so a
+                // `monitor` check sees liveness that would otherwise die with
+                // this task. Best-effort: a failed heartbeat costs one stale
+                // check, and must never end the capture.
+                //
+                // The record is resolved PER BEAT rather than once here,
+                // because a blocking run gets its file mid-run when its caller
+                // walks away and this thread was spawned before it existed.
+                // What keeps that record alive until the first beat lands — or
+                // forever, on a pinned `--output-format` run, which never
+                // beats at all — is its `recorded_at` mint stamp, not this
+                // closure.
+                Some(handoff) => {
+                    let mut beat = |tail: String, session: Option<String>| {
+                        handoff.heartbeat(now_ms(), &tail, session.as_deref());
+                    };
+                    read_stdout(h, streaming, &capture, Some(&mut beat));
+                }
+                None => read_stdout(h, streaming, &capture, None),
             }
-            None => read_stdout(h, streaming, &capture, None),
-        })
+            let _ = stdout_eof_tx.send(());
+        });
+        stdout_eof_rx
     });
-    let _stderr_reader = child.stderr.take().map(|mut h| {
+    let (stderr_eof_tx, stderr_eof_rx) = std::sync::mpsc::channel::<()>();
+    let stderr_reader_eof = child.stderr.take().map(|mut h| {
         let stderr_slot = std::sync::Arc::clone(&stderr_slot);
         std::thread::spawn(move || {
             let bytes = drain_pipe(&mut h);
             *stderr_slot.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
-        })
+            let _ = stderr_eof_tx.send(());
+        });
+        stderr_eof_rx
     });
 
     // Nothing between the spawn above and the capture take below may return:
@@ -4226,16 +4244,27 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
     };
 
-    // Taken once the child has exited, never joined: a grandchild that
-    // inherited claude's stdout pipe keeps a reader parked in `read` long
-    // after the child is gone, and a join here would wedge the run — and its
-    // liveness record — on the grandchild. What the take costs is any bytes
-    // the readers had not consumed yet; the readers are usually at the pipe's
-    // tail when the child exits, and a grandchild's post-exit writes are not
-    // the delegate's result anyway. The parked threads are bounded so: each
-    // writes nothing after `finalize` (its beats resolve `Finished` and write
-    // nothing, and its capture pushes land in slots nobody reads), holds no
-    // lock while writing, and drops its `Arc`s when it exits.
+    // Both slots are final only at EOF — before it, a slot may still be empty
+    // while the child's words sit in its reader's own buffer — so the take
+    // waits for both readers' EOF signals, sharing one PIPE_EOF_GRACE deadline,
+    // and then proceeds with whatever arrived, letting a failed run's reason
+    // and its throttle/402 scan see what the child actually printed on either
+    // pipe. The wait stays bounded and never joins: a grandchild that
+    // inherited claude's stdout or stderr keeps its reader parked in `read`
+    // long after the child is gone, and an unbounded wait here would wedge the
+    // run — and its liveness record — on the grandchild. What a run past the
+    // grace still costs is any bytes a reader had not stored yet; the parked
+    // threads are bounded so: each writes nothing after this take (its beats
+    // resolve `Finished` and write nothing, and its slot writes land in slots
+    // nobody reads), holds no lock while writing, and drops its `Arc`s when it
+    // exits.
+    let eof_deadline = Instant::now() + PIPE_EOF_GRACE;
+    for rx in [stdout_reader_eof.as_ref(), stderr_reader_eof.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = rx.recv_timeout(eof_deadline.saturating_duration_since(Instant::now()));
+    }
     let capture = capture_slot
         .lock()
         .map(|mut c| std::mem::take(&mut *c))
@@ -4284,7 +4313,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     };
     let now = now_epoch_secs();
     let dead_key_fp = profile_credential_fingerprint(target);
-    match classify_run(
+    match classify_run_with(
+        opts.isolation,
+        opts.subagent_type,
         status,
         &stderr_bytes,
         &capture,
@@ -4397,7 +4428,38 @@ enum RunOutcome {
     Unparseable(serde_json::Value, String),
 }
 
+/// The classifier the inline tests pose directly: a shared run with no
+/// `--agent`, the shape whose failure reason never gains the isolated-agent
+/// clause. The spawn path classifies through [`classify_run_with`]. Unix-only
+/// because every caller builds an `ExitStatus` through
+/// `ExitStatusExt::from_raw`.
+#[cfg(all(test, unix))]
 fn classify_run(
+    status: std::process::ExitStatus,
+    stderr_bytes: &[u8],
+    capture: &StreamCapture,
+    profile: &str,
+    session_id: &str,
+    dead_key_fp: Option<u64>,
+) -> RunOutcome {
+    classify_run_with(
+        Isolation::Shared,
+        None,
+        status,
+        stderr_bytes,
+        capture,
+        profile,
+        session_id,
+        dead_key_fp,
+    )
+}
+
+/// [`classify_run`] carrying the run's own isolation and `--agent` spelling:
+/// the two facts the isolated-agent clause keys on, known only at the spawn.
+#[allow(clippy::too_many_arguments)]
+fn classify_run_with(
+    isolation: Isolation,
+    subagent_type: Option<&str>,
     status: std::process::ExitStatus,
     stderr_bytes: &[u8],
     capture: &StreamCapture,
@@ -4429,6 +4491,9 @@ fn classify_run(
         }
         if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
             reason.push_str(&dead_key_clause(profile));
+        }
+        if let Some(clause) = isolated_agent_clause(isolation, subagent_type, &stderr) {
+            reason.push_str(&clause);
         }
         return RunOutcome::Exited {
             envelope: salvage_envelope(profile, reason, capture, Some(session_id)),
@@ -6021,6 +6086,27 @@ fn dead_key_clause(name: &str) -> String {
          this account's cached balance — `profiles` shows no figure for '{name}' until the \
          key is re-captured (`clauth login {name} --api-key`)"
     )
+}
+
+/// The reply clause for an isolated delegate whose `--agent` Claude Code
+/// refused at startup. Keyed on the run's own isolation flag and the agent
+/// spelling the spawn carried, never on a roster or built-in agent list
+/// (those differ per box), so a shared run, an agentless run, or any other
+/// failure keeps the bare reason.
+fn isolated_agent_clause(
+    isolation: Isolation,
+    subagent_type: Option<&str>,
+    stderr: &str,
+) -> Option<String> {
+    let name = subagent_type?;
+    if isolation != Isolation::Isolated || !stderr.contains(&format!("--agent '{name}' not found"))
+    {
+        return None;
+    }
+    Some(format!(
+        " an `isolated: true` delegate loads no plugin or user agents: drop `isolated` to \
+         run `{name}`"
+    ))
 }
 
 /// The write half of the dead-key arm: drop the balance marker `profiles`

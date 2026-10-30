@@ -5269,7 +5269,7 @@ fn run_delegate_never_returns_between_spawning_the_reader_and_taking_the_capture
         .expect("run_delegate is defined")
         .1;
     let spawn = body
-        .find("let _stdout_reader = child.stdout.take()")
+        .find("let stdout_reader_eof = child.stdout.take()")
         .expect("the reader thread is spawned");
     let take = body
         .find("let capture = capture_slot")
@@ -9712,6 +9712,176 @@ fn a_non_zero_exit_still_hands_back_what_the_run_produced() {
     );
 }
 
+/// An isolated delegate's failure helper: a real spawn (`FakeClaude` printing
+/// the named stderr and exiting 1) of an agent run on the admitted fixture, so
+/// the clause the classifier keys on is the run's own isolation and agent
+/// spelling, never a classifier argument a hand-built call could spoof.
+#[cfg(unix)]
+fn scripted_agent_failure_reason(
+    isolation: Isolation,
+    subagent_type: Option<&str>,
+    stderr: &str,
+) -> String {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_credit_spend_target(&home, None, false, true);
+    let mut fake = FakeClaude::new(&home);
+    fake.set_scripted_failure(stderr, "1");
+    let envelope = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation,
+        depth: 0,
+        handoff: None,
+    })
+    .expect("a non-zero exit is an envelope, never a transport error");
+    envelope["result"].as_str().expect("reason").to_owned()
+}
+
+/// The startup-failure hint: a `subagent_type` spelled from the roster the
+/// caller sees in its own shared session dies as Claude Code's
+/// `--agent '<name>' not found` startup line on an isolated run — and the
+/// failure must say so, keyed on the run's own isolation flag and the agent
+/// spelling the spawn carried, never on a roster or built-in list (those
+/// differ per box). Pinned by equality against the composed fixture: the
+/// child's stderr is scripted, so every interpolated value is fixed.
+#[cfg(unix)]
+#[test]
+fn an_isolated_agents_startup_failure_hints_at_dropping_isolated() {
+    let reason = scripted_agent_failure_reason(
+        Isolation::Isolated,
+        Some("agents:code-explorer"),
+        "--agent 'agents:code-explorer' not found. Available agents: claude, Explore, \
+         general-purpose, Plan, statusline-setup.",
+    );
+    assert_eq!(
+        reason,
+        "claude exited with 1: --agent 'agents:code-explorer' not found. Available agents: \
+         claude, Explore, general-purpose, Plan, statusline-setup. an `isolated: true` \
+         delegate loads no plugin or user agents: drop `isolated` to run \
+         `agents:code-explorer`. pick the run back up with `session_id: \"<session_id>\"`",
+        "the hint rides the reason whole, after the child's own words: {reason}"
+    );
+}
+
+/// The clause is scoped to isolated runs: the same startup failure on a shared
+/// delegate is the caller's own spelling problem — the shared run loads the
+/// agents the roster named — so the reason is the bare classifier text.
+#[cfg(unix)]
+#[test]
+fn a_shared_agents_startup_failure_carries_no_isolated_hint() {
+    let reason = scripted_agent_failure_reason(
+        Isolation::Shared,
+        Some("agents:code-explorer"),
+        "--agent 'agents:code-explorer' not found. Available agents: claude, Explore, \
+         general-purpose, Plan, statusline-setup.",
+    );
+    assert_eq!(
+        reason,
+        "claude exited with 1: --agent 'agents:code-explorer' not found. Available agents: \
+         claude, Explore, general-purpose, Plan, statusline-setup.. pick the run back up with \
+         `session_id: \"<session_id>\"`",
+        "a shared run's failure is the bare reason, no hint: {reason}"
+    );
+}
+
+/// No `subagent_type`, no hint: an isolated run whose `--agent` (or anything
+/// else) died at startup names its own failure, never an `isolated` flag the
+/// call never set.
+#[cfg(unix)]
+#[test]
+fn an_isolated_run_without_an_agent_failure_names_no_agent_hint() {
+    let reason = scripted_agent_failure_reason(
+        Isolation::Isolated,
+        None,
+        "--agent 'agents:code-explorer' not found. Available agents: claude, Explore, \
+         general-purpose, Plan, statusline-setup.",
+    );
+    assert_eq!(
+        reason,
+        "claude exited with 1: --agent 'agents:code-explorer' not found. Available agents: \
+         claude, Explore, general-purpose, Plan, statusline-setup.. pick the run back up with \
+         `session_id: \"<session_id>\"`",
+        "an agentless isolated run's failure is the bare reason: {reason}"
+    );
+}
+
+/// Any other failure on an isolated agent run keeps the bare reason: the hint
+/// keys on Claude Code's `--agent '<name>' not found` startup line, so an
+/// unrelated stderr never suggests dropping `isolated`.
+#[cfg(unix)]
+#[test]
+fn an_isolated_agent_runs_other_failure_keeps_the_bare_reason() {
+    let reason = scripted_agent_failure_reason(
+        Isolation::Isolated,
+        Some("agents:code-explorer"),
+        "boom: something else entirely",
+    );
+    assert_eq!(
+        reason,
+        "claude exited with 1: boom: something else entirely. pick the run back up with \
+         `session_id: \"<session_id>\"`",
+        "an unrelated failure is the bare reason, no hint: {reason}"
+    );
+}
+
+/// A grandchild that inherits the child's stderr keeps the stderr reader parked
+/// past the child's exit, so the take must proceed on its bounded grace rather
+/// than wedge the run — and its liveness record — on the grandchild's pipe. The
+/// shim exits at once while a grandchild subshell holds stderr for 30 s, far
+/// past the bound asserted here, and the run still returns in time with
+/// whatever the pipe carried (nothing: the child printed no stderr).
+#[cfg(unix)]
+#[test]
+fn a_grandchild_holding_stderr_past_the_exit_does_not_wedge_the_run() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_credit_spend_target(&home, None, false, true);
+    let mut fake = FakeClaude::new(&home);
+    fake.set_grandchild_hold("30");
+    let started = std::time::Instant::now();
+    let envelope = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect("the run returns on the child's exit, not on the grandchild's");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the run finalizes on the child's exit, well under the grandchild's 30 s \
+         hold: {elapsed:?}"
+    );
+    assert!(
+        envelope.get("result").is_some(),
+        "the failure envelope still hands back a reason: {envelope}"
+    );
+}
+
 /// Finding 13, the unparseable half: a clean exit whose stdout was never an
 /// envelope loses exactly as much, and for the same reason. `#[cfg(unix)]` for
 /// the same reason as the arm above.
@@ -11730,7 +11900,7 @@ fn run_delegate_records_the_spawn_only_after_the_child_exists() {
         .find("let mut child = command")
         .expect("the child is spawned");
     let reader = body
-        .find("let _stdout_reader = child.stdout.take()")
+        .find("let stdout_reader_eof = child.stdout.take()")
         .expect("the reader thread is spawned");
     let marked = body
         .find(".mark_spawned()")
