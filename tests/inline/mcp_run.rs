@@ -5815,7 +5815,9 @@ fn a_batch_result_file_write_failure_falls_back_inline() {
     .unwrap();
     let blocked = crate::profile::clauth_dir()
         .expect("clauth dir under the sandbox")
-        .join("jobs/results/d-mbfail-0.txt");
+        .join("jobs")
+        .join("results")
+        .join("d-mbfail-0.txt");
     std::fs::create_dir_all(&blocked).expect("block the result path");
 
     let result = call_monitor_batch(vec!["d-mbfail-0", "d-mbfail-1"]);
@@ -6081,7 +6083,11 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
         })
         .expect("the mismatched result is reported under the caller-supplied id");
     assert!(
-        path.ends_with("jobs/results/d-mis-0.txt"),
+        std::path::Path::new(&path).ends_with(
+            std::path::Path::new("jobs")
+                .join("results")
+                .join("d-mis-0.txt")
+        ),
         "the result file is keyed by the id the job was collected under, never \
          the record's stored id: {path}"
     );
@@ -6093,7 +6099,9 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
     assert!(
         !crate::profile::clauth_dir()
             .unwrap()
-            .join("jobs/results/d-decoy-0.txt")
+            .join("jobs")
+            .join("results")
+            .join("d-decoy-0.txt")
             .exists(),
         "the stored id's own result file is never written from a mismatched record"
     );
