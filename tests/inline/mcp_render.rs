@@ -2678,6 +2678,154 @@ fn monitor_batch_prose_never_opens_with_a_blank_line() {
     assert_eq!(prose, "since your last call: credentials file rewritten");
 }
 
+/// A `result: "file"` reply names the result's first line beside the path, so
+/// the model can judge the answer without paying a Read for the body.
+#[test]
+fn result_file_prose_names_the_results_first_line() {
+    let e = serde_json::json!({
+        "result": "all done\nsecond line\n\nthird line",
+        "total_cost_usd": 0.5,
+        "live_usage": {"endpoint": "anthropic"},
+    });
+    assert_eq!(
+        result_file_prose("/tmp/r.txt", "abc123", &e),
+        "result written to /tmp/r.txt (sha256 abc123); first line: all done; (cost $0.5)",
+    );
+}
+
+/// The first line is the first NON-empty line of the delegate's RESULT text,
+/// trimmed, every control character escaped, cut at 200 characters with
+/// `format::truncate`'s three-dot `...` marker. A non-string result renders its
+/// literal and a missing one reads `unknown`, matching `envelope_prose`.
+#[test]
+fn result_first_line_trims_escapes_and_cuts() {
+    assert_eq!(
+        result_first_line(&serde_json::json!({
+            "result": "\n  \n  real answer  \nsecond line"
+        })),
+        "real answer",
+        "blank leading lines are skipped, the line is trimmed"
+    );
+    assert_eq!(
+        result_first_line(&serde_json::json!({"result": "a\u{1}b"})),
+        "a\\u{0001}b",
+        "a control byte escapes, never rides raw",
+    );
+    let long = "x".repeat(300);
+    let cut = result_first_line(&serde_json::json!({ "result": long }));
+    assert_eq!(cut.chars().count(), 200, "the cut lands at 200 characters");
+    assert!(cut.ends_with("..."), "a cut line ends in `...`: {cut}");
+    assert_eq!(
+        result_first_line(&serde_json::json!({"result": 42})),
+        "42",
+        "a numeric result renders its literal"
+    );
+    assert_eq!(
+        result_first_line(&serde_json::json!({})),
+        "unknown",
+        "a missing result reads unknown"
+    );
+}
+
+/// The bound is on the RENDERED line. `escape_unless` widens every control
+/// character to its eight-character `\u{....}` spelling, so a cut taken before
+/// the escape lets a line of control bytes through at eight times the budget.
+/// The cut lands after the escape, keeps `format::truncate`'s `...` marker,
+/// and never splits an escape sequence: 200 control characters escape to 1600
+/// characters and render as twenty-four whole escapes plus the marker, inside
+/// the 200-character bound.
+#[test]
+fn result_first_line_bounds_the_escaped_output() {
+    let line = "\u{1}".repeat(200);
+    let out = result_first_line(&serde_json::json!({ "result": line }));
+    assert!(
+        out.chars().count() <= 200,
+        "the escaped line stays inside the bound: {} chars",
+        out.chars().count()
+    );
+    let expected = format!("{}...", "\\u{0001}".repeat(24));
+    assert_eq!(out, expected, "whole escapes only, marker on the cut");
+}
+
+/// A literal backslash in the text is not an escape: the cut keeps the text
+/// before it instead of backing up to it and collapsing the line.
+#[test]
+fn result_first_line_keeps_text_before_a_literal_backslash() {
+    let line = format!("\\{}\u{1}", "x".repeat(198));
+    let out = result_first_line(&serde_json::json!({ "result": line }));
+    let expected = format!("\\{}...", "x".repeat(196));
+    assert_eq!(out, expected, "the cut keeps the line, marker at the bound");
+}
+
+/// A bidi override in a delegate's first line is escaped like a control
+/// character, so the reply cannot reorder the line it sits in.
+#[test]
+fn result_first_line_escapes_a_bidi_override() {
+    let out = result_first_line(&serde_json::json!({ "result": "ok\u{202e}evil" }));
+    assert_eq!(out, "ok\\u{202e}evil");
+}
+
+/// An escape that would straddle the bound is dropped whole: the line keeps
+/// its text up to the escape and never shows a dangling `\u` or `\`.
+#[test]
+fn result_first_line_drops_an_escape_straddling_the_bound() {
+    for lead in [195, 196] {
+        let line = format!("{}\u{1}", "x".repeat(lead));
+        let out = result_first_line(&serde_json::json!({ "result": line }));
+        assert_eq!(out, format!("{}...", "x".repeat(lead)), "lead {lead}");
+    }
+}
+
+/// A done batch row that carries a result file renders COMPACT: verdict, first
+/// line, then the path + sha256 the body lives under, plus the cost clause. A
+/// row without a result file (the write-failure fallback) keeps the inline
+/// envelope spelling unchanged.
+#[test]
+fn monitor_batch_prose_renders_a_compact_done_row() {
+    let compact = serde_json::json!({
+        "results": [{
+            "job_id": "d-1-0",
+            "status": "done",
+            "is_error": false,
+            "first_line": "all done",
+            "result_file": "/tmp/d-1-0.txt",
+            "sha256": "abc",
+            "total_cost_usd": 1.5,
+            "live_usage": {"endpoint": "anthropic"},
+        }],
+    });
+    assert_eq!(
+        monitor_batch_prose(&compact),
+        "job `d-1-0` finished: all done; \
+         result written to /tmp/d-1-0.txt (sha256 abc); (cost $1.5)",
+    );
+
+    let failed = serde_json::json!({
+        "results": [{
+            "job_id": "d-2-0",
+            "status": "done",
+            "is_error": true,
+            "first_line": "boom",
+            "result_file": "/tmp/d-2-0.txt",
+            "sha256": "abc",
+        }],
+    });
+    assert_eq!(
+        monitor_batch_prose(&failed),
+        "job `d-2-0` failed: boom; result written to /tmp/d-2-0.txt (sha256 abc)",
+        "the verdict word mirrors the envelope's error flag"
+    );
+
+    let inline = serde_json::json!({
+        "results": [{"job_id": "d-3-0", "status": "done", "is_error": false, "result": "ok"}],
+    });
+    assert_eq!(
+        monitor_batch_prose(&inline),
+        "job `d-3-0` finished: ok",
+        "a row without a result file keeps the inline spelling"
+    );
+}
+
 /// A cancelled run is not a timed-out one, and the verdict word is the first
 /// thing a reader takes off the line. The salvage clauses already render here,
 /// so a cancel carries its partial and its resume handle for free.

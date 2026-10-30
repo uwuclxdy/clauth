@@ -568,6 +568,15 @@ fn result_file_path(id: &str) -> std::result::Result<std::path::PathBuf, String>
     Ok(dir.join(format!("{id}.txt")))
 }
 
+/// The sha256 hex of some bytes, lowercase — the figure a result-file reply
+/// carries so the model can check the file it Reads.
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Write one folded envelope to its result file atomically (0o700 dir, 0o600
 /// file) and return its path and sha256 hex.
 fn write_result_file(
@@ -576,13 +585,13 @@ fn write_result_file(
 ) -> std::result::Result<(std::path::PathBuf, String), String> {
     let path = result_file_path(id)?;
     let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
-    let digest = sha2::Sha256::digest(&bytes);
-    let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let hash = sha256_hex(&bytes);
     crate::profile::atomic_write_600(&path, &bytes).map_err(|e| e.to_string())?;
     Ok((path, hash))
 }
 
-/// The short reply a `result: "file"` delegate returns: path, sha256, cost line.
+/// The short reply a `result: "file"` delegate returns: path, sha256, the
+/// result's first line, cost line.
 fn result_file_reply(
     path: &std::path::Path,
     sha256: &str,
@@ -900,9 +909,9 @@ pub(crate) struct DelegateArgs {
     /// raw `--permission-mode` in `args`.
     permission_mode: Option<String>,
     /// Where the result envelope goes. `result: "file"` writes the envelope
-    /// under `~/.clauth` and returns its path, sha256 and cost line only; the
-    /// model Reads the file for the body. Unset (default): the envelope rides
-    /// the reply inline.
+    /// under `~/.clauth` and returns its path, sha256, cost line and the
+    /// result's first line; the model Reads the file for the body. Unset
+    /// (default): the envelope rides the reply inline.
     result: Option<String>,
     /// Additional environment variables passed to the delegate session. Values
     /// you set for `CLAUDE_CONFIG_DIR`, `CLAUTH_MCP_DEPTH` and
@@ -1997,8 +2006,10 @@ across accounts."
     #[tool(
         description = "Check, collect, or stop a background `delegate` by providing `job_ids`. \
 With `job_ids`: a running job reports its account, elapsed time, and its latest output. A \
-finished job also hands back its result. With `job_ids` and `cancel: true`, the named jobs are \
-asked to stop and each hands back whatever it produced.\n\n\
+finished job also hands back its result; a batch over finished jobs writes each envelope to a \
+result file and reports one compact entry per job — status, cost, path, sha256 and the \
+result's first line; Read the file for the body. With `job_ids` and `cancel: true`, the named \
+jobs are asked to stop and each hands back whatever it produced.\n\n\
 Without `job_ids`: lists at most 10 delegates clauth holds, live runs first. An interrupted \
 blocking `delegate` (its caller walked away mid-run) keeps running as a background job, and that \
 listing is where you find its id."
@@ -2852,7 +2863,7 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
             // Eviction is the claim's job, already done: an owned record's
             // file is consumed, a refused one renamed back — either way this
             // render is the one delivery of it.
-            let (blocks, is_error) = render_done_envelope(record, digest);
+            let (blocks, is_error) = render_done_envelope(&job_id, record, digest);
             if is_error {
                 Ok(CallToolResult::error(blocks))
             } else {
@@ -2928,22 +2939,9 @@ async fn monitor_batch(
                 // refused one (mismatched self-report) was renamed back and
                 // renders without eviction — the stored-id rule.
                 // No per-result digest: one rides the whole reply below.
-                let (mut payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
+                let (payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
                 any_error |= is_error;
-                // The folded envelope is always an object (a non-object
-                // self-report is wrapped under `result` first), so the caller's
-                // per-id markers cannot collide with delegate output.
-                if let serde_json::Value::Object(map) = &mut payload {
-                    map.insert(
-                        "job_id".to_string(),
-                        serde_json::Value::String(echo_name(&id)),
-                    );
-                    map.insert(
-                        "status".to_string(),
-                        serde_json::Value::String("done".to_string()),
-                    );
-                }
-                payload
+                batch_done_entry(&id, payload, is_error)
             }
         };
         results.push(entry);
@@ -2977,6 +2975,67 @@ async fn monitor_batch(
     } else {
         Ok(CallToolResult::success(blocks))
     }
+}
+
+/// The reply entry a batch carries for one finished job: the folded envelope
+/// goes to the job's result file through the same writer `result: "file"` uses,
+/// and the entry keeps only the compact fields — status, cost, path, sha256 and
+/// the result's first line — because the file is the body's one delivery and a
+/// batch of oversized envelopes must not inline their bodies.
+///
+/// The file is keyed by the id the job was COLLECTED under, never the record's
+/// stored `job_id`: a refused record's stored id names some other job's file,
+/// and a write there would poison that job's result. A crashed tombstone
+/// carries no body worth a Read and a failed or impossible write must never
+/// lose the one — both render the inline envelope entry, unchanged.
+fn batch_done_entry(id: &str, payload: serde_json::Value, is_error: bool) -> serde_json::Value {
+    if !payload
+        .get("crashed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && jobs::is_safe_job_id(id)
+    {
+        match write_result_file(id, &payload) {
+            Ok((path, sha256)) => {
+                let mut entry = serde_json::json!({
+                    "job_id": echo_name(id),
+                    "status": "done",
+                    "is_error": is_error,
+                    "result_file": path.display().to_string(),
+                    "sha256": sha256,
+                    "first_line": render::result_first_line(&payload),
+                });
+                // The compact row carries the cost clause's own two fields;
+                // the full live-usage fold stays in the file with the body.
+                if let Some(cost) = payload.get("total_cost_usd") {
+                    entry["total_cost_usd"] = cost.clone();
+                }
+                if let Some(endpoint) = payload.get("live_usage").and_then(|lu| lu.get("endpoint"))
+                {
+                    entry["live_usage"] = serde_json::json!({ "endpoint": endpoint });
+                }
+                return entry;
+            }
+            Err(reason) => {
+                logline!("clauth: result file write failed: {reason}; falling back to inline")
+            }
+        }
+    }
+    // The folded envelope is always an object (a non-object self-report is
+    // wrapped under `result` first), so the caller's per-id markers cannot
+    // collide with delegate output.
+    let mut payload = payload;
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(
+            "job_id".to_string(),
+            serde_json::Value::String(echo_name(id)),
+        );
+        map.insert(
+            "status".to_string(),
+            serde_json::Value::String("done".to_string()),
+        );
+    }
+    payload
 }
 
 /// Fold a finished job's envelope the way every delivery path does, returning
@@ -3025,11 +3084,35 @@ fn fold_done_envelope(
 }
 
 /// Render a finished job's envelope into its response blocks and error flag.
+/// A collect of a `result: "file"` job answers with the path the finalize
+/// already wrote — file, sha256, first line — instead of inlining the body a
+/// second time; the file is keyed by the id the job was COLLECTED under, never
+/// the record's stored `job_id`, for the same refused-record reason
+/// [`batch_done_entry`] documents. A missing, unreadable or crash-time
+/// result file falls back to the inline envelope, never losing the body.
 fn render_done_envelope(
+    collected_id: &str,
     record: jobs::JobRecord,
     digest: &DigestTracker,
 ) -> (Vec<ContentBlock>, bool) {
     let (payload, is_error) = fold_done_envelope(&record, DigestMode::Report(digest));
+    if !record.crashed
+        && jobs::is_safe_job_id(collected_id)
+        && let Ok(path) = result_file_path(collected_id)
+        && path.exists()
+        && let Ok(bytes) = std::fs::read(&path)
+    {
+        let hash = sha256_hex(&bytes);
+        let mut prose = render::result_file_prose(&path.display().to_string(), &hash, &payload);
+        // The fold above REPORTED the digest, so the compact reply renders it:
+        // a delta consumed into a reply that never names it is lost for good.
+        let digest = render::digest_prose(&payload["since_your_last_call"]);
+        if !digest.is_empty() {
+            prose.push_str("; ");
+            prose.push_str(&digest);
+        }
+        return (single_block(prose), is_error);
+    }
     let prose = render::monitor_job_prose(&payload);
     (single_block(prose), is_error)
 }

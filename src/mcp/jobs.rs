@@ -34,6 +34,7 @@
 //! tombstone when the server dies with the caller gone; the tombstone is a
 //! collectable record `monitor` then answers and removes.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1096,9 +1097,10 @@ fn gc_server_markers() {
 
 /// Best-effort GC at server startup: drop `done` files past their TTL and
 /// `running` files whose server is gone ([`running_is_corpse`]), sweep stray
-/// `.tmp` from a crash mid-write, reap stale delivery ledgers, and prune the
-/// owner markers no server holds any more. Nothing is evicted by count: the
-/// store is bounded by the two TTLs alone (see [`MAX_RETAINED`]).
+/// `.tmp` from a crash mid-write, reap stale delivery ledgers, reap the result
+/// files whose job the same rules retired, and prune the owner markers no
+/// server holds any more. Nothing is evicted by count: the store is bounded by
+/// the two TTLs alone (see [`MAX_RETAINED`]).
 pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
     gc_server_markers();
@@ -1511,8 +1513,16 @@ fn sweep(now: u64, scope: Scope) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
+    // The ids whose records this sweep kept. A result file none of them names
+    // has lost its job — retired here by the same Done-TTL rule the record
+    // itself answers to, or in an earlier sweep — and goes with it, under the
+    // full sweep only, like every destructive rule: never from a reader.
+    let mut surviving: HashSet<String> = HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             if full {
                 // A delivery ledger is kept while the unknown answer it feeds
@@ -1543,6 +1553,7 @@ fn sweep(now: u64, scope: Scope) {
             JobState::Running => running_is_corpse(&record, now),
         };
         if !expired {
+            surviving.insert(record.job_id.clone());
             continue;
         }
         // A dead blocking run's liveness record is CONVERTED rather than
@@ -1572,6 +1583,41 @@ fn sweep(now: u64, scope: Scope) {
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+    if full {
+        reap_unbacked_results(&surviving);
+    }
+}
+
+/// Reap the result files the store no longer backs: every `<safe job
+/// id>.txt` in `jobs/results/` whose id no surviving record names. A record's
+/// expiry is decided by the sweep that just ran, on the same [`DONE_TTL_MS`]
+/// horizon the record itself answers to, so a result file outliving its record
+/// is past retention by construction — one clock, not a second one. Only the
+/// shape `write_result_file` creates is judged; anything else in the directory
+/// is left exactly as found.
+fn reap_unbacked_results(surviving: &HashSet<String>) {
+    let Ok(dir) = jobs_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir.join("results")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_safe_job_id(id) || surviving.contains(id) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 

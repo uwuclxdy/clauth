@@ -743,6 +743,10 @@ fn result_file_writes_the_envelope_and_returns_path_and_sha256() {
         text.starts_with("result written to ") && text.contains("sha256 "),
         "the reply carries path and sha256, not the inline body: {text}",
     );
+    assert!(
+        text.contains("first line: cwd does not exist"),
+        "the reply names the result's first line beside the path: {text}",
+    );
     let path = text
         .split_once("result written to ")
         .expect("path leads")

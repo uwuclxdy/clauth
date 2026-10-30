@@ -5423,7 +5423,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     .unwrap();
     let record = jobs::read("d-render-0").expect("seeded job");
 
-    let (blocks, is_error) = render_done_envelope(record, &DigestTracker::new());
+    let (blocks, is_error) = render_done_envelope("d-render-0", record, &DigestTracker::new());
 
     assert!(
         !is_error,
@@ -5483,9 +5483,33 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         "one line per requested id plus the one tail clause: {text}"
     );
 
+    // The compact entry names the result file the claim just wrote: the path
+    // is parsed back out of the reply, the file must exist and its bytes must
+    // hash to the sha256 the entry carries.
+    let (path, sha) = lines[0]
+        .split_once("result written to ")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once(" (sha256 "))
+        .map(|(path, rest)| {
+            let sha: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            (path.to_string(), sha)
+        })
+        .expect("a done entry names its result file and sha256");
+    assert!(
+        lines[0].starts_with("job `d-b1-0` finished: all done; result written to "),
+        "a done id carries a compact entry, in the order given: {}",
+        lines[0]
+    );
+    let body = std::fs::read(&path).expect("the named result file exists");
+    let digest = sha2::Sha256::digest(&body);
     assert_eq!(
-        lines[0], "job `d-b1-0` finished: all done",
-        "a done id carries its envelope, in the order given",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        sha,
+        "the entry's sha256 matches the file's bytes: {}",
+        lines[0]
     );
     assert!(
         jobs::read("d-b1-0").is_none(),
@@ -5609,7 +5633,8 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
     let _home = HomeSandbox::new();
     // The done result is multi-line on purpose: real delegate output wraps,
     // and a single-line fixture would let the line count pass for the wrong
-    // reason (the count would pin the fixture, not the per-job shape).
+    // reason. The first line only rides the reply; the second is the body's,
+    // in the file the entry names.
     jobs::write_done_parts(
         "d-b1-0",
         "work",
@@ -5648,25 +5673,196 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         .collect();
     assert_eq!(
         lines.len(),
-        6,
-        "three named job lines, one wrapped line of the multi-line result, the \
-         running job's own quoted tail line, and the one unknown-count clause"
+        5,
+        "three named job lines, the running job's own quoted tail line, and the \
+         one unknown-count clause; a done result's body no longer wraps into the \
+         reply — the entry names the file that holds it"
     );
     assert_eq!(
-        lines[3], "    \"still compiling\"",
+        lines[2], "    \"still compiling\"",
         "a tail rides its own indented line under its job",
     );
     assert_eq!(named.len(), 3, "one named line per job");
-    assert_eq!(named[0], "job `d-b1-0` finished: line one");
-    assert_eq!(
-        lines[1], "line two",
-        "a multi-line result wraps inside its own job line"
+    assert!(
+        named[0].starts_with("job `d-b1-0` finished: line one; result written to "),
+        "a done entry names the first line and the result file: {named:?}"
     );
     assert!(
         named[1].starts_with("job `d-b2-0` running on `work`, elapsed"),
         "a running line names its id and state: {lines:?}"
     );
     assert_eq!(named[2], "job `d-b3-0` unknown");
+}
+
+/// A batch over finished jobs writes each envelope through the same result-file
+/// writer `result: "file"` uses and replies one compact entry per job — status,
+/// first line, path, sha256 — with the full body in the file. Seven oversized
+/// envelopes were the shape that used to inline 78 KB into one reply, so the
+/// entry cap is measured on the whole reply, not per row.
+#[test]
+fn a_batch_over_finished_jobs_writes_compact_result_files_and_names_first_lines() {
+    let _home = HomeSandbox::new();
+    let ids: Vec<String> = (0..7).map(|i| format!("d-mb7-{i}")).collect();
+    for id in &ids {
+        jobs::write_done_parts(
+            id,
+            "work",
+            1,
+            None,
+            None,
+            false,
+            serde_json::json!({
+                "profile": "work",
+                "is_error": false,
+                "result": format!("result line one {id}\nsecond line"),
+            }),
+        )
+        .unwrap();
+    }
+
+    let result = call_monitor_batch(ids.iter().map(String::as_str).collect());
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a batch over finished, healthy jobs is not an error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        7,
+        "one compact line per finished job, nothing else: {text}"
+    );
+    assert!(
+        text.len() < 4096,
+        "the whole reply stays under 4 KB with seven entries: {} bytes",
+        text.len()
+    );
+
+    for (i, id) in ids.iter().enumerate() {
+        let line = lines[i];
+        let needle = format!("job `{id}` finished: result line one {id}; result written to ");
+        assert!(
+            line.starts_with(&needle),
+            "the entry names the status and the result's first line, then the file: {line}"
+        );
+        let (path, sha) = line
+            .split_once("result written to ")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once(" (sha256 "))
+            .map(|(path, rest)| {
+                let sha: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                (path.to_string(), sha)
+            })
+            .expect("the entry carries path and sha256");
+        assert_eq!(sha.len(), 64, "the sha256 is the full hex digest: {line}");
+        let body = std::fs::read(&path).expect("the result file exists");
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &body);
+        let digest: String = sha2::Digest::finalize(hasher)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            digest, sha,
+            "the entry's sha256 matches the file's bytes: {line}"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&body).expect("the file holds the folded envelope");
+        assert_eq!(
+            envelope["result"],
+            format!("result line one {id}\nsecond line"),
+            "the file holds the FULL envelope, both lines: {path}"
+        );
+        assert!(
+            jobs::read(id).is_none(),
+            "the job file is still evicted by its claim"
+        );
+    }
+}
+
+/// A result-file write that fails falls back to the inline envelope row, for
+/// that job alone — the body is never lost and the batch's other jobs keep the
+/// compact shape. A directory at the file's own path makes the atomic rename
+/// inside `write_result_file` fail deterministically, with no permission games.
+#[test]
+fn a_batch_result_file_write_failure_falls_back_inline() {
+    let _home = HomeSandbox::new();
+    jobs::write_done_parts(
+        "d-mbfail-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    jobs::write_done_parts(
+        "d-mbfail-1",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
+    )
+    .unwrap();
+    let blocked = crate::profile::clauth_dir()
+        .expect("clauth dir under the sandbox")
+        .join("jobs/results/d-mbfail-0.txt");
+    std::fs::create_dir_all(&blocked).expect("block the result path");
+
+    let result = call_monitor_batch(vec!["d-mbfail-0", "d-mbfail-1"]);
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0], "job `d-mbfail-0` finished: all done",
+        "the failed write falls back to the inline envelope row: {text}"
+    );
+    assert!(
+        lines[1].starts_with("job `d-mbfail-1` finished: fine; result written to "),
+        "the batch's healthy job keeps the compact shape: {text}"
+    );
+}
+
+/// A one-id collect of a job whose result file already exists (the job was
+/// spawned with `result: "file"`) answers with the path, sha256 and first line
+/// instead of inlining the body that is already on disk. A job without a result
+/// file keeps the inline reply unchanged.
+#[test]
+fn a_result_file_job_collected_by_one_id_answers_path_and_first_line() {
+    let _home = HomeSandbox::new();
+    let envelope = serde_json::json!({
+        "profile": "work",
+        "is_error": false,
+        "result": "the answer",
+    });
+    jobs::write_done_parts("d-rf1-0", "work", 1, None, None, false, envelope.clone()).unwrap();
+    write_result_file("d-rf1-0", &envelope).expect("seed the result file");
+    jobs::write_done_parts("d-rf2-0", "work", 1, None, None, false, envelope).unwrap();
+
+    let text = monitor_text("d-rf1-0");
+    assert!(
+        text.starts_with("result written to ") && text.contains("first line: the answer"),
+        "the collect answers with the path and the first line: {text}"
+    );
+
+    let inline = monitor_text("d-rf2-0");
+    assert!(
+        inline.contains("delegate to `work` finished: the answer"),
+        "a job with no result file keeps the inline reply: {inline}"
+    );
 }
 
 /// A batch scan whose deadline passes mid-pass must resolve every id checked
@@ -5863,15 +6059,43 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .expect("results text");
+    let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
-        text.lines().collect::<Vec<_>>(),
-        vec![
-            "job `d-mis-0` finished: stolen",
-            "job `d-absent-0` unknown",
-            "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
-        ],
-        "the result is reported under the caller-supplied id, envelope intact, \
-         with the batch's one unknown-count clause on the tail",
+        lines.get(1..3),
+        Some(
+            &[
+                "job `d-absent-0` unknown",
+                "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+            ][..]
+        ),
+        "the batch's one unknown-count clause stays on the tail: {text}",
+    );
+    let (path, sha) = lines
+        .first()
+        .and_then(|l| l.split_once("result written to "))
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once(" (sha256 "))
+        .map(|(path, rest)| {
+            let sha: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            (path.to_string(), sha)
+        })
+        .expect("the mismatched result is reported under the caller-supplied id");
+    assert!(
+        path.ends_with("jobs/results/d-mis-0.txt"),
+        "the result file is keyed by the id the job was collected under, never \
+         the record's stored id: {path}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the result file exists"))
+            .expect("the envelope lands in the file intact");
+    assert_eq!(body["result"], "stolen", "the envelope is intact: {body}");
+    assert_eq!(sha.len(), 64, "the entry carries the full sha256: {sha}");
+    assert!(
+        !crate::profile::clauth_dir()
+            .unwrap()
+            .join("jobs/results/d-decoy-0.txt")
+            .exists(),
+        "the stored id's own result file is never written from a mismatched record"
     );
     assert!(
         jobs::read("d-decoy-0").is_some(),

@@ -1264,6 +1264,69 @@ fn gc_sweeps_stray_tmp_files() {
     assert!(!dir.join("d-1-0.json.tmp").exists(), "stray tmp swept");
 }
 
+/// A result file dies with its job. The same sweep that reaps an expired
+/// `done` record reaps the `<job_id>.txt` beside it in the same pass — one
+/// retention rule, never a second clock — and a result file whose record an
+/// earlier sweep already took goes with that too. Only the
+/// `<safe job id>.txt` shape the result writer creates is judged: a file of
+/// any other name is left exactly as found.
+#[test]
+fn gc_reaps_a_result_file_once_its_job_is_gone() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    seed_done_at(
+        "d-old-done",
+        now - DONE_TTL_MS - 1,
+        Some(now - DONE_TTL_MS - 1),
+    );
+    seed_done_at("d-fresh-done", now, Some(now));
+    for id in ["d-old-done", "d-fresh-done"] {
+        crate::mcp::write_result_file(id, &serde_json::json!({ "result": "body" })).unwrap();
+    }
+    let results = jobs_dir().unwrap().join("results");
+    // A result file whose record an earlier sweep already took, and two files
+    // the result writer never creates.
+    crate::mcp::write_result_file("d-vanished", &serde_json::json!({ "result": "body" })).unwrap();
+    std::fs::write(results.join("keep-me.notes"), b"foreign").unwrap();
+    std::fs::write(results.join("not an id.txt"), b"foreign").unwrap();
+
+    gc(now);
+
+    assert!(
+        !results.join("d-old-done.txt").exists(),
+        "the expired job's result file is reaped in the same sweep"
+    );
+    assert!(
+        !results.join("d-vanished.txt").exists(),
+        "a result file with no job behind it is reaped"
+    );
+    assert!(
+        results.join("d-fresh-done.txt").exists(),
+        "a live job's result file survives"
+    );
+    assert!(
+        results.join("keep-me.notes").exists(),
+        "a file of another shape is not this sweep's to read"
+    );
+    assert!(
+        results.join("not an id.txt").exists(),
+        "a .txt whose stem is not a safe job id is never touched"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(&results).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(results.join("d-fresh-done.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the results dir stays owner-only");
+        assert_eq!(file_mode, 0o600, "the result file stays owner-only");
+    }
+}
+
 /// A day of jobs can exceed [`MAX_RETAINED`] on a busy box, and no count cap may
 /// evict a record its TTL still protects: the cap this store used to carry,
 /// sorted on the same anchor the TTL reads, dropped a crashed run's record while

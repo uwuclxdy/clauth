@@ -1521,10 +1521,77 @@ pub(crate) fn cost_clause(e: &Value) -> String {
     }
 }
 
-/// Prose for a `result: "file"` reply: the path, the sha256, and the envelope's
-/// cost clause — the model Reads the file for the body.
+/// The character budget a result's first line gets in a reply: wide enough to
+/// carry a real first line, narrow enough that a 256-id batch stays bounded.
+const FIRST_LINE_MAX_CHARS: usize = 200;
+
+/// `line` with every control character and every bidi formatting character
+/// written as its `\u{..}` escape (delegate output is untrusted: it can
+/// neither drive the terminal nor reorder the line), held to `max` characters
+/// of the ESCAPED spelling with `format::truncate`'s `...` marker. The cut is taken per raw character, so it never splits an escape
+/// and never mistakes a literal `\` in the text for one; the work stops one
+/// character past the bound, whatever the line's length.
+fn escape_within(line: &str, max: usize) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut used = 0;
+    for c in line.chars() {
+        let piece = crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !c.is_control() && !crate::format::reorders_display(c)
+        });
+        used += piece.chars().count();
+        pieces.push(piece);
+        if used > max {
+            break;
+        }
+    }
+    if used <= max {
+        return pieces.concat();
+    }
+    let budget = max.saturating_sub(3);
+    let mut out = String::new();
+    let mut len = 0;
+    for piece in &pieces {
+        let n = piece.chars().count();
+        if len + n > budget {
+            break;
+        }
+        out.push_str(piece);
+        len += n;
+    }
+    out.push_str(&"..."[..max.min(3)]);
+    out
+}
+
+/// The first non-empty line of a delegate envelope's `result`, trimmed, every
+/// control and bidi formatting character written as its `\u{..}` escape, cut to
+/// [`FIRST_LINE_MAX_CHARS`] characters of the ESCAPED spelling with
+/// `format::truncate`'s `...` marker. A non-string result renders its literal
+/// and a missing one reads `unknown`, matching `envelope_prose`. A
+/// path-bearing reply carries this beside the result file, so the model can
+/// judge the answer without paying a Read for the body.
+pub(crate) fn result_first_line(e: &Value) -> String {
+    let text = match e.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown");
+    escape_within(line, FIRST_LINE_MAX_CHARS)
+}
+
+/// Prose for a `result: "file"` reply: the path, the sha256, the result's
+/// first line, and the envelope's cost clause — the model Reads the file for
+/// the body, and the first line tells it whether it needs to.
 pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
-    let mut out = format!("result written to {path} (sha256 {sha256})");
+    let mut out = format!(
+        "result written to {path} (sha256 {sha256}); first line: {}",
+        result_first_line(e)
+    );
     let cost = cost_clause(e);
     if !cost.is_empty() {
         out.push(';');
@@ -1878,6 +1945,7 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
             }
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
             match r.get("status").and_then(Value::as_str) {
+                Some("done") if r.get("result_file").is_some() => compact_done_row(job_id, r),
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
                 Some("running") => running_status_prose(r),
                 _ => format!("job `{job_id}` unknown"),
@@ -1903,6 +1971,36 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
                 "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
             ),
         );
+    }
+    out
+}
+
+/// One done batch row whose envelope went to a result file: the verdict word,
+/// the result's first line, then the path and sha256 the body lives under, plus
+/// the cost clause. The entry carries only the fields this line and
+/// `cost_clause` read, so a batch of oversized envelopes never inlines their
+/// bodies; the file is the body's one delivery. A row without a
+/// `result_file` (a write that fell back inline) never reaches here.
+fn compact_done_row(job_id: &str, r: &Value) -> String {
+    let verdict = if r.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        "failed"
+    } else {
+        "finished"
+    };
+    let mut out = format!(
+        "job `{job_id}` {verdict}: {}; result written to {} (sha256 {})",
+        r.get("first_line")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("result_file")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),
+    );
+    let cost = cost_clause(r);
+    if !cost.is_empty() {
+        out.push(';');
+        out.push_str(&cost);
     }
     out
 }
