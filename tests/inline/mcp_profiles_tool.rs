@@ -878,6 +878,141 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
     );
 }
 
+/// The runway reaches the roster row through the payload: `windows_payload`
+/// carries the funded wallet's numeric balance beside its burn, so the prose
+/// divides two numbers and never parses its own rendered figure. The burn is
+/// recency-weighted, so the row's exact runway is the prose test's job; this
+/// one pins that the clause reaches the row at all.
+#[test]
+fn a_wallet_series_renders_its_runway_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    let runway = row
+        .split_once("CNY/day (~")
+        .and_then(|(_, rest)| rest.split_once(" left)"))
+        .map(|(n, _)| n.to_string());
+    assert!(
+        runway
+            .as_deref()
+            .is_some_and(|n| n.ends_with(" day") || n.ends_with(" days") || n.ends_with(" h")),
+        "the funded wallet's runway rides its burn: {row}",
+    );
+    // The series burns ~393 CNY/day, so 498.18 CNY lasts 1.27 days; the
+    // count stays 1 for any burn between ~333 and ~498 CNY/day, so the
+    // recency weighting's drift between the fixture's stamps and the call
+    // cannot move it, while a wrong unit does.
+    assert!(
+        row.ends_with(" CNY/day (~1 day left)"),
+        "the funded wallet's runway in whole days: {row}",
+    );
+}
+
+/// The numeric balance the prose divides rides the payload, and it is the
+/// FUNDED wallet's amount in the burn's currency — the two-wallet cache lists
+/// an empty USD row first, so a balance taken off the first row would name a
+/// different wallet than the burn.
+#[test]
+fn the_runway_payload_carries_the_funded_wallets_balance() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let now = crate::usage::now_ms();
+    let history = [
+        (now - 2 * 3_600_000, 600.18),
+        (now - 3_600_000, 550.18),
+        (now - 30 * 60_000, 520.18),
+    ]
+    .into_iter()
+    .map(|(ts, amount)| crate::usage::WalletSample {
+        ts,
+        label: "api balance".to_string(),
+        amount,
+        currency: "CNY".to_string(),
+    })
+    .collect::<Vec<_>>();
+    let rate = crate::usage::funded_wallet_rate(&history, &stats.rows)
+        .expect("the funded CNY wallet carries a rate");
+    assert_eq!(rate.currency, "CNY");
+    let payload = windows_payload(&ProfileWindows::ThirdParty {
+        stats: Some(stats),
+        age_secs: None,
+        provider: None,
+        wallet_rate: Some(rate),
+    });
+    assert_eq!(payload["wallet_balance"].as_f64(), Some(498.18));
+    assert_eq!(payload["wallet_burn_currency"], "CNY");
+}
+
+/// The receipt's `target` clause reads the payload `windows_payload` builds:
+/// `live_usage_json` folds `wallet_balance` and the burn in through
+/// `dated_windows_payload`, so a delegate reply names the target wallet's
+/// runway without a second render path. 498.18 CNY at 160.7/day lasts 3.10
+/// days -> three whole days.
+#[test]
+fn the_runway_reaches_the_delegate_receipt_through_live_usage_json() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let rate = crate::usage::WalletRate {
+        label: "api balance".to_string(),
+        currency: "CNY".to_string(),
+        amount: 498.18,
+        per_day: 160.7,
+    };
+    let lu = live_usage_json(
+        Some("vendor"),
+        Some(&ProfileWindows::ThirdParty {
+            stats: Some(stats),
+            age_secs: None,
+            provider: None,
+            wallet_rate: Some(rate),
+        }),
+    );
+    let prose = render::live_usage_prose(&lu, "target");
+    assert!(
+        prose.ends_with("(~3 days left)"),
+        "the receipt's target clause names the target wallet's runway: {prose}",
+    );
+}
+
 /// One-wallet control for the ruling: a profile whose cache carries a single
 /// funded wallet renders exactly as it did before the rule — same figure,
 /// same row shape.

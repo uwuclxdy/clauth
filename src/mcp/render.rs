@@ -892,13 +892,16 @@ fn windows_prose(windows: &Value) -> String {
                 format!("no 5h/7d limits; {figure}")
             };
             // The wallet-burn rate rides the figure it qualifies — the same
-            // first-class-figure shape the Usage tab's rate rows carry, so a
-            // reader picking a delegate target judges the runway themselves.
+            // first-class-figure shape the Usage tab's rate rows carry.
             if let (Some(per_day), Some(currency)) = (
                 windows.get("wallet_burn_per_day").and_then(Value::as_f64),
                 windows.get("wallet_burn_currency").and_then(Value::as_str),
             ) {
                 out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+                // The runway rides the burn it is derived from, in the same
+                // phrase, so the two figures the reader would divide always
+                // sit beside their answer.
+                out.push_str(&wallet_runway_clause(windows));
             }
             out.push_str(&freshness_clause(windows));
             out
@@ -942,6 +945,44 @@ fn windows_prose(windows: &Value) -> String {
             out
         }
         _ => "usage unknown".to_string(),
+    }
+}
+
+/// The funded wallet's runway — how long its balance lasts at its own burn —
+/// appended beside the two figures it divides, so a reader picking a delegate
+/// target never divides them itself. Whole days from one day up (`~1 day`,
+/// `~2 days`), whole hours under a day (`~7 h`), each rounded to nearest;
+/// under half an hour rounds to no hour at all and reads `<1 h`. Omitted when
+/// either figure is missing, when the burn reads as zero at one decimal (`0`
+/// never runs out), when the balance is not positive (a debt is no runway), and
+/// when the ratio overflows to a non-finite number.
+fn wallet_runway_clause(windows: &Value) -> String {
+    let balance = windows.get("wallet_balance").and_then(Value::as_f64);
+    let per_day = windows.get("wallet_burn_per_day").and_then(Value::as_f64);
+    let (Some(balance), Some(per_day)) = (balance, per_day) else {
+        return String::new();
+    };
+    // The burn as rendered (one decimal): one reading `~0.0` is no burn to the
+    // reader.
+    if !(balance > 0.0 && (per_day * 10.0).round() > 0.0) {
+        return String::new();
+    }
+    let days = balance / per_day;
+    // A ratio that overflows to infinity names no runway a reader can use.
+    if !days.is_finite() {
+        return String::new();
+    }
+    if days >= 1.0 {
+        let whole = days.round();
+        let unit = if whole == 1.0 { "day" } else { "days" };
+        format!(" (~{whole:.0} {unit} left)")
+    } else {
+        let hours = (days * 24.0).round();
+        if hours < 1.0 {
+            " (<1 h left)".to_string()
+        } else {
+            format!(" (~{hours:.0} h left)")
+        }
     }
 }
 

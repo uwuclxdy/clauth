@@ -173,6 +173,9 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
             // the roster and the delegate reply render beside the balance,
             // the way they already share `fetched_secs_ago`.
             if let Some(rate) = wallet_rate {
+                // `amount` and `per_day` are one wallet's two figures, so the
+                // runway never divides one wallet's balance by another's burn.
+                payload["wallet_balance"] = serde_json::json!(rate.amount);
                 payload["wallet_burn_per_day"] = serde_json::json!(rate.per_day);
                 payload["wallet_burn_currency"] = serde_json::json!(rate.currency);
             }

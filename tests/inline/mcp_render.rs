@@ -848,6 +848,59 @@ fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     );
 }
 
+/// The wallet's runway rides its burn rate, so a reader picking a delegate
+/// target reads how long the account lasts instead of dividing two figures:
+/// whole days from one day up, whole hours below it. 371.47 / 160.7 = 2.31
+/// days; 50 / 160.7 = 0.311 days = 7.47 h.
+#[test]
+fn windows_prose_names_the_wallet_runway_beside_its_burn() {
+    let wallet = |balance: f64, per_day: f64| {
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": format!("api balance: {balance:.2} CNY"),
+            "provider_windows": false,
+            "wallet_balance": balance,
+            "wallet_burn_per_day": per_day,
+            "wallet_burn_currency": "CNY",
+        }))
+    };
+    assert_eq!(
+        wallet(371.47, 160.7),
+        "no 5h/7d limits; api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)",
+    );
+    assert_eq!(
+        wallet(50.0, 160.7),
+        "no 5h/7d limits; api balance: 50.00 CNY · ~160.7 CNY/day (~7 h left)",
+    );
+}
+
+/// No runway without both figures: a zero burn never runs out, and a burn with
+/// no numeric balance has nothing to divide.
+#[test]
+fn windows_prose_names_no_runway_without_a_balance_and_a_burn() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "wallet_balance": 371.47,
+            "wallet_burn_per_day": 0.0,
+            "wallet_burn_currency": "CNY",
+        })),
+        "no 5h/7d limits; api balance: 371.47 CNY · ~0.0 CNY/day",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "wallet_burn_per_day": 160.7,
+            "wallet_burn_currency": "CNY",
+        })),
+        "no 5h/7d limits; api balance: 371.47 CNY · ~160.7 CNY/day",
+    );
+}
+
 /// An unknown is DATED when the payload carries an age (owner ruling
 /// 2026-09-08: date the unknowns — the age is the one signal separating an
 /// all-lapsed pair from a never-fetched account), and never marked `stale`:
@@ -905,8 +958,7 @@ fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
 }
 
 /// The wallet-burn rate rides the balance it qualifies, before the freshness
-/// clause — the shortfall-report shape: the figure and its pace, the caller
-/// judges the runway.
+/// clause — the shortfall-report shape: the figure and its pace.
 #[test]
 fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
     assert_eq!(
@@ -939,6 +991,94 @@ fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
             "provider_windows": false,
         })),
         "no 5h/7d limits; api balance: 2.53 CNY",
+    );
+}
+
+/// The runway rounds to the nearest whole unit and keeps its unit above the
+/// day: 160.7 CNY/day makes 200 CNY last 1.24 days → one SINGULAR day, 12 CNY
+/// last 1.79 h → 2 h, and 1 CNY (0.15 h) rounds to no whole hour at all.
+/// A negative balance is no runway, not a negative one.
+#[test]
+fn windows_prose_rounds_the_runway_to_whole_days_and_hours() {
+    let wallet = |balance: f64, per_day: f64| {
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": format!("api balance: {balance:.2} CNY"),
+            "provider_windows": false,
+            "wallet_balance": balance,
+            "wallet_burn_per_day": per_day,
+            "wallet_burn_currency": "CNY",
+        }))
+    };
+    assert_eq!(
+        wallet(200.0, 160.7),
+        "no 5h/7d limits; api balance: 200.00 CNY · ~160.7 CNY/day (~1 day left)",
+    );
+    assert_eq!(
+        wallet(160.7, 160.7),
+        "no 5h/7d limits; api balance: 160.70 CNY · ~160.7 CNY/day (~1 day left)",
+    );
+    assert_eq!(
+        wallet(12.0, 160.7),
+        "no 5h/7d limits; api balance: 12.00 CNY · ~160.7 CNY/day (~2 h left)",
+    );
+    assert_eq!(
+        wallet(1.0, 160.7),
+        "no 5h/7d limits; api balance: 1.00 CNY · ~160.7 CNY/day (<1 h left)",
+    );
+    // Days round to nearest too: 250 / 160.7 = 1.56 days, which floors to 1
+    // and rounds to 2.
+    assert_eq!(
+        wallet(250.0, 160.7),
+        "no 5h/7d limits; api balance: 250.00 CNY · ~160.7 CNY/day (~2 days left)",
+    );
+    // A non-finite ratio is no runway either: 1e307 / 0.05 overflows to `inf`
+    // (the payload never carries one today, and the guard keeps `~inf days
+    // left` off a row if it ever does).
+    let overflow = wallet(1e307, 0.05);
+    assert!(
+        overflow.ends_with(" CNY/day"),
+        "a non-finite runway renders no clause: {overflow}",
+    );
+    // The guard reads the burn AS RENDERED (one decimal): 0.04/day prints
+    // `~0.0`, which reads as no burn, so no runway of decades rides it.
+    assert_eq!(
+        wallet(371.47, 0.04),
+        "no 5h/7d limits; api balance: 371.47 CNY · ~0.0 CNY/day",
+    );
+    assert_eq!(
+        wallet(-5.0, 160.7),
+        "no 5h/7d limits; api balance: -5.00 CNY · ~160.7 CNY/day",
+    );
+}
+
+/// The delegate receipt renders through the same prose, so the target clause
+/// names the target wallet's runway beside its burn — one spelling of one
+/// account's headroom, never a second render path.
+#[test]
+fn delegate_prose_names_the_wallet_runway_in_the_target_clause() {
+    let sync = serde_json::json!({
+        "profile": "vendor",
+        "is_error": false,
+        "result": "ok",
+        "total_cost_usd": 0.5,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "live_usage": {
+            "profile": "vendor",
+            "endpoint": "api.deepseek.com",
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "wallet_balance": 371.47,
+            "wallet_burn_per_day": 160.7,
+            "wallet_burn_currency": "CNY",
+        }
+    });
+    assert_eq!(
+        delegate_prose(&sync),
+        "delegate to `vendor` finished: ok (equivalent Anthropic API rate cost: $0.5), \
+         usage: input 10 tokens, output 5 tokens; target `vendor`: no 5h/7d limits; \
+         api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)"
     );
 }
 
