@@ -528,22 +528,29 @@ fn the_delegates_detail_reads_the_store_in_banded_order() {
     );
 }
 
-/// The folded plugin check's health is the worst of its four sub-checks (clauth
-/// on PATH, mcpServers wiring, plugin install, CC version). Driven through the
-/// pure `plugin_check` with a controlled PATH so each arm is deterministic.
+/// The folded plugin check's health is the worst of its groups (clauth on
+/// PATH, mcpServers wiring, plugin install, CC version, the completion
+/// script). Driven through the pure `plugin_check` with a controlled PATH so
+/// each arm is deterministic.
 #[test]
-fn the_plugin_check_health_is_the_worst_of_the_four() {
+fn the_plugin_check_health_is_the_worst_of_its_groups() {
+    use crate::completions::{InstalledScript, ScriptState};
     use crate::plugin_probe::McpProbe;
     let _home = crate::testutil::HomeSandbox::new();
     let path = std::path::PathBuf::from("/usr/bin/clauth");
 
     // clauth missing alone is danger, whatever the others say.
-    let check = super::plugin_check(None, Some(Some("1.2.3".to_string())), Some(McpProbe::Ok));
+    let check = super::plugin_check(
+        None,
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+        None,
+    );
     assert_eq!(check.health, super::Health::Danger);
 
     // clauth present, nothing wired or installed: both fixes warn, and the
     // install leads.
-    let check = super::plugin_check(Some(&path), None, None);
+    let check = super::plugin_check(Some(&path), None, None, None);
     assert_eq!(check.health, super::Health::Warn);
     assert_eq!(check.fix, Some(super::ServiceFix::InstallPlugin));
 
@@ -553,15 +560,70 @@ fn the_plugin_check_health_is_the_worst_of_the_four() {
         Some(&path),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(check.fix.is_none());
+
+    // A stale completion script warns and offers its update fix.
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+        Some(InstalledScript {
+            shell: "bash".to_string(),
+            state: ScriptState::Stale,
+        }),
+    );
+    assert_eq!(check.health, super::Health::Warn);
+    assert_eq!(
+        check.fix,
+        Some(super::ServiceFix::Completions {
+            shell: "bash".to_string(),
+            stale: true,
+        })
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "f  update completions"),
+        "{:?}",
+        check.detail
+    );
+
+    // A missing script is an invitation, not a problem: it offers its install
+    // fix and moves no health.
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+        Some(InstalledScript {
+            shell: "bash".to_string(),
+            state: ScriptState::Missing,
+        }),
+    );
+    assert_eq!(
+        check.health,
+        super::Health::Ok,
+        "a missing completion script moves no health"
+    );
+    assert_eq!(
+        check.fix,
+        Some(super::ServiceFix::Completions {
+            shell: "bash".to_string(),
+            stale: false,
+        })
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "f  install completions"),
+        "{:?}",
+        check.detail
+    );
 
     // A boot failure is danger even when the wiring and install are fine.
     let check = super::plugin_check(
         Some(&path),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Failed("refused".to_string())),
+        None,
     );
     assert_eq!(check.health, super::Health::Danger);
 }
@@ -583,6 +645,7 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
         Some(&path),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
 
     let data_line = format!(
@@ -646,6 +709,7 @@ fn the_plugin_check_reads_a_global_wire_as_wired() {
         Some(std::path::Path::new("/usr/bin/clauth")),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
     assert!(
         check.detail.iter().any(|l| l == "mcp entry: registered"),
@@ -680,6 +744,7 @@ fn the_plugin_check_reads_a_user_install_as_healthy() {
         Some(std::path::Path::new("/usr/bin/clauth")),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(
@@ -710,6 +775,7 @@ fn the_plugin_check_warns_on_a_user_install_older_than_this_clauth() {
         Some(std::path::Path::new("/usr/bin/clauth")),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
     let data_line = format!(
         "data: {}",
@@ -791,6 +857,7 @@ fn the_plugin_check_reads_a_user_install_that_is_not_older_as_healthy() {
             Some(std::path::Path::new("/usr/bin/clauth")),
             Some(Some("1.2.3".to_string())),
             Some(McpProbe::Ok),
+            None,
         );
         assert_eq!(
             check.health,
@@ -821,7 +888,12 @@ fn the_plugin_check_reads_a_user_install_that_is_not_older_as_healthy() {
 #[test]
 fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
     let _home = crate::testutil::HomeSandbox::new();
-    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+    );
     let data_line = format!(
         "data: {}",
         crate::profile::clauth_dir()
@@ -932,6 +1004,9 @@ fn the_delegates_detail_names_rate_limited_traffic() {
 #[test]
 fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     let _home = crate::testutil::HomeSandbox::new();
+    // No supported `$SHELL`, so the fixture holds exactly the wire and install
+    // problems the cursor arithmetic is about.
+    let _env = crate::testutil::EnvPin::new(&_home, &[("SHELL", None)]);
     let mut app = bare_app();
     app.tab = super::Tab::Services;
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
@@ -1845,7 +1920,12 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
     });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 
-    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+    );
     assert_eq!(
         check.health,
         super::Health::Ok,
@@ -1933,6 +2013,263 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     );
 }
 
+/// The completions fix is the one writer `clauth completions install` runs:
+/// list `f`, `↵`, then the confirm's `y` rewrites the script byte-identical to
+/// the binary's emission and adds the rc `source` line, and the fix's own
+/// re-probe drops the problem.
+#[cfg(unix)]
+#[test]
+fn the_completions_fix_rewrites_the_script_and_clears_the_problem() {
+    use crate::completions::{ScriptState, emission, script_state};
+    use ratatui::crossterm::event::KeyCode;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    // clauth resolvable on PATH, so the health asserts below read the
+    // completions group alone rather than the missing-binary danger.
+    let _path = ClauthPath::new(&home);
+    // A healthy user-scope install and mcp wiring leave completions as the
+    // plugin detail's only problem.
+    write_plugin_install("user", Some(env!("CARGO_PKG_VERSION")));
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    // Plant a stale script without running the writer: no rc file carries the
+    // `source` line, so a fix that bypassed `install` could not add it.
+    let path = home
+        .home()
+        .join(".clauth")
+        .join("completions")
+        .join("clauth.bash");
+    std::fs::create_dir_all(path.parent().expect("script dir")).expect("mkdir");
+    std::fs::write(&path, "an older script\n").expect("plant the stale script");
+    let rc = home.home().join(".bashrc");
+    assert!(!rc.exists(), "fixture: no rc file before the fix");
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let idx = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    app.services.cursor = idx;
+    app.services.focus = super::ServicesFocus::List;
+    assert_eq!(
+        app.services.checks[idx].problems.len(),
+        1,
+        "fixture: the stale script is the plugin detail's only problem"
+    );
+    assert_eq!(
+        app.services.checks[idx].health,
+        super::Health::Warn,
+        "a stale script warns"
+    );
+    assert_eq!(
+        app.services.checks[idx].fix,
+        Some(super::ServiceFix::Completions {
+            shell: "bash".to_string(),
+            stale: true,
+        }),
+        "the row offers the update fix"
+    );
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix().map(super::fix_verb),
+        Some("update completions"),
+        "list `f` lands on the update completions line"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => {
+            assert_eq!(state.message, "update bash completions?");
+            assert_eq!(
+                state.detail.as_deref(),
+                Some(
+                    "writes ~/.clauth/completions/clauth.bash and adds a source line to ~/.bashrc if it has none."
+                ),
+                "the confirm says where the fix writes"
+            );
+            assert!(!state.choice, "the confirm defaults to cancel");
+        }
+        other => panic!("expected the completions confirm, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("read the planted script"),
+        b"an older script\n",
+        "nothing may run before the confirm's yes"
+    );
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        std::fs::read(&path).expect("read the rewritten script"),
+        emission("bash").expect("bash emission").as_bytes(),
+        "the fix writes the binary's own emission, never a copy of what it wrote"
+    );
+    assert_eq!(
+        script_state("bash").expect("a supported shell"),
+        ScriptState::Current,
+        "the rewritten script reads current"
+    );
+    let rc_text = std::fs::read_to_string(&rc).expect("the fix adds the rc source line");
+    let source_line = format!("source \"{}\"", path.display());
+    assert_eq!(
+        rc_text.matches(&source_line).count(),
+        1,
+        "the fix runs `install`, which appends the source line exactly once: {rc_text:?}"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Success, "wrote bash completions")),
+        "the success toast names the write"
+    );
+    let idx = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    assert!(
+        !app.services.checks[idx]
+            .detail
+            .iter()
+            .any(|line| line.starts_with("completions")),
+        "the fix's own re-probe drops the completions line: {:?}",
+        app.services.checks[idx].detail
+    );
+    assert!(
+        app.services.checks[idx].fix.is_none(),
+        "and the plugin row is left with no fix: {:?}",
+        app.services.checks[idx].fix
+    );
+    assert_eq!(
+        app.services.checks[idx].health,
+        super::Health::Ok,
+        "a current script leaves the row healthy"
+    );
+}
+
+/// A failed completions fix reports why, not just the action: the failure
+/// toast's head names the verb and its detail carries the root cause and the
+/// file it hit.
+#[cfg(unix)]
+#[test]
+fn a_failed_completions_fix_surfaces_the_root_cause() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    let path = plant_stale_bash_script(&home);
+    // A directory where the rc file belongs makes the rc read fail, the shape
+    // a permissions error takes.
+    let rc = home.home().join(".bashrc");
+    std::fs::remove_file(&rc).expect("drop the rc file the first install wrote");
+    std::fs::create_dir(&rc).expect("mkdir the rc path");
+
+    let mut app = bare_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::Completions {
+            shell: "bash".into(),
+            stale: true,
+        },
+    );
+
+    let toast = app.toasts.back().expect("a failure toast");
+    assert_eq!(toast.kind, super::ToastKind::Danger);
+    let (head, detail) = toast.body.split_once('\n').expect("a head and a detail");
+    assert_eq!(head, "update completions failed", "the head names the verb");
+    assert!(
+        detail.contains("failed to read") && detail.contains(&rc.display().to_string()),
+        "the detail carries the root cause and the file: {detail:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read the script"),
+        b"an older script\n",
+        "a refused install writes nothing"
+    );
+}
+
+/// Each shell's completions confirm names the write it makes: bash and zsh also
+/// add the rc `source` line `install_rc` writes, fish names its own directory.
+/// The verb follows the script's state.
+#[test]
+fn the_completions_confirms_name_each_shells_write() {
+    use crate::tui::app::{Check, Health, Problem, ServiceFix};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let cases = [
+        (
+            true,
+            "bash",
+            (
+                "update bash completions?",
+                "writes ~/.clauth/completions/clauth.bash and adds a source line to ~/.bashrc if it has none.",
+            ),
+        ),
+        (
+            false,
+            "bash",
+            (
+                "install bash completions?",
+                "writes ~/.clauth/completions/clauth.bash and adds a source line to ~/.bashrc if it has none.",
+            ),
+        ),
+        (
+            true,
+            "zsh",
+            (
+                "update zsh completions?",
+                "writes ~/.clauth/completions/clauth.zsh and adds a source line to ~/.zshrc if it has none.",
+            ),
+        ),
+        (
+            false,
+            "fish",
+            (
+                "install fish completions?",
+                "writes ~/.config/fish/completions/clauth.fish.",
+            ),
+        ),
+    ];
+    for (stale, shell, (message, detail)) in cases {
+        let fix = ServiceFix::Completions {
+            shell: shell.to_string(),
+            stale,
+        };
+        let mut app = bare_app();
+        app.tab = super::Tab::Services;
+        app.services.checks = vec![Check {
+            label: "plugin",
+            health: Health::Warn,
+            detail: vec![super::fix_line(&fix)],
+            fix: Some(fix.clone()),
+            problems: vec![Problem { line: 0, fix }],
+            shunt_focus: Vec::new(),
+            shunt_action_start: None,
+        }];
+        app.services.focus = super::ServicesFocus::Detail;
+        app.services.problem_cursor = 0;
+
+        super::apply_service_fix(&mut app);
+        match app.modals.last() {
+            Some(super::Modal::Confirm(state)) => {
+                assert_eq!(state.message, message, "{shell} confirm message");
+                assert_eq!(
+                    state.detail.as_deref(),
+                    Some(detail),
+                    "{shell} confirm detail"
+                );
+                assert!(!state.choice, "{shell} confirm defaults to cancel");
+            }
+            other => panic!("{shell}: expected a completions confirm, got {other:?}"),
+        }
+    }
+}
+
 /// The pin the whole install fix hangs on: `ConfirmAction::InstallPlugin` runs
 /// agentgear's `install(Scope::User, Source::Embedded)` — visible here as the
 /// exact `claude plugin` invocations the fake CLI records (user scope on both
@@ -1943,6 +2280,9 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
 #[test]
 fn the_install_fix_runs_agentgear_user_scope_install() {
     let home = crate::testutil::HomeSandbox::new();
+    // No supported `$SHELL`: this test pins the plugin install, so the
+    // completions group must not add a second fix to the row it reads.
+    let _env = crate::testutil::EnvPin::new(&home, &[("SHELL", None)]);
     let config = home.home().join(".claude-config");
     std::fs::create_dir_all(&config).expect("config dir");
     let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
@@ -20357,6 +20697,7 @@ fn the_plugin_row_escapes_markers_in_fields_read_off_the_registry() {
         Some(std::path::Path::new("/usr/bin/clauth")),
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
+        None,
     );
     assert!(
         check.detail.iter().any(|l| l == "commit: abc\\u{e000}def"),
@@ -49120,6 +49461,9 @@ fn a_same_state_services_poll_colors_nothing() {
 #[test]
 fn a_plugin_row_health_change_out_of_view_colors_services() {
     let _home = crate::testutil::HomeSandbox::new();
+    // No supported `$SHELL`: the completions group stays off, so the plugin
+    // row's only open issue is the install this test seeds.
+    let _env = crate::testutil::EnvPin::new(&_home, &[("SHELL", None)]);
     let _path = ClauthPath::new(&_home);
     let mut app = bare_app();
     app.tab = super::Tab::Overview;
@@ -53684,6 +54028,28 @@ const OWN_REMOVED_TOAST: &str = "this clauth's binary was removed: quit it befor
 const OWN_REMOVED_INSTALL_REFUSAL: &str =
     "this clauth's binary was removed: reinstall clauth and open it to install the plugin";
 
+/// The refusal a replaced TUI gives in place of the completions update.
+#[cfg(unix)]
+const OWN_REPLACED_COMPLETIONS_UPDATE_REFUSAL: &str =
+    "this clauth is still running the old binary: quit and reopen it before updating completions";
+
+/// The refusal a replaced TUI gives in place of the completions install.
+#[cfg(unix)]
+const OWN_REPLACED_COMPLETIONS_INSTALL_REFUSAL: &str =
+    "this clauth is still running the old binary: quit and reopen it before installing completions";
+
+/// The refusal a TUI whose binary is gone gives in place of the completions
+/// update.
+#[cfg(unix)]
+const OWN_REMOVED_COMPLETIONS_UPDATE_REFUSAL: &str =
+    "this clauth's binary was removed: reinstall clauth and open it to update completions";
+
+/// The refusal a TUI whose binary is gone gives in place of the completions
+/// install.
+#[cfg(unix)]
+const OWN_REMOVED_COMPLETIONS_INSTALL_REFUSAL: &str =
+    "this clauth's binary was removed: reinstall clauth and open it to install completions";
+
 /// This TUI's own executable removed since it started (the path left empty, the
 /// shape `cargo uninstall` leaves) raises the removal's toast, never the
 /// replaced one, once per run.
@@ -53867,6 +54233,99 @@ fn a_replaced_tui_binary_refuses_the_plugin_install() {
         Some((super::ToastKind::Warning, OWN_REPLACED_INSTALL_REFUSAL)),
         "the refusal names the restart"
     );
+}
+
+/// Install bash's completion script, then leave bytes this binary never
+/// emitted at its path: the stale shape the card offers to update.
+#[cfg(unix)]
+fn plant_stale_bash_script(home: &crate::testutil::HomeSandbox) -> std::path::PathBuf {
+    crate::completions::install(Some("bash")).expect("install the completion script");
+    let path = home
+        .home()
+        .join(".clauth")
+        .join("completions")
+        .join("clauth.bash");
+    std::fs::write(&path, "an older script\n").expect("plant the stale script");
+    path
+}
+
+/// A replaced TUI refuses the completions fix, and the refusal's verb follows
+/// the fix asked for: the script it would write is the old image's emission,
+/// not the installed binary's.
+#[cfg(unix)]
+#[test]
+fn a_replaced_tui_binary_refuses_the_completions_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let path = plant_stale_bash_script(&home);
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let mut app = bare_app();
+    for (stale, refusal) in [
+        (true, OWN_REPLACED_COMPLETIONS_UPDATE_REFUSAL),
+        (false, OWN_REPLACED_COMPLETIONS_INSTALL_REFUSAL),
+    ] {
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::Completions {
+                shell: "bash".into(),
+                stale,
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("read the script"),
+            b"an older script\n",
+            "a replaced TUI writes nothing"
+        );
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((super::ToastKind::Warning, refusal)),
+            "the refusal names the restart"
+        );
+    }
+}
+
+/// A TUI whose binary is gone refuses the completions fix the same way, with
+/// the removal's own refusal and the asked-for fix's verb.
+#[cfg(unix)]
+#[test]
+fn a_removed_tui_binary_refuses_the_completions_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let path = plant_stale_bash_script(&home);
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    std::fs::remove_file(&recorded).expect("remove the recorded file");
+
+    let mut app = bare_app();
+    for (stale, refusal) in [
+        (true, OWN_REMOVED_COMPLETIONS_UPDATE_REFUSAL),
+        (false, OWN_REMOVED_COMPLETIONS_INSTALL_REFUSAL),
+    ] {
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::Completions {
+                shell: "bash".into(),
+                stale,
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("read the script"),
+            b"an older script\n",
+            "a removed TUI writes nothing"
+        );
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((super::ToastKind::Warning, refusal)),
+            "the refusal names the reinstall"
+        );
+    }
 }
 
 /// Write a feed carrying `binary_replaced` under the given stamp.

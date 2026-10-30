@@ -1501,6 +1501,14 @@ pub(crate) enum ConfirmAction {
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
+    /// Services tab: rewrite the shell's completion script through
+    /// `completions::install`, the `clauth completions install` writer, which
+    /// also keeps the shell rc's `source` line current. `stale` picks the verb
+    /// the confirm and a failure toast say.
+    Completions {
+        shell: String,
+        stale: bool,
+    },
     /// Services tab: adopt a found standalone shunt config (TOML only), running
     /// the probe and store plan off the UI thread.
     AdoptConfig(std::path::PathBuf),
@@ -2835,6 +2843,13 @@ pub(crate) enum ServiceFix {
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
     InstallPlugin,
+    /// Rewrite the shell completion script through `completions::install`, the
+    /// one writer `clauth completions install` runs. `stale` picks the verb:
+    /// an update rewrites an older script, an install writes an absent one.
+    Completions {
+        shell: String,
+        stale: bool,
+    },
     /// Adopt a found standalone shunt config. `PathBuf` = the discovered TOML.
     AdoptConfig(std::path::PathBuf),
     /// Move a stopped standalone's account stores into clauth's managed stores.
@@ -3575,6 +3590,8 @@ pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
     match fix {
         ServiceFix::WireMcpServers => "wire mcp server",
         ServiceFix::InstallPlugin => "install plugin",
+        ServiceFix::Completions { stale: true, .. } => "update completions",
+        ServiceFix::Completions { stale: false, .. } => "install completions",
         ServiceFix::HealHerdrConfig(_) => "heal herdr config",
         ServiceFix::AdoptConfig(_) => "adopt config",
         ServiceFix::MoveStoresIn => "move stores in",
@@ -12087,6 +12104,19 @@ fn apply_service_fix(app: &mut App) {
                 on_confirm: ConfirmAction::InstallPlugin,
             }));
         }
+        ServiceFix::Completions { shell, stale } => {
+            app.disarm_quit();
+            // The writer's own path builder names what the fix touches, so the
+            // confirm cannot drift onto a second spelling of it.
+            let verb = if stale { "update" } else { "install" };
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("{verb} {shell} completions?"),
+                detail: crate::completions::install_summary(&shell).ok(),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::Completions { shell, stale },
+            }));
+        }
         ServiceFix::AdoptConfig(path) => {
             app.disarm_quit();
             app.open_modal(Modal::Confirm(ConfirmState {
@@ -17172,16 +17202,19 @@ pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
 /// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
-/// on PATH and the data dir, a blank line between the three groups. The
-/// install leads because installing is the fix a fresh box needs, and it also
-/// registers the server. Health is the worst of the four; the fixable problems
-/// walk in detail order, so list-level `f` lands on install first. `clauth_path` is
-/// passed in (the recompute also gates the start probe on it) so the verdict
-/// logic unit-tests without a live `PATH`.
-fn plugin_check(
+/// on PATH and the data dir, a blank line between the three groups, and the
+/// shell completion script's state last. The install leads because installing
+/// is the fix a fresh box needs, and it also registers the server. Health is
+/// the worst of the five, but a missing completion script offers its fix
+/// without moving it; the fixable problems walk in detail order, so
+/// list-level `f` lands on install first. `clauth_path` and `completions` are
+/// passed in (the recompute resolves both off the live box) so the verdict
+/// logic unit-tests without a live `PATH` or `$SHELL`.
+pub(crate) fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
     mcp_boot: Option<crate::plugin_probe::McpProbe>,
+    completions: Option<crate::completions::InstalledScript>,
 ) -> Check {
     use crate::plugin_probe as probe;
 
@@ -17395,8 +17428,45 @@ fn plugin_check(
             .unwrap_or_else(|_| "\u{2014}".to_string())
     ));
 
+    // The installed shell completion script. Its own group, last: a stale one
+    // is the least severe plugin problem, so it never displaces the fixes
+    // above it, and it warns. A missing one is an invitation, not a problem:
+    // it offers the install and moves no health. No line at all while the
+    // script is current or the shell is unknown (`completions` is `None`).
+    if let Some(script) = completions
+        && let Some((word, stale)) = match script.state {
+            crate::completions::ScriptState::Stale => Some(("stale", true)),
+            crate::completions::ScriptState::Missing => Some(("missing", false)),
+            crate::completions::ScriptState::Current => None,
+        }
+    {
+        detail.push(String::new());
+        detail.push(format!(
+            "completions: {word} ({})",
+            escape_control(&script.shell)
+        ));
+        detail.push(if stale {
+            format!(
+                "{} script differs from this clauth's",
+                escape_control(&script.shell)
+            )
+        } else {
+            format!("{} script not installed", escape_control(&script.shell))
+        });
+        let fix = ServiceFix::Completions {
+            shell: script.shell,
+            stale,
+        };
+        let line = detail.len();
+        detail.push(fix_line(&fix));
+        problems.push(Problem { line, fix });
+        if stale {
+            health = worst(health, Health::Warn);
+        }
+    }
+
     // The first fix line shown, in the order the detail walk presents them
-    // (install, then wire).
+    // (install, then wire, then completions).
     let fix = problems.first().map(|p| p.fix.clone());
 
     Check {
@@ -27496,6 +27566,35 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 ),
             },
         },
+        // Asked at the fix itself, never off a cached reading: a replaced image
+        // would write its old emission, not what the installed binary prints.
+        ConfirmAction::Completions { shell, stale } => {
+            match crate::plugin_host::self_exe_change() {
+                Some(change) => app.toast(
+                    ToastKind::Warning,
+                    own_binary_completions_refusal(change, stale),
+                ),
+                None => match crate::completions::install(Some(&shell)) {
+                    Ok(()) => {
+                        app.toast(ToastKind::Success, format!("wrote {shell} completions"));
+                        // The card's own re-probe: the script on disk just changed.
+                        recompute_services_checks(app, false, ShuntRefresh::Keep);
+                    }
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "{} failed\n{}",
+                            if stale {
+                                "update completions"
+                            } else {
+                                "install completions"
+                            },
+                            escape_control(&error_toast_detail(&e)),
+                        ),
+                    ),
+                },
+            }
+        }
         ConfirmAction::BlankCredentials(name) => {
             let name = ProfileName::from(name);
             // Logging the active profile out signs the live slot out.
@@ -29029,6 +29128,25 @@ fn own_binary_install_refusal(change: ExeChange) -> &'static str {
     }
 }
 
+/// The refusal in place of the completions fix while this TUI's own executable
+/// stays changed: the script it would write is the old image's emission, never
+/// what the installed binary prints.
+fn own_binary_completions_refusal(change: ExeChange, stale: bool) -> String {
+    let (gerund, verb) = if stale {
+        ("updating", "update")
+    } else {
+        ("installing", "install")
+    };
+    match change {
+        ExeChange::Replaced => format!(
+            "this clauth is still running the old binary: quit and reopen it before {gerund} completions"
+        ),
+        ExeChange::Removed => format!(
+            "this clauth's binary was removed: reinstall clauth and open it to {verb} completions"
+        ),
+    }
+}
+
 /// Re-read how a fresh daemon's binary changed under the health the app holds
 /// now. A change into `Some` tints the Services tab and raises its kind's
 /// toast, once per kind per run; any change rebuilds the plugin card, so its
@@ -29388,6 +29506,7 @@ fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
         clauth_path,
         app.services.cc_version.clone(),
         app.services.mcp_boot.clone(),
+        crate::completions::detected_installed_script(),
     );
     // Its own group, last: the renderer wraps it over several rows, and past
     // every fix line those rows move no fix line's rendered row.

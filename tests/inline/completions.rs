@@ -2130,3 +2130,191 @@ _describe() { print -r -- "describe $1 count=${#${(P)2}}" }
         );
     }
 }
+
+/// Where `install` puts each shell's script, spelled out per component so the
+/// expectation never borrows the code's own path builder.
+fn installed_script(home: &std::path::Path, shell: &str) -> std::path::PathBuf {
+    match shell {
+        "fish" => home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("clauth.fish"),
+        _ => home
+            .join(".clauth")
+            .join("completions")
+            .join(format!("clauth.{shell}")),
+    }
+}
+
+fn emission(shell: &str) -> &'static str {
+    match shell {
+        "bash" => BASH.as_str(),
+        "zsh" => ZSH.as_str(),
+        _ => FISH.as_str(),
+    }
+}
+
+/// The confirm's path joins its components with `/` on every platform:
+/// `Path::display` separates with `\` on Windows, so a confirm built on it
+/// would read `~/.clauth\completions\clauth.bash` there.
+#[test]
+fn the_confirm_joins_the_script_path_components_with_slashes() {
+    let rel = std::path::PathBuf::from_iter(["a", "b"]);
+    assert_eq!(slash_joined(&rel), "a/b");
+}
+
+/// No script on disk reads as missing, the state the Services card turns into
+/// an install invitation.
+#[test]
+fn a_shell_with_no_installed_script_reads_missing() {
+    let _home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Missing,
+            "{shell}",
+        );
+    }
+}
+
+/// A script `install` just wrote is the binary's own emission, so it reads
+/// current.
+#[test]
+fn a_freshly_installed_script_reads_current() {
+    let _home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        install(Some(shell)).expect("install");
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Current,
+            "{shell}",
+        );
+    }
+}
+
+/// A script an older clauth wrote (here: the emission with every `limit-reset`
+/// line gone, a verb that binary never knew) reads stale by its bytes, and
+/// `install` rewrites it byte-identical to what `clauth completions <shell>`
+/// prints.
+#[test]
+fn an_older_script_reads_stale_until_install_rewrites_it() {
+    let home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        install(Some(shell)).expect("first install");
+        let path = installed_script(home.home(), shell);
+        let older: String = emission(shell)
+            .lines()
+            .filter(|line| !line.contains("limit-reset"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            older,
+            emission(shell),
+            "{shell}: the fixture dropped a line"
+        );
+        std::fs::write(&path, &older).expect("plant the older script");
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Stale,
+            "{shell}",
+        );
+
+        install(Some(shell)).expect("update");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the rewritten script"),
+            emission(shell),
+            "{shell}: the update writes the binary's own emission",
+        );
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Current,
+            "{shell}",
+        );
+    }
+}
+
+/// A shell clauth ships no script for has no state to read.
+#[test]
+fn an_unsupported_shell_has_no_script_state() {
+    let _home = HomeSandbox::new();
+    assert!(script_state("tcsh").is_err());
+}
+
+/// A script that exists but cannot be read is an error, never a stale claim:
+/// bytes we could not read prove nothing either way, so the card shows nothing
+/// rather than inviting a rewrite.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_script_is_an_error_not_stale() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = HomeSandbox::new();
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    install(Some("bash")).expect("install");
+    let path = installed_script(home.home(), "bash");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let state = script_state("bash");
+    let detected = detected_installed_script();
+    // Restore the mode so the sandbox's tempdir can be removed.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod back");
+    assert!(
+        state.is_err(),
+        "an unreadable script reads as an error: {state:?}"
+    );
+    assert!(
+        detected.is_none(),
+        "the card shows nothing over an unreadable script"
+    );
+}
+
+/// An rc file that is not valid UTF-8 keeps every one of its bytes: the
+/// install reads raw bytes and appends the `source` block, never replacing
+/// what it could not decode.
+#[test]
+fn a_non_utf8_rc_keeps_its_bytes_and_gains_the_source_line() {
+    let home = HomeSandbox::new();
+    let rc = home.home().join(".bashrc");
+    let original: &[u8] = b"alias ll='ls -l' # caf\xe9\nexport EDITOR=vim\n";
+    std::fs::write(&rc, original).expect("plant the rc");
+
+    install(Some("bash")).expect("install");
+
+    let script = installed_script(home.home(), "bash");
+    let mut expected = original.to_vec();
+    expected.extend_from_slice(
+        format!("\n# clauth completions\nsource \"{}\"\n", script.display()).as_bytes(),
+    );
+    assert_eq!(
+        std::fs::read(&rc).expect("read the rc"),
+        expected,
+        "the rc's own bytes survive untouched, with the source block appended"
+    );
+}
+
+/// A script of the emission's own length but one byte different still reads
+/// stale: the check is byte equality, never a length or size compare.
+#[test]
+fn a_same_length_script_reads_stale() {
+    let home = HomeSandbox::new();
+    install(Some("bash")).expect("install");
+    let path = installed_script(home.home(), "bash");
+    let mut bytes = std::fs::read(&path).expect("read the installed script");
+    let first = bytes
+        .iter()
+        .position(|&b| b != b'\n')
+        .expect("the emission has content");
+    bytes[first] = if bytes[first] == b'a' { b'b' } else { b'a' };
+    std::fs::write(&path, &bytes).expect("plant the same-length script");
+    assert_eq!(
+        std::fs::read(&path).expect("read it back").len(),
+        emission("bash").len(),
+        "fixture control: the same length as the emission"
+    );
+    assert_eq!(
+        script_state("bash").expect("a supported shell"),
+        ScriptState::Stale,
+        "one different byte of the same length is stale"
+    );
+}

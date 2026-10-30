@@ -2457,6 +2457,9 @@ fn value_tone(key: &str, value: &str) -> Style {
             theme::success()
         }
         ("installed", "no") | ("mcp entry", "not") => theme::warning(),
+        // A stale completion script is a problem; a missing one is an
+        // invitation and stays body text.
+        ("completions", "stale") => theme::warning(),
         ("mcp server", "won't") => theme::danger(),
         ("plugin", "linked") => theme::success(),
         ("plugin", "installed") => theme::success(),

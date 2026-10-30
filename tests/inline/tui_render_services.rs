@@ -613,6 +613,213 @@ fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
     );
 }
 
+// ── completions fix ──────────────────────────────────────────────────────────
+
+/// Plant completion bytes at the path `install` wrote, so the test never
+/// re-types the writer's location.
+fn plant_completions(home: &crate::testutil::HomeSandbox, shell: &str, bytes: &str) {
+    crate::completions::install(Some(shell)).expect("install the completion script");
+    let path = match shell {
+        "fish" => home
+            .home()
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("clauth.fish"),
+        _ => home
+            .home()
+            .join(".clauth")
+            .join("completions")
+            .join(format!("clauth.{shell}")),
+    };
+    std::fs::write(path, bytes).expect("plant the completion bytes");
+}
+
+/// The Services `plugin` detail, built by the production probe over the
+/// sandbox `$SHELL` and its installed script.
+fn plugin_detail_over_completions() -> Check {
+    crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        crate::completions::detected_installed_script(),
+    )
+}
+
+/// The readouts every plugin detail carries, with the key column at `pad`
+/// (the display width before each value).
+fn plugin_base_rows(pad: usize) -> Vec<String> {
+    let spaces = |key_w: usize| " ".repeat(pad.saturating_sub(key_w) + 2);
+    vec![
+        format!("installed{}no (marketplace unknown)", spaces(9)),
+        "installs at user scope".to_string(),
+        "f  install plugin".to_string(),
+        format!("mcp entry{}not registered", spaces(9)),
+        format!("mcp source{}none", spaces(10)),
+        "writes the clauth entry into ~/.claude.json".to_string(),
+        "f  wire mcp server".to_string(),
+        format!("claude{}press r to probe", spaces(6)),
+        format!("path{}/usr/bin/clauth", spaces(4)),
+        "data".to_string(),
+    ]
+}
+
+/// The plugin detail's rows with the `data` row cut to its key: its value is
+/// the sandbox home's path, which the pane truncates at a width that depends on
+/// how long the temp dir's path is.
+fn plugin_rows(rows: &[String]) -> Vec<String> {
+    detail_rows(rows)
+        .into_iter()
+        .map(|row| {
+            if row.starts_with("data ") {
+                "data".to_string()
+            } else {
+                row
+            }
+        })
+        .collect()
+}
+
+/// A stale script names the problem and its `f  update completions` line; a
+/// current one shows neither. Pinned by equality off the rendered rows.
+#[test]
+fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+
+    plant_completions(&home, "bash", "an older script\n");
+    let stale = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&stale);
+    let mut expected = plugin_base_rows(11);
+    expected.extend([
+        "completions  stale (bash)".to_string(),
+        "bash script differs from this clauth's".to_string(),
+        "f  update completions".to_string(),
+    ]);
+    assert_eq!(
+        plugin_rows(&rows),
+        expected,
+        "a stale script names the problem and its update fix, by equality"
+    );
+
+    crate::completions::install(Some("bash")).expect("rewrite the script");
+    let current = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&current);
+    assert_eq!(
+        plugin_rows(&rows),
+        plugin_base_rows(10),
+        "a current script shows no completions line and no fix, by equality"
+    );
+}
+
+/// No script with a known shell offers `f  install completions`; an unknown
+/// shell shows nothing, since clauth ships no script to compare against.
+#[test]
+fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let _bash =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    let missing = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&missing);
+    let mut expected = plugin_base_rows(11);
+    expected.extend([
+        "completions  missing (bash)".to_string(),
+        "bash script not installed".to_string(),
+        "f  install completions".to_string(),
+    ]);
+    assert_eq!(
+        plugin_rows(&rows),
+        expected,
+        "a missing script names the problem and its install fix, by equality"
+    );
+    drop(_bash);
+
+    let _tcsh =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/tcsh")))]);
+    let unknown = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&unknown);
+    assert_eq!(
+        plugin_rows(&rows),
+        plugin_base_rows(10),
+        "an unknown shell renders the card without any completions row"
+    );
+    drop(_tcsh);
+
+    // An unset `$SHELL` takes the same no-line branch.
+    let _unset = crate::testutil::EnvPin::new(&home, &[("SHELL", None)]);
+    let absent = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&absent);
+    let detail = plugin_rows(&rows);
+    assert!(
+        detail.iter().any(|l| l.starts_with("data")),
+        "the plugin detail rendered: {detail:?}"
+    );
+    assert_eq!(
+        detail,
+        plugin_base_rows(10),
+        "an unset $SHELL renders the card without any completions row"
+    );
+}
+
+/// A script an older clauth wrote (here: this binary's emission with every
+/// `limit-reset` line gone, a verb it never knew) runs all the way to the
+/// card's update line.
+#[test]
+fn a_verb_removed_script_reaches_the_cards_update_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    let older: String = crate::completions::emission("bash")
+        .expect("bash emission")
+        .lines()
+        .filter(|line| !line.contains("limit-reset"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    plant_completions(&home, "bash", &older);
+    assert_eq!(
+        crate::completions::script_state("bash").expect("a supported shell"),
+        crate::completions::ScriptState::Stale,
+        "fixture: the older script reads stale"
+    );
+
+    let app = app_with(plugin_detail_over_completions());
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    assert!(
+        detail.iter().any(|l| l == "f  update completions"),
+        "the older script's card offers the update: {detail:?}"
+    );
+}
+
+/// A stale completion value warns; a missing one is an invitation, not a
+/// problem state, and stays body text.
+#[test]
+fn the_completions_value_tones_only_a_stale_script() {
+    let value_styles = |text: &str| {
+        super::detail_line(text, 11, 80)
+            .spans
+            .iter()
+            .skip(1)
+            .map(|s| s.style)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        value_styles("completions: stale (bash)"),
+        vec![super::theme::warning()],
+        "a stale script warns"
+    );
+    assert_eq!(
+        value_styles("completions: missing (bash)"),
+        vec![super::theme::body()],
+        "a missing script is no problem state"
+    );
+}
+
 /// Descending into the plugin detail, ↑↓ walks the fixable problems and the
 /// focused one takes the caret; `↵` opens the focused problem's confirm.
 #[test]

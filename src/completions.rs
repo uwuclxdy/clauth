@@ -516,14 +516,19 @@ static ZSH: LazyLock<String> =
 static FISH: LazyLock<String> =
     LazyLock::new(|| FISH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &fish_login_flags()));
 
-pub(crate) fn print_script(shell: &str) -> Result<()> {
-    let script = match shell {
-        "bash" => BASH.as_str(),
-        "zsh" => ZSH.as_str(),
-        "fish" => FISH.as_str(),
+/// The script this binary emits for `shell`, the bytes `clauth completions
+/// <shell>` prints and `install` writes.
+pub(crate) fn emission(shell: &str) -> Result<&'static str> {
+    match shell {
+        "bash" => Ok(BASH.as_str()),
+        "zsh" => Ok(ZSH.as_str()),
+        "fish" => Ok(FISH.as_str()),
         _ => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
-    };
-    out!("{script}");
+    }
+}
+
+pub(crate) fn print_script(shell: &str) -> Result<()> {
+    out!("{}", emission(shell)?);
     Ok(())
 }
 
@@ -607,12 +612,103 @@ pub(crate) fn install(shell: Option<&str>) -> Result<()> {
         None => detect_shell()?,
     };
 
-    match shell.as_str() {
-        "bash" => install_rc("bash", &BASH, ".bashrc"),
-        "zsh" => install_rc("zsh", &ZSH, ".zshrc"),
-        "fish" => install_fish(),
-        s => bail!("unsupported shell '{s}', expected: bash, zsh, fish"),
+    match rc_name(&shell) {
+        Some(rc) => install_rc(&shell, emission(&shell)?, rc),
+        None if shell == "fish" => install_fish(),
+        None => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
     }
+}
+
+/// The shell rc file `install` keeps clauth's `source` line in; only the
+/// shells that read one have an entry.
+fn rc_name(shell: &str) -> Option<&'static str> {
+    match shell {
+        "bash" => Some(".bashrc"),
+        "zsh" => Some(".zshrc"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptState {
+    Current,
+    Stale,
+    Missing,
+}
+
+/// Where `install` puts `shell`'s script: the one path builder the writer and
+/// the state reader share, so neither can drift onto another location.
+fn script_path(home: &std::path::Path, shell: &str) -> Result<std::path::PathBuf> {
+    match shell {
+        "bash" | "zsh" => Ok(home
+            .join(".clauth")
+            .join("completions")
+            .join(format!("clauth.{shell}"))),
+        "fish" => Ok(home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("clauth.fish")),
+        other => bail!("unsupported shell '{other}', expected: bash, zsh, fish"),
+    }
+}
+
+/// Whether the script installed for `shell` is this binary's own emission.
+/// `Missing` when nothing sits at the writer's path; any other read failure is
+/// an error, never a stale claim (bytes we could not read prove nothing).
+pub(crate) fn script_state(shell: &str) -> Result<ScriptState> {
+    let path = script_path(&home_dir()?, shell)?;
+    let installed = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScriptState::Missing),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    if installed == emission(shell)? {
+        Ok(ScriptState::Current)
+    } else {
+        Ok(ScriptState::Stale)
+    }
+}
+
+/// An installed completion script and the shell it belongs to, as the Services
+/// plugin card reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledScript {
+    pub(crate) shell: String,
+    pub(crate) state: ScriptState,
+}
+
+/// The shell `$SHELL` names and its script's state; `None` when no supported
+/// shell is named or the script cannot be read (the card then shows nothing).
+pub(crate) fn detected_installed_script() -> Option<InstalledScript> {
+    let shell = detect_shell().ok()?;
+    let state = script_state(&shell).ok()?;
+    Some(InstalledScript { shell, state })
+}
+
+/// `rel`'s components joined with `/`, the separator the confirm always reads:
+/// `Path::display` separates with `\` on Windows.
+fn slash_joined(rel: &std::path::Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// What `install(Some(shell))` writes, in the Services confirm's wording: the
+/// script's path from the writer's own builder, plus the rc edit bash and zsh
+/// also make.
+pub(crate) fn install_summary(shell: &str) -> Result<String> {
+    let home = home_dir()?;
+    let path = script_path(&home, shell)?;
+    let shown = path.strip_prefix(&home).map_or_else(
+        |_| path.display().to_string(),
+        |rel| format!("~/{}", slash_joined(rel)),
+    );
+    Ok(match rc_name(shell) {
+        Some(rc) => format!("writes {shown} and adds a source line to ~/{rc} if it has none."),
+        None => format!("writes {shown}."),
+    })
 }
 
 fn detect_shell() -> Result<String> {
@@ -628,26 +724,37 @@ fn detect_shell() -> Result<String> {
     }
 }
 
-fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
+fn install_rc(shell: &str, script: &str, rc_file: &str) -> Result<()> {
     let home = home_dir()?;
-    let completions_dir = home.join(".clauth").join("completions");
-    crate::profile::mkdir_700(&completions_dir)?;
-    let script_path = completions_dir.join(format!("clauth.{shell}"));
-    crate::profile::atomic_write_600(&script_path, script)
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
+    let path = script_path(&home, shell)?;
+    let rc_path = home.join(rc_file);
+    let source_line = format!("source \"{}\"", path.display());
 
-    let rc_path = home.join(rc_name);
-    let source_line = format!("source \"{}\"", script_path.display());
+    // Raw bytes: a file that does not decode must keep every byte it holds.
+    // Only a missing file counts as empty. Read before writing the script, so
+    // a refused install leaves the disk untouched.
+    let existing = match fs::read(&rc_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", rc_path.display())),
+    };
 
-    let existing = fs::read_to_string(&rc_path).unwrap_or_default();
-    let already = existing.lines().any(|l| l.trim() == source_line);
+    if let Some(dir) = path.parent() {
+        crate::profile::mkdir_700(dir)?;
+    }
+    crate::profile::atomic_write_600(&path, script)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    let already = existing
+        .split(|&b| b == b'\n')
+        .any(|line| line.trim_ascii() == source_line.as_bytes());
 
     if !already {
         let mut new = existing;
-        if !new.is_empty() && !new.ends_with('\n') {
-            new.push('\n');
+        if !new.is_empty() && !new.ends_with(b"\n") {
+            new.push(b'\n');
         }
-        new.push_str(&format!("\n# clauth completions\n{source_line}\n"));
+        new.extend_from_slice(format!("\n# clauth completions\n{source_line}\n").as_bytes());
         fs::write(&rc_path, new)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
     }
@@ -741,10 +848,10 @@ pub(crate) fn auto_install_once() {
 }
 
 fn install_fish() -> Result<()> {
-    let home = home_dir()?;
-    let dir = home.join(".config").join("fish").join("completions");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("clauth.fish");
+    let path = script_path(&home_dir()?, "fish")?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     fs::write(&path, &*FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
