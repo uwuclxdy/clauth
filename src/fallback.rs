@@ -2123,12 +2123,12 @@ pub(crate) struct StartCandidate {
 
 /// The `--auto` walk: every resolvable fallback-chain member in walk order,
 /// each judged by [`start_block`] with the models THAT member's session will
-/// run (its own runtime overlay plus the process-env pair passed in and the
+/// run (its own runtime overlay plus the process-env triple passed in and the
 /// passthrough args — see [`crate::start::member_launch_demand`]), plus the
 /// index of the first clear member (freshness PREFERRED in pass one, any
 /// freshness accepted in pass two — the same preference the switch walk gives
 /// its target in [`next_auto_switch_target`]). `env_models` is the process-env
-/// model pair, read once by `cmd_start`, so this walk never reads the process
+/// launch triple, read once by `cmd_start`, so this walk never reads the process
 /// environment itself. Each pass follows the `walk_order` mode: chain position
 /// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
 /// the least-used week under `most-weekly-headroom`.
@@ -2136,7 +2136,7 @@ pub(crate) fn start_walk(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
     claude_args: &[String],
-    env_models: [Option<String>; 2],
+    env_models: [Option<String>; 3],
     needs_oauth: bool,
     cwd: Option<&Path>,
 ) -> (Vec<StartCandidate>, Option<usize>) {
@@ -2426,14 +2426,14 @@ pub(crate) type StartPick = (ProfileName, Vec<StartCandidate>, Option<usize>, Ve
 /// the picked member's name and the demand its pick/launch line prints. Held
 /// as a function — not inline in `cmd_start` — so the arm's `rows[pick]`
 /// choice is pinned at its real call site (see `tests/inline/fallback.rs`),
-/// not a hand-built-rows stand-in. `env_models` is the process-env model pair,
+/// not a hand-built-rows stand-in. `env_models` is the process-env launch triple,
 /// read once by `cmd_start`, so this never reads the process environment
 /// itself.
 pub(crate) fn start_pick(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
     claude_args: &[String],
-    env_models: [Option<String>; 2],
+    env_models: [Option<String>; 3],
     follows_chain: bool,
     cwd: Option<&Path>,
 ) -> Result<StartPick> {

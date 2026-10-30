@@ -7027,6 +7027,7 @@ fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
         haiku: Some("deepseek-flash[1m]".to_string()),
         fable: Some("deepseek-v4-pro[1m]".to_string()),
         subagent: None,
+        advisor: None,
     };
     // A concurrent writer fills every offered row before the apply re-reads the
     // fresh profile, so every move is skipped.

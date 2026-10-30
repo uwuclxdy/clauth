@@ -13579,6 +13579,7 @@ mod env_editor {
             ConfigRow::HaikuModel,
             ConfigRow::FableModel,
             ConfigRow::SubagentModel,
+            ConfigRow::AdvisorModel,
         ] {
             assert!(
                 !rows.contains(&row),
@@ -13631,6 +13632,7 @@ mod env_editor {
             ConfigRow::HaikuModel,
             ConfigRow::FableModel,
             ConfigRow::SubagentModel,
+            ConfigRow::AdvisorModel,
         ] {
             assert!(rows.contains(&row), "every override shows once expanded");
         }
@@ -13641,7 +13643,7 @@ mod env_editor {
     }
 
     #[test]
-    fn expanded_overrides_list_fable_first_then_opus_sonnet_haiku_subagent() {
+    fn expanded_overrides_list_fable_first_then_opus_sonnet_haiku_subagent_advisor() {
         let _home = crate::testutil::HomeSandbox::new();
         let mut app = app_with_env(BTreeMap::new());
         enter_detail(&mut app);
@@ -13656,6 +13658,7 @@ mod env_editor {
                         | ConfigRow::HaikuModel
                         | ConfigRow::FableModel
                         | ConfigRow::SubagentModel
+                        | ConfigRow::AdvisorModel
                 )
             })
             .collect();
@@ -13667,6 +13670,7 @@ mod env_editor {
                 ConfigRow::SonnetModel,
                 ConfigRow::HaikuModel,
                 ConfigRow::SubagentModel,
+                ConfigRow::AdvisorModel,
             ]
         );
     }
@@ -13742,6 +13746,78 @@ mod env_editor {
                 "the row's buffer follows the saved value"
             );
         }
+    }
+
+    /// On a saved account the `advisor` row sits collapsed under `+ model
+    /// override`; revealing it, typing `opus` and ⏎ saves `[models] advisor`,
+    /// and clearing the row removes it again. Neither touches the other rows.
+    #[test]
+    fn the_advisor_row_is_editable_on_a_saved_account_and_persists() {
+        let _home = HomeSandbox::new();
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_app_state(&AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        })
+        .expect("save state");
+        crate::profile::save_profile(&profile).expect("save profile");
+        let mut app = app_with_profile(profile);
+        enter_detail(&mut app);
+        let advisor_on_disk = || {
+            crate::profile::load_config()
+                .expect("reload")
+                .profiles
+                .into_iter()
+                .find(|p| p.name == "acct")
+                .expect("the account is on disk")
+                .models
+                .advisor
+        };
+
+        assert!(
+            !config_rows(&app).contains(&ConfigRow::AdvisorModel),
+            "an unset advisor hides behind the reveal chip"
+        );
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::ModelOverrideAdd)
+            .expect("reveal chip");
+        super::super::run_config_row(&mut app, ConfigRow::ModelOverrideAdd);
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::AdvisorModel)
+            .expect("the advisor row shows once revealed");
+
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            Some(ConfigRow::AdvisorModel),
+            "⏎ opens the advisor field"
+        );
+        for c in "opus".chars() {
+            super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+        }
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(advisor_on_disk().as_deref(), Some("opus"));
+        let saved = crate::profile::load_config()
+            .expect("reload")
+            .profiles
+            .into_iter()
+            .find(|p| p.name == "acct")
+            .expect("the account is on disk");
+        assert!(
+            saved.models.default.is_none() && saved.models.subagent.is_none(),
+            "only the advisor row was written"
+        );
+
+        // Empty it: the row is cleared on disk and keeps its place until the
+        // pane is left, like every other override.
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        for _ in 0.."opus".len() {
+            super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+        }
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(advisor_on_disk(), None);
     }
 
     /// Typing into an OAuth account's empty base url turns it into an api
@@ -18879,8 +18955,8 @@ fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
     );
 }
 
-/// The `+ new` draft's seven buffers, endpoint first, in the Setup rows' order.
-fn draft_buffers(app: &super::App) -> [String; 7] {
+/// The `+ new` draft's eight buffers, endpoint first, in the Setup rows' order.
+fn draft_buffers(app: &super::App) -> [String; 8] {
     let d = app.config_draft.as_ref().expect("draft still mounted");
     [
         &d.base_url,
@@ -18890,6 +18966,7 @@ fn draft_buffers(app: &super::App) -> [String; 7] {
         &d.sonnet_model,
         &d.haiku_model,
         &d.subagent_model,
+        &d.advisor_model,
     ]
     .map(|i| i.value.clone())
 }
@@ -18925,6 +19002,7 @@ fn typed_draft_on_custom_preset() -> super::App {
     draft.haiku_model = super::InputState::new("typed-haiku");
     draft.fable_model = super::InputState::new("typed-fable");
     draft.subagent_model = super::InputState::new("typed-subagent");
+    draft.advisor_model = super::InputState::new("typed-advisor");
     app.config_draft = Some(draft);
 
     pick_menu_entry(&mut app, "apply preset");
@@ -18949,7 +19027,7 @@ fn apply_preset_on_new_offers_keep_or_clear_for_typed_buffers() {
             "",
             "apply 'zz-custom' to the new account?",
             "the preset leaves base url, model, fable, sonnet,",
-            "haiku, subagent unset.",
+            "haiku, subagent, advisor unset.",
             "",
             "cancel   keep them   clear them",
             "",
@@ -18974,6 +19052,7 @@ fn apply_preset_on_new_keeps_the_buffers_the_preset_leaves_unset() {
             "typed-sonnet",
             "typed-haiku",
             "typed-subagent",
+            "typed-advisor",
         ]
         .map(str::to_string),
     );
@@ -18992,7 +19071,7 @@ fn apply_preset_on_new_row_clears_the_buffers_the_preset_leaves_unset() {
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
         draft_buffers(&app),
-        ["", "", "", "x-opus", "", "", ""].map(str::to_string),
+        ["", "", "", "x-opus", "", "", "", ""].map(str::to_string),
     );
     let draft = app.config_draft.as_ref().unwrap();
     assert_eq!(
@@ -19035,12 +19114,13 @@ fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
             "deepseek-flash[1m]",
             "deepseek-flash[1m]",
             "",
+            "",
         ]
         .map(str::to_string),
     );
 }
 
-/// `create account` saves each of the six model buffers into its own row.
+/// `create account` saves each of the seven model buffers into its own row.
 #[test]
 fn create_saves_every_model_buffer_into_its_own_row() {
     use crate::profile::{ModelSettings, ProfileName};
@@ -19055,6 +19135,7 @@ fn create_saves_every_model_buffer_into_its_own_row() {
     draft.haiku_model = super::InputState::new("m-haiku");
     draft.fable_model = super::InputState::new("m-fable");
     draft.subagent_model = super::InputState::new(" m-subagent ");
+    draft.advisor_model = super::InputState::new(" m-advisor ");
     app.config_draft = Some(draft);
     super::commit_new_account(&mut app);
     let cfg = app.config();
@@ -19067,6 +19148,7 @@ fn create_saves_every_model_buffer_into_its_own_row() {
             haiku: Some("m-haiku".to_string()),
             fable: Some("m-fable".to_string()),
             subagent: Some("m-subagent".to_string()),
+            advisor: Some("m-advisor".to_string()),
         },
     );
 }
@@ -19157,6 +19239,7 @@ fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
             haiku: Some("deepseek-flash[1m]".to_string()),
             fable: Some("deepseek-v4-pro[1m]".to_string()),
             subagent: None,
+            advisor: None,
         },
     );
 }
@@ -19614,6 +19697,7 @@ fn keep_them_writes_the_preset_and_keeps_what_it_leaves_unset() {
                 haiku: Some("deepseek-flash[1m]".to_string()),
                 fable: Some("deepseek-v4-pro[1m]".to_string()),
                 subagent: Some("old-subagent".to_string()),
+                advisor: None,
             },
         ),
     );
@@ -19646,6 +19730,7 @@ fn clear_them_writes_the_preset_and_clears_what_it_leaves_unset() {
                 haiku: Some("deepseek-flash[1m]".to_string()),
                 fable: Some("deepseek-v4-pro[1m]".to_string()),
                 subagent: None,
+                advisor: None,
             },
         ),
     );
@@ -23287,6 +23372,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
             ConfigRow::SonnetModel,
             ConfigRow::HaikuModel,
             ConfigRow::SubagentModel,
+            ConfigRow::AdvisorModel,
             ConfigRow::Login,
             ConfigRow::Create,
         ],
@@ -40636,6 +40722,7 @@ fn rebind_apply_that_moved_nothing_is_not_now() {
         haiku: Some("deepseek-flash[1m]".to_string()),
         fable: Some("deepseek-v4-pro[1m]".to_string()),
         subagent: None,
+        advisor: None,
     };
     for name in ["D1", "D2", "DS1"] {
         let mut p = deepseek_account(name, None);
@@ -43863,6 +43950,7 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
         draft.haiku_model = super::InputState::new("zed-haiku");
         draft.fable_model = super::InputState::new("zed-fable");
         draft.subagent_model = super::InputState::new("zed-subagent");
+        draft.advisor_model = super::InputState::new("zed-advisor");
         draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
             crate::actions::CaptureSnapshot {
                 credentials: None,
@@ -43890,6 +43978,7 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
                 && d.haiku_model.value == "zed-haiku"
                 && d.fable_model.value == "zed-fable"
                 && d.subagent_model.value == "zed-subagent"
+                && d.advisor_model.value == "zed-advisor"
                 && matches!(d.captured_login, Some(super::DraftLogin::LiveLogin(_)))
         })
     }
@@ -48202,6 +48291,7 @@ fn apply_preset_refuses_on_a_codex_and_shunt_new_form() {
             ("sonnet", draft.sonnet_model.trimmed()),
             ("haiku", draft.haiku_model.trimmed()),
             ("subagent", draft.subagent_model.trimmed()),
+            ("advisor", draft.advisor_model.trimmed()),
         ] {
             assert_eq!(buf, "", "{why}: {label} buffer untouched");
         }
@@ -48241,6 +48331,7 @@ fn apply_preset_refuses_on_a_suspended_codex_or_shunt_form() {
             ("sonnet", draft.sonnet_model.trimmed()),
             ("haiku", draft.haiku_model.trimmed()),
             ("subagent", draft.subagent_model.trimmed()),
+            ("advisor", draft.advisor_model.trimmed()),
         ] {
             assert_eq!(buf, "", "{why}: {label} buffer untouched");
         }

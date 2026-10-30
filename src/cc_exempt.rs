@@ -515,18 +515,48 @@ const OPTIONAL_VALUE_FLAGS: &[&str] = &[
     "--prompt-suggestions",
 ];
 
+/// What one [`fold_args`] walk of the args yields.
+struct FoldedArgs {
+    /// The last user `--settings` value.
+    settings: Option<String>,
+    /// The args with every `--settings` flag (and its value) removed.
+    clean: Vec<String>,
+    /// The last non-blank `--advisor` value, both spellings.
+    advisor: Option<String>,
+}
+
 /// Split `passthrough` into the last user `--settings` value (folded in) and
-/// the args with every `--settings` flag (and its value) removed, walking the
-/// words the way claude parses argv: a [`VALUE_FLAGS`] member takes the next
-/// word whatever it holds, a short cluster ending in exactly one `n` takes the
-/// next word, an [`OPTIONAL_VALUE_FLAGS`] member takes only a word without a
-/// leading `-`, and the first `--` that sits in a flag position (never a
-/// taken value) ends option parsing. A `--settings` flag with no word left to
-/// take is `Err`.
+/// the args with every `--settings` flag (and its value) removed. See
+/// [`fold_args`] for how the words are walked; a `--settings` flag with no
+/// word left to take is `Err`.
 pub(crate) fn fold_settings_args(
     passthrough: &[String],
 ) -> Result<(Option<String>, Vec<String>), ()> {
+    fold_args(passthrough).map(|folded| (folded.settings, folded.clean))
+}
+
+/// The model the last `--advisor` flag in `args` names, in both spellings.
+/// Read off the same walk that folds `--settings` out ([`fold_args`]), so a
+/// word another flag consumed as its value is never read as the advisor
+/// (`--name --advisor opus` names the session `--advisor`), and nothing past
+/// the `--` separator counts. A blank value is ignored: it names no model, so
+/// it neither clears an earlier flag nor shadows the settings tiers, and the
+/// launch demand over-counts rather than under-counts. An `Err` walk (a bare
+/// `--settings` claude refuses) reads no advisor.
+pub(crate) fn last_advisor_arg(args: &[String]) -> Option<String> {
+    fold_args(args).ok().and_then(|folded| folded.advisor)
+}
+
+/// Walk `passthrough` the way claude parses argv: a [`VALUE_FLAGS`] member
+/// takes the next word whatever it holds, a short cluster ending in exactly
+/// one `n` takes the next word, an [`OPTIONAL_VALUE_FLAGS`] member takes only a
+/// word without a leading `-`, and the first `--` that sits in a flag position
+/// (never a taken value) ends option parsing. One walk carries both the folded
+/// `--settings` and the last `--advisor`, so the two cannot disagree about
+/// which words are flags.
+fn fold_args(passthrough: &[String]) -> Result<FoldedArgs, ()> {
     let mut value: Option<String> = None;
+    let mut advisor: Option<String> = None;
     let mut clean: Vec<String> = Vec::with_capacity(passthrough.len());
     let mut i = 0;
     let mut positional = false; // past the end-of-options marker
@@ -559,12 +589,21 @@ pub(crate) fn fold_settings_args(
             }
             continue;
         }
+        if let Some(rest) = arg.strip_prefix("--advisor=") {
+            note_advisor(&mut advisor, rest);
+            clean.push(arg.to_string());
+            i += 1;
+            continue;
+        }
         if VALUE_FLAGS.contains(&arg) {
             // the flag and its value stay in the passthrough: only a
             // `--settings` flag itself is folded out
             clean.push(arg.to_string());
             i += match passthrough.get(i + 1) {
                 Some(next) => {
+                    if arg == "--advisor" {
+                        note_advisor(&mut advisor, next);
+                    }
                     clean.push(next.clone());
                     2
                 }
@@ -597,7 +636,20 @@ pub(crate) fn fold_settings_args(
         clean.push(arg.to_string());
         i += 1;
     }
-    Ok((value, clean))
+    Ok(FoldedArgs {
+        settings: value,
+        clean,
+        advisor,
+    })
+}
+
+/// Record one `--advisor` value, trimmed to match the settings values it is
+/// compared with, as the last advisor, ignoring a blank one.
+fn note_advisor(advisor: &mut Option<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        *advisor = Some(value.to_owned());
+    }
 }
 
 /// Whether a short cluster takes the next word: `-n` is claude's only

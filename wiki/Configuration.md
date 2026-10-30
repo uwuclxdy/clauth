@@ -78,9 +78,12 @@ sonnet   = "claude-sonnet-4-5-20250929"   # ANTHROPIC_DEFAULT_SONNET_MODEL
 haiku    = "claude-haiku-4-5-20251001"    # ANTHROPIC_DEFAULT_HAIKU_MODEL
 fable    = "claude-fable-5"               # ANTHROPIC_DEFAULT_FABLE_MODEL
 subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
+advisor  = "opus"                         # advisorModel, the server-side advisor's model
 ```
 
-`default` lands as the top-level `model` key in `settings.json`; the rest ride in its `env` block. A switch or a `clauth start` applies whichever account you land on.
+`default` and `advisor` land as the top-level `model` and `advisorModel` keys in `settings.json`; the rest ride in its `env` block. A switch or a `clauth start` applies whichever account you land on.
+
+An unset `default` or `advisor` removes its key rather than leaving the last one in place. An account with no `advisor` row therefore strips any `advisorModel` from the `settings.json` a switch or a start writes. That includes a global one you set by hand: a switch removes it from `~/.claude/settings.json` itself, and a start leaves it out of the session's copy. Claude Code's advisor is then off on that account unless you ask for it with a `--advisor` flag, so set `advisor` on each account that should keep one. `advisor` takes an alias (`opus`) or a full model id, and it is a model like any other for what an account has to serve: `clauth start --auto` and the MCP delegate count it ([Auto-Switch](Auto-Switch#choosing-where-a-session-starts)). No built-in preset binds it.
 
 ## Presets
 
@@ -115,7 +118,7 @@ MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-po
 
 A saved preset whose name matches a built-in (`qwen` saved before the `Qwen` built-in shipped, say) still lists among the saved presets, without the built-in mark, and applies and deletes as your own.
 
-clauth offers to move your accounts onto each built-in's current models. An account whose endpoint matches a built-in's is offered that built-in's value on every model row that is empty or still holds an id the built-in shipped in an earlier release; any other id stays. A row the built-in leaves unset (`subagent`, on every built-in) stays empty, and is cleared if it holds an earlier release's id. The first TUI launch with something to offer opens one confirm, the first launch after installing or updating included: accounts with the same changes share a block, each with its own toggle line, all checked. <kbd>space</kbd> flips one and `apply` writes the checked accounts. `not now` (or <kbd>esc</kbd>), and an `apply` that writes every checked account, keep it closed until a release changes the built-in presets; a failed write brings it back on the next launch. From the shell, `clauth presets rebind` prints the same moves at any time, `not now` or not, and `clauth presets rebind --yes` applies them; naming accounts limits either to them. An account that fails is named on stderr while the rest still move; rows it saved before failing count as moved, and the command exits 1.
+clauth offers to move your accounts onto each built-in's current models. An account whose endpoint matches a built-in's is offered that built-in's value on every model row that is empty or still holds an id the built-in shipped in an earlier release; any other id stays. A row the built-in leaves unset (`subagent` and `advisor`, on every built-in) stays empty, and is cleared if it holds an earlier release's id. The first TUI launch with something to offer opens one confirm, the first launch after installing or updating included: accounts with the same changes share a block, each with its own toggle line, all checked. <kbd>space</kbd> flips one and `apply` writes the checked accounts. `not now` (or <kbd>esc</kbd>), and an `apply` that writes every checked account, keep it closed until a release changes the built-in presets; a failed write brings it back on the next launch. From the shell, `clauth presets rebind` prints the same moves at any time, `not now` or not, and `clauth presets rebind --yes` applies them; naming accounts limits either to them. An account that fails is named on stderr while the rest still move; rows it saved before failing count as moved, and the command exits 1.
 
 ## Auto-start the 5-hour window
 
@@ -223,7 +226,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
-| `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
+| `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent`, `advisor` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
 

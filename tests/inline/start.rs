@@ -2093,7 +2093,7 @@ fn an_unpinnable_resume_records_its_union_families_not_the_headline() {
         &ResumedAgent::Unknown,
         false,
         None,
-        &[Some("opus".to_owned()), None],
+        &[Some("opus".to_owned()), None, None],
     );
     assert_eq!(
         families,
@@ -2117,7 +2117,7 @@ fn an_agent_launch_records_its_fallback_not_the_env_headline() {
         &ResumedAgent::Agent("pa".to_owned()),
         false,
         None,
-        &[Some("opus".to_owned()), None],
+        &[Some("opus".to_owned()), None, None],
     );
     assert_eq!(
         families,
@@ -3331,4 +3331,536 @@ fn a_default_without_member_default_stays_literal() {
         ),
         ["haiku", "default"]
     );
+}
+
+// ── advisor model in the launch demand ───────────────────────────────────────
+
+/// A launch's demand models for the advisor tests: `args` as the passthrough,
+/// `env` as the inherited or caller env (`leg`), `stale` as the outgoing
+/// profile's stale env keys, under `~/.claude/settings.json` as the shared
+/// base.
+fn advisor_demand(
+    profile: &Profile,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    leg: EnvLeg,
+    stale: &[&str],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let stale: Vec<String> = stale.iter().map(|k| (*k).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    member_launch_models(
+        profile,
+        Isolation::Shared,
+        &stale,
+        &args,
+        None,
+        leg,
+        cwd,
+        |key| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+    )
+}
+
+/// A launch with no env, no stale keys and no project dir.
+fn plain_advisor_demand(profile: &Profile, args: &[&str]) -> Vec<String> {
+    advisor_demand(profile, args, None, EnvLeg::Caller, &[], &[])
+}
+
+/// A project dir under the sandbox home holding `.claude/settings.json` and
+/// `.claude/settings.local.json` bodies (`None` writes no file).
+fn project_with(
+    home: &HomeSandbox,
+    name: &str,
+    shared: Option<&str>,
+    local: Option<&str>,
+) -> std::path::PathBuf {
+    let dir = home.home().join(name);
+    fs::create_dir_all(dir.join(".claude")).unwrap();
+    if let Some(body) = shared {
+        fs::write(dir.join(".claude").join("settings.json"), body).unwrap();
+    }
+    if let Some(body) = local {
+        fs::write(dir.join(".claude").join("settings.local.json"), body).unwrap();
+    }
+    dir
+}
+
+fn profile_with_advisor(advisor: Option<&str>) -> Profile {
+    let mut p = Profile::new("adv".to_string(), None, None);
+    p.models.advisor = advisor.map(str::to_owned);
+    p
+}
+
+/// The advisor joins the demand beside the headline, from the last non-blank
+/// `--advisor` in either spelling, and only where claude would read the flag
+/// as the advisor flag.
+#[test]
+fn the_advisor_flag_joins_the_demand() {
+    let _home = HomeSandbox::new();
+    let p = profile_with_advisor(None);
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor=opus"]),
+        ["sonnet", "opus"],
+        "the equals spelling reads the same"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "haiku", "--advisor=opus"]
+        ),
+        ["sonnet", "opus"],
+        "the last flag wins, across spellings"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", ""]),
+        ["sonnet"],
+        "a blank value names no model"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "opus", "--advisor", ""]
+        ),
+        ["sonnet", "opus"],
+        "a blank later flag does not clear an earlier one"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "--advisor", "opus"]),
+        ["--advisor"],
+        "`--model` takes `--advisor` as its value, so no advisor flag was given"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--name", "--advisor", "opus"]),
+        ["sonnet"],
+        "`--name` takes `--advisor` as its value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor"]),
+        ["sonnet"],
+        "a trailing `--advisor` has no value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--", "--advisor", "opus"]),
+        ["sonnet"],
+        "nothing past the separator is a flag"
+    );
+}
+
+/// A blank `--advisor` shadows nothing: the settings tiers still apply.
+#[test]
+fn a_blank_advisor_flag_leaves_the_settings_tiers_in_force() {
+    let home = HomeSandbox::new();
+    let project = project_with(&home, "proj", Some(r#"{"advisorModel":"haiku"}"#), None);
+    let p = profile_with_advisor(None);
+    let demand = |args: &[&str]| advisor_demand(&p, args, Some(&project), EnvLeg::Caller, &[], &[]);
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", ""]),
+        ["sonnet", "haiku"]
+    );
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"],
+        "a non-blank flag outranks the project tier"
+    );
+}
+
+/// Each settings tier supplies the advisor in Claude Code's order: the
+/// `--settings` passthrough, then the project's local file, its shared file,
+/// then the overlay (the profile's `[models] advisor` row), with the flag over
+/// all of them.
+#[test]
+fn the_advisor_model_is_read_from_each_settings_tier_in_precedence_order() {
+    let home = HomeSandbox::new();
+    let inline = r#"{"advisorModel":"fable"}"#;
+    let file = home.home().join("pass.json");
+    fs::write(&file, r#"{"advisorModel":"fable"}"#).unwrap();
+    let both = project_with(
+        &home,
+        "both",
+        Some(r#"{"advisorModel":"sonnet"}"#),
+        Some(r#"{"advisorModel":"haiku"}"#),
+    );
+    let shared_only = project_with(&home, "shared", Some(r#"{"advisorModel":"sonnet"}"#), None);
+    let row = profile_with_advisor(Some("opus"));
+    let blank = profile_with_advisor(None);
+    let demand = |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>| {
+        let mut full = vec!["--model", "m"];
+        full.extend_from_slice(args);
+        advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], &[])
+    };
+
+    assert_eq!(demand(&row, &[], None), ["m", "opus"], "the overlay row");
+    assert_eq!(
+        demand(&blank, &["--settings", inline], None),
+        ["m", "fable"],
+        "inline --settings JSON"
+    );
+    assert_eq!(
+        demand(&blank, &["--settings", file.to_str().unwrap()], None),
+        ["m", "fable"],
+        "a --settings file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&shared_only)),
+        ["m", "sonnet"],
+        "the project's shared file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&both)),
+        ["m", "haiku"],
+        "the project's local file outranks its shared file"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&both)),
+        ["m", "haiku"],
+        "a project tier outranks the overlay"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", inline], Some(&both)),
+        ["m", "fable"],
+        "the --settings passthrough outranks the project tiers"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--settings", inline, "--advisor", "opus"],
+            Some(&both)
+        ),
+        ["m", "opus"],
+        "the flag outranks every settings tier"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "user"], Some(&both)),
+        ["m"],
+        "`--setting-sources user` leaves the project tiers unread"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "project"], Some(&both)),
+        ["m", "sonnet"],
+        "only the enabled tier counts"
+    );
+}
+
+/// The overlay strips a global `advisorModel` when the profile has no row (the
+/// writer is clauth-owned, like `model`), so the global key never reaches the
+/// demand; an isolated runtime has no base at all, and only the row applies.
+#[test]
+fn a_global_advisor_model_never_counts_without_a_profile_row() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(claude.join("settings.json"), r#"{"advisorModel":"opus"}"#).unwrap();
+    let args = ["--model".to_owned(), "m".to_owned()];
+    let demand = |p: &Profile, isolation: Isolation| {
+        member_launch_models(p, isolation, &[], &args, None, EnvLeg::Caller, None, |_| {
+            None
+        })
+    };
+
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Shared),
+        ["m"],
+        "no row: the shared base's advisorModel is removed by the overlay"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Shared),
+        ["m", "haiku"],
+        "a row replaces the base value"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Isolated),
+        ["m", "haiku"],
+        "an isolated runtime reads the row alone"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Isolated),
+        ["m"]
+    );
+}
+
+/// The advisor resolves through the child's `ANTHROPIC_DEFAULT_*_MODEL` alias
+/// remap like any other demand string, composites expanded first.
+#[test]
+fn the_advisor_alias_remaps_through_the_childs_default_model_env() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.opus = Some("claude-opus-5-5".to_owned());
+    p.models.fable = Some("claude-fable-5".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m"]),
+        ["m", "claude-opus-5-5"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "best"]),
+        ["m", "claude-fable-5", "claude-opus-5-5"],
+        "a composite expands to its member aliases, each remapped"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "opus[1m]"]),
+        ["m", "claude-opus-5-5[1m]"],
+        "a context suffix is kept"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "claude-sonnet-5"]),
+        ["m", "claude-sonnet-5"],
+        "a full id is demanded as typed"
+    );
+}
+
+#[test]
+fn the_advisor_is_a_fallback_side_model_beside_the_subagent_and_the_fallback_list() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.subagent = Some("haiku".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--fallback-model", "fable"]),
+        ["sonnet", "fable", "opus", "haiku"],
+        "headline, the fallback list, the advisor, then the subagent"
+    );
+    assert_eq!(
+        crate::fallback::demand_from(plain_advisor_demand(&p, &["--model", "opus"])),
+        ["opus", "haiku"],
+        "an advisor equal to the headline is one family once the walk dedups"
+    );
+}
+
+/// `cc_env_truthy` is Claude Code's own boolean parse of an env value.
+#[test]
+fn cc_env_truthy_matches_claude_codes_boolean_parse() {
+    for yes in ["1", "true", "TRUE", "True", " yes ", "on", "ON", "\tOn\n"] {
+        assert!(cc_env_truthy(yes), "{yes:?}");
+    }
+    for no in [
+        "", " ", "0", "false", "no", "off", "2", "y", "enabled", "truee",
+    ] {
+        assert!(!cc_env_truthy(no), "{no:?}");
+    }
+}
+
+/// A truthy `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` the child sees drops the
+/// advisor, whichever source carries the flag and the model; a falsy one keeps
+/// it.
+#[test]
+fn a_truthy_disable_flag_drops_the_advisor() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let kept = |p: &Profile, args: &[&str], env: &[(&str, &str)]| {
+        advisor_demand(p, args, None, EnvLeg::Caller, &[], env) == ["m", "opus"]
+    };
+    let args = ["--model", "m", "--advisor", "opus"];
+
+    for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+        assert!(
+            !kept(&row, &args, &[(key, truthy)]),
+            "caller env {truthy:?} drops the advisor"
+        );
+        let inline = format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#);
+        let mut with_settings = args.to_vec();
+        with_settings.extend(["--settings", inline.as_str()]);
+        assert!(
+            !kept(&row, &with_settings, &[]),
+            "--settings env {truthy:?} drops the advisor"
+        );
+        let project = project_with(
+            &home,
+            "killed",
+            Some(&format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#)),
+            None,
+        );
+        assert_eq!(
+            advisor_demand(&row, &args, Some(&project), EnvLeg::Caller, &[], &[]),
+            ["m"],
+            "project env {truthy:?} drops the advisor"
+        );
+        let mut profile_env = row.clone();
+        profile_env.env.insert(key.to_owned(), truthy.to_owned());
+        assert!(
+            !kept(&profile_env, &args, &[]),
+            "profile [env] {truthy:?} drops the advisor"
+        );
+    }
+    for falsy in ["0", "false", "no", "off", ""] {
+        assert!(
+            kept(&row, &args, &[(key, falsy)]),
+            "caller env {falsy:?} keeps the advisor"
+        );
+    }
+    assert!(kept(&row, &args, &[]), "an unset flag keeps the advisor");
+}
+
+/// The kill switch and the model resolve through separate tiers: the highest
+/// tier that sets the switch decides, wherever the model came from.
+#[test]
+fn the_disable_flag_and_the_advisor_model_resolve_through_separate_tiers() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let off = format!(r#"{{"env":{{"{key}":"1"}}}}"#);
+    let on = format!(r#"{{"env":{{"{key}":"0"}}}}"#);
+    let project_off = project_with(&home, "off", Some(&off), None);
+    let project_on = project_with(&home, "on", Some(&on), None);
+    let mut row = profile_with_advisor(Some("opus"));
+    let demand =
+        |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>, env: &[(&str, &str)]| {
+            let mut full = vec!["--model", "m"];
+            full.extend_from_slice(args);
+            advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], env)
+        };
+
+    assert_eq!(
+        demand(&row, &[], Some(&project_off), &[]),
+        ["m"],
+        "the model from the overlay, the switch from the project tier"
+    );
+    assert_eq!(
+        demand(&row, &["--advisor", "haiku"], Some(&project_off), &[]),
+        ["m"],
+        "the flag names a model but the project switch still turns the tool off"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", &on], Some(&project_off), &[]),
+        ["m", "opus"],
+        "a higher tier's falsy switch beats a lower tier's truthy one"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[(key, "1")]),
+        ["m", "opus"],
+        "a project env value beats the caller env"
+    );
+    row.env.insert(key.to_owned(), "1".to_owned());
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[]),
+        ["m", "opus"],
+        "the project env beats the overlay env"
+    );
+    assert_eq!(
+        demand(&row, &[], None, &[(key, "0")]),
+        ["m"],
+        "the overlay env beats the caller env"
+    );
+
+    // `--setting-sources` narrows the project tiers for the switch as it does
+    // for the model: a project switch in a tier Claude Code never reads is no
+    // switch at all.
+    let row = profile_with_advisor(Some("opus"));
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "user"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "`--setting-sources user` leaves the project switch unread, so the advisor stays"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "local"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "the shared project file is not in a `local`-only list"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "project"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m"],
+        "an enabled project tier's switch still turns the advisor off"
+    );
+}
+
+/// On the start path the kill switch rides the process env and reaches the
+/// child only where the scrub keeps it: a key the outgoing profile's `[env]`
+/// carried is stale, so the child never sees it and the advisor stays.
+#[test]
+fn a_stale_process_env_kill_switch_does_not_drop_the_advisor() {
+    let _home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let args = ["--model", "m"];
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[], &[(key, "1")]),
+        ["m"],
+        "an inherited truthy switch survives the scrub and turns the advisor off"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[key], &[(key, "1")]),
+        ["m", "opus"],
+        "a stale key is scrubbed, so the advisor stays"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Caller, &[key], &[(key, "1")]),
+        ["m"],
+        "the delegate's caller env is layered after the scrub, so it always reaches the child"
+    );
+}
+
+/// A launch whose headline is unknown still demands the advisor beside the
+/// fallback side: an agent with no model, and an unpinnable resume.
+#[test]
+fn an_agent_launch_keeps_the_advisor_on_the_fallback_side() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let args: Vec<String> = ["--agent", "reviewer"].map(str::to_owned).to_vec();
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &args,
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("reviewer"));
+    assert_eq!(
+        demand.models,
+        ["opus"],
+        "the advisor is known whatever the agent runs"
+    );
+
+    let unknown = member_launch_unknown_headline_models(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(unknown, ["opus"]);
+}
+
+/// The advisor never changes whether the headline is unknown: a launch naming
+/// no model with no member default stays unknown with an advisor set.
+#[test]
+fn the_advisor_does_not_resolve_an_unknown_headline() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert!(demand.unknown);
+    assert_eq!(demand.models, ["opus"]);
 }

@@ -548,8 +548,11 @@ pub(crate) enum ConfigRow {
     HaikuModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
+    /// `advisorModel` — the model Claude Code's server-side advisor runs on,
+    /// an alias or a full id, free text.
+    AdvisorModel,
     /// The `+ model override` reveal row. Shown only while the unset alias
-    /// overrides are collapsed; ⏎ expands fable/opus/sonnet/haiku/subagent inline.
+    /// overrides are collapsed; ⏎ expands fable/opus/sonnet/haiku/subagent/advisor inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
@@ -606,6 +609,7 @@ impl ConfigRow {
                 | ConfigRow::HaikuModel
                 | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
+                | ConfigRow::AdvisorModel
                 | ConfigRow::BellThreshold
                 | ConfigRow::UsageProbeInterval
         )
@@ -631,6 +635,7 @@ impl ConfigRow {
             | ConfigRow::SonnetModel
             | ConfigRow::HaikuModel
             | ConfigRow::SubagentModel
+            | ConfigRow::AdvisorModel
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
@@ -750,12 +755,13 @@ impl App {
 }
 
 /// The alias-override rows, in the order Setup lists them.
-const OVERRIDE_ROWS: [ConfigRow; 5] = [
+const OVERRIDE_ROWS: [ConfigRow; 6] = [
     ConfigRow::FableModel,
     ConfigRow::OpusModel,
     ConfigRow::SonnetModel,
     ConfigRow::HaikuModel,
     ConfigRow::SubagentModel,
+    ConfigRow::AdvisorModel,
 ];
 
 /// The weekly-line preset ladder: one source for the Config row's segmented
@@ -949,6 +955,7 @@ pub(crate) struct ConfigDraft {
     pub(crate) haiku_model: InputState,
     pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
+    pub(crate) advisor_model: InputState,
     pub(crate) bell_threshold: InputState,
     /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
     /// buffer spells it.
@@ -1011,7 +1018,7 @@ pub(crate) struct ConfigDraft {
 }
 
 impl ConfigDraft {
-    /// The model block the six model buffers spell, each trimmed, a blank
+    /// The model block the seven model buffers spell, each trimmed, a blank
     /// one unset.
     fn typed_models(&self) -> ModelSettings {
         ModelSettings {
@@ -1021,6 +1028,7 @@ impl ConfigDraft {
             haiku: self.haiku_model.trimmed_some(),
             fable: self.fable_model.trimmed_some(),
             subagent: self.subagent_model.trimmed_some(),
+            advisor: self.advisor_model.trimmed_some(),
         }
     }
 
@@ -1046,6 +1054,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &self.haiku_model,
             ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
+            ConfigRow::AdvisorModel => &self.advisor_model,
             ConfigRow::BellThreshold => &self.bell_threshold,
             ConfigRow::UsageProbeInterval => &self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
@@ -1078,6 +1087,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &mut self.haiku_model,
             ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
+            ConfigRow::AdvisorModel => &mut self.advisor_model,
             ConfigRow::BellThreshold => &mut self.bell_threshold,
             ConfigRow::UsageProbeInterval => &mut self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
@@ -1138,6 +1148,7 @@ impl ConfigDraft {
             &self.haiku_model,
             &self.fable_model,
             &self.subagent_model,
+            &self.advisor_model,
             &self.bell_threshold,
             &self.usage_probe_interval,
             &self.env_value,
@@ -22300,6 +22311,7 @@ fn push_override_rows(
                 ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
                 ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
                 ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
+                ConfigRow::AdvisorModel => profile.and_then(|p| p.models.advisor.as_deref()),
                 _ => None,
             };
             v.is_some_and(|s| !s.trim().is_empty())
@@ -22667,6 +22679,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         haiku_model: InputState::new(""),
         fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
+        advisor_model: InputState::new(""),
         bell_threshold: InputState::new(""),
         usage_probe_interval: InputState::new(""),
         env_value: InputState::new(""),
@@ -22702,6 +22715,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
         fable_model: InputState::new(m.fable.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
+        advisor_model: InputState::new(m.advisor.as_deref().unwrap_or("")),
         bell_threshold: InputState::new(&row_committed_value(
             profile,
             name,
@@ -23686,6 +23700,9 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
+        ConfigRow::AdvisorModel => profile
+            .and_then(|p| p.models.advisor.clone())
+            .unwrap_or_default(),
         ConfigRow::BellThreshold => profile
             .and_then(|p| p.bell_threshold)
             .map(format_weekly_pct)
@@ -23739,7 +23756,8 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
         | ConfigRow::FableModel
-        | ConfigRow::SubagentModel => CommitResult::from(commit_model_field(app, field)),
+        | ConfigRow::SubagentModel
+        | ConfigRow::AdvisorModel => CommitResult::from(commit_model_field(app, field)),
         ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
         ConfigRow::EnvAdd => commit_env_new_key(app),
         ConfigRow::BellThreshold => CommitResult::from(commit_bell_threshold(app)),
@@ -23930,6 +23948,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         ConfigRow::HaikuModel => models.haiku = scalar,
         ConfigRow::FableModel => models.fable = scalar,
         ConfigRow::SubagentModel => models.subagent = scalar,
+        ConfigRow::AdvisorModel => models.advisor = scalar,
         // The other rows carry no `ModelSettings` field and never route here
         // (`commit_model_field` is the only caller). Named, so a new
         // `ConfigRow` variant fails the build instead of a silent no-op.
@@ -25856,6 +25875,7 @@ fn stamp_draft_from_preset(
         (models.haiku, &mut draft.haiku_model),
         (models.fable, &mut draft.fable_model),
         (models.subagent, &mut draft.subagent_model),
+        (models.advisor, &mut draft.advisor_model),
     ] {
         *field = InputState::new(value.as_deref().unwrap_or_default());
     }

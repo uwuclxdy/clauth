@@ -458,6 +458,52 @@ fn a_credit_capped_target_refuses_a_credit_billed_model_named_in_env() {
     }
 }
 
+/// The advisor runs on the delegate's account, so a credit-billed advisor is
+/// demand like the subagent: a capped member refuses it, from `--advisor` in
+/// the call's `args` and from the member's own `[models] advisor` row.
+#[test]
+fn a_credit_capped_target_refuses_a_credit_billed_advisor() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let err = delegate_to_capped_with(Some("opus"), &["--advisor", "fable"], &[], &cwd)
+        .expect_err("args name a fable advisor");
+    assert_eq!(err, REFUSES_FABLE);
+    assert_admitted(delegate_to_capped_with(
+        Some("opus"),
+        &["--advisor", "haiku"],
+        &[],
+        &cwd,
+    ));
+
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.models.advisor = Some("fable".to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+    let err = delegate_to_capped(Some("opus"), &cwd).expect_err("the row names a fable advisor");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// The call's `env` reaches the child after the scrub, so a truthy
+/// `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` there turns the advisor off and the gate
+/// no longer counts its family.
+#[test]
+fn a_disabled_advisor_tool_in_the_call_env_is_not_demand() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+
+    assert_admitted(delegate_to_capped_with(
+        Some("opus"),
+        &["--advisor", "fable"],
+        &[(key, "1")],
+        &cwd,
+    ));
+    let err = delegate_to_capped_with(Some("opus"), &["--advisor", "fable"], &[(key, "0")], &cwd)
+        .expect_err("a falsy switch keeps the advisor");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
 /// A named model replaces only the headline: the overlay's subagent model
 /// still runs (a `Task` subagent spends the same account), so it is demand.
 #[test]

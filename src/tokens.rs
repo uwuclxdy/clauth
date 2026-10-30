@@ -176,7 +176,7 @@ impl UsageShape {
 fn apply_usage_shapes(recs: &mut [LineRec]) {
     let mut by_model: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, r) in recs.iter().enumerate() {
-        if r.has_usage {
+        if r.has_usage && !r.advisor {
             by_model.entry(r.model.clone()).or_default().push(i);
         }
     }
@@ -712,7 +712,55 @@ struct TranscriptUsage {
     /// `when.mode` overrides key on it, so it rides into the ledger's hour
     /// buckets. Absent on every line an older client wrote — standard.
     speed: Option<String>,
+    /// The per-call usage records behind this line's totals. The top-level
+    /// numbers above are the sum of the `message` iterations only; a
+    /// server-side advisor call rides here as its own `advisor_message`
+    /// iteration, on its own model, and is NOT in the top-level totals — so
+    /// without reading this list the advisor's spend never reaches the ledger.
+    /// Absent on every line an older client wrote, and `null` on the
+    /// `<synthetic>` refusal and error lines.
+    #[serde(deserialize_with = "null_as_default")]
+    iterations: Vec<UsageIteration>,
 }
+
+/// A field that may be written as `null` reads as its default, so one `null`
+/// never costs the whole transcript line.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// One entry of `usage.iterations[]`: a single model call inside the line's
+/// request. Only the advisor entries are read (see [`TranscriptUsage::iterations`]);
+/// the `message` entries are already summed into the line's top-level usage,
+/// and unknown keys (`cache_creation{}`, ...) are ignored.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct UsageIteration {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    /// The model this call ran on. The advisor runs on its own model, not the
+    /// line's, so it prices at that model's rate.
+    model: Option<String>,
+    /// The call's own serving mode. The line's `speed` does not carry over: it
+    /// describes the line's own calls, not the advisor's. Absent on every
+    /// iteration 2.1.314 writes — standard.
+    speed: Option<String>,
+    #[serde(deserialize_with = "null_as_default")]
+    input_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    output_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    cache_read_input_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    cache_creation_input_tokens: u64,
+}
+
+/// The `usage.iterations[].type` of a server-side advisor call.
+const ADVISOR_ITERATION: &str = "advisor_message";
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
@@ -1044,6 +1092,11 @@ struct LineRec {
     /// fill the hour buckets' fast subset and price at the feed's fast rate.
     fast: bool,
     tool_calls: u64,
+    /// A server-side advisor iteration's usage (see [`UsageIteration`]), never
+    /// a message: it is excluded from shape classification so an advisor-only
+    /// model is never mistaken for a non-reporting provider and the advisor
+    /// rows never join a main model's consecutive-turn chain.
+    advisor: bool,
 }
 
 impl LineRec {
@@ -1533,7 +1586,58 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             shape: UsageShape::Healthy,
             fast: usage.is_some_and(|u| u.speed.as_deref() == Some("fast")),
             tool_calls,
+            advisor: false,
         });
+        // The advisor's calls ride inside the line's `iterations[]` and are not
+        // in its top-level usage, so each becomes its own usage record under
+        // the advisor's model. The key hangs off the line's own key (the
+        // message id), so every streamed copy of the line — which repeat the
+        // same iterations — and every file that carries the line forward
+        // dedups to one count; the ordinal counts advisor entries only, so a
+        // reordered or growing `iterations[]` keeps each advisor call on the
+        // same key. An advisor call prices as standard unless its own entry
+        // records a `speed`: the line's `speed` is the line's, not the advisor's.
+        if let (Some(u), Some(parent)) = (usage, out.last()) {
+            let (date, hour, base_key) = (parent.date.clone(), parent.hour, parent.tok_key.clone());
+            let advisor_calls = u
+                .iterations
+                .iter()
+                .filter(|it| it.kind.as_deref() == Some(ADVISOR_ITERATION));
+            for (n, it) in advisor_calls.enumerate() {
+                if it.input_tokens
+                    | it.output_tokens
+                    | it.cache_read_input_tokens
+                    | it.cache_creation_input_tokens
+                    == 0
+                {
+                    continue;
+                }
+                let model = it
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown");
+                out.push(LineRec {
+                    date: date.clone(),
+                    hour,
+                    uuid: String::new(),
+                    session: String::new(),
+                    is_message: false,
+                    has_usage: true,
+                    tok_key: format!("{base_key}#adv{n}"),
+                    model: model.to_owned(),
+                    input: it.input_tokens,
+                    output: it.output_tokens,
+                    cache_read: it.cache_read_input_tokens,
+                    cache_create: it.cache_creation_input_tokens,
+                    shape: UsageShape::Healthy,
+                    fast: it.speed.as_deref() == Some("fast"),
+                    tool_calls: 0,
+                    advisor: true,
+                });
+            }
+        }
     }
     let mut out = collapse_streamed_turns(out);
     for rec in &mut out {

@@ -169,34 +169,41 @@ pub(crate) fn admit<'a>(
     Ok(profile)
 }
 
-/// The process-env model overrides a launcher can inherit, in pair order: the
-/// headline model, then the subagent model. The pair order is the contract
-/// between [`process_model_env`] and [`member_launch_demand`]'s scrub filter, so
-/// reading and filtering cannot drift.
-const PROCESS_MODEL_ENV_KEYS: [&str; 2] = ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"];
+/// The process-env launch keys a launcher can inherit, in slot order: the
+/// headline model, the subagent model, then the advisor kill switch (not a
+/// model, but read through the same scrub filter and tier precedence). The slot
+/// order is the contract between [`process_model_env`] and
+/// [`member_launch_demand`]'s scrub filter, so reading and filtering cannot
+/// drift.
+const PROCESS_MODEL_ENV_KEYS: [&str; 3] = [
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
+];
 
-/// The process-env model pair, read once per `cmd_start`.
-/// [`crate::fallback::start_walk`] takes the pair as an argument rather than
-/// reading the process environment itself, so its tests pass an explicit empty
-/// pair and stay hermetic.
-pub(crate) fn process_model_env() -> [Option<String>; 2] {
+/// The process-env launch triple, read once per `cmd_start`.
+/// [`crate::fallback::start_walk`] takes it as an argument rather than reading
+/// the process environment itself, so its tests pass an explicit empty triple
+/// and stay hermetic.
+pub(crate) fn process_model_env() -> [Option<String>; 3] {
     PROCESS_MODEL_ENV_KEYS.map(|key| std::env::var(key).ok())
 }
 
 /// The `env_of` reader for [`member_launch_demand`]: maps a model env key to
-/// its slot in the process-env pair, so the start and fallback paths pass one
+/// its slot in the process-env triple, so the start and fallback paths pass one
 /// closure instead of each writing the match.
 pub(crate) fn process_model_env_of(
-    env_models: &[Option<String>; 2],
+    env_models: &[Option<String>; 3],
 ) -> impl Fn(&str) -> Option<String> + '_ {
     move |key| match key {
         "ANTHROPIC_MODEL" => env_models[0].clone(),
         "CLAUDE_CODE_SUBAGENT_MODEL" => env_models[1].clone(),
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" => env_models[2].clone(),
         _ => None,
     }
 }
 
-/// Where the `env_models` pair came from. The start path's inherited process
+/// Where the `env_models` triple came from. The start path's inherited process
 /// env is scrubbed before the child sees it, so a key reaches the child only
 /// where [`crate::runtime::env_survives_scrub`] keeps it; the delegate's caller
 /// env is layered AFTER the scrub ([`crate::mcp::apply_delegate_env`]), so it
@@ -328,6 +335,15 @@ pub(crate) struct LaunchDemand {
 ///   `fallbackModel` (`--settings` passthrough > project > overlay), plus
 ///   `CLAUDE_CODE_SUBAGENT_MODEL` as the child sees it (passthrough env, else
 ///   project env, else overlay env, else inherited/caller where it survives);
+/// - the server-side ADVISOR model joins that same fallback side: it runs on
+///   the session's own account, so an account that cannot serve it strands the
+///   advisor turn like a subagent. Its source is the last non-blank `--advisor`
+///   value, else the highest settings source's `advisorModel` (`--settings`
+///   passthrough > project > overlay, the overlay being the profile's
+///   `[models] advisor` row), and it is dropped when
+///   `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` is truthy ([`cc_env_truthy`]) as the
+///   child sees it. A `--fallback-model` equal to the headline drops the
+///   settings fallback list, never the advisor;
 /// - then a `[models]` alias (`opus`/`sonnet`/`haiku`/`fable`, bare or with a
 ///   `[1m]`-style context suffix) remaps onto the `ANTHROPIC_DEFAULT_*_MODEL`
 ///   env value the child sees; a composite (`opusplan`/`best`) expands to its
@@ -443,6 +459,14 @@ fn member_launch_demand_with(
             .or_else(|| overlay.env_value(key))
             .or_else(|| survives(key).then(|| env_of(key)).flatten())
     };
+    // The advisor model by Claude Code's source precedence, off unless the
+    // kill switch the child sees is falsy. A blank flag value was ignored by
+    // `last_advisor_arg`, so it cannot shadow a settings tier.
+    let advisor = crate::cc_exempt::last_advisor_arg(claude_args)
+        .or_else(|| passthrough.advisor.clone())
+        .or_else(|| project.advisor.clone())
+        .or_else(|| overlay.advisor.clone())
+        .filter(|_| !child_env(PROCESS_MODEL_ENV_KEYS[2]).is_some_and(|v| cc_env_truthy(&v)));
     let settings_model = passthrough
         .model
         .clone()
@@ -457,13 +481,19 @@ fn member_launch_demand_with(
     if let Some(named) = named_model {
         // A named model decides the headline; the agent (named or not) is
         // irrelevant.
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         models.insert(0, named);
         remap_model_aliases(&mut models, &child_env);
     } else if unknown_headline {
         // The transcript clauth could not pin names the headline, so only the
         // fallback side is known — the shape a model-less agent launch resolves.
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         remap_model_aliases(&mut models, &child_env);
     } else if let Some(agent) = parsed_agent_arg(claude_args).or_else(|| {
         passthrough
@@ -477,10 +507,16 @@ fn member_launch_demand_with(
         // delegate pre-flight refuses a credit-billed fallback family first, and
         // `launch_families` still records those families.
         agent_without_model = Some(agent);
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         remap_model_aliases(&mut models, &child_env);
     } else {
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         if let Some(session) = session_model {
             models.insert(0, session);
         }
@@ -500,6 +536,18 @@ fn member_launch_demand_with(
         agent_without_model,
         unknown,
     }
+}
+
+/// Whether Claude Code reads an env value as true: its own boolean parse
+/// (`De` in the 2.1.314 bundle) lowercases and trims, then accepts `1`,
+/// `true`, `yes` and `on`. Anything else, an empty value included, is false.
+/// The one reading `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` gets here, so the demand
+/// drops the advisor exactly when the child does.
+pub(crate) fn cc_env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// The last `--agent` value in the args, both spellings. A blank value is
@@ -671,7 +719,7 @@ pub(crate) fn launch_families_for(
     resumed: &ResumedAgent,
     named_model: bool,
     spawn_cwd: Option<&Path>,
-    env_models: &[Option<String>; 2],
+    env_models: &[Option<String>; 3],
 ) -> Vec<String> {
     let env_of = process_model_env_of(env_models);
     if matches!(resumed, ResumedAgent::Unknown) && !named_model {
@@ -871,11 +919,17 @@ fn project_model_sources(
         if out.fallbacks.is_none() {
             out.fallbacks = src.fallbacks;
         }
+        if out.advisor.is_none() {
+            out.advisor = src.advisor;
+        }
         if out.env_anthropic.is_none() {
             out.env_anthropic = src.env_anthropic;
         }
         if out.env_subagent.is_none() {
             out.env_subagent = src.env_subagent;
+        }
+        if out.env_disable_advisor.is_none() {
+            out.env_disable_advisor = src.env_disable_advisor;
         }
         if out.env_opus.is_none() {
             out.env_opus = src.env_opus;
@@ -893,9 +947,10 @@ fn project_model_sources(
     out
 }
 
-/// The one fallback list a launch resolved, beside the subagent env string,
-/// held here so the fold is testable without a home or a process environment.
-/// An empty env value is dropped, never a family.
+/// The one fallback list a launch resolved, beside the advisor model and the
+/// subagent env string (in that slot order), held here so the fold is testable
+/// without a home or a process environment. An empty value is dropped, never a
+/// family.
 pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]) -> Vec<String> {
     let mut out = settings;
     out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));

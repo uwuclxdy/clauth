@@ -240,6 +240,10 @@ fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
         Some("default subagent model in this account"),
     );
     assert_eq!(
+        row_hint(ConfigRow::AdvisorModel, &snap).as_deref(),
+        Some("server-side advisor model in this account"),
+    );
+    assert_eq!(
         row_hint(ConfigRow::ModelOverrideAdd, &snap).as_deref(),
         Some("set custom model names on this account"),
     );

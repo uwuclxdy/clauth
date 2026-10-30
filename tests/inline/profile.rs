@@ -2963,10 +2963,37 @@ fn model_settings_round_trip_through_config_toml() {
         haiku: None,
         fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
+        advisor: Some("opus".to_string()),
     };
     let rendered = render_config_toml(&profile);
     let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
     assert_eq!(parsed.models, profile.models);
+    assert!(
+        rendered.contains("advisor = \"opus\"\n"),
+        "the advisor row is written under [models]: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "`advisor` is the\n# server-side advisor model (the `advisorModel` setting)."
+        ),
+        "the generated comment block names the row"
+    );
+}
+
+#[test]
+fn model_settings_advisor_row_is_a_settable_field() {
+    let mut models = ModelSettings::default();
+    assert!(models.is_empty());
+    models.set_field("advisor", Some("opus".to_string()));
+    assert_eq!(models.field("advisor").map(String::as_str), Some("opus"));
+    assert_eq!(models.advisor.as_deref(), Some("opus"));
+    assert!(
+        !models.is_empty(),
+        "a lone advisor row is not an empty block"
+    );
+    models.set_field("advisor", None);
+    assert!(models.field("advisor").is_none());
+    assert!(models.is_empty());
 }
 
 /// Write `profiles.toml` into the sandboxed home and read it back through the
@@ -6458,7 +6485,7 @@ fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
         &config,
         crate::runtime::Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );

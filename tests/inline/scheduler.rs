@@ -29404,7 +29404,7 @@ fn start_auto_passes_over_a_refused_setup_token() {
         &cfg,
         crate::runtime::Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
