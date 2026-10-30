@@ -12460,7 +12460,7 @@ fn commit_herdr_tag_edit(app: &mut App) -> bool {
     if let Err(e) = saved {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         return false;
     }
@@ -15873,7 +15873,7 @@ impl PoolJob {
                 Err(e) => PoolMutationResult::Removed {
                     name: display,
                     removed: false,
-                    error: Some(format!("{e}")),
+                    error: Some(error_toast_detail(&e)),
                 },
             },
             PoolJob::Refresh {
@@ -15890,7 +15890,7 @@ impl PoolJob {
                 Err(e) => PoolMutationResult::Refreshed {
                     name: display,
                     needs_relogin: false,
-                    error: Some(format!("{e}")),
+                    error: Some(error_toast_detail(&e)),
                 },
             },
         }
@@ -16498,7 +16498,7 @@ fn start_shunt_add(app: &mut App) {
                         family,
                     }))
                 })
-                .map_err(|e| format!("{e}")),
+                .map_err(|e| error_toast_detail(&e)),
         ));
     });
     open_login_modal(app);
@@ -17487,7 +17487,13 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         reorder_profile(&mut cfg, idx, new_idx)
     };
     if let Err(e) = result {
-        app.toast(ToastKind::Danger, format!("reorder failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "reorder failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        );
         return;
     }
     app.profile_cursor.set(new_idx);
@@ -18217,7 +18223,10 @@ fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>) 
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -18246,7 +18255,13 @@ fn perform_switch_off(app: &mut App) {
                 "all accounts spent\nswitched off to halt usage".to_string(),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("switch-off failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "switch-off failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -19267,7 +19282,7 @@ fn commit_refresh_interval_edit(app: &mut App) -> bool {
     if let Err(e) = saved {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         return false;
     }
@@ -19329,7 +19344,7 @@ fn commit_context_nudge_edit(app: &mut App) -> bool {
     if let Err(e) = saved {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         return false;
     }
@@ -19416,7 +19431,7 @@ fn commit_weekly_threshold_edit(app: &mut App) -> bool {
     if let Err(e) = saved {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         return false;
     }
@@ -19901,7 +19916,7 @@ fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) 
     if let Some(e) = save_err {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         false
     } else {
@@ -19944,7 +19959,7 @@ fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) -> bool {
     if let Some(e) = save_err {
         app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         );
         false
     } else {
@@ -20140,7 +20155,10 @@ fn write_preferred_days(
         Err(e) => {
             app.toast(
                 ToastKind::Danger,
-                format!("preferred days update failed\n{e}"),
+                format!(
+                    "preferred days update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
             );
             None
         }
@@ -20187,7 +20205,7 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     }
     app.toast(
         ToastKind::Danger,
-        format!("save failed\n{}", escape_control(&e.to_string())),
+        format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
     );
     false
 }
@@ -20269,7 +20287,7 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
         None => app.refresh_tokens(),
         Some(e) => app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
     }
 }
@@ -20354,7 +20372,7 @@ fn toggle_last_resort(app: &mut App) {
         }
         Outcome::SaveFailed(e) => app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
     }
 }
@@ -20432,7 +20450,7 @@ fn toggle_preferred(app: &mut App) {
         }
         Outcome::SaveFailed(e) => app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
     }
 }
@@ -23096,7 +23114,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             return;
         }
     };
@@ -23118,7 +23139,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     let on_disk = match crate::profile::load_profile(name) {
         Ok(p) => p,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             return;
         }
     };
@@ -23144,7 +23168,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
         let mut disarmed = on_disk.clone();
         disarmed.rolling_token = false;
         if let Err(e) = save_profile_config(&disarmed) {
-            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             return;
         }
         let mut cfg = app.config();
@@ -23155,7 +23182,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
         .and_then(|_| crate::claude::clear_session_token(name))
     {
-        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
         return;
     }
     app.session_tokens.remove(name.as_str());
@@ -23177,7 +23207,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
         .map(|c| c.is_active(name))
         .unwrap_or_else(|_| app.config().is_active(name));
     if active && let Err(e) = force_link_profile_credentials(name) {
-        app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
         return;
     }
     // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
@@ -23220,7 +23253,8 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
                 ToastKind::Danger,
                 format!(
                     "cleared the long-lived token for '{name}'{tail}{rolled}, but the preserved \
-                     mint remains\n{e}"
+                     mint remains\n{}",
+                    escape_control(&error_toast_detail(&e))
                 ),
             );
             return;
@@ -23398,7 +23432,7 @@ fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String,
             match validation {
                 Ok(()) => Some((typed, true)),
                 Err(e) => {
-                    app.toast(ToastKind::Danger, format!("{e}"));
+                    app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                     None
                 }
             }
@@ -23656,7 +23690,13 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
                     p.env.insert(key.to_string(), String::new());
                 }
             }
-            app.toast(ToastKind::Danger, format!("env update failed\n{e}"))
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            )
         }
     }
 }
@@ -23804,7 +23844,13 @@ fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
             true
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("model update failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "model update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
             false
         }
     }
@@ -23913,7 +23959,13 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) -> bool {
             true
         }
         Some(Err(e)) => {
-            app.toast(ToastKind::Danger, format!("alert update failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "alert update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
             false
         }
     }
@@ -23996,7 +24048,13 @@ fn cycle_model(app: &mut App) {
                 d.model = InputState::new(&value);
             }
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("model update failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "model update failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -24429,7 +24487,13 @@ fn commit_env_value(app: &mut App, i: usize) -> bool {
             true
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
             false
         }
     }
@@ -24519,7 +24583,13 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
             let mut cfg = app.config();
             edit_profile_env(&mut cfg, name, new_env)
         } {
-            app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
             return false;
         }
         // The add persisted an empty placeholder; arm the cancel so an escape
@@ -24746,7 +24816,7 @@ fn commit_rename(app: &mut App) -> bool {
     }
     let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
-        app.toast(ToastKind::Danger, format!("{e}"));
+        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return false;
     }
     // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
@@ -24782,7 +24852,10 @@ fn commit_rename(app: &mut App) -> bool {
             true
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("rename failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("rename failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             false
         }
     }
@@ -24842,7 +24915,10 @@ fn commit_endpoint(app: &mut App) -> bool {
             true
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("edit failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("edit failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
             false
         }
     }
@@ -24904,7 +24980,7 @@ fn commit_new_account(app: &mut App) {
     };
     let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
-        app.toast(ToastKind::Danger, format!("{e}"));
+        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return;
     }
     // A fresh login becomes the active one when none is, linking the live
@@ -25037,7 +25113,10 @@ fn commit_new_account(app: &mut App) {
                 {
                     finish_created_profile(app, &name);
                 }
-                app.toast(ToastKind::Danger, format!("create failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("create failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
                 return;
             };
             // Decide the rollback from the profile as saved on disk after the
@@ -25276,7 +25355,10 @@ pub(crate) fn drain_profile_delete(app: &mut App) {
                 app.toast(ToastKind::Success, format!("deleted '{name}'"));
             }
             DeleteResult::Ran(_, Err(e)) => {
-                app.toast(ToastKind::Danger, format!("delete failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("delete failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
             }
             DeleteResult::Panicked => app.toast(ToastKind::Danger, "delete failed"),
         }
@@ -25500,7 +25582,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                 NamePromptAction::DuplicateProfile(source) => {
                     let validation = validate_profile_name(&name, Harness::Claude, None);
                     if let Err(e) = validation {
-                        app.toast(ToastKind::Danger, format!("{e}"));
+                        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                         return;
                     }
                     app.pop_modal();
@@ -25514,7 +25596,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     // The preset store is its own namespace — neither harness's
                     // roster has a say; only the charset + built-in rules apply.
                     if let Err(e) = validate_name_chars(&name) {
-                        app.toast(ToastKind::Danger, format!("{e}"));
+                        app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                         return;
                     }
                     if crate::presets::is_builtin(&name) {
@@ -25827,7 +25909,13 @@ fn apply_preset_to(
                 format!("applied '{}' to '{name}'", preset.name),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "apply preset failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -25881,7 +25969,13 @@ fn save_preset_from(app: &mut App, source: &str, preset: &str) {
     };
     match crate::presets::save_preset(preset, &base_url, &models) {
         Ok(()) => app.toast(ToastKind::Success, format!("saved preset '{preset}'")),
-        Err(e) => app.toast(ToastKind::Danger, format!("save preset failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "save preset failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -25902,7 +25996,13 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
                 format!("duplicated '{source}' as '{new_name}'"),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("duplicate failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "duplicate failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -25942,7 +26042,10 @@ fn toggle_profile_disabled(app: &mut App, name: &ProfileName, direction: Disable
             ToastKind::Info,
             format!("'{name}' is already {}", direction.verb()),
         ),
-        Err(e) => app.toast(ToastKind::Danger, format!("toggle failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("toggle failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -25991,7 +26094,7 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
         Outcome::SaveFailed(e) => {
             app.toast(
                 ToastKind::Danger,
-                format!("save failed\n{}", escape_control(&e.to_string())),
+                format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
             );
         }
     }
@@ -26954,7 +27057,7 @@ fn store_rebind_digest(app: &mut App, digest: &str) {
         }
         Err(e) => app.toast(
             ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
+            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
     }
 }
@@ -27077,7 +27180,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
         }
         Err(e) => app.toast(
             ToastKind::Danger,
-            diagnostic_toast_body("herdr config fix failed", &e.to_string()),
+            diagnostic_toast_body("herdr config fix failed", &error_toast_detail(&e)),
         ),
     }
 }
@@ -27147,7 +27250,15 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         format!("overwrote '{name}' with the captured login"),
                     );
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed\n{e}")),
+                Err(e) => {
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "overwrite failed\n{}",
+                            escape_control(&error_toast_detail(&e))
+                        ),
+                    );
+                }
             }
         }
         ConfirmAction::AdoptDivergence(snapshot, name, account) => {
@@ -27207,7 +27318,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 }
                 Err(e) => app.toast(
                     ToastKind::Danger,
-                    format!("save failed\n{}", escape_control(&e.to_string())),
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
                 ),
             }
         }
@@ -27330,7 +27441,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     // Reflect the new wiring in the rows without a fresh version probe.
                     recompute_services_checks(app, false, ShuntRefresh::Keep);
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
+                Err(e) => {
+                    app.toast(
+                        ToastKind::Danger,
+                        format!("wire failed\n{}", escape_control(&error_toast_detail(&e))),
+                    );
+                }
             }
         }
         ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
@@ -27376,7 +27492,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 }
                 Err(e) => app.toast(
                     ToastKind::Danger,
-                    diagnostic_toast_body("install failed", &e.to_string()),
+                    diagnostic_toast_body("install failed", &error_toast_detail(&e)),
                 ),
             },
         },
@@ -27415,7 +27531,15 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
+                Err(e) => {
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "log out failed\n{}",
+                            escape_control(&error_toast_detail(&e))
+                        ),
+                    );
+                }
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
@@ -27471,7 +27595,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     ToastKind::Success,
                     format!("deleted preset '{}'", loaded.name),
                 ),
-                Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "delete preset failed\n{}",
+                        escape_control(&error_toast_detail(&e))
+                    ),
+                ),
             }
         }
         ConfirmAction::AdoptConfig(path) => {
@@ -27678,7 +27808,13 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
             let oauth_moved = match oauth_moved {
                 Ok(oauth_moved) => oauth_moved,
                 Err(e) => {
-                    app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "overwrite failed\n{}",
+                            escape_control(&error_toast_detail(&e))
+                        ),
+                    );
                     return;
                 }
             };
@@ -27689,7 +27825,10 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 crate::usage::expire_profile_ttl(&ProfileName::from(active));
             }
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
-                app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
                 return;
             }
             app.refresh_tokens();
@@ -27729,7 +27868,13 @@ fn run_discard_divergence(app: &mut App, active: &str) {
         return;
     };
     if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
-        app.toast(ToastKind::Danger, format!("discard failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "discard failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        );
         return;
     }
     app.toast(
@@ -27968,7 +28113,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 .map(|_| ())
                 .and_then(|()| validate_foreign_harness_free(&name, Harness::Claude));
             if let Err(e) = validation {
-                app.toast(ToastKind::Danger, format!("{e}"));
+                app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
                 return;
             }
             let collision = {
@@ -28062,7 +28207,13 @@ fn commit_capture_name(
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("captured '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "capture failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -28483,7 +28634,10 @@ fn apply_login_snapshot(
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("login failed\n{}", escape_control(&error_toast_detail(&e))),
+        ),
     }
 }
 
@@ -28532,7 +28686,13 @@ fn apply_console_login(
                 ),
             );
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("console login failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "console login failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -29387,7 +29547,10 @@ fn drain_op_results(app: &mut App) {
             Err(e) => {
                 app.toast(
                     ToastKind::Danger,
-                    format!("refresh for '{name}' failed\n{e}"),
+                    format!(
+                        "refresh for '{name}' failed\n{}",
+                        escape_control(&error_toast_detail(&e))
+                    ),
                 );
                 app.set_tab_activity(Tab::Usage, ToastKind::Danger);
             }
@@ -29631,7 +29794,10 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!("adopt failed\n{}", escape_control(&error_toast_detail(&e))),
+            ),
         }
         return DivergenceVerdict::Clean;
     }

@@ -2007,7 +2007,7 @@ fn a_store_entry_shunt_cannot_carry_refuses_only_where_shunt_reads_the_tokens() 
         (
             Ok(Some("kerry:a,b".to_string())),
             Err(format!(
-                "clauth's client-token store {} holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again",
+                "clauth's client-token store holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again; store: {}",
                 store.display()
             ))
         )

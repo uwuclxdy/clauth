@@ -20388,6 +20388,74 @@ fn the_field_refusal_toast_escapes_a_marker_in_the_error() {
     );
 }
 
+/// A field-refusal toast over a chain whose root cause carries a control
+/// byte shows that cause, escaped, beside the outer context — the cause is
+/// neither dropped nor allowed to style the rows after it.
+#[test]
+fn the_field_refusal_toast_escapes_the_control_bytes_in_the_appended_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let err = anyhow::anyhow!("x\u{E000}y").context("the outer context");
+    super::show_field_refusal(&mut app, &super::ShuntFieldKey::Bind, &err);
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("save failed\nx\\u{e000}y · the outer context"),
+        "the appended cause renders with its control bytes escaped"
+    );
+}
+
+/// A converted plain-`{e}` toast site (`toggle_profile_disabled`) escapes a
+/// control byte inside the error chain: disabling a name that is not in the
+/// roster reaches `disable_profile`'s `profile '<name>' not found` refusal, and
+/// the toast spells the name's control byte `\u{…}` so it never styles the
+/// rows after it.
+#[test]
+fn the_disabled_toggle_toast_escapes_the_control_bytes_in_the_missing_profile_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::toggle_profile_disabled(
+        &mut app,
+        &crate::profile::ProfileName::from("x\u{1b}y"),
+        super::DisableDirection::Disable,
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("toggle failed\nprofile 'x\\u{1b}y' not found"),
+        "the missing-profile cause renders with its control bytes escaped"
+    );
+}
+
+/// The auto-start toggle's `save failed` toast keeps the whole `anyhow`
+/// chain, root cause first: the plain `{e}` outer line alone (`failed to
+/// write config.toml`) never tells why the write failed. Unix-only: the toast
+/// pins the unix io cause, and the same fault spells a different cause on
+/// Windows.
+#[cfg(unix)]
+#[test]
+fn a_save_failed_toast_keeps_the_whole_anyhow_chain() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    // A directory at the profile's `config.toml` path: the save's atomic
+    // rename onto it fails for every uid (a file never renames onto a
+    // directory), so the write's own context rides over a real io cause.
+    let config_path = crate::profile::clauth_dir()
+        .unwrap()
+        .join("profiles")
+        .join("weekly")
+        .join("config.toml");
+    std::fs::create_dir_all(&config_path).unwrap();
+    let mut app = super::App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("weekly".to_string(), None, None)],
+    });
+    super::toggle_auto_start(&mut app, &ProfileName::from("weekly"));
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("save failed\nIs a directory (os error 21) · failed to write config.toml"),
+        "the toast body carries the chain, root cause first"
+    );
+}
+
 /// An incident toast driven through the real status feed pipeline shows a
 /// marker in the feed title spelled `\u{…}`, so it never styles the toast rows.
 #[test]
@@ -20443,10 +20511,12 @@ fn the_herdr_fix_failed_toast_escapes_each_diagnostic_line() {
 
 /// Driving `run_herdr_heal`'s error arm end to end: a herdr config path whose
 /// directory name holds a prose marker, created as a directory so the read
-/// fails, names the path in the `cannot read herdr's config at …` context and
-/// the toast spells the marker `\u{…}`. Holds on every OS because reading a
-/// directory is a non-`NotFound` failure on all three (unix "Is a directory",
-/// windows "Access is denied").
+/// fails, leads the toast with the io cause (root first, the whole chain via
+/// `error_toast_detail`), names the path in the `cannot read herdr's config at …`
+/// context, and spells the marker `\u{…}`. Unix-only: reading a directory
+/// fails on every OS, but each spells its own io cause (unix "Is a directory",
+/// windows "Access is denied"), so the pinned unix cause gates the probe.
+#[cfg(unix)]
 #[test]
 fn the_herdr_heal_toast_escapes_a_marker_in_the_config_path() {
     let home = crate::testutil::HomeSandbox::new();
@@ -20458,7 +20528,7 @@ fn the_herdr_heal_toast_escapes_a_marker_in_the_config_path() {
         super::ConfirmAction::HealHerdrConfig(marker_dir.clone()),
     );
     let expected = format!(
-        "herdr config fix failed\ncannot read herdr's config at {} (encoding or permissions); fix it before clauth edits it",
+        "herdr config fix failed\nIs a directory (os error 21) · cannot read herdr's config at {} (encoding or permissions); fix it before clauth edits it",
         marker_dir
             .display()
             .to_string()
@@ -26822,7 +26892,7 @@ fn a_failed_day_list_save_keeps_memory_on_the_disk_value_and_names_the_error() {
     assert_eq!(app.toasts[0].kind, super::ToastKind::Danger);
     assert_eq!(
         app.toasts[0].body,
-        "preferred days update failed\nfailed to write config.toml"
+        "preferred days update failed\nPermission denied (os error 13) · failed to write config.toml"
     );
 }
 
@@ -35874,7 +35944,7 @@ fn the_client_token_group_renders_a_store_read_error() {
     // The store read failure's sentence, pinned whole: the fixture fixes the
     // store path, and the unparseable store fixes the refusal.
     let sentence = format!(
-        "clauth's client-token store {} does not parse; delete it and add the tokens again",
+        "clauth's client-token store does not parse; delete it and add the tokens again; store: {}",
         path.display()
     );
     assert_eq!(
@@ -37841,7 +37911,7 @@ fn a_failed_plain_create_keeps_the_form_open_with_its_typed_draft() {
         app.toasts.back().map(|t| (t.kind, t.body.as_str())),
         Some((
             super::ToastKind::Danger,
-            "create failed\nfailed to write config.toml"
+            "create failed\nPermission denied (os error 13) · failed to write config.toml"
         )),
         "the plain create-failure toast by equality"
     );
@@ -37902,7 +37972,7 @@ fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
         app.toasts.back().map(|t| (t.kind, t.body.as_str())),
         Some((
             super::ToastKind::Danger,
-            "create failed\nfailed to write config.toml"
+            "create failed\nPermission denied (os error 13) · failed to write config.toml"
         )),
         "the plain create-failure toast by equality"
     );

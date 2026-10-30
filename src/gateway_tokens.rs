@@ -687,6 +687,8 @@ pub(crate) enum ClientTokenRefusal {
     StoreUnread { path: PathBuf, cause: String },
 }
 
+/// A refusal's sentence leads with the outcome; a store path rides last, so a
+/// full path never sits between the outcome and its cause on a wrapped toast.
 impl std::fmt::Display for ClientTokenRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -770,17 +772,17 @@ impl std::fmt::Display for ClientTokenRefusal {
             }
             Self::BadEntry { profile, path } => write!(
                 f,
-                "clauth's client-token store {} holds an entry for profile {profile:?} that shunt cannot read; remove that profile's token and add it again",
+                "clauth's client-token store holds an entry for profile {profile:?} that shunt cannot read; remove that profile's token and add it again; store: {}",
                 path.display()
             ),
             Self::StoreUnread { path, cause } => write!(
                 f,
-                "clauth's client-token store {} cannot be read ({cause}); repair its permissions or remove it",
+                "clauth's client-token store cannot be read ({cause}); repair its permissions or remove it; store: {}",
                 path.display()
             ),
             Self::StoreUnreadable { path } => write!(
                 f,
-                "clauth's client-token store {} does not parse; delete it and add the tokens again",
+                "clauth's client-token store does not parse; delete it and add the tokens again; store: {}",
                 path.display()
             ),
         }

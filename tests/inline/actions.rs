@@ -8893,7 +8893,7 @@ fn an_unparseable_store_refuses_delete_and_rename_naming_the_file() {
         .join("gateway-client-tokens.toml");
     std::fs::write(&store, "[tokens]\na = \"tok-secret\n").expect("store");
     let unreadable = format!(
-        "clauth's client-token store {} does not parse; delete it and add the tokens again",
+        "clauth's client-token store does not parse; delete it and add the tokens again; store: {}",
         store.display()
     );
     assert_eq!(
@@ -8978,7 +8978,7 @@ fn an_unreadable_store_refuses_delete_and_rename_naming_the_file() {
         .join("gateway-client-tokens.toml");
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).expect("chmod");
     let unread = format!(
-        "clauth's client-token store {} cannot be read (Permission denied (os error 13)); repair its permissions or remove it",
+        "clauth's client-token store cannot be read (Permission denied (os error 13)); repair its permissions or remove it; store: {}",
         store.display()
     );
     let outcome = (delete(&mut config, "a"), rename(&mut config, "a", "b"));
