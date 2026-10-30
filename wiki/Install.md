@@ -49,7 +49,7 @@ A binary install on v0.17.0 or older cannot download a current release and never
 
 ## Shell completions
 
-The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.clauth/.completions_installed`.
+The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.clauth/.completions_installed`. A declined prompt is not asked again, but the Services tab's `plugin` row keeps offering `install completions` without warning.
 
 Install or refresh them any time:
 
@@ -61,7 +61,7 @@ clauth completions bash             # print the script to stdout instead
 
 `CLAUTH_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
-`clauth resume` and `clauth info` complete session ids (and `latest`), and codex profile names complete beside the Claude Code ones after `clauth`, `start`, `delete` and `switch`, and alone after `limit-reset`. An install from v0.18.0 or older keeps its old script: run `clauth completions install` once to pick it up.
+`clauth resume` and `clauth info` complete session ids (and `latest`), and codex profile names complete beside the Claude Code ones after `clauth`, `start`, `delete` and `switch`, and alone after `limit-reset`. An installed script never updates by itself: when the script at the path `clauth completions install` writes (`~/.clauth/completions/clauth.<shell>`; fish `~/.config/fish/completions/clauth.fish`) differs from what this clauth prints, select the `plugin` row and press <kbd>f</kbd> until `update completions` is focused, then <kbd>⏎</kbd>, or run `clauth completions install`.
 
 ## Claude Code plugin
 

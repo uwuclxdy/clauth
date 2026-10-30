@@ -280,7 +280,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
     clauth-child.json      # the proxy the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop (0600)
     clauth.log             # the proxy's own stdout and stderr, size-capped like daemon.log (0600)
   completions/             # generated shell completion scripts
-  .completions_installed   # marker: completions have been installed
+  .completions_installed   # marker: the first-launch completions prompt was answered
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
   daemon-stops-in-flight.json # runtime trees whose supervisor stop is in flight, the supervisors that wedged on SIGTERM (pid and start time) and, on macOS and Windows, the trees already announced as spared; no credential (0600)
   .claude-json-sync.lock   # the flock serializing every `.claude.json` merge, switch strip, session seed and `wire mcp server` across live clauth processes, so one Claude Code write costs each copy at most one rewrite; empty, 0600
