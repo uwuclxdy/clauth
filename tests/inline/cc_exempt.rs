@@ -1351,21 +1351,27 @@ fn help_value_flags_reads_a_value_option_s_names_off_one_line() {
 }
 
 #[test]
+#[ignore = "needs a claude binary on PATH; run with --ignored where one is installed"]
 fn the_value_flags_cover_every_help_listed_value_option() {
     // drift guard: a value option a new claude release lists fails here until
     // VALUE_FLAGS carries it. Reads `claude --help` and nothing else: never a
-    // session, and never the real HOME.
+    // session, and never the real HOME. Ignored by default because the regular
+    // CI legs install no claude, where a skip would read as drift coverage; a
+    // run that asks for it fails without one.
     let home = crate::testutil::HomeSandbox::new();
-    let Ok(output) = Command::new("claude")
+    let output = Command::new("claude")
         .arg("--help")
         .env("HOME", home.home())
         .output()
-    else {
-        // no claude binary on this box: nothing to drift against. Say so, so
-        // a run without claude never reads as drift coverage.
-        eprintln!("SKIP: claude not installed; VALUE_FLAGS was NOT checked for drift");
-        return;
-    };
+        .unwrap_or_else(|e| {
+            panic!("`claude --help` did not run ({e}): the drift check needs claude on PATH")
+        });
+    assert!(
+        output.status.success(),
+        "`claude --help` exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let help = String::from_utf8_lossy(&output.stdout);
     let listed = help_value_flags(&help);
     // first, middle and last value option of the 2.1.311 help: the parser
