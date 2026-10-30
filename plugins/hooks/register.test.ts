@@ -148,6 +148,73 @@ function appendRow(uuid: string, agentId?: string) {
   }
 }
 
+// The cadence the mod runs the note command at, in mock-clock milliseconds:
+// pinned to the shipped value, because the same run stamps the account the
+// token-speed reader attributes spend to, so the window also bounds how long
+// a switch stays attributed to the old account.
+const NOTE_CADENCE_MS = 10_000
+
+// What `clauth hook-profile-changed-note` prints for a fire that earned one or
+// more notes: a single classic envelope, every note joined into one string.
+function noteEnvelope(...notes: string[]): string {
+  return JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: notes.join('\n\n') },
+  })
+}
+
+type NoteRun = { argv: readonly string[]; init?: { stdin?: string; timeoutMs?: number } }
+
+// The note subcommand as the test sees it: every run recorded, each answered
+// from `answer` (the caller mutates it between windows) instead of spawning a
+// real `clauth`.
+function installNoteCommand(on: On, answer: { stdout?: string; exitCode?: number }): NoteRun[] {
+  const runs: NoteRun[] = []
+  on('process.run', ($, e, next) => {
+    runs.push({ argv: e.argv, init: e.init })
+    return {
+      value: {
+        exitCode: answer.exitCode ?? 0,
+        stdout: answer.stdout ?? '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  return runs
+}
+
+// Nothing runs beneath a test's hooks, so a raised classic event settles on the
+// test's own bottom; this installs one.
+function classicBottom(
+  on: On,
+  result: { block?: string; additionalContext?: string[] } = {},
+): void {
+  on('classic.PostToolUse', ($, e, next) => result)
+}
+
+// A PostToolUse payload as the engine raises it, with the event's own scope.
+function toolEvent(id: string, agentId?: string) {
+  return {
+    tool_name: 'Bash',
+    tool_input: { command: 'ls' },
+    tool_response: 'ok',
+    tool_use_id: id,
+    ...(agentId !== undefined ? { agent_id: agentId } : {}),
+  }
+}
+
+// A main-scope agent-spawn call, the one PostToolUse the headroom nudge
+// computes on.
+function spawnEvent(id: string) {
+  return { ...toolEvent(id), tool_name: 'Agent' }
+}
+
+// The bottom for a classic event other than PostToolUse.
+function stopBottom(on: On): void {
+  on('classic.SubagentStop', ($, e, next) => ({}))
+}
+
 const ASK = { decision: 'ask' as const }
 const QUESTION = [
   { question: 'Which lib?', header: 'Lib', options: [{ label: 'date-fns', description: '' }], multiSelect: false },
@@ -1408,4 +1475,239 @@ test('N2: session.end awaits the end post before returning', async ($, on) => {
   releaseEnd()
   await p
   expect(ended).toBe(true)
+})
+
+// The note command runs on the event's own scope, and its envelope reaches
+// the model as the event's context.
+test('P1: the note command runs on the event and its envelope reaches the model', async ($, on) => {
+  setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, {
+    stdout: noteEnvelope(
+      'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
+    ),
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.classic.PostToolUse({
+    session_id: 'sid-1',
+    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
+    ...toolEvent('tu-1'),
+  })
+
+  expect(out.additionalContext).toEqual([
+    'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
+  ])
+  expect(runs).toHaveLength(1)
+  expect(runs[0].argv).toEqual(['clauth', 'hook-profile-changed-note'])
+  expect(runs[0].init?.timeoutMs).toBe(10_000)
+  expect(JSON.parse(runs[0].init?.stdin ?? '')).toEqual({
+    session_id: 'sid-1',
+    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+  })
+})
+
+// The context-size note rides the same subcommand and envelope, so one run can
+// carry both; its text must reach the model unchanged.
+test('P2: the 600k context note reaches the model unchanged', async ($, on) => {
+  setup(on)
+  classicBottom(on)
+  const note =
+    'clauth: context window usage has exceeded 600k tokens. consider writing or updating a handoff prompt so a fresh session can take over.'
+  installNoteCommand(on, { stdout: noteEnvelope(note) })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.classic.PostToolUse(toolEvent('tu-1'))
+
+  expect(out.additionalContext).toEqual([note])
+})
+
+// The whole cost being removed: the command is a subprocess, and the tool
+// events inside one cadence window must not each pay for one.
+test('P3: tool calls in one cadence window share one subprocess', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (const id of ['tu-1', 'tu-2', 'tu-3']) await $.classic.PostToolUse(toolEvent(id))
+  expect(runs).toHaveLength(1)
+
+  await clock.advance(NOTE_CADENCE_MS - 1)
+  await $.classic.PostToolUse(toolEvent('tu-4'))
+  expect(runs).toHaveLength(1)
+
+  await clock.advance(1)
+  const out = await $.classic.PostToolUse(toolEvent('tu-5'))
+  expect(runs).toHaveLength(2)
+  expect(out.additionalContext).toEqual(['note'])
+})
+
+// The mod sits above whatever else answers the event: its note joins that
+// context instead of replacing it.
+test('P4: the note joins the chain context, it does not replace it', async ($, on) => {
+  setup(on)
+  installNoteCommand(on, { stdout: noteEnvelope('note') })
+  classicBottom(on, { additionalContext: ['beneath'], block: 'stop' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.classic.PostToolUse(toolEvent('tu-1'))
+
+  expect(out).toEqual({ block: 'stop', additionalContext: ['beneath', 'note'] })
+})
+
+// The command is silent in the ordinary case, and a failure is silence too: a
+// broken or missing `clauth` must never break the tool result it rides on.
+test('P5: a silent, failing or unparseable command adds no context', async ($, on) => {
+  const { clock } = setup(on)
+  const answer: { stdout?: string; exitCode?: number } = { stdout: '' }
+  const runs = installNoteCommand(on, answer)
+  classicBottom(on, { block: 'kept' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+
+  await clock.advance(NOTE_CADENCE_MS)
+  answer.exitCode = 1
+  expect(await $.classic.PostToolUse(toolEvent('tu-2'))).toEqual({ block: 'kept' })
+
+  await clock.advance(NOTE_CADENCE_MS)
+  answer.exitCode = 0
+  answer.stdout = 'not json'
+  expect(await $.classic.PostToolUse(toolEvent('tu-3'))).toEqual({ block: 'kept' })
+  expect(runs).toHaveLength(3)
+})
+
+// A subagent's fire carries its own scope, so the command's per-scope record
+// lands on the subagent's, never the main thread's.
+test('P6: a subagent fire feeds the command its own agent scope', async ($, on) => {
+  setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse({
+    session_id: 'sid-1',
+    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
+    ...toolEvent('tu-1', 'a1'),
+  })
+
+  expect(runs).toHaveLength(1)
+  expect(JSON.parse(runs[0].init?.stdin ?? '')).toEqual({
+    session_id: 'sid-1',
+    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+    agent_id: 'a1',
+  })
+})
+
+// A main-scope agent-spawn call is the one fire the headroom nudge computes
+// on, and a skipped fire loses it for good, so the window never skips it; it
+// also leaves the window where it stood.
+test('P7: a main-scope agent spawn runs inside the window without taking it', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse(toolEvent('tu-1'))
+  await clock.advance(1_000)
+  await $.classic.PostToolUse(spawnEvent('tu-2'))
+
+  expect(runs).toHaveLength(2)
+  expect((JSON.parse(runs[1].init?.stdin ?? '') as { tool_name?: string }).tool_name).toBe('Agent')
+
+  await clock.advance(NOTE_CADENCE_MS - 1_000)
+  await $.classic.PostToolUse(toolEvent('tu-3'))
+  expect(runs).toHaveLength(3)
+})
+
+// One window per scope: a subagent's calls never spend the main thread's
+// window, and one subagent's never spend another's.
+test('P8: the window is per scope, not per module', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse(toolEvent('tu-1'))
+  await clock.advance(1_000)
+  await $.classic.PostToolUse(toolEvent('tu-2', 'a1'))
+  expect(runs).toHaveLength(2)
+
+  await clock.advance(1_000)
+  await $.classic.PostToolUse(toolEvent('tu-3'))
+  expect(runs).toHaveLength(2)
+  await $.classic.PostToolUse(toolEvent('tu-4', 'a2'))
+  expect(runs).toHaveLength(3)
+})
+
+// The scope key carries the session too, so a fire naming another
+// conversation never spends this one's window.
+test('P9: the window key carries the session id', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse({ session_id: 'sid-1', transcript_path: '/t', ...toolEvent('tu-1') })
+  await clock.advance(1_000)
+  await $.classic.PostToolUse({ session_id: 'sid-2', transcript_path: '/t', ...toolEvent('tu-2') })
+  expect(runs).toHaveLength(2)
+})
+
+// A subagent's stop drops its window entry: nothing else bounds the map, and
+// a stale entry could only withhold a run a later fire owes.
+test('P10: a subagent stop releases its window entry', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  stopBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse(toolEvent('tu-1', 'a1'))
+  await clock.advance(1_000)
+  await $.classic.SubagentStop({ agent_id: 'a1' })
+  await $.classic.PostToolUse(toolEvent('tu-2', 'a1'))
+  expect(runs).toHaveLength(2)
+})
+
+// Parallel tool calls settle together; the window is stamped before the run's
+// first await, so a burst inside one window is still one process.
+test('P11: a parallel burst inside one window runs once', async ($, on) => {
+  setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await Promise.all(
+    ['tu-1', 'tu-2', 'tu-3', 'tu-4'].map(id => $.classic.PostToolUse(toolEvent(id))),
+  )
+  expect(runs).toHaveLength(1)
+})
+
+// A run the engine rejects (its 10 s bound, a missing `clauth`) is silence,
+// and the tool event still settles with what the hooks beneath answered.
+test('P12: a rejected run adds no context', async ($, on) => {
+  setup(on)
+  classicBottom(on, { block: 'kept' })
+  on('process.run', async () => {
+    throw new Error('spawn failed')
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+})
+
+// An agent-spawn call skips the cadence only on the main scope: a subagent's
+// spawn is its own scope's ordinary fire, so its own window still holds it.
+test('P14: a subagent agent-spawn call does not bypass its window', async ($, on) => {
+  const { clock } = setup(on)
+  classicBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.classic.PostToolUse(toolEvent('tu-1', 'a1'))
+  await clock.advance(1_000)
+  await $.classic.PostToolUse({ ...toolEvent('tu-2', 'a1'), tool_name: 'Agent' })
+  expect(runs).toHaveLength(1)
+})
+
+test('Q1: a hook failing before next still lets the hooks beneath answer', async ($, on) => {
+  on('clock.now', () => { throw new Error('clock down') })
+  classicBottom(on, { block: 'kept' })
+  const runs = installNoteCommand(on, { stdout: '' })
+  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+  expect(runs).toHaveLength(0)
 })

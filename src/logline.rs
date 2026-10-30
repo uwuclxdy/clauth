@@ -109,7 +109,7 @@ pub(crate) fn line(args: std::fmt::Arguments<'_>) {
 
 /// Always the log FILE, never stderr, whatever [`route`] would pick.
 ///
-/// For a caller that runs once per tool call in a hook process. A hook's stderr
+/// For a caller that runs once per fire in a hook process. A hook's stderr
 /// is a pipe rather than a terminal and `STAMP` is off, which is precisely the
 /// `Sink::Stderr` arm — so a per-fire diagnostic through [`line`] is an
 /// unbounded write onto the channel Claude Code surfaces to the user, and a

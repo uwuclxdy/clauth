@@ -28,9 +28,10 @@
 //!   the credential link points elsewhere, so a path-derived name answers "which
 //!   directory" rather than "which account".
 //! - **A stat gates the resolution, and a TTL bounds what the stat misses.**
-//!   This runs on every tool call, so the record carries a stamp of the
-//!   resolution's inputs and skips it when nothing moved. The stamp is the
-//!   credential store plus a hash of [`crate::profile::reload_fingerprint`],
+//!   Fires arrive on tool activity and at each prompt, so the record carries
+//!   a stamp of the resolution's inputs and skips it when nothing moved. The
+//!   stamp is the credential store plus a hash of
+//!   [`crate::profile::reload_fingerprint`],
 //!   which is the crate's own predicate for "could a config reload change the
 //!   answer" and covers every per-profile `config.toml` that two hand-rolled
 //!   stats did not. [`RESOLUTION_TTL`] is the correctness backstop rather than
@@ -63,8 +64,8 @@
 //!   context names the window before the 429 lands. The nudge answers "would a
 //!   switch catch this": the burn-projection gate r8 ships, the fallback-chain
 //!   walk replayed over the disk cache, and the live-session registry's
-//!   `follows_chain` — a session the chain may move already hears about the
-//!   move one tool call after it lands. Suppression and re-arm ride the same
+//!   `follows_chain` — a session the chain may move hears about the move at
+//!   its next fire. Suppression and re-arm ride the same
 //!   record the account note uses.
 //!
 //! A failure is silence at exit 0 wherever this module can make it one, because
@@ -800,10 +801,10 @@ fn note_for_inner(
     if stored.as_ref() != Some(&record) {
         if store_record(&path, &record).is_err() {
             // The record IS the suppression mechanism, so a note that cannot be
-            // remembered is re-emitted on every tool call for the life of the
+            // remembered is re-emitted on every fire for the life of the
             // conversation. Keyed on the write failing at all rather than on any one
             // cause: a full disk and a read-only tree reach this the same way.
-            // The log FILE, not `logline!`. This runs once per tool call, so a
+            // The log FILE, not `logline!`. This runs once per fire, so a
             // persistent failure through the routed sink lands on a hook's
             // (non-terminal) stderr once per fire — the same unbounded flood this
             // suppression exists to prevent, moved onto the channel Claude Code
@@ -1160,13 +1161,17 @@ struct NudgeFigures {
     reset: i64,
 }
 
-/// Whether a `tool_name` is Claude Code's agent-spawn tool, the one call the
-/// headroom nudge gates on and the context nudge counts as a running agent.
-/// Claude Code 2.1.285 renamed the tool `Task` -> `Agent` (0 `Task` of 250
-/// measured spawns), so both spellings match; the comparison is exact, never
-/// a substring.
+/// The `tool_name` values Claude Code raises for an agent-spawn call, the one
+/// call the headroom nudge gates on and the context nudge counts as a running
+/// agent. Claude Code 2.1.285 renamed the tool `Task` -> `Agent` (0 `Task` of
+/// 250 measured spawns), so both spellings match; the comparison is exact,
+/// never a substring. `plugins/hooks/register.ts` mirrors this list to skip
+/// the note cadence on those calls, and a test compares the two.
+pub(crate) const AGENT_SPAWN_TOOLS: [&str; 2] = ["Task", "Agent"];
+
+/// Whether a `tool_name` is Claude Code's agent-spawn tool.
 pub(crate) fn is_agent_spawn_tool(name: &str) -> bool {
-    matches!(name, "Task" | "Agent")
+    AGENT_SPAWN_TOOLS.contains(&name)
 }
 
 /// Gather the nudge's inputs. `None` for a fire that is not nudge-eligible at
@@ -1190,8 +1195,8 @@ fn read_nudge(payload: &Payload, shared: Option<&crate::profile::AppConfig>) -> 
     {
         return None;
     }
-    // A session the chain may move already hears about the move one tool call
-    // after it lands — the account note's own job. The registry row is keyed by
+    // A session the chain may move hears about the move at its next fire —
+    // the account note's own job. The registry row is keyed by
     // the clauth runtime sid, which this hook child reaches through the
     // `CLAUDE_CONFIG_DIR` `clauth start` sets (the payload's `session_id` is
     // Claude Code's conversation id, a different namespace). One lock-free row

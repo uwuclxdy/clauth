@@ -265,7 +265,7 @@ fn a_report_herdr_keeps_refusing_is_sent_once_per_fire() {
 
 /// Only herdr's not-yet-accepted refusal arms a re-send: any other failure
 /// keeps the logged-silence posture, so a broken herdr is never re-spawned on
-/// every tool call.
+/// every fire.
 #[test]
 fn a_failure_other_than_a_refusal_arms_no_resend() {
     let home = HomeSandbox::new();
@@ -282,7 +282,7 @@ fn a_failure_other_than_a_refusal_arms_no_resend() {
 
 /// The arm reads herdr's error code, not the bare fact of an error envelope:
 /// a stale pane id answers `pane_not_found` on every call, and re-sending it
-/// per tool call would buy nothing.
+/// on every fire would buy nothing.
 #[test]
 fn another_herdr_error_code_arms_no_resend() {
     let home = HomeSandbox::new();

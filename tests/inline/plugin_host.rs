@@ -131,6 +131,19 @@ fn the_await_job_hook_matches_delegate_under_both_server_names() {
     }
 }
 
+/// Every command a hooks.json event runs, across its matcher groups.
+fn event_commands(hooks: &serde_json::Value, event: &str) -> Vec<String> {
+    hooks["hooks"][event]
+        .as_array()
+        .unwrap_or_else(|| panic!("{event} is an array"))
+        .iter()
+        .filter_map(|group| group["hooks"].as_array())
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The SessionStart wiring the self-heal rides on: the committed hooks.json
 /// must carry BOTH hooks — the profile-change note keeps working, and the new
 /// self-heal entry points at the hidden `clauth self-heal` subcommand. A drift
@@ -141,15 +154,7 @@ fn session_start_hook_wires_self_heal_beside_the_note() {
     let hooks: serde_json::Value =
         serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
             .expect("plugins/hooks/hooks.json parses");
-    let commands: Vec<String> = hooks["hooks"]["SessionStart"]
-        .as_array()
-        .expect("SessionStart is an array")
-        .iter()
-        .filter_map(|group| group["hooks"].as_array())
-        .flatten()
-        .filter_map(|hook| hook["command"].as_str())
-        .map(str::to_string)
-        .collect();
+    let commands = event_commands(&hooks, "SessionStart");
     assert!(
         commands
             .iter()
@@ -159,6 +164,137 @@ fn session_start_hook_wires_self_heal_beside_the_note() {
     assert!(
         commands.iter().any(|c| c == "clauth self-heal"),
         "the self-heal hook is not wired into SessionStart: {commands:?}"
+    );
+}
+
+/// A prompt is the main scope's backstop for the note: a turn whose tool
+/// calls all fall inside a cadence window the previous turn opened would
+/// otherwise go unchecked. The UserPromptSubmit leg must keep its entry.
+#[test]
+fn prompt_submit_keeps_the_note_command() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let commands = event_commands(&hooks, "UserPromptSubmit");
+    assert!(
+        commands
+            .iter()
+            .any(|c| c == "clauth hook-profile-changed-note"),
+        "the profile-change note must keep its UserPromptSubmit slot: {commands:?}"
+    );
+}
+
+/// The mid-turn note is one process spawn per cadence window in the hooks
+/// module. A `PostToolUse` entry whose matcher takes every tool spawns a
+/// command on each call, so none may exist: an absent, empty, `*` or `.*`
+/// matcher all run for any tool. Each matcher is read as a regex and checked
+/// against ordinary tool names; one the `regex` crate cannot read fails here
+/// rather than passing unseen. `Agent` is left out: a matcher naming only the
+/// agent-spawn tools is a legitimate shape.
+#[test]
+fn no_post_tool_use_entry_runs_on_every_tool_call() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let groups = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse is an array");
+    for entry in groups {
+        let matcher = entry
+            .get("matcher")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !matcher.is_empty(),
+            "a PostToolUse entry without a matcher runs on every tool call: {entry}"
+        );
+        let matcher =
+            regex::Regex::new(matcher).expect("a PostToolUse matcher compiles as a regex");
+        for tool in ["Bash", "Read", "Write"] {
+            assert!(
+                !matcher.is_match(tool),
+                "{tool:?} is an ordinary call, so the matcher runs on every tool call: {entry}"
+            );
+        }
+    }
+}
+
+/// The note window map's sweep is its only bound on growth besides a
+/// subagent's stop. `claude plugin test` loads the module in its own graph, so
+/// a plugin test cannot read the map size (measured 2026-10-30: an exported
+/// counter read 0 and a global read -1); the sweep is pinned at the
+/// source instead. What that cannot see: whether the sweep runs at all, and
+/// whether a `return`, an uncalled function or a `/* */` block comment inside
+/// the handler span leaves it dead code.
+#[test]
+fn the_note_window_sweep_bounds_the_map() {
+    let source = include_str!("../../plugins/hooks/register.ts");
+    assert!(
+        source.contains("for (const [stale, at] of lastNoteAt)"),
+        "register.ts must keep the note window sweep: it is the map's only \
+         bound besides a subagent's stop"
+    );
+    assert!(
+        source.contains("lastNoteAt.delete(stale)"),
+        "the sweep must drop the entry it found stale, not just walk the map"
+    );
+    let handler = source
+        .find("on('classic.PostToolUse'")
+        .expect("register.ts registers a classic.PostToolUse handler");
+    let stamp = handler
+        + source[handler..]
+            .find("lastNoteAt.set(key, now)")
+            .expect("the handler stamps the window before it runs the note");
+    // Comment lines are dropped first: an out-commented sweep still carries
+    // both substrings, so a raw `contains` reads it as present.
+    let body = source[handler..stamp]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        body.contains(
+            "for (const [stale, at] of lastNoteAt) { if (now - at >= NOTE_CADENCE_MS) \
+             lastNoteAt.delete(stale) }"
+        ),
+        "the window stamp must be preceded, inside classic.PostToolUse, by the \
+         sweep loop and its bare NOTE_CADENCE_MS threshold: {body}"
+    );
+}
+
+/// The hooks module skips the note cadence on a main-scope agent-spawn call
+/// so the headroom nudge still fires there, from a list of tool names it
+/// mirrors from clauth. Both sides must name the same tools: a name only one
+/// side knows silently drops that spawn's nudge.
+#[test]
+fn module_and_clauth_name_the_same_agent_spawn_tools() {
+    let source = include_str!("../../plugins/hooks/register.ts");
+    let decl = source
+        .find("const AGENT_SPAWN_TOOLS")
+        .expect("register.ts names its agent-spawn tool list");
+    // Bound the parse to the declaration's own line, so a respelling with no
+    // `= [` reds here instead of parsing a later declaration's list.
+    let line = source[decl..]
+        .lines()
+        .next()
+        .expect("the declaration line is not empty");
+    let open = line
+        .find("= [")
+        .expect("the list follows the declaration on its own line")
+        + 3;
+    let close = open + line[open..].find(']').expect("the list closes on its line");
+    let module: Vec<&str> = line[open..close]
+        .split(',')
+        .map(|name| name.trim().trim_matches('\''))
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(!module.is_empty(), "the parsed list must not be empty");
+    assert_eq!(
+        module,
+        crate::hook_note::AGENT_SPAWN_TOOLS.to_vec(),
+        "register.ts's agent-spawn list drifted from clauth's predicate"
     );
 }
 

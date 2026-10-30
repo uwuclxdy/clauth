@@ -18,6 +18,21 @@ const POLL_BACKOFF_MS = 5000
 const LINE2_LEAD = '  Allow this? Answer here or on your phone.   '
 // The AskUserQuestion row's second line, leading text before the one button.
 const QUESTION_LINE2_LEAD = '  Answer on your phone, or here.   '
+// The mid-turn check: the hidden `clauth` subcommand that prints both notes.
+// The same run records the account this session spends now, and the
+// token-speed reader attributes spend from that resolution's stamp, so the
+// window bounds how much later than the next tool call a switch is recorded:
+// a change with no later tool call waits for the next prompt. Inside a window
+// a tool call pays no process, so N calls in one window cost one spawn
+// instead of N.
+const NOTE_CADENCE_MS = 10_000
+// One run's bound: past it the note is dropped and the event settles without
+// it, so a hung `clauth` cannot hold the tool result longer.
+const NOTE_TIMEOUT_MS = 10_000
+// The tool names Claude Code raises for an agent spawn (`is_agent_spawn_tool`
+// in `src/hook_note.rs`).
+const AGENT_SPAWN_TOOLS: readonly string[] = ['Task', 'Agent']
+const NOTE_COMMAND = ['clauth', 'hook-profile-changed-note'] as const
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
@@ -54,6 +69,8 @@ let pendingPrompt: { text: string } | null = null
 let helds = new Map<string, HeldEntry>()
 let interruptedTurn: string | null = null
 let askCounter = 0
+// The last cadence run per scope, keyed by session and agent id.
+let lastNoteAt = new Map<string, number>()
 
 const bodyBytes = (body: string): number => encoder.encode(body).length
 
@@ -453,8 +470,68 @@ function stopPollLoop(): void {
   pollStarted = false
 }
 
+// The scope one note fire speaks for.
+type NoteScope = {
+  session_id: string
+  transcript_path: string
+  tool_name: string
+  agent_id?: string
+}
+
+// The window one fire belongs to: a subagent's calls never spend the main
+// thread's window or another subagent's.
+function noteWindowKey(e: { session_id: string; agent_id?: string }): string {
+  return `${e.session_id}/${e.agent_id ?? ''}`
+}
+
+// The classic hook input the note command reads, taken from the event the
+// engine raised: `clauth`'s own parser keeps these fields, and the scope is
+// the event's, so a subagent's note lands on the subagent's record.
+function noteInput(e: NoteScope): string {
+  return JSON.stringify({
+    session_id: e.session_id,
+    transcript_path: e.transcript_path,
+    hook_event_name: 'PostToolUse',
+    tool_name: e.tool_name,
+    ...(e.agent_id !== undefined ? { agent_id: e.agent_id } : {}),
+  })
+}
+
+// The command's classic envelope as text for the model, or nothing: it prints
+// nothing when no note earned the fire, and every other answer is silence too.
+function noteContext(stdout: string): string | null {
+  try {
+    const value = JSON.parse(stdout) as {
+      hookSpecificOutput?: { hookEventName?: string; additionalContext?: unknown }
+    }
+    const out = value.hookSpecificOutput
+    if (out === undefined || out.hookEventName !== 'PostToolUse') return null
+    if (typeof out.additionalContext !== 'string') return null
+    return out.additionalContext === '' ? null : out.additionalContext
+  } catch {
+    return null
+  }
+}
+
+// One cadence window's run of the note command: the note's text, or nothing.
+// A command that cannot start or overruns is silence, as the subcommand's own
+// contract is, so a broken install never breaks the tool result it rides on.
+async function runNote($: EngineInterface, e: NoteScope): Promise<string | null> {
+  try {
+    const run = await $.process.run(NOTE_COMMAND, {
+      stdin: noteInput(e),
+      timeoutMs: NOTE_TIMEOUT_MS,
+    })
+    return run.exitCode === 0 ? noteContext(run.stdout) : null
+  } catch {
+    return null
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    // The note windows belong to the session: a fresh one starts open.
+    lastNoteAt.clear()
     const os = await $.env.get('OS')
     const home = await $.env.get('HOME')
     if (os === 'Windows_NT' || !home || !home.startsWith('/')) {
@@ -516,6 +593,36 @@ export const register: Register = on => {
     }
     return next(e)
   })
+
+  on('classic.PostToolUse', async ($, e, next) => {
+    // A main-scope agent-spawn call is what the headroom nudge is computed
+    // on, and a skipped fire never replays it, so it runs the command
+    // whatever the window says and leaves the window where it stood.
+    const spawn = e.agent_id === undefined && AGENT_SPAWN_TOOLS.includes(e.tool_name)
+    if (!spawn) {
+      const key = noteWindowKey(e)
+      const now = await $.clock.now()
+      const lastAt = lastNoteAt.get(key)
+      if (lastAt !== undefined && now - lastAt < NOTE_CADENCE_MS) return next(e)
+      // A scope that never fires its stop ages out here, so the map holds
+      // only the scopes that ran inside one window.
+      for (const [stale, at] of lastNoteAt) {
+        if (now - at >= NOTE_CADENCE_MS) lastNoteAt.delete(stale)
+      }
+      // Stamped before the run's own awaits, so tools settling together share
+      // the window instead of each spawning.
+      lastNoteAt.set(key, now)
+    }
+    const settled = await next(e)
+    const note = await runNote($, e)
+    if (note === null) return settled
+    return { ...settled, additionalContext: [...(settled.additionalContext ?? []), note] }
+  }).catch(($, e, next) => next(e))
+
+  on('classic.SubagentStop', async ($, e, next) => {
+    lastNoteAt.delete(noteWindowKey(e))
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on(
     'tool.check',

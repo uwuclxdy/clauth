@@ -553,7 +553,7 @@ fn a_resolution_is_retaken_once_the_ttl_expires() {
 }
 
 /// The record IS the suppression mechanism, so a note it cannot remember would
-/// be re-emitted on every tool call for the life of the conversation.
+/// be re-emitted on every fire for the life of the conversation.
 #[test]
 fn a_note_that_cannot_be_recorded_is_not_emitted() {
     let _home = HomeSandbox::new();

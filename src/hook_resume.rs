@@ -40,9 +40,9 @@
 //! the report again with a fresh seq, until one is accepted. herdr answers the
 //! same code for causes that never clear (another source holding the pane's
 //! state, a non-claude agent detected there), so on such a pane every prompt
-//! and tool call re-sends: one bounded spawn each, logged once when armed.
+//! and every fire re-sends: one bounded spawn each, logged once when armed.
 //! Only that code arms it; any other failure disarms it, so a broken or hung
-//! herdr is never re-spawned per tool call, and one failed re-send leaves the
+//! herdr is never re-spawned on every fire, and one failed re-send leaves the
 //! report to the next attribution change.
 //!
 //! The seq is minted epoch-ms and persisted on the conversation's note
@@ -100,8 +100,8 @@ pub(crate) fn report_for_fire(payload: &Payload, current: Option<&str>, attribut
     };
     // Only a `SessionStart` or a real attribution change can move the resume
     // command — its session id or its profile changed — and only an armed
-    // re-send still owes one, so every other fire (per tool call, per prompt)
-    // is a no-op.
+    // re-send still owes one, so every other fire (prompts, cadence runs,
+    // agent spawns) is a no-op.
     let armed = load_record(&path).is_some_and(|record| record.resume_pending);
     if payload.event != "SessionStart" && !attribution_changed && !armed {
         return;

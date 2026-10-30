@@ -45,15 +45,6 @@
             "rewakeSummary": "clauth delegate update"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "clauth hook-profile-changed-note",
-            "timeout": 10
-          }
-        ]
       }
     ]
   }
