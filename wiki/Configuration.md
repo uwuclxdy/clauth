@@ -198,7 +198,7 @@ The codex roster, kept apart from `profiles.toml` so a codex switch never rewrit
 | `weekly_switch_threshold` | float | `98.0` | the codex chain's 7d exhaustion line, 50-100; a value outside the band reads as the default and is rewritten to `98.0` on the next save, and a key the file never carried is not invented into it |
 | `[ids]` | table | `{}` | written by clauth, one per profile; leave it as written |
 
-A codex profile's own `config.toml` carries `harness = "codex"` and one optional key of its own, `hooks_json` (below); the Claude Code keys in the next table do not apply to it.
+A codex profile's own `config.toml` carries `harness = "codex"` and two optional keys of its own, `hooks_json` and `mcp_oauth` (below); the Claude Code keys in the next table do not apply to it.
 
 ## `config.toml`
 
@@ -226,6 +226,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
+| `mcp_oauth` | bool | `false` | codex profiles only: share the MCP server logins `codex mcp login` saved in `~/.codex/.credentials.json` (used when no OS keyring answers) with that profile's shared session homes, so OAuth MCP servers keep their tools inside `clauth start` sessions. One file for all of them: a refresh in a session reaches `~/.codex`, and a first login made in a session is kept at its exit (when two sessions both make a first login before either exits, only the first to exit is kept). These are bearer credentials for every server you signed in to, readable by each opted-in profile's sessions. Log out from `~/.codex`: a `codex mcp logout` inside a session comes back in the next one. Off, neither file reaches a session home |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
@@ -333,7 +334,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit; kept while a background session's (clauth start <p> -- --bg) job names it, until claude rm <id>, or while a job store clauth reads (the global one, or the tree's own) cannot be read, or holds a job whose recorded launch flags clauth cannot read and that runs in this session's runtime tree (at clauth's cleanup of a shared session's file, also one in the profile's unsuffixed runtime/ or runtime-bg/); clauth's next stale-session cleanup (when clauth start or resume launches, the TUI opens, or the daemon or the plugin's MCP server starts) removes it after that
       spawn-settings-isolated-<sid>.json # likewise, only when the isolated tree sits under a symlinked path
     cx/                    # a codex profile (see Codex)
-      config.toml          # harness = "codex", plus hooks_json
+      config.toml          # harness = "codex", plus hooks_json / mcp_oauth
       auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture
       auth.lkg.json        # last-known-good copy of auth.json
       auth.attempt         # no-replay memo: a fingerprint of the refresh token last sent

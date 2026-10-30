@@ -64,6 +64,8 @@ Same shape, same reasons, same failure modes. Per session, keyed by the session 
 | `config.toml` | copy of the user's `~/.codex/config.toml` | copy |
 | `skills/`, `rules/`, `agents/`, `templates/`, `references/`, `AGENTS.md` | symlink to the user's | absent (isolated links nothing from the user) |
 | `hooks.json` | symlink ONLY when the profile opts in; default off | absent |
+| `.credentials.json` | HARD link to the user's MCP OAuth file ONLY when the profile opts in (`mcp_oauth`); default off | absent |
+| `mcp-oauth-locks` | symlink to the user's lock dir, with the same opt-in | absent |
 | the four sqlite DBs plus their `-wal`/`-shm` | symlink to the profile-global home | per-session |
 | `history.jsonl` | symlink to the profile-global home | per-session |
 | `sessions/`, `archived_sessions/` | symlink to the profile-global home (the store's dirs exist before the link, so codex can create through it) | per-session, discarded |
@@ -73,6 +75,7 @@ Rules that fall out of it:
 
 - the home dir name must NOT match `runtime*` or `sessions*`. Both config reconcilers walk `shared_runtime_dirs()` (`runtime.rs:762`), which filters on exactly those stems, so a codex home named `runtime-<sid>` would receive Claude Code's `settings.json`.
 - `hooks.json` is opt-in per profile because hooks execute code and the home is one clauth built.
+- `.credentials.json` (MCP OAuth) is opt-in per profile because it holds bearer credentials for every MCP server the user signed in to. It is a hard link because codex opens it `O_NOFOLLOW` for writing.
 - Windows `LinkMode::Fake` gets the same treatment claude gets: copy plus mtime mirror, and the per-session keying collapses to a shared tree there, with the same consequences already documented for claude. The `auth.json` copy converges with the store at build and at teardown: the later `last_refresh` wins, mtime where a side has no parseable stamp or both stamps are equal, and a remaining tie goes to the side that was the only possible writer at that boundary (the copy at teardown, the store at build).
 - the one teardown sync-back left is the corrupt-DB recovery copy (codex renames the linked DB aside and writes a fresh real file; the healed file is copied into the store): best-effort, never failing a completed session, matching `rescue_teardown`. Rollouts need none: they land in the store through the link.
 - `auth.json` being one physical file is what makes decision 8 hold. There is no seed step, no adopt-back watchdog, and no whitelist-diff of the home.

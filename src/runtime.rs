@@ -11776,6 +11776,10 @@ struct CodexProfileOpts {
     /// Link the operator's `~/.codex/hooks.json` into shared session homes.
     #[serde(default)]
     hooks_json: bool,
+    /// Share the operator's codex MCP OAuth logins (`~/.codex/.credentials.json`)
+    /// with shared session homes — see [`share_codex_mcp_oauth`].
+    #[serde(default)]
+    mcp_oauth: bool,
 }
 
 fn codex_profile_opts(name: &str) -> CodexProfileOpts {
@@ -11816,7 +11820,21 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   `create_dir_all` cannot pass a dangling dir link). Isolated: a real
 ///   per-session `sessions/`, discarded by design. Fake: the home IS the
 ///   global store.
+// Every caller is a unix-only test; on other targets the test build would flag it as dead code.
+#[cfg(all(test, unix))]
 fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
+    build_codex_home_with(home, name, isolation, mode, &codex_profile_opts(name))
+}
+
+/// [`build_codex_home`] with the profile's codex knobs already read, so a
+/// caller that must act on the same decision later (teardown) reads them once.
+fn build_codex_home_with(
+    home: &Path,
+    name: &str,
+    isolation: Isolation,
+    mode: LinkMode,
+    opts: &CodexProfileOpts,
+) -> Result<()> {
     let operator = home_dir()?.join(".codex");
     let global = codex_global_home(name)?;
     let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
@@ -11899,12 +11917,118 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         }
     }
 
+    // MCP OAuth logins are opt-in and best-effort — a server that cannot
+    // see them only loses its tools, never the session.
+    if isolation == Isolation::Shared
+        && mode == LinkMode::Real
+        && opts.mcp_oauth
+        && let Err(e) = share_codex_mcp_oauth(&operator, home)
+    {
+        logline!("clauth: sharing codex MCP OAuth logins failed: {e:#}");
+    }
+
     let sessions = home.join("sessions");
     if sessions.symlink_metadata().is_err() {
         crate::profile::mkdir_700(&sessions)
             .with_context(|| format!("failed to create {}", sessions.display()))?;
     }
     Ok(())
+}
+
+/// Codex's MCP OAuth file store (`rmcp-client/src/oauth.rs`), used when no OS
+/// keyring answers, and its aggregate-store lock dir (`oauth/store_lock.rs`).
+const CODEX_MCP_OAUTH_FILE: &str = ".credentials.json";
+const CODEX_MCP_OAUTH_LOCKS: &str = "mcp-oauth-locks";
+
+/// With the profile's `mcp_oauth` opt-in, a shared session sees the operator's
+/// MCP OAuth logins (`codex mcp login <server>`), which live in
+/// `~/.codex/.credentials.json` when no OS keyring answers. Without them every
+/// OAuth server answers AuthRequired and codex starts the session without its
+/// tools. Opt-in because those are bearer credentials for every server the
+/// operator signed in to: each opted-in profile's sessions can read and use them.
+///
+/// The file is a HARD link, not a symlink: codex opens it for writing with
+/// `O_NOFOLLOW`, so a symlink would fail every refresh, and its write truncates
+/// in place, so one inode keeps a rotated refresh token visible to the operator
+/// and to every sibling session. The lock dir is a symlink (codex opens files
+/// inside it), so sessions serialize on the operator's lock, not one each.
+/// No credential file is placed while the operator has no logins yet (the lock
+/// dir is still created and linked); the teardown half
+/// ([`carry_codex_mcp_oauth_back`]) keeps a first login made in a session.
+///
+/// Limits: a `codex mcp logout` inside a session unlinks only that home's name,
+/// so the login comes back in the next session — log out from `~/.codex`. And
+/// when the operator has no file yet, only one session's first login is kept:
+/// see [`carry_codex_mcp_oauth_back`].
+fn share_codex_mcp_oauth(operator: &Path, home: &Path) -> Result<()> {
+    if !operator.is_dir() {
+        return Ok(());
+    }
+    let locks = operator.join(CODEX_MCP_OAUTH_LOCKS);
+    crate::profile::mkdir_700(&locks)
+        .with_context(|| format!("failed to create {}", locks.display()))?;
+    let locks_dst = home.join(CODEX_MCP_OAUTH_LOCKS);
+    if locks_dst.symlink_metadata().is_err() {
+        link_entry(&locks, &locks_dst)?;
+    }
+    let src = operator.join(CODEX_MCP_OAUTH_FILE);
+    let dst = home.join(CODEX_MCP_OAUTH_FILE);
+    if src.is_file() && dst.symlink_metadata().is_err() {
+        std::fs::hard_link(&src, &dst).with_context(|| {
+            format!("failed to hard-link {} -> {}", dst.display(), src.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// The teardown half of [`share_codex_mcp_oauth`]: a session that made the
+/// first MCP login wrote its own `.credentials.json`; give the operator that
+/// file (as one more hard link) before the home is removed. A home whose file
+/// is not the operator's while the operator has one of its own is left alone
+/// and logged: neither side is provably newer, and the operator's stays.
+/// So when two sessions both make a first login before either ends, the first
+/// teardown's file becomes the operator's and the second's is logged and
+/// dropped with its home.
+fn carry_codex_mcp_oauth_back(operator: &Path, home: &Path) -> Result<()> {
+    let session = home.join(CODEX_MCP_OAUTH_FILE);
+    let Ok(meta) = session.symlink_metadata() else {
+        return Ok(());
+    };
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let target = operator.join(CODEX_MCP_OAUTH_FILE);
+    match target.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if operator.is_dir() {
+                std::fs::hard_link(&session, &target).with_context(|| {
+                    format!(
+                        "failed to hard-link {} -> {}",
+                        target.display(),
+                        session.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to stat {}", target.display())),
+        Ok(op_meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if (op_meta.dev(), op_meta.ino()) != (meta.dev(), meta.ino()) {
+                    logline!(
+                        "clauth: {} differs from {}; kept the operator's",
+                        session.display(),
+                        target.display()
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = op_meta;
+            Ok(())
+        }
+    }
 }
 
 /// Live codex session guard — the codex [`ProfileRuntime`]. On drop: converges
@@ -11921,6 +12045,10 @@ pub(crate) struct CodexRuntime {
     profile: String,
     isolation: Isolation,
     mode: LinkMode,
+    /// The profile's `mcp_oauth` opt-in as read when this home was built:
+    /// teardown carries a session-made MCP login back only if the session
+    /// started opted in, whatever the profile says by then.
+    mcp_oauth: bool,
     _pid_lock: File,
 }
 
@@ -11935,6 +12063,7 @@ impl CodexRuntime {
         // reads the account as idle while a session is mid-start on it.
         let _rotation_guard = RotationGuard::acquire(&owned)?;
 
+        let mut mcp_oauth = false;
         let (session, home, sessions, pid_file, pid_lock, mode) = with_state_lock(|_held| {
             crate::profile::mkdir_700(&profile_root)
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
@@ -12005,7 +12134,9 @@ impl CodexRuntime {
             }
             crate::profile::mkdir_700(&home)
                 .with_context(|| format!("failed to create {}", home.display()))?;
-            build_codex_home(&home, name, isolation, mode)?;
+            let opts = codex_profile_opts(name);
+            mcp_oauth = opts.mcp_oauth;
+            build_codex_home_with(&home, name, isolation, mode, &opts)?;
 
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
@@ -12049,6 +12180,7 @@ impl CodexRuntime {
             profile: name.to_string(),
             isolation,
             mode,
+            mcp_oauth,
             _pid_lock: pid_lock,
         })
     }
@@ -12080,6 +12212,14 @@ impl Drop for CodexRuntime {
         // profile-global home — best-effort, never failing a completed
         // session, and a no-op when the home IS the store (fake shared) or
         // the flavor keeps its state per-session (isolated).
+        if self.isolation == Isolation::Shared
+            && self.mode == LinkMode::Real
+            && self.mcp_oauth
+            && let Ok(operator) = home_dir().map(|h| h.join(".codex"))
+            && let Err(e) = carry_codex_mcp_oauth_back(&operator, &self.home)
+        {
+            logline!("clauth: carrying codex MCP OAuth logins at teardown failed: {e:#}");
+        }
         if self.isolation == Isolation::Shared
             && self.mode == LinkMode::Real
             && let Ok(global) = codex_global_home(&self.profile)
