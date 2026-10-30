@@ -224,6 +224,7 @@ struct Snap {
     haiku: String,
     fable: String,
     subagent: String,
+    advisor: String,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
@@ -369,6 +370,7 @@ impl Snap {
             haiku: String::new(),
             fable: String::new(),
             subagent: String::new(),
+            advisor: String::new(),
             env: Vec::new(),
             auto_start: false,
             usage_probe: false,
@@ -480,6 +482,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 haiku: text(&p.models.haiku),
                 fable: text(&p.models.fable),
                 subagent: text(&p.models.subagent),
+                advisor: text(&p.models.advisor),
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -1253,6 +1256,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::AdvisorModel => &snap.advisor,
         ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::UsageProbeInterval => &snap.usage_probe_interval,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
@@ -1288,6 +1292,7 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::ApiKey if snap.mint_armed => "clauth mints a client token for this profile",
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
+        ConfigRow::AdvisorModel => "server-side advisor model in this account",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
@@ -1567,6 +1572,11 @@ fn detail_row(
         ConfigRow::SubagentModel => {
             return kv_field(
                 arrow, "subagent", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::AdvisorModel => {
+            return kv_field(
+                arrow, "advisor", input, editing, selected, false, false, width,
             );
         }
         // A custom env entry: its key is the label; mask the value when the key

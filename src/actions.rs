@@ -3314,6 +3314,7 @@ fn trimmed_models(models: ModelSettings) -> ModelSettings {
         haiku: trim(models.haiku),
         fable: trim(models.fable),
         subagent: trim(models.subagent),
+        advisor: trim(models.advisor),
     }
 }
 

@@ -10982,6 +10982,7 @@ fn a_launch_transport_serializes_to_a_stable_row_format() {
         haiku: Some("model-haiku".into()),
         fable: Some("model-fable".into()),
         subagent: Some("model-subagent".into()),
+        advisor: Some("model-advisor".into()),
     };
     let value = serde_json::to_value(LaunchTransport::of(&modeled)).expect("serialize");
     assert_eq!(
@@ -10993,6 +10994,7 @@ fn a_launch_transport_serializes_to_a_stable_row_format() {
             "haiku": "model-haiku",
             "fable": "model-fable",
             "subagent": "model-subagent",
+            "advisor": "model-advisor",
         })
     );
     let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");

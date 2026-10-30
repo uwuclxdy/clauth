@@ -24,10 +24,10 @@
 //!   would be undone on every start.
 //! - `~/.claude/settings.json` is NOT a pristine operator base.
 //!   `claude::apply_profile_to_claude_settings` rewrites the ACTIVE profile's
-//!   managed env keys, `apiKeyHelper`, and `model` into that very file on every
-//!   switch. It is a member carrying its own per-profile fields, so those must
-//!   neither propagate outward nor be overwritten by a sibling's — which the
-//!   symmetric [`key_role`] rule gives for free.
+//!   managed env keys, `apiKeyHelper`, `model`, and `advisorModel` into that
+//!   very file on every switch. It is a member carrying its own per-profile
+//!   fields, so those must neither propagate outward nor be overwritten by a
+//!   sibling's — which the symmetric [`key_role`] rule gives for free.
 //!
 //! With no live `clauth start` session there is nothing to reconcile and nothing
 //! to lose: teardown discards each session's runtime tree, so the base is the
@@ -78,6 +78,7 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "forceLoginGatewayUrl",
     "forceLoginOrgUUID",
     "model",
+    "advisorModel",
 ];
 
 /// The stat snapshot from the last [`sync_once`] that did work; the key for
@@ -108,8 +109,8 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// The set has two halves:
 /// - top level ([`PER_PROFILE_TOP_FIELDS`]): `apiKeyHelper` names the profile
 ///   whose `config.toml` holds the raw key, so propagating that one string hands
-///   one account's key to another without any `env` entry moving; `model` is
-///   routing.
+///   one account's key to another without any `env` entry moving; `model` and
+///   `advisorModel` are routing.
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
 ///   every key any profile declares in its own `config.toml` `[env]`.

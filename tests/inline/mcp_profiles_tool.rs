@@ -1900,3 +1900,33 @@ fn a_launcher_exited_bg_job_and_a_held_row_render_two_live_sessions() {
          supervisorless tree's job do not",
     );
 }
+
+/// The advisor row is a bind like any other: a named account that sets it
+/// shows `advisor -> <id>` after its tier binds.
+#[test]
+fn a_named_accounts_advisor_row_prints_among_its_binds() {
+    let _home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    vendor.models.advisor = Some("opus".to_string());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: opus -> \
+             deepseek-v4-pro, advisor -> opus; no api key"
+        ],
+    );
+}

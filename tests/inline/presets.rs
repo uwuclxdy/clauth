@@ -33,6 +33,7 @@ fn binds(opus: &str, sonnet: &str, haiku: &str, fable: &str) -> ModelSettings {
         haiku: Some(haiku.to_string()),
         fable: Some(fable.to_string()),
         subagent: None,
+        advisor: None,
     }
 }
 
@@ -412,6 +413,7 @@ fn the_retired_qwen_ids_are_offered_the_qwen_cloud_binds() {
         haiku: Some(id.to_string()),
         fable: Some(id.to_string()),
         subagent: Some(id.to_string()),
+        advisor: None,
     };
     let own = ModelSettings {
         opus: Some("qwen3.8-max[1m]".to_string()),
@@ -706,6 +708,7 @@ fn every_field(tag: &str) -> ModelSettings {
         haiku: Some(format!("{tag}-haiku")),
         fable: Some(format!("{tag}-fable")),
         subagent: Some(format!("{tag}-subagent")),
+        advisor: Some(format!("{tag}-advisor")),
     }
 }
 
@@ -748,7 +751,72 @@ fn a_preset_applies_and_clears_each_field_by_its_own_row() {
                 haiku: Some("t-haiku".to_string()),
                 fable: Some("t-fable".to_string()),
                 subagent: Some("t-subagent".to_string()),
+                advisor: Some("t-advisor".to_string()),
             }
         )
     );
+}
+
+#[test]
+fn the_advisor_is_a_model_row_no_built_in_binds() {
+    assert!(super::MODEL_ROWS.contains(&"advisor"));
+    for builtin in super::BUILTINS {
+        assert!(
+            builtin.binds.models().advisor.is_none(),
+            "{} must leave the advisor unset",
+            builtin.name
+        );
+    }
+}
+
+/// A custom advisor id on a built-in's endpoint is never an offered move: the
+/// built-in leaves the row unset, and an account's own id is only ever replaced
+/// when it is a former id of that built-in.
+#[test]
+fn an_advisor_id_on_a_built_in_endpoint_gets_no_rebind_move() {
+    let ds = super::BUILTINS
+        .iter()
+        .find(|b| b.name == "DeepSeek")
+        .expect("DeepSeek built-in");
+    let mut held = ds.binds.models();
+    held.advisor = Some("my-id".to_string());
+    let config = config_with(vec![account("ds", ds.base_url, held)]);
+    assert!(
+        rebind_offers(&config).is_empty(),
+        "nothing to offer: every bound row is current and the advisor is the account's own"
+    );
+}
+
+#[test]
+fn apply_diff_and_applied_to_carry_the_advisor_row() {
+    let preset = super::Preset {
+        name: "p".to_string(),
+        base_url: None,
+        models: ModelSettings::default(),
+        builtin: false,
+    };
+    let held = ModelSettings {
+        advisor: Some("opus".to_string()),
+        ..ModelSettings::default()
+    };
+    let (replaces, leaves) = preset.apply_diff(None, &held);
+    assert!(replaces.is_empty());
+    assert_eq!(leaves, vec!["advisor"]);
+
+    let (_, kept) = preset.applied_to(&None, &held, super::Leftover::Keep);
+    assert_eq!(kept.advisor.as_deref(), Some("opus"));
+    let (_, cleared) = preset.applied_to(&None, &held, super::Leftover::Clear);
+    assert_eq!(cleared.advisor, None);
+
+    let setting = super::Preset {
+        models: ModelSettings {
+            advisor: Some("sonnet".to_string()),
+            ..ModelSettings::default()
+        },
+        ..preset
+    };
+    let (replaces, _) = setting.apply_diff(None, &held);
+    assert_eq!(replaces, vec!["advisor"]);
+    let (_, replaced) = setting.applied_to(&None, &held, super::Leftover::Keep);
+    assert_eq!(replaced.advisor.as_deref(), Some("sonnet"));
 }
