@@ -4,7 +4,7 @@ name: ci
 # include_str!s it), so it is re-included; later patterns win.
 on:
   push:
-    branches: [mommy, dev]
+    branches: [mommy, dev, "dev-*"]
     paths:
       - "**"
       - "!**/*.md"
@@ -95,7 +95,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y mold
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
-      # Only mommy saves: a dev or PR run restores mommy's cache, and saving its
+      # Only mommy saves: a dev, dev-* or PR run restores mommy's cache, and saving its
       # own would store a second copy of every cold compile against the repo's
       # cache quota.
       - uses: Swatinem/rust-cache@v2
