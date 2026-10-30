@@ -6485,7 +6485,7 @@ fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
         &config,
         crate::runtime::Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );

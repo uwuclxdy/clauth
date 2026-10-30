@@ -1624,3 +1624,115 @@ fn hook_command_names_the_installed_binary_and_fails_open() {
         "'/opt/clauth bin/clauth' hook-read-exempt || true"
     );
 }
+
+// ── last_advisor_arg ─────────────────────────────────────────────────────────
+
+fn advisor_of(args: &[&str]) -> Option<String> {
+    last_advisor_arg(&strings(args))
+}
+
+/// The last non-blank `--advisor` value, read off the same walk that folds
+/// `--settings` out, so it follows claude's own argv reading.
+#[test]
+fn last_advisor_arg_reads_both_spellings_and_the_last_one_wins() {
+    assert_eq!(advisor_of(&[]), None);
+    assert_eq!(advisor_of(&["--advisor", "opus"]).as_deref(), Some("opus"));
+    assert_eq!(advisor_of(&["--advisor=opus"]).as_deref(), Some("opus"));
+    assert_eq!(
+        advisor_of(&["--advisor", "haiku", "-p", "--advisor=opus"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--advisor=haiku", "--advisor", "opus"]).as_deref(),
+        Some("opus")
+    );
+    // A model id with a context suffix or a path-like id is taken whole.
+    assert_eq!(
+        advisor_of(&["--advisor", "claude-opus-5-5[1m]"]).as_deref(),
+        Some("claude-opus-5-5[1m]")
+    );
+}
+
+#[test]
+fn last_advisor_arg_ignores_a_blank_value_without_clearing_an_earlier_one() {
+    assert_eq!(advisor_of(&["--advisor", ""]), None);
+    assert_eq!(advisor_of(&["--advisor", "  "]), None);
+    assert_eq!(advisor_of(&["--advisor="]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor", ""]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor="]).as_deref(),
+        Some("opus")
+    );
+}
+
+#[test]
+fn last_advisor_arg_trims_the_value() {
+    assert_eq!(advisor_of(&["--advisor", " opus"]).as_deref(), Some("opus"));
+    assert_eq!(advisor_of(&["--advisor=opus "]).as_deref(), Some("opus"));
+    assert_eq!(
+        advisor_of(&["--advisor", "\topus\n", "--advisor", "  "]).as_deref(),
+        Some("opus"),
+        "a blank later value still leaves the trimmed earlier one"
+    );
+}
+
+#[test]
+fn last_advisor_arg_follows_claudes_value_eating_and_separator_rules() {
+    // `--name` and `--model` take the next word whatever it holds, so an
+    // `--advisor` there is their value, not a flag.
+    assert_eq!(advisor_of(&["--name", "--advisor", "opus"]), None);
+    assert_eq!(advisor_of(&["--model", "--advisor", "opus"]), None);
+    assert_eq!(
+        advisor_of(&["--name", "--advisor", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "the second `--advisor` is a flag again"
+    );
+    // A short value-taking cluster and an optional-value flag follow the walk.
+    assert_eq!(
+        advisor_of(&["-pn", "--advisor", "--advisor", "opus"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--resume", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "an optional-value flag never takes a `-`-led word"
+    );
+    // A trailing flag has no value to take.
+    assert_eq!(advisor_of(&["--advisor"]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor"]).as_deref(),
+        Some("opus")
+    );
+    // The first flag-position `--` ends option parsing; a value the separator
+    // is taken as is not a separator.
+    assert_eq!(advisor_of(&["--", "--advisor", "opus"]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--", "--advisor", "haiku"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--name", "--", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "a `--` taken as a value is not the separator"
+    );
+    // The prompt is positional: a word after it that spells the flag is not one.
+    assert_eq!(advisor_of(&["-p", "hello", "--", "--advisor=opus"]), None);
+}
+
+/// A bare `--settings` claude refuses reads no advisor; the fold still strips a
+/// `--settings` flag without touching `--advisor` in the clean args.
+#[test]
+fn the_advisor_flag_stays_in_the_clean_args_and_rides_beside_settings() {
+    let args = strings(&["--advisor", "opus", "--settings", "{}", "--advisor=haiku"]);
+    let (settings, clean) = fold_settings_args(&args).expect("folds");
+    assert_eq!(settings.as_deref(), Some("{}"));
+    assert_eq!(clean, strings(&["--advisor", "opus", "--advisor=haiku"]));
+    assert_eq!(last_advisor_arg(&args).as_deref(), Some("haiku"));
+    assert_eq!(
+        last_advisor_arg(&strings(&["--advisor", "opus", "--settings"])),
+        None
+    );
+}

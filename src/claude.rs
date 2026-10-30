@@ -5053,18 +5053,24 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
 /// chain (a higher settings source's list replaces them: an absent key reads
 /// `None`, an empty or non-array value reads `Some(vec![])`, i.e. no fallback),
 /// and `env.CLAUDE_CODE_SUBAGENT_MODEL` joins the demand whatever the headline;
-/// the top-level `agent` names the session's agent, the settings-tier leg of
-/// the agent chain. The four `ANTHROPIC_DEFAULT_*_MODEL` keys carry the
-/// `[models]` alias remap, read here so the remap resolves what the child
-/// actually sees. Read off the SAME overlay `build_claude_settings_json`
-/// writes, so the two cannot drift on the builder or base choice.
+/// the top-level `advisorModel` names the server-side advisor's model, which
+/// joins the fallback side too, unless `env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL`
+/// turns the advisor off; the top-level `agent` names the session's agent, the
+/// settings-tier leg of the agent chain. The four `ANTHROPIC_DEFAULT_*_MODEL`
+/// keys carry the `[models]` alias remap, read here so the remap resolves what
+/// the child actually sees. Read off the SAME overlay
+/// `build_claude_settings_json` writes, so the two cannot drift on the builder
+/// or base choice.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeModelSources {
     pub(crate) model: Option<String>,
     pub(crate) agent: Option<String>,
     pub(crate) fallbacks: Option<Vec<String>>,
+    /// The top-level `advisorModel`, trimmed; a blank value reads `None`.
+    pub(crate) advisor: Option<String>,
     pub(crate) env_anthropic: Option<String>,
     pub(crate) env_subagent: Option<String>,
+    pub(crate) env_disable_advisor: Option<String>,
     pub(crate) env_opus: Option<String>,
     pub(crate) env_sonnet: Option<String>,
     pub(crate) env_haiku: Option<String>,
@@ -5080,6 +5086,7 @@ impl RuntimeModelSources {
         match key {
             "ANTHROPIC_MODEL" => self.env_anthropic.clone(),
             "CLAUDE_CODE_SUBAGENT_MODEL" => self.env_subagent.clone(),
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" => self.env_disable_advisor.clone(),
             "ANTHROPIC_DEFAULT_OPUS_MODEL" => self.env_opus.clone(),
             "ANTHROPIC_DEFAULT_SONNET_MODEL" => self.env_sonnet.clone(),
             "ANTHROPIC_DEFAULT_HAIKU_MODEL" => self.env_haiku.clone(),
@@ -5090,9 +5097,10 @@ impl RuntimeModelSources {
 }
 
 /// The model slots a settings object carries, read off the keys Claude Code
-/// itself reads: top-level `model`, `agent`, `fallbackModel`, and the model
-/// `env` keys. Shared by the overlay reader, the project settings tiers and the
-/// `--settings` passthrough tier, so the three fold the same keys.
+/// itself reads: top-level `model`, `agent`, `fallbackModel`, `advisorModel`,
+/// and the model `env` keys plus the advisor kill switch. Shared by the overlay
+/// reader, the project settings tiers and the `--settings` passthrough tier, so
+/// the three fold the same keys.
 pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeModelSources {
     let env = |key: &str| settings["env"][key].as_str().map(str::to_owned);
     RuntimeModelSources {
@@ -5112,8 +5120,14 @@ pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeMo
                 })
                 .unwrap_or_default()
         }),
+        advisor: settings["advisorModel"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         env_anthropic: env("ANTHROPIC_MODEL"),
         env_subagent: env("CLAUDE_CODE_SUBAGENT_MODEL"),
+        env_disable_advisor: env("CLAUDE_CODE_DISABLE_ADVISOR_TOOL"),
         env_opus: env("ANTHROPIC_DEFAULT_OPUS_MODEL"),
         env_sonnet: env("ANTHROPIC_DEFAULT_SONNET_MODEL"),
         env_haiku: env("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
