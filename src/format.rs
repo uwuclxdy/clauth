@@ -817,8 +817,9 @@ pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
 /// never stored one reaches this state too (a working api key does not
 /// authenticate the usage gateway), and telling that operator something expired
 /// sends them hunting for what to renew instead of to the login they have not
-/// run. A non-Alibaba profile has no session at all, so its verdict can only
-/// mean the api key itself was rejected.
+/// run. Past a refused setup token and a captured console, a non-Alibaba
+/// profile has no session at all, so its verdict can only mean the api key
+/// itself was rejected.
 pub(crate) fn auth_expired_label(profile: &Profile) -> &'static str {
     if crate::usage::dead_login_is_setup_token(profile) {
         DIAG_TOKEN_REJECTED
