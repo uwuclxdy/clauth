@@ -254,6 +254,39 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     assert_eq!(read_json(&p2)["theme"], json!("dark"));
 }
 
+/// `advisorModel` is a model choice written per account (`[models] advisor`), so
+/// a sibling's value must never reach another member: not the base, not a
+/// runtime copy, and not the other way round.
+#[test]
+fn advisor_model_stays_exactly_where_it_was() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    let p2 = runtime_path(home.home(), "p2");
+    write_json(&base, &json!({"advisorModel": "opus", "env": {}}), t(1));
+    write_json(
+        &p1,
+        &json!({"advisorModel": "sonnet", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    // p2 has no advisor row, so its runtime copy carries no `advisorModel`.
+    write_json(&p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    assert_eq!(read_json(&base)["advisorModel"], json!("opus"));
+    assert_eq!(read_json(&p1)["advisorModel"], json!("sonnet"));
+    assert!(
+        read_json(&p2).get("advisorModel").is_none(),
+        "p2 received a sibling's advisor, turning its advisor on"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "precondition: this sync did rewrite p2"
+    );
+}
+
 #[test]
 fn unparseable_member_is_skipped_not_clobbered() {
     let home = HomeSandbox::new();
@@ -476,6 +509,7 @@ fn every_credential_minting_top_level_key_is_per_profile() {
         "forceLoginGatewayUrl",
         "forceLoginOrgUUID",
         "model",
+        "advisorModel",
     ] {
         assert_eq!(
             key_role(KeyPath::Top(key), &custom_env),

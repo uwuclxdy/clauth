@@ -1659,7 +1659,8 @@ impl AppConfig {
 /// Per-account model knobs written into the profile's Claude Code `settings.json`.
 /// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
-/// `CLAUDE_CODE_SUBAGENT_MODEL`.
+/// `CLAUDE_CODE_SUBAGENT_MODEL`; `advisor` is the top-level `advisorModel`
+/// setting, the model Claude Code's server-side advisor tool runs on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1674,6 +1675,8 @@ pub(crate) struct ModelSettings {
     pub(crate) fable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subagent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) advisor: Option<String>,
 }
 
 impl ModelSettings {
@@ -1684,10 +1687,11 @@ impl ModelSettings {
             && self.haiku.is_none()
             && self.fable.is_none()
             && self.subagent.is_none()
+            && self.advisor.is_none()
     }
 
     /// The stored id for a row named by its settings key (`default`, `opus`,
-    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    /// `sonnet`, `haiku`, `fable`, `subagent`, `advisor`). `None` outside that set.
     pub(crate) fn field(&self, row: &str) -> Option<&String> {
         match row {
             "default" => self.default.as_ref(),
@@ -1696,6 +1700,7 @@ impl ModelSettings {
             "haiku" => self.haiku.as_ref(),
             "fable" => self.fable.as_ref(),
             "subagent" => self.subagent.as_ref(),
+            "advisor" => self.advisor.as_ref(),
             _ => None,
         }
     }
@@ -1709,6 +1714,7 @@ impl ModelSettings {
             "haiku" => self.haiku = value,
             "fable" => self.fable = value,
             "subagent" => self.subagent = value,
+            "advisor" => self.advisor = value,
             _ => {}
         }
     }
@@ -5165,7 +5171,8 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
     out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
     out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
-    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n");
+    out.push_str("# server-side advisor model (the `advisorModel` setting).\n");
     let m = &profile.models;
     let scalars = [
         ("default", &m.default),
@@ -5174,6 +5181,7 @@ fn render_config_toml(profile: &Profile) -> String {
         ("haiku", &m.haiku),
         ("fable", &m.fable),
         ("subagent", &m.subagent),
+        ("advisor", &m.advisor),
     ];
     if scalars.iter().all(|(_, v)| v.is_none()) {
         out.push_str("# [models]\n");

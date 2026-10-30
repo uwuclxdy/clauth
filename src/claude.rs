@@ -5412,6 +5412,18 @@ pub(crate) fn build_claude_settings_json(
             obj.remove("model");
         }
     }
+    // `advisorModel` is clauth-owned the same way `model` is: set when the
+    // profile has an `advisor` row, removed when it has none, so a profile
+    // without the row runs with the advisor off instead of inheriting the
+    // previous profile's (or a hand-set global) value.
+    match profile.models.advisor.as_deref() {
+        Some(model) => {
+            obj.insert("advisorModel".into(), model.into());
+        }
+        None => {
+            obj.remove("advisorModel");
+        }
+    }
 
     // An api-key profile mints its key via CC's top-level `apiKeyHelper`
     // instead of `env.ANTHROPIC_AUTH_TOKEN` (cleared above). The key then

@@ -37,7 +37,7 @@ pub(crate) enum Leftover {
 fn block_rows<'a>(
     base_url: Option<&'a str>,
     m: &'a ModelSettings,
-) -> [(&'static str, Option<&'a str>); 7] {
+) -> [(&'static str, Option<&'a str>); 8] {
     [
         ("base url", base_url),
         ("model", m.default.as_deref()),
@@ -46,6 +46,7 @@ fn block_rows<'a>(
         ("sonnet", m.sonnet.as_deref()),
         ("haiku", m.haiku.as_deref()),
         ("subagent", m.subagent.as_deref()),
+        ("advisor", m.advisor.as_deref()),
     ]
 }
 
@@ -94,6 +95,7 @@ impl Preset {
                 haiku: pick(&m.haiku, &models.haiku),
                 fable: pick(&m.fable, &models.fable),
                 subagent: pick(&m.subagent, &models.subagent),
+                advisor: pick(&m.advisor, &models.advisor),
             },
         )
     }
@@ -124,9 +126,11 @@ struct Builtin {
 /// How a built-in fills the account's model block: one id per Claude tier.
 /// `default` becomes the `opus` alias, so the main model follows the opus bind
 /// and a model release touches tier rows only; `subagent` stays unset, so a
-/// subagent's own tier pick resolves through that tier's bind. A `[1m]` suffix
-/// makes Claude Code size the context window at 1M, so it rides only an id
-/// whose endpoint takes that much.
+/// subagent's own tier pick resolves through that tier's bind; `advisor` stays
+/// unset too, since an advisor is an opt-in second model that no endpoint's
+/// bind should switch on for an account. A `[1m]` suffix makes Claude Code
+/// size the context window at 1M, so it rides only an id whose endpoint takes
+/// that much.
 struct Binds {
     opus: &'static str,
     sonnet: &'static str,
@@ -144,6 +148,7 @@ impl Binds {
             haiku: id(self.haiku),
             fable: id(self.fable),
             subagent: None,
+            advisor: None,
         }
     }
 }
@@ -375,9 +380,11 @@ pub(crate) fn delete_preset(name: &str) -> Result<()> {
 // ── Re-bind offer engine ──────────────────────────────────────────────────────
 
 /// The model rows the offer walks, in render order (`default` is the account's
-/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row).
-pub(crate) const MODEL_ROWS: [&str; 6] =
-    ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row; `advisor`
+/// the `advisorModel` setting).
+pub(crate) const MODEL_ROWS: [&str; 7] = [
+    "default", "opus", "sonnet", "haiku", "fable", "subagent", "advisor",
+];
 
 /// The `(unset)` marker for a row with no stored id, on both the old and the
 /// new side.
@@ -515,6 +522,12 @@ fn digest_of_builtins(builtins: &[Builtin]) -> String {
         hasher.update([0u8]);
         let binds = builtin.binds.models();
         for row in MODEL_ROWS {
+            // A row no built-in binds must not move the digest: `advisor` is
+            // one, and folding it in would change the shipped digest and
+            // reopen the rebind confirm for every account that dismissed it.
+            if row == "advisor" && binds.field(row).is_none() {
+                continue;
+            }
             hasher.update(row.as_bytes());
             hasher.update([0u8]);
             if let Some(value) = binds.field(row) {

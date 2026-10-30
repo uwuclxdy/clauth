@@ -233,6 +233,7 @@ fn model_binds_row(p: &Profile) -> Option<serde_json::Value> {
         ("haiku", &p.models.haiku),
         ("fable", &p.models.fable),
         ("subagent", &p.models.subagent),
+        ("advisor", &p.models.advisor),
     ] {
         if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
             binds.insert(tier.to_string(), serde_json::json!(id));

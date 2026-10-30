@@ -440,6 +440,7 @@ fn build_settings_writes_model_knobs() {
         haiku: None,
         fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
+        advisor: Some("opus".to_string()),
     };
     let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
@@ -454,6 +455,62 @@ fn build_settings_writes_model_knobs() {
         v["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none(),
         "an unset tier override writes no env key",
     );
+    assert_eq!(
+        v["advisorModel"], "opus",
+        "the advisor row → top-level `advisorModel`, as `default` → `model`"
+    );
+    assert!(
+        v["env"]
+            .as_object()
+            .expect("env object")
+            .keys()
+            .all(|k| !k.to_ascii_lowercase().contains("advisor")),
+        "the advisor is a settings key, never an env key",
+    );
+}
+
+/// A row-less profile removes `advisorModel` from the base, the way it removes
+/// `model`: the advisor is clauth-owned, so a profile without the row runs with
+/// it off instead of inheriting a hand-set or earlier profile's value. This is
+/// the one place a global `advisorModel` is dropped on a switch or start.
+#[test]
+fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    fs::write(
+        &base,
+        r#"{"advisorModel":"opus","permissions":{"allow":["Bash"]}}"#,
+    )
+    .expect("seed base settings");
+    let profile = crate::profile::Profile::new("p".to_string(), None, None);
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert!(v.get("advisorModel").is_none(), "no row → no advisorModel");
+    assert_eq!(
+        v["permissions"]["allow"][0], "Bash",
+        "other top-level keys survive"
+    );
+
+    // With the row set, the base value is replaced rather than kept.
+    let mut with_row = crate::profile::Profile::new("p".to_string(), None, None);
+    with_row.models.advisor = Some("claude-opus-5-5".to_string());
+    let json = build_claude_settings_json(Some(&base), &with_row, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert_eq!(v["advisorModel"], "claude-opus-5-5");
+}
+
+/// The advisor row alone is a non-empty model block, so a profile that sets
+/// nothing else still gets its settings written.
+#[test]
+fn an_advisor_row_alone_is_enough_to_write_settings() {
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.models.advisor = Some("opus".to_string());
+    assert!(!profile.models.is_empty());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert_eq!(v["advisorModel"], "opus");
 }
 
 /// `ModelSettings::is_empty` is the gate that decides whether a profile with no
