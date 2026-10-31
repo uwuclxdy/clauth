@@ -48,7 +48,6 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1436,16 +1435,43 @@ fn line_model(msg: &TranscriptMsg) -> String {
 /// classifying + correcting the per-model usage shapes (see
 /// [`apply_usage_shapes`]). The cutoff/today split happens later in
 /// [`merge_topup`], so an advancing `last_computed_date` never forces a
-/// re-read. Silently skips parse errors.
+/// re-read. Silently skips parse errors and failed line reads; the read ends
+/// after [`MAX_CONSECUTIVE_READ_ERRORS`] failed reads in a row.
 fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
     let reader = std::io::BufReader::new(file);
+    let mut out = collapse_streamed_turns(parse_lines(reader));
+    for rec in &mut out {
+        if rec.has_usage && is_placeholder_model(&rec.model) {
+            rec.has_usage = false;
+        }
+    }
+    apply_usage_shapes(&mut out);
+    out
+}
+
+/// Failed reads in a row that end the line loop: a read error that never
+/// clears (a `.jsonl` path symlinked to a directory, say) would otherwise spin
+/// it forever.
+const MAX_CONSECUTIVE_READ_ERRORS: usize = 3;
+
+/// Parse one transcript's lines into per-line contribution records: the line
+/// loop behind [`parse_file`]. An unparseable or non-message line is skipped.
+fn parse_lines(reader: impl std::io::BufRead) -> Vec<LineRec> {
     let mut out = Vec::new();
+    let mut consecutive_read_errors = 0usize;
     for line in reader.lines() {
-        let Ok(line) = line else { continue };
+        let Ok(line) = line else {
+            consecutive_read_errors += 1;
+            if consecutive_read_errors >= MAX_CONSECUTIVE_READ_ERRORS {
+                break;
+            }
+            continue;
+        };
+        consecutive_read_errors = 0;
         let parsed: TranscriptLine = match serde_json::from_str(&line) {
             Ok(p) => p,
             Err(_) => continue,
@@ -1535,13 +1561,6 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             tool_calls,
         });
     }
-    let mut out = collapse_streamed_turns(out);
-    for rec in &mut out {
-        if rec.has_usage && is_placeholder_model(&rec.model) {
-            rec.has_usage = false;
-        }
-    }
-    apply_usage_shapes(&mut out);
     out
 }
 

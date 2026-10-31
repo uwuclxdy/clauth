@@ -288,6 +288,242 @@ fn transcript_usage_without_a_model_keeps_unknown_bucket() {
     assert_eq!((records[0].input, records[0].output), (3, 1));
 }
 
+/// A read error that never clears (a `.jsonl` that is really a directory) ends
+/// the parse instead of looping forever. The read runs on a thread behind a
+/// bounded wait, so the loop fails by assertion instead of hanging the suite;
+/// `std` cannot cancel that thread, so a red leaves it spinning until the test
+/// process exits.
+#[cfg(unix)]
+#[test]
+fn a_persistent_read_error_ends_parse_file() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let target = dir.join("not-a-file-dir");
+    std::fs::create_dir_all(&target).expect("create target directory");
+    let path = dir.join("dir.jsonl");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink transcript to a directory");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_path = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_file(&thread_path));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_file did not return within 10s: a persistent read error never ends the line loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a directory read yields no records, got {}",
+        recs.len()
+    );
+}
+
+/// One failed read is still skipped: a line that is not valid UTF-8 between two
+/// good lines drops only itself, so both good lines count.
+#[test]
+fn a_bad_utf8_line_between_two_good_lines_drops_only_itself() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let path = dir.join("mixed.jsonl");
+    let good_a = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let good_b = r#"{"timestamp":"2026-06-11T13:00:00+00:00","message":{"id":"b","usage":{"input_tokens":5,"output_tokens":2}}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(good_a.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&[0xff, 0xfe, b'x', b'\n']);
+    bytes.extend_from_slice(good_b.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).expect("write transcript");
+
+    let recs = parse_file(&path);
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(tokens, vec![(3, 1), (5, 2)]);
+}
+
+/// A `BufRead` whose reads follow a script: each read yields either one line
+/// or an error. Once the script runs out, the last step repeats, so a trailing
+/// `Fail` is a read error that never clears.
+enum ReadStep {
+    Line(&'static str),
+    Fail,
+}
+
+struct ScriptedReader {
+    steps: Vec<ReadStep>,
+    next: usize,
+    served: Vec<u8>,
+    consumed: usize,
+    reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScriptedReader {
+    fn new(steps: Vec<ReadStep>, reads: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            steps,
+            next: 0,
+            served: Vec::new(),
+            consumed: 0,
+            reads,
+        }
+    }
+}
+
+impl std::io::Read for ScriptedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = std::io::BufRead::fill_buf(self)?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        std::io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for ScriptedReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.consumed < self.served.len() {
+            return Ok(&self.served[self.consumed..]);
+        }
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let line = match &self.steps[self.next] {
+            ReadStep::Line(line) => Some(*line),
+            ReadStep::Fail => None,
+        };
+        if self.next + 1 < self.steps.len() {
+            self.next += 1;
+        }
+        match line {
+            Some(line) => {
+                // A newline-terminated read is what `read_until` needs to
+                // return the line before the next read's error arrives; a
+                // line without one reads as a partial line that the error
+                // discards, unlike any real transcript file.
+                self.served = format!("{line}\n").into_bytes();
+                self.consumed = 0;
+                Ok(&self.served)
+            }
+            None => Err(std::io::Error::other("scripted read failure")),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.consumed = (self.consumed + amt).min(self.served.len());
+    }
+}
+
+/// A reader that fails every read ends the parse after exactly three read
+/// attempts. The outcome alone (an empty list) cannot tell a capped loop from
+/// an early exit, so the read count is pinned too. The bounded wait turns a
+/// regression into a failed assertion instead of a hung suite.
+#[test]
+fn parse_lines_stops_after_three_consecutive_failed_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(vec![ReadStep::Fail], std::sync::Arc::clone(&reads));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: a reader that fails every read never ends the loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a reader that never yields a line parses no records, got {}",
+        recs.len()
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the loop must stop after the third failed read in a row"
+    );
+}
+
+/// Two failed reads, then a good line, then failed reads that never clear: the
+/// good line still counts, and the second run of failures stops the loop after
+/// three. Pins the failure counter's reset on the good read (6 reads, not 4)
+/// and the skip of a failed read (the good line survives two failures).
+#[test]
+fn parse_lines_counts_a_good_line_between_failed_read_runs() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads after a good line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "the good line between two failed-read runs still counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        6,
+        "2 failed reads + 1 good read + 3 failed reads, then the loop stops"
+    );
+}
+
+/// A successful read resets the failure count even when its line records
+/// nothing: two failed reads, an unparseable line, two failed reads, a good
+/// line, then failed reads that never clear. The good line counts and the loop
+/// stops after 9 reads; a count reset only on a recorded line stops at the
+/// fourth read instead.
+#[test]
+fn parse_lines_resets_the_failure_count_on_an_unparseable_line() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line("not json"),
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads around an unparseable line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "an unparseable line resets the failure count, so the later good line counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "2 failed + 1 unparseable + 2 failed + 1 good + 3 failed reads, then the loop stops"
+    );
+}
+
 // ── 1. base stats parsing ─────────────────────────────────────────────────────
 
 #[test]
