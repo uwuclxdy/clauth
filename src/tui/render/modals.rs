@@ -582,16 +582,22 @@ fn draw_modal_scrolled(
         })
         .collect();
     let total = lines.len();
-    // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
-    // line (an `Acknowledge` confirm's ` close `) renders as one row — reserve
-    // only what the branch below actually draws.
-    let button_rows = match &tail.extra {
-        Some(ModalExtra::Buttons(buttons))
-            if buttons.width() > inner_w && buttons.spans.len() >= 3 =>
-        {
-            3
+    // A button row wider than the modal's inner width stacks one button per
+    // row: a `Span`-joined line has no widget that wraps at its gaps, and a
+    // clipped row loses a whole button. A one-button line (an `Acknowledge`
+    // confirm's ` close `) has nothing to stack and still renders as one row.
+    // Reserve the rows the branch below actually draws: one per button plus
+    // the spacer row every modal keeps above its buttons.
+    let button_groups = match &tail.extra {
+        Some(ModalExtra::Buttons(buttons)) if buttons.width() > inner_w => {
+            let groups = button_stack_lines(buttons);
+            (groups.len() > 1).then_some(groups)
         }
-        Some(ModalExtra::Buttons(_)) => 2,
+        _ => None,
+    };
+    let button_rows = match (&tail.extra, &button_groups) {
+        (Some(ModalExtra::Buttons(_)), Some(groups)) => groups.len() as u16 + 1,
+        (Some(ModalExtra::Buttons(_)), None) => 2,
         _ => 0,
     };
     let h = (lines.len() as u16 + 4 + button_rows).min(area.height.saturating_sub(4));
@@ -628,39 +634,42 @@ fn draw_modal_scrolled(
     };
     draw_scrolled_lines(frame, body, lines, (scroll, scroll + viewport), None);
     if let Some(ModalExtra::Buttons(buttons)) = &tail.extra {
+        // Rows the buttons may fill: the rect minus its top border, its top
+        // padding row and its bottom border, so the bottom padding row is the
+        // last row the border encloses. A terminal too short for the reserved
+        // rows keeps only those, pinned to the modal's bottom, so a tighter
+        // terminal cuts the rows above instead of drawing over the border.
+        let last_inside = rect.height.saturating_sub(3);
         let button_area = Rect {
             y: inner.y + inner.height.saturating_sub(button_rows.saturating_sub(1)),
             height: button_rows.saturating_sub(1),
             ..inner
         };
-        if buttons.width() > inner_w {
-            match &buttons.spans[..] {
-                // No button widget can stack the choice while keeping each
-                // complete on a narrow screen: the cancel/affirmative pair
-                // stacks into two rows.
-                [cancel, _, add] => {
+        match &button_groups {
+            Some(groups) => {
+                let first = groups.len().saturating_sub(last_inside as usize);
+                for (i, group) in groups.iter().enumerate().skip(first) {
                     frame.render_widget(
-                        Paragraph::new(Line::from(cancel.clone()).alignment(Alignment::Right)),
+                        Paragraph::new(group.clone()),
                         Rect {
-                            height: 1,
-                            ..button_area
-                        },
-                    );
-                    frame.render_widget(
-                        Paragraph::new(Line::from(add.clone()).alignment(Alignment::Right)),
-                        Rect {
-                            y: button_area.y + 1,
+                            y: button_area.y + (i - first) as u16,
                             height: 1,
                             ..button_area
                         },
                     );
                 }
-                // A one-span line (an `Acknowledge` confirm's ` close `) has no
-                // pair to stack; render it as a plain right-aligned paragraph.
-                _ => frame.render_widget(Paragraph::new(buttons.clone()), button_area),
             }
-        } else {
-            frame.render_widget(Paragraph::new(buttons.clone()), button_area);
+            None => {
+                let height = button_area.height.min(last_inside);
+                frame.render_widget(
+                    Paragraph::new(buttons.clone()),
+                    Rect {
+                        y: inner.y + inner.height.saturating_sub(height),
+                        height,
+                        ..button_area
+                    },
+                );
+            }
         }
     }
     if let Some((row, cell)) = caret_row
@@ -681,6 +690,34 @@ fn draw_modal_scrolled(
         line_starts,
         total,
     }
+}
+
+/// One line per button in a row: a span of spaces alone is the gap a stacked
+/// layout drops, and each button keeps the row's alignment so it pins to the
+/// same edge the single-row form does.
+fn button_stack_lines<'a>(buttons: &Line<'a>) -> Vec<Line<'a>> {
+    let mut groups: Vec<Vec<Span<'a>>> = Vec::new();
+    let mut current: Vec<Span<'a>> = Vec::new();
+    for span in &buttons.spans {
+        if !span.content.is_empty() && span.content.chars().all(|c| c == ' ') {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(span.clone());
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+        .into_iter()
+        .map(|spans| {
+            let mut line = Line::from(spans);
+            line.alignment = buttons.alignment;
+            line
+        })
+        .collect()
 }
 
 /// A tab in a modal body is one break space: ratatui drops control characters

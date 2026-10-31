@@ -3964,8 +3964,7 @@ fn the_modal_caps_at_sixty_percent_from_eighty_columns() {
 fn the_modal_button_groups_keep_a_one_cell_gap() {
     use crate::tui::app::{
         ConfirmAction, ConfirmScroll, ConfirmState, Dirty, EnvCollisionForm, LossWarningButton,
-        LossWarningDrop, LossWarningState, LossWarningTarget, PresetApplyButton, PresetApplyForm,
-        PresetTarget, Tab,
+        LossWarningDrop, LossWarningState, LossWarningTarget, Tab,
     };
     use ratatui::layout::Rect;
 
@@ -3984,20 +3983,7 @@ fn the_modal_button_groups_keep_a_one_cell_gap() {
         "two-button confirm gap"
     );
 
-    let apply = PresetApplyForm {
-        target: PresetTarget::NewAccount,
-        preset: crate::presets::Preset {
-            name: "p".into(),
-            base_url: None,
-            models: Default::default(),
-            builtin: false,
-        },
-        message: "apply preset p?".into(),
-        replaces: vec!["base url"],
-        leaves: vec!["models"],
-        focus: PresetApplyButton::Cancel,
-        scroll: ConfirmScroll::default(),
-    };
+    let apply = preset_apply_form();
     let rows = slice_modal(&render_rows(
         80,
         24,
@@ -4064,6 +4050,381 @@ fn the_modal_button_groups_keep_a_one_cell_gap() {
 
     let rows = render_rebind(&rebind_render_form(), 80, 40);
     assert_eq!(button_tail(&rows), "not now   apply", "rebind gap");
+}
+
+/// The separator between buttons is any span of spaces alone, not just the
+/// exact single raw space every current builder emits: a wider or styled gap
+/// still stacks one button per row.
+#[test]
+fn button_stack_lines_splits_on_any_space_only_gap() {
+    let row = Line::from(vec![
+        Span::raw(" cancel "),
+        Span::raw("   "),
+        Span::raw(" keep "),
+        Span::styled(" ", Style::default().fg(theme::danger_color())),
+        Span::raw(" clear "),
+    ])
+    .alignment(Alignment::Right);
+    let lines = button_stack_lines(&row);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [" cancel ", " keep ", " clear "],
+        "one button per line"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.alignment == Some(Alignment::Right)),
+        "each stacked line keeps the group's alignment"
+    );
+}
+
+/// The preset-apply confirm's fixture: a message, the keys it replaces and
+/// leaves, and a body that wraps at a phone-width modal.
+fn preset_apply_form() -> PresetApplyForm {
+    use crate::tui::app::{ConfirmScroll, PresetTarget};
+    PresetApplyForm {
+        target: PresetTarget::NewAccount,
+        preset: crate::presets::Preset {
+            name: "p".into(),
+            base_url: None,
+            models: Default::default(),
+            builtin: false,
+        },
+        message: "apply preset p?".into(),
+        replaces: vec!["base url"],
+        leaves: vec!["models"],
+        focus: PresetApplyButton::Cancel,
+        scroll: ConfirmScroll::default(),
+    }
+}
+
+/// At 28 columns the preset-apply confirm's three buttons each take their own
+/// row, whole: the shared button row stacks N buttons when the row overflows
+/// the modal's inner width, the same way it already stacks the two-button pair.
+/// The rows are pinned whole, so a stacked button that drifts off the group's
+/// right edge reds as surely as one that clips.
+#[test]
+fn the_preset_apply_buttons_stack_one_per_row_at_28_columns() {
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let rows = slice_modal(&render_rows(
+        28,
+        20,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_preset_apply(f, a, &apply),
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│  apply preset p?     │".to_string(),
+            "│  replaces base url.  │".to_string(),
+            "│  the preset leaves   │".to_string(),
+            "│  models unset.       │".to_string(),
+            "│                      │".to_string(),
+            "│             cancel   │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "│                      │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "28 columns"
+    );
+}
+
+/// The loss warning's trio stacks one per row at 28 columns too: the shared
+/// layout is pinned on both three-button producers, not only preset apply.
+#[test]
+fn the_loss_warning_buttons_stack_one_per_row_at_28_columns() {
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Tab,
+    };
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let loss = LossWarningState {
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Overview),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::SetupField],
+        },
+    };
+    let rows = slice_modal(&render_rows(
+        28,
+        20,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_loss_warning(f, a, &loss),
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ WARNING ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│  there are unsaved   │".to_string(),
+            "│  edits on the setup  │".to_string(),
+            "│  tab. save them      │".to_string(),
+            "│  before switching?   │".to_string(),
+            "│                      │".to_string(),
+            "│            go back   │".to_string(),
+            "│            discard   │".to_string(),
+            "│               save   │".to_string(),
+            "│                      │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "28 columns"
+    );
+}
+
+/// A terminal too short for the stacked rows keeps them inside the modal's
+/// border: the rows stay pinned to the modal's bottom, so a tighter terminal
+/// drops rows above the cut and never moves one that still fits, and the border
+/// under them survives. The block fills the last row the border encloses — the
+/// bottom padding row — never the border row itself. Six rows is the shortest
+/// terminal that draws a bordered modal at all: below it the centered rect is
+/// one row, where the two borders merge.
+#[test]
+fn a_stacked_button_row_never_draws_outside_a_short_modal() {
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let frame = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_preset_apply(f, a, &apply)
+        })
+    };
+    let render = |height: u16| slice_modal(&frame(height));
+    // Where the centered rect is a single row (both borders merged into it) no
+    // button draws at all, rather than one beside the modal.
+    for height in 4..=5u16 {
+        let rows = frame(height);
+        for label in ["cancel", "keep", "clear"] {
+            assert!(
+                !rows.join("\n").contains(label),
+                "{label} draws on a {height}-row terminal:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+    // The whole frame, not only the modal's slice: a row drawn below the bottom
+    // border would sit outside a slice that stops at the first `╰`.
+    for height in 6..=12u16 {
+        let rows = frame(height);
+        let top = rows
+            .iter()
+            .position(|row| row.contains('\u{256d}'))
+            .unwrap_or_else(|| panic!("modal top border at height {height}:\n{}", rows.join("\n")));
+        let bottom = rows
+            .iter()
+            .position(|row| row.contains('\u{2570}'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "modal bottom border at height {height}:\n{}",
+                    rows.join("\n")
+                )
+            });
+        assert!(
+            top < bottom,
+            "a bordered modal at height {height}:\n{}",
+            rows.join("\n")
+        );
+        for (i, row) in rows.iter().enumerate() {
+            for label in ["cancel", "keep", "clear"] {
+                assert!(
+                    !row.contains(label) || (top < i && i < bottom),
+                    "{label} at frame row {i} stays between the borders at height {height}:\n{}",
+                    rows.join("\n")
+                );
+            }
+        }
+        assert_eq!(
+            rows[bottom].trim(),
+            format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(22)),
+            "the bottom border under the buttons at height {height}"
+        );
+    }
+    // The shortest heights that still hold a row inside the border: the block is
+    // pinned to the bottom, so only the rows above it are cut.
+    assert_eq!(
+        render(9),
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "9 rows"
+    );
+    assert_eq!(
+        render(10),
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│             cancel   │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "10 rows"
+    );
+}
+
+/// A squeezed modal draws its button row on the last row the block's border
+/// encloses — the bottom padding row base filled — and never on or past the
+/// border: the button text stays strictly between the border rows anywhere in
+/// the frame, the bottom border stays whole, and the rows that hold a button
+/// are the ones `want` names, content and all.
+fn check_squeezed_modal(name: &str, needles: &[&str], rows: Vec<String>, want: &[(usize, &str)]) {
+    let top = rows
+        .iter()
+        .position(|row| row.contains('\u{256d}'))
+        .unwrap_or_else(|| panic!("{name}: modal top border:\n{}", rows.join("\n")));
+    let bottom = rows
+        .iter()
+        .position(|row| row.contains('\u{2570}'))
+        .unwrap_or_else(|| panic!("{name}: modal bottom border:\n{}", rows.join("\n")));
+    assert!(
+        top < bottom,
+        "{name}: a bordered modal:\n{}",
+        rows.join("\n")
+    );
+    for (i, row) in rows.iter().enumerate() {
+        for needle in needles {
+            assert!(
+                !row.contains(needle) || (top < i && i < bottom),
+                "{name}: {needle:?} at frame row {i}, outside the border rows {top}..={bottom}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+    let border = rows[bottom].trim();
+    assert!(
+        border.starts_with('\u{2570}') && border.ends_with('\u{256f}'),
+        "{name}: the bottom border stays whole:\n{}",
+        rows.join("\n")
+    );
+    let slice = slice_modal(&rows);
+    let drawn: Vec<usize> = slice
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| needles.iter().any(|needle| row.contains(needle)))
+        .map(|(i, _)| i)
+        .collect();
+    let expected: Vec<usize> = want.iter().map(|(i, _)| *i).collect();
+    assert_eq!(
+        drawn,
+        expected,
+        "{name}: button rows {drawn:?} != {expected:?}:\n{}",
+        rows.join("\n")
+    );
+    for (index, line) in want {
+        assert_eq!(
+            &slice[*index],
+            line,
+            "{name}: button row {index} at 28 columns:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
+/// A terminal squeezed below a modal's reserved button rows still keeps its
+/// button row inside the block's border, for every button shape: the preset
+/// apply trio, the two-button pair and a one-button `close` notice. Where base
+/// drew a button row inside the border, a row is still drawn there; nothing
+/// draws above the top border or below the bottom one.
+#[test]
+fn a_squeezed_modal_keeps_its_button_row_inside_the_border() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let stop = ConfirmState {
+        message: "quit?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    let ack = ConfirmState {
+        message: "account in use".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Acknowledge,
+    };
+    let trio = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_preset_apply(f, a, &apply)
+        })
+    };
+    let pair = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_confirm(f, a, &stop)
+        })
+    };
+    let notice = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_confirm(f, a, &ack)
+        })
+    };
+
+    let cancel = "│             cancel   │";
+    let keep = "│               keep   │";
+    let clear = "│              clear   │";
+    let pair_row = "│   cancel   stop   │";
+    let close = "│          close   │";
+
+    let trio_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, clear)]),
+        (9, &[(2, keep), (3, clear)]),
+        (10, &[(2, cancel), (3, keep), (4, clear)]),
+        (11, &[(2, cancel), (3, keep), (4, clear)]),
+        (12, &[(3, cancel), (4, keep), (5, clear)]),
+    ];
+    for (height, want) in trio_want {
+        check_squeezed_modal(
+            "preset apply",
+            &["cancel", "keep", "clear"],
+            trio(*height),
+            want,
+        );
+    }
+
+    let pair_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, pair_row)]),
+        (9, &[(2, pair_row)]),
+        (10, &[(3, pair_row)]),
+        (11, &[(4, pair_row)]),
+        (12, &[(4, pair_row)]),
+    ];
+    for (height, want) in pair_want {
+        check_squeezed_modal("two-button pair", &["cancel   stop"], pair(*height), want);
+    }
+
+    let notice_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, close)]),
+        (9, &[(2, close)]),
+        (10, &[(3, close)]),
+        (11, &[(4, close)]),
+        (12, &[(4, close)]),
+    ];
+    for (height, want) in notice_want {
+        check_squeezed_modal("one-button notice", &["close"], notice(*height), want);
+    }
 }
 
 /// `chunk_line` wraps at word boundaries, still splits a word
