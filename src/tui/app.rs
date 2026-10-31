@@ -1573,25 +1573,18 @@ pub(crate) enum ConfirmAction {
         display: String,
     },
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
-    /// client token, then point the profile at the gateway (`url`). `replace`
-    /// is the confirm's third body line (`None` = nothing to replace), built
-    /// when the confirm opened. `require` = the add serves the
-    /// `require client tokens` flow, so its mint also runs the require (or the
-    /// restart wait).
+    /// client token, then point the profile at the gateway (`url`). `require` =
+    /// the add serves the `require client tokens` flow, so its mint also runs
+    /// the require (or the restart wait).
     AddToken {
         record: crate::gateway::GatewayRecord,
         profile: String,
         url: String,
-        replace: Option<String>,
         require: bool,
     },
     /// `require client tokens?`'s `require`: add `[server.auth]` (checked,
-    /// hot-reloads). `profiles` = the profile names whose `base_url` names the
-    /// gateway, pre-joined with `, ` for the confirm's third line (empty = no
-    /// line).
-    RequireClientTokens {
-        profiles: String,
-    },
+    /// hot-reloads).
+    RequireClientTokens,
 }
 
 /// The startup re-bind confirm: move accounts whose endpoint matches a
@@ -12262,8 +12255,8 @@ fn stays_word(k: usize) -> &'static str {
 }
 
 /// The `require client tokens?` confirm: the warning, then (when any profile's
-/// `base_url` names the gateway) the profiles line. The profiles names ride in
-/// the confirm action for the render's third line.
+/// `base_url` names the gateway) the profiles line, appended to `detail` —
+/// empty = no profile names the gateway, no line.
 fn open_require_confirm(app: &mut App) {
     if app.services.shunt_record.is_none() {
         app.toast(
@@ -12277,13 +12270,17 @@ fn open_require_confirm(app: &mut App) {
         .map(|name| escape_control(&name))
         .collect::<Vec<_>>()
         .join(", ");
+    let mut detail = "every consumer that sends no token is refused from then on.".to_string();
+    if !profiles.is_empty() {
+        detail.push_str(&format!("\nprofiles using the gateway: {profiles}."));
+    }
     app.disarm_quit();
     app.open_modal(Modal::Confirm(ConfirmState {
         message: "require client tokens?".to_string(),
-        detail: Some("every consumer that sends no token is refused from then on.".to_string()),
+        detail: Some(detail),
         choice: false,
         scroll: ConfirmScroll::default(),
-        on_confirm: ConfirmAction::RequireClientTokens { profiles },
+        on_confirm: ConfirmAction::RequireClientTokens,
     }));
 }
 
@@ -13991,33 +13988,37 @@ fn open_token_overwrite_confirm(app: &mut App, profile: String, require: bool) {
         }
     };
     let replace = match (base_url.as_deref(), has_key) {
-        (Some(base), true) => Some(format!(
+        (Some(base), true) => format!(
             "it replaces {} and its current api key.",
             escape_control(base)
-        )),
-        (Some(base), false) => Some(format!("it replaces {}.", escape_control(base))),
-        // An OAuth profile (no base url): the overwrite turns its subscription
-        // login into a gateway consumer, so the third line names that and the
-        // way back (the owner ruling 2026-10-12).
-        (None, _) => Some(
-            "it stops using its subscription login, which stays stored; clear its base url in Setup to go back."
-                .to_string(),
         ),
+        (Some(base), false) => format!("it replaces {}.", escape_control(base)),
+        // An OAuth profile (no base url): the overwrite turns its subscription
+        // login into a gateway consumer, so the line names that and the way
+        // back.
+        (None, _) => {
+            "it stops using its subscription login, which stays stored; clear its base url in Setup to go back."
+                .to_string()
+        }
     };
+    // The replace line rides in `detail`, the same prose the renderer gives
+    // every detail row.
+    let mut detail = format!(
+        "its base url becomes {} and its api key a new client token.",
+        escape_control(&url)
+    );
+    detail.push('\n');
+    detail.push_str(&replace);
     app.disarm_quit();
     app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("point {} at the shunt gateway?", escape_control(&profile)),
-        detail: Some(format!(
-            "its base url becomes {} and its api key a new client token.",
-            escape_control(&url)
-        )),
+        detail: Some(detail),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddToken {
             record,
             profile,
             url,
-            replace,
             require,
         },
     }));
@@ -21702,14 +21703,20 @@ fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
 const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
 
 /// The shared daemon-start confirm, opened by the action menu's `start daemon`
-/// and by a no-daemon `start shunt`; its two detail lines are drawn off
-/// [`ConfirmAction::StartDaemon`]. `cancel`/`esc` spawn nothing; `start` runs
+/// and by a no-daemon `start shunt`. `cancel`/`esc` spawn nothing; `start` runs
 /// [`start_daemon`].
 fn open_daemon_start_confirm(app: &mut App) {
     app.disarm_quit();
     app.open_modal(Modal::Confirm(ConfirmState {
         message: "start daemon?".to_string(),
-        detail: None,
+        detail: Some(
+            concat!(
+                "spawns the clauth daemon detached: ",
+                cmd_lit!("clauth daemon"),
+                "\nlogfile at ~/.clauth/daemon.log."
+            )
+            .to_string(),
+        ),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StartDaemon,
@@ -27944,12 +27951,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             record,
             profile,
             url,
-            replace: _,
             require,
         } => {
             start_shunt_token_add(app, record, profile, url, require);
         }
-        ConfirmAction::RequireClientTokens { .. } => {
+        ConfirmAction::RequireClientTokens => {
             let Some(record) = app.services.shunt_record.clone() else {
                 app.toast(
                     ToastKind::Danger,

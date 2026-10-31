@@ -29,7 +29,7 @@ use super::panes::{
     follow_scroll_offset, follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret,
     right_meta_fits, title_label, with_bg,
 };
-use super::prose::{self, cmd_lit, key_lit};
+use super::prose::{self, key_lit};
 use crate::fallback::BlockedReason;
 
 /// The stamp a published scroll bound carries: the frame area it was computed
@@ -1292,7 +1292,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::RemoveEntry { .. }
             | ConfirmAction::RemoveToken { .. }
             | ConfirmAction::AddToken { .. }
-            | ConfirmAction::RequireClientTokens { .. }
+            | ConfirmAction::RequireClientTokens
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -1311,7 +1311,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             "remove".to_string()
         }
         ConfirmAction::AddToken { .. } => "overwrite".to_string(),
-        ConfirmAction::RequireClientTokens { .. } => "require".to_string(),
+        ConfirmAction::RequireClientTokens => "require".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -1328,47 +1328,6 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         for line in detail.lines() {
             lines.push(prose::marked(line, theme::dim()).into());
         }
-    }
-    // The daemon-start confirm carries its two lines here rather than in
-    // `detail`, which its caller leaves `None`.
-    if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
-        lines.push(
-            prose::marked(
-                concat!(
-                    "spawns the clauth daemon detached: ",
-                    cmd_lit!("clauth daemon")
-                ),
-                theme::dim(),
-            )
-            .into(),
-        );
-        lines.push(
-            Line::from(Span::styled(
-                "logfile at ~/.clauth/daemon.log.",
-                theme::dim(),
-            ))
-            .into(),
-        );
-    }
-    // The token-add confirm's third line names only what the overwrite
-    // replaces, `None` when the profile had neither a base url nor a key.
-    if let ConfirmAction::AddToken { replace, .. } = &state.on_confirm
-        && let Some(replace) = replace
-    {
-        lines.push(prose::marked(replace, theme::dim()).into());
-    }
-    // The require confirm's third line names the profiles whose `base_url`
-    // names the gateway; empty = none to name, no line.
-    if let ConfirmAction::RequireClientTokens { profiles } = &state.on_confirm
-        && !profiles.is_empty()
-    {
-        lines.push(
-            prose::marked(
-                &format!("profiles using the gateway: {profiles}."),
-                theme::dim(),
-            )
-            .into(),
-        );
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `close`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {

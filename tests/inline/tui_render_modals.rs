@@ -1930,9 +1930,7 @@ fn the_require_confirm_button_is_dangerous() {
         detail: None,
         choice: false,
         scroll: ConfirmScroll::default(),
-        on_confirm: ConfirmAction::RequireClientTokens {
-            profiles: String::new(),
-        },
+        on_confirm: ConfirmAction::RequireClientTokens,
     };
     let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
@@ -2016,7 +2014,14 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let state = ConfirmState {
         message: "start daemon?".into(),
-        detail: None,
+        detail: Some(
+            concat!(
+                "spawns the clauth daemon detached: ",
+                super::prose::cmd_lit!("clauth daemon"),
+                "\nlogfile at ~/.clauth/daemon.log."
+            )
+            .into(),
+        ),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StartDaemon,

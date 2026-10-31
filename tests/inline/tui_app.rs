@@ -8873,7 +8873,15 @@ fn a_no_daemon_start_shunt_opens_the_daemon_start_confirm() {
                 state.detail.as_deref(),
                 state.choice
             ),
-            ("start daemon?", None, false),
+            (
+                "start daemon?",
+                Some(concat!(
+                    "spawns the clauth daemon detached: ",
+                    crate::tui::render::prose::cmd_lit!("clauth daemon"),
+                    "\nlogfile at ~/.clauth/daemon.log."
+                )),
+                false
+            ),
             "the shared confirm, cancel focused"
         );
         assert!(matches!(state.on_confirm, ConfirmAction::StartDaemon));
@@ -37625,8 +37633,9 @@ fn an_empty_roster_opens_the_picker_with_new_profile_alone() {
 }
 
 /// Open the picker on a one-profile roster and confirm the pick; the
-/// overwrite confirm's replace line (its third body line).
-fn overwrite_replace_line(app: &mut super::App) -> Option<String> {
+/// overwrite confirm's `detail`: the base-url line, then the line naming
+/// what the overwrite replaces.
+fn overwrite_confirm_detail(app: &mut super::App) -> Option<String> {
     use ratatui::crossterm::event::KeyCode;
     app.services.focus = super::ServicesFocus::Detail;
     app.services
@@ -37634,29 +37643,21 @@ fn overwrite_replace_line(app: &mut super::App) -> Option<String> {
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(app, crate::testutil::key(KeyCode::Down));
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
-    let confirm = top_confirm(app);
-    assert_eq!(
-        confirm.detail.as_deref(),
-        Some("its base url becomes http://127.0.0.1:3001 and its api key a new client token."),
-        "the overwrite confirm's second line"
-    );
-    match &confirm.on_confirm {
-        super::ConfirmAction::AddToken { replace, .. } => replace.clone(),
-        _ => panic!("an add-token confirm"),
-    }
+    top_confirm(app).detail.clone()
 }
 
-/// The overwrite confirm's third line names exactly what it replaces: an
-/// api-key endpoint reads `it replaces <base> and its current api key.` (or
-/// `it replaces <base>.` with no key), and an OAuth profile (no base url)
-/// reads the subscription-login copy (the owner ruling 2026-10-12).
+/// The overwrite confirm's `detail` names exactly what it replaces, one line
+/// per `\n`: an api-key endpoint reads `it replaces <base> and its current api
+/// key.` (or `it replaces <base>.` with no key), and an OAuth profile (no base
+/// url) reads the subscription-login copy — the overwrite turns its
+/// subscription login into a gateway consumer.
 #[test]
 fn the_overwrite_confirm_names_what_it_replaces_in_all_three_shapes() {
     use crate::profile::Profile;
 
     const OAUTH: &str = "it stops using its subscription login, which stays stored; clear its base url in Setup to go back.";
 
-    fn case(base: Option<&str>, key: Option<&str>, expected: Option<&str>) {
+    fn case(base: Option<&str>, key: Option<&str>, replace_line: &str) {
         let home = crate::testutil::HomeSandbox::new();
         let _env = crate::testutil::no_shunt_env(&home);
         adopt_token_record(&home, TOKEN_CONFIG, "");
@@ -37666,24 +37667,26 @@ fn the_overwrite_confirm_names_what_it_replaces_in_all_three_shapes() {
             key.map(str::to_string),
         )]);
         assert_eq!(
-            overwrite_replace_line(&mut app),
-            expected.map(str::to_string),
-            "the replace line for base={base:?} key={key:?}"
+            overwrite_confirm_detail(&mut app),
+            Some(format!(
+                "its base url becomes http://127.0.0.1:3001 and its api key a new client token.\n{replace_line}"
+            )),
+            "the overwrite confirm's detail for base={base:?} key={key:?}"
         );
     }
 
     case(
         Some("https://api.example.com"),
         Some("k"),
-        Some("it replaces https://api.example.com and its current api key."),
+        "it replaces https://api.example.com and its current api key.",
     );
     case(
         Some("https://api.example.com"),
         None,
-        Some("it replaces https://api.example.com."),
+        "it replaces https://api.example.com.",
     );
-    case(None, Some("k"), Some(OAUTH));
-    case(None, None, Some(OAUTH));
+    case(None, Some("k"), OAUTH);
+    case(None, None, OAUTH);
 }
 
 /// A confirmed add mints the token into the store and points the profile at
@@ -39583,15 +39586,10 @@ fn f_reaches_the_require_line_and_enter_opens_the_confirm() {
         assert_eq!(confirm.message, "require client tokens?");
         assert_eq!(
             confirm.detail.as_deref(),
-            Some("every consumer that sends no token is refused from then on."),
-            "the require confirm body by equality"
-        );
-        assert!(
-            matches!(
-                &confirm.on_confirm,
-                super::ConfirmAction::RequireClientTokens { profiles } if profiles == "alice, bob"
+            Some(
+                "every consumer that sends no token is refused from then on.\nprofiles using the gateway: alice, bob."
             ),
-            "the profiles field joins the two gateway names with `, `"
+            "the require confirm body by equality: the warning, then the two gateway names joined with `, `"
         );
         let lines = confirm_render_lines(&app);
         assert!(
@@ -39612,12 +39610,10 @@ fn f_reaches_the_require_line_and_enter_opens_the_confirm() {
         let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
         press_require(&mut app);
         let confirm = top_confirm(&app);
-        assert!(
-            matches!(
-                &confirm.on_confirm,
-                super::ConfirmAction::RequireClientTokens { profiles } if profiles.is_empty()
-            ),
-            "no profile names the gateway, so the profiles field is empty"
+        assert_eq!(
+            confirm.detail.as_deref(),
+            Some("every consumer that sends no token is refused from then on."),
+            "no profile names the gateway, so the detail stays one line"
         );
         let lines = confirm_render_lines(&app);
         assert!(
