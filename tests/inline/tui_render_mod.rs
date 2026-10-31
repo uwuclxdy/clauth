@@ -3967,49 +3967,96 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
     }
 }
 
-/// Desktop pin: the name column absorbs the spare width at 160, so the ASCII
-/// name renders whole instead of the pre-S9 clip (`abcdefghijklmnopqrstu…`).
+/// Desktop pin: past the clamp the name column stops absorbing the panel's
+/// spare width — the columns keep their cap-width layout and the band centres,
+/// so the 26-cell ASCII name clips to its 22-cell column (`…`) while the type
+/// cell stays on the same terminal cell as every other row. The expected row
+/// is hand-derived from the layout at the 122-cell cap plus the centring pad.
 #[test]
-fn the_overview_name_column_desktop_rows_replace_the_pre_s9_clip() {
+fn the_overview_name_column_clips_to_its_capped_column_at_160() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    // Select on the row content after the band's centring pad, never a
+    // left-flush prefix: past the clamp every row carries the pad.
     let got: Vec<String> = rows
         .iter()
-        .filter(|r| r.starts_with("│ ❯"))
+        .filter(|r| {
+            r.contains("abcdefghijklmnopqrst")
+                && r.strip_prefix("│")
+                    .is_some_and(|c| c.trim_start().starts_with("❯ "))
+        })
         .cloned()
         .collect();
     assert_eq!(
         got,
         vec![
-            "│ ❯   abcdefghijklmnopqrstuvwxyz                —                        [█░░░░░░░░░] 12%                  [█░░░░░░░░░]  8%                                    │",
+            "│                  ❯   abcdefghijklmnopqrstu…   —                     [█░░░░░░░░░] 12%             [█░░░░░░░░░]  8%                                            │",
         ],
         "name column ascii row at 160 cols"
     );
 }
 
-/// Desktop pin: the CJK/emoji name columns render whole before and after —
-/// pre-S9 sized them by char count, so they sat left of the cell-sized column.
-/// Whole before, re-measured by cells now, not clips replaced.
+/// Desktop pin: the CJK and emoji names render whole inside the capped name
+/// column, and the type cell lands on the same terminal cell in the CJK, emoji
+/// and ASCII rows — one cell-measured column layout shared by every row, the
+/// band's centring pad included. The expected rows are hand-derived from the
+/// layout at the 122-cell cap plus the centring pad.
 #[test]
 fn the_overview_name_column_desktop_rows_measure_by_cells() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    // Select on the row content after the band's centring pad, never a
+    // left-flush prefix: past the clamp every row carries the pad.
     let got: Vec<String> = rows
         .iter()
-        .filter(|r| r.starts_with("│   ✻") || r.starts_with("│     emoji"))
+        .filter(|r| {
+            r.contains('[')
+                && r.strip_prefix("│").is_some_and(|c| {
+                    let content = c.trim_start();
+                    content.starts_with("✻ ") || content.starts_with("emoji-")
+                })
+        })
         .cloned()
         .collect();
     assert_eq!(
         got,
         vec![
-            "│   ✻ cjk-日 本 語 ア カ ウ ン ト                       —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                                    │",
-            "│     emoji-🧭 ⚠️ -account                        —                        [██████░░░░] 63%                  [████░░░░░░] 40%                                    │",
+            "│                    ✻ cjk-日 本 語 ア カ ウ ン ト      —                     [█████░░░░░] 49%             [███░░░░░░░] 30%                                            │",
+            "│                      emoji-🧭 ⚠️ -account       —                     [██████░░░░] 63%             [████░░░░░░] 40%                                            │",
         ],
         "name column wide rows at 160 cols"
+    );
+    // The type cell opens at the same terminal cell in every row. The measure
+    // is buffer cells, not chars or grapheme widths: a flattened row spends
+    // one char per cell except an emoji selector, which rides inside the glyph
+    // cell it follows.
+    let dash_cell = |row: &str| {
+        row[..row.find('—').expect("type dash present")]
+            .chars()
+            .filter(|c| *c != '\u{fe0f}')
+            .count()
+    };
+    let ascii_row = rows
+        .iter()
+        .find(|r| {
+            r.contains("abcdefghijklmnopqrst")
+                && r.strip_prefix("│")
+                    .is_some_and(|c| c.trim_start().starts_with("❯ "))
+        })
+        .expect("ascii row present");
+    assert_eq!(
+        dash_cell(&got[0]),
+        dash_cell(ascii_row),
+        "cjk type cell aligns"
+    );
+    assert_eq!(
+        dash_cell(&got[1]),
+        dash_cell(ascii_row),
+        "emoji type cell aligns"
     );
 }
 

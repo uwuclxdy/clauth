@@ -152,6 +152,15 @@ fn harness_counts(app: &App) -> String {
     terms.join(" · ")
 }
 
+/// Shift a table line right by `pad` cells — the centred band's left margin.
+fn band_indent(mut line: Line<'static>, pad: usize) -> Line<'static> {
+    if pad == 0 {
+        return line;
+    }
+    line.spans.insert(0, Span::raw(" ".repeat(pad)));
+    line
+}
+
 fn draw_overview_accounts(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -197,8 +206,25 @@ fn draw_overview_accounts(
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
-    let widths = OverviewWidths::new(list_area.width, app, readings);
-    let header = overview_header(&widths, any_deepseek(app));
+    // The table is a band, centred in the panel: its columns are laid out in at
+    // most `OVERVIEW_MAX_W` cells, and past that the band the row settles on is
+    // centred. The panel itself stays full width.
+    let widths = if list_area.width > OVERVIEW_MAX_W {
+        OverviewWidths::new_banded(OVERVIEW_MAX_W, app, readings)
+    } else {
+        OverviewWidths::new(list_area.width, app, readings)
+    };
+    let band_pad = if list_area.width > OVERVIEW_MAX_W {
+        let band_w = widths.row_width() + widths.codex_chip_w;
+        // A row the tiers cannot fit into the cap (a codex reading too wide for
+        // even the bare tiers, which `codex_label` prints unclamped) outgrows
+        // the band; it draws flush left and clipped, as it did before the band
+        // existed.
+        usize::from(inner.width).saturating_sub(band_w) / 2
+    } else {
+        0
+    };
+    let header = band_indent(overview_header(&widths, any_deepseek(app)), band_pad);
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
     let items = app.main_items();
@@ -231,10 +257,16 @@ fn draw_overview_accounts(
                 } else {
                     theme::label()
                 };
-                rows.push(ListItem::new(Line::from(prose::spans(
-                    &format!("  {text}"),
-                    heading,
-                ))));
+                let line = Line::from(prose::spans(&format!("  {text}"), heading));
+                // A heading is prose, not a band column: take the indent only
+                // while the line still fits the panel, so an unbounded reason
+                // keeps the full inner width instead of clipping early.
+                let pad = if line.width() + band_pad <= usize::from(inner.width) {
+                    band_pad
+                } else {
+                    0
+                };
+                rows.push(ListItem::new(band_indent(line, pad)));
                 rendered += 1;
             }
             BandEntry::Item(item) => {
@@ -256,7 +288,7 @@ fn draw_overview_accounts(
                     }
                 };
                 rows.push(ListItem::new(select_line(
-                    line,
+                    band_indent(line, band_pad),
                     flat == sel,
                     focused,
                     width,
@@ -388,9 +420,29 @@ const FIVE_HOUR_WIDE_AT: usize = 81;
 const SEVEN_DAY_WIDE_AT: usize = 102;
 /// Minimum gap between overview columns.
 const GAP_MIN: usize = 2;
+/// Widest the accounts table's band is laid out in. Past this the table stops
+/// widening and a wider terminal only adds margins beside the centred band, the
+/// way the Tokens dashboard clamps its own (`DASH_MAX_W`); stretching a column
+/// or the gaps to the panel border is the shape the clamp rules out.
+const OVERVIEW_MAX_W: u16 = 122;
 
 impl OverviewWidths {
+    /// The unbanded layout: the panel is at or below [`OVERVIEW_MAX_W`], so the
+    /// columns lay out at the panel's own width.
     fn new(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
+        Self::build(width, false, app, readings)
+    }
+
+    /// The banded layout: the panel is past [`OVERVIEW_MAX_W`], so the columns
+    /// lay out at the cap. There t/s outranks the wall-clock stamps — the bonus
+    /// charges only true slack — and the codex chip never pays with the name
+    /// column: the name keeps its uncharged width and a chip that does not fit
+    /// hides whole.
+    fn new_banded(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
+        Self::build(width, true, app, readings)
+    }
+
+    fn build(width: u16, banded: bool, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
         let max_name = app
             .config()
@@ -461,6 +513,21 @@ impl OverviewWidths {
             overview_tiers(max_name, total, labels);
         let live = live_column_width(max_name, total, labels);
 
+        // The speed column exists from the first frame; cells are blank until a
+        // fresh producer answers. It drops whole before `live` (it needs both
+        // columns to fit) and before the 7d stamp. Banded, it outranks the
+        // wall-clock stamps: charged before the bonus, so the stamp takes only
+        // the slack the speed column leaves, and the countdown cells keep their
+        // room.
+        let banded_tps = if banded && tps_column_width(max_name, total, labels) > 0 {
+            let need =
+                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
+                    + TIMER_SLOT;
+            if need <= total { TPS_W } else { 0 }
+        } else {
+            0
+        };
+
         if shows_clock {
             const CLOCK_COLS: usize = 10;
             // A wall-clock stamp needs 10 cells beyond the countdown (the worst
@@ -469,14 +536,15 @@ impl OverviewWidths {
             // from slack the layout would otherwise spend on gap padding, after
             // the live column and the shrink loop have settled — so turning the
             // setting on can add a stamp but never cost a countdown, a bar or
-            // the live column. The t/s column is charged AFTER this bonus (its
-            // slot is 0 in the slack), so a wall-clock stamp outranks it too.
-            // Widening the tier itself instead pushed the 7d column down to 5
-            // at 130 columns, deleting its bar. A column that gets only part of
-            // the 10 still degrades cleanly in `reset_suffix`.
+            // the live column. The t/s slot in the slack is the banded charge
+            // (0 unbanded): a wall-clock stamp outranks t/s below the cap, and
+            // above it t/s outranks the stamps. Widening the tier itself
+            // instead pushed the 7d column down to 5 at 130 columns, deleting
+            // its bar. A column that gets only part of the 10 still degrades
+            // cleanly in `reset_suffix`.
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width_cols(name, kind, five, seven, live, 0, GAP_MIN)
+                    fixed_overview_width_cols(name, kind, five, seven, live, banded_tps, GAP_MIN)
                         + TIMER_SLOT,
                 )
             };
@@ -487,12 +555,9 @@ impl OverviewWidths {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
-        // The speed column exists from the first frame; cells are blank until a
-        // fresh producer answers. It drops whole before `live` (it needs both
-        // columns to fit) and before the 7d stamp, and yields to the wall-clock
-        // bonus: once the bonus has claimed its cells, the column is kept only
-        // if the post-bonus row still fits the pane.
-        let tps = if tps_column_width(max_name, total, labels) > 0 {
+        let tps = if banded_tps > 0 {
+            banded_tps
+        } else if tps_column_width(max_name, total, labels) > 0 {
             let need =
                 fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
                     + TIMER_SLOT;
@@ -529,11 +594,11 @@ impl OverviewWidths {
                     + TIMER_SLOT,
             );
         }
-        // The chip slot is charged against the flexible widths — the gap first,
-        // down to its floor, then the name down to `NAME_READING_FLOOR` — and
-        // past the floor the chip sheds whole, nothing charged: the name and gap
-        // revert to the uncharged layout, and the renderer drops the chip
-        // rather than letting it peek in.
+        // The chip slot is charged against the flexible widths: the gap first,
+        // down to its floor, then — unbanded only — the name down to
+        // `NAME_READING_FLOOR`. Past that the chip sheds whole, nothing
+        // charged: the name and gap revert to the uncharged layout, and the
+        // renderer drops the chip rather than letting it peek in.
         if codex_chip_text > 0 {
             let name_uncharged = name;
             let gap_uncharged = gap;
@@ -548,7 +613,10 @@ impl OverviewWidths {
                 if gap > GAP_MIN {
                     gap -= 1;
                     codex_chip_w = gap + codex_chip_text;
-                } else if name > NAME_READING_FLOOR {
+                } else if !banded && name > NAME_READING_FLOOR {
+                    // Banded, the name column keeps its uncharged width: the
+                    // chip rides only the slack that is left once the name has
+                    // reached it, and hides whole when none is.
                     name -= 1;
                 } else {
                     name = name_uncharged;
@@ -585,6 +653,25 @@ impl OverviewWidths {
             codex_labels,
             pool_labels,
         }
+    }
+
+    /// The width the table's widest row draws at these columns, before the
+    /// codex `↺ N` chip: the cursor and bell prefix, every column and its gap,
+    /// and the timer slot. The band centres on this plus [`Self::codex_chip_w`]:
+    /// the chip rides the row's trailing gap, so the widest row the layout can
+    /// draw is `row_width() + codex_chip_w` wide, and centring on `row_width()`
+    /// alone spends the leftover on the left margin that the chip's ride also
+    /// needs, clipping the chip just above the cap.
+    fn row_width(&self) -> usize {
+        fixed_overview_width_cols(
+            self.name,
+            self.kind,
+            self.five_hour,
+            self.seven_day,
+            self.live,
+            self.tps,
+            self.gap,
+        ) + TIMER_SLOT
     }
 
     /// Whether the 7d column holds its bar: below that tier it is the bare

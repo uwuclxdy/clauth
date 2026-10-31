@@ -7,7 +7,7 @@ use super::*;
 use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
-use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
+use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName, ResetDisplay};
 use crate::testutil::{countdown_reset_in, reset_in};
 use crate::usage::{FetchLeg, FetchStatus, UsageInfo};
 use std::collections::BTreeMap;
@@ -1053,6 +1053,145 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
         suffixes[1].style.fg,
         theme::faint().fg,
         "7d drains off its own avg pace",
+    );
+}
+
+/// The accounts panel's inner cells, one per terminal row: `section_box`
+/// borders (1) and pads (1) a cell each side, so a `width`-column pane leaves
+/// `width - 4` inner cells.
+fn accounts_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The panel's inner cells of one rendered row (border and pad stripped).
+fn panel_inner(line: &str) -> String {
+    let cells: Vec<char> = line.chars().collect();
+    cells[2..cells.len() - 2].iter().collect()
+}
+
+/// The Overview table is a BAND, not a full-width stretch: past the clamp a
+/// wider terminal only widens the margins beside a centred table, rather than
+/// widening the name column and the gaps to the panel border. The pin compares
+/// a 160- and a 260-column pane against a pane exactly at the clamp's inner
+/// width: all three draw the same band.
+#[test]
+fn the_overview_table_band_clamps_instead_of_widening_past_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("ax-main-", 95.0, 10.0, 3600);
+    let usage = a_readings.usage.clone();
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("ax-main-"), vec![]);
+    let app = App::new(config);
+    // The fixture's readings ride into the frame: usage figures are drawn, the
+    // shape the band must not disturb.
+    for (name, info) in usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+
+    // 126 columns = 122 inner cells: a pane exactly at the clamp.
+    let wide = accounts_rows(&app, 160, 8);
+    let wider = accounts_rows(&app, 260, 8);
+    let widest = accounts_rows(&app, 200, 8);
+    let capped = accounts_rows(&app, 126, 8);
+
+    // Header (row 1) and account row (row 2) both form the band.
+    for row in [1usize, 2] {
+        let band = panel_inner(&wide[row]);
+        assert_eq!(
+            band.trim(),
+            panel_inner(&wider[row]).trim(),
+            "a wider terminal must not widen the table (row {row})"
+        );
+        assert_eq!(
+            band.trim(),
+            panel_inner(&capped[row]).trim(),
+            "the clamped pane draws the same band (row {row})"
+        );
+    }
+
+    // The cap binds from below, too: a pane exactly at the clamp's inner width
+    // still carries the full column set (`live`, `t/s`), so an over-tight cap
+    // sheds columns instead of only widening the margins.
+    let capped_header = panel_inner(&capped[1]);
+    assert!(
+        capped_header.contains("live") && capped_header.contains("t/s"),
+        "the 126-column pane keeps the full column set: {capped_header}"
+    );
+
+    // The band is centred and leaves margins on BOTH sides of the full-width
+    // panel. The header opens with the 4-cell cursor+bell prefix and closes
+    // with the 4-wide `t/s` cell holding three glyphs, so its leading and
+    // trailing blanks carry one fixed allowance each. Checked at more than one
+    // above-cap width so a collapsed pad cannot hide behind the 160 frame.
+    for header in [
+        panel_inner(&wide[1]),
+        panel_inner(&widest[1]),
+        panel_inner(&wider[1]),
+    ] {
+        let cells: Vec<char> = header.chars().collect();
+        let lead = cells.len() - header.trim_start().chars().count();
+        let trail = cells.len() - header.trim_end().chars().count();
+        let left_margin = lead - 4;
+        let right_margin = trail.saturating_sub(1);
+        assert!(
+            left_margin > 0,
+            "the band leaves a left margin: lead {lead}"
+        );
+        assert!(
+            right_margin > 0,
+            "the band leaves a right margin: trail {trail}"
+        );
+        assert!(
+            right_margin.abs_diff(left_margin) <= 1,
+            "the band is centred to within a cell: left {left_margin}, right {right_margin}"
+        );
+        let band_w = cells.len() - left_margin - right_margin;
+        assert!(
+            band_w <= usize::from(OVERVIEW_MAX_W),
+            "the band never outgrows the clamp: {band_w} > {OVERVIEW_MAX_W}"
+        );
+    }
+}
+
+/// At 100 columns the table draws its 92 cells inside the 96-cell inner width
+/// (the layout settles at name 8, kind 16, 5h 26, 7d 5, live 4, no t/s, gap 7),
+/// so the pin is the whole frame.
+#[test]
+fn the_overview_table_at_100_columns_draws_92_cells_in_the_96_cell_inner_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("ax-main-", 95.0, 10.0, 3600);
+    let usage = a_readings.usage.clone();
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("ax-main-"), vec![]);
+    let app = App::new(config);
+    // The fixture's readings ride into the frame, so the pin covers a drawn
+    // reading, not an all-dash row.
+    for (name, info) in usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+
+    let rows = accounts_rows(&app, 100, 8);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────────── 1 claude ─╮",
+            "│     account        type                    5h                               7d          live     │",
+            "│ ❯ ✻ ax-main-       —                     ⋯ [█░░░░░░░░░] 10% (1h 0m)         —                    │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+        "the whole frame at 100 columns"
     );
 }
 
@@ -4136,11 +4275,13 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
         app.codex_rows = rows();
     }
 
-    // The base row fits at every width; wherever the chip is charged the whole
-    // row fits too.
+    // The base row fits at loop widths below the clamp; wherever the chip is
+    // charged the whole row fits too. Above the cap the renderer lays out at
+    // the clamped width with the chip riding the leftover, which the unbanded
+    // model cannot bind — there the rendered frame is the only check.
     for w in 60u16..=220 {
         let inner = usize::from(w) - 4;
-        let widths = OverviewWidths::new(w - 4, &app, &readings);
+        let widths = OverviewWidths::new((w - 4).min(OVERVIEW_MAX_W), &app, &readings);
         let base = super::fixed_overview_width_cols(
             widths.name,
             widths.kind,
@@ -4150,7 +4291,9 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
             widths.tps,
             widths.gap,
         ) + super::TIMER_SLOT;
-        assert!(base <= inner, "the base row exceeds the pane at {w}");
+        if inner <= usize::from(OVERVIEW_MAX_W) {
+            assert!(base <= inner, "the base row exceeds the pane at {w}");
+        }
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).expect("terminal");
         term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
@@ -4158,9 +4301,11 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         if rows.iter().any(|r| r.contains("↺")) {
             // "↺ 12" — the widest chip in the fixture — sits one gap past the
-            // columns; a charged row never exceeds the pane.
-            let row_w = base + widths.gap + "↺ 12".chars().count();
-            assert!(row_w <= inner, "the charged row exceeds the pane at {w}");
+            // columns; a charged row renders its chip whole at every width.
+            assert!(
+                rows.iter().any(|r| r.contains("↺ 12")),
+                "the charged row renders its chip whole at {w}: clipped by the pad"
+            );
         }
     }
 
@@ -4175,6 +4320,656 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
         !rows.iter().any(|r| r.contains("↺")),
         "the chip sheds whole below the name floor: {rows:?}"
     );
+}
+
+/// Below the cap the chip charge keeps its original order — the gap first,
+/// then the name down to its floor — so a banked reset still shows its chip
+/// beside a long claude name at the widths where that charge binds. The
+/// expected frames are captured off the pre-band renderer (d01f99cb) with
+/// this exact fixture; dropping the name arm makes the chip vanish here.
+const BELOW_CAP_CHIP_FRAMES: &[(u16, &[&str])] = &[
+    (
+        106,
+        &[
+            "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────── 1 claude · 1 codex ─╮",
+            "│     account  type                  5h                          7d                           live       │",
+            "│ ❯ ✻ ax-mai…  —                                 —                           —                           │",
+            "│                                                                                                        │",
+            "│   codex                                                                                                │",
+            "│     cx1      pro                   —                           —                                  ↺ 12 │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+    (
+        111,
+        &[
+            "╭─ ACCOUNTS ───────────────────────────────────────────────────────────────────────────── 1 claude · 1 codex ─╮",
+            "│     accou…  type                  5h                          7d                           live  t/s        │",
+            "│ ❯ ✻ ax-ma…  —                                 —                           —                                 │",
+            "│                                                                                                             │",
+            "│   codex                                                                                                     │",
+            "│     cx1     pro                   —                           —                                        ↺ 12 │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+];
+
+/// The below-cap chip frames at the widths where the unbanded name charge
+/// binds (name column 7/6): the chip shows whole because the name pays for it.
+#[test]
+fn the_below_cap_chip_still_shows_where_the_name_pays_for_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (p, readings) = profile("ax-main-long", 95.0, 42.0, 3600);
+    let (config, _readings) = config_with(vec![(p, readings)], Some("ax-main-long"), vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    for (w, want) in BELOW_CAP_CHIP_FRAMES {
+        let rows = accounts_rows(&app, *w, 12);
+        assert_eq!(
+            rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            *want,
+            "the below-cap chip frame at {w} columns"
+        );
+    }
+}
+
+/// An absurd codex reading (`codex_label` prints utilization unclamped, so a
+/// `used_percent` of 1e300 gives a ~300-cell label the tiers cannot fit) makes
+/// the band wider than the panel: the row draws flush left and clipped, as it
+/// did before the band existed, and the centring arithmetic must not underflow.
+#[test]
+fn an_absurd_codex_reading_draws_clipped_instead_of_panicking_the_band() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: 1e300,
+            resets_at: None,
+        }),
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    for w in [127u16, 130, 160, 200] {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 8)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            rows[1].starts_with("│     account"),
+            "the {w}-column header must draw flush left (no band pad): {:?}",
+            rows[1]
+        );
+    }
+}
+
+/// A banked codex reset's `↺ N` chip rides the row's trailing gap past the
+/// band's centred edge, so the band centres on the widest row the layout can
+/// draw — the columns plus the chip's ride. Panel widths just above the cap
+/// are the tight window: the pad halves the leftover the chip rides, and a
+/// band centred on the columns alone clips the chip's digits there.
+#[test]
+fn a_banked_codex_chip_never_clips_just_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    // The chip's clip window sits just above the cap, wherever the charged row
+    // leaves less ride than half the leftover: sweep the whole window.
+    for w in 123u16..=133 {
+        let rows = accounts_rows(&app, w, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("↺ 12")),
+            "the banked reset chip renders whole at {w} columns: {rows:?}"
+        );
+    }
+}
+
+/// Seeds a fresh tps snapshot for the named claude accounts, so the table's
+/// per-row t/s cells render their speed figures.
+fn tps_fixture(app: &mut App, names: &[&str], speed: f64) {
+    let figures = |speed: f64| crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate: speed,
+            speed: Some(speed),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap_or(0))
+            .unwrap_or_else(chrono::Utc::now)
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    for name in names {
+        snap.accounts.insert((*name).to_string(), figures(speed));
+    }
+    app.set_tps(Some(snap));
+}
+
+/// The clock-mode band fixture: one reading-carrying account, its reset stamp
+/// mode, and a fresh tps figure. With `resets` the 5h/7d windows carry resets,
+/// so the cells render countdowns and wall-clock stamps (read by substring
+/// only); without, both windows are reset-free so the frames hold no
+/// wall-clock text and stay byte-stable across runs. The account is not
+/// active: an active account burning tps renders the animated active mark,
+/// which re-times every frame.
+fn clock_band_app(display: ResetDisplay, resets: bool) -> (App, ReadingsSnapshot) {
+    let (p, mut r) = profile("ax-main-", 95.0, 42.0, 3600);
+    if resets {
+        r.usage.get_mut("ax-main-").unwrap().seven_day = Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        });
+    } else {
+        let five = r.usage.get_mut("ax-main-").unwrap();
+        five.five_hour = Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        });
+    }
+    let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+    config.state.reset_display = Some(display);
+    let mut app = App::new(config);
+    tps_fixture(&mut app, &["ax-main-"], 12.0);
+    (app, readings)
+}
+
+/// Above the cap t/s outranks the wall-clock stamps: in clock and both modes a
+/// wide terminal keeps the t/s column — header and per-row cells alike — and
+/// the 5h/7d cells keep their countdowns, the wall-clock part of the cells
+/// being the first thing to give way. Below the cap nothing changes (the byte
+/// pins cover 100..=126).
+#[test]
+fn the_band_keeps_the_speed_column_and_the_countdowns_in_clock_mode() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for display in [ResetDisplay::Clock, ResetDisplay::Both] {
+        let (app, readings) = clock_band_app(display, true);
+        for w in [150u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            let header = &rows[1];
+            assert!(
+                header.contains("t/s"),
+                "{display:?} keeps the t/s header at {w} columns: {header}"
+            );
+            let account = rows
+                .iter()
+                .find(|r| r.contains("ax-main-"))
+                .expect("the account row renders");
+            // A char index, not the byte index `find` returns: the row's leading
+            // border glyph is multibyte.
+            let col = header
+                .find("t/s")
+                .map(|b| header[..b].chars().count())
+                .expect("t/s header present");
+            let cells: Vec<char> = account.chars().collect();
+            assert_eq!(
+                &cells[col..col + 4].iter().collect::<String>(),
+                "  12",
+                "{display:?} keeps the per-row t/s cell at {w} columns: header {header} / row {account}"
+            );
+            // A countdown exists only in both mode: in clock mode the user's own
+            // setting renders the wall-clock stamp instead, and the reset part
+            // the band may drop first is exactly what that mode renders. The
+            // countdown rides inside the cell's reset parens, beside the stamp
+            // when it fits.
+            if display == ResetDisplay::Both {
+                assert!(
+                    account.contains("1h 0m"),
+                    "{display:?} keeps the 5h countdown at {w} columns: {account}"
+                );
+                assert!(
+                    account.contains("3d 5h"),
+                    "{display:?} keeps the 7d countdown at {w} columns: {account}"
+                );
+            }
+        }
+    }
+}
+
+/// The flattened buffer cells of one `draw_overview_accounts` frame, drawn
+/// with a caller-supplied readings snapshot rather than the app store's.
+fn band_rows(app: &App, readings: &ReadingsSnapshot, w: u16, h: u16) -> Vec<String> {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, readings))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// SHA-256 over the frame's rows (newline-terminated), hex-encoded, so a
+/// whole-frame byte pin stays a handful of hashes instead of hundreds of
+/// strings.
+fn frame_hash(rows: &[String]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for r in rows {
+        h.update(r.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The codex `↺ N` chip never pays with a claude name: above the cap the name
+/// column keeps its uncharged width (22 cells at the cap for these rosters),
+/// so a 20- and a 22-cell name render whole, and the chip shows only where
+/// room is left after that — with a 22-cell name column none is, so the chip
+/// hides whole; a short-name roster still shows it.
+#[test]
+fn the_chip_never_shrinks_a_claude_name_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = ["twenty-char-name-abc", "abcdefghijklmnopqrstuv"];
+    let codex = || {
+        vec![CodexRow {
+            name: crate::profile::ProfileName::from("cx1"),
+            active: false,
+            broken: false,
+            plan: Some("pro".to_string()),
+            five_hour: None,
+            seven_day: None,
+            resets: Some(12),
+            fetched_at: None,
+        }]
+    };
+    for display in [None, Some(ResetDisplay::Both)] {
+        let (mut config, readings) = config_with(
+            names.iter().map(|n| profile(n, 95.0, 42.0, 3600)).collect(),
+            Some("twenty-char-name-abc"),
+            vec![],
+        );
+        config.state.reset_display = display;
+        let mut app = App::new(config);
+        app.codex_rows = codex();
+        for w in [139u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            for name in names {
+                assert!(
+                    rows.iter().any(|r| r.contains(name)),
+                    "{display:?} keeps a {name} name whole at {w} columns: {rows:?}"
+                );
+            }
+            assert!(
+                !rows.iter().any(|r| r.contains("↺")),
+                "{display:?} hides the chip when the name column leaves no room at {w}: {rows:?}"
+            );
+        }
+    }
+
+    // Where room IS left, the chip still shows: a short-name roster's name
+    // column is 8 cells. In relative mode the gap-widened row leaves the chip
+    // its ride; in both mode the wall-clock stamps consume the cap's whole
+    // slack (the row fills 122 exactly), so the chip hides — the stamps outrank
+    // it once t/s has had its cells.
+    for display in [None, Some(ResetDisplay::Both)] {
+        let chip_shows = display.is_none();
+        let (mut config, readings) =
+            config_with(vec![profile("ax", 95.0, 42.0, 3600)], Some("ax"), vec![]);
+        config.state.reset_display = display;
+        let mut app = App::new(config);
+        app.codex_rows = codex();
+        for w in [139u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            assert_eq!(
+                rows.iter().any(|r| r.contains("↺ 12")),
+                chip_shows,
+                "{display:?} shows the chip exactly where room is left at {w} columns: {rows:?}"
+            );
+        }
+    }
+}
+
+/// A heading is prose, not a band column: the `shunt — not read: <reason>`
+/// line keeps the full inner width a too-long reason needs, instead of
+/// clipping `band_pad` cells early at the panel border.
+#[test]
+fn an_unread_shunt_reason_keeps_its_tail_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    let reason = "gateway refused the read and the retry ladder ran out before the probe window closed, leaving the pool unreadable for this session".to_string();
+    assert_eq!(reason.chars().count(), 130);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead(reason.clone());
+    let rows = accounts_rows(&app, 160, 12);
+    assert!(
+        rows.iter().any(|r| r.contains(reason.as_str())),
+        "the not-read reason renders whole at 160 columns: {rows:?}"
+    );
+}
+
+/// Per-frame FNV-1a of the clock/both band frames at 100..=126 columns,
+/// captured off the pre-band renderer (d01f99cb) with this exact fixture.
+/// The Clock and Both rows match at every width because the fixture's windows
+/// are reset-free — the display mode touches no byte below the cap — so the
+/// pin locks the column path, and the stamp-bearing cells below the cap are
+/// covered by the reset-mode sweep and the speed-column test.
+const CLOCK_BAND_FRAMES: &[(ResetDisplay, u16, &str)] = &[
+    (
+        ResetDisplay::Clock,
+        100,
+        "b2412ec01c5bbf6d2622ee96d9064419a99841602011499dd34f75f19546cc73",
+    ),
+    (
+        ResetDisplay::Clock,
+        101,
+        "ebba2fdaf3c68ec5a9cf0e195deaac878f763e0b17078a4c1c443aac34d238c0",
+    ),
+    (
+        ResetDisplay::Clock,
+        102,
+        "c10e5bca37fb85a72c0d4c00d80abccf490c70de5af0442f1968f93ee9f55812",
+    ),
+    (
+        ResetDisplay::Clock,
+        103,
+        "f0e75e8b98348363b2e10eb6c531f470f200727c520ef5a1149c43518af9eaa0",
+    ),
+    (
+        ResetDisplay::Clock,
+        104,
+        "165b38861e5bdca5ae061e28598ec737ba22ebef2148a21e77a0eb2c92804765",
+    ),
+    (
+        ResetDisplay::Clock,
+        105,
+        "98fcdd54aa480eb0ea4c624049cc712dd5e95372d8ced561d046470cddebeb37",
+    ),
+    (
+        ResetDisplay::Clock,
+        106,
+        "b3ad8fdc49f9e0054237e3803ff417c7353384b310003c24407dbdc0b0558c30",
+    ),
+    (
+        ResetDisplay::Clock,
+        107,
+        "3b383677350987eb639c06553743dfad21a44df7e9ba14379cfe29db9be28acd",
+    ),
+    (
+        ResetDisplay::Clock,
+        108,
+        "7705a7ef5de3ba2e196a7c97a33d670ec7b99dc94478d8a1cbb8dc22b9023051",
+    ),
+    (
+        ResetDisplay::Clock,
+        109,
+        "74450f3711a518f592d553f6ea9445b653854292400cd3c7b6de0d116eefebfc",
+    ),
+    (
+        ResetDisplay::Clock,
+        110,
+        "3b7e5f153f542e8e51f110099870239707434a965dadfdf634915f98292b6817",
+    ),
+    (
+        ResetDisplay::Clock,
+        111,
+        "935b7c6723bf3da9750dca5b37a6b3782695c3b37645e38617f1dd8067e4044e",
+    ),
+    (
+        ResetDisplay::Clock,
+        112,
+        "76b30956bbb5949b85dfb7b50c17482e9b55eeaf747dc925e09813a6717ca500",
+    ),
+    (
+        ResetDisplay::Clock,
+        113,
+        "47a19cfc51568ec7f45021e7eec293b26f4063c6d7854431219f1f29d455562d",
+    ),
+    (
+        ResetDisplay::Clock,
+        114,
+        "38ae7c533652e60265c7f2a235058d8751ee4d0f580c1abf63672d2daf2dcdf7",
+    ),
+    (
+        ResetDisplay::Clock,
+        115,
+        "47cb08e45da45cfabdd7a2277ad161f7e3ff1f1ba4e666f391526f5cc3645fc6",
+    ),
+    (
+        ResetDisplay::Clock,
+        116,
+        "411caacb4fc2e7a34e8b957df5e6640d5d76f412cb0af6364ebacfbdcb89a515",
+    ),
+    (
+        ResetDisplay::Clock,
+        117,
+        "257dc858804cf7e9cb01fc4295f12fbc79167d57122e66154da242ad56f3e1c1",
+    ),
+    (
+        ResetDisplay::Clock,
+        118,
+        "d003921cffb1b43139514e2c4c1d19913a945af41daa38f434496c89b2e13313",
+    ),
+    (
+        ResetDisplay::Clock,
+        119,
+        "309b6df6149dc25cce5ce1efed9f991e0eae5105715c48b423c11ff6e600b2ca",
+    ),
+    (
+        ResetDisplay::Clock,
+        120,
+        "4f3134fa91c652925f11be944bf3dc298120937a39253dbbd4622f0f30d2db3e",
+    ),
+    (
+        ResetDisplay::Clock,
+        121,
+        "57299969cce4a2bc9961b00110a4e9bb0a5d0348b64db5030d7ca55366d5856a",
+    ),
+    (
+        ResetDisplay::Clock,
+        122,
+        "4ccec46540ea24ce41f4d81645cf45f70f752ec9f8f5a64dd76438bb03b75337",
+    ),
+    (
+        ResetDisplay::Clock,
+        123,
+        "ea8f41741645130eef66ecbc43e7211775898ffa114b5576fef8f107bef57c7d",
+    ),
+    (
+        ResetDisplay::Clock,
+        124,
+        "d92b673f7405e7e84a54a013e61b99d7609444edc9f1c1141448e88b6ec422cf",
+    ),
+    (
+        ResetDisplay::Clock,
+        125,
+        "399f74530ded36e25a5f9f125a125c1c63b22e4318d10e583585ed9b93dd20fc",
+    ),
+    (
+        ResetDisplay::Clock,
+        126,
+        "60ef073e3e7142e814be399b3953d13cacabbbfbec15034942d383c67af4199b",
+    ),
+    (
+        ResetDisplay::Both,
+        100,
+        "b2412ec01c5bbf6d2622ee96d9064419a99841602011499dd34f75f19546cc73",
+    ),
+    (
+        ResetDisplay::Both,
+        101,
+        "ebba2fdaf3c68ec5a9cf0e195deaac878f763e0b17078a4c1c443aac34d238c0",
+    ),
+    (
+        ResetDisplay::Both,
+        102,
+        "c10e5bca37fb85a72c0d4c00d80abccf490c70de5af0442f1968f93ee9f55812",
+    ),
+    (
+        ResetDisplay::Both,
+        103,
+        "f0e75e8b98348363b2e10eb6c531f470f200727c520ef5a1149c43518af9eaa0",
+    ),
+    (
+        ResetDisplay::Both,
+        104,
+        "165b38861e5bdca5ae061e28598ec737ba22ebef2148a21e77a0eb2c92804765",
+    ),
+    (
+        ResetDisplay::Both,
+        105,
+        "98fcdd54aa480eb0ea4c624049cc712dd5e95372d8ced561d046470cddebeb37",
+    ),
+    (
+        ResetDisplay::Both,
+        106,
+        "b3ad8fdc49f9e0054237e3803ff417c7353384b310003c24407dbdc0b0558c30",
+    ),
+    (
+        ResetDisplay::Both,
+        107,
+        "3b383677350987eb639c06553743dfad21a44df7e9ba14379cfe29db9be28acd",
+    ),
+    (
+        ResetDisplay::Both,
+        108,
+        "7705a7ef5de3ba2e196a7c97a33d670ec7b99dc94478d8a1cbb8dc22b9023051",
+    ),
+    (
+        ResetDisplay::Both,
+        109,
+        "74450f3711a518f592d553f6ea9445b653854292400cd3c7b6de0d116eefebfc",
+    ),
+    (
+        ResetDisplay::Both,
+        110,
+        "3b7e5f153f542e8e51f110099870239707434a965dadfdf634915f98292b6817",
+    ),
+    (
+        ResetDisplay::Both,
+        111,
+        "935b7c6723bf3da9750dca5b37a6b3782695c3b37645e38617f1dd8067e4044e",
+    ),
+    (
+        ResetDisplay::Both,
+        112,
+        "76b30956bbb5949b85dfb7b50c17482e9b55eeaf747dc925e09813a6717ca500",
+    ),
+    (
+        ResetDisplay::Both,
+        113,
+        "47a19cfc51568ec7f45021e7eec293b26f4063c6d7854431219f1f29d455562d",
+    ),
+    (
+        ResetDisplay::Both,
+        114,
+        "38ae7c533652e60265c7f2a235058d8751ee4d0f580c1abf63672d2daf2dcdf7",
+    ),
+    (
+        ResetDisplay::Both,
+        115,
+        "47cb08e45da45cfabdd7a2277ad161f7e3ff1f1ba4e666f391526f5cc3645fc6",
+    ),
+    (
+        ResetDisplay::Both,
+        116,
+        "411caacb4fc2e7a34e8b957df5e6640d5d76f412cb0af6364ebacfbdcb89a515",
+    ),
+    (
+        ResetDisplay::Both,
+        117,
+        "257dc858804cf7e9cb01fc4295f12fbc79167d57122e66154da242ad56f3e1c1",
+    ),
+    (
+        ResetDisplay::Both,
+        118,
+        "d003921cffb1b43139514e2c4c1d19913a945af41daa38f434496c89b2e13313",
+    ),
+    (
+        ResetDisplay::Both,
+        119,
+        "309b6df6149dc25cce5ce1efed9f991e0eae5105715c48b423c11ff6e600b2ca",
+    ),
+    (
+        ResetDisplay::Both,
+        120,
+        "4f3134fa91c652925f11be944bf3dc298120937a39253dbbd4622f0f30d2db3e",
+    ),
+    (
+        ResetDisplay::Both,
+        121,
+        "57299969cce4a2bc9961b00110a4e9bb0a5d0348b64db5030d7ca55366d5856a",
+    ),
+    (
+        ResetDisplay::Both,
+        122,
+        "4ccec46540ea24ce41f4d81645cf45f70f752ec9f8f5a64dd76438bb03b75337",
+    ),
+    (
+        ResetDisplay::Both,
+        123,
+        "ea8f41741645130eef66ecbc43e7211775898ffa114b5576fef8f107bef57c7d",
+    ),
+    (
+        ResetDisplay::Both,
+        124,
+        "d92b673f7405e7e84a54a013e61b99d7609444edc9f1c1141448e88b6ec422cf",
+    ),
+    (
+        ResetDisplay::Both,
+        125,
+        "399f74530ded36e25a5f9f125a125c1c63b22e4318d10e583585ed9b93dd20fc",
+    ),
+    (
+        ResetDisplay::Both,
+        126,
+        "60ef073e3e7142e814be399b3953d13cacabbbfbec15034942d383c67af4199b",
+    ),
+];
+
+/// Below the cap the clock-mode band is untouched: at 100..=126 columns the
+/// clock and both frames draw byte-identical to the pre-band renderer. The
+/// fixture's windows carry no reset stamps, so the frames hold no wall-clock
+/// text and the pin is stable across runs; the countdown-bearing cells are
+/// pinned by the speed-column test above.
+#[test]
+fn the_clock_band_below_the_cap_is_byte_identical() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (display, w, want) in CLOCK_BAND_FRAMES {
+        let (app, readings) = clock_band_app(*display, false);
+        let rows = band_rows(&app, &readings, *w, 12);
+        assert_eq!(
+            frame_hash(&rows),
+            *want,
+            "the {display:?} frame at {w} columns must draw byte-identical below the cap"
+        );
+    }
 }
 
 /// A quarantined codex chain renders the same broken-login `×` the claude row
@@ -4307,7 +5102,7 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
         });
     }
     let (mut config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
-    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    config.state.reset_display = Some(ResetDisplay::Both);
     let app = App::new(config);
 
     let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
@@ -6070,10 +6865,11 @@ fn the_tps_cell_abbreviates_with_k_and_never_truncates() {
 /// The row never exceeds the pane in any reset mode: the wall-clock bonus
 /// yields to the t/s column only when the post-bonus row still fits. Swept at
 /// a whole reading and at a two-decimal one (which widens the 5h tier's
-/// excess), so the saturation path above excess 0 is charged too.
+/// excess), so the saturation path above excess 0 is charged too. Above the
+/// cap the renderer lays out banded at `OVERVIEW_MAX_W`, so the row is checked
+/// against the cap there and against the pane below it.
 #[test]
 fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
-    use crate::profile::ResetDisplay;
     let _home = crate::testutil::HomeSandbox::new();
     for mode in [
         ResetDisplay::Relative,
@@ -6087,7 +6883,13 @@ fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
             let mut app = App::new(config);
             app.set_tps(Some(tps_overview_snapshot(1_000)));
             for w in 95..=140u16 {
-                let widths = OverviewWidths::new(w, &app, &readings);
+                // Above the cap the renderer runs the banded layout at
+                // `OVERVIEW_MAX_W`; the model follows it.
+                let widths = if w > 126 {
+                    OverviewWidths::new_banded(OVERVIEW_MAX_W, &app, &readings)
+                } else {
+                    OverviewWidths::new(w, &app, &readings)
+                };
                 let row_w = super::fixed_overview_width_cols(
                     widths.name,
                     widths.kind,
@@ -6097,9 +6899,15 @@ fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
                     widths.tps,
                     widths.gap,
                 ) + super::TIMER_SLOT;
+                // Below the cap the row may fill the pane; above it, the cap.
+                let bound = if w > 126 {
+                    usize::from(OVERVIEW_MAX_W)
+                } else {
+                    w as usize
+                };
                 assert!(
-                    row_w <= w as usize,
-                    "{mode:?} at {w} (util {util}): {row_w} > {w}"
+                    row_w <= bound,
+                    "{mode:?} at {w} (util {util}): {row_w} > {bound}"
                 );
             }
         }
