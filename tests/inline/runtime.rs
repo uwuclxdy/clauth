@@ -20474,6 +20474,251 @@ fn the_revoked_bearer_queue_dedupes_and_survives_a_drain_that_cannot_run() {
     assert!(take_revoked_bearers().is_empty(), "taking empties it");
 }
 
+fn drain_live(profile: &str, session: &str) -> LiveRuntime {
+    LiveRuntime {
+        runtime: PathBuf::from(format!("/nonexistent/runtime-{session}")),
+        profile: crate::profile::ProfileName::from(profile),
+        session: session.to_string(),
+        background: false,
+    }
+}
+
+fn queued(pairs: &[(&str, &str)]) -> Vec<(crate::profile::ProfileName, String)> {
+    pairs
+        .iter()
+        .map(|(m, r)| (crate::profile::ProfileName::from(*m), (*r).to_string()))
+        .collect()
+}
+
+/// A drain settles a pair only once every one of its member's sessions is
+/// settled: an item written or one no longer holding the bearer settles its
+/// session, while a leg that failed (a locked Keychain or any other error)
+/// or found the sidecar not ready yet keeps the pair queued. A pair's other
+/// sessions still run after one fails, and each leg sees the pair's `logged`
+/// flag unset.
+#[test]
+fn a_drain_requeues_a_pair_until_every_session_settles() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![
+        drain_live("written", "1-0"),
+        drain_live("moved", "2-0"),
+        drain_live("notyet", "3-0"),
+        drain_live("locked", "4-0"),
+        drain_live("multi", "5-0"),
+        drain_live("multi", "6-0"),
+    ];
+    for member in ["written", "moved", "notyet", "locked", "multi"] {
+        note_revoked_rolling_bearer(
+            &crate::profile::ProfileName::from(member),
+            format!("old-{member}"),
+        );
+    }
+    let mut legs = Vec::new();
+    let now = Instant::now();
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |member, revoked, session, logged: &mut bool| {
+            legs.push(format!("{member}/{revoked}/{}/{logged}", session.session));
+            match (member.as_str(), session.session.as_str()) {
+                ("written", _) | ("multi", "6-0") => Ok(ItemRepoint::Written),
+                ("moved", _) => Ok(ItemRepoint::NotHeld),
+                ("notyet", _) => Ok(ItemRepoint::NotYet),
+                _ => Err(anyhow::anyhow!("keychain locked")),
+            }
+        },
+    );
+    assert_eq!(
+        legs,
+        vec![
+            "written/old-written/1-0/false",
+            "moved/old-moved/2-0/false",
+            "notyet/old-notyet/3-0/false",
+            "locked/old-locked/4-0/false",
+            "multi/old-multi/5-0/false",
+            "multi/old-multi/6-0/false",
+        ],
+        "every pair reaches each of its member's sessions, the failed pair's second one included"
+    );
+    assert_eq!(
+        take_revoked_bearers(),
+        queued(&[
+            ("notyet", "old-notyet"),
+            ("locked", "old-locked"),
+            ("multi", "old-multi"),
+        ]),
+        "a failed or not-yet leg keeps its pair queued; a written or no-longer-held one settles it"
+    );
+}
+
+/// The macOS item leg writes the blob the mutating rule changed: it must call
+/// `repoint_copied_bearer` (which swaps the bearer in), never only the
+/// predicate, before its `put_blob_at`. Pinned by source because the leg runs
+/// against a real Keychain alone.
+#[test]
+fn the_item_leg_writes_the_blob_the_rule_rewrote() {
+    let code = code_tokens_only(include_str!("../../src/keychain.rs"));
+    let start = code
+        .find("fn repoint_config_dir_item_bearer(")
+        .expect("the item leg exists");
+    let body = &code[start..];
+    let body = &body[..body.find("\n}\n").expect("the item leg's closing brace")];
+    let rewrite = body
+        .find("crate::claude::repoint_copied_bearer(&mut blob,")
+        .expect("the leg rewrites the blob through the mutating rule");
+    let write = body
+        .find("put_blob_at(&service, &account, &blob)")
+        .expect("the leg writes that same blob");
+    assert!(
+        rewrite < write,
+        "the blob is rewritten before it is written"
+    );
+}
+
+/// What a test leg answers on one drain attempt.
+#[derive(Clone, Copy)]
+enum Answer {
+    Locked,
+    Failed,
+    NotYet,
+    Written,
+}
+
+/// A re-queued pair waits before its next attempt: 1 s after the first
+/// failure or not-yet, then doubling (the swap item retry's backoff). A
+/// failure is logged once per pair: the flag the leg sets when it logs
+/// survives the re-queue, and a quiet locked-Keychain attempt leaves it unset.
+#[test]
+fn a_requeued_pair_backs_off_and_logs_a_failure_once() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let t0 = Instant::now();
+    let far = t0 + Duration::from_secs(600);
+    let mut attempts = Vec::new();
+    let drain_at = |at: Duration, attempts: &mut Vec<(Duration, bool)>, answer: Answer| {
+        drain_revoked_bearers_with(&sessions, t0 + at, far, |_, _, _, logged: &mut bool| {
+            attempts.push((at, *logged));
+            match answer {
+                Answer::Locked => Err(anyhow::anyhow!("keychain locked")),
+                Answer::Failed => {
+                    *logged = true;
+                    Err(anyhow::anyhow!("write failed"))
+                }
+                Answer::NotYet => Ok(ItemRepoint::NotYet),
+                Answer::Written => Ok(ItemRepoint::Written),
+            }
+        });
+    };
+    drain_at(Duration::ZERO, &mut attempts, Answer::Locked);
+    drain_at(Duration::from_millis(500), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(1), &mut attempts, Answer::Failed);
+    drain_at(Duration::from_millis(2500), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(3), &mut attempts, Answer::NotYet);
+    drain_at(Duration::from_secs(6), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(7), &mut attempts, Answer::Written);
+    assert_eq!(
+        attempts,
+        vec![
+            (Duration::ZERO, false),
+            (Duration::from_secs(1), false),
+            (Duration::from_secs(3), true),
+            (Duration::from_secs(7), true),
+        ],
+        "attempts run at 0 s, +1 s, +2 s, then +4 s (a not-yet backs off like a failure); \
+         a quiet locked attempt leaves the next failure to log, and a logged one stays logged"
+    );
+    assert!(
+        take_revoked_bearers().is_empty(),
+        "the written item settles the pair"
+    );
+}
+
+/// A pair the drain's deadline cut off stays queued and stays due: it did not
+/// fail, so it takes no backoff.
+#[test]
+fn a_pair_the_deadline_cut_off_stays_due() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let now = Instant::now();
+    let mut ran = 0;
+    drain_revoked_bearers_with(&sessions, now, Instant::now(), |_, _, _, _| {
+        ran += 1;
+        Ok(ItemRepoint::Written)
+    });
+    assert_eq!(ran, 0, "a spent deadline runs no leg");
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 1, "the cut-off pair is due at once on the next drain");
+    assert!(take_revoked_bearers().is_empty());
+}
+
+/// A pair whose first session failed and whose second the deadline then cut
+/// off is a failed pair: it backs off rather than staying due.
+#[test]
+fn a_failed_pair_the_deadline_also_cut_off_backs_off() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0"), drain_live("acct", "2-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let now = Instant::now();
+    let mut legs = Vec::new();
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        Instant::now() + Duration::from_millis(500),
+        |_, _, session, _| {
+            legs.push(session.session.clone());
+            std::thread::sleep(Duration::from_millis(600));
+            Err(anyhow::anyhow!("write failed"))
+        },
+    );
+    assert_eq!(
+        legs,
+        vec!["1-0"],
+        "the deadline passed during the first leg"
+    );
+    let mut ran = 0;
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 0, "the failed pair is not due again at once");
+    drain_revoked_bearers_with(
+        &sessions,
+        now + Duration::from_secs(1),
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 2, "it is due after its 1 s backoff, for both sessions");
+    assert!(take_revoked_bearers().is_empty());
+}
+
 /// The adopting witness refuses a tree the session does not own, records
 /// nothing then, and refuses while a sweep's delete of the item is in flight.
 #[test]

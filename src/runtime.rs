@@ -10382,20 +10382,33 @@ pub(crate) fn sessions_on_member(live: Vec<LiveRuntime>, member: &ProfileName) -
 }
 
 /// Rolling bearers a stamp revoked, waiting for [`repoint_copied_bearers`]:
-/// `(member, revoked bearer)`. A process-wide queue, so a stamp made inside a
+/// the member, the revoked bearer, when the next attempt is due with the
+/// backoff it now waits ([`next_item_retry_gap`]), and whether a failure of
+/// it is already in the log. A new pair is due at once with a zero gap, so its
+/// first attempt may run as soon as a drain does.
+#[derive(Debug)]
+struct QueuedRevokedBearer {
+    member: ProfileName,
+    revoked: String,
+    due: Instant,
+    gap: Duration,
+    logged: bool,
+}
+
+/// The re-points above. A process-wide queue, so a stamp made inside a
 /// state-flock hold or an armed subprocess budget is re-pointed by the next
 /// drain that runs outside both. Per thread under test, so sibling tests do
 /// not see each other's stamps.
 #[cfg(not(test))]
-static REVOKED_BEARERS: std::sync::Mutex<Vec<(ProfileName, String)>> =
+static REVOKED_BEARERS: std::sync::Mutex<Vec<QueuedRevokedBearer>> =
     std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 thread_local! {
-    static REVOKED_BEARERS: std::cell::RefCell<Vec<(ProfileName, String)>> =
+    static REVOKED_BEARERS: std::cell::RefCell<Vec<QueuedRevokedBearer>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn with_revoked_bearers<R>(f: impl FnOnce(&mut Vec<(ProfileName, String)>) -> R) -> R {
+fn with_revoked_bearers<R>(f: impl FnOnce(&mut Vec<QueuedRevokedBearer>) -> R) -> R {
     #[cfg(not(test))]
     {
         let mut queue = REVOKED_BEARERS
@@ -10409,6 +10422,20 @@ fn with_revoked_bearers<R>(f: impl FnOnce(&mut Vec<(ProfileName, String)>) -> R)
     }
 }
 
+/// Queue `entry` for [`repoint_copied_bearers`], keeping the timer of a pair
+/// already queued: a stamp that revokes the same bearer again asks for the
+/// same re-point, and starting it over could only postpone a failing pair.
+fn queue_revoked_bearer(entry: QueuedRevokedBearer) {
+    with_revoked_bearers(|q| {
+        if !q
+            .iter()
+            .any(|e| e.member == entry.member && e.revoked == entry.revoked)
+        {
+            q.push(entry);
+        }
+    });
+}
+
 /// Record that a stamp of `member`'s sidecar revoked `revoked`
 /// ([`crate::claude::revoked_by_stamp`]). Only macOS keeps per-session items,
 /// so elsewhere nothing is queued outside tests.
@@ -10416,27 +10443,33 @@ pub(crate) fn note_revoked_rolling_bearer(member: &ProfileName, revoked: String)
     if !(cfg!(target_os = "macos") || cfg!(test)) {
         return;
     }
-    with_revoked_bearers(|q| {
-        if !q.iter().any(|(m, r)| m == member && *r == revoked) {
-            q.push((member.clone(), revoked));
-        }
+    queue_revoked_bearer(QueuedRevokedBearer {
+        member: member.clone(),
+        revoked,
+        due: Instant::now(),
+        gap: Duration::ZERO,
+        logged: false,
     });
 }
 
-/// Take the queued `(member, revoked bearer)` pairs. For the drain and tests.
+/// Take the queued `(member, revoked bearer)` pairs, in queue order. For
+/// tests: [`drain_revoked_bearers_with`] takes only the pairs due at its
+/// `now` and leaves the rest queued.
 #[cfg_attr(
-    not(any(target_os = "macos", test)),
-    allow(
-        dead_code,
-        reason = "the only caller is the macOS copied-bearer re-point"
-    )
+    not(test),
+    allow(dead_code, reason = "only the tests take the whole queue back")
 )]
 pub(crate) fn take_revoked_bearers() -> Vec<(ProfileName, String)> {
-    with_revoked_bearers(std::mem::take)
+    with_revoked_bearers(|q| {
+        std::mem::take(q)
+            .into_iter()
+            .map(|e| (e.member, e.revoked))
+            .collect()
+    })
 }
 
-/// How long one drain may spend on Keychain legs, across every session.
-/// Sessions it does not reach are queued again for the next drain.
+/// How long one drain may spend on Keychain legs, across every pair. A pair
+/// the deadline cuts short is queued again for the next drain.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -10450,39 +10483,195 @@ const REPOINT_DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// bearer a stamp just revoked (see `wiki/Auto-Switch.md`). Called right
 /// after the stamp's callers release their locks: a drain inside a state-flock
 /// hold or an armed subprocess budget does nothing and leaves the queue for
-/// the next one, so no Keychain leg ever runs under either. macOS only; a
-/// no-op elsewhere and under `cfg(test)`, where `keychain::enabled()` is
-/// false.
+/// the next one, so no Keychain leg ever runs under either. Each pair due now
+/// runs through [`drain_revoked_bearers_with`], which backs a failed one off
+/// and leaves one the deadline cut short due, so the next drain retries it.
+/// macOS only; a no-op elsewhere and under `cfg(test)`, where
+/// `keychain::enabled()` is false.
 pub(crate) fn repoint_copied_bearers() {
     #[cfg(target_os = "macos")]
     {
+        let now = Instant::now();
         if !crate::keychain::enabled()
             || crate::lock::state_lock_held()
             || crate::lock::armed_budget_remaining().is_some()
+            || with_revoked_bearers(|q| q.iter().all(|e| e.due > now))
         {
             return;
         }
-        let queued = take_revoked_bearers();
-        if queued.is_empty() {
-            return;
-        }
-        let deadline = Instant::now() + REPOINT_DRAIN_BUDGET;
+        let deadline = now + REPOINT_DRAIN_BUDGET;
         let live = live_session_runtime_dirs();
-        for (member, revoked) in queued {
-            let targets = sessions_on_member(live.clone(), &member);
-            if !repoint_member_sessions(&member, &revoked, targets, deadline) {
-                note_revoked_rolling_bearer(&member, revoked);
+        let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
+        drain_revoked_bearers_with(
+            &live,
+            now,
+            deadline,
+            |member, revoked, live, logged: &mut bool| {
+                let Ok(sidecar) =
+                    crate::profile::profile_dir(member).map(|d| d.join("session-token.json"))
+                else {
+                    return Ok(ItemRepoint::NotHeld);
+                };
+                let Ok(service) = crate::keychain::keychain_service_for_config_dir(&live.runtime)
+                else {
+                    return Ok(ItemRepoint::NotHeld);
+                };
+                let is_owned = owned.contains(&service);
+                if !is_owned
+                    && !session_item_may_adopt(&live.runtime, &live.session, live.background)
+                {
+                    return Ok(ItemRepoint::NotHeld);
+                }
+                let outcome = owned_keychain_leg(
+                    KEYCHAIN_MIRROR_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+                    || {
+                        if is_owned {
+                            namespaced_keychain_ledger::authorize_owned_write(&live.runtime)
+                        } else {
+                            namespaced_keychain_ledger::authorize_live_write(
+                                &live.runtime,
+                                &live.profile,
+                                &live.session,
+                                live.background,
+                            )
+                        }
+                    },
+                    |owned| {
+                        crate::keychain::repoint_config_dir_item_bearer(
+                            &live.runtime,
+                            owned,
+                            revoked,
+                            &sidecar,
+                            member,
+                        )
+                    },
+                );
+                match outcome {
+                    Ok(ItemRepoint::Written) => {
+                        logline!(
+                            "clauth: session {} held a copy of '{member}' rolling bearer that its last \
+                         re-stamp replaced; its per-session Keychain item now holds the current one",
+                            live.session
+                        );
+                        Ok(ItemRepoint::Written)
+                    }
+                    Ok(outcome) => Ok(outcome),
+                    Err(e) => {
+                        if !*logged && !crate::keychain::failed_on_locked_keychain(&e) {
+                            logline!(
+                                "clauth: could not re-point session {}'s per-session Keychain item at \
+                             '{member}' current rolling bearer: {e:#}",
+                                live.session
+                            );
+                            *logged = true;
+                        }
+                        if e.downcast_ref::<crate::keychain::ItemReadFailed>()
+                            .is_some()
+                        {
+                            Ok(ItemRepoint::NotHeld)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            },
+        );
+    }
+}
+
+/// Drain the queued re-points due at `now`, running `leg` once for each of a
+/// pair's member's live sessions. Its `&mut bool` is the pair's "a failure is
+/// already in the log" flag, which persists across retries: a leg logs a
+/// failure only while it is unset and sets it when it does, so a pair logs one
+/// failure however long it retries.
+///
+/// A pair settles once `leg` has settled each of its member's sessions:
+/// [`ItemRepoint::Written`] (the item now holds the current bearer) and
+/// [`ItemRepoint::NotHeld`] (nothing there to re-point, ever) each settle
+/// one. A pair with a leg that returned `Err` or
+/// [`ItemRepoint::NotYet`] is queued again after [`next_item_retry_gap`],
+/// taking that backoff even when the deadline also cut it short, and its
+/// other sessions still run. A pair the deadline cut short (its check,
+/// `Instant::now() >= deadline`, runs before each leg) with no failed leg is
+/// queued again with its timer unchanged, so it stays due. A pair whose
+/// member has no live session settles here: no leg would ever run for it.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller outside tests is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn drain_revoked_bearers_with(
+    live: &[LiveRuntime],
+    now: Instant,
+    deadline: Instant,
+    mut leg: impl FnMut(&ProfileName, &str, &LiveRuntime, &mut bool) -> Result<ItemRepoint>,
+) {
+    let due = with_revoked_bearers(|q| {
+        let (due, later) = std::mem::take(q).into_iter().partition(|e| e.due <= now);
+        *q = later;
+        due
+    });
+    for mut entry in due {
+        let mut failed = false;
+        let mut cut_short = false;
+        for target in sessions_on_member(live.to_vec(), &entry.member) {
+            if Instant::now() >= deadline {
+                cut_short = true;
+                break;
             }
+            match leg(&entry.member, &entry.revoked, &target, &mut entry.logged) {
+                Ok(ItemRepoint::Written | ItemRepoint::NotHeld) => {}
+                Ok(ItemRepoint::NotYet) | Err(_) => failed = true,
+            }
+        }
+        if failed {
+            let gap = next_item_retry_gap(entry.gap);
+            queue_revoked_bearer(QueuedRevokedBearer {
+                due: now + gap,
+                gap,
+                ..entry
+            });
+        } else if cut_short {
+            queue_revoked_bearer(entry);
         }
     }
 }
 
+/// What one session's re-point leg found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller outside tests is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) enum ItemRepoint {
+    /// The item now holds the current rolling bearer.
+    Written,
+    /// Nothing this leg can ever re-point: the item no longer holds the
+    /// revoked bearer or none exists, or the session's item is one clauth
+    /// may not write (no ledger row and not adoptable, no derivable service
+    /// or profile dir) or cannot read (macOS `keychain::ItemReadFailed`).
+    /// Settled for good.
+    NotHeld,
+    /// The item still holds the revoked bearer, but the sidecar cannot
+    /// replace it yet.
+    NotYet,
+}
+
 /// [`repoint_copied_bearers`] on a detached thread, for the daemon's run
-/// loop: only when something is queued, and never two at once.
+/// loop: only when a pair is due, and never two at once.
 pub(crate) fn repoint_copied_bearers_detached() {
     use std::sync::atomic::{AtomicBool, Ordering as O};
     static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if cfg!(test) || with_revoked_bearers(|q| q.is_empty()) || IN_FLIGHT.swap(true, O::AcqRel) {
+    let now = Instant::now();
+    if cfg!(test)
+        || with_revoked_bearers(|q| q.iter().all(|e| e.due > now))
+        || IN_FLIGHT.swap(true, O::AcqRel)
+    {
         return;
     }
     let spawned = std::thread::Builder::new()
@@ -10494,74 +10683,6 @@ pub(crate) fn repoint_copied_bearers_detached() {
     if spawned.is_err() {
         IN_FLIGHT.store(false, O::Release);
     }
-}
-
-/// macOS: re-point each of `targets`' items holding `revoked`, returning
-/// `false` when the drain's deadline cut it short (the caller queues the pair
-/// again; the sessions already re-pointed then read as caught up).
-#[cfg(target_os = "macos")]
-fn repoint_member_sessions(
-    member: &ProfileName,
-    revoked: &str,
-    targets: Vec<LiveRuntime>,
-    deadline: Instant,
-) -> bool {
-    let Ok(sidecar) = crate::profile::profile_dir(member).map(|d| d.join("session-token.json"))
-    else {
-        return true;
-    };
-    let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
-    for live in targets {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        let Ok(service) = crate::keychain::keychain_service_for_config_dir(&live.runtime) else {
-            continue;
-        };
-        let is_owned = owned.contains(&service);
-        if !is_owned && !session_item_may_adopt(&live.runtime, &live.session, live.background) {
-            continue;
-        }
-        let outcome = owned_keychain_leg(
-            KEYCHAIN_MIRROR_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
-            || {
-                if is_owned {
-                    namespaced_keychain_ledger::authorize_owned_write(&live.runtime)
-                } else {
-                    namespaced_keychain_ledger::authorize_live_write(
-                        &live.runtime,
-                        &live.profile,
-                        &live.session,
-                        live.background,
-                    )
-                }
-            },
-            |owned| {
-                crate::keychain::repoint_config_dir_item_bearer(
-                    &live.runtime,
-                    owned,
-                    revoked,
-                    &sidecar,
-                    member,
-                )
-            },
-        );
-        match outcome {
-            Ok(true) => logline!(
-                "clauth: session {} held a copy of '{member}' rolling bearer that its last \
-                 re-stamp replaced; its per-session Keychain item now holds the current one",
-                live.session
-            ),
-            Ok(false) => {}
-            Err(e) if crate::keychain::failed_on_locked_keychain(&e) => {}
-            Err(e) => logline!(
-                "clauth: could not re-point session {}'s per-session Keychain item at \
-                 '{member}' current rolling bearer: {e:#}",
-                live.session
-            ),
-        }
-    }
-    true
 }
 
 /// Which Keychain arm a session start takes, derived from the install source
