@@ -1362,7 +1362,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         .map_err(cli_err)?;
     outln!(
         "clauth: login complete.\n{}",
-        oauth_login::login_summary(&outcome.credentials)
+        oauth_login::login_summary(&outcome.credentials, outcome.plan.as_ref())
     );
     // The uuid the login's own verification probe saw rides the snapshot to
     // whichever action commits it, which is what anchors the profile — so

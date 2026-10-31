@@ -409,6 +409,7 @@ fn seed_flag_states() {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -459,6 +460,7 @@ fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
                 codex_plan: None,
                 email: None,
@@ -610,6 +612,7 @@ fn seed_canceled_account() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,

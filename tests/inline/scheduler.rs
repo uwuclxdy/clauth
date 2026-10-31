@@ -2089,6 +2089,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         }),
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -2109,6 +2110,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: Some(address.clone()),
@@ -2191,6 +2193,7 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     crate::testutil::register_names(&["cold"]);
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -2267,6 +2270,7 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
         }),
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -2283,6 +2287,7 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
 
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -14536,6 +14541,7 @@ fn pre_rotation_serves_a_live_body() {
     let info = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -14559,12 +14565,13 @@ fn pre_rotation_429_on_a_valid_token_bails_rate_limited_with_plan() {
 
     let err = FetchError::RateLimited {
         retry_after: Some(Duration::from_secs(30)),
-        plan: Some(PlanInfo {
+        plan: Some(Box::new(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
-        }),
+        })),
     };
     // token_clock_expired == false: a still-valid token's 429 is a pure
     // endpoint rate limit — bail to cache, plan and retry_after both intact.
@@ -14598,12 +14605,13 @@ fn pre_rotation_429_on_an_expired_token_rotates_and_drops_the_plan() {
 
     let with_hint = FetchError::RateLimited {
         retry_after: Some(Duration::from_secs(5)),
-        plan: Some(PlanInfo {
+        plan: Some(Box::new(PlanInfo {
             tier: PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
-        }),
+        })),
     };
     // token_clock_expired == true: falls through to rotation. The `Rotate`
     // variant has no plan field at all — the dead-token plan is dropped by
@@ -17221,6 +17229,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
             }),
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -19560,6 +19569,7 @@ const CANCELED_PROFILE_BODY: &str = r#"{"account":{"uuid":"uuid-1"},
 fn active_pro_plan() -> crate::usage::PlanInfo {
     crate::usage::PlanInfo {
         tier: crate::usage::PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: Some("active".to_string()),
         codex_plan: None,
         email: None,

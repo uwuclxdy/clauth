@@ -2421,6 +2421,7 @@ fn status_body_never_leaks_a_credential() {
     let reading = |utilization: f64| crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,
@@ -2790,6 +2791,7 @@ fn status_schema_agrees_with_the_serialized_body() {
     let oauth_reading = crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,

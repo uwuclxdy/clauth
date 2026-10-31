@@ -1339,6 +1339,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         crate::usage::UsageInfo {
             plan: Some(crate::usage::PlanInfo {
                 tier: crate::usage::PlanTier::Max(Some(20)),
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,
@@ -1367,12 +1368,61 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
     assert!(
-        plan_row.contains("Claude Max 20x"),
+        plan_row.contains("Claude Ultra"),
         "hybrid plan row shows its fetched tier, got {plan_row:?}"
     );
     assert!(
         !plan_row.contains("api"),
         "hybrid plan row must not fall through to the bare 'api' literal, got {plan_row:?}"
+    );
+}
+
+/// The Usage plan row reads the server's own plan name like every other plan
+/// surface; the token stamp and the local map would both say `Claude Max`.
+#[test]
+fn header_lines_plan_shows_the_server_plan_name() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("named"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "named",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(5)),
+                plan_display_name: Some("Ultra Lite".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        plan_row.contains("Claude Ultra Lite"),
+        "the plan row shows the server's name, got {plan_row:?}"
     );
 }
 
@@ -1729,6 +1779,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -1807,6 +1858,7 @@ fn status_lines_name_an_organizations_refusal_apart_from_a_canceled_plan() {
             UsageInfo {
                 plan: Some(PlanInfo {
                     tier: PlanTier::Free,
+                    plan_display_name: None,
                     subscription_status: Some(status.to_string()),
                     codex_plan: None,
                     email: None,
@@ -1840,6 +1892,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,

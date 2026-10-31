@@ -285,6 +285,17 @@ fn account_type_label_dashes_an_unfetched_plan() {
     assert_eq!(account_type_label(&unclassified, None), NO_DATA);
 }
 
+/// A server plan name is an answer on its own: an unclassified tier beside it
+/// still shows the name, never the no-data dash.
+#[test]
+fn account_type_label_shows_the_server_name_of_an_unclassified_tier() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("u"));
+    let mut usage = serde_json::to_value(crate::usage::UsageInfo::default()).expect("serializes");
+    usage["plan"] = serde_json::json!({"tier": "Unknown", "plan_display_name": "Ultra Lite"});
+    let usage: crate::usage::UsageInfo = serde_json::from_value(usage).expect("reads");
+    assert_eq!(account_type_label(&profile, Some(&usage)), "Ultra Lite");
+}
+
 /// The other direction: a fetched tier still loses only its `Claude ` prefix,
 /// `Free` is untouched, and an api-key profile still reads `API`.
 #[test]
@@ -292,6 +303,7 @@ fn account_type_label_keeps_every_known_tier() {
     let plan = |tier| crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -301,7 +313,19 @@ fn account_type_label_keeps_every_known_tier() {
 
     let max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let max_usage = plan(crate::usage::PlanTier::Max(Some(20)));
-    assert_eq!(account_type_label(&max, Some(&max_usage)), "Max 20x");
+    assert_eq!(account_type_label(&max, Some(&max_usage)), "Ultra");
+
+    let named = crate::testutil::blank_profile(&crate::profile::ProfileName::from("n"));
+    let mut named_usage =
+        serde_json::to_value(plan(crate::usage::PlanTier::Max(Some(5)))).expect("serializes");
+    named_usage["plan"]["plan_display_name"] = serde_json::json!("Ultra Lite");
+    let named_usage: crate::usage::UsageInfo =
+        serde_json::from_value(named_usage).expect("reads back");
+    assert_eq!(
+        account_type_label(&named, Some(&named_usage)),
+        "Ultra Lite",
+        "the server's plan name outranks the local map"
+    );
 
     let free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     let free_usage = plan(crate::usage::PlanTier::Free);

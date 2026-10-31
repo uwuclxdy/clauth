@@ -287,6 +287,7 @@ fn oauth_profile(
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,

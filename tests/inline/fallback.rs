@@ -53,6 +53,7 @@ fn canceled_usage() -> UsageInfo {
         five_hour: Some(window(5.0, Some(live_reset()))),
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -8419,6 +8420,7 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     let mut canceled_usage = start_walk_usage(240, 5.0, 10.0);
     canceled_usage.plan = Some(PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_owned()),
         codex_plan: None,
         email: None,
@@ -8480,6 +8482,7 @@ fn start_walk_blocks_an_organizations_refusal_apart_from_a_canceled_plan() {
         let mut usage = start_walk_usage(240, 5.0, 10.0);
         usage.plan = Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some(status.to_owned()),
             codex_plan: None,
             email: None,

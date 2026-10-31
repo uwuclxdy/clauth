@@ -57,11 +57,11 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 }
 
 /// Human account-tier label for an OAuth profile, preferring the fetched plan
-/// tier (carries the Max multiplier, e.g. `Max 5x`) over the bare OAuth
-/// `subscription_type` token (`max`). Read straight off the on-disk `/profile`
-/// cache, so it holds even before this session's first live fetch. `None` for
-/// third-party/api-key profiles and when neither a fetched plan nor a token hint
-/// is on disk.
+/// (the server's own plan name when it sends one, else the local tier map) over
+/// the bare OAuth `subscription_type` token (`max`). Read straight off the
+/// on-disk `/profile` cache, so it holds even before this session's first live
+/// fetch. `None` for third-party/api-key profiles and when neither a fetched
+/// plan nor a token hint is on disk.
 ///
 /// Cancellation is a STATUS, not a tier: the org drops to `claude_free` when a
 /// subscription is canceled, so a `Free` reading already carries it, and the
@@ -70,9 +70,9 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.usage_cache_is_third_party() {
         return None;
     }
-    let fetched = cached_plan(&profile.name).filter(|p| p.tier != PlanTier::Unknown);
+    let fetched = cached_plan(&profile.name).filter(PlanInfo::is_classified);
     match fetched {
-        Some(plan) => plan.tier.short_label(),
+        Some(plan) => plan.short_label(),
         None => {
             let sub = profile
                 .credentials

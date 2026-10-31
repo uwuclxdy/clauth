@@ -1155,8 +1155,11 @@ pub(crate) fn parse_manual_code(
 /// A one-glance summary of a captured login for the `clauth login` CLI. Never
 /// prints the tokens — just a sha256 prefix of the refresh token (proves it is
 /// real and lets you confirm it differs from other profiles), the granted
-/// scopes, and the access-token expiry.
-pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
+/// scopes, the access-token expiry, and the plan. The plan line prefers the
+/// login's own `/profile` probe over the token stamp: the probe answering is
+/// itself proof the minted token works, and an Ultra organization stamps no
+/// `subscription_type` at all.
+pub(crate) fn login_summary(creds: &ClaudeCredentials, plan: Option<&PlanInfo>) -> String {
     let Some(oauth) = creds.claude_ai_oauth.as_ref() else {
         return "  (no OAuth block captured)".to_string();
     };
@@ -1183,19 +1186,26 @@ pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
         .expires_at
         .map(|ms| format!("{}s from now", (ms - now_ms() as i64) / 1000))
         .unwrap_or_else(|| "(unknown)".to_string());
-    // The plan tier is stamped from a live `/profile` probe in `finish_login`,
-    // so a present value doubles as proof the minted token works against the API.
-    let plan = match oauth.subscription_type.as_deref() {
+    // The login's `/profile` probe in `finish_login` answered this very mint,
+    // so its plan needs no corroboration from the token stamp; that stamp stays
+    // the fallback for a probe that classified nothing.
+    let probed = plan
+        .filter(|p| p.is_classified())
+        .and_then(PlanInfo::display);
+    let plan = match probed {
+        Some(label) => format!("  plan: {label} (token verified against the API)"),
         // An unclassifiable claim still proves the token works, so echo it raw
         // rather than dropping the line or naming a tier the token never made.
-        Some(sub) => {
-            let tier = crate::usage::PlanTier::from_subscription_type(Some(sub)).display();
-            format!(
-                "  plan: {} (token verified against the API)",
-                tier.as_deref().unwrap_or(sub)
-            )
-        }
-        None => "  plan: will populate on the first usage refresh".to_string(),
+        None => match oauth.subscription_type.as_deref() {
+            Some(sub) => {
+                let tier = crate::usage::PlanTier::from_subscription_type(Some(sub)).display();
+                format!(
+                    "  plan: {} (token verified against the API)",
+                    tier.as_deref().unwrap_or(sub)
+                )
+            }
+            None => "  plan: will populate on the first usage refresh".to_string(),
+        },
     };
     format!(
         "  refresh sha256: {sha}...\n  scopes: {scopes}\n  access token expires: {expiry}\n{plan}"

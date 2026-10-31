@@ -220,7 +220,7 @@ pub(crate) struct ProfileEntry {
     /// The third-party endpoint, `None` for the default Anthropic one.
     #[schema(required = true)]
     pub(crate) base_url: Option<String>,
-    /// Human tier label for an anthropic account (`Max 5x`); `None` for
+    /// Human tier label for an anthropic account (`Max`); `None` for
     /// third-party/api-key profiles.
     #[schema(required = true)]
     pub(crate) tier: Option<String>,

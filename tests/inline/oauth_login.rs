@@ -425,10 +425,74 @@ fn login_summary_names_the_plan_a_free_login_stored() {
         }),
     };
     assert!(
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
             .contains("  plan: Claude Free (token verified against the API)"),
         "got: {}",
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
+    );
+}
+
+fn token_stamped(sub: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: sub.map(str::to_string),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The login's own `/profile` probe knows the plan better than the bare token
+/// stamp: a 20x Max login stamps `max` but reads as Ultra.
+#[test]
+fn login_summary_names_the_plan_the_probe_read_over_the_token_stamp() {
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(20)),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&plan));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// An Ultra organization mints no token stamp, yet its probe still named the
+/// plan, and the server's own name wins there too.
+#[test]
+fn login_summary_names_a_probed_plan_when_the_token_has_no_stamp() {
+    let ultra = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Ultra,
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(None), Some(&ultra));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+    let named = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        plan_display_name: Some("Ultra Lite".to_string()),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&named));
+    assert!(
+        summary.contains("  plan: Claude Ultra Lite (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// A probe that classified nothing is no plan: the token stamp still speaks.
+#[test]
+fn login_summary_falls_back_to_the_token_stamp_over_an_unclassified_probe() {
+    let unknown = crate::usage::PlanInfo::default();
+    let summary = super::login_summary(&token_stamped(Some("pro")), Some(&unknown));
+    assert!(
+        summary.contains("  plan: Claude Pro (token verified against the API)"),
+        "got: {summary}"
     );
 }
 
@@ -447,7 +511,7 @@ fn login_summary_defers_when_the_token_claims_no_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     };
-    let summary = super::login_summary(&creds);
+    let summary = super::login_summary(&creds, None);
     assert!(
         summary.contains("  plan: will populate on the first usage refresh"),
         "got: {summary}"

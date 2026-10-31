@@ -1050,6 +1050,7 @@ fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: status.map(str::to_string),
             codex_plan: None,
             email: None,
@@ -1100,8 +1101,8 @@ fn json_tier_falls_back_to_the_token_claim_with_no_cache() {
 }
 
 /// A cached plan outranks the token claim. The multiplier is the discriminator:
-/// the token carries a bare `max` and nothing else, so `Max 20x` is unreachable
-/// by the token path and can only have come off the cache.
+/// the token carries a bare `max` and nothing else, so `Ultra` (the 20x tier) is
+/// unreachable by the token path and can only have come off the cache.
 #[test]
 fn json_tier_reports_the_cached_plan_over_the_token_claim() {
     let _home = HomeSandbox::new();
@@ -1112,7 +1113,7 @@ fn json_tier_reports_the_cached_plan_over_the_token_claim() {
     cache_plan("work", PlanTier::Max(Some(20)), None);
     let resolved = ("work".to_string(), Source::RefreshMatch);
 
-    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Max 20x");
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Ultra");
 }
 
 /// The defect this field carried: a Pro account canceled AFTER login kept

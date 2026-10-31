@@ -867,6 +867,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
             }),
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,

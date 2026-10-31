@@ -1263,7 +1263,10 @@ fn classify_pre_rotation(
     match result {
         Ok(info) => PreRotationDecision::Serve(Box::new(info)),
         Err(FetchError::RateLimited { retry_after, plan }) if !token_clock_expired => {
-            PreRotationDecision::BailRateLimited { retry_after, plan }
+            PreRotationDecision::BailRateLimited {
+                retry_after,
+                plan: plan.map(|p| *p),
+            }
         }
         Err(FetchError::Status(401)) => PreRotationDecision::Rotate { unmask_429: None },
         Err(FetchError::RateLimited { retry_after, .. }) => PreRotationDecision::Rotate {
@@ -1438,7 +1441,7 @@ fn fetch_with_rotation(
                 Ok(info) => FetchOutcome::live(name, info, None).with_profile_fetch(profile_fetch),
                 Err(FetchError::RateLimited { retry_after, plan }) => {
                     FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
-                        .with_plan(plan)
+                        .with_plan(plan.map(|p| *p))
                         .with_profile_fetch(profile_fetch)
                 }
                 Err(_) => FetchOutcome::cached(name, FetchStatus::Cached, None, None)
@@ -1672,7 +1675,7 @@ fn fetch_with_rotation(
             // The fresh-token `/profile` reading still rides along (a canceled
             // account 429s `/usage` even on a freshly rotated token).
             FetchOutcome::cached(name, FetchStatus::RateLimited, rotated, retry_after)
-                .with_plan(plan)
+                .with_plan(plan.map(|p| *p))
                 .with_profile_fetch(&profile_fetch)
         }
         Err(_) => {

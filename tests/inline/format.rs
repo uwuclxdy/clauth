@@ -483,6 +483,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
     let canceled_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -490,7 +491,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&canceled, Some(&canceled_usage)),
+        account_tier(&canceled, Some(&canceled_usage)).map(|p| p.tier),
         Some(PlanTier::Free)
     );
 
@@ -500,13 +501,17 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// An unfetched plan has no tier at all. `account_tier` says so with `None`
@@ -517,7 +522,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
     let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    assert_eq!(account_tier(&bare, None), None);
+    assert_eq!(account_tier(&bare, None).map(|p| p.tier), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
@@ -532,7 +537,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&unclassified, None), None);
+    assert_eq!(account_tier(&unclassified, None).map(|p| p.tier), None);
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
@@ -540,13 +545,17 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     let unknown_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&unknown_plan, Some(&unknown_usage)), None);
+    assert_eq!(
+        account_tier(&unknown_plan, Some(&unknown_usage)).map(|p| p.tier),
+        None
+    );
 }
 
 /// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
@@ -570,6 +579,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let plan = |tier| crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -581,7 +591,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let unclassified_usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
-        account_tier(&unclassified, Some(&unclassified_usage)),
+        account_tier(&unclassified, Some(&unclassified_usage)).map(|p| p.tier),
         Some(PlanTier::Max(None)),
         "an unclassified fetched tier must not mask the token's claim"
     );
@@ -592,7 +602,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let disagreeing_usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
-        account_tier(&disagreeing, Some(&disagreeing_usage)),
+        account_tier(&disagreeing, Some(&disagreeing_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20))),
         "the fetched tier is the better source and still wins"
     );
@@ -615,7 +625,10 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&free, None), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, None).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// The other direction: a real tier still renders, and `Free` is untouched by
@@ -626,6 +639,7 @@ fn account_tier_still_renders_every_known_tier() {
     let fetched_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -633,7 +647,7 @@ fn account_tier_still_renders_every_known_tier() {
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&fetched, Some(&fetched_usage)),
+        account_tier(&fetched, Some(&fetched_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20)))
     );
 
@@ -641,13 +655,17 @@ fn account_tier_still_renders_every_known_tier() {
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 
     let mut token_only = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
@@ -660,7 +678,10 @@ fn account_tier_still_renders_every_known_tier() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&token_only, None), Some(PlanTier::Pro));
+    assert_eq!(
+        account_tier(&token_only, None).map(|p| p.tier),
+        Some(PlanTier::Pro)
+    );
 }
 
 /// The splitter family's bytes, pinned here because every routing test asserts

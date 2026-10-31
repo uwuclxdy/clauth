@@ -1161,12 +1161,14 @@ fn a_plan_without_an_email_keeps_its_cache_shape() {
 fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     let prev_pro = PlanInfo {
         tier: PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
         email: None,
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -1209,15 +1211,237 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
 }
 
 #[test]
-fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
-    assert_eq!(
-        PlanTier::Max(Some(5)).short_label().as_deref(),
-        Some("Max 5x")
-    );
+fn short_label_drops_claude_prefix() {
     assert_eq!(PlanTier::Max(None).short_label().as_deref(), Some("Max"));
     assert_eq!(PlanTier::Pro.short_label().as_deref(), Some("Pro"));
     // an unknown tier carries no label so the MCP omits it entirely.
     assert_eq!(PlanTier::Unknown.short_label(), None);
+}
+
+/// The wire still sends `claude_max` + `default_claude_max_20x` for the plan
+/// this label names Ultra, and `_5x` for the one it names Max.
+#[test]
+fn the_twenty_x_max_tier_reads_as_ultra() {
+    assert_eq!(
+        PlanTier::Max(Some(20)).short_label().as_deref(),
+        Some("Ultra")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(20)).display().as_deref(),
+        Some("Claude Ultra")
+    );
+}
+
+#[test]
+fn the_five_x_max_tier_reads_as_max() {
+    assert_eq!(PlanTier::Max(Some(5)).short_label().as_deref(), Some("Max"));
+    assert_eq!(
+        PlanTier::Max(Some(5)).display().as_deref(),
+        Some("Claude Max")
+    );
+    assert_eq!(PlanTier::Max(None).display().as_deref(), Some("Claude Max"));
+}
+
+/// Only the two renamed multipliers move; any other figure the wire sends
+/// keeps naming itself.
+#[test]
+fn another_max_multiplier_keeps_its_figure() {
+    assert_eq!(
+        PlanTier::Max(Some(50)).short_label().as_deref(),
+        Some("Max 50x")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(50)).display().as_deref(),
+        Some("Claude Max 50x")
+    );
+}
+
+#[test]
+fn an_ultra_organization_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_profile(
+            Some("claude_ultra"),
+            false,
+            false,
+            Some("default_claude_ultra")
+        ),
+        PlanTier::Ultra
+    );
+    assert_eq!(PlanTier::Ultra.short_label().as_deref(), Some("Ultra"));
+    assert_eq!(PlanTier::Ultra.display().as_deref(), Some("Claude Ultra"));
+}
+
+#[test]
+fn an_ultra_token_stamp_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_subscription_type(Some("ultra")),
+        PlanTier::Ultra
+    );
+}
+
+/// Claude Code 2.1.314 maps no `claude_ultra` organization to a
+/// `subscriptionType` (its map holds max, pro, enterprise and team only), so a
+/// login mints no stamp Claude Code would not mint itself.
+#[test]
+fn an_ultra_login_classifies_its_plan_and_mints_no_subscription_stamp() {
+    let raw: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"uuid-ultra","has_claude_max":false,"has_claude_pro":false},
+            "organization":{"organization_type":"claude_ultra","rate_limit_tier":"default_claude_ultra"}}"#,
+    )
+    .expect("fixture parses");
+    let probe = login_profile_from_raw(raw);
+    assert_eq!(probe.plan.tier, PlanTier::Ultra);
+    assert_eq!(probe.subscription_type, None);
+    assert_eq!(
+        probe.rate_limit_tier.as_deref(),
+        Some("default_claude_ultra"),
+        "the raw tier still rides through verbatim"
+    );
+}
+
+fn max_body_named(display_name: &str) -> RawProfile {
+    serde_json::from_value(serde_json::json!({
+        "organization": {
+            "organization_type": "claude_max",
+            "rate_limit_tier": "default_claude_max_5x",
+            "plan_display_name": display_name,
+        }
+    }))
+    .expect("fixture parses")
+}
+
+/// The server's own plan name outranks the local map, on both label forms.
+#[test]
+fn the_server_plan_name_wins_over_the_local_map() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    assert_eq!(plan.tier, PlanTier::Max(Some(5)));
+    assert_eq!(plan.short_label().as_deref(), Some("Ultra Lite"));
+    assert_eq!(plan.display().as_deref(), Some("Claude Ultra Lite"));
+}
+
+/// The name Claude Code accepts: 1 to 40 characters, letters and digits at
+/// both ends (a `+` may also end it), letters, digits, space, `.`, `+` and `-`
+/// between.
+#[test]
+fn a_server_plan_name_at_the_validators_edges_is_kept() {
+    let forty = "A".repeat(40);
+    for name in [
+        "U",
+        "Max 20x",
+        "Pro+",
+        "Ultra 2.0",
+        "Team-Plus",
+        "Ültra",
+        forty.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some(name),
+            "{name:?} is a valid plan name"
+        );
+        assert_eq!(
+            plan.display(),
+            Some(format!("Claude {name}")),
+            "{name:?} is a valid plan name"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_server_plan_name_falls_back_to_the_local_map() {
+    let forty_one = "A".repeat(41);
+    for name in [
+        "",
+        "   ",
+        " Ultra",
+        "Ultra ",
+        "-Ultra",
+        "Ultra.",
+        "Max!",
+        "Ultra\u{1b}[31m",
+        "Ultra\nMax",
+        "Ultra\u{e000}",
+        forty_one.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some("Max"),
+            "{name:?} is not a plan name"
+        );
+        assert_eq!(
+            plan.display().as_deref(),
+            Some("Claude Max"),
+            "{name:?} is not a plan name"
+        );
+    }
+}
+
+/// The server's name is part of the cached plan: a read back off
+/// `usage_cache.json` still carries it.
+#[test]
+fn the_server_plan_name_survives_the_cache_round_trip() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    let text = serde_json::to_string(&plan).expect("serializes");
+    let back: PlanInfo = serde_json::from_str(&text).expect("reads back");
+    assert_eq!(back.short_label().as_deref(), Some("Ultra Lite"));
+}
+
+/// A tier this build does not know (a newer clauth's variant, in either serde
+/// shape) reads as `Unknown` and keeps the rest of the plan, instead of failing
+/// the whole `usage_cache.json` read.
+#[test]
+fn an_unknown_stored_tier_reads_unknown_and_keeps_the_rest() {
+    for tier in [serde_json::json!("Mega"), serde_json::json!({"Mega": 3})] {
+        let mut v = serde_json::to_value(UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Pro,
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("serializes");
+        v["plan"]["tier"] = tier.clone();
+        let read = serde_json::from_value::<UsageInfo>(v);
+        assert!(read.is_ok(), "{tier} fails the whole read: {read:?}");
+        let plan = read.expect("checked").plan.expect("the plan survives");
+        assert_eq!(plan.tier, PlanTier::Unknown, "{tier}");
+        assert_eq!(
+            plan.subscription_status.as_deref(),
+            Some("active"),
+            "{tier}"
+        );
+    }
+}
+
+#[test]
+fn an_ultra_tier_round_trips_through_the_cache() {
+    let plan = PlanInfo {
+        tier: PlanTier::Ultra,
+        ..Default::default()
+    };
+    let back: PlanInfo =
+        serde_json::from_str(&serde_json::to_string(&plan).expect("serializes")).expect("reads");
+    assert_eq!(back.tier, PlanTier::Ultra);
+}
+
+/// The free tier is the organization's own word that no paid plan is live (a
+/// canceled subscription drops to it): a paid name beside it never wins,
+/// whatever the subscription status says.
+#[test]
+fn a_free_tier_outranks_a_server_plan_name() {
+    for status in [Some("canceled"), Some("active"), None] {
+        let plan = PlanInfo {
+            tier: PlanTier::Free,
+            plan_display_name: Some("Ultra".to_string()),
+            subscription_status: status.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(plan.short_label().as_deref(), Some("Free"), "{status:?}");
+        assert_eq!(plan.display().as_deref(), Some("Claude Free"), "{status:?}");
+    }
 }
 
 /// A credential-less / no-claim profile must NOT fabricate a paid tier: `None`

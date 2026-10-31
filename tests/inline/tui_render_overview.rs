@@ -778,6 +778,7 @@ fn canceled_marker_is_dead_first() {
     let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
     a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -1119,6 +1120,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     // fallback tier a credential-less profile happens to default to.
     let plan = crate::usage::PlanInfo {
         tier: crate::usage::PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
         email: None,

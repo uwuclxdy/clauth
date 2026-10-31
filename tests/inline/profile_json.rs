@@ -336,6 +336,7 @@ fn a_body_with_no_window_is_never_stale() {
     let plan_only = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -513,6 +514,7 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -541,6 +543,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -553,7 +556,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
         &usage,
     );
 
-    assert_eq!(tier_label(&profile), Some("Max 20x".to_string()));
+    assert_eq!(tier_label(&profile), Some("Ultra".to_string()));
 }
 
 /// Regression guard the other direction: an un-canceled cached plan still
@@ -566,6 +569,7 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(5)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -578,14 +582,92 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
         &usage,
     );
 
-    assert_eq!(tier_label(&profile), Some("Max 5x".to_string()));
+    assert_eq!(tier_label(&profile), Some("Max".to_string()));
+}
+
+/// The server's own plan name, cached beside the tier, is the label every
+/// published surface reads, over the local map.
+#[test]
+fn tier_label_prefers_the_server_plan_name() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
+    let profile = blank_profile(&crate::profile::ProfileName::from("kerry"));
+    let mut usage = serde_json::to_value(UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(Some(5)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .expect("serializes");
+    usage["plan"]["plan_display_name"] = serde_json::json!("Ultra Lite");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    assert_eq!(tier_label(&profile), Some("Ultra Lite".to_string()));
+}
+
+/// Write `kerry`'s `usage_cache.json` with `plan` spliced in raw, so a test
+/// can hand the reader a plan no fetch would write.
+fn cache_raw_plan(plan: serde_json::Value) -> Profile {
+    crate::testutil::register_names(&["kerry"]);
+    let mut usage = serde_json::to_value(UsageInfo::default()).expect("serializes");
+    usage["plan"] = plan;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
+    blank_profile(&crate::profile::ProfileName::from("kerry"))
+}
+
+/// A canceled subscription drops the organization to the free tier; a paid
+/// plan name beside that tier never outranks it.
+#[test]
+fn tier_label_keeps_the_free_tier_over_a_paid_server_name() {
+    let _home = HomeSandbox::new();
+    let profile = cache_raw_plan(serde_json::json!({
+        "tier": "Free",
+        "plan_display_name": "Ultra",
+        "subscription_status": "canceled",
+    }));
+    assert_eq!(tier_label(&profile), Some("Free".to_string()));
+}
+
+/// The stored name passes the same check the wire read applies: a cache
+/// carrying a control sequence falls back to the local map.
+#[test]
+fn tier_label_rejects_a_malformed_cached_server_name() {
+    let _home = HomeSandbox::new();
+    for name in ["Bad\u{1b}[31m", "Ultra\n", " Ultra"] {
+        let profile = cache_raw_plan(serde_json::json!({
+            "tier": {"Max": 5},
+            "plan_display_name": name,
+        }));
+        assert_eq!(tier_label(&profile), Some("Max".to_string()), "{name:?}");
+    }
+}
+
+/// A server name is an answer on its own: an organization type this build
+/// does not classify still shows the name it sent.
+#[test]
+fn tier_label_shows_the_server_name_of_an_unclassified_tier() {
+    let _home = HomeSandbox::new();
+    let profile = cache_raw_plan(serde_json::json!({
+        "tier": "Unknown",
+        "plan_display_name": "Ultra Lite",
+    }));
+    assert_eq!(tier_label(&profile), Some("Ultra Lite".to_string()));
 }
 
 /// `tier_label` reads the same OAuth cache `published_windows` does, so it
 /// inherits the same leftover: a CONVERTED profile — a `base_url` + key saved on
 /// disk, the `edit_profile_endpoint` shape — publishes no tier even with a
 /// plan-bearing `usage_cache.json` from its earlier OAuth life still on disk:
-/// publishing that leftover rendered `Max 5x` beside the account's new
+/// publishing that leftover rendered a plan label beside the account's new
 /// `generic` label. The OAuth half is the guard's other direction: an account
 /// whose figures do live in the OAuth cache keeps its tier.
 #[test]
@@ -600,6 +682,7 @@ fn tier_label_is_none_for_a_converted_profile() {
     let stale_plan = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(5)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -617,7 +700,7 @@ fn tier_label_is_none_for_a_converted_profile() {
     seed_usage_cache("kerry", &stale_plan, Duration::from_secs(100));
     assert_eq!(
         tier_label(&blank_profile(&crate::profile::ProfileName::from("kerry"))),
-        Some("Max 5x".to_string()),
+        Some("Max".to_string()),
         "an OAuth account keeps its tier"
     );
 }

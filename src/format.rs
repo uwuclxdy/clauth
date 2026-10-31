@@ -13,7 +13,7 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
 use crate::profile::{Profile, ProfileName};
 use crate::profile_json::OauthAge;
-use crate::usage::{PlanTier, UsageInfo, humanize_duration};
+use crate::usage::{PlanInfo, PlanTier, UsageInfo, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -675,18 +675,19 @@ pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
         .collect()
 }
 
-/// The account's tier: a fetched plan wins when classified, else the OAuth
-/// token's `subscription_type` claim, else `None` when neither names one. A
-/// surface renders its own no-data form on `None` rather than a bare "Claude"
-/// that reads as a real plan.
-pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanTier> {
-    // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
-    // the way `profile_json::tier_label` does, or this surface reads "no data"
-    // while that one shows the token's tier for the very same account.
+/// The account's plan: a fetched plan wins when it names one (a classified
+/// tier or the server's own plan name), else the OAuth token's
+/// `subscription_type` claim, else `None` when neither names one. A surface
+/// renders its own no-data form on `None` rather than a bare "Claude" that
+/// reads as a real plan.
+pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanInfo> {
+    // A fetched plan wins, but an UNCLASSIFIED one is not an answer: fall
+    // through the way `profile_json::tier_label` does, or this surface reads
+    // "no data" while that one shows the token's tier for the very same account.
     let fetched = usage
         .and_then(|u| u.plan.as_ref())
-        .map(|p| p.tier.clone())
-        .filter(|t| *t != PlanTier::Unknown);
+        .filter(|p| p.is_classified())
+        .cloned();
     fetched.or_else(|| {
         // No fetched plan yet — fall back to the OAuth token's subscription_type.
         let sub = profile
@@ -696,7 +697,10 @@ pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Opti
             .and_then(|o| o.subscription_type.as_deref());
         match PlanTier::from_subscription_type(sub) {
             PlanTier::Unknown => None,
-            tier => Some(tier),
+            tier => Some(PlanInfo {
+                tier,
+                ..PlanInfo::default()
+            }),
         }
     })
 }

@@ -27,7 +27,7 @@ fn oauth(name: &str) -> Profile {
     p
 }
 
-/// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
+/// Warm `name`'s OAuth usage cache: a `Max` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
 /// A cache a live fetch just wrote. Stamped, because an undated body is the
 /// one shape the age contract reads as stale, and these rows pin the healthy
@@ -46,6 +46,7 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Max(Some(5)),
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,
@@ -64,7 +65,7 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
     );
 }
 
-const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
+const HEADER: &str = "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT";
 
 /// `lines`, each newline-terminated: the whole `render_table` output, so a
 /// stray or missing blank line reds where `str::lines` would hide it.
@@ -76,7 +77,7 @@ fn table_of(lines: &[&str]) -> String {
 fn future_iso(ahead_secs: i64) -> String {
     crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + ahead_secs)
 }
-const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
+const WORK_ROW: &str = "* work     Max     42.4%    17.6%  -";
 
 #[test]
 fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
@@ -138,7 +139,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
         [
             HEADER,
             WORK_ROW,
-            "  off      Max           -        -  - (disabled)",
+            "  off      Max         -        -  - (disabled)",
         ],
         "the disabled row keeps its columns aligned and carries the (disabled) marker"
     );
@@ -160,6 +161,7 @@ fn write_canceled_cache(name: &str) {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -200,7 +202,7 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free          -        -  - (canceled)",
+            "  dead     Free        -        -  - (canceled)",
         ],
         "the canceled row keeps its tier in PLAN and carries the marker"
     );
@@ -307,7 +309,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free          -        -  - (disabled, canceled)",
+            "  dead     Free        -        -  - (disabled, canceled)",
         ],
         "neither state may hide the other"
     );
@@ -1541,7 +1543,7 @@ fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table(
         render(&config),
         table_of(&[
             "  PROFILE       PLAN         5H USED      7D USED  ENDPOINT",
-            "* work          Max 5x        42.46%        17.6%  -",
+            "* work          Max           42.46%        17.6%  -",
             "  idle          Max                -            -  -",
             "  z             Z.ai      700 / 1000  2500 / 2500  https://api.z.ai/api/anthropic",
             "",
@@ -1572,12 +1574,12 @@ fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
     assert_eq!(
         render(&config),
         table_of(&[
-            "  PROFILE      PLAN    5H USED  7D USED  ENDPOINT",
-            "* workstation  Max 5x    42.4%   17.65%  -",
+            "  PROFILE      PLAN  5H USED  7D USED  ENDPOINT",
+            "* workstation  Max     42.4%   17.65%  -",
             "",
-            "  CODEX        PLAN    5H USED  7D USED",
-            "  cx-work      plus      3.26%      30%",
-            "* cx-home      go          12%      61%",
+            "  CODEX        PLAN  5H USED  7D USED",
+            "  cx-work      plus    3.26%      30%",
+            "* cx-home      go        12%      61%",
         ])
     );
 }
@@ -1598,8 +1600,8 @@ fn list_table_names_a_quarantined_codex_chain_after_its_7d_cell() {
             HEADER,
             WORK_ROW,
             "",
-            "  CODEX    PLAN    5H USED  7D USED",
-            "  spare    pro         12%      30% (login expired)",
+            "  CODEX    PLAN  5H USED  7D USED",
+            "  spare    pro       12%      30% (login expired)",
         ])
     );
 }
@@ -1661,8 +1663,8 @@ fn list_table_reads_no_claude_cancellation_off_a_codex_rows_cache() {
             HEADER,
             WORK_ROW,
             "",
-            "  CODEX    PLAN    5H USED  7D USED",
-            "  ghost    -             -        -",
+            "  CODEX    PLAN  5H USED  7D USED",
+            "  ghost    -           -        -",
         ])
     );
 }

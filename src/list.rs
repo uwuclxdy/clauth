@@ -50,7 +50,7 @@ struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
-    /// Tier for an anthropic account (`Max 5x`), else the provider name for a
+    /// Tier for an anthropic account (`Max`), else the provider name for a
     /// third-party one; a codex account's ChatGPT plan, else `-`, since its
     /// provider names no plan. Typed off the entry's `tier` field, keeping this
     /// in lockstep with `status`. A canceled subscription reads as its

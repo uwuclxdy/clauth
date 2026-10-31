@@ -16,7 +16,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{
-    NO_DATA, ResetFmt, activity_verb, duration_label, is_past_reset, relative_age,
+    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset, relative_age,
     reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
@@ -1298,7 +1298,7 @@ fn header_lines(
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
     // as a real plan on the one row an operator checks their plan from.
-    let plan_w = plan.as_deref().map(|s| s.chars().count()).unwrap_or(1);
+    let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
