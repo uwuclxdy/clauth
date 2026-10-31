@@ -31,7 +31,7 @@
 
 **Juggle every Claude Code account from one terminal: switch in a keypress, track live 5h / 7d usage, auto-switch before a limit stops you, even hand a task to another account from inside Claude.**
 
-Most account tools do one half. clauth pairs instant **switching between multiple Claude Code accounts** with a live **usage monitor**, then wires the two together so a fallback chain moves you off an exhausted account before Claude Code ever blocks. Works with Claude Pro, Max, Team, Enterprise OAuth accounts or any custom API endpoint. Linux, macOS, Windows.
+Most account tools do one half. clauth pairs instant **switching between multiple Claude Code accounts** with a live **usage monitor**, then wires the two together so a fallback chain moves you off an exhausted account before Claude Code ever blocks. Works with Claude Pro, Max, Ultra, Team, Enterprise OAuth accounts or any custom API endpoint. Linux, macOS, Windows.
 
 ![clauth TUI demo: switching Claude Code accounts with live usage bars](media/demo.gif)
 
@@ -39,7 +39,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ## Features
 
-- 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Team / Enterprise) or a custom API endpoint, plan tier detected for you
+- 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Ultra / Team / Enterprise) or a custom API endpoint, plan tier detected for you
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
@@ -168,7 +168,7 @@ clauth is the only one of these that pairs account switching with a live usage m
 
 **How do I monitor Claude Code usage and rate limits?** The Overview tab shows color-coded 5h (and 7-day) bars per account with reset times; the Usage tab breaks down every rate-limit window the API reports; the Tokens tab adds a global token dashboard with API-equivalent cost.
 
-**Does it work with Claude Pro, Max, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected, including Max 5x / 20x). API-endpoint profiles cover the Anthropic API or any compatible proxy.
+**Does it work with Claude Pro, Max, Ultra, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected): the label is the plan name Anthropic's own profile sends when it sends one, else clauth's map of Pro, Max, Ultra, Team, and Enterprise. API-endpoint profiles cover the Anthropic API or any compatible proxy.
 
 **Where does clauth store my Claude Code credentials?** Locally under `~/.clauth/`, with `0600` permissions on Unix. Claude tokens only ever go to Anthropic, codex tokens only to OpenAI. See [SECURITY.md](SECURITY.md).
 

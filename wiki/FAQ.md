@@ -10,7 +10,7 @@
 
 **Can Claude Code switch accounts automatically when I hit the 5-hour limit?** Put the accounts in the fallback chain. clauth switches to the next member with headroom the moment the active one crosses its threshold, from the TUI or from `clauth daemon` with the TUI closed. [Auto-switch](Auto-Switch).
 
-**Does it work with Pro, Max, Team, and Enterprise?** Yes, plan tier detected automatically, Max 5x and 20x included. Endpoint profiles cover the Anthropic API and any compatible proxy.
+**Does it work with Pro, Max, Ultra, Team, and Enterprise?** Yes, plan tier detected automatically: the label is the plan name Anthropic's own profile sends when it sends one, else clauth's map of Pro, Max, Ultra, Team, and Enterprise. Endpoint profiles cover the Anthropic API and any compatible proxy.
 
 **Where does clauth store my credentials?** Under `~/.clauth/`, owner-only on Unix. Claude tokens go to Anthropic and codex tokens to OpenAI, nowhere else. [Security](Security).
 

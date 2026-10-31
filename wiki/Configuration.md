@@ -10,7 +10,7 @@ Most keys below have a TUI equivalent on the Setup, Fallback, Config or Services
 
 ## Account types
 
-**Claude Pro / Max / Team / Enterprise.** Leave `base_url` blank. clauth captures the OAuth token from your session or mints one through `clauth login`, then detects the plan tier from Anthropic's profile endpoint. The login also stamps the account's `rateLimitTier` into the credential, which Claude Code reads at startup for plan-gated flags; a profile minted earlier picks the stamp up on its next usage poll (the hourly `/profile` fetch), or immediately with one `clauth login <name>`.
+**Claude Pro / Max / Ultra / Team / Enterprise.** Leave `base_url` blank. clauth captures the OAuth token from your session or mints one through `clauth login`, then detects the plan tier from Anthropic's profile endpoint. The login also stamps the account's `rateLimitTier` into the credential, which Claude Code reads at startup for plan-gated flags; a profile minted earlier picks the stamp up on its next usage poll (the hourly `/profile` fetch), or immediately with one `clauth login <name>`.
 
 **API endpoint.** Set `base_url`, and `api_key` if the endpoint wants one. Works against the Anthropic API or any compatible proxy. The key is handed to Claude Code through `apiKeyHelper` rather than written into `settings.json`.
 
