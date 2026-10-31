@@ -11,7 +11,7 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
-    profile_dir, read_json_file, save_profile,
+    profile_dir, read_json_file, read_json_file_capped, save_profile,
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
@@ -80,7 +80,9 @@ pub(crate) fn session_token_status(name: &ProfileName) -> Option<SessionTokenSta
     if !path.exists() {
         return None;
     }
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    // The capped reader: this read runs in the 1 Hz tally (tier 1b's
+    // per-profile walk) and behind every switch/overview gate.
+    let creds = read_json_file_capped::<ClaudeCredentials>(&path).ok()?;
     let oauth = creds.claude_ai_oauth.as_ref()?;
     if oauth.refresh_token.is_some() {
         return Some(SessionTokenStatus::NotLongLived);
@@ -101,7 +103,7 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
         return None;
     }
     let path = profile_dir(name).ok()?.join("session-token.json");
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let creds = read_json_file_capped::<ClaudeCredentials>(&path).ok()?;
     creds
         .access_token()
         .filter(|t| !t.is_empty())

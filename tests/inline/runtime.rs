@@ -7707,6 +7707,66 @@ fn gc_collects_a_dead_pair_when_a_plain_file_sits_in_the_job_store() {
     });
 }
 
+/// A GLOBAL store caught mid-create fails [`crate::claude_jobs::JobTrees::unfinished_under`]
+/// closed — the macOS rotation gate's store term — the same arm an unreadable
+/// store takes: the record about to land can name any tree, so the gate cannot
+/// say which trees an unfinished job names. Pinned by the arm-removal plant;
+/// no under-mid-create rotation fixture exists.
+#[test]
+fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        fs::create_dir_all(tmp.path().join(".claude").join("jobs").join("0add99f5"))
+            .expect("mkdir the record-less dir");
+
+        let jobs = crate::claude_jobs::job_trees();
+        let store = match jobs.unfinished_under(&profiles.join("anyaccount")) {
+            Err(store) => store,
+            Ok(trees) => panic!(
+                "a global mid-create store must fail the rotation term closed, got {trees:?}"
+            ),
+        };
+        assert_eq!(
+            store,
+            std::path::PathBuf::from("~/.claude/jobs"),
+            "the refusal names the conventional global store, as every other \
+             global-store refusal spells it"
+        );
+    });
+}
+
+/// A `state.json` that is not a regular file — a FIFO planted in the store —
+/// fails the STORE read closed, and returns within a bounded wait: the read
+/// runs in the 1 Hz tally and every MCP `profiles` call, so it opens with
+/// `O_NONBLOCK` and rejects the open handle's non-regular type.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_fifo_state_json_fails_the_store_read_closed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgfifo", "runtime-4242-25", "4242-25");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f2");
+        fs::create_dir_all(&job).expect("mkdir job dir");
+        crate::testutil::mkfifo(&job.join("state.json"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            gc_stale_runtimes();
+            tx.send(()).expect("report the sweep");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the sweep returns within the bound");
+        assert!(
+            runtime.exists() && sessions.exists(),
+            "a FIFO record fails the store read closed: the dead pair is spared"
+        );
+    });
+}
+
 /// #7: a job dir caught before its first `state.json` lands spares the dead
 /// pair — the reader is fail-closed on a missing record, not permissive.
 /// Claude Code creates the dir, writes `state.json.tmp.<rand>`, renames it to
@@ -7733,6 +7793,48 @@ fn gc_spares_a_dead_pair_when_a_job_dir_has_no_state_yet() {
             );
         });
     }
+}
+
+/// The same mid-create shapes in a TREE-LOCAL store — a copy host's or
+/// isolated tree's own `jobs/`, which the mirror never carries — spare the dead
+/// pair through the scoped-unreadable gates (`named_or_affected`,
+/// `unreadable_under`), not the global early arm. A permissive reading there
+/// would collect a copy-host tree during job creation. Control: a dir holding
+/// only an empty `tmp/` is a removed job's leftover, not a creation caught
+/// mid-create — the pair is collected.
+#[test]
+fn gc_spares_a_dead_pair_when_a_tree_local_job_dir_has_no_state_yet() {
+    for (shape, staged) in [("empty", None), ("staged", Some("state.json.tmp.8d511663"))] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-8", "4242-8");
+            let job = runtime.join("jobs").join("0add99ec");
+            fs::create_dir_all(&job).expect("mkdir tree job dir");
+            if let Some(staged) = staged {
+                fs::write(job.join(staged), b"{\"state\":").expect("staged record");
+            }
+            gc_stale_runtimes();
+            assert!(
+                runtime.join(".claude.json").is_file() && sessions.is_dir(),
+                "{shape}: a tree-local job dir with no state.json yet must spare the dead pair"
+            );
+        });
+    }
+    // Control: the leftover shape. `tmp/` follows `state.json` in the creation
+    // order, so a dir holding only an empty `tmp/` is a removed job's leftover
+    // — nothing can be mid-create there, and the pair is collected.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-8", "4242-8");
+        fs::create_dir_all(runtime.join("jobs/0add99ec/tmp")).expect("mkdir leftover tmp/");
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "a tree-local tmp/-only dir is a removed job's leftover: the dead pair is collected"
+        );
+    });
 }
 
 /// F9 (cloudy 2026-10-22): on a copy host the tree's `jobs/` is its own real
@@ -8249,7 +8351,7 @@ fn an_unreadable_global_store_blocks_every_account() {
 /// `exit-cause` file is a removed job and the dead pair is collected. Any other
 /// record-less content stays unreadable and spares, as before.
 #[test]
-fn gc_reads_a_removed_jobs_leftover_dir_as_no_job() {
+fn gc_reads_a_removed_jobs_recordless_dir_as_no_job() {
     for (shape, with_tmp, with_cause, collected) in [
         ("tmp only", true, false, true),
         ("exit-cause only", false, true, true),
@@ -8461,6 +8563,62 @@ fn gc_logs_no_per_pair_spare_line_under_an_unreadable_store() {
     });
 }
 
+/// A global store caught mid-create spares every dead tree WITHOUT a per-pair
+/// spare line (no job was shown to name any of them): the sweep-level line
+/// covers it, once, naming the dir a record is about to land in. Once no
+/// record-less dir remains, the next sweep collects the dead pair.
+#[test]
+fn gc_logs_the_global_mid_create_sweep_line_once_and_collects_the_dead_pair_next_sweep() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (_live_runtime, live_sessions) =
+            dead_pair(&profiles, "bgmid", "runtime-4242-21", "4242-21");
+        let marker = open_pid_file(&live_sessions.join("4242-21")).expect("marker");
+        marker.lock().expect("lock");
+        let (dead_runtime, dead_sessions) =
+            dead_pair(&profiles, "bgdead", "runtime-4242-22", "4242-22");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f0");
+        fs::create_dir_all(&job).expect("mkdir the record-less job dir");
+
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        let store = tmp.path().join(".claude").join("jobs");
+        let sweep_line = format!(
+            "clauth: spared every dead runtime tree this sweep: a Claude Code \
+             background job under {} has no record yet",
+            store.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == sweep_line).count(),
+            1,
+            "the global mid-create sweep line appears exactly once, by equality"
+        );
+        assert!(
+            !snap
+                .iter()
+                .any(|l| l.starts_with("clauth: spared runtime tree ")),
+            "no per-pair spare line under a mid-create store, live or dead pair"
+        );
+        assert!(
+            dead_runtime.exists() && dead_sessions.exists(),
+            "the record-less dir spares the dead pair this sweep"
+        );
+
+        fs::remove_dir_all(&job).expect("remove the record-less dir");
+        gc_stale_runtimes();
+        assert!(
+            !dead_runtime.exists() && !dead_sessions.exists(),
+            "the next sweep with no record-less dir collects the dead pair"
+        );
+        drop(marker);
+    });
+}
+
 /// A scoped failure (a tree's own unreadable `jobs/`) spares the tree and logs
 /// ONE sweep-level line naming the store, once per sweep; the per-pair line
 /// stays silent because no job was shown to name the tree.
@@ -8500,6 +8658,59 @@ fn a_scoped_store_failure_logs_one_sweep_line_naming_the_path() {
         );
         assert!(runtime.exists() && sessions.exists(), "the tree is spared");
         restore_readable(&jobs);
+    });
+}
+
+/// A tree-local store caught mid-create was READ — it is no store failure — but
+/// its record-less dir can name its tree the next instant, so the tree is
+/// spared this sweep and the sweep log names the tree and the dir, one line per
+/// such store. The per-pair spare line stays silent: no job was shown to name
+/// the tree.
+#[test]
+fn a_tree_local_mid_create_store_logs_one_sweep_line_naming_the_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-24", "4242-24");
+        let jobs = runtime.join("jobs");
+        fs::create_dir_all(jobs.join("0add99f1")).expect("mkdir the record-less tree job dir");
+
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        // The line prints the walked tree (the store's parent), the same
+        // spelling the per-pair line carries — a gate whose TMPDIR reaches the
+        // fixture through a symlink included.
+        let sweep_line = format!(
+            "clauth: spared runtime tree {}: a Claude Code background job \
+             under {} has no record yet",
+            runtime.display(),
+            jobs.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == sweep_line).count(),
+            1,
+            "the tree-local mid-create sweep line appears exactly once, by equality"
+        );
+        assert!(
+            !snap.iter().any(|l| l.starts_with(
+                "clauth: spared runtime trees this sweep: the Claude Code \
+                     background-job store "
+            )),
+            "a read store is no store failure, whatever shape its dir holds"
+        );
+        let per_pair = format!(
+            "clauth: spared runtime tree {}: a live Claude Code background job names it",
+            runtime.display()
+        );
+        assert!(
+            !snap.contains(&per_pair),
+            "no per-pair line claims a job names a tree whose store merely held a record-less dir"
+        );
+        assert!(runtime.exists() && sessions.exists(), "the tree is spared");
     });
 }
 
@@ -9147,6 +9358,69 @@ fn guard_home_project_settings_appends_setting_sources_only_at_home() {
     assert!(
         in_project.get_args().next().is_none(),
         "a normal project cwd must keep reading its own project settings"
+    );
+}
+
+// ── capped record reads ──────────────────────────────────────────────────────
+
+/// A FIFO at the path must return at once, never block the reader on the
+/// `open`: the guard opens with `O_NONBLOCK` and rejects the open handle's
+/// non-regular type. Bounded like the other non-regular pins, so a regression
+/// that drops the flag blocks here and the 10 s wait reds instead of hanging
+/// the suite.
+#[cfg(unix)]
+#[test]
+fn read_regular_capped_refuses_a_writerless_fifo_without_blocking() {
+    let home = HomeSandbox::new();
+    let fifo = home.home().join("record-fifo");
+    crate::testutil::mkfifo(&fifo);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = read_regular_capped(&fifo, RECORD_READ_CAP);
+        tx.send(read.is_err()).expect("report the read");
+    });
+    let refused = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read returns within the bound");
+    assert!(
+        refused,
+        "a FIFO is not a regular file: the read fails closed"
+    );
+}
+
+/// A profile dir whose identity cannot be resolved for a reason other than
+/// not-found (a link loop) may hold a tree a live job names, so the member map
+/// reports itself partial — the count then reads unread rather than short —
+/// while every resolvable dir still maps to its name. A dangling entry (its
+/// target gone) names no tree a record can reach and stays out silently.
+#[cfg(unix)]
+#[test]
+fn the_member_map_reports_an_unresolvable_profile_dir_as_partial() {
+    let _home = HomeSandbox::new();
+    let work = make_profile("work");
+    let config = config_of(&[&work]);
+    let dir = crate::profile::profile_dir(&work.name).expect("profile dir");
+    fs::create_dir_all(&dir).expect("mkdir work");
+    let profiles = dir.parent().expect("profiles root");
+    std::os::unix::fs::symlink(profiles.join("gone-target"), profiles.join("dangling"))
+        .expect("a dangling link");
+
+    let (members, partial) = live_member_dirs(&config).expect("the root lists");
+    assert!(!partial, "a dangling link alone is not a partial read");
+    assert_eq!(
+        members.get(&crate::canonical::identity(&dir).expect("canonical work")),
+        Some(&"work".to_string())
+    );
+
+    let looped = profiles.join("looped");
+    std::os::unix::fs::symlink(&looped, &looped).expect("a self-referencing link");
+    let (members, partial) = live_member_dirs(&config).expect("the root lists");
+    assert!(partial, "an unresolvable profile dir makes the map partial");
+    assert_eq!(
+        members.get(&crate::canonical::identity(&dir).expect("canonical work")),
+        Some(&"work".to_string()),
+        "the resolvable dir still maps"
     );
 }
 

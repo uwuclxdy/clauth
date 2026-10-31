@@ -390,9 +390,10 @@ pub(crate) struct LiveTally {
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
     unattributed: usize,
-    /// The registry or the bare-marker dir could not be listed (it exists but
-    /// refuses, or `~/.clauth` itself does not resolve), so [`LiveTally::total`]
-    /// has no reading to give.
+    /// The registry, the bare-marker dir, the job store or a profile dir could
+    /// not be listed (it exists but refuses, or `~/.clauth` itself does not
+    /// resolve), or a running job's supervisor record could not be read, so
+    /// [`LiveTally::total`] has no reading to give.
     unread: bool,
 }
 
@@ -400,6 +401,10 @@ pub(crate) struct LiveTally {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MemberSessions {
     pub(crate) sessions: usize,
+    /// How many of `sessions` are delegate runs: one-shot headless runs a
+    /// clauth MCP spawned, counted inside `sessions` as every per-account
+    /// surface counts them.
+    pub(crate) delegates: usize,
     /// How many of `sessions` the fallback chain is allowed to move.
     pub(crate) following: usize,
     /// The newest swap ONTO this account. `None` when no session here has ever
@@ -408,21 +413,36 @@ pub(crate) struct MemberSessions {
 }
 
 impl LiveTally {
-    /// Read the registry and drop rows whose session is gone. Row GC runs from
+    /// Every live session on the account it currently runs as: registry rows
+    /// whose marker is still held, the bare `claude` sessions the credential
+    /// link resolves onto, and the background jobs Claude Code still runs after
+    /// their launcher released its marker.
+    ///
+    /// A row is dropped once its session is gone. Row GC runs from
     /// `runtime::gc_stale_runtimes` at daemon STARTUP, not per tick, so a
     /// SIGKILLed session's row outlives it for the whole daemon run. Gates on
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
+        Self::collect_in(config, &crate::claude_jobs::job_trees())
+    }
+
+    /// [`LiveTally::collect`] against a job store the caller already read, so a
+    /// pass-level caller reads the store once and shares that snapshot (the
+    /// [`crate::runtime::has_live_session_in`] precedent).
+    pub(crate) fn collect_in(config: &AppConfig, jobs: &crate::claude_jobs::JobTrees) -> Self {
         let rows = read_registry();
         let unread = rows.is_none();
-        let mut tally = Self::from_live_rows(
-            rows.unwrap_or_default()
-                .into_iter()
-                .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held()),
-        );
+        let rows = rows.unwrap_or_default();
+        let live: Vec<LiveSession> = rows
+            .iter()
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
+            .cloned()
+            .collect();
+        let mut tally = Self::from_live_rows(live.clone());
         tally.unread = unread;
         tally.add_bare_sessions(config);
+        tally.add_background_jobs(config, jobs, &rows, &live);
         tally
     }
 
@@ -467,6 +487,43 @@ impl LiveTally {
         slot.following += bare;
     }
 
+    /// Fold in the background jobs Claude Code still runs whose `clauth start`
+    /// launcher already exited: the marker flock released, so no row above
+    /// counts the session, while the job store still names its tree — one of
+    /// the account's slots is in use. A counted row on the same tree is the
+    /// same session, so each tree's jobs are netted against the rows holding it
+    /// ([`crate::runtime::live_background_jobs`]). A job on an account the
+    /// config no longer holds counts on the account whose dir its tree sits
+    /// under, the way a registry row of a deleted account already lands here:
+    /// the session still spends that account's window.
+    ///
+    /// An unreadable job store adds no session to the account it covers and
+    /// leaves the fleet total unread, the direction
+    /// [`LiveTally::add_bare_sessions`] takes: a bg session nothing could read
+    /// must not read as idle on screen. The unknown stays with the account it
+    /// covers: a TREE-local store contributes no jobs for THAT account alone,
+    /// while every readable account's running job still counts on its own
+    /// account. [`LiveTally::own`] and [`LiveTally::delegates`] are single
+    /// fleet numbers, so the one unknown contribution still leaves the fleet
+    /// total unknown — folding it in as zero is the direction this tally
+    /// already refuses.
+    fn add_background_jobs(
+        &mut self,
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        rows: &[LiveSession],
+        counted: &[LiveSession],
+    ) {
+        let (background, unread) =
+            crate::runtime::live_background_jobs(config, jobs, rows, counted);
+        self.unread |= unread;
+        for job in background {
+            let slot = self.members.entry(job.member).or_default();
+            slot.sessions += 1;
+            slot.following += usize::from(job.follows_chain);
+        }
+    }
+
     /// Tally rows already known to be live. Attribution is `current_member`,
     /// which the executor writes only on a session's FIRST swap — so a session
     /// that never moved (every pinned one, and every follower before it swaps)
@@ -476,10 +533,12 @@ impl LiveTally {
             std::collections::BTreeMap::new();
         let mut delegates = 0;
         for row in rows {
-            delegates += usize::from(row.is_delegate);
+            let is_delegate = usize::from(row.is_delegate);
+            delegates += is_delegate;
             let member = row.current_member.unwrap_or(row.start_profile);
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
+            slot.delegates += is_delegate;
             slot.following += usize::from(row.follows_chain);
             slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
         }
@@ -492,8 +551,9 @@ impl LiveTally {
     }
 
     /// A tally straight from rows, for tests in other modules that need a fleet
-    /// without laying registry files down. Skips the liveness filter, which is
-    /// the half [`LiveTally::collect`] adds and this module's own tests pin.
+    /// without laying registry files down. Skips the liveness filter and the
+    /// job-store term, which are the halves [`LiveTally::collect`] adds and this
+    /// module's own tests pin.
     #[cfg(test)]
     pub(crate) fn of(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self::from_live_rows(rows)
@@ -505,7 +565,7 @@ impl LiveTally {
     }
 
     /// A tally that read `rows` but not every dir it counts from (the bare
-    /// markers refused), for tests in other modules.
+    /// markers or the job store refused), for tests in other modules.
     #[cfg(test)]
     pub(crate) fn partly_read(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self {
@@ -524,8 +584,8 @@ impl LiveTally {
     }
 
     /// Every live session across the fleet: those on a deleted account and bare
-    /// ones on a link no profile matches included. `None` when a dir it counts
-    /// from could not be listed.
+    /// ones on a link no profile matches included. `None` when a dir or record it counts
+    /// from could not be read.
     pub(crate) fn total(&self) -> Option<usize> {
         if self.unread {
             return None;
@@ -534,8 +594,8 @@ impl LiveTally {
     }
 
     /// Own (non-delegate) live sessions across the fleet: `clauth start` and
-    /// codex rows plus bare sessions. `None` when a dir it counts from could
-    /// not be listed.
+    /// codex rows plus bare sessions. `None` when a dir or record it counts from could
+    /// not be read.
     pub(crate) fn own(&self) -> Option<usize> {
         if self.unread {
             return None;
@@ -546,8 +606,8 @@ impl LiveTally {
         )
     }
 
-    /// Delegate live sessions across the fleet. `None` when a dir it counts
-    /// from could not be listed.
+    /// Delegate live sessions across the fleet. `None` when a dir or record it counts
+    /// from could not be read.
     pub(crate) fn delegates(&self) -> Option<usize> {
         if self.unread {
             return None;
@@ -640,7 +700,13 @@ fn read_registry() -> Option<Vec<LiveSession>> {
 }
 
 fn read_row(path: &Path) -> Option<LiveSession> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    // A regular file only, bounded: the row path was never typed, and an
+    // `open` on a FIFO blocks forever — the registry read runs every tally
+    // tick. A non-regular or unreadable row drops the way an unreadable one
+    // always did.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// One session's own row, or `None` when it is absent or unparseable. Read

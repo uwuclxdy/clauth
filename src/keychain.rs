@@ -385,8 +385,9 @@ const SECURITY_STDIN_LINE_MAX: usize = 4096;
 /// other macOS versions get. A blob past it is refused rather than sent — not
 /// the only non-destructive disposition (E2BIG past the break fails safe too),
 /// but the only one that names the size and the remediation instead of
-/// surfacing as a bare spawn failure.
-const SECURITY_ARGV_VALUE_MAX: usize = 512 * 1024;
+/// surfacing as a bare spawn failure. The value is defined in `runtime` beside
+/// the record cap because the credentials reads share the same bound.
+const SECURITY_ARGV_VALUE_MAX: usize = crate::runtime::CREDENTIALS_READ_CAP as usize;
 
 /// How [`put_blob_at`] hands one write to `security`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -212,8 +212,9 @@ fn third_party_headline_all_lapsed_bars_keep_the_plan_prefix() {
 /// The reader here is picking a delegate target, so a provider's refusal has to
 /// reach the headline WITH its figure: the number alone reads as spendable and
 /// sent one run into a `402`, while the refusal alone hides how short the
-/// account is. `funded_wallets` drops a zero wallet, so an exhausted account
-/// reaches the headline through the first-value arm rather than the wallet one.
+/// account is. `funded_wallets` drops a zero wallet, so no funded wallet exists
+/// and the any-wallet arm picks the spent `api balance` before the first-value
+/// arm gets a chance.
 #[test]
 fn third_party_headline_names_a_refusal_beside_its_figure() {
     let mut s = third_party_stats(
@@ -801,12 +802,14 @@ fn live_usage_prose_dates_an_all_lapsed_unknown() {
     assert_eq!(absent, "active profile `work`: 5h unknown, 7d unknown");
 }
 
-/// The denial is conditional on what the provider publishes. One that reports
-/// its own `5h`/`7d` bars HAS those limits, so a denial beside them contradicts
-/// the very figure it introduces; one answering with a wallet has none, and the
-/// reader needs telling before reading the amount as a window. A third-party
-/// account with no figure at all denies nothing: the provider's limits are
-/// exactly what clauth cannot answer for there.
+/// The denial is conditional on what the provider publishes AND on what the
+/// response carries. One that reports its own `5h`/`7d` bars HAS those limits,
+/// so a denial beside them contradicts the very figure it introduces; an
+/// account answering with a wallet has none, and the denial never rides an api
+/// balance; a no-windows account whose figure is a
+/// counter with no wallet still needs telling. A third-party account with no
+/// figure at all denies nothing: the provider's limits are exactly what clauth
+/// cannot answer for there.
 #[test]
 fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     assert_eq!(
@@ -822,8 +825,20 @@ fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         })),
-        "no 5h/7d limits; api balance: 31.45 CNY",
+        "api balance: 31.45 CNY",
+        "the denial never rides an api balance",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "credits: 42 units",
+            "provider_windows": false,
+            "has_wallet": false,
+        })),
+        "no 5h/7d limits; credits: 42 units",
+        "a counter keeps the denial",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({"kind": "third_party", "balance": null})),
@@ -859,6 +874,7 @@ fn windows_prose_names_the_wallet_runway_beside_its_burn() {
             "kind": "third_party",
             "balance": format!("api balance: {balance:.2} CNY"),
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_balance": balance,
             "wallet_burn_per_day": per_day,
             "wallet_burn_currency": "CNY",
@@ -866,11 +882,11 @@ fn windows_prose_names_the_wallet_runway_beside_its_burn() {
     };
     assert_eq!(
         wallet(371.47, 160.7),
-        "no 5h/7d limits; api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)",
+        "api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)",
     );
     assert_eq!(
         wallet(50.0, 160.7),
-        "no 5h/7d limits; api balance: 50.00 CNY · ~160.7 CNY/day (~7 h left)",
+        "api balance: 50.00 CNY · ~160.7 CNY/day (~7 h left)",
     );
 }
 
@@ -883,21 +899,23 @@ fn windows_prose_names_no_runway_without_a_balance_and_a_burn() {
             "kind": "third_party",
             "balance": "api balance: 371.47 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_balance": 371.47,
             "wallet_burn_per_day": 0.0,
             "wallet_burn_currency": "CNY",
         })),
-        "no 5h/7d limits; api balance: 371.47 CNY · ~0.0 CNY/day",
+        "api balance: 371.47 CNY · ~0.0 CNY/day",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
             "kind": "third_party",
             "balance": "api balance: 371.47 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_burn_per_day": 160.7,
             "wallet_burn_currency": "CNY",
         })),
-        "no 5h/7d limits; api balance: 371.47 CNY · ~160.7 CNY/day",
+        "api balance: 371.47 CNY · ~160.7 CNY/day",
     );
 }
 
@@ -940,9 +958,21 @@ fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "stale": true,
         })),
-        "no 5h/7d limits; api balance: 31.45 CNY (stale)",
+        "api balance: 31.45 CNY (stale)",
+    );
+    // A counter's stale verdict rides AFTER the denial, which keeps its place.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "credits: 42 units",
+            "provider_windows": false,
+            "has_wallet": false,
+            "stale": true,
+        })),
+        "no 5h/7d limits; credits: 42 units (stale)",
     );
     // And on the arm that prints no denial, so the clause rides the FIGURE
     // rather than whatever text happens to precede it.
@@ -966,10 +996,11 @@ fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
             "kind": "third_party",
             "balance": "api balance: 2.53 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_burn_per_day": 4.17,
             "wallet_burn_currency": "CNY",
         })),
-        "no 5h/7d limits; api balance: 2.53 CNY · ~4.2 CNY/day",
+        "api balance: 2.53 CNY · ~4.2 CNY/day",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
@@ -989,8 +1020,9 @@ fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
             "kind": "third_party",
             "balance": "api balance: 2.53 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         })),
-        "no 5h/7d limits; api balance: 2.53 CNY",
+        "api balance: 2.53 CNY",
     );
 }
 
@@ -1005,6 +1037,7 @@ fn windows_prose_rounds_the_runway_to_whole_days_and_hours() {
             "kind": "third_party",
             "balance": format!("api balance: {balance:.2} CNY"),
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_balance": balance,
             "wallet_burn_per_day": per_day,
             "wallet_burn_currency": "CNY",
@@ -1012,25 +1045,25 @@ fn windows_prose_rounds_the_runway_to_whole_days_and_hours() {
     };
     assert_eq!(
         wallet(200.0, 160.7),
-        "no 5h/7d limits; api balance: 200.00 CNY · ~160.7 CNY/day (~1 day left)",
+        "api balance: 200.00 CNY · ~160.7 CNY/day (~1 day left)",
     );
     assert_eq!(
         wallet(160.7, 160.7),
-        "no 5h/7d limits; api balance: 160.70 CNY · ~160.7 CNY/day (~1 day left)",
+        "api balance: 160.70 CNY · ~160.7 CNY/day (~1 day left)",
     );
     assert_eq!(
         wallet(12.0, 160.7),
-        "no 5h/7d limits; api balance: 12.00 CNY · ~160.7 CNY/day (~2 h left)",
+        "api balance: 12.00 CNY · ~160.7 CNY/day (~2 h left)",
     );
     assert_eq!(
         wallet(1.0, 160.7),
-        "no 5h/7d limits; api balance: 1.00 CNY · ~160.7 CNY/day (<1 h left)",
+        "api balance: 1.00 CNY · ~160.7 CNY/day (<1 h left)",
     );
     // Days round to nearest too: 250 / 160.7 = 1.56 days, which floors to 1
     // and rounds to 2.
     assert_eq!(
         wallet(250.0, 160.7),
-        "no 5h/7d limits; api balance: 250.00 CNY · ~160.7 CNY/day (~2 days left)",
+        "api balance: 250.00 CNY · ~160.7 CNY/day (~2 days left)",
     );
     // A non-finite ratio is no runway either: 1e307 / 0.05 overflows to `inf`
     // (the payload never carries one today, and the guard keeps `~inf days
@@ -1044,11 +1077,11 @@ fn windows_prose_rounds_the_runway_to_whole_days_and_hours() {
     // `~0.0`, which reads as no burn, so no runway of decades rides it.
     assert_eq!(
         wallet(371.47, 0.04),
-        "no 5h/7d limits; api balance: 371.47 CNY · ~0.0 CNY/day",
+        "api balance: 371.47 CNY · ~0.0 CNY/day",
     );
     assert_eq!(
         wallet(-5.0, 160.7),
-        "no 5h/7d limits; api balance: -5.00 CNY · ~160.7 CNY/day",
+        "api balance: -5.00 CNY · ~160.7 CNY/day",
     );
 }
 
@@ -1069,6 +1102,7 @@ fn delegate_prose_names_the_wallet_runway_in_the_target_clause() {
             "kind": "third_party",
             "balance": "api balance: 371.47 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_balance": 371.47,
             "wallet_burn_per_day": 160.7,
             "wallet_burn_currency": "CNY",
@@ -1077,7 +1111,7 @@ fn delegate_prose_names_the_wallet_runway_in_the_target_clause() {
     assert_eq!(
         delegate_prose(&sync),
         "delegate to `vendor` finished: ok (equivalent Anthropic API rate cost: $0.5), \
-         usage: input 10 tokens, output 5 tokens; target `vendor`: no 5h/7d limits; \
+         usage: input 10 tokens, output 5 tokens; target `vendor`: \
          api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)"
     );
 }
@@ -1105,8 +1139,9 @@ fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         },
-        "has_live_session": true,
+        "live_sessions": 1,
         "throughput": [{
             "model": "deepseek-chat",
             "tok_s": 12.3,
@@ -1120,8 +1155,8 @@ fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     assert_eq!(
         text,
         "- solo (global active) [anthropic]: usage unknown; tier unknown\n\
-         - vendor [DeepSeek, api.deepseek.com]: no 5h/7d limits; api balance: 31.45 CNY; \
-         live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
+         - vendor [DeepSeek, api.deepseek.com]: api balance: 31.45 CNY; \
+         1 live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
 }
 
@@ -1459,7 +1494,8 @@ fn profiles_prose_handles_empty_roster_and_error_envelope() {
 
 /// The same ruling on the folded live-usage clause: a delegate to an api-key
 /// account reports that account's own figures, denies the limits that account
-/// really lacks, and dates the figure off its own cache.
+/// really lacks (a wallet denies none — the denial never rides an api
+/// balance), and dates the figure off its own cache.
 #[test]
 fn live_usage_prose_answers_for_a_third_party_target() {
     assert_eq!(
@@ -1469,11 +1505,26 @@ fn live_usage_prose_answers_for_a_third_party_target() {
                 "kind": "third_party",
                 "balance": "api balance: 31.45 CNY",
                 "provider_windows": false,
+                "has_wallet": true,
                 "fetched_secs_ago": 30,
             }),
             "target",
         ),
-        "target `vendor`: no 5h/7d limits; api balance: 31.45 CNY (cached 30s ago)",
+        "target `vendor`: api balance: 31.45 CNY (cached 30s ago)",
+    );
+    assert_eq!(
+        live_usage_prose(
+            &serde_json::json!({
+                "profile": "cnt",
+                "kind": "third_party",
+                "balance": "credits: 42 units",
+                "provider_windows": false,
+                "has_wallet": false,
+                "fetched_secs_ago": 30,
+            }),
+            "target",
+        ),
+        "target `cnt`: no 5h/7d limits; credits: 42 units (cached 30s ago)",
     );
     assert_eq!(
         live_usage_prose(
@@ -2438,7 +2489,8 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
                     "endpoint": "api.deepseek.com",
                     "kind": "third_party",
                     "balance": "api balance: 31.45 USD",
-                    "provider_windows": false
+                    "provider_windows": false,
+                    "has_wallet": true
                 }
             },
         ],
@@ -2448,7 +2500,7 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
         delegate_fanout_prose(&fanout),
         "delegated to `solo` (job `d-7-0`), `vendor` (job `d-7-1`); \
          target `solo`: 5h 12% used, 7d 45.6% used; \
-         target `vendor`: no 5h/7d limits; api balance: 31.45 USD; \
+         target `vendor`: api balance: 31.45 USD; \
          since your last call: credentials file rewritten",
     );
 }
@@ -2477,7 +2529,8 @@ fn delegate_fanout_results_prose_names_each_row_and_digest_last() {
                     "endpoint": "api.deepseek.com",
                     "kind": "third_party",
                     "balance": "api balance: 31.45 USD",
-                    "provider_windows": false
+                    "provider_windows": false,
+                    "has_wallet": true
                 }
             },
         ],
@@ -2486,7 +2539,7 @@ fn delegate_fanout_results_prose_names_each_row_and_digest_last() {
     assert_eq!(
         delegate_fanout_results_prose(&payload),
         "delegate to `solo` finished: ok; target `solo`: 5h 12% used, 7d 45.6% used\n\
-         delegate to `vendor` finished: done; target `vendor`: no 5h/7d limits; api balance: 31.45 USD\n\
+         delegate to `vendor` finished: done; target `vendor`: api balance: 31.45 USD\n\
          since your last call: credentials file rewritten",
     );
 }
@@ -3026,6 +3079,7 @@ fn delegate_prose_shrinks_the_finished_envelope() {
             "kind": "third_party",
             "endpoint": "api.deepseek.com",
             "provider_windows": false,
+            "has_wallet": true,
             "balance": "api balance: 1044.41 CNY",
             "fetched_secs_ago": 35
         },
@@ -3047,7 +3101,7 @@ fn delegate_prose_shrinks_the_finished_envelope() {
         "delegate to `DS8` finished: <the delegate's answer> (equivalent Anthropic API rate \
          cost: $3.411), usage: input 83930 tokens, `cache_read_input_tokens` 3948672, \
          output 40681 tokens, `service_tier` standard, `speed` standard; resume with session id \
-         `d44b2c9c-...`; permission denials: Bash; target `DS8`: no 5h/7d limits; \
+         `d44b2c9c-...`; permission denials: Bash; target `DS8`: \
          api balance: 1044.41 CNY (cached 35s ago)"
     );
 }

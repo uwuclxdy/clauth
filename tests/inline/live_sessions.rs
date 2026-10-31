@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::mpsc::channel;
 
-use crate::testutil::HomeSandbox;
+use crate::testutil::{HomeSandbox, oauth_profile, write_linked_credentials};
 
 /// A row for a session that never ran, with every field pinned so the tests
 /// assert exact values rather than "something was written".
@@ -553,6 +553,789 @@ fn collect_excludes_the_daemons_background_hold() {
     );
 }
 
+// ── background jobs ─────────────────────────────────────────────────────────
+
+/// A `clauth start <p> -- --bg` session outlives its launcher: the launcher
+/// exits, its marker releases, and Claude Code's job store alone still names
+/// the account's fixed background tree. That job holds one of the account's
+/// slots, so it counts on the account it runs on.
+#[test]
+fn a_background_job_with_a_released_marker_counts_on_its_account() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    // The launcher's row outlives its marker: nothing holds it, so the job
+    // store is the only evidence the session is still running.
+    register(&LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "a running background job is a live session on the account it runs on"
+    );
+}
+
+/// `claude stop` ends a background session but leaves its job dir in the store
+/// until `claude rm` (the captured 2.1.304 shape: `state: "stopped"` with
+/// `firstTerminalAt` stamped). A stopped job holds none of the account's
+/// slots, so it is no live session — netting it in keeps every stopped job on
+/// the shared fixed tree reading as a phantom session forever.
+#[test]
+fn a_stopped_job_counts_no_session() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    register(&LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job_in(
+        home.home(),
+        "job-1",
+        &tree,
+        "stopped",
+        Some("2026-10-30T00:00:00Z"),
+    );
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        0,
+        "a stopped background job holds no slot, so it is no live session"
+    );
+}
+
+/// A `claude attach` revives a stopped job as `running` with the
+/// `firstTerminalAt` stamp kept, and a revived job runs again: it counts on the
+/// account it runs on like any other working job.
+#[test]
+fn a_revived_job_counts_on_its_account() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    register(&LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job_in(
+        home.home(),
+        "job-1",
+        &tree,
+        "running",
+        Some("2026-10-30T00:00:00Z"),
+    );
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "a revived job runs again, so it counts on its account"
+    );
+}
+
+/// A handed-off (`--with-fallback`) session's tree sits under its START
+/// profile's dir while the session runs on `current_member`, so the job that
+/// names it counts on the member the row names and on no earlier account.
+#[test]
+fn a_handed_off_job_counts_only_on_its_current_account() {
+    let home = HomeSandbox::new();
+    let work = crate::profile::ProfileName::from("work");
+    let spare = crate::profile::ProfileName::from("spare");
+    let config = config_with(
+        vec![
+            crate::testutil::blank_profile(&work),
+            crate::testutil::blank_profile(&spare),
+        ],
+        "work",
+    );
+    register(&LiveSession {
+        current_member: Some("spare".to_string()),
+        follows_chain: true,
+        ..row("7777-0", "work")
+    })
+    .expect("register the moved row");
+    let trees = crate::runtime::session_runtime_trees(&work, false, "7777-0").expect("tree layout");
+    let tree = trees[0].clone();
+    std::fs::create_dir_all(&tree).expect("build the per-session tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&spare).sessions,
+        1,
+        "the job counts on the account the session runs on now"
+    );
+    assert_eq!(
+        tally.member(&work).sessions,
+        0,
+        "the account the session left counts nothing"
+    );
+    // The whole slice, so the job's `following` cannot drop off the mark the
+    // chain card and the Overview `⇄` glyph read.
+    assert_eq!(
+        tally.member(&spare),
+        MemberSessions {
+            sessions: 1,
+            delegates: 0,
+            following: 1,
+            last_swap_at: None,
+        },
+        "a job on a follower's tree is a session the chain may move"
+    );
+}
+
+/// A launcher's held marker and the job naming its tree are ONE session: the
+/// count takes the greater of the two readings per tree, never their sum, and
+/// a second job beside a held marker is the second session it is.
+#[test]
+fn a_job_beside_a_held_marker_counts_the_session_once() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    register(&LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    })
+    .expect("register the launcher row");
+    let _marker =
+        crate::runtime::hold_background_row_marker(&name, "4243-0").expect("hold the marker");
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "the held marker and the job naming its tree are one session"
+    );
+
+    crate::testutil::write_claude_job(home.home(), "job-2", &tree);
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        2,
+        "a second job on the same tree is a second session"
+    );
+}
+
+/// A job store the tally cannot read leaves the fleet total unread — the same
+/// direction the bare-marker dir takes: folding an unknown in as zero would
+/// hide a running session that holds one of the account's slots.
+#[test]
+fn an_unreadable_job_store_leaves_the_total_unread() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(claude.join("jobs"), b"not a directory").expect("block the job store");
+
+    assert_eq!(
+        LiveTally::collect(&config).total(),
+        None,
+        "an unreadable job store has no count to give"
+    );
+}
+
+/// A TREE-local store failing is unknown for that account alone: its own jobs
+/// contribute nothing while every readable account's jobs still count. The
+/// fleet chip's own/delegates are single fleet numbers, so one account's
+/// unknown contribution still leaves the total unread — folding it in as zero
+/// is the direction this tally already refuses.
+#[test]
+fn a_tree_local_unreadable_job_store_leaves_the_total_unread() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    std::fs::write(tree.join("jobs"), b"not a directory").expect("block the tree's job store");
+
+    assert_eq!(
+        LiveTally::collect(&config).total(),
+        None,
+        "one account's unreadable job store leaves the fleet total unread"
+    );
+}
+
+/// One account's unreadable tree-local store contributes no job of its own and
+/// must not discard ANOTHER account's running background job: the readable
+/// account's job still counts on it, while the one unknown contribution leaves
+/// the fleet total unread.
+#[test]
+fn an_unreadable_tree_does_not_discard_another_accounts_background_job() {
+    let home = HomeSandbox::new();
+    let work = crate::profile::ProfileName::from("work");
+    let busy = crate::profile::ProfileName::from("busy");
+    let config = config_with(
+        vec![
+            crate::testutil::blank_profile(&work),
+            crate::testutil::blank_profile(&busy),
+        ],
+        "work",
+    );
+    let work_tree = crate::runtime::background_runtime_tree(&work).expect("work's tree");
+    let busy_tree = crate::runtime::background_runtime_tree(&busy).expect("busy's tree");
+    std::fs::create_dir_all(&work_tree).expect("build work's tree");
+    std::fs::create_dir_all(&busy_tree).expect("build busy's tree");
+    crate::testutil::write_live_supervisor(&busy_tree);
+    std::fs::write(work_tree.join("jobs"), b"not a directory").expect("block work's job store");
+    crate::testutil::write_claude_job(home.home(), "job-1", &busy_tree);
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&busy).sessions,
+        1,
+        "a readable account's running background job still counts on it"
+    );
+    assert_eq!(
+        tally.member(&work).sessions,
+        0,
+        "the unreadable account contributes no job of its own"
+    );
+    assert_eq!(
+        tally.total(),
+        None,
+        "the one unknown contribution still leaves the fleet total unread"
+    );
+}
+
+/// A host upgraded from the pre-`runtime-<sid>` keying keeps the legacy bare
+/// `runtime` dir beside the per-session trees. A per-session row occupies only
+/// its OWN tree, so a job naming the bare legacy tree still counts: netting it
+/// against a row that does not hold that tree would net a real session away.
+#[test]
+fn a_row_nets_jobs_only_against_the_tree_it_occupies() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let trees = crate::runtime::session_runtime_trees(&name, false, "4242-0").expect("layout");
+    let per_session = trees[0].clone();
+    let legacy = trees[1].clone();
+    std::fs::create_dir_all(&per_session).expect("build the per-session tree");
+    std::fs::create_dir_all(&legacy).expect("build the leftover legacy tree");
+    crate::testutil::write_live_supervisor(&legacy);
+    register(&row("4242-0", "work")).expect("register the per-session row");
+    let _marker = crate::runtime::hold_session_row_marker(&name, false, "4242-0")
+        .expect("hold the per-session marker");
+    crate::testutil::write_claude_job(home.home(), "job-1", &legacy);
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        2,
+        "the row and the job naming the bare legacy tree are two sessions"
+    );
+}
+
+/// A job record's `state` alone does not say a session runs. A supervisor that
+/// shut down, was killed, or never started leaves its job's record at `state:
+/// "working"` until `claude rm`, and nothing reads that record: the count asks
+/// the tree's own supervisor, which fails closed only for the gate that must
+/// not collect a tree under a job.
+#[test]
+fn a_job_counts_only_while_its_trees_supervisor_is_live() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        0,
+        "a working job whose tree has no supervisor record holds no slot"
+    );
+
+    // A recorded pid that is positively dead — a child that exited and was
+    // reaped — is a `Gone` supervisor: nothing supervises the tree, so the
+    // working job holds no slot. Linux/macOS only while the Windows verify has
+    // no positively-dead reading there (every parseable record reads
+    // `Unverifiable` and counts).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut dead = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a child to reap");
+        let dead_pid = dead.id();
+        let start = crate::testutil::proc_start_of(dead_pid).expect("the dead pid's live start");
+        let _ = dead.wait();
+        crate::testutil::write_daemon_lock(&tree, dead_pid, &start);
+
+        assert_eq!(
+            LiveTally::collect(&config).member(&name).sessions,
+            0,
+            "a working job whose recorded supervisor pid is positively dead holds no slot"
+        );
+    }
+
+    crate::testutil::write_live_supervisor(&tree);
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "the same job under a live supervisor counts on its account"
+    );
+}
+
+/// A `daemon.lock` that does not parse names no pid, so nothing shows a live
+/// supervisor: the count reads the tree unread, never as a live session.
+#[test]
+fn an_unparseable_supervisor_record_reads_unread_not_live() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "fixture control: the same tree with a parseable live record counts its job"
+    );
+
+    std::fs::write(tree.join("daemon.lock"), br#"{"pid":12"#).expect("truncate the lock");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&name).sessions,
+        0,
+        "a record naming no pid shows no live supervisor, so its job holds no slot"
+    );
+    assert_eq!(
+        tally.total(),
+        None,
+        "the count has no reading to give, so it says unread rather than complete"
+    );
+}
+
+/// An older build linked the home's `daemon.lock`/`daemon.status.json` into the
+/// tree (see `runtime::read_supervisor_record`). For the count the link is
+/// FOLLOWED and its target verified like a plain record: the home roster
+/// supervisor's liveness is exactly what the tree's job hangs on. A dangling
+/// link or a target whose recorded pid is positively dead holds no slot — a
+/// clean shutdown deletes the target file, leaving the tree-side link to
+/// dangle. The GC keeps reading the link as absent, so the tree still collects
+/// with no stop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_symlinked_supervisor_record_is_verified_through_its_link() {
+    enum Target {
+        Missing,
+        DeadPid,
+        LivePid,
+    }
+    for (shape, target, counts) in [
+        ("dangling", Target::Missing, 0),
+        ("dead pid", Target::DeadPid, 0),
+        ("live pid", Target::LivePid, 1),
+    ] {
+        let home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("work");
+        let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+        let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+        std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+        let record_dir = home.home().join("roster-supervisor");
+        std::fs::create_dir_all(&record_dir).expect("the linked record's dir");
+        match target {
+            Target::Missing => {}
+            Target::DeadPid => {
+                let mut dead = std::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn a child to reap");
+                let dead_pid = dead.id();
+                let start =
+                    crate::testutil::proc_start_of(dead_pid).expect("the dead pid's live start");
+                let _ = dead.wait();
+                crate::testutil::write_daemon_lock(&record_dir, dead_pid, &start);
+            }
+            Target::LivePid => {
+                let pid = std::process::id();
+                let start =
+                    crate::testutil::proc_start_of(pid).expect("the test process's start time");
+                crate::testutil::write_daemon_lock(&record_dir, pid, &start);
+            }
+        }
+        std::os::unix::fs::symlink(record_dir.join("daemon.lock"), tree.join("daemon.lock"))
+            .expect("link the lock");
+        crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+        assert_eq!(
+            LiveTally::collect(&config).member(&name).sessions,
+            counts,
+            "{shape}: the link's target decides whether the job counts"
+        );
+    }
+}
+
+/// A profile dir that is a symlink to a dir outside `profiles/` is a layout
+/// [`crate::runtime::runtime_trees`] deliberately follows. Its tree's canonical
+/// path then sits outside `profiles/`, so attribution must come from the
+/// profiles walk's own name for the dir, not from the tree path's grandparent:
+/// the job counts on the configured name.
+#[cfg(unix)]
+#[test]
+fn a_job_under_a_profile_dir_linked_outside_profiles_counts_on_its_name() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let profile = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::create_dir_all(profile.parent().expect("profiles root")).expect("mkdir profiles");
+    let target = home.home().join("elsewhere");
+    std::fs::create_dir_all(&target).expect("mkdir the link target");
+    std::os::unix::fs::symlink(&target, &profile).expect("link the profile dir");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the tree through the link");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "a job under a profile dir linked outside profiles/ counts on its own name"
+    );
+}
+
+/// A profile dir linked to a SIBLING dir inside `profiles/` canonicalizes to
+/// the sibling, so a tree-path grandparent test attributes the job to the
+/// sibling's entry name. Attribution reads the profiles walk instead: the
+/// configured dir's own name wins over the dir it points at.
+#[cfg(unix)]
+#[test]
+fn a_job_under_a_profile_dir_linked_to_a_sibling_counts_on_its_own_name() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let pointed_at = crate::profile::ProfileName::from("realwork");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let profile = crate::profile::profile_dir(&name).expect("profile dir");
+    let sibling = profile.parent().expect("profiles root").join("realwork");
+    std::fs::create_dir_all(&sibling).expect("mkdir the sibling");
+    std::os::unix::fs::symlink(&sibling, &profile).expect("link the profile dir");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the tree through the link");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&name).sessions,
+        1,
+        "a job under a sibling-linked profile dir counts on its configured name"
+    );
+    assert_eq!(
+        tally.member(&pointed_at).sessions,
+        0,
+        "and never on the name of the sibling it points at"
+    );
+}
+
+/// A `claude --bg` on a config dir clauth does not own names no clauth session:
+/// a live job whose tree sits outside `profiles/` counts on no account and
+/// leaves the fleet total at zero.
+#[test]
+fn a_job_outside_the_profiles_root_counts_on_no_account() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    std::fs::create_dir_all(crate::profile::profile_dir(&name).expect("profile dir"))
+        .expect("mkdir work, so an account exists to misattribute to");
+    let foreign = home.home().join("some-config").join("runtime-bg");
+    std::fs::create_dir_all(&foreign).expect("mkdir a foreign tree");
+    crate::testutil::write_live_supervisor(&foreign);
+    crate::testutil::write_claude_job(home.home(), "job-1", &foreign);
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(tally.member(&name).sessions, 0, "no account owns the tree");
+    assert_eq!(tally.total(), Some(0), "the job counts on no account");
+}
+
+/// A link whose target is not a regular file — a writer-less FIFO, a device —
+/// must neither hang nor blow up the count: the tally runs at 1 Hz in the TUI
+/// and once per MCP `profiles` call, so the read opens with `O_NONBLOCK` (a
+/// writer-less FIFO opens at once) and rejects the open handle's non-regular
+/// type (a device read never ends). Such a target names no pid, so nothing
+/// shows a live supervisor: the count reads the tree unread and the collect
+/// returns within a bounded wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_non_regular_link_target_returns_bounded_and_reads_unread() {
+    for (shape, link_target) in [("fifo", None), ("/dev/zero", Some("/dev/zero"))] {
+        let home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("work");
+        let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+        let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+        std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+        let target = match link_target {
+            None => {
+                let fifo = home.home().join("roster-fifo");
+                crate::testutil::mkfifo(&fifo);
+                fifo
+            }
+            Some(path) => std::path::PathBuf::from(path),
+        };
+        std::os::unix::fs::symlink(&target, tree.join("daemon.lock")).expect("link the lock");
+        crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tally = LiveTally::collect(&config);
+            let sessions = tally.member(&name).sessions;
+            tx.send((sessions, tally.total()))
+                .expect("report the collect");
+        });
+        let (sessions, total) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the collect returns within the bound");
+        assert_eq!(
+            sessions, 0,
+            "{shape}: a non-regular link target shows no live supervisor"
+        );
+        assert_eq!(total, None, "{shape}: so the count has no reading to give");
+    }
+}
+
+/// A registry row that is not a regular file — a FIFO planted among the row
+/// files — must neither hang nor blow up the count: the registry read runs
+/// every tick. The row is dropped the way an unreadable one always was, and
+/// the collect returns within a bounded wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_non_regular_registry_row_returns_bounded_and_drops_the_row() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    crate::live_sessions::register(&row("4242-0", "work")).expect("register a real row");
+    let _marker = crate::runtime::hold_session_row_marker(&name, false, "4242-0")
+        .expect("hold the real row's marker");
+    let fifo = registry_dir().expect("registry dir").join("4242-9");
+    crate::testutil::mkfifo(&fifo);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sessions = LiveTally::collect(&config).member(&name).sessions;
+        tx.send(sessions).expect("report the collect");
+    });
+    let sessions = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the collect returns within the bound");
+    assert_eq!(
+        sessions, 1,
+        "the planted FIFO row is dropped, the real row still counts"
+    );
+}
+
+/// A FIFO at the global credentials path — the well-known file every bare-marker
+/// tally tick and every session-scope `profiles` call reads — must neither hang
+/// nor blow up the count: the read opens with `O_NONBLOCK` and rejects the open
+/// handle's non-regular type. A non-regular file reads `None`, the arm an
+/// unreadable credentials file already takes: the resolution proceeds
+/// credential-less and the bare session lands in the unattributed bucket, the
+/// count still a count.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_non_regular_credentials_file_returns_bounded_and_reads_unknown() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    crate::testutil::write_linked_credentials("rt-work");
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+    let fifo = home.home().join(".claude").join(".credentials.json");
+    std::fs::remove_file(&fifo).expect("clear the credentials file");
+    crate::testutil::mkfifo(&fifo);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let tally = LiveTally::collect(&config);
+        tx.send(tally).expect("report the collect");
+    });
+    let tally = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the collect returns within the bound");
+    // The resolution proceeds credential-less — the same arm any unreadable
+    // credentials file takes — and tier 4 attributes the bare session to the
+    // credential-less active profile, so the tally stays a count.
+    assert_eq!(
+        tally.member(&name).sessions,
+        1,
+        "the non-regular credentials file reads unknown: the bare session attributes \
+         through the credential-less active profile"
+    );
+    assert_eq!(
+        tally.total(),
+        Some(1),
+        "the collect is a count, not an unread"
+    );
+}
+
+/// A FIFO at a profile's `session-token.json` sidecar must neither hang nor
+/// blow up the count: a refresh-less login's resolution walks every profile's
+/// sidecar on every bare-marker tally tick (tier 1b), so the read opens with
+/// `O_NONBLOCK` and rejects the open handle's non-regular type. A non-regular
+/// sidecar reads `None`, the arm a corrupt sidecar already takes: the tier
+/// misses and the count stays a count.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_non_regular_session_token_returns_bounded_and_misses_the_tier() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    // Tier 1b fires only on a refresh-less login: a real credentials file
+    // carrying an access token and no refresh token.
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(
+        claude.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"at-fifo"}}"#,
+    )
+    .expect("write the refresh-less credentials");
+    let profile_dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::create_dir_all(&profile_dir).expect("mkdir the profile dir");
+    crate::testutil::mkfifo(&profile_dir.join("session-token.json"));
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let tally = LiveTally::collect(&config);
+        tx.send(tally).expect("report the collect");
+    });
+    let tally = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the collect returns within the bound");
+    assert_eq!(
+        tally.member(&name).sessions,
+        1,
+        "the non-regular sidecar misses the tier: the bare session attributes through \
+         the credential-less active profile"
+    );
+    assert_eq!(
+        tally.total(),
+        Some(1),
+        "the collect is a count, not an unread"
+    );
+}
+
+/// A job record whose first 64 KiB parses and whose tail is junk pins the read
+/// cap's bounded-work half: the capped read stops at the cap, the record
+/// parses and the job counts; an unbounded read would swallow the tail, fail
+/// the parse and read the store unreadable (0). No under-cap fixture can tell
+/// the two apart.
+#[test]
+fn a_job_record_at_the_cap_reads_only_the_cap() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    let job_dir = home.home().join(".claude").join("jobs").join("0add99f4");
+    std::fs::create_dir_all(&job_dir).expect("mkdir job dir");
+    let mut record = serde_json::json!({
+        "state": "working",
+        "respawnFlags": [],
+        "providerEnv": { "CLAUDE_CONFIG_DIR": tree.to_string_lossy() },
+    })
+    .to_string();
+    let cap = crate::runtime::RECORD_READ_CAP as usize;
+    while record.len() < cap {
+        record.push(' ');
+    }
+    let mut bytes = record.into_bytes();
+    assert_eq!(
+        bytes.len(),
+        crate::runtime::RECORD_READ_CAP as usize,
+        "fixture: the padded record fills exactly the cap"
+    );
+    bytes.extend_from_slice(b"junk");
+    std::fs::write(job_dir.join("state.json"), &bytes).expect("write the oversized record");
+
+    assert_eq!(
+        LiveTally::collect(&config).member(&name).sessions,
+        1,
+        "the capped read stops at the cap: the record parses and the job counts"
+    );
+}
+
+/// `claude --bg` stages its record as `state.json.tmp.<rand>` before renaming
+/// it, and creates the job dir empty first, so a store caught mid-create holds
+/// a dir no record can be read from. That is a job that names no tree yet, not
+/// an unreadable store: the store's real records must still count, and the
+/// fleet total must stay a count rather than going unknown.
+#[test]
+fn a_mid_create_job_dir_does_not_hide_the_stores_running_jobs() {
+    for staged in [None, Some("state.json.tmp.8d511663")] {
+        let home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("work");
+        let config = config_with(vec![crate::testutil::blank_profile(&name)], "work");
+        let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+        std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+        crate::testutil::write_live_supervisor(&tree);
+        crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+        let mid_create = home
+            .home()
+            .join(".claude")
+            .join("jobs")
+            .join("job-creating");
+        std::fs::create_dir_all(&mid_create).expect("mkdir the job dir");
+        if let Some(staged) = staged {
+            std::fs::write(mid_create.join(staged), b"{\"state\":").expect("stage the record");
+        }
+
+        let tally = LiveTally::collect(&config);
+        assert_eq!(
+            tally.member(&name).sessions,
+            1,
+            "{staged:?}: the store's running job still counts"
+        );
+        assert_eq!(
+            tally.total(),
+            Some(1),
+            "{staged:?}: a job dir with no record yet is no unreadable store"
+        );
+    }
+}
+
+/// A bg job on an account deleted with `delete --force` still spends that
+/// account's window and still runs in a tree under `profiles/`: the count walks
+/// the job trees, so the job reaches the fleet total and the account's slot the
+/// way a registry row of a deleted account already does.
+#[test]
+fn a_job_on_a_deleted_account_reaches_the_fleet_total() {
+    let home = HomeSandbox::new();
+    let deleted = crate::profile::ProfileName::from("gone");
+    let config = config_with(vec![], "work");
+    let tree = crate::runtime::background_runtime_tree(&deleted).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the deleted account's tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::testutil::write_claude_job(home.home(), "job-1", &tree);
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&deleted).sessions,
+        1,
+        "the job counts on the account whose dir its tree sits under"
+    );
+    assert_eq!(
+        tally.total(),
+        Some(1),
+        "a session on a deleted account still spends, so the fleet total counts it"
+    );
+}
+
 /// After `clauth delete <launch_profile> --force`, the launch profile's marker
 /// dir is gone — but the session keeps running on `current_member` and holds
 /// that member's marker. The probe must look at `current_member`, not
@@ -625,21 +1408,6 @@ fn a_session_that_never_swapped_probes_start_profile_in_collect() {
 
 // ── bare `claude` sessions ───────────────────────────────────────────────────
 
-fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
-    profile.credentials = Some(crate::profile::ClaudeCredentials {
-        claude_ai_oauth: Some(crate::profile::OAuthToken {
-            access_token: format!("at-{name}"),
-            refresh_token: Some(refresh.to_string()),
-            expires_at: None,
-            scopes: None,
-            subscription_type: None,
-            ..crate::profile::OAuthToken::default_extra()
-        }),
-    });
-    profile
-}
-
 fn config_with(profiles: Vec<crate::profile::Profile>, active: &str) -> AppConfig {
     AppConfig {
         state: crate::profile::AppState {
@@ -649,17 +1417,6 @@ fn config_with(profiles: Vec<crate::profile::Profile>, active: &str) -> AppConfi
         },
         profiles,
     }
-}
-
-/// What the credential link the bare `claude` reads actually holds.
-fn write_linked_credentials(refresh: &str) {
-    let dir = crate::profile::claude_dir().expect("claude dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .claude");
-    std::fs::write(
-        dir.join(".credentials.json"),
-        format!(r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}"}}}}"#),
-    )
-    .expect("write linked credentials");
 }
 
 /// A bare `claude` — started without `clauth start` — burns the same account
@@ -678,6 +1435,7 @@ fn a_held_bare_marker_counts_on_the_account_the_credential_link_resolves_to() {
         LiveTally::collect(&config).member(&crate::profile::ProfileName::from("work")),
         MemberSessions {
             sessions: 1,
+            delegates: 0,
             following: 1,
             last_swap_at: None,
         },
@@ -799,6 +1557,16 @@ fn the_tally_splits_own_from_delegates_and_total_is_unchanged() {
     assert_eq!(tally.total(), Some(5), "total keeps counting every row");
     assert_eq!(tally.own(), Some(3), "own is the non-delegate rows");
     assert_eq!(tally.delegates(), Some(2), "delegates is the marked rows");
+    assert_eq!(
+        tally.member(&crate::profile::ProfileName::from("work")),
+        MemberSessions {
+            sessions: 5,
+            delegates: 2,
+            following: 4,
+            last_swap_at: None,
+        },
+        "the per-account slice splits the delegates out of its own sessions"
+    );
 }
 
 /// An unread tally gives neither part a reading — the split chip's `—` form.

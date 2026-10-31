@@ -7051,6 +7051,53 @@ fn the_daemon_does_not_retry_an_account_whose_profile_dir_is_unreadable() {
     let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
 }
 
+/// One record-less dir in the GLOBAL store — a `claude --bg` caught mid-create,
+/// or a crash's leftover — makes the store read `Named` with a global
+/// mid-create verdict, not `Unreadable`. The gates keep sparing, but nothing
+/// says a job names any account's tree, so the adoption leg must leave the
+/// holds as they are and adopt NOTHING: without the skip it would build a
+/// background tree, claim a marker and write a hold row for EVERY configured
+/// account off one stray dir, permanently.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_adopts_nothing_while_the_global_store_holds_a_recordless_dir() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![
+            profile_with_creds("bg1", "tok-1"),
+            profile_with_creds("bg2", "tok-2"),
+            profile_with_creds("bg3", "tok-3"),
+        ],
+        None,
+        60_000,
+    );
+    let mut daemon = daemon_for(config);
+    std::fs::create_dir_all(
+        crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("jobs")
+            .join("0add99f3"),
+    )
+    .expect("mkdir the record-less dir");
+
+    for _ in 0..10 {
+        daemon.background.reconcile(
+            vec![
+                crate::profile::ProfileName::from("bg1"),
+                crate::profile::ProfileName::from("bg2"),
+                crate::profile::ProfileName::from("bg3"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            daemon.background.adoption_attempts, 0,
+            "a global mid-create store adopts nothing: no job names any account"
+        );
+    }
+}
+
 /// The daemon's tick thread must never probe the link mode: the probe writes
 /// shared dotfiles, so a tick-side probe would race every locked `clauth start`
 /// probe on the same account. The adoption worker probes under the state lock

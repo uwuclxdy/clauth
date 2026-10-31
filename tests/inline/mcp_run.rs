@@ -1246,16 +1246,14 @@ fn an_own_endpoint_capped_accounts_row_carries_no_credit_cap_flag() {
         );
     }
     let config = crate::profile::load_config().expect("load config");
-    let jobs = crate::claude_jobs::job_trees();
-    let handed_off = crate::runtime::handed_off_live_members(&jobs);
+    let live = crate::live_sessions::LiveTally::collect(&config);
     let now = 1_700_000_000_000;
     let row = |n: &crate::profile::ProfileName| {
         profile_row(
             config.find(n).expect("profile in the config"),
             &config,
             now,
-            &jobs,
-            &handed_off,
+            &live,
         )
     };
     assert_eq!(
@@ -4515,8 +4513,8 @@ fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
 
     let text = monitor_text("d-vendor-0");
     assert!(
-        text.contains("; quota: no 5h/7d limits; api balance: 31.45 CNY"),
-        "the target's own cache answers, and the 5h/7d window it cannot have reads as none: {text}",
+        text.contains("; quota: api balance: 31.45 CNY"),
+        "the target's own cache answers, and the wallet figure rides no denial: {text}",
     );
     assert!(
         !text.contains("quota: usage unknown"),
@@ -4548,8 +4546,9 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
 
     let text = monitor_text("d-generic-0");
     assert!(
-        text.contains("; quota: no 5h/7d limits; total: 31.45 CNY"),
-        "a generic endpoint's own cache answers its quota: {text}",
+        text.contains("; quota: total: 31.45 CNY"),
+        "a generic endpoint's own cache answers its quota, its parseable balance \
+         row riding no denial: {text}",
     );
 
     let folded = render::delegate_prose(&fold_delegate_live_usage(
@@ -4561,7 +4560,7 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
         DigestMode::Skip,
     ));
     assert!(
-        folded.contains("target `litellm`: no 5h/7d limits; total: 31.45 CNY"),
+        folded.contains("target `litellm`: total: 31.45 CNY"),
         "and the same figures ride the delegate footer: {folded}",
     );
 }

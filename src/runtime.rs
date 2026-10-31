@@ -81,8 +81,8 @@ use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, clauth_dir, home_dir,
-    profile_dir, profile_subpath,
+    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, clauth_dir,
+    home_dir, profile_dir, profile_subpath,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1036,6 +1036,250 @@ fn job_names_tree_under(name: &ProfileName, jobs: &crate::claude_jobs::JobTrees)
         .unwrap_or(true)
 }
 
+/// One live Claude Code background job the shared live-session tally counts: a
+/// `clauth start <p> -- --bg` session whose launcher exited, so its marker
+/// released, while Claude Code's job store still names its tree. A
+/// `--with-fallback` session's tree sits under its START profile's dir even
+/// after the chain moved it, so attribution follows the registry row.
+pub(crate) struct BackgroundJob {
+    /// The account the job runs on: its registry row's `current_member` (else
+    /// `start_profile`), or, with no row left, the profile whose dir the job's
+    /// tree sits under.
+    pub(crate) member: String,
+    /// Whether the session follows the chain, as its row says. A fixed
+    /// background tree never follows the chain, so a job with no row does not.
+    pub(crate) follows_chain: bool,
+}
+
+/// The background jobs `jobs` names that no held marker already counts, one
+/// [`BackgroundJob`] per job. The trees come from the snapshot, so a job on an
+/// account the config no longer holds counts on that account's name — a
+/// session does not stop spending because its account left the roster. A job
+/// naming a tree a counted row occupies is that row's session, never a second
+/// one: jobs and counted rows are compared per tree, and the fixed background
+/// tree carries one job per session while every row on it holds one marker. A
+/// tree whose supervisor is no longer live holds no session at all
+/// ([`supervisor_is_live`]).
+///
+/// The returned `unread` flag says the fleet total has no reading to give: the
+/// global job store failed, or a scoped store did, so some tree's jobs are
+/// missing; or a named tree's supervisor record could not be read, so whether
+/// its jobs run is unknown. Every READABLE tree's jobs still count, so one
+/// unreadable store never discards another account's running job.
+pub(crate) fn live_background_jobs(
+    config: &AppConfig,
+    jobs: &crate::claude_jobs::JobTrees,
+    rows: &[crate::live_sessions::LiveSession],
+    counted: &[crate::live_sessions::LiveSession],
+) -> (Vec<BackgroundJob>, bool) {
+    let mut held: HashMap<PathBuf, usize> = HashMap::new();
+    for row in counted {
+        for tree in row_runtime_trees(row) {
+            *held.entry(tree).or_default() += 1;
+        }
+    }
+    let Some((named, mut unread)) = jobs.unfinished_jobs() else {
+        return (Vec::new(), true);
+    };
+    let Ok((members, members_partial)) = live_member_dirs(config) else {
+        return (Vec::new(), true);
+    };
+    // `job_trees`' own walk flags a steady unreadable profile dir; this covers
+    // one that fails between the two walks.
+    unread |= members_partial;
+    let mut per_tree: HashMap<PathBuf, usize> = HashMap::new();
+    for (_, tree) in named {
+        *per_tree.entry(tree).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    for (tree, naming) in per_tree {
+        let Some(dir_member) = tree_member(&tree, &members) else {
+            continue;
+        };
+        let extra = naming.saturating_sub(held.get(&tree).copied().unwrap_or(0));
+        if extra == 0 {
+            continue;
+        }
+        match supervisor_is_live(&tree) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => {
+                unread = true;
+                continue;
+            }
+        }
+        let owner = row_for_tree(rows, &tree);
+        let member = owner.map_or(dir_member, |row| {
+            row.current_member
+                .clone()
+                .unwrap_or_else(|| row.start_profile.clone())
+        });
+        let follows_chain = owner.is_some_and(|row| row.follows_chain);
+        out.extend((0..extra).map(|_| BackgroundJob {
+            member: member.clone(),
+            follows_chain,
+        }));
+    }
+    (out, unread)
+}
+
+/// The name clauth addresses every profile dir by, keyed by that dir's
+/// canonical identity — the form a job record's tree is keyed in
+/// ([`crate::claude_jobs`] resolves `CLAUDE_CONFIG_DIR` with
+/// [`crate::canonical::identity`]). Configured profiles go in first, so a
+/// profile dir that is a symlink or junction attributes on its own name rather
+/// than on the dir it points at; a dir the config no longer holds (a deleted
+/// account's leftover) fills in the identity it did not claim. One `read_dir`
+/// of `profiles/`, the walk [`runtime_trees`] makes. `Err`: the profiles root
+/// exists but cannot be listed, so no tree can be attributed and the count has
+/// no reading to give. The flag is `true` when an entry could not be listed or
+/// resolved for a reason other than not-found: a tree under it would count on
+/// no account, so the count reads unread, the way the sibling walks fail
+/// closed. A not-found dir (configured but never created, or a dangling link)
+/// holds no tree a record can name.
+fn live_member_dirs(config: &AppConfig) -> Result<(HashMap<PathBuf, String>, bool), ()> {
+    let mut dirs = HashMap::new();
+    let mut partial = false;
+    for name in &config.state.profiles {
+        let Ok(dir) = profile_dir(name) else {
+            continue;
+        };
+        match member_identity(&dir) {
+            Ok(Some(id)) => {
+                dirs.entry(id).or_insert_with(|| name.to_string());
+            }
+            Ok(None) => {}
+            Err(()) => partial = true,
+        }
+    }
+    let root = profiles_root_dir().map_err(|_| ())?;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((dirs, partial)),
+        Err(_) => return Err(()),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            partial = true;
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        match member_identity(&entry.path()) {
+            Ok(Some(id)) => {
+                dirs.entry(id).or_insert(name);
+            }
+            Ok(None) => {}
+            Err(()) => partial = true,
+        }
+    }
+    Ok((dirs, partial))
+}
+
+/// A profile dir's canonical identity; `Ok(None)` when it does not exist.
+fn member_identity(path: &Path) -> Result<Option<PathBuf>, ()> {
+    match crate::canonical::identity(path) {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The account a runtime tree belongs to: the profile dir whose canonical
+/// identity is the tree's parent, named by [`live_member_dirs`]. `None` for a
+/// dir outside `profiles/` — a `claude --bg` on some config dir clauth does not
+/// own names no clauth session. A deleted account's dir keeps its name, so its
+/// tree attributes.
+fn tree_member(tree: &Path, members: &HashMap<PathBuf, String>) -> Option<String> {
+    members.get(tree.parent()?).cloned()
+}
+
+/// Whether the tree's own Claude Code supervisor still runs, so the jobs its
+/// store names are running too. `Some(false)` for no supervisor record at all
+/// (a clean shutdown deletes both files) or a recorded pid that no longer
+/// names a live process: the job record keeps `state: "working"` until
+/// `claude rm` while no session runs. `Some(true)` for a live or unverifiable
+/// supervisor, the fail-closed direction the GC spare takes: the pid may be a
+/// live supervisor clauth cannot verify. `None` when the record itself is
+/// unreadable — a `daemon.lock` (or, with none, a `daemon.status.json`) that
+/// does not parse, names no valid pid, is over the cap, or is not a regular
+/// file — since it names no pid, nothing shows a live supervisor,
+/// and the caller reads the count unread rather than inventing a session.
+///
+/// A symlinked record is FOLLOWED and its target verified like a plain record
+/// — an older build linked the home's lock/status into the tree, and the home
+/// supervisor's liveness is exactly what the tree's jobs hang on
+/// ([`supervisor_state`] keeps reading the link as absent, so the GC still
+/// collects the tree with no stop). A dangling link reads absent: a clean
+/// shutdown deletes the target file, leaving the tree-side link to dangle.
+/// Reads records and process state only (`kill(0)`, `/proc` on linux,
+/// `proc_pidinfo` and sysctl on macOS) — a record is typed through
+/// [`read_regular_capped`] — no subprocess, no signal.
+fn supervisor_is_live(tree: &Path) -> Option<bool> {
+    match read_supervisor_record_for(tree, RecordLinks::Yes) {
+        Ok(Some((pid, start))) => Some(!matches!(
+            verify_supervisor_record(tree, pid, &start),
+            SupervisorState::Gone
+        )),
+        Ok(None) => Some(false),
+        Err(()) => None,
+    }
+}
+
+/// The ONE runtime tree a counted row occupies: its fixed background tree for a
+/// background row (built under its `start_profile`, which a background session
+/// never leaves), else the per-session layout whose paired `sessions<rest>/<sid>`
+/// holds its marker.
+///
+/// A row names no transport, and on a host upgraded from the pre-`runtime-<sid>`
+/// keying BOTH layouts can exist: claiming the tree the row does not run in
+/// would net a real job away from the tree it names. The marker file is the
+/// row's own evidence of which layout it occupies.
+fn row_runtime_trees(row: &crate::live_sessions::LiveSession) -> Vec<PathBuf> {
+    if row.background {
+        return background_runtime_tree(&ProfileName::from(row.start_profile.as_str()))
+            .ok()
+            .and_then(|tree| crate::canonical::identity(&tree).ok())
+            .into_iter()
+            .collect();
+    }
+    let Ok(trees) = session_runtime_trees(
+        &ProfileName::from(row.start_profile.as_str()),
+        row.isolated,
+        &row.session_id,
+    ) else {
+        return Vec::new();
+    };
+    trees
+        .into_iter()
+        .find(|tree| row_marker_beside(tree, &row.session_id))
+        .and_then(|tree| crate::canonical::identity(&tree).ok())
+        .into_iter()
+        .collect()
+}
+
+/// Whether `tree`'s paired marker dir holds `session_id`'s marker — the
+/// module's `runtime<rest>` ↔ `sessions<rest>` rule, asking which layout a row
+/// actually runs in.
+fn row_marker_beside(tree: &Path, session_id: &str) -> bool {
+    tree.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(paired_sessions_name)
+        .is_some_and(|sessions| tree.with_file_name(sessions).join(session_id).exists())
+}
+
+/// The registry row whose session built `tree`, read off the `<sid>` a
+/// per-session runtime dir name carries; `None` for the fixed background tree
+/// and for a session whose row is gone.
+fn row_for_tree<'a>(
+    rows: &'a [crate::live_sessions::LiveSession],
+    tree: &Path,
+) -> Option<&'a crate::live_sessions::LiveSession> {
+    let sid = sid_of_runtime_dir_name(tree.file_name()?.to_str()?)?;
+    rows.iter().find(|row| row.session_id == sid)
+}
+
 /// Whether a live session — marker-held and holding a rotatable store, or an
 /// UNFINISHED background job on one — must block rotating this profile's chain.
 /// Kept PURE (the caller reads `cfg!`) so both arms run from a Linux test, like
@@ -1749,6 +1993,13 @@ fn gc_runtime_trees() {
              background-job record under {} could not be read",
             offending.display()
         );
+    } else if let Some(store) = job_trees.global_mid_create_store() {
+        // A job dir with no record yet may name any tree the next instant.
+        logline!(
+            "clauth: spared every dead runtime tree this sweep: a Claude Code \
+             background job under {} has no record yet",
+            store.display()
+        );
     }
     // One line per scoped unreadable (a profile dir, or a tree's own `jobs/`),
     // once per sweep, naming the store the operator can act on — the per-pair
@@ -1757,6 +2008,17 @@ fn gc_runtime_trees() {
         logline!(
             "clauth: spared runtime trees this sweep: the Claude Code \
              background-job store {} could not be read",
+            store.display()
+        );
+    }
+    // One line per scoped store caught mid-create, once per sweep: the store
+    // was read, so it is no failure, but the tree is spared because its
+    // record-less dir can name it the next instant.
+    for (tree, store) in job_trees.scoped_mid_create_stores() {
+        logline!(
+            "clauth: spared runtime tree {}: a Claude Code background job \
+             under {} has no record yet",
+            tree.display(),
             store.display()
         );
     }
@@ -7771,26 +8033,137 @@ fn supervisor_record_pid_is_valid(pid: u32) -> bool {
     pid != 0 && pid <= i32::MAX as u32
 }
 
+/// Whether a record reader follows a symlinked `daemon.lock` /
+/// `daemon.status.json` to its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordLinks {
+    /// GC: the link names the HOME roster's supervisor, never this tree's own —
+    /// a link reads as absent, so the tree collects with no stop and
+    /// `remove_dir_all` unlinks the link, leaving the shared target intact.
+    No,
+    /// The count: the link is followed and its target verified like a plain
+    /// record — the home supervisor's liveness is exactly what the tree's jobs
+    /// hang on. A dangling link reads absent: a clean shutdown deletes the
+    /// target, leaving the tree-side link to dangle.
+    Yes,
+}
+
+/// The cap on every record read the live count makes but a credentials blob
+/// ([`CREDENTIALS_READ_CAP`]): live-session registry rows, supervisor locks and
+/// status files, job records, session-token sidecars. The largest real one is a job `state.json` — a
+/// provider config dir, a state word, respawn flags, a session id — at a few
+/// KiB, so 64 KiB is an order of magnitude above it; a read truncated at the
+/// cap fails the record's parse and the caller fails closed.
+pub(crate) const RECORD_READ_CAP: u64 = 64 * 1024;
+
+/// The cap on a credentials blob read: a `.credentials.json` carries Claude
+/// Code's `mcpOAuth` block beside the login and outgrows any job record, up to
+/// the 512 KiB ceiling the Keychain writer accepts (its macOS-only
+/// `SECURITY_ARGV_VALUE_MAX` derives from this). A larger file truncates, fails
+/// its parse, and the caller reads no credentials (the lookup proceeds
+/// credential-less, a cache entry reads as a miss). The cache entry wraps its
+/// blob, so it carries a few bytes less headroom than the blob.
+pub(crate) const CREDENTIALS_READ_CAP: u64 = 512 * 1024;
+
+/// Read `path` only when the FOLLOWED entry is a regular file, bounded to
+/// `cap` bytes. On unix the type check runs on the OPEN handle (`O_NONBLOCK`,
+/// then `fstat`), so a path swapped after the open cannot block it
+/// ([`open_record`]); other targets type the entry with a separate stat before
+/// opening it, and [`open_record`] names that residual. The `take` bounds a
+/// target that grows or was never bounded. `Ok(None)`: the path is gone
+/// (`NotFound`). `Ok(Some(bytes))`: a regular file's bytes, possibly truncated
+/// at `cap`. `Err(())`: the entry is not a regular file (a FIFO, device,
+/// directory or socket) or the read failed — the caller fails closed, the same
+/// arm an unreadable record takes.
+pub(crate) fn read_regular_capped(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, ()> {
+    use std::io::Read as _;
+    let Some(file) = open_record(path)? else {
+        return Ok(None);
+    };
+    if !file.metadata().map_err(|_| ())?.is_file() {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).map_err(|_| ())?;
+    Ok(Some(bytes))
+}
+
+/// Open `path` (following links) for [`read_regular_capped`] without ever
+/// blocking on a FIFO: `O_NONBLOCK` makes the open return on a writer-less
+/// FIFO, whose handle the caller's `fstat` then rejects. `Ok(None)`: the path is
+/// gone. Anything else the kernel let open comes back for the type check.
+#[cfg(unix)]
+fn open_record(path: &Path) -> Result<Option<File>, ()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Every other target types the entry with a separate stat before opening it;
+/// a swap between the two is this arm's residual, and the `take` still bounds
+/// whatever the open reads.
+#[cfg(not(unix))]
+fn open_record(path: &Path) -> Result<Option<File>, ()> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+        Ok(meta) if !meta.is_file() => Err(()),
+        Ok(_) => File::open(path).map(Some).map_err(|_| ()),
+    }
+}
+
 /// `(pid, proc_start)` from `<tree>/daemon.lock`, falling back to
-/// `<tree>/daemon.status.json`. `Ok(None)`: neither is a regular file.
-/// `Err(())`: a non-regular, non-symlink entry (a directory), a regular
-/// file that failed to parse, or a record whose pid is 0 or above `i32::MAX`
-/// — fail closed, a supervisor may be alive and unverifiable.
+/// `<tree>/daemon.status.json`. `Ok(None)`: neither names a readable record.
+/// `Err(())`: a non-regular, non-symlink entry (a directory), a record that
+/// failed to parse, or a pid of 0 or above `i32::MAX` — fail closed, a
+/// supervisor may be alive and unverifiable.
 ///
-/// A SYMLINK reads as absent: an older clauth build linked the home's
-/// lock/status into the tree, so the supervisor the link names is the HOME
-/// roster's, never this tree's own — the tree collects with no stop, and
-/// `remove_dir_all` unlinks the link, leaving the shared target intact.
+/// A SYMLINK reads as absent for [`RecordLinks::No`]: an older clauth build
+/// linked the home's lock/status into the tree, so the supervisor the link
+/// names is the HOME roster's, never this tree's own — the tree collects with
+/// no stop, and `remove_dir_all` unlinks the link, leaving the shared target
+/// intact. [`RecordLinks::Yes`] follows the link instead, for the count.
 fn read_supervisor_record(tree: &Path) -> Result<Option<(u32, String)>, ()> {
+    read_supervisor_record_for(tree, RecordLinks::No)
+}
+
+fn read_supervisor_record_for(
+    tree: &Path,
+    links: RecordLinks,
+) -> Result<Option<(u32, String)>, ()> {
     let lock = tree.join("daemon.lock");
     match lock.symlink_metadata() {
         Ok(meta) if meta.file_type().is_file() => {
-            let body = std::fs::read(&lock).map_err(|_| ())?;
+            let body = read_regular_capped(&lock, RECORD_READ_CAP)?.ok_or(())?;
             let record = serde_json::from_slice::<DaemonLock>(&body).map_err(|_| ())?;
             if !supervisor_record_pid_is_valid(record.pid) {
                 return Err(());
             }
             return Ok(Some((record.pid, record.proc_start)));
+        }
+        Ok(meta) if meta.file_type().is_symlink() && links == RecordLinks::Yes => {
+            // The count reads through the link, regular targets only and
+            // bounded: a FIFO or device target never blocks or grows the read
+            // (it fails closed), a dangling link's target is gone — read as an
+            // absent lock and fall through to the status file.
+            match read_regular_capped(&lock, RECORD_READ_CAP) {
+                Ok(None) => {}
+                Err(()) => return Err(()),
+                Ok(Some(body)) => {
+                    let record = serde_json::from_slice::<DaemonLock>(&body).map_err(|_| ())?;
+                    if !supervisor_record_pid_is_valid(record.pid) {
+                        return Err(());
+                    }
+                    return Ok(Some((record.pid, record.proc_start)));
+                }
+            }
         }
         Ok(meta) if meta.file_type().is_symlink() => {}
         Ok(_) => return Err(()),
@@ -7800,12 +8173,25 @@ fn read_supervisor_record(tree: &Path) -> Result<Option<(u32, String)>, ()> {
     let status = tree.join("daemon.status.json");
     match status.symlink_metadata() {
         Ok(meta) if meta.file_type().is_file() => {
-            let body = std::fs::read(&status).map_err(|_| ())?;
+            let body = read_regular_capped(&status, RECORD_READ_CAP)?.ok_or(())?;
             let record = serde_json::from_slice::<DaemonStatus>(&body).map_err(|_| ())?;
             if !supervisor_record_pid_is_valid(record.supervisor_pid) {
                 return Err(());
             }
             Ok(Some((record.supervisor_pid, record.supervisor_proc_start)))
+        }
+        Ok(meta) if meta.file_type().is_symlink() && links == RecordLinks::Yes => {
+            match read_regular_capped(&status, RECORD_READ_CAP) {
+                Ok(None) => Ok(None),
+                Err(()) => Err(()),
+                Ok(Some(body)) => {
+                    let record = serde_json::from_slice::<DaemonStatus>(&body).map_err(|_| ())?;
+                    if !supervisor_record_pid_is_valid(record.supervisor_pid) {
+                        return Err(());
+                    }
+                    Ok(Some((record.supervisor_pid, record.supervisor_proc_start)))
+                }
+            }
         }
         Ok(meta) if meta.file_type().is_symlink() => Ok(None),
         Ok(_) => Err(()),

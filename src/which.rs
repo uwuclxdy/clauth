@@ -367,8 +367,17 @@ fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
 }
 
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // A regular file only, bounded: the credentials path is read every
+    // session-scope `profiles` call and every bare-marker tally tick, and an
+    // `open` on a FIFO blocks forever (a device read never ends). A
+    // non-regular or unreadable file reads `None`, the arm an unreadable
+    // credentials file already takes: the resolution proceeds credential-less.
+    // The cap is the Keychain blob ceiling, not the job-record one: a
+    // credentials file carries Claude Code's `mcpOAuth` block beside the login
+    // and grows far past a job record's size.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::CREDENTIALS_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// [`resolve_profile_candidate`] filtered so a user-disabled account is never
@@ -735,7 +744,15 @@ fn keychain_cache_entry(
 
 #[cfg(any(target_os = "macos", test))]
 fn read_keychain_cache_entry(dir: &Path, service: &str) -> Option<KeychainEvidenceEntry> {
-    let bytes = std::fs::read(keychain_cache_entry_path(dir, service)).ok()?;
+    // A regular file only, bounded like `read_credentials` and by the same
+    // ceiling: the entry wraps one credential blob, so it can run as large.
+    // A non-regular or unreadable entry reads `None`, the arm an absent or
+    // unparseable entry already takes ("no evidence").
+    let bytes = crate::runtime::read_regular_capped(
+        &keychain_cache_entry_path(dir, service),
+        crate::runtime::CREDENTIALS_READ_CAP,
+    )
+    .ok()??;
     serde_json::from_slice(&bytes).ok()
 }
 

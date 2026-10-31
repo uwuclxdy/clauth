@@ -956,6 +956,30 @@ fn keychain_cache_write_reads_back_owner_only_and_preserves_other_services() {
     }
 }
 
+/// An entry wraps one credential blob, which an `mcpOAuth` map can push past
+/// the 64 KiB record cap; the entry still reads back whole.
+#[test]
+fn a_keychain_cache_entry_past_the_record_cap_still_reads_back() {
+    let _home = HomeSandbox::new();
+    let dir = keychain_cache_dir().expect("the sandbox home resolves");
+    let mut blob = keychain_blob(Some("rt-big"));
+    blob["mcpOAuth"] = serde_json::json!({ "pad": "x".repeat(70 * 1024) });
+    write_keychain_cache_entry(
+        &dir,
+        "svc-big",
+        &KeychainEvidenceEntry {
+            at: 1000,
+            blob: Some(blob),
+        },
+    )
+    .expect("write the large entry");
+    let read = read_keychain_cache_entry(&dir, "svc-big").expect("a 70 KiB entry reads back");
+    assert_eq!(
+        read.blob.as_ref().expect("the entry holds its blob")["claudeAiOauth"]["refreshToken"],
+        "rt-big"
+    );
+}
+
 #[test]
 fn an_unparseable_keychain_cache_is_a_miss() {
     let _home = HomeSandbox::new();
@@ -1858,5 +1882,23 @@ fn json_tps_never_publishes_the_attribution_timeline() {
     assert!(
         v.get("entries").is_none() && v.get("attribution").is_none(),
         "which --json hides the timeline: {v}"
+    );
+}
+
+/// `.credentials.json` carries Claude Code's `mcpOAuth` block beside the login,
+/// so a credentials file can run far past a job record's size. The read is
+/// bounded by the Keychain blob ceiling instead: a padded file still resolves
+/// its account, rather than failing its parse and going credential-less.
+#[test]
+fn a_credentials_file_with_a_large_mcp_oauth_block_still_resolves_its_account() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("solo", "rt-solo")], Some("solo"));
+    crate::testutil::write_linked_credentials("rt-solo");
+    crate::testutil::pad_linked_credentials_past_record_cap();
+
+    assert_eq!(
+        resolve_global(&config),
+        Some(("solo".to_string(), Source::RefreshMatch)),
+        "a credentials file padded past the job-record cap still attributes its login"
     );
 }

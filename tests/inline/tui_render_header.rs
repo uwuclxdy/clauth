@@ -1935,6 +1935,39 @@ fn the_turned_pose_paints_its_facing_cut_black() {
     assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
 }
 
+/// The chip counts the job-store term, not held markers alone: a launcher that
+/// exited releases its marker while Claude Code still runs the job, so the
+/// app's own collection totals the held row and that job at two.
+#[test]
+fn a_launcher_exited_bg_job_and_a_held_row_render_two_live_sessions() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("uwuclxdy");
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "uwuclxdy"))
+        .expect("register the held row");
+    let _m0 = crate::runtime::hold_session_row_marker(&name, false, "4242-0")
+        .expect("hold the row's marker");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        background: true,
+        ..crate::testutil::live_row("4243-0", "uwuclxdy")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job(home.home(), "jobrun", &tree);
+
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Overview;
+    assert_eq!(
+        row_content(&app, 90, 1),
+        format!(
+            "[ 2 live ]  [ — tok/s ]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
+        "the chip counts the launcher-exited job beside the held row"
+    );
+}
+
 /// On an xterm-256 terminal the cut-outs take palette index 16, the cube's
 /// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint.
 #[test]

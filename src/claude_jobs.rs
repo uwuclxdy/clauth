@@ -19,17 +19,24 @@
 //! gates) counts a job as live while its job dir exists (until `claude rm`),
 //! whatever its `state`: a finished job may be revived (`claude attach`) and
 //! the cost of sparing its tree is disk — except in an ISOLATED tree, which no
-//! session can re-enter, where only an UNFINISHED job spares. A record-less job
-//! dir that is a removed job's leftover — an empty `tmp/` and/or an
-//! `exit-cause` file — reads as no job; every other record-less dir stays
-//! unreadable and spares, so a job caught mid-create never reads as collected.
-//! The settings term ([`JobTrees::spares_settings`]) spares a spawn-settings
-//! file a job's `respawnFlags` name. The rotation term
-//! ([`JobTrees::unfinished_under`]) counts only UNFINISHED jobs: a
-//! `stopped`/`done`/`failed` job must not freeze the chain, and only `state`
-//! can say "finished" — `firstTerminalAt` cannot (a revived `running` job keeps
-//! the stamp). A global-store failure is global; a tree-local or profile-dir
-//! failure is SCOPED to that account's trees.
+//! session can re-enter, where only an UNFINISHED job spares. A job dir with no
+//! record is either a removed job's leftover — an empty `tmp/` and/or an
+//! `exit-cause` file — or caught mid-create (an empty dir, or only staged
+//! `state.json.tmp.*` records); neither names a job. A leftover is no job to
+//! any reader. A mid-create dir names no tree yet either, so the live-session
+//! count skips it and keeps counting the store's real records, while every gate
+//! that must not collect a tree a job reads fails closed for it — the tree
+//! itself for a tree-local dir, every tree for the global one, since the record
+//! about to land can name any of them. Any other record-less dir is unreadable
+//! and spares. The settings term ([`JobTrees::spares_settings`]) spares a
+//! spawn-settings file a job's `respawnFlags` name. The rotation term
+//! ([`JobTrees::unfinished_under`]) and the live-session term
+//! ([`JobTrees::unfinished_jobs`]) count only UNFINISHED jobs: a
+//! `stopped`/`done`/`failed` job must not freeze the chain and holds no
+//! session slot, and only `state` can say "finished" — `firstTerminalAt`
+//! cannot (a revived `running` job keeps the stamp). A global-store failure is
+//! global; a tree-local or profile-dir failure is SCOPED to that account's
+//! trees.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -127,8 +134,9 @@ struct ProviderEnv {
 }
 
 /// The name sets one readable job-store walk yields. The fields are private
-/// behind the query methods: `unfinished ⊆ named` must hold, and a caller
-/// reading one set directly could break it.
+/// behind the query methods: `unfinished ⊆ named` and
+/// `unfinished_by_job ⊆ named_by_job` must hold, and a caller reading one set
+/// directly could break it.
 #[derive(Debug)]
 pub(crate) struct NamedTrees {
     /// Canonical identities of every config dir a live job names, whatever its
@@ -141,6 +149,10 @@ pub(crate) struct NamedTrees {
     /// tree, so the set — not the tree's presence in `named` — says when the
     /// jobs naming a tree changed.
     named_by_job: HashMap<PathBuf, HashSet<String>>,
+    /// The UNFINISHED half of `named_by_job`, for the live-session term: a
+    /// finished job (`stopped`/`done`/`failed`) still spares its tree (it may
+    /// be revived) but no longer RUNS, so the session count never reads it.
+    unfinished_by_job: HashMap<PathBuf, HashSet<String>>,
     /// Canonical identities of every config dir an UNFINISHED job names — a
     /// subset of `named` (an unfinished job is also live for the spare term).
     unfinished: HashSet<PathBuf>,
@@ -162,6 +174,11 @@ pub(crate) struct NamedTrees {
     /// unreadable — a global store failure is the separate
     /// [`JobTrees::Unreadable`] arm.
     unreadable: Vec<UnreadableStore>,
+    /// The GLOBAL store was caught mid-create: a job dir there holds no record
+    /// yet. It names no tree and the count skips it, but the record about to
+    /// land can name any tree, so every gate fails closed for all of them.
+    /// `Some(store)` is the dir to name in a log line.
+    global_mid_create: Option<PathBuf>,
 }
 
 /// One scoped unreadable: the canonical identity a spare/block query matches
@@ -173,6 +190,10 @@ struct UnreadableStore {
     /// The store dir the operator can act on (the tree's `jobs/`, or the
     /// profile dir).
     store: PathBuf,
+    /// The store was READ, but held a job dir caught mid-create. Gates fail
+    /// closed for the scope; the live-session count skips the dir and counts
+    /// the store's other records.
+    mid_create: bool,
 }
 
 /// The answer to "which runtime trees and settings files must a sweep or gate
@@ -232,6 +253,7 @@ impl JobTrees {
     pub(crate) fn spares(&self, tree: &Path) -> bool {
         match self {
             JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) if sets.global_mid_create.is_some() => true,
             JobTrees::Named(sets) if sets.named.is_empty() && sets.unreadable.is_empty() => false,
             JobTrees::Named(sets) => named_or_affected(tree, &sets.named, &sets.unreadable),
         }
@@ -264,6 +286,7 @@ impl JobTrees {
     pub(crate) fn unfinished_names(&self, tree: &Path) -> bool {
         match self {
             JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) if sets.global_mid_create.is_some() => true,
             JobTrees::Named(sets) if sets.unfinished.is_empty() && sets.unreadable.is_empty() => {
                 false
             }
@@ -309,13 +332,49 @@ impl JobTrees {
         }
     }
 
-    /// The store dir every scoped unreadable names, for the sweep-level GC log:
-    /// one entry per scoped unreadable, once per sweep, empty under a global
-    /// [`JobTrees::Unreadable`] (the global line already covers that).
+    /// The store dir every scoped STORE FAILURE names, for the sweep-level GC
+    /// log: one entry per scoped unreadable, once per sweep, empty under a
+    /// global [`JobTrees::Unreadable`] (the global line already covers that). A
+    /// store caught mid-create was read, so it names no store here.
     pub(crate) fn scoped_unreadable_stores(&self) -> Vec<&Path> {
         match self {
             JobTrees::Unreadable { .. } => Vec::new(),
-            JobTrees::Named(sets) => sets.unreadable.iter().map(|u| u.store.as_path()).collect(),
+            JobTrees::Named(sets) => sets
+                .unreadable
+                .iter()
+                .filter(|u| !u.mid_create)
+                .map(|u| u.store.as_path())
+                .collect(),
+        }
+    }
+
+    /// Every scoped store caught mid-create as `(spared tree, store dir)`, for
+    /// the sweep-level GC log: the store was read, so it is no store failure,
+    /// but its record-less dir can name the tree the next instant, so the tree
+    /// is spared and the log names the dir. The tree is the store's parent, the
+    /// walked spelling the per-pair line prints — never `scope`'s canonical
+    /// one. One entry per such store; empty under a global
+    /// [`JobTrees::Unreadable`].
+    pub(crate) fn scoped_mid_create_stores(&self) -> Vec<(&Path, &Path)> {
+        match self {
+            JobTrees::Unreadable { .. } => Vec::new(),
+            JobTrees::Named(sets) => sets
+                .unreadable
+                .iter()
+                .filter(|u| u.mid_create)
+                .map(|u| (u.store.parent().unwrap_or(&u.scope), u.store.as_path()))
+                .collect(),
+        }
+    }
+
+    /// The global store dir when the store was caught mid-create, for the
+    /// sweep-level GC log: every spare term fails closed for every tree, and
+    /// this names the dir a record is about to land in. `None` on a readable
+    /// store and under [`JobTrees::Unreadable`] (its own arm names the store).
+    pub(crate) fn global_mid_create_store(&self) -> Option<&Path> {
+        match self {
+            JobTrees::Unreadable { .. } => None,
+            JobTrees::Named(sets) => sets.global_mid_create.as_deref(),
         }
     }
 
@@ -331,7 +390,49 @@ impl JobTrees {
         match self {
             JobTrees::Unreadable { .. } => true,
             JobTrees::Named(sets) => {
-                named_under(&sets.named, dir) || unreadable_under(dir, &sets.unreadable)
+                sets.global_mid_create.is_some()
+                    || named_under(&sets.named, dir)
+                    || unreadable_under(dir, &sets.unreadable)
+            }
+        }
+    }
+
+    /// Every job Claude Code still RUNS, as `(job id, canonical tree)`, for the
+    /// live-session count: one entry per job, so two jobs on one shared tree
+    /// read as two sessions. The trees come from the snapshot's own records,
+    /// never from the configured profiles, so a job on an account the config no
+    /// longer holds is counted on the tree's own account — a session does not
+    /// stop spending because its account was deleted from the roster.
+    ///
+    /// A finished job (`stopped`/`done`/`failed`) holds no slot and names
+    /// nothing here — its dir outlives `claude stop` until `claude rm` — and an
+    /// unknown or missing `state` reads unfinished, the direction
+    /// [`JobTrees::unfinished_under`] takes. Trees under a store that could not
+    /// be read are left out and make the second element true, so the caller
+    /// knows the count is short; a store caught mid-create is not one of those
+    /// (it was read, and its record-less dir names no tree). `None` under a
+    /// global [`JobTrees::Unreadable`]: the count has no reading to give, the
+    /// direction [`crate::live_sessions::LiveTally`] takes for its other
+    /// unknown reads.
+    pub(crate) fn unfinished_jobs(&self) -> Option<(Vec<(String, PathBuf)>, bool)> {
+        match self {
+            JobTrees::Unreadable { .. } => None,
+            JobTrees::Named(sets) => {
+                let readable = |tree: &PathBuf| {
+                    !sets
+                        .unreadable
+                        .iter()
+                        .any(|u| !u.mid_create && tree.starts_with(&u.scope))
+                };
+                let jobs = sets
+                    .unfinished_by_job
+                    .iter()
+                    .filter(|(tree, _)| readable(tree))
+                    .flat_map(|(tree, job_ids)| {
+                        job_ids.iter().map(move |id| (id.clone(), tree.clone()))
+                    })
+                    .collect();
+                Some((jobs, sets.unreadable.iter().any(|u| !u.mid_create)))
             }
         }
     }
@@ -347,6 +448,9 @@ impl JobTrees {
         match self {
             JobTrees::Unreadable { .. } => true,
             JobTrees::Named(sets) => {
+                if sets.global_mid_create.is_some() {
+                    return true;
+                }
                 if sets.named_settings.is_empty()
                     && sets.unknown_flags_trees.is_empty()
                     && sets.unreadable.is_empty()
@@ -379,6 +483,11 @@ impl JobTrees {
         match self {
             JobTrees::Unreadable { store, .. } => Err(store.clone()),
             JobTrees::Named(sets) => {
+                if sets.global_mid_create.is_some() {
+                    // The conventional location every other global-store
+                    // refusal names, never this host's absolute path.
+                    return Err(PathBuf::from("~/.claude/jobs"));
+                }
                 let dir_id = match crate::canonical::identity(dir) {
                     Ok(id) => id,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -537,20 +646,23 @@ impl<'de> serde::de::Visitor<'de> for RespawnFlagsVisitor {
 /// whole read unreadable; a tree-local or profile-dir failure is SCOPED to that
 /// dir's trees. Any job dir whose `state.json` is missing, unreadable, or
 /// unparseable makes its STORE unreadable — EXCEPT a missing record whose dir
-/// is a removed job's leftover ([`removed_jobs_leftover`]), which reads as no
-/// job.
+/// is a removed job's leftover or a creation caught mid-create
+/// ([`recordless_job_dir`]): a leftover reads as no job, and a mid-create dir
+/// is skipped while the gates fail closed for it.
 pub(crate) fn job_trees() -> JobTrees {
     #[cfg(test)]
     JOB_TREES_READS.with(|c| c.set(c.get() + 1));
     let mut sets = NamedTrees {
         named: HashSet::new(),
         named_by_job: HashMap::new(),
+        unfinished_by_job: HashMap::new(),
         unfinished: HashSet::new(),
         tree_by_session: HashMap::new(),
         global_sessions: HashSet::new(),
         named_settings: HashSet::new(),
         unknown_flags_trees: HashSet::new(),
         unreadable: Vec::new(),
+        global_mid_create: None,
     };
 
     let jobs_dir = match claude_dir() {
@@ -568,11 +680,15 @@ pub(crate) fn job_trees() -> JobTrees {
     };
     // The global store is authoritative for every account, so a failure here
     // stays global and the refusal names the conventional store location.
-    if let Err(offending) = read_jobs_dir(&jobs_dir, None, false, &mut sets) {
-        return JobTrees::Unreadable {
-            offending,
-            store: PathBuf::from("~/.claude/jobs"),
-        };
+    match read_jobs_dir(&jobs_dir, None, false, &mut sets) {
+        Ok(false) => {}
+        Ok(true) => sets.global_mid_create = Some(jobs_dir.clone()),
+        Err(offending) => {
+            return JobTrees::Unreadable {
+                offending,
+                store: PathBuf::from("~/.claude/jobs"),
+            };
+        }
     }
 
     let runtime_trees = match crate::runtime::runtime_trees() {
@@ -587,7 +703,7 @@ pub(crate) fn job_trees() -> JobTrees {
         }
     };
     for profile in runtime_trees.unreadable_profiles {
-        record_unreadable(&mut sets.unreadable, &profile, &profile);
+        record_unreadable(&mut sets.unreadable, &profile, &profile, false);
     }
     for tree in runtime_trees.trees {
         let jobs = tree.join("jobs");
@@ -606,22 +722,32 @@ pub(crate) fn job_trees() -> JobTrees {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(_) => tree.clone(),
                 };
-                if read_jobs_dir(&jobs, Some(&owner), isolated, &mut sets).is_err() {
-                    record_unreadable(&mut sets.unreadable, &tree, &jobs);
+                match read_jobs_dir(&jobs, Some(&owner), isolated, &mut sets) {
+                    Ok(false) => {}
+                    Ok(true) => record_unreadable(&mut sets.unreadable, &tree, &jobs, true),
+                    Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
                 }
             }
-            Ok(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs),
+            Ok(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs),
+            Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
         }
     }
 
     JobTrees::Named(Box::new(sets))
 }
 
-/// Push one scoped unreadable: `scope` (a tree or profile dir) is canonicalized
-/// for the spare/block matches, and `store` is the dir the refusal names.
-fn record_unreadable(unreadable: &mut Vec<UnreadableStore>, scope: &Path, store: &Path) {
+/// Push one scoped store verdict: `scope` (a tree or profile dir) is
+/// canonicalized for the spare/block matches, and `store` is the dir the
+/// refusal names. `mid_create` marks a store that was read but held a job dir
+/// caught mid-create — the gates fail closed for the scope, and the
+/// live-session count keeps counting the store's other records.
+fn record_unreadable(
+    unreadable: &mut Vec<UnreadableStore>,
+    scope: &Path,
+    store: &Path,
+    mid_create: bool,
+) {
     let scope = match crate::canonical::identity(scope) {
         Ok(id) => id,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return,
@@ -630,6 +756,7 @@ fn record_unreadable(unreadable: &mut Vec<UnreadableStore>, scope: &Path, store:
     unreadable.push(UnreadableStore {
         scope,
         store: store.to_path_buf(),
+        mid_create,
     });
 }
 
@@ -642,18 +769,22 @@ fn record_unreadable(unreadable: &mut Vec<UnreadableStore>, scope: &Path, store:
 /// as no jobs; any other failure returns the offending dir, which the caller
 /// maps to a global or scoped unreadable. The record rules are [`job_trees`]'s:
 /// a plain file is no job, a job naming no config dir contributes nothing, and
-/// a record-less dir is either a removed job's leftover (no job) or unreadable.
+/// a record-less dir is a removed job's leftover or a creation caught
+/// mid-create ([`recordless_job_dir`]), both skipped, or unreadable. `Ok(true)`
+/// says the store held a mid-create dir, which the caller records so the gates
+/// fail closed for it while the count still reads the store's other records.
 fn read_jobs_dir(
     jobs_dir: &Path,
     owner: Option<&Path>,
     isolated: bool,
     sets: &mut NamedTrees,
-) -> Result<(), PathBuf> {
+) -> Result<bool, PathBuf> {
     let entries = match std::fs::read_dir(jobs_dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err(jobs_dir.to_path_buf()),
     };
+    let mut mid_create = false;
     for entry in entries {
         let entry = entry.map_err(|_| jobs_dir.to_path_buf())?;
         let job_dir = entry.path();
@@ -661,22 +792,24 @@ fn read_jobs_dir(
         if !is_dir {
             continue;
         }
-        let record = match std::fs::read(job_dir.join("state.json")) {
-            Ok(bytes) => bytes,
-            // `claude rm` CAN leave the supervisor running — measured with a
-            // second tree's supervisor sharing the roster — and that supervisor
-            // recreates the job dir with no record — an empty `tmp/`, then
-            // `exit-cause` once signalled. A lone bare job's supervisor exits
-            // instead. A creation never makes those shapes (`tmp/` follows
-            // `state.json`), so the leftover reads as no job; every other
-            // record-less dir stays unreadable (fail closed).
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match removed_jobs_leftover(&job_dir) {
-                    Ok(true) => continue,
-                    Ok(false) | Err(_) => return Err(job_dir.clone()),
+        // A regular file only, bounded: the record path was never typed, and an
+        // `open` on a FIFO blocks forever (a device read never ends) — the
+        // reader runs in the 1 Hz tally and every MCP `profiles` call. A
+        // non-regular or unreadable record fails the STORE read closed.
+        let record = match crate::runtime::read_regular_capped(
+            &job_dir.join("state.json"),
+            crate::runtime::RECORD_READ_CAP,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => match recordless_job_dir(&job_dir) {
+                Ok(RecordlessJobDir::Removed) => continue,
+                Ok(RecordlessJobDir::MidCreate) => {
+                    mid_create = true;
+                    continue;
                 }
-            }
-            Err(_) => return Err(job_dir.clone()),
+                Ok(RecordlessJobDir::Unknown) | Err(_) => return Err(job_dir.clone()),
+            },
+            Err(()) => return Err(job_dir.clone()),
         };
         let state: JobState = match serde_json::from_slice(&record) {
             Ok(state) => state,
@@ -717,14 +850,20 @@ fn read_jobs_dir(
             continue;
         }
         sets.named.insert(tree_id.clone());
+        if !finished {
+            sets.unfinished.insert(tree_id.clone());
+        }
         if let Some(job_id) = job_dir.file_name().and_then(|name| name.to_str()) {
             sets.named_by_job
                 .entry(tree_id.clone())
                 .or_default()
                 .insert(job_id.to_owned());
-        }
-        if !finished {
-            sets.unfinished.insert(tree_id.clone());
+            if !finished {
+                sets.unfinished_by_job
+                    .entry(tree_id.clone())
+                    .or_default()
+                    .insert(job_id.to_owned());
+            }
         }
         if !state.session_id.is_empty() {
             sets.tree_by_session
@@ -756,36 +895,61 @@ fn read_jobs_dir(
             }
         }
     }
-    Ok(())
+    Ok(mid_create)
 }
 
-/// Whether a record-less job dir is a removed job's leftover: its entries are a
-/// NON-EMPTY subset of {`tmp` = an empty directory, `exit-cause` = a regular
-/// file}. A creation never makes that shape — an empty dir and a
-/// `state.json.tmp.*` staged record are mid-create, and a `tmp/` holding
-/// anything is not the leftover — so only a supervisor that outlived `claude rm`
-/// does. A list that cannot be read is `Err`, which the caller reads as
-/// unreadable (fail closed).
-fn removed_jobs_leftover(job_dir: &Path) -> io::Result<bool> {
+/// What a job dir with no `state.json` is.
+enum RecordlessJobDir {
+    /// A removed job's leftover: entries are a NON-EMPTY subset of {`tmp` = an
+    /// empty directory, `exit-cause` = a regular file}. `claude rm` can leave
+    /// the job's supervisor running, and that supervisor recreates the dir this
+    /// way (an empty `tmp/`, then `exit-cause` once signalled); a lone bare
+    /// job's supervisor exits instead. No reader counts it as a job.
+    Removed,
+    /// Caught mid-create: an empty dir, or one holding only staged
+    /// `state.json.tmp.*` records. Claude Code creates the dir, stages the
+    /// record, renames it, and only then creates `tmp/` (measured 5/5, 2.1.308),
+    /// so a creation never makes the leftover shape and a `tmp/` holding
+    /// anything is neither.
+    MidCreate,
+    /// Any other record-less dir: unreadable, fail closed.
+    Unknown,
+}
+
+/// Classify a record-less job dir. A list that cannot be read is `Err`, which
+/// the caller reads as unreadable (fail closed).
+fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
     let mut seen = false;
+    let mut leftover = true;
+    let mut mid_create = true;
     for entry in std::fs::read_dir(job_dir)? {
         let entry = entry?;
         seen = true;
         let name = entry.file_name();
+        let file_type = entry.file_type()?;
         if name == "tmp" {
-            if !entry.file_type()?.is_dir() {
-                return Ok(false);
-            }
-            if std::fs::read_dir(entry.path())?.next().is_some() {
-                return Ok(false);
+            if !file_type.is_dir() || std::fs::read_dir(entry.path())?.next().is_some() {
+                leftover = false;
             }
         } else if name == "exit-cause" {
-            if !entry.file_type()?.is_file() {
-                return Ok(false);
+            if !file_type.is_file() {
+                leftover = false;
             }
         } else {
-            return Ok(false);
+            leftover = false;
+        }
+        let staged = name
+            .to_str()
+            .is_some_and(|name| name.starts_with("state.json.tmp."));
+        if !(staged && file_type.is_file()) {
+            mid_create = false;
         }
     }
-    Ok(seen)
+    if seen && leftover {
+        return Ok(RecordlessJobDir::Removed);
+    }
+    if mid_create {
+        return Ok(RecordlessJobDir::MidCreate);
+    }
+    Ok(RecordlessJobDir::Unknown)
 }

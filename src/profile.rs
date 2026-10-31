@@ -2818,6 +2818,22 @@ pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
+/// [`read_json_file`] for a path the live-session count runs every tick: a
+/// regular file only and bounded ([`crate::runtime::read_regular_capped`]),
+/// since a blocking `open` on a FIFO never returns and a device read never
+/// ends. A non-regular or unreadable file
+/// reads `Err`, the same arm an unreadable file takes; the callers map it to
+/// "no sidecar".
+pub(crate) fn read_json_file_capped<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP)
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
+}
+
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;

@@ -1849,6 +1849,63 @@ pub(crate) fn oauth_pair(access: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
+/// An OAuth profile whose captured credential is `refresh`, so the shared
+/// `~/.claude/.credentials.json` link a bare `claude` reads resolves to it.
+pub(crate) fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
+    let mut profile = blank_profile(&crate::profile::ProfileName::from(name));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    profile
+}
+
+/// What the credential link a bare `claude` reads holds: the shared
+/// `~/.claude/.credentials.json` carrying `refresh`, under the caller's pinned
+/// HOME.
+pub(crate) fn write_linked_credentials(refresh: &str) {
+    let dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}"}}}}"#),
+    )
+    .expect("write linked credentials");
+}
+
+/// Pad the linked `~/.claude/.credentials.json` with an `mcpOAuth` block of 70
+/// one-KiB entries, past [`crate::runtime::RECORD_READ_CAP`], the way a fleet of
+/// OAuth MCP servers grows the real file.
+pub(crate) fn pad_linked_credentials_past_record_cap() {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    let mut blob: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read the link")).expect("parse");
+    let mcp: serde_json::Map<String, serde_json::Value> = (0..70)
+        .map(|i| {
+            (
+                format!("server-{i:02}"),
+                serde_json::json!({"accessToken": "x".repeat(1024)}),
+            )
+        })
+        .collect();
+    blob["mcpOAuth"] = serde_json::Value::Object(mcp);
+    let bytes = serde_json::to_vec(&blob).expect("serialize the padded blob");
+    assert!(
+        bytes.len() as u64 > crate::runtime::RECORD_READ_CAP,
+        "fixture control: the file is past the record cap ({} bytes)",
+        bytes.len()
+    );
+    std::fs::write(&path, &bytes).expect("write the padded credentials");
+}
+
 /// Write a long-lived `session-token.json` sidecar (no refresh token, so
 /// `claude::has_session_token` reads it as a login) into `name`'s profile dir
 /// under the process HOME, which the caller's `HomeSandbox` pins.
@@ -3527,14 +3584,43 @@ impl Drop for FakeSupervisor {
     }
 }
 
-/// Write `<tree>/daemon.lock` in the supervisor's content-file shape.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+/// Write `<tree>/daemon.lock` in the supervisor's content-file shape. Ungated
+/// like the file it writes: [`write_live_supervisor`] poses a live supervisor
+/// on every platform, and a real one writes this same pair everywhere.
 pub(crate) fn write_daemon_lock(tree: &Path, pid: u32, start: &str) {
     std::fs::write(
         tree.join("daemon.lock"),
         format!("{{\"pid\":{pid},\"procStart\":\"{start}\"}}"),
     )
     .expect("write daemon.lock");
+}
+
+/// Create a FIFO at `path` for the non-regular-file guards: `std` has no
+/// stable `mkfifo` and the crate forbids `unsafe`, so the test shells out to
+/// the coreutils one.
+#[cfg(all(test, unix))]
+pub(crate) fn mkfifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo {} failed", path.display());
+}
+
+/// Record a LIVE supervisor in `tree`'s `daemon.lock`: the test process's own
+/// pid with its real start time, so the record names a live process. The pid
+/// is not a `daemon run` process, so the verify reads it `Unverifiable` — the
+/// arm the live-session count treats as alive — and no test signals it.
+pub(crate) fn write_live_supervisor(tree: &Path) {
+    std::fs::create_dir_all(tree).expect("mkdir the supervised tree");
+    let pid = std::process::id();
+    // Windows: the supervisor's identity form is unmeasured, so any well-formed
+    // record reads `Unverifiable` there and the start string is not compared.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let start = proc_start_of(pid).expect("the test process's start time");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let start = String::from("Thu Oct 22 20:59:19 2026");
+    write_daemon_lock(tree, pid, &start);
 }
 
 /// Write `<tree>/daemon.status.json` in the supervisor's fallback shape.

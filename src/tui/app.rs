@@ -6046,8 +6046,11 @@ impl App {
         let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
-        // handle below.
-        let live_sessions = crate::live_sessions::LiveTally::collect(&config);
+        // handle below. The tally and the handed-off set share ONE job-store
+        // snapshot, so a job landing mid-construction cannot split them; the
+        // tick refreshes the same pair from one read.
+        let job_trees = crate::claude_jobs::job_trees();
+        let live_sessions = crate::live_sessions::LiveTally::collect_in(&config, &job_trees);
         let tps = crate::tps::load_cache();
         let daemon_health = crate::daemon::daemon_health();
         // The Overview pool actions read this record without the Services tab
@@ -6065,9 +6068,6 @@ impl App {
             .profiles
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
-        // The handed-off set derives from the job snapshot, so both are read
-        // once here and refreshed as a pair on the tick.
-        let job_trees = crate::claude_jobs::job_trees();
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
 
         let mut app = Self {
@@ -29362,12 +29362,13 @@ fn poll_live_sessions(app: &mut App) {
         return;
     }
     app.last_live_sessions_refresh = Some(Instant::now());
-    let tally = crate::live_sessions::LiveTally::collect(&app.config());
-    app.set_live_sessions(tally);
     // The job-store snapshot and the handed-off set it implies ride the same
     // tick: refreshed here, never per frame, so the Setup detail's live-session
-    // field reads a store at most once a second.
+    // field and the tally's background-job term read one store at most once a
+    // second.
     let jobs = crate::claude_jobs::job_trees();
+    let tally = crate::live_sessions::LiveTally::collect_in(&app.config(), &jobs);
+    app.set_live_sessions(tally);
     app.handed_off = crate::runtime::handed_off_live_members(&jobs);
     app.job_trees = jobs;
 }

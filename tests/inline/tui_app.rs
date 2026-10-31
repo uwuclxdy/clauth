@@ -3580,6 +3580,26 @@ fn the_live_session_tick_reads_the_job_store_once() {
     );
 }
 
+/// The constructor seeds the live tally and the handed-off set from ONE job
+/// snapshot. Two reads let a job land between them, so the chip and the
+/// handed-off marks would disagree about which jobs exist.
+#[test]
+fn the_constructor_reads_the_job_store_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::claude_jobs::reset_job_trees_reads();
+    let _app = app_with(vec![crate::profile::Profile::new(
+        "acct".to_string(),
+        None,
+        None,
+    )]);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the constructor seeds the tally and the handed-off set from one snapshot"
+    );
+}
+
 // ── lock-order regression ───────────────────────────────────────────────────
 
 /// `reload_if_state_changed` must NOT hold the config guard while it writes the

@@ -2116,8 +2116,7 @@ fn an_unfunded_target_is_refused_at_routing_time() {
         first_text(&result),
         "delegate to `broke` failed: cannot fund a run: broke — api balance: \
          0.00 CNY (balance too low) (cached 1h 30m ago); name another account; \
-         target `broke`: no 5h/7d limits; api balance: 0.00 CNY (balance too \
-         low) (cached 1h 30m ago)",
+         target `broke`: api balance: 0.00 CNY (balance too low) (cached 1h 30m ago)",
         "the refusal names the account, the provider's figure, the verdict, \
          the cache age and the fix, and the headroom clause dates the same \
          cache"

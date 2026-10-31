@@ -1449,8 +1449,13 @@ impl BackgroundHolds {
         }
         // An unreadable store names every tree, so it cannot say which holds to
         // adopt; leaving the holds as they are is the fail-closed direction
-        // (nothing was released above either).
-        if matches!(jobs, crate::claude_jobs::JobTrees::Unreadable { .. }) {
+        // (nothing was released above either). A store caught mid-create names
+        // no tree either — its record-less dir can name any tree the next
+        // instant — so it adopts nothing new the same way; the release loop
+        // above has already kept every hold.
+        if matches!(jobs, crate::claude_jobs::JobTrees::Unreadable { .. })
+            || jobs.global_mid_create_store().is_some()
+        {
             return;
         }
         // A streak whose job has gone says nothing about the next one: clearing

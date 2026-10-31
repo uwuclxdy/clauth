@@ -336,10 +336,12 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 /// the previous window's last reading and drops), and when no live bar remains
 /// the chain falls through to the first funded wallet row (an empty wallet a
 /// two-wallet provider lists first must not win the headline over the funded
-/// one), then the first stat row that carries a value; the plan label prefixes
-/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
-/// heading) are skipped so the headline never renders a dangling `label:` with
-/// nothing after it.
+/// one), then any wallet at all — a spent one included — so a row whose
+/// `has_wallet` drops the `no 5h/7d limits` denial always renders a wallet
+/// rather than a bare counter, then the first stat row that carries a value;
+/// the plan label prefixes the line when present. Value-less rows (e.g.
+/// DeepSeek's `USD balance` heading) are skipped so the headline never renders
+/// a dangling `label:` with nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
     // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
@@ -366,7 +368,15 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 
     let mut body = if !live_bars.is_empty() {
         live_bars
-    } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
+    } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            crate::providers::balance_wallets(&s.rows)
+                .into_iter()
+                .next()
+        })
+    {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s
         .rows
@@ -855,16 +865,22 @@ fn age_clause(v: &Value) -> String {
 /// limits, which is exactly what the denial would be claiming to know.
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
-/// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba, MiniMax) HAS limits of its own whether or not this one response
-/// carried any, so a denial beside its figure is false or unknowable (Alibaba's
-/// current window is monthly with a dormant 5h pair that may return, so clauth
-/// cannot know it has no 5h limit); a provider answering with a wallet or a counter
-/// (DeepSeek, ollama, a generic endpoint) has none, and saying so is what
-/// stops its figure reading as one more window someone can wait out. The split
-/// is the payload's `provider_windows` flag, decided from the provider plus
-/// the response's bars at the source — matching the rendered figure for a `5h`
-/// substring would make the copy decide its own meaning.
+/// it has none AND its figure is no wallet. A provider that publishes usage
+/// windows of its own (z.ai, Alibaba, MiniMax) HAS limits of its own whether or
+/// not this one response carried any, so a denial beside its figure is false or
+/// unknowable (Alibaba's current window is monthly with a dormant 5h pair that
+/// may return, so clauth cannot know it has no 5h limit); a no-windows account
+/// answering with a WALLET (DeepSeek, a generic endpoint's own balance row) gets
+/// the figure alone — the denial never rides an api balance, the one figure a
+/// reader can measure rather than wait out, and a spent wallet already refuses
+/// by its own verdict beside the number; a no-windows account whose figure is a
+/// COUNTER (ollama, a generic endpoint's scalar that parses as no wallet) keeps
+/// the denial, which is what stops its figure reading as one more window
+/// someone can wait out. Both splits are the payload's — `provider_windows` and
+/// `has_wallet`, decided at the source (`has_wallet` by the same
+/// `is_balance_row` + `parse_balance` pair every wallet surface uses,
+/// zero-amount wallets included) — never a match on the rendered `api balance`
+/// text, which would make the copy decide its own meaning.
 ///
 /// A freshness clause rides the FIGURE it dates, and the `stale` word never
 /// rides an unknown: a verdict qualifies a figure, and beside one the prose
@@ -886,6 +902,10 @@ fn windows_prose(windows: &Value) -> String {
                 .get("provider_windows")
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
+                || windows
+                    .get("has_wallet")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
             {
                 figure.to_string()
             } else {
@@ -1075,12 +1095,26 @@ fn profile_line(row: &Value) -> String {
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
     }
-    if row
-        .get("has_live_session")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    // One snapshot per call, the Overview live column's per-account slice.
+    if let Some(sessions) = row.get("live_sessions").and_then(Value::as_u64)
+        && sessions > 0
     {
-        out.push_str("; live session");
+        let mut clause = if sessions == 1 {
+            "1 live session".to_string()
+        } else {
+            format!("{sessions} live sessions")
+        };
+        if let Some(delegates) = row.get("live_delegates").and_then(Value::as_u64)
+            && delegates > 0
+        {
+            clause.push_str(&if delegates == 1 {
+                " (1 delegate)".to_string()
+            } else {
+                format!(" ({delegates} delegates)")
+            });
+        }
+        out.push_str("; ");
+        out.push_str(&clause);
     }
     // Model binds ride only a row the call named (a `names` filter or the
     // session scope), so the unfiltered roster renders none; only set binds
@@ -1165,6 +1199,22 @@ fn profile_line(row: &Value) -> String {
     out
 }
 
+/// The line a reply carries when the live-session tally could not read every
+/// dir or record it counts from (a session or job store, a profile dir, a
+/// running job's supervisor record). The per-row counts it does carry may be short, so the
+/// reply names the unknown once instead of printing a count that reads as
+/// complete.
+const LIVE_SESSIONS_UNKNOWN: &str =
+    "live sessions: partly unknown (a session store could not be read)";
+
+/// Whether the reply's tally had a read fail (`live_sessions_unknown`).
+fn live_sessions_unknown(payload: &Value) -> bool {
+    payload
+        .get("live_sessions_unknown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Prose for `profiles`. The all-scope roster is one `profile_line` per
 /// profile; the session-scope arm is the folded-in former `which`: the one row
 /// THIS session resolves to, rendered through the same `profile_line` (so it
@@ -1225,12 +1275,28 @@ pub(crate) fn profiles_prose(p: &Value) -> String {
             out.push_str("; ");
             out.push_str(&digest);
         }
+        if live_sessions_unknown(p) {
+            out.push('\n');
+            out.push_str(LIVE_SESSIONS_UNKNOWN);
+        }
         return out;
     }
     if rows.is_empty() {
-        return "no profiles".to_string();
+        // The unknown clause is unconditional: a failed read marks every reply
+        // that renders tally figures, and an empty roster's would-be rows are
+        // figures too, so "no profiles" alone must not read as a full reply.
+        return if live_sessions_unknown(p) {
+            format!("no profiles\n{LIVE_SESSIONS_UNKNOWN}")
+        } else {
+            "no profiles".to_string()
+        };
     }
-    rows.iter().map(profile_line).collect::<Vec<_>>().join("\n")
+    let mut out = rows.iter().map(profile_line).collect::<Vec<_>>().join("\n");
+    if live_sessions_unknown(p) {
+        out.push('\n');
+        out.push_str(LIVE_SESSIONS_UNKNOWN);
+    }
+    out
 }
 
 /// Prose for `switch_profile`: the outcome, then the active profile's live

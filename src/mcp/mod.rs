@@ -15,7 +15,7 @@ mod herdr_report;
 pub(crate) mod jobs;
 mod render;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -148,6 +148,17 @@ fn load_usage(name: &ProfileName) -> Option<UsageInfo> {
 /// generic endpoint falls back to whether its response carried bars. It rides
 /// the payload because the prose layer never sees the stats — recovering it by
 /// matching the rendered text would tie the copy to a substring of itself.
+///
+/// `has_wallet` carries the other half of that same scalar question: whether
+/// the cached stats hold a WALLET (a balance row the shared `is_balance_row` +
+/// `parse_balance` pair types, zero-amount included — an account can hold a
+/// wallet it has spent to zero) or a counter with none. The headroom prose
+/// denies a 5h/7d limit beside a counter and never beside a wallet — the
+/// denial never rides an api balance — so the split must ride the payload too,
+/// keyed the same way every wallet surface (the rank, the headline, the
+/// overview column) keys it, never off the rendered text. The headline prefers
+/// any wallet — funded or spent — over a non-wallet row, so `has_wallet` true
+/// always means the figure beside the dropped denial is a wallet.
 fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
     match windows {
         // An empty array is a missing FIGURE, the one case the prose reads as
@@ -167,6 +178,9 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
                 "balance": stats.as_ref().map(render::third_party_headline),
                 "provider_windows": provider.is_some_and(|p| p.publishes_windows())
                     || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
+                "has_wallet": stats
+                    .as_ref()
+                    .is_some_and(|s| !crate::providers::balance_wallets(&s.rows).is_empty()),
             });
             // The wallet-burn rate, omitted when it carries no news (the same
             // rule every optional field here follows): a first-class figure
@@ -247,12 +261,16 @@ fn model_binds_row(p: &Profile) -> Option<serde_json::Value> {
 /// One roster row for `p`, the shape both `profiles` scopes render through
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
+///
+/// `live` is one [`crate::live_sessions::LiveTally`] read the whole reply
+/// shares, so no two rows can disagree about who is live and the per-account
+/// number is the Overview live column's own slice
+/// ([`crate::live_sessions::LiveTally::member`]).
 fn profile_row(
     p: &Profile,
     config: &AppConfig,
     now: i64,
-    jobs: &crate::claude_jobs::JobTrees,
-    handed_off: &HashSet<String>,
+    live: &crate::live_sessions::LiveTally,
 ) -> serde_json::Value {
     let name = &p.name;
     // One read of this account's own cache, feeding the one carrier its figures
@@ -278,11 +296,17 @@ fn profile_row(
     if let Some(url) = p.routing_endpoint() {
         row["host"] = serde_json::json!(render::base_url_host(url));
     }
-    // Both of these are absent unless they say something. Emitted
-    // unconditionally they were 39% of a 27-profile response, nearly all of it
-    // `false` and rows carrying no warning.
-    if crate::runtime::has_live_session_in(name, jobs, handed_off) {
-        row["has_live_session"] = serde_json::json!(true);
+    // Live-session counts and throughput are absent unless they say something:
+    // emitted unconditionally they were 39% of a 27-profile response, nearly
+    // all of it carrying nothing and rows with no warning. The counts ride the
+    // one snapshot the whole roster shares, so no two rows can disagree about
+    // who is live.
+    let live = live.member(name);
+    if live.sessions > 0 {
+        row["live_sessions"] = serde_json::json!(live.sessions);
+        if live.delegates > 0 {
+            row["live_delegates"] = serde_json::json!(live.delegates);
+        }
     }
     let warnings = throughput_warnings(name, now);
     if !warnings.is_empty() {
@@ -1057,8 +1081,7 @@ named, one it cannot place, or an agent run with no model named."
             }
         };
 
-        let jobs = crate::claude_jobs::job_trees();
-        let handed_off = crate::runtime::handed_off_live_members(&jobs);
+        let live = crate::live_sessions::LiveTally::collect(&config);
         // Binds ride only a reply that names its accounts: a `names` filter
         // renders every row it names, so each carries them; the unfiltered
         // roster names none and carries none.
@@ -1072,7 +1095,7 @@ named, one it cannot place, or an agent run with no model named."
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
             .map(|p| {
-                let mut row = profile_row(p, &config, now, &jobs, &handed_off);
+                let mut row = profile_row(p, &config, now, &live);
                 if let Some(binds) = named.then(|| model_binds_row(p)).flatten() {
                     row["models"] = binds;
                 }
@@ -1080,7 +1103,13 @@ named, one it cannot place, or an agent run with no model named."
             })
             .collect();
 
-        let payload = serde_json::json!({ "profiles": profiles });
+        // The per-row counts are slices of a tally that may have read less than
+        // its whole input; the renderer says so rather than printing a short
+        // count as complete.
+        let payload = serde_json::json!({
+            "profiles": profiles,
+            "live_sessions_unknown": live.total().is_none(),
+        });
         let prose = render::profiles_prose(&payload);
         Ok(CallToolResult::success(single_block(prose)))
     }
@@ -1090,14 +1119,17 @@ named, one it cannot place, or an agent run with no model named."
     /// itself resolves by, plus `source`. Rendered through `profile_line` so the
     /// row carries the roster's own guards (the anthropic tier guard included).
     fn profiles_session(&self, config: &AppConfig) -> Result<CallToolResult, ErrorData> {
+        // Collect the tally once, before the resolve branch: the stores count
+        // whether or not this session resolves to an account, so a failed read
+        // must mark the reply even when no row resolves to carry it.
+        let live = crate::live_sessions::LiveTally::collect(config);
+        let live_sessions_unknown = live.total().is_none();
         let resolved = crate::which::resolve_active(config);
         let mut rows = Vec::with_capacity(1);
         if let Some((name, source)) = resolved.as_ref()
             && let Some(p) = config.find(&ProfileName::from(name.clone()))
         {
-            let jobs = crate::claude_jobs::job_trees();
-            let handed_off = crate::runtime::handed_off_live_members(&jobs);
-            let mut row = profile_row(p, config, now_epoch_secs(), &jobs, &handed_off);
+            let mut row = profile_row(p, config, now_epoch_secs(), &live);
             // The session scope names its one account by construction, so its
             // row carries the binds the way a `names`-filtered row does.
             if let Some(binds) = model_binds_row(p) {
@@ -1107,7 +1139,11 @@ named, one it cannot place, or an agent run with no model named."
             rows.push(row);
         }
         let payload = fold_active_live_usage(
-            serde_json::json!({ "scope": "session", "profiles": rows }),
+            serde_json::json!({
+                "scope": "session",
+                "profiles": rows,
+                "live_sessions_unknown": live_sessions_unknown,
+            }),
             config,
             DigestMode::Report(&self.digest),
         );
