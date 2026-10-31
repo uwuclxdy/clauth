@@ -4830,7 +4830,8 @@ fn a_modal_owns_the_arrows_so_the_footer_drops_the_tab_hint() {
 /// With a login in flight and an editor open, esc goes to the editor, so the
 /// login line's trailing hint is the editor's own row, whose `esc revert` names
 /// the field rather than the login, and esc leaves the login running; with no
-/// editor the same line offers the login's `esc cancel`, and esc cancels it.
+/// editor the same line offers the login's `esc cancel` and the global `? help`
+/// (`?` falls past the login to the help arm), and esc cancels it.
 #[test]
 fn the_login_line_names_the_keys_an_open_editor_takes_first() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4860,17 +4861,255 @@ fn the_login_line_names_the_keys_an_open_editor_takes_first() {
 
     assert_eq!(
         footer_of(&dump(&app, 100, 30)),
-        format!("{spinner} logging in 'fresh'   esc cancel"),
+        format!("{spinner} logging in 'fresh'   esc cancel   ? help"),
         "no editor: the login's own cancel"
     );
     handle_key(&mut app, key(KeyCode::Esc));
     assert!(app.login.is_none(), "esc cancelled the login");
 }
 
+/// Every login row shape keeps its exit key whole from 35 columns up, and at
+/// every width 34..=52 the row renders inside the footer inset, a rendered `?`
+/// is always the whole `? help` group, and the account name stays inside its
+/// budget (the row width minus the inset, the `logging in ''` envelope and the
+/// shape's root essentials). The byte rows below are hand-derived from those
+/// rules and pinned at the width where each shape's kept set changes: the
+/// width a shed pair (`↵ save`, 44) or `? help` (43-46, the pickers 49/51)
+/// first fits. The residual the invariants allow: the two day-picker rows end
+/// `q bac` at exactly 34 — envelope (15) + `←→ day` + `q back` (18) is 33
+/// cells in a 32-cell footer row (1-cell inset each side), identical bytes
+/// before the derived pair existed; closing it needs the envelope copy itself
+/// to yield.
+#[test]
+fn the_login_rows_keep_their_exit_keys_from_35_up_and_the_picker_clip_at_34() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use crate::tui::app::{
+        CodexLoginSession, LoginMethod, LoginSession, LoginStage, SeededInput, Tab, handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+
+    let deepseek = |login: Option<LoginSession>, codex: Option<CodexLoginSession>| -> App {
+        let profiles = vec![
+            Profile::new(
+                "D1".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                None,
+            ),
+            Profile::new(
+                "D2".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                None,
+            ),
+        ];
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+                ..AppState::default()
+            },
+            profiles,
+        });
+        app.login = login;
+        app.codex_login = codex;
+        app
+    };
+    let claude = || {
+        Some(LoginSession {
+            name: "fresh".into(),
+            account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
+            generation: 0,
+            url: None,
+            stage: LoginStage::WaitingBrowser,
+            method: LoginMethod::Browser,
+            paste: None,
+            paste_field: None,
+        })
+    };
+    let codex = || {
+        Some(CodexLoginSession {
+            name: "cdx-one".into(),
+            generation: 0,
+            url: None,
+            cancel: crate::codex_login::LoginCancel::new(),
+            is_new: false,
+        })
+    };
+    let shapes: Vec<(&str, App)> = vec![
+        ("claude field", {
+            let mut app = App::new(AppConfig {
+                state: AppState::default(),
+                profiles: vec![],
+            });
+            app.tab = Tab::Config;
+            app.login = claude();
+            app.refresh_interval_draft = Some(SeededInput::new("60"));
+            app
+        }),
+        ("claude picker", {
+            let mut app = preferred_days_card(Vec::new());
+            app.login = claude();
+            handle_key(&mut app, key(KeyCode::Enter));
+            app
+        }),
+        ("claude rebind", deepseek(claude(), None)),
+        ("claude none", {
+            let mut app = App::new(AppConfig {
+                state: AppState::default(),
+                profiles: vec![],
+            });
+            app.login = claude();
+            app
+        }),
+        ("codex picker", {
+            let mut app = preferred_days_card(Vec::new());
+            app.codex_login = codex();
+            handle_key(&mut app, key(KeyCode::Enter));
+            app
+        }),
+        ("codex rebind", deepseek(None, codex())),
+        ("codex none", {
+            let mut app = App::new(AppConfig {
+                state: AppState::default(),
+                profiles: vec![],
+            });
+            app.codex_login = codex();
+            app
+        }),
+    ];
+    let row = |shapes: &[(&str, App)], label: &str, w: u16| -> String {
+        let app = &shapes
+            .iter()
+            .find(|(name, _)| *name == label)
+            .expect("shape exists")
+            .1;
+        footer_of(&dump(app, w, 30)).to_string()
+    };
+    // The invariants, swept at every width per shape. Nothing renders past the
+    // footer inset, the exit pair renders whole (the two 34-column day-picker
+    // rows excepted, the residual named above; the collapsed rows append
+    // `? help` after it, so this is a whole-group check, not a tail check), a
+    // rendered `?` is the whole `? help` group, and the name never exceeds its
+    // budget — the constants (inset 2, envelope 18, the essentials below) are
+    // the hand side of the hand-derived byte rows that follow.
+    for (label, _) in &shapes {
+        let (exit, essentials) = match *label {
+            "claude field" => ("esc revert", 10),
+            "claude rebind" | "codex rebind" => ("q not now", 9),
+            "claude picker" | "codex picker" => ("q back", 15),
+            _ => ("esc cancel", 10),
+        };
+        for w in 34u16..=52 {
+            let rendered = row(&shapes, label, w);
+            assert!(
+                rendered.chars().count() <= (w - 2) as usize,
+                "{label} at {w} renders {rendered:?} past the footer inset"
+            );
+            if !(w == 34 && label.contains("picker")) {
+                assert!(
+                    rendered.contains(exit),
+                    "{label} at {w} loses its exit key: {rendered:?}"
+                );
+            }
+            if rendered.contains('?') {
+                assert!(
+                    rendered.contains("? help"),
+                    "{label} at {w} clips the help pair: {rendered:?}"
+                );
+            }
+            let budget = (w as usize)
+                .saturating_sub(2)
+                .saturating_sub(18)
+                .saturating_sub(essentials);
+            let name = rendered
+                .split("logging in '")
+                .nth(1)
+                .map(|rest| rest.split('\'').next().unwrap_or_default())
+                .unwrap_or_default();
+            assert!(
+                name.chars().count() <= budget,
+                "{label} at {w} renders the name {name:?} over its {budget}-cell budget"
+            );
+        }
+    }
+
+    // Hand-derived rows, each from the rules in the doc comment:
+    //   claude field 34: name budget 32-18-10 = 4 -> 'fre…' (4 cells); the row
+    //     is the 19-cell envelope + `esc revert` (13) = 32.
+    //   claude picker 49: name 47-18-15 = 14 -> 'fresh'; the shed budget
+    //     47-23 = 24 holds `←→ day   ? help   q back` (24) exactly.
+    //   claude rebind 43: name 41-18-9 = 14 -> 'fresh'; the shed budget 18
+    //     holds `? help   q not now` (18) exactly.
+    //   codex none 46: name 44-18-10 = 16 -> 'cdx-one'; the shed budget 19
+    //     holds `esc cancel   ? help` (19) exactly.
+    //   picker 34 (both lines): name budget 32-18-15 -> 0; the shed budget 14
+    //     sits one cell under the essentials' 15, so `q back` clips its tail.
+    for (label, w, expected) in [
+        ("claude field", 34, "⠋ logging in 'fre…'   esc revert"),
+        (
+            "claude field",
+            44,
+            "⠋ logging in 'fresh'   ↵ save   esc revert",
+        ),
+        ("claude picker", 34, "⠋ logging in ''   ←→ day   q bac"),
+        ("claude picker", 35, "⠋ logging in ''   ←→ day   q back"),
+        (
+            "claude picker",
+            40,
+            "⠋ logging in 'fresh'   ←→ day   q back",
+        ),
+        (
+            "claude picker",
+            49,
+            "⠋ logging in 'fresh'   ←→ day   ? help   q back",
+        ),
+        ("claude rebind", 34, "⠋ logging in 'fresh'   q not now"),
+        (
+            "claude rebind",
+            43,
+            "⠋ logging in 'fresh'   ? help   q not now",
+        ),
+        ("claude none", 34, "⠋ logging in 'fre…'   esc cancel"),
+        (
+            "claude none",
+            44,
+            "⠋ logging in 'fresh'   esc cancel   ? help",
+        ),
+        ("codex picker", 34, "⠋ logging in ''   ←→ day   q bac"),
+        (
+            "codex picker",
+            45,
+            "⠋ logging in 'cdx-one'   ←→ day   q back",
+        ),
+        (
+            "codex picker",
+            51,
+            "⠋ logging in 'cdx-one'   ←→ day   ? help   q back",
+        ),
+        ("codex rebind", 34, "⠋ logging in 'cdx-…'   q not now"),
+        (
+            "codex rebind",
+            45,
+            "⠋ logging in 'cdx-one'   ? help   q not now",
+        ),
+        ("codex none", 34, "⠋ logging in 'cdx…'   esc cancel"),
+        (
+            "codex none",
+            46,
+            "⠋ logging in 'cdx-one'   esc cancel   ? help",
+        ),
+    ] {
+        assert_eq!(row(&shapes, label, w), expected, "{label} at {w}");
+    }
+}
+
 /// A narrow login line sheds an open editor's hints the way the plain footer
 /// sheds its row, rightmost non-essential first, so the editor's exit hint
 /// stays whole beside `logging in '<name>'` at 45 columns: a typed field sheds
-/// its caret keys and keeps `↵ save`, the day picker keeps its `←→ day`.
+/// its caret keys and keeps `↵ save`, the day picker keeps its `←→ day` and
+/// `q back` while the derived `? help` retires — the row cannot hold it beside
+/// the whole name, and the name yields to the root essentials, never to the
+/// pair.
 #[test]
 fn a_narrow_login_line_keeps_the_open_editors_exit_hint() {
     let _home = crate::testutil::HomeSandbox::new();

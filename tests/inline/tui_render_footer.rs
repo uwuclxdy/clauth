@@ -277,6 +277,131 @@ fn the_rebind_confirm_footer_row_is_pinned() {
     }
 }
 
+/// With a login in flight and the re-bind confirm open, the login line derives
+/// `? help` the same way the plain footer does: `?` falls through the confirm
+/// (`KeyOwner::claims`), so the key still opens help above the modal — pressed
+/// for real, with the confirm staying open beneath.
+#[test]
+fn the_login_footer_shows_help_beside_the_rebind_confirm() {
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use crate::tui::app::{LoginMethod, LoginStage, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![
+        Profile::new(
+            "D1".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        Profile::new(
+            "D2".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+    ];
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open"
+    );
+    app.login = Some(LoginSession {
+        name: "fresh".into(),
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
+        generation: 0,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'fresh'   ↑↓ row   space toggle   ↵ choose   ? help   q not now",
+        "the rebind confirm's help key rides the login line"
+    );
+    handle_key(&mut app, key(KeyCode::Char('?')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Help)),
+        "`?` opens help above the re-bind confirm"
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm stays open beneath the help modal"
+    );
+    app.modals.pop();
+    assert!(app.login.is_some(), "the login stays live");
+
+    app.login = None;
+    app.codex_login = Some(CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'cdx-one'   ↑↓ row   space toggle   ↵ choose   ? help   q not now",
+        "the rebind confirm's help key rides the codex login line"
+    );
+}
+
+/// With a login in flight and nothing owning the keyboard, `?` falls through to
+/// the global help arm (`handle_key` takes only esc/q for a live login), so the
+/// collapsed login row derives `? help` the same way an owned row does — and
+/// the hint is honest: the key opens help above the login.
+#[test]
+fn the_collapsed_login_row_derives_help_from_the_global_key() {
+    use crate::testutil::key;
+    use crate::tui::app::{LoginMethod, LoginStage, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.login = Some(LoginSession {
+        name: "fresh".into(),
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
+        generation: 0,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'fresh'   esc cancel   ? help",
+        "the collapsed claude login row derives ? help"
+    );
+    handle_key(&mut app, key(KeyCode::Char('?')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Help)),
+        "`?` opens help above the live login"
+    );
+    assert!(app.login.is_some(), "the login stays live");
+
+    let mut codex = bare_app();
+    codex.codex_login = Some(CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    assert_eq!(
+        settled_footer(&codex, 80, 24),
+        "⠋ logging in 'cdx-one'   esc cancel   ? help",
+        "the collapsed codex login row derives ? help"
+    );
+}
+
 // ── modal footer derivation ──────────────────────────────────────────────────
 
 /// The hint pairs one modal's footer derives from.
@@ -1574,7 +1699,8 @@ fn the_login_footer_shows_the_open_modals_row() {
 
 /// A codex re-login in flight keeps its lead line and reads `q back` while its
 /// modal is open (the collapse key; `r`/`c` live in the modal body) and `esc
-/// cancel` once collapsed — the [`draw_login`] shape without the paste door.
+/// cancel` plus the derived `? help` once collapsed — the [`draw_login`] shape
+/// without the paste door.
 #[test]
 fn the_codex_login_footer_names_only_its_modal_keys() {
     use crate::tui::app::CodexLoginSession;
@@ -1601,7 +1727,7 @@ fn the_codex_login_footer_names_only_its_modal_keys() {
     collapsed.codex_login = Some(session());
     assert_eq!(
         settled_footer(&collapsed, 80, 24),
-        "⠋ logging in 'cdx-one'   esc cancel",
+        "⠋ logging in 'cdx-one'   esc cancel   ? help",
         "the collapsed codex login's footer"
     );
 }

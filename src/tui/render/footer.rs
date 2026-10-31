@@ -161,7 +161,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // own row behind the login lead; the login modal's open code field is
         // the exception, where `q` is data and ↵ submits.
         let keys = login_keys(owner, app, frame_area, session.paste_field.is_some());
-        draw_login(frame, area, session, keys, app.tick_count);
+        draw_login(frame, area, session, keys, owner, app);
         return;
     }
 
@@ -171,7 +171,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // so its own row rides behind the codex lead; collapsed, esc cancels.
     if let Some(session) = &app.codex_login {
         let keys = login_keys(owner, app, frame_area, false);
-        draw_codex_login(frame, area, session, keys, app.tick_count);
+        draw_codex_login(frame, area, session, keys, owner, app);
         return;
     }
 
@@ -183,13 +183,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         match owner.zip(owner.and_then(|o| owner_hints(o, app, frame_area))) {
             Some((owner, own)) => {
                 let mut hints = own.to_vec();
-                if !owner.claims(app, KeyCode::Char('?')) {
-                    let at = hints
-                        .iter()
-                        .position(|(key, _)| *key == "q")
-                        .unwrap_or(hints.len());
-                    hints.insert(at, ("?", "help"));
-                }
+                insert_help(&mut hints, Some(owner), app);
                 hints
             }
             None => owner
@@ -248,6 +242,23 @@ fn bound_is_current(stamp: ScrollStamp, area: Rect, app: &App) -> bool {
     stamp.width == area.width
         && stamp.height == area.height
         && stamp.generation == app.modal_generation.get()
+}
+
+/// The `? help` an owner's row derives: [`owner_hints`] rows omit it, and this
+/// inserts it ahead of the owner's `q` group wherever `?` falls through to the
+/// global help arm — an owner that lets `?` past (the day picker, the re-bind
+/// confirm, a locked shunt editor), or no owner at all (the login lines'
+/// collapsed row; the plain footer's no-owner row carries the pair in
+/// [`tab_hints`] instead). The login lines retire the pair where their shed
+/// row cannot hold it: [`login_row_hints`].
+fn insert_help(hints: &mut Vec<(&'static str, &'static str)>, owner: Option<KeyOwner>, app: &App) {
+    if !owner.is_some_and(|owner| owner.claims(app, KeyCode::Char('?'))) {
+        let at = hints
+            .iter()
+            .position(|(key, _)| *key == "q")
+            .unwrap_or(hints.len());
+        hints.insert(at, ("?", "help"));
+    }
 }
 
 /// An owner's own grammar, the whole hint row while it holds the keyboard
@@ -791,6 +802,18 @@ fn usage_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     hints
 }
 
+/// The cells [`shed_to_width`] measures: each pair's key, a space, its label
+/// and a 3-cell gap between pairs. The login lines measure the same rows so
+/// the derived `? help` can retire where it would cost an exit key its cells;
+/// the essentials alone can still overflow a floor-width row.
+fn hint_row_width(hints: &[(&str, &str)]) -> usize {
+    let cells: usize = hints
+        .iter()
+        .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+        .sum();
+    cells + hints.len().saturating_sub(1) * 3
+}
+
 /// Measured degradation for narrow terminals: while the row of `hints`, each
 /// `key label` group 3 spaces from the next, overflows `width` cells, drop the
 /// rightmost non-essential hint. Navigation the screen offers no other way
@@ -799,14 +822,7 @@ fn usage_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// since inside a text field those keys are self-evident. On a desktop-width
 /// terminal everything fits and nothing changes.
 fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
-    let row_width = |hints: &[(&str, &str)]| -> usize {
-        let cells: usize = hints
-            .iter()
-            .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
-            .sum();
-        cells + hints.len().saturating_sub(1) * 3
-    };
-    while row_width(hints) > width {
+    while hint_row_width(hints) > width {
         match hints.iter().rposition(|h| !essential_hint(h)) {
             Some(i) => {
                 hints.remove(i);
@@ -817,8 +833,9 @@ fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
 }
 
 /// A hint the row keeps under every shed: the screen's only way out or around,
-/// discoverability, and armed confirms. [`draw_login`] mirrors this when it
-/// caps a profile name, so a long name never crowds these out.
+/// discoverability, and armed confirms. [`draw_login`] and
+/// [`draw_codex_login`] mirror this when they cap a profile name, so a long
+/// name never crowds these out.
 fn essential_hint(hint: &(&str, &str)) -> bool {
     let (key, label) = *hint;
     matches!(
@@ -1220,19 +1237,43 @@ fn login_keys(owner: Option<KeyOwner>, app: &App, frame_area: Rect, paste_open: 
     }
 }
 
-/// The hint set a login-in-flight footer shows for its [`LoginKeys`]. `paste`
-/// is the login's own paste-field hints (the claude modal's `↵ submit · esc
-/// back`; the codex modal has no paste door, so none).
+/// The root hint set a login-in-flight footer shows for its [`LoginKeys`]:
+/// `paste` is the login's own paste-field hints (the claude modal's `↵ submit
+/// · esc back`; the codex modal has no paste door, so none). The derived
+/// `? help` joins — and retires where the row cannot hold it — in
+/// [`login_row_hints`].
 fn login_key_hints(
     keys: LoginKeys,
     paste: &'static [(&'static str, &'static str)],
-) -> &'static [(&'static str, &'static str)] {
+) -> Vec<(&'static str, &'static str)> {
     match keys {
         LoginKeys::Back => &[("q", "back")],
         LoginKeys::Cancel => &[("esc", "cancel")],
         LoginKeys::Paste => paste,
         LoginKeys::Owner(hints) => hints,
     }
+    .to_vec()
+}
+
+/// The login lines' shed of [`login_key_hints`]' root row: the derived
+/// `? help` joins before the shed (it is essential, so the non-essential pairs
+/// go first), and retires where even the kept row cannot hold it — the exit
+/// keys never yield to it. No [`owner_hints`] row and none of these root rows
+/// carries the pair, so the retirement can never drop an intrinsic one.
+fn login_row_hints(
+    mut hints: Vec<(&'static str, &'static str)>,
+    owner: Option<KeyOwner>,
+    app: &App,
+    budget: usize,
+) -> Vec<(&'static str, &'static str)> {
+    insert_help(&mut hints, owner, app);
+    shed_to_width(&mut hints, budget);
+    if hint_row_width(&hints) > budget
+        && let Some(at) = hints.iter().position(|(key, _)| *key == "?")
+    {
+        hints.remove(at);
+    }
+    hints
 }
 
 /// Login-in-progress line. Independent of `footer_alert` so key handling that
@@ -1247,25 +1288,33 @@ fn draw_login(
     area: Rect,
     session: &LoginSession,
     keys: LoginKeys,
-    tick: u64,
+    owner: Option<KeyOwner>,
+    app: &App,
 ) {
     let hints = login_key_hints(keys, &[("↵", "submit"), ("esc", "back")]);
     // The name's budget is the row width minus the spinner, the `logging in ''`
-    // envelope and the essential hints' cells, so a long profile name never
-    // crowds out the one key that leaves the modal.
+    // envelope and the root essentials' cells — measured before the derived
+    // `? help` joins, so the pair never costs the name a second time.
     let name_budget = (area.width as usize)
         .saturating_sub(1 + 1 + "logging in ''".len() + 3)
-        .saturating_sub(essential_hint_width(hints));
+        .saturating_sub(essential_hint_width(&hints));
     let name = truncate(&session.name, name_budget);
     let mut spans = vec![
-        Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        ),
         Span::styled(format!("logging in '{name}'"), theme::dim()),
     ];
     // Each hint here carries a 3-space lead, while `shed_to_width` counts a gap
     // only between groups: the name and one lead come off its budget.
     let lead = spans.iter().map(Span::width).sum::<usize>() + 3;
-    let mut hints = hints.to_vec();
-    shed_to_width(&mut hints, (area.width as usize).saturating_sub(lead));
+    let hints = login_row_hints(
+        hints,
+        owner,
+        app,
+        (area.width as usize).saturating_sub(lead),
+    );
     for (key, action) in hints {
         spans.push(Span::styled(format!("   {key} "), theme::accent().bold()));
         spans.push(Span::styled(action, theme::dim()));
@@ -1285,16 +1334,34 @@ fn draw_codex_login(
     area: Rect,
     session: &CodexLoginSession,
     keys: LoginKeys,
-    tick: u64,
+    owner: Option<KeyOwner>,
+    app: &App,
 ) {
     let hints = login_key_hints(keys, &[]);
+    // The name's budget is the [`draw_login`] rule: the row width minus the
+    // spinner, the `logging in ''` envelope and the root essentials' cells —
+    // measured before the derived `? help` joins, so the pair never costs the
+    // name a second time.
+    let name_budget = (area.width as usize)
+        .saturating_sub(1 + 1 + "logging in ''".len() + 3)
+        .saturating_sub(essential_hint_width(&hints));
+    let name = truncate(&session.name, name_budget);
     let mut spans = vec![
-        Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
-        Span::styled(format!("logging in '{}'", session.name), theme::dim()),
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        ),
+        Span::styled(format!("logging in '{name}'"), theme::dim()),
     ];
+    // Each hint here carries a 3-space lead, while `shed_to_width` counts a gap
+    // only between groups: the name and one lead come off its budget.
     let lead = spans.iter().map(Span::width).sum::<usize>() + 3;
-    let mut hints = hints.to_vec();
-    shed_to_width(&mut hints, (area.width as usize).saturating_sub(lead));
+    let hints = login_row_hints(
+        hints,
+        owner,
+        app,
+        (area.width as usize).saturating_sub(lead),
+    );
     for (key, action) in hints {
         spans.push(Span::styled(format!("   {key} "), theme::accent().bold()));
         spans.push(Span::styled(action, theme::dim()));
