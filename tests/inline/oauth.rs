@@ -9217,3 +9217,61 @@ fn a_spend_over_a_landed_stage_sends_the_landed_token_past_a_torn_store_read() {
         .collect();
     assert_eq!(sent, vec!["rt-mid".to_string()]);
 }
+
+/// The re-point is driven by the rotation stamp: a rotation of a rolling
+/// profile queues the bearer its stamp replaced, a rotation of a profile
+/// without the flag queues nothing, and neither the arming stamp nor an
+/// unchanged bearer does.
+#[test]
+fn a_rolling_rotation_queues_the_bearer_its_stamp_revoked() {
+    let _home = HomeSandbox::new();
+    let _ = crate::runtime::take_revoked_bearers();
+    let name = "test-repoint-queue";
+    let profile = crate::profile::ProfileName::from(name);
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+    let rotate = |access: &str, refresh: &str| {
+        persist_rotation(
+            &handle,
+            &profile,
+            TokenResponse {
+                access_token: access.to_string(),
+                refresh_token: refresh.to_string(),
+                expires_in: 3600,
+                scope: None,
+            },
+        )
+        .expect("persist");
+    };
+    rotate("at-first", "rt-first");
+    assert!(
+        crate::runtime::take_revoked_bearers().is_empty(),
+        "the arming stamp replaced no rolling bearer"
+    );
+    rotate("at-second", "rt-second");
+    assert_eq!(
+        crate::runtime::take_revoked_bearers(),
+        vec![(profile.clone(), "at-first".to_string())]
+    );
+
+    let plain = "test-repoint-plain";
+    let config = oauth_config(plain, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+    persist_rotation(
+        &handle,
+        &crate::profile::ProfileName::from(plain),
+        TokenResponse {
+            access_token: "at-plain".to_string(),
+            refresh_token: "rt-plain".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    assert!(
+        crate::runtime::take_revoked_bearers().is_empty(),
+        "a profile without the rolling flag stamps nothing"
+    );
+}

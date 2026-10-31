@@ -16892,8 +16892,8 @@ fn no_item_leg_folds_in_a_carry_or_a_flock() {
         }
     }
     assert_eq!(
-        calls, 6,
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out and the seed's retry each call `owned_keychain_leg` once"
+        calls, 7,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the copied-bearer re-point each call `owned_keychain_leg` once"
     );
     assert!(
         offenders.is_empty(),
@@ -19835,4 +19835,484 @@ fn a_gc_pass_spares_a_chain_row_whose_job_lands_after_its_snapshot() {
         crate::live_sessions::get(sid).is_some(),
         "the job re-read spares the handed-off row"
     );
+}
+
+// ── copied rolling bearers: who gets re-pointed ─────────────────────────────
+
+/// Adoption reaches a session's own per-session tree and, for a background
+/// row, the account's shared `runtime-bg` tree; never another session's tree,
+/// a malformed id or a directory clauth did not build.
+#[test]
+fn session_item_adoption_is_limited_to_a_live_sessions_own_tree() {
+    let root = Path::new("/h/.clauth/profiles/acct");
+    assert!(session_item_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(session_item_may_adopt(
+        &root.join("runtime-isolated-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-34181-1"),
+        "34181-0",
+        false
+    ));
+    assert!(session_item_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        true
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        true
+    ));
+    assert!(!session_item_may_adopt(
+        Path::new("/work/my-claude"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(
+        &root.join("runtime"),
+        "34181-0",
+        false
+    ));
+    assert!(!session_item_may_adopt(&root.join("runtime-bg"), "x", true));
+}
+
+/// Only sessions on the stamped member are candidates.
+#[test]
+fn a_stamp_concerns_only_its_members_sessions() {
+    let live = |p: &str, sid: &str| LiveRuntime {
+        runtime: PathBuf::from(format!("/h/{p}/runtime-{sid}")),
+        profile: crate::profile::ProfileName::from(p),
+        session: sid.to_string(),
+        background: false,
+    };
+    let all = vec![live("a", "1-0"), live("b", "2-0"), live("a", "3-0")];
+    let on_a = sessions_on_member(all, &crate::profile::ProfileName::from("a"));
+    assert_eq!(
+        on_a.iter().map(|l| l.session.as_str()).collect::<Vec<_>>(),
+        vec!["1-0", "3-0"]
+    );
+}
+
+/// An item no row names is adopted with the background flag the row carries:
+/// a background row's `runtime-bg` is accepted, a per-session id on it is not.
+#[test]
+fn a_background_sessions_item_is_adopted_on_its_own_tree() {
+    let home = HomeSandbox::new();
+    let tree = home.home().join(".clauth/profiles/acct/runtime-bg");
+    fs::create_dir_all(&tree).expect("tree");
+    let profile = crate::profile::ProfileName::from("acct");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", false).is_err()
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+    let owned = namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", true)
+        .expect("adopted");
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile,
+            session: "704-1".to_string(),
+        }]
+    );
+    namespaced_keychain_ledger::authorize_owned_write(&tree).expect("owned now");
+}
+
+/// An item the ledger does not name refuses the owned witness.
+#[test]
+fn the_owned_witness_needs_a_row() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-705-1");
+    fs::create_dir_all(&runtime).expect("runtime");
+    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
+}
+
+/// The live-session walk keeps live Claude rows whose tree exists, records
+/// the member each is on, reaches a background row's `runtime-bg`, and skips
+/// codex rows, dead rows, rows without a tree and duplicates of one tree.
+#[test]
+fn live_session_runtime_dirs_lists_live_claude_trees_only() {
+    let _home = HomeSandbox::new();
+    let acct = crate::profile::ProfileName::from("acct");
+    let tree = |sid: &str| {
+        let [real, _] = session_runtime_trees(&acct, false, sid).expect("trees");
+        real
+    };
+
+    // Live, swapped onto another member, with a tree.
+    let mut swapped = crate::testutil::live_row("801-0", "acct");
+    swapped.current_member = Some("other".to_string());
+    crate::live_sessions::register(&swapped).expect("register");
+    let _swapped_marker =
+        hold_session_row_marker(&crate::profile::ProfileName::from("other"), false, "801-0")
+            .expect("marker");
+    fs::create_dir_all(tree("801-0")).expect("tree");
+
+    // Live but its tree was never built.
+    crate::live_sessions::register(&crate::testutil::live_row("802-0", "acct")).expect("register");
+    let _treeless = hold_session_row_marker(&acct, false, "802-0").expect("marker");
+
+    // A dead row with a tree.
+    crate::live_sessions::register(&crate::testutil::live_row("803-0", "acct")).expect("register");
+    fs::create_dir_all(tree("803-0")).expect("tree");
+
+    // A codex row.
+    let mut codex = crate::testutil::live_row("804-0", "acct");
+    codex.harness = crate::harness::Harness::Codex;
+    crate::live_sessions::register(&codex).expect("register");
+    let _codex_marker = hold_session_row_marker(&acct, false, "804-0").expect("marker");
+    fs::create_dir_all(tree("804-0")).expect("tree");
+
+    // A background row on the account's shared tree.
+    let mut bg = crate::testutil::live_row("805-0", "acct");
+    bg.background = true;
+    crate::live_sessions::register(&bg).expect("register");
+    let bg_tree = background_runtime_tree(&acct).expect("bg tree");
+    fs::create_dir_all(&bg_tree).expect("bg tree");
+    let _bg_marker = hold_background_row_marker(&acct, "805-0").expect("bg marker");
+
+    let mut live = live_session_runtime_dirs();
+    live.sort_by(|a, b| a.session.cmp(&b.session));
+    let sessions: Vec<&str> = live.iter().map(|l| l.session.as_str()).collect();
+    assert!(sessions.contains(&"801-0"), "{live:?}");
+    assert!(!sessions.contains(&"802-0"), "no tree: {live:?}");
+    assert!(!sessions.contains(&"803-0"), "dead: {live:?}");
+    assert!(!sessions.contains(&"804-0"), "codex: {live:?}");
+    let swapped = live.iter().find(|l| l.session == "801-0").expect("swapped");
+    assert_eq!(
+        swapped.profile.as_str(),
+        "other",
+        "the member, not the start profile"
+    );
+    assert!(!swapped.background);
+    let bg = live
+        .iter()
+        .find(|l| l.session == "805-0")
+        .expect("background row");
+    assert!(bg.background);
+    assert_eq!(bg.runtime, bg_tree);
+}
+
+/// The queue keeps one entry per revoked bearer and member, and a drain that
+/// cannot run (no Keychain under test, or off macOS) leaves it as it was; the
+/// daemon's detached drain is a no-op under test.
+#[test]
+fn the_revoked_bearer_queue_dedupes_and_survives_a_drain_that_cannot_run() {
+    let _ = take_revoked_bearers();
+    let a = crate::profile::ProfileName::from("a");
+    let b = crate::profile::ProfileName::from("b");
+    note_revoked_rolling_bearer(&a, "old".to_string());
+    note_revoked_rolling_bearer(&a, "old".to_string());
+    note_revoked_rolling_bearer(&b, "old".to_string());
+    note_revoked_rolling_bearer(&a, "older".to_string());
+    repoint_copied_bearers();
+    repoint_copied_bearers_detached();
+    assert_eq!(
+        take_revoked_bearers(),
+        vec![
+            (a.clone(), "old".to_string()),
+            (b, "old".to_string()),
+            (a, "older".to_string()),
+        ]
+    );
+    assert!(take_revoked_bearers().is_empty(), "taking empties it");
+}
+
+fn drain_live(profile: &str, session: &str) -> LiveRuntime {
+    LiveRuntime {
+        runtime: PathBuf::from(format!("/nonexistent/runtime-{session}")),
+        profile: crate::profile::ProfileName::from(profile),
+        session: session.to_string(),
+        background: false,
+    }
+}
+
+fn queued(pairs: &[(&str, &str)]) -> Vec<(crate::profile::ProfileName, String)> {
+    pairs
+        .iter()
+        .map(|(m, r)| (crate::profile::ProfileName::from(*m), (*r).to_string()))
+        .collect()
+}
+
+/// A drain settles a pair only once every one of its member's sessions is
+/// settled: an item written or one no longer holding the bearer settles its
+/// session, while a leg that failed (a locked Keychain or any other error)
+/// or found the sidecar not ready yet keeps the pair queued. A pair's other
+/// sessions still run after one fails, and each leg sees the pair's `logged`
+/// flag unset.
+#[test]
+fn a_drain_requeues_a_pair_until_every_session_settles() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![
+        drain_live("written", "1-0"),
+        drain_live("moved", "2-0"),
+        drain_live("notyet", "3-0"),
+        drain_live("locked", "4-0"),
+        drain_live("multi", "5-0"),
+        drain_live("multi", "6-0"),
+    ];
+    for member in ["written", "moved", "notyet", "locked", "multi"] {
+        note_revoked_rolling_bearer(
+            &crate::profile::ProfileName::from(member),
+            format!("old-{member}"),
+        );
+    }
+    let mut legs = Vec::new();
+    let now = Instant::now();
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |member, revoked, session, logged: &mut bool| {
+            legs.push(format!("{member}/{revoked}/{}/{logged}", session.session));
+            match (member.as_str(), session.session.as_str()) {
+                ("written", _) | ("multi", "6-0") => Ok(ItemRepoint::Written),
+                ("moved", _) => Ok(ItemRepoint::NotHeld),
+                ("notyet", _) => Ok(ItemRepoint::NotYet),
+                _ => Err(anyhow::anyhow!("keychain locked")),
+            }
+        },
+    );
+    assert_eq!(
+        legs,
+        vec![
+            "written/old-written/1-0/false",
+            "moved/old-moved/2-0/false",
+            "notyet/old-notyet/3-0/false",
+            "locked/old-locked/4-0/false",
+            "multi/old-multi/5-0/false",
+            "multi/old-multi/6-0/false",
+        ],
+        "every pair reaches each of its member's sessions, the failed pair's second one included"
+    );
+    assert_eq!(
+        take_revoked_bearers(),
+        queued(&[
+            ("notyet", "old-notyet"),
+            ("locked", "old-locked"),
+            ("multi", "old-multi"),
+        ]),
+        "a failed or not-yet leg keeps its pair queued; a written or no-longer-held one settles it"
+    );
+}
+
+/// The macOS item leg writes the blob the mutating rule changed: it must call
+/// `repoint_copied_bearer` (which swaps the bearer in), never only the
+/// predicate, before its `put_blob_at`. Pinned by source because the leg runs
+/// against a real Keychain alone.
+#[test]
+fn the_item_leg_writes_the_blob_the_rule_rewrote() {
+    let code = code_tokens_only(include_str!("../../src/keychain.rs"));
+    let start = code
+        .find("fn repoint_config_dir_item_bearer(")
+        .expect("the item leg exists");
+    let body = &code[start..];
+    let body = &body[..body.find("\n}\n").expect("the item leg's closing brace")];
+    let rewrite = body
+        .find("crate::claude::repoint_copied_bearer(&mut blob,")
+        .expect("the leg rewrites the blob through the mutating rule");
+    let write = body
+        .find("put_blob_at(&service, &account, &blob)")
+        .expect("the leg writes that same blob");
+    assert!(
+        rewrite < write,
+        "the blob is rewritten before it is written"
+    );
+}
+
+/// What a test leg answers on one drain attempt.
+#[derive(Clone, Copy)]
+enum Answer {
+    Locked,
+    Failed,
+    NotYet,
+    Written,
+}
+
+/// A re-queued pair waits before its next attempt: 1 s after the first
+/// failure or not-yet, then doubling (the swap item retry's backoff). A
+/// failure is logged once per pair: the flag the leg sets when it logs
+/// survives the re-queue, and a quiet locked-Keychain attempt leaves it unset.
+#[test]
+fn a_requeued_pair_backs_off_and_logs_a_failure_once() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let t0 = Instant::now();
+    let far = t0 + Duration::from_secs(600);
+    let mut attempts = Vec::new();
+    let drain_at = |at: Duration, attempts: &mut Vec<(Duration, bool)>, answer: Answer| {
+        drain_revoked_bearers_with(&sessions, t0 + at, far, |_, _, _, logged: &mut bool| {
+            attempts.push((at, *logged));
+            match answer {
+                Answer::Locked => Err(anyhow::anyhow!("keychain locked")),
+                Answer::Failed => {
+                    *logged = true;
+                    Err(anyhow::anyhow!("write failed"))
+                }
+                Answer::NotYet => Ok(ItemRepoint::NotYet),
+                Answer::Written => Ok(ItemRepoint::Written),
+            }
+        });
+    };
+    drain_at(Duration::ZERO, &mut attempts, Answer::Locked);
+    drain_at(Duration::from_millis(500), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(1), &mut attempts, Answer::Failed);
+    drain_at(Duration::from_millis(2500), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(3), &mut attempts, Answer::NotYet);
+    drain_at(Duration::from_secs(6), &mut attempts, Answer::Written);
+    drain_at(Duration::from_secs(7), &mut attempts, Answer::Written);
+    assert_eq!(
+        attempts,
+        vec![
+            (Duration::ZERO, false),
+            (Duration::from_secs(1), false),
+            (Duration::from_secs(3), true),
+            (Duration::from_secs(7), true),
+        ],
+        "attempts run at 0 s, +1 s, +2 s, then +4 s (a not-yet backs off like a failure); \
+         a quiet locked attempt leaves the next failure to log, and a logged one stays logged"
+    );
+    assert!(
+        take_revoked_bearers().is_empty(),
+        "the written item settles the pair"
+    );
+}
+
+/// A pair the drain's deadline cut off stays queued and stays due: it did not
+/// fail, so it takes no backoff.
+#[test]
+fn a_pair_the_deadline_cut_off_stays_due() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let now = Instant::now();
+    let mut ran = 0;
+    drain_revoked_bearers_with(&sessions, now, Instant::now(), |_, _, _, _| {
+        ran += 1;
+        Ok(ItemRepoint::Written)
+    });
+    assert_eq!(ran, 0, "a spent deadline runs no leg");
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 1, "the cut-off pair is due at once on the next drain");
+    assert!(take_revoked_bearers().is_empty());
+}
+
+/// A pair whose first session failed and whose second the deadline then cut
+/// off is a failed pair: it backs off rather than staying due.
+#[test]
+fn a_failed_pair_the_deadline_also_cut_off_backs_off() {
+    let _ = take_revoked_bearers();
+    let sessions = vec![drain_live("acct", "1-0"), drain_live("acct", "2-0")];
+    note_revoked_rolling_bearer(
+        &crate::profile::ProfileName::from("acct"),
+        "old".to_string(),
+    );
+    let now = Instant::now();
+    let mut legs = Vec::new();
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        Instant::now() + Duration::from_millis(500),
+        |_, _, session, _| {
+            legs.push(session.session.clone());
+            std::thread::sleep(Duration::from_millis(600));
+            Err(anyhow::anyhow!("write failed"))
+        },
+    );
+    assert_eq!(
+        legs,
+        vec!["1-0"],
+        "the deadline passed during the first leg"
+    );
+    let mut ran = 0;
+    drain_revoked_bearers_with(
+        &sessions,
+        now,
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 0, "the failed pair is not due again at once");
+    drain_revoked_bearers_with(
+        &sessions,
+        now + Duration::from_secs(1),
+        now + Duration::from_secs(60),
+        |_, _, _, _| {
+            ran += 1;
+            Ok(ItemRepoint::Written)
+        },
+    );
+    assert_eq!(ran, 2, "it is due after its 1 s backoff, for both sessions");
+    assert!(take_revoked_bearers().is_empty());
+}
+
+/// The adopting witness refuses a tree the session does not own, records
+/// nothing then, and refuses while a sweep's delete of the item is in flight.
+#[test]
+fn the_adopting_witness_refuses_foreign_trees_and_in_flight_deletes() {
+    let home = HomeSandbox::new();
+    let profile = crate::profile::ProfileName::from("acct");
+    let foreign = home.home().join("my-claude");
+    fs::create_dir_all(&foreign).expect("foreign");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "806-0", false)
+            .is_err()
+    );
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-806-0");
+    fs::create_dir_all(&runtime).expect("runtime");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "806-1", false)
+            .is_err(),
+        "another session's id"
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+    let service =
+        crate::claude::namespaced_keychain_service(&runtime.canonicalize().expect("canonical"));
+    let _in_flight =
+        with_state_lock(|_held| namespaced_keychain_ledger::record_in_flight_locked(&service))
+            .expect("stamp");
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "806-0", false)
+            .is_err()
+    );
+    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
 }

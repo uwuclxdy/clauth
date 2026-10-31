@@ -2307,6 +2307,10 @@ fn land_pair_with(
     if matches!(landing, Landing::Landed) {
         delete_stage(name);
     }
+    // A stamp in the hold above may have revoked a bearer a session's
+    // per-session item holds a copy of: re-point those items now, off the
+    // flock.
+    crate::runtime::repoint_copied_bearers();
     Ok(landing)
 }
 
@@ -3226,7 +3230,11 @@ fn ensure_installable_with(
     // mis-filled/dead-chain) is decided there, so no rolling-token profile can fall
     // through a vanilla path and install the shared rotating pair.
     if profile_rolling_token(config, name) {
-        return rolling_install_gate(config, name, refresher, horizon_ms, wait, spend_marker);
+        let gate = rolling_install_gate(config, name, refresher, horizon_ms, wait, spend_marker);
+        // A no-spend re-stamp in the gate may have revoked a copied bearer;
+        // a no-op while the caller holds a flock or an armed budget.
+        crate::runtime::repoint_copied_bearers();
+        return gate;
     }
     vanilla_install_gate(config, name, refresher, horizon_ms, spend_marker)
 }
@@ -3817,6 +3825,7 @@ pub(crate) fn restamp_rolling_token(
         LockWait::NoWait,
         None,
     );
+    crate::runtime::repoint_copied_bearers();
     // A ROLLING-classified sidecar now clear of the horizon = the no-spend
     // re-stamp just landed (the Refreshed and mint-degrade paths log at their
     // source, and a mint left in place classifies out here rather than being

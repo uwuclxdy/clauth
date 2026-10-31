@@ -406,9 +406,24 @@ pub(crate) fn stamp_rolling_token(
         // Saved first into the install source (`credentials.json` before the
         // first roll), the keep below carries it onto the new bearer.
         sync_live_extra_into_install_source(name);
+        // The bearer this stamp replaces, read in the same hold as the write:
+        // the one a session's per-session item may hold a copy of.
+        let replaced = read_json_file::<ClaudeCredentials>(&path)
+            .ok()
+            .and_then(|c| c.claude_ai_oauth);
         preserve_static_mint(name)?;
         let bytes = keep_non_login_in_sidecar(&bytes, &path);
-        atomic_write_600(&path, bytes).context("write rolling session-token.json")
+        atomic_write_600(&path, bytes).context("write rolling session-token.json")?;
+        if let Some(revoked) = revoked_by_stamp(
+            replaced.as_ref(),
+            sidecar
+                .claude_ai_oauth
+                .as_ref()
+                .map_or("", |o| o.access_token.as_str()),
+        ) {
+            crate::runtime::note_revoked_rolling_bearer(name, revoked);
+        }
+        Ok(())
     })
 }
 
@@ -1026,6 +1041,113 @@ pub(crate) fn rolling_bearer_behind_chain(
         && chain.expires_at.is_some_and(|exp| exp > now)
         && !chain.access_token.is_empty()
         && sidecar.access_token != chain.access_token
+}
+
+/// The rolling bearer a stamp writing `stamped` revoked: the one it replaced
+/// (`replaced`, the sidecar's block before the write), when that was a rolling
+/// bearer clauth wrote ([`SidecarKind::Rolling`]) and differs from the new
+/// one. A mint, a mis-fill, an absent sidecar or an unchanged bearer yields
+/// `None`: nothing a session can hold a copy of was revoked by this stamp.
+/// PURE.
+pub(crate) fn revoked_by_stamp(
+    replaced: Option<&crate::profile::OAuthToken>,
+    stamped: &str,
+) -> Option<String> {
+    let replaced = replaced?;
+    (sidecar_kind_of(replaced) == SidecarKind::Rolling
+        && !replaced.access_token.is_empty()
+        && replaced.access_token != stamped)
+        .then(|| replaced.access_token.clone())
+}
+
+/// The item side of [`copied_bearer_repoint`]'s rule: whether the item's
+/// `claudeAiOauth` is exactly `revoked` and refreshless ([`sidecar_kind_of`]
+/// is not [`SidecarKind::Misfilled`], so `refreshToken: ""` counts as a
+/// refresh token). An item failing this has nothing to re-point, now or
+/// later. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn item_holds_revoked(item: &serde_json::Value, revoked: &str) -> bool {
+    if revoked.is_empty() {
+        return false;
+    }
+    let Some(held) = item
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())
+    else {
+        return false;
+    };
+    held.access_token == revoked && sidecar_kind_of(&held) != SidecarKind::Misfilled
+}
+
+/// Whether a session's per-session Keychain item holds a copy of `revoked`,
+/// the rolling bearer its member's last stamp replaced, and should take the
+/// sidecar's current one. True only when the item holds that exact bearer
+/// ([`item_holds_revoked`]), and the sidecar now holds a live rolling bearer
+/// that differs from it and is not itself behind its chain
+/// (`sidecar_behind_chain`, from [`rolling_sidecar_behind_chain`]). Matching
+/// the exact revoked bearer, not any differing one, leaves alone a static
+/// mint, another account's bearer and anything clauth did not write for this
+/// member. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn copied_bearer_repoint(
+    item: &serde_json::Value,
+    revoked: &str,
+    sidecar: &serde_json::Value,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    if sidecar_behind_chain || !item_holds_revoked(item, revoked) {
+        return false;
+    }
+    let Some(current) = sidecar
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())
+    else {
+        return false;
+    };
+    sidecar_kind_of(&current) == SidecarKind::Rolling
+        && current.expires_at.is_some_and(|exp| exp > now)
+        && !current.access_token.is_empty()
+        && current.access_token != revoked
+}
+
+/// Replace `item`'s copied bearer with `sidecar`'s block when
+/// [`copied_bearer_repoint`] holds, reporting whether it changed; every other
+/// key of the item (`mcpOAuth` among them) is kept as it was. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn repoint_copied_bearer(
+    item: &mut serde_json::Value,
+    revoked: &str,
+    sidecar: &serde_json::Value,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    if !copied_bearer_repoint(item, revoked, sidecar, now, sidecar_behind_chain) {
+        return false;
+    }
+    let (Some(obj), Some(block)) = (item.as_object_mut(), sidecar.get("claudeAiOauth")) else {
+        return false;
+    };
+    obj.insert("claudeAiOauth".to_string(), block.clone());
+    true
 }
 
 /// [`rolling_bearer_behind_chain`] over `name`'s files on disk: the

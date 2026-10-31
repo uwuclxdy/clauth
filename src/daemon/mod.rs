@@ -2046,6 +2046,10 @@ impl Daemon {
             self.tick();
             self.heartbeat
                 .store(crate::usage::now_ms(), Ordering::Relaxed);
+            // Copied bearers a stamp queued while a tick's budget was armed,
+            // re-pointed off this loop so its Keychain legs never spend the
+            // watchdog's window.
+            crate::runtime::repoint_copied_bearers_detached();
             ticks = ticks.wrapping_add(1);
         }
     }
