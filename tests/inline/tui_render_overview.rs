@@ -6427,6 +6427,244 @@ fn a_burning_rows_mark_advances_with_the_working_clock() {
     );
 }
 
+/// A wide glyph (CJK, emoji) in an Overview cell must be measured in DISPLAY
+/// CELLS — the per-grapheme unicode-width sum `format::grapheme_cells`
+/// (East-Asian-Ambiguous = 1), what the buffer draws for the CJK/emoji/
+/// lam-alef class (its one divergence: the buffer widens a halfwidth
+/// dakuten/handakuten U+FF9E/U+FF9F where unicode-width reports 0), and the
+/// measure the chain row's marker gate gates on — never in chars: a char count
+/// pads a row holding one short, and every column after it shifts left. Pinned
+/// as exact rows: a CJK-named account and an ASCII-named sibling at the same
+/// pane width draw identical cells — lead, name slot, and every column after
+/// the name byte-identical, the name slot holding the CJK name flush at its
+/// full 8-cell width (4 chars, 2 cells each) against the ASCII sibling's
+/// padded 8 cells.
+#[test]
+fn cjk_named_row_keeps_its_columns_aligned_with_an_ascii_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let seven = || UsageWindow {
+        utilization: 20.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400)),
+    };
+    let (a, mut a_readings) = profile("測試帳號", 95.0, 10.0, 3600);
+    a_readings
+        .usage
+        .get_mut("測試帳號")
+        .expect("fixture usage")
+        .seven_day = Some(seven());
+    let (b, mut b_readings) = profile("ascii", 95.0, 10.0, 3600);
+    b_readings
+        .usage
+        .get_mut("ascii")
+        .expect("fixture usage")
+        .seven_day = Some(seven());
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let cjk = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
+    let ascii = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+
+    // The row as one cell per slot, measured the way the terminal draws
+    // (per-grapheme width, a wide grapheme repeated once per cell it fills) —
+    // so a slice index IS a cell column. No boundary here splits a wide
+    // grapheme: cells 4 and 4 + widths.name fall between the space-padded
+    // slots, and the CJK name fills its slot exactly.
+    let cells = |row: &str| -> Vec<String> {
+        Span::raw(row)
+            .styled_graphemes(Style::default())
+            .flat_map(|g| {
+                let symbol = g.symbol.to_string();
+                std::iter::repeat_n(symbol.clone(), Span::raw(symbol).width())
+            })
+            .collect()
+    };
+    let cjk_cells = cells(&cjk);
+    let ascii_cells = cells(&ascii);
+    // Control on the measure: a wide glyph draws 2 cells where an ASCII twin
+    // draws 1, so a misaligned row cannot hide from the pins below.
+    assert_eq!(cells("  測a").len(), 5);
+    assert_eq!(cells("   a").len(), 4);
+    // The row as plain graphemes, for content pins inside a slot.
+    let graphemes = |row: &str| -> Vec<String> {
+        Span::raw(row)
+            .styled_graphemes(Style::default())
+            .map(|g| g.symbol.to_string())
+            .collect()
+    };
+    assert_eq!(
+        cjk_cells.len(),
+        ascii_cells.len(),
+        "both rows draw the same cell count: cjk={cjk:?} ascii={ascii:?}"
+    );
+    // Independent anchors, hand-computed off the fixture (never the code's own
+    // measure): 測試帳號 = 4 graphemes x 2 cells = 8, plus 4 lead cells.
+    assert_eq!(widths.name, 8, "CJK fixture: 4 wide graphemes = 8 cells");
+    let name_slot = 12; // 2 cursor + 2 marker cells, then the 8-cell name
+    assert_eq!(
+        graphemes(&cjk)[4..8].join(""),
+        "測試帳號",
+        "the CJK name fills its slot flush, no pad: cjk={cjk:?}"
+    );
+    assert_eq!(
+        cjk_cells[4..name_slot].len(),
+        8,
+        "the CJK name occupies exactly its slot's cells: cjk={cjk:?}"
+    );
+    assert_eq!(
+        ascii_cells[4..name_slot].join(""),
+        "ascii   ",
+        "the ASCII sibling pads its name slot to the same width: ascii={ascii:?}"
+    );
+    assert_eq!(
+        cjk_cells[..4],
+        ascii_cells[..4],
+        "the lead cells must be identical: cjk={cjk:?} ascii={ascii:?}"
+    );
+    assert_eq!(
+        cjk_cells[name_slot..],
+        ascii_cells[name_slot..],
+        "every column after the name must be byte-identical: cjk={cjk:?} ascii={ascii:?}"
+    );
+}
+
+/// The name column's budget must count the cells the buffer draws — the
+/// per-grapheme sum `grapheme_cells`, not the whole-string `Span::width`
+/// format.rs documents as folding an Arabic lam-alef ligature to one cell
+/// while the buffer draws it per grapheme as two. A `لالالالالا` name (10
+/// graphemes, 5 ligatures drawn 2 cells each) must budget 10 and render
+/// whole; on the whole-string measure the budget under-counts and the row
+/// cuts the name to `…` despite room.
+#[test]
+fn lam_alef_name_fitting_its_column_renders_whole_without_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("لالالالالا", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    // Hand-computed: 10 base-letter graphemes at 1 cell each (5 mandatory
+    // lam-alef ligature pairs, each drawn as two grapheme cells by the
+    // buffer).
+    assert_eq!(
+        widths.name, 10,
+        "the name budget must count the buffer's cells: {}",
+        widths.name
+    );
+    let row = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
+    assert!(
+        row.contains("لالالالالا"),
+        "a name that fits its budgeted column renders whole, never cut to `…`: {row:?}"
+    );
+}
+
+/// The DeepSeek amount column's width budget (`deepseek_amount_w`) must
+/// measure cells. A wide-glyph amount can only reach the measure, never the
+/// rendered row: `parse_balance` (providers/mod.rs) filters the render path
+/// to ASCII amounts, so this pins the measure at the widths level and cannot
+/// red at row level.
+#[test]
+fn deepseek_amount_width_measures_cells_not_chars() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // `🦀` = 1 char, 2 cells: chars().count() under-measures by exactly the
+    // bug the class closes.
+    let (a, a_readings) = deepseek_profile("ds", &["🦀 USD"]);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    assert_eq!(
+        widths.deepseek_amount_w, 2,
+        "the amount budget must count display cells: {}",
+        widths.deepseek_amount_w
+    );
+}
+
+/// The chain panel's member name budget (`widest_name`) must measure the
+/// buffer's cells, like the accounts row's: a `لالالالالا` member name (10
+/// graphemes, 5 lam-alef ligatures drawn 2 cells each) fits its row at a wide
+/// pane and must render whole, never cut to `…`. On the whole-string
+/// `Span::width` measure the budget folds the ligatures to 5, clamps to the
+/// 6-cell floor, and the row cuts the name despite room.
+#[test]
+fn lam_alef_chain_member_fitting_its_row_renders_whole_without_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("لالالالالا", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec!["لالالالالا"]);
+    let app = App::new(config);
+    let (lines, member_count) = fallback_flow_lines(&app, 120, &readings);
+    assert_eq!(member_count, 1, "fixture: one chain member");
+    let row = line_text(&lines[0]);
+    assert!(
+        row.contains("لالالالالا"),
+        "a chain member name that fits its row renders whole, never cut to `…`: {row:?}"
+    );
+}
+
+/// The chain row's index must fill its budgeted slot: `idx_w` is sized for the
+/// widest index (digits + 1), so with 11 members the `11` row draws 3 cells
+/// where a 1-digit row draws 2 unless the index is aligned to the budget —
+/// unaligned, every 1-digit row's gauge and figure shift one cell left
+/// against the 2-digit row, breaking the shared columns the readings'
+/// left-padding exists to keep. Pinned by the figure column (`/`) opening on
+/// the same cell in every member row.
+#[test]
+fn chain_index_fills_its_slot_so_member_rows_stay_aligned() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..11).map(|i| format!("m{i:02}")).collect();
+    let members: Vec<(Profile, ReadingsSnapshot)> =
+        names.iter().map(|n| profile(n, 95.0, 10.0, 3600)).collect();
+    let chain: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (config, readings) = config_with(members, None, chain);
+    let app = App::new(config);
+    let (lines, member_count) = fallback_flow_lines(&app, 120, &readings);
+    assert_eq!(member_count, 11, "fixture: eleven chain members");
+    // The cell column each member row's figure separator opens on.
+    let figure_col = |row: &str| -> usize {
+        let mut col = 0usize;
+        for g in Span::raw(row).styled_graphemes(Style::default()) {
+            if g.symbol == "/" {
+                return col;
+            }
+            col += Span::raw(g.symbol).width();
+        }
+        usize::MAX
+    };
+    let cols: Vec<usize> = lines[..11]
+        .iter()
+        .map(|l| figure_col(&line_text(l)))
+        .collect();
+    assert_eq!(
+        cols,
+        vec![cols[0]; 11],
+        "every member row's figure column must sit on one cell: {cols:?}"
+    );
+}
+
+/// The DeepSeek amount pad inside `deepseek_balance_cell` must left-pad each
+/// amount to the shared amount budget in cells, one measure with the budget
+/// itself (`deepseek_amount_w`): the widest amount gets exactly one space
+/// before its currency, every narrower amount's currency starts on the same
+/// column. Pinned at the unit level, exact output; the pad's wide-glyph path
+/// cannot red at row level (`parse_balance` filters rendered amounts to
+/// ASCII), so this locks the alignment contract the pad serves.
+#[test]
+fn deepseek_amount_pad_aligns_currencies_on_one_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = deepseek_profile("ds", &["1.71 USD", "197.50 CNY"]);
+    let (_, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let stats = readings.stats_of("ds").expect("fixture stats");
+    // Hand-computed off the fixture: amounts "1.71" (4) and "197.50" (6),
+    // amount_w = 6; sorted by amount descending; inner = 22 cells, +2
+    // brackets = 24 in a 26-cell column → 2 trailing pad cells.
+    let cell = deepseek_balance_cell(26, 6, Some(stats));
+    let text: String = cell.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "[197.50 CNY,   1.71 USD]  ");
+}
+
 #[test]
 fn the_active_shunt_mark_reads_the_client_token_store_at_startup() {
     let _home = crate::testutil::HomeSandbox::new();

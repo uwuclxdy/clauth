@@ -24,7 +24,9 @@ use super::super::app::{
     member_days, parse_max_spend, parse_weekly_override, preferred_days_preset,
 };
 use super::super::theme;
-use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume, truncate};
+use super::format::{
+    ResetFmt, fixed_split, grapheme_cells, relative_age, reset_pill, reset_resume, truncate,
+};
 use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
@@ -728,7 +730,12 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
     /// The dropped pill's indent: the rail glyph + 1 space, where the hint text
     /// under it starts too.
     const DROP_LEAD_W: usize = 2;
-    let cells = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
+    let cells = |spans: &[Span<'static>]| {
+        spans
+            .iter()
+            .map(|s| grapheme_cells(&s.content))
+            .sum::<usize>()
+    };
     let total = pills.len();
     let mut lines = Vec::with_capacity(total * 2);
     for (i, (mut content, hint)) in pills.into_iter().enumerate() {
@@ -774,7 +781,7 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
                 if let Some((name, reading)) =
                     text.rsplit_once(' ').filter(|(_, r)| r.ends_with('%'))
                 {
-                    let keep = Span::raw(name).width().saturating_sub(over);
+                    let keep = grapheme_cells(name).saturating_sub(over);
                     label.content = if keep == 0 {
                         reading.to_string().into()
                     } else {

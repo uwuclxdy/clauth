@@ -12,6 +12,7 @@ use crate::testutil::countdown_reset_in;
 use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Style;
 use std::collections::BTreeMap;
 
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
@@ -4491,4 +4492,36 @@ fn the_member_card_toggles_paint_their_parts_in_split_colours() {
         crate::testutil::assert_split_toggle(row("weekly gate"), true);
         crate::testutil::assert_split_toggle(row("last resort"), false);
     }
+}
+
+/// The pill block's fit math must measure the cells the buffer draws — the
+/// per-grapheme sum — on the fit branch (`cells`) and the name cut (`keep`)
+/// alike. On the whole-string `Span::width` measure an Arabic lam-alef
+/// ligature folds to one cell, so a `[ لالالالالا 95% ]` pill (18 true cells,
+/// 13 folded) passes the fit check at a 30-cell pane (16 key + 13) and
+/// overruns it by 4 drawn cells; measured in cells, the pill drops under the
+/// key and renders whole inside the pane. (The cut amount itself folds
+/// algebraically away — `cells` and `keep` under-count the same span — so the
+/// reachable defect is the branch selection, not the cut.)
+#[test]
+fn lam_alef_pill_fits_the_pane_it_renders_in() {
+    let content = pill("لالالالالا 95%".to_string(), theme::warning());
+    let lines = pill_block(vec![(content, String::new())], 30);
+    let row = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains('['))
+        .expect("the pill renders");
+    let mut drawn = 0usize;
+    for g in Span::raw(row.as_str()).styled_graphemes(Style::default()) {
+        drawn += Span::raw(g.symbol).width();
+    }
+    assert!(
+        drawn <= 30,
+        "the pill must render inside the pane it measured against ({drawn} cells): {row:?}"
+    );
+    assert!(
+        row.contains("لالالالالا") && row.contains("95%"),
+        "the pill keeps its whole label and reading when it fits: {row:?}"
+    );
 }

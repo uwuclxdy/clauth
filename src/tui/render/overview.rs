@@ -310,8 +310,8 @@ struct LabelWidths {
 impl LabelWidths {
     fn of(labels: impl Iterator<Item = (Option<String>, Option<String>)>) -> Self {
         labels.fold(Self::default(), |acc, (five, seven)| Self {
-            five: acc.five.max(five.map_or(0, |l| l.len())),
-            seven: acc.seven.max(seven.map_or(0, |l| l.len())),
+            five: acc.five.max(five.map_or(0, |l| grapheme_cells(&l))),
+            seven: acc.seven.max(seven.map_or(0, |l| grapheme_cells(&l))),
         })
     }
 
@@ -396,7 +396,7 @@ impl OverviewWidths {
             .config()
             .profiles
             .iter()
-            .map(|p| Span::raw(p.name.as_str()).width())
+            .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
@@ -450,7 +450,7 @@ impl OverviewWidths {
             app.codex_rows
                 .iter()
                 .filter_map(|r| r.resets)
-                .map(|count| format!("↺ {count}").chars().count())
+                .map(|count| grapheme_cells(&format!("↺ {count}")))
                 .max()
                 .unwrap_or(0)
         } else {
@@ -567,7 +567,7 @@ impl OverviewWidths {
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
             .filter(|r| crate::providers::is_balance_row(&r.label))
-            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
+            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| grapheme_cells(a)))
             .max()
             .unwrap_or(0);
 
@@ -878,12 +878,13 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     // The usage cells take the claude row's lead-in (narrow gap + a blank
     // timer slot) and its left alignment, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
-    let cell = |window: Option<&UsageWindow>, label_w: usize, w: usize| match window {
-        Some(win) => Span::styled(
-            fixed(&format!("{:>label_w$}", codex_label(win)), w),
-            theme::base(),
-        ),
-        None => Span::styled(fixed(&format!("{NO_DATA:>label_w$}"), w), theme::faint()),
+    let cell = |window: Option<&UsageWindow>, label_w: usize, w: usize| {
+        let (label, style) = match window {
+            Some(win) => (codex_label(win), theme::base()),
+            None => (NO_DATA.to_string(), theme::faint()),
+        };
+        let pad = " ".repeat(label_w.saturating_sub(grapheme_cells(&label)));
+        Span::styled(fixed(&format!("{pad}{label}"), w), style)
     };
     let labels = widths.codex_labels;
     spans.push(narrow_gap(widths));
@@ -1004,7 +1005,7 @@ fn render_pool_row(
         five.as_ref().is_some_and(is_past_reset),
         0,
     ));
-    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     spans.extend(five_spans);
     spans.push(Span::raw(
         " ".repeat(widths.five_hour.saturating_sub(five_len)),
@@ -1022,7 +1023,7 @@ fn render_pool_row(
             seven.as_ref().is_some_and(is_past_reset),
             0,
         ));
-        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
         spans.extend(seven_spans);
         spans.push(Span::raw(
             " ".repeat(widths.seven_day.saturating_sub(seven_len)),
@@ -1291,7 +1292,7 @@ fn render_overview_row(
     // `window_summary_spans_bracketed`: that helper lives in the shared
     // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
     // future caller the way a new parameter would. Widths are unaffected (the
-    // pad math counts chars, not styles).
+    // pad math measures display cells, not styles).
     let flatten = |mut spans: Vec<Span<'static>>| {
         if disabled {
             for s in &mut spans {
@@ -1318,7 +1319,7 @@ fn render_overview_row(
             0,
         ))
     };
-    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
     spans.push(Span::raw(" ".repeat(five_pad)));
@@ -1353,7 +1354,7 @@ fn render_overview_row(
             seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
         }
         let seven_spans = flatten(seven_cell);
-        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
@@ -1471,7 +1472,10 @@ fn deepseek_balance_cell(
     let inner: String = balances
         .iter()
         .map(|b| match b.rsplit_once(' ') {
-            Some((amount, currency)) => format!("{amount:>amount_w$} {currency}"),
+            Some((amount, currency)) => format!(
+                "{}{amount} {currency}",
+                " ".repeat(amount_w.saturating_sub(grapheme_cells(amount)))
+            ),
             None => b.clone(),
         })
         .collect::<Vec<_>>()
@@ -1633,7 +1637,7 @@ fn fallback_flow_lines(
     // Narrow: tighter name clamp + a gauge sized from what's left, so a chain
     // row fits a phone line instead of hard-wrapping its trailing figures.
     let last = chain.len() - 1;
-    let idx_w = (last + 1).to_string().chars().count() + 1;
+    let idx_w = grapheme_cells(&(last + 1).to_string()) + 1;
     // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
     // the widest so the `%` signs line up.
     // It also makes every row's content the same width, which is what lets the
@@ -1641,7 +1645,7 @@ fn fallback_flow_lines(
     let thr_w = chain
         .iter()
         .filter_map(|n| cfg.find(n))
-        .map(|p| format!("{:.0}", threshold_for(p)).len())
+        .map(|p| grapheme_cells(&format!("{:.0}", threshold_for(p))))
         .max()
         .unwrap_or(3);
     // Readings left-pad to the widest the chain renders, the no-data dash
@@ -1653,7 +1657,7 @@ fn fallback_flow_lines(
                 .usage_of(n.as_str())
                 .and_then(|u| u.five_hour.as_ref())
                 .map(|w| w.utilization);
-            chain_reading(pct).map_or(NO_DATA.chars().count(), |l| l.len())
+            chain_reading(pct).map_or(grapheme_cells(NO_DATA), |l| grapheme_cells(&l))
         })
         .max()
         .unwrap_or(0);
@@ -1665,7 +1669,7 @@ fn fallback_flow_lines(
     // the clamp bites only once the gauge + figure need the room.
     let widest_name = chain
         .iter()
-        .map(|n| Span::raw(n.as_str()).width())
+        .map(|n| grapheme_cells(n.as_str()))
         .max()
         .unwrap_or(8);
     let name_w = if narrow {
@@ -1786,7 +1790,7 @@ fn fallback_flow_lines(
         Span::styled(" ]", theme::dim()),
         Span::raw(" "),
     ];
-    let chip_w: usize = chip.iter().map(Span::width).sum();
+    let chip_w: usize = chip.iter().map(|s| grapheme_cells(&s.content)).sum();
     // The first line also carries the 2-cell lead before the chip, so the tail
     // wraps to `width - chip - 2` — else the caption's first line overruns the
     // pane by exactly those two cells and clips without a mark.
@@ -1904,7 +1908,7 @@ struct ChainRow {
 
 impl ChainRow {
     fn base_width(&self) -> usize {
-        self.base.iter().map(|s| s.width()).sum()
+        self.base.iter().map(|s| grapheme_cells(&s.content)).sum()
     }
 
     /// Pad the content out to `col`, then append whichever trailers fit inside
@@ -1919,15 +1923,19 @@ impl ChainRow {
     fn into_line(self, col: usize, width: usize) -> Line<'static> {
         let fits = |w: usize| col + w <= width;
         let trailer: Vec<Span<'static>> = match (self.hint, self.marker) {
-            (Some(h), Some(m)) if fits(h.width() + 1 + m.width()) => vec![h, Span::raw(" "), m],
-            (Some(_), Some(m)) if fits(m.width()) => vec![m],
-            (Some(h), None) if fits(h.width()) => vec![h],
-            (None, Some(m)) if fits(m.width()) => vec![m],
+            (Some(h), Some(m))
+                if fits(grapheme_cells(&h.content) + 1 + grapheme_cells(&m.content)) =>
+            {
+                vec![h, Span::raw(" "), m]
+            }
+            (Some(_), Some(m)) if fits(grapheme_cells(&m.content)) => vec![m],
+            (Some(h), None) if fits(grapheme_cells(&h.content)) => vec![h],
+            (None, Some(m)) if fits(grapheme_cells(&m.content)) => vec![m],
             _ => Vec::new(),
         };
         let mut spans = self.base;
         if !trailer.is_empty() {
-            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let used: usize = spans.iter().map(|s| grapheme_cells(&s.content)).sum();
             spans.push(Span::raw(" ".repeat(col.saturating_sub(used))));
             spans.extend(trailer);
         }
@@ -1993,7 +2001,18 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
 
     let mut spans = vec![
         Span::styled(format!(" {rail} "), theme::faint()),
-        Span::styled(format!("{} ", index + 1), theme::faint()),
+        // Right-align the index to the widest index's digits so every row's
+        // index fills the same `idx_w` slot the budget reserved — unpadded, a
+        // 1-digit row runs one cell narrower than a 2-digit row and shifts
+        // every shared column after it.
+        Span::styled(
+            format!(
+                "{:>idx$} ",
+                index + 1,
+                idx = grapheme_cells(&(last + 1).to_string())
+            ),
+            theme::faint(),
+        ),
         Span::styled(format!("{name_text}{name_pad}  "), name_style),
     ];
     let mut figure_line = None;
@@ -2004,11 +2023,21 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             let threshold = threshold_for(profile);
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
-                Some(v) => (
-                    format!("  {:>reading_w$}", format_pct(v)),
-                    Style::default().fg(theme::util_color(v)),
+                Some(v) => {
+                    let label = format_pct(v);
+                    let pad = " ".repeat(reading_w.saturating_sub(grapheme_cells(&label)));
+                    (
+                        format!("  {pad}{label}"),
+                        Style::default().fg(theme::util_color(v)),
+                    )
+                }
+                None => (
+                    format!(
+                        "  {}{NO_DATA}",
+                        " ".repeat(reading_w.saturating_sub(grapheme_cells(NO_DATA)))
+                    ),
+                    theme::faint(),
                 ),
-                None => (format!("  {NO_DATA:>reading_w$}"), theme::faint()),
             };
             if figure_inline {
                 spans.push(Span::styled(figure, figure_style));
