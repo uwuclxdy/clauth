@@ -165,7 +165,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
 | `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard`; on an account running on a long-lived token, `Overwrite` is skipped: the launch asks instead, and a headless switch (the plugin, the API) refuses |
-| `theme` | string | auto | `full` or `compatible` |
+| `[theme] name` | string | auto | the TUI color depth: `"full"` (24-bit) or `"compatible"` (nearest xterm-256, with every surface fill left unpainted so the terminal's own background shows). a theme pick writes the `[theme]` table; an older scalar `theme = "full"` still reads |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
 | `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `services`; a saved `plugin` loads as `services`. edited from the Config tab's `home tab` row. the first herdr launch lands on `services` with the herdr row open instead |

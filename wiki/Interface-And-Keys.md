@@ -149,7 +149,7 @@ A saved Claude Code account's rows:
 
 | Row | Options | Default |
 |-----|---------|---------|
-| `theme` | `full`, `compatible` | auto-detected |
+| `theme` | `full`, `compatible` | auto-detected; a pick saves the `[theme]` table with `name = "..."` (an older scalar `theme = "full"` still reads and saves back in its own form until a pick), and `compatible` leaves the terminal's own background showing |
 | `reset display` | `relative`, `clock`, `both` | `relative` |
 | `clock` | `24h`, `12h` | `24h` |
 | `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services` | `overview` |

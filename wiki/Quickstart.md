@@ -95,7 +95,7 @@ clauth list           # account table with cached usage, no network
 | `clauth proxy disable <service>` | | stop that proxy and keep its row, port, admin token and state dir, so its profiles work again after a re-enable; nothing is deleted. Refuses while `proxies.toml` holds a row with a key clauth does not know, naming the row and the key |
 | `clauth proxy list` | `--json` | one row per `clauth-<service>-proxy` on PATH or registered, joined with the daemon's live state: service, version, contract, enabled, port, state; `--json` emits an array of objects. A row that has a reason (a `misconfigured` row's unknown key, a refused `manifest`, a missing token) prints it as `<service>: <reason>` on its own line after a blank line below the table; `--json` adds a `reason` field to each object, a string or `null` |
 
-`--theme <full\|compatible>` is global and forces a color depth for the TUI.
+`--theme <full\|compatible>` is global and forces a color depth for the TUI: `full` paints its own surfaces, while `compatible` uses the nearest xterm-256 color and leaves the terminal's own background showing.
 
 ### Rules worth knowing
 
@@ -184,7 +184,7 @@ clauth list           # account table with cached usage, no network
 | `CODEX_HOME` | set by `clauth start` on a codex profile to the session's own home, which is how `which` answers inside one; read by `login --codex` as the codex home to capture from, when it is not a clauth session home; when you set your own, the home a codex switch repoints the `auth.json` link under and a delete detaches it from |
 | `CLAUTH_OPERATOR_CODEX_HOME` | internal, set by `clauth start` on a codex profile to the codex home you launched it from, so a clauth command run inside the session acts on your own home and not the session's. Never set it yourself |
 | `SHELL` | how `completions install` detects your shell when you do not name one |
-| `COLORTERM` | what the TUI auto-detects its color depth from: `truecolor` or `24bit` picks `full`, anything else `compatible`. `--theme` and the `theme` key in `profiles.toml` both beat it |
+| `COLORTERM` | what the TUI auto-detects its color depth from: `truecolor` or `24bit` picks `full`, anything else `compatible`. `--theme` and the `[theme] name` key in `profiles.toml` (an older scalar `theme = "full"` still reads) both beat it |
 | `HERDR_CONFIG_PATH` | which config file `herdr install` writes into, matching how herdr itself reads the override |
 | `HERDR_BIN_PATH` | which `herdr` binary clauth runs, else `herdr` on `PATH`. herdr injects it into every pane process itself |
 
