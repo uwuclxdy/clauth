@@ -9166,11 +9166,149 @@ fn the_empty_state_frame_fits_exactly_and_clamps_on_a_small_pane() {
     assert_eq!(rows[3], "╰───────────────╯ ");
     assert_eq!(rows[4], " ".repeat(18));
 
+    // Without a frame the copy re-wraps at the pane's own width: both lines
+    // fit whole in 16 cells, so the bare copy takes 2 rows, centred (an odd
+    // leftover cell sits on the left, as ratatui's centre alignment puts it).
     let rows = draw(16, 4);
-    assert_eq!(rows[0], "   no accounts  ");
-    assert_eq!(rows[1], "       yet      ");
-    assert_eq!(rows[2], "   n to create  ");
-    assert_eq!(rows[3], "       one      ");
+    assert_eq!(rows[0], " ".repeat(16));
+    assert_eq!(rows[1], " no accounts yet");
+    assert_eq!(rows[2], " n to create one");
+    assert_eq!(rows[3], " ".repeat(16));
+}
+
+/// A pane too small for the frame shows the bare copy wrapped at its own
+/// width; when even that runs taller than the pane, the hint goes whole and the
+/// action line keeps its key: the key line is the one that must never clip.
+#[test]
+fn the_bare_empty_state_keeps_the_action_line_before_the_hint() {
+    let draw = |w: u16, h: u16| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            super::panes::empty_state(f, f.area(), "no accounts yet", "n", "to create one")
+        })
+        .unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+
+    // 16x3: both lines fit whole at width 16, so nothing drops.
+    let rows = draw(16, 3);
+    assert_eq!(
+        rows,
+        vec![
+            " no accounts yet".to_string(),
+            " n to create one".to_string(),
+            " ".repeat(16),
+        ]
+    );
+
+    // 16x1: one row holds only the action line.
+    assert_eq!(draw(16, 1), vec![" n to create one".to_string()]);
+
+    // 12x3: the hint wraps to 2 rows and the action to 2; the hint cannot fit
+    // whole beside the action, so it drops whole, never cut to a fragment.
+    assert_eq!(
+        draw(12, 3),
+        vec![
+            " n to create".to_string(),
+            "     one    ".to_string(),
+            " ".repeat(12),
+        ]
+    );
+
+    // 10x2: the action alone wraps to 2 rows and fills the pane.
+    assert_eq!(
+        draw(10, 2),
+        vec!["   n to   ".to_string(), "create one".to_string()]
+    );
+
+    // 10x1: the action's first row, which carries the key.
+    assert_eq!(draw(10, 1), vec!["   n to   ".to_string()]);
+}
+
+/// The interior rows of the first pane titled `title`, each trimmed, after
+/// asserting every non-empty row sits centred between the side borders (left
+/// and right gaps within one cell of each other).
+fn pane_interior_rows(app: &App, w: u16, h: u16, title: &str) -> Vec<String> {
+    pane_interior_raw(app, w, h, title)
+        .into_iter()
+        .map(|raw| {
+            let text = raw.trim();
+            if !text.is_empty() {
+                let left = raw.chars().take_while(|c| *c == ' ').count();
+                let right = raw.chars().rev().take_while(|c| *c == ' ').count();
+                assert!(
+                    left.abs_diff(right) <= 1,
+                    "{title} at {w}x{h}: {raw:?} is not centred ({left} vs {right})"
+                );
+            }
+            text.to_string()
+        })
+        .collect()
+}
+
+/// The raw interior rows of the first pane titled `title`: the text between
+/// its side borders on every row below its top border, down to its bottom
+/// border.
+fn pane_interior_raw(app: &App, w: u16, h: u16, title: &str) -> Vec<String> {
+    let screen = dump(app, w, h);
+    let rows: Vec<&str> = screen.lines().collect();
+    let head = format!("╭─ {title} ");
+    let top = rows
+        .iter()
+        .position(|r| r.contains(&head))
+        .unwrap_or_else(|| panic!("no {title} pane at {w}x{h}:\n{screen}"));
+    let col = rows[top].chars().position(|c| c == '╭').unwrap();
+    rows[top + 1..]
+        .iter()
+        .take_while(|r| r.chars().nth(col) != Some('╰'))
+        .map(|r| {
+            let cells: Vec<char> = r.chars().skip(col + 1).collect();
+            let end = cells.iter().position(|&c| c == '│').unwrap_or(cells.len());
+            cells[..end].iter().collect::<String>()
+        })
+        .collect()
+}
+
+/// On a 20-column terminal the accounts pane is too small for the frame: the
+/// bare copy re-wraps at the pane's width and keeps the whole action line.
+#[test]
+fn a_20_column_terminal_keeps_the_whole_empty_action_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (tab, title) in [(Tab::Overview, "ACCOUNTS"), (Tab::Usage, "USAGE")] {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        });
+        app.tab = tab;
+        let shown: Vec<String> = pane_interior_rows(&app, 20, 8, title)
+            .into_iter()
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert_eq!(shown, ["no accounts yet", "n to create one"], "{title}");
+    }
+}
+
+/// A zero-width or zero-height pane draws nothing and does not panic.
+#[test]
+fn the_empty_state_draws_nothing_in_a_zero_sized_pane() {
+    for (w, h) in [(0u16, 3u16), (5, 0), (0, 0)] {
+        let mut term = Terminal::new(TestBackend::new(6, 4)).unwrap();
+        term.draw(|f| {
+            let area = ratatui::layout::Rect {
+                x: 1,
+                y: 1,
+                width: w,
+                height: h,
+            };
+            super::panes::empty_state(f, area, "no accounts yet", "n", "to create one")
+        })
+        .unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            rows.iter().all(|r| r.trim().is_empty()),
+            "{w}x{h} drew {rows:?}"
+        );
+    }
 }
 
 /// The Status, Services and Fallback framed empties sit centred in their
@@ -9247,6 +9385,11 @@ fn the_empty_state_keeps_its_action_line_on_a_short_pane() {
     });
     status.tab = Tab::Status;
     assert!(action_in(&status, "r to fetch"), "status action line");
+    assert_eq!(
+        pane_interior_rows(&status, 45, 20, "INCIDENTS"),
+        ["no status data yet", "r to fetch", ""],
+        "status rows"
+    );
 
     let mut services = App::new(AppConfig {
         state: AppState::default(),
@@ -9254,4 +9397,9 @@ fn the_empty_state_keeps_its_action_line_on_a_short_pane() {
     });
     services.tab = Tab::Services;
     assert!(action_in(&services, "r to run"), "services action line");
+    assert_eq!(
+        pane_interior_rows(&services, 45, 20, "SERVICES"),
+        ["no services yet", "r to run", ""],
+        "services rows"
+    );
 }

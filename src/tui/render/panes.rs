@@ -535,7 +535,8 @@ pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<L
 /// pane's inner width at its spaces (a marked key stays whole); the frame is
 /// sized to the wrapped copy — height = rows + 2, width = widest row + 2 — and
 /// centred in the pane, never stretched to fill it. When the pane cannot hold
-/// the frame, the wrapped copy renders bare and centred, no frame.
+/// the frame, the copy re-wraps at the pane's own width and renders bare and
+/// centred, no frame.
 pub(super) fn empty_state(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -558,12 +559,34 @@ pub(super) fn empty_state(
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     if area.width < frame_w || area.height < frame_h {
-        let rows = u16::try_from(lines.len())
-            .unwrap_or(area.height)
-            .min(area.height);
+        // Bare fallback: re-wrap at the pane's own width — the copy wrapped for
+        // the frame's inner width clips its action line on a pane too narrow
+        // for the frame even when the whole copy would fit. When the wrapped
+        // copy still runs taller than the pane, the hint drops whole (never as
+        // a fragment) before any action row drops, and the action's first rows
+        // keep the key row first.
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let pane_w = usize::from(area.width);
+        let mut hint_rows: Vec<Line<'static>> = Vec::new();
+        let mut action_rows: Vec<Line<'static>> = Vec::new();
+        for wrapped in prose::wrap(hint, pane_w, base) {
+            hint_rows.push(Line::from(wrapped));
+        }
+        for wrapped in prose::wrap(action_text.as_str(), pane_w, base) {
+            action_rows.push(Line::from(wrapped));
+        }
+        let pane_h = usize::from(area.height);
+        let kept: Vec<Line<'static>> = if hint_rows.len() + action_rows.len() <= pane_h {
+            hint_rows.into_iter().chain(action_rows).collect()
+        } else {
+            action_rows.into_iter().take(pane_h).collect()
+        };
+        let rows = u16::try_from(kept.len()).unwrap_or(area.height);
         let y = area.y + area.height.saturating_sub(rows) / 2;
         frame.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(kept)
                 .style(base)
                 .alignment(Alignment::Center),
             Rect {

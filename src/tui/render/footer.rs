@@ -213,6 +213,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.tab == Tab::Overview && owner.is_none() && app.current_main_item().is_none() {
         hints.retain(|(key, _)| *key != "e");
     }
+    // `⇧↑↓` swaps the cursor's account with a neighbour: nothing moves without
+    // an account under the cursor and a second account, as its handler checks.
+    if app.tab == Tab::Overview
+        && owner.is_none()
+        && !(matches!(app.current_main_item(), Some(MainItemKind::Profile(_)))
+            && app.config().profiles.len() > 1)
+    {
+        hints.retain(|(key, _)| *key != "⇧↑↓");
+    }
 
     shed_to_width(&mut hints, area.width as usize);
 
@@ -411,6 +420,21 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // `r` re-reads the listing), so they build a Vec like Services.
     if app.tab == Tab::Usage {
         let mut hints = usage_hints(app);
+        hints.push(("q", q_label));
+        return hints;
+    }
+
+    // The Status list hints derive from the incident count like Services: `↑↓`
+    // and `↵` act only while the list holds a row, and the key handler gates
+    // both on the same `incidents.len() > 0` predicate this reads, so an empty
+    // list advertises neither.
+    if app.tab == Tab::Status && app.status.focus == StatusFocus::List {
+        let mut hints = Vec::new();
+        if !app.status.incidents.is_empty() {
+            hints.push(("↑↓", "incident"));
+            hints.push(("↵", "open"));
+        }
+        hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
         hints.push(("q", q_label));
         return hints;
     }
@@ -637,13 +661,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
         }
         Tab::Status => match app.status.focus {
-            StatusFocus::List => &[
-                ("↑↓", "incident"),
-                ("↵", "open"),
-                ("r", "refresh"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
+            StatusFocus::List => &[], // handled above: its hints derive from the incident count
             StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
         },
         Tab::Services => &[], // handled above: its hints carry a computed verb

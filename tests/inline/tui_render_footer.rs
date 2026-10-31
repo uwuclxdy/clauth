@@ -2849,8 +2849,8 @@ fn x_over_a_toast_pops_and_disarms_the_quit() {
     assert!(!app.quit, "the quit re-arms after x");
 }
 
-/// With no row under the Overview cursor `e` opens nothing, so the footer drops
-/// its hint; the row's other keys keep their places.
+/// With no row under the Overview cursor `e` opens nothing and `⇧↑↓` moves
+/// nothing, so the footer drops both hints.
 #[test]
 fn the_empty_overview_footer_drops_the_edit_key() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2863,12 +2863,39 @@ fn the_empty_overview_footer_drops_the_edit_key() {
 
     assert_eq!(
         settled_footer(&app, 80, 24),
-        "←→ tabs   ⇧↑↓ reorder   a actions   c harness   ? help   q quit"
+        "←→ tabs   a actions   c harness   ? help   q quit"
+    );
+}
+
+/// `⇧↑↓` swaps the cursor's account with a neighbour, so it is hinted only
+/// while the cursor holds an account and another account exists to swap with.
+#[test]
+fn the_overview_footer_hints_reorder_only_with_a_neighbour_to_swap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("p1")),
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("p2")),
+        ],
+    });
+    app.tab = Tab::Overview;
+    assert!(
+        matches!(
+            app.current_main_item(),
+            Some(crate::tui::app::MainItemKind::Profile(_))
+        ),
+        "precondition: an account under the cursor"
+    );
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
     );
 }
 
 /// With a row under the Overview cursor `e` opens its Setup editor, so the
-/// drawn footer keeps the hint beside the other row keys.
+/// drawn footer keeps the hint; a lone account has no neighbour to swap with,
+/// so `⇧↑↓` drops.
 #[test]
 fn the_overview_footer_with_a_row_names_the_edit_key() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2885,7 +2912,7 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
     );
     assert_eq!(
         settled_footer(&app, 80, 24),
-        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit"
     );
 }
 
@@ -2950,6 +2977,29 @@ fn r_reloads_an_unreadable_token_cache_and_x_leaves_it() {
         "r clears the failure while the reload runs"
     );
     assert!(app.tokens_topping_up, "r starts the reload");
+}
+
+/// An empty Status list advertises no row key: `↑↓` moves nothing and `↵`
+/// opens nothing there, from the incident count the key handler gates on.
+#[test]
+fn an_empty_status_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Status;
+    app.status.focus = crate::tui::app::StatusFocus::List;
+    assert!(
+        app.status.incidents.is_empty(),
+        "precondition: no incidents"
+    );
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
 }
 
 /// An empty Services list advertises no row key: `↑↓` moves nothing and `↵`
