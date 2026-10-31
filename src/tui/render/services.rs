@@ -43,10 +43,10 @@ use super::modals::danger_button;
 use super::panes::{
     MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
-    follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
-    help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, with_bg,
-    wrap_words,
+    follow_scroll_offset, footnote_height, footnote_lines, footnote_split, head_cols,
+    help_tooltip_lines, help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell,
+    label_style, master_detail, place_caret, section_box, select_line, toggle_value, value_caret,
+    with_bg, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -2106,7 +2106,8 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
 /// through the shared helper.
 fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
     let foot = footnote_lines(DELEGATES_STEER, body.width as usize);
-    let (scroll_area, foot_area) = footnote_split(body, foot.len());
+    let (scroll_area, foot_area) =
+        footnote_split(body, footnote_height(DELEGATES_STEER, body.width as usize));
     // The framed empty state needs its 4 rows (2 borders + 2 lines).
     if let Some(area) = foot_area
         && scroll_area.height >= 4

@@ -634,6 +634,14 @@ pub(super) fn footnote_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The height a [`footnote_lines`] wrap produces: the one footnote-height
+/// derival, so every caller feeding [`footnote_layout`] or
+/// [`footnote_split`] — the draw helper and any caller pre-computing the
+/// pinned-footnote geometry before the draw — counts the lines the same way.
+pub(super) fn footnote_height(text: &str, width: usize) -> usize {
+    footnote_lines(text, width).len()
+}
+
 /// How a pinned footnote splits the pane interior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FootnoteLayout {
@@ -723,7 +731,8 @@ pub(super) fn draw_scrolled_lines_with_footnote(
     let foot: Vec<Line<'static>> = footnote
         .map(|text| footnote_lines(text, inner.width as usize))
         .unwrap_or_default();
-    match footnote_layout(inner.height as usize, foot.len()) {
+    let foot_h = footnote.map_or(0, |text| footnote_height(text, inner.width as usize));
+    match footnote_layout(inner.height as usize, foot_h) {
         FootnoteLayout::Absent => {
             let total = lines.len();
             let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
@@ -758,7 +767,7 @@ pub(super) fn draw_scrolled_lines_with_footnote(
         }
         FootnoteLayout::Pinned { .. } => {
             let total = lines.len();
-            let (scroll_area, foot_area) = footnote_split(inner, foot.len());
+            let (scroll_area, foot_area) = footnote_split(inner, foot_h);
             let offset = draw_scrolled_lines(frame, scroll_area, lines, focus, saved);
             if let Some(area) = foot_area {
                 frame.render_widget(Paragraph::new(foot).style(theme::base()), area);

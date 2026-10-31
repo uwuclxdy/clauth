@@ -2028,6 +2028,113 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     );
 }
 
+/// The edit-caret guard must bound the caret by the scroll viewport the card
+/// renders into, not by the pane's full inner height: with the `resumes:`
+/// footnote pinned, the rows the footnote takes (its blank margin row and the
+/// footnote row itself) are not rendered content, and a caret row landing
+/// there must leave the cursor unset, not park it on the footnote. The
+/// defecting state decouples the cursored row from the edited row (cursor on
+/// `rotate at`, edit on `max spend`) — the key handler keeps the edited row
+/// cursored, so no real key path reaches it, and the render function is driven
+/// directly with the mismatched state to pin the guard itself.
+#[test]
+fn typed_caret_is_not_placed_in_the_rows_the_pinned_footnote_takes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (w, h) = (100u16, 19u16);
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .unwrap();
+    app.fallback_edit = Some(crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state: CardEdit::MaxSpend(InputState::new("5")),
+        seed: Some("5".to_string()),
+    });
+
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.join("\n");
+    let resumes = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("resumes:"))
+        .unwrap_or_else(|| panic!("[{w}x{h}] resumes: never renders:\n{screen}"));
+    assert_eq!(
+        detail_of(&rows[resumes - 1]),
+        "",
+        "[{w}x{h}] precondition: a blank margin row sits above the footnote:\n{screen}"
+    );
+    assert!(
+        !rows.iter().any(|r| detail_of(r).starts_with("max spend")),
+        "[{w}x{h}] precondition: the typed row sits below the scroll viewport (inside the footnote's rows):\n{screen}"
+    );
+    let caret = term.get_cursor_position().ok();
+    assert!(
+        caret.is_none_or(|c| (c.y as usize) < resumes - 1),
+        "[{w}x{h}] the edit caret must not be placed in the rows the pinned footnote takes \
+         (caret row {:?}, footnote at row {resumes}):\n{screen}",
+        caret.map(|c| c.y)
+    );
+}
+
+/// The day-picker scroll chase must keep the chased caret line inside the
+/// scroll viewport the card renders into, not the pane's full inner height:
+/// with the `resumes:` footnote pinned, a chase anchored on `inner.height`
+/// under-chases by the rows the footnote takes, and the caret chip the user
+/// walked to renders below the fold (invisible — the picker places no native
+/// cursor, so nothing else exposes it). The state is a real key path: `⏎` on
+/// `preferred days` opens the picker, `→` walks it to the last chip.
+#[test]
+fn day_picker_caret_line_scrolls_into_the_viewport_under_a_pinned_footnote() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (w, h) = (26u16, 15u16);
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::PreferredDays)
+        .unwrap();
+    app.fallback_edit = Some(crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state: CardEdit::Days(crate::tui::app::DayPicker {
+            cursor: 6,
+            warned: false,
+        }),
+        seed: None,
+    });
+
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.join("\n");
+    let resumes = rows
+        .iter()
+        .position(|r| r.contains("resumes:"))
+        .unwrap_or_else(|| panic!("[{w}x{h}] resumes: never renders:\n{screen}"));
+    assert!(
+        rows[resumes - 1]
+            .chars()
+            .all(|c| matches!(c, ' ' | '│' | '┊' | '┃')),
+        "[{w}x{h}] precondition: a blank margin row sits above the footnote:\n{screen}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("[ ]")),
+        "[{w}x{h}] precondition: the day picker renders:\n{screen}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("❯[")),
+        "[{w}x{h}] the chased picker caret chip must render inside the scroll viewport:\n{screen}"
+    );
+}
+
 /// Finding shape from review round 2: a 40x24 terminal (~14 inner rows after
 /// borders and the left chain) with a blocked member fills the card past the
 /// pane — the LAST rows must stay reachable by walking the cursor down, not

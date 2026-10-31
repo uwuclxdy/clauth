@@ -34,9 +34,10 @@ use super::panes::{
     DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_ORG_REFUSED, DIAG_OTHER_MODELS_OK,
     DIAG_STALE, DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, FIX_ORG_REFUSED,
     MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list,
-    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, name_color, pill, place_caret, rail_hint_lines, section_box,
-    section_box_verbatim, select_line, toggle_value, value_caret, wrap_words,
+    footnote_height, footnote_split, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill, place_caret,
+    rail_hint_lines, section_box, section_box_verbatim, select_line, toggle_value, value_caret,
+    wrap_words,
 };
 use super::prose::{cmd, key, mark_commands, setup_token_remint_fix};
 use crate::fallback::{
@@ -334,7 +335,17 @@ fn draw_chain_detail(
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let height = inner.height as usize;
+    // The viewport the draw below will render into: the footnote height and
+    // the split come from the same `panes` derival the draw itself uses, so
+    // the day-picker chase below chases to the same rows the draw renders.
+    // (The typed-field caret guard further down reads the draw's own
+    // `ScrolledDraw.viewport`.)
+    let foot_h = footnote
+        .as_deref()
+        .map(|text| footnote_height(text, inner.width as usize))
+        .unwrap_or(0);
+    let (scroll_area, _) = footnote_split(inner, foot_h);
+    let viewport = scroll_area.height as usize;
     let focus = match selected {
         // The header block + the rows + a tooltip outgrow a short pane (a
         // 40x24 terminal leaves ~14 inner rows, and a blocked member's pill
@@ -364,7 +375,7 @@ fn draw_chain_detail(
             }
             .map(|k| block.start + k);
             let start = caret_line.map_or(block.start, |line| {
-                block.start.max((line + 1).saturating_sub(height))
+                block.start.max((line + 1).saturating_sub(viewport))
             });
             (start, block.end)
         }
@@ -411,12 +422,13 @@ fn draw_chain_detail(
         e.input().map(|draft| (e.row(), draft, unit_cols))
     });
 
-    // The row must actually be ON the pane before its caret is placed. The
-    // scroll above chases the CURSORED row, which is the row being typed on
-    // every real path — but a degenerate pane (no rows at all) can still leave
-    // it off, and an unguarded set parks a visible
-    // caret on a border or the pane below, since a real terminal clamps the
-    // row rather than dropping it. Mirrors the `config.rs` edit-caret guard.
+    // The row must actually be RENDERED before its caret is placed: the scroll
+    // viewport, not the pane. A pinned `resumes:` footnote takes rows from the
+    // pane the scroll area never draws into, so a pane-bounded set parks a
+    // visible caret on the footnote (a real terminal clamps the row rather
+    // than dropping it). The scroll above chases the CURSORED row, which is
+    // the row being typed on every real path — but a degenerate pane (no rows
+    // at all) can still leave it off. Mirrors the `config.rs` edit-caret guard.
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some((row, draft, unit_cols)) = typing
@@ -426,7 +438,7 @@ fn draw_chain_detail(
             .filter(|span| !span.is_empty())
             .map(|span| span.start)
         && at >= scroll
-        && at - scroll < inner.height as usize
+        && at - scroll < draw.viewport
     {
         // x = the (clamped) value column + unit + the caret's cell in the
         // value window.
