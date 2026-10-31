@@ -12920,6 +12920,79 @@ fn publish_round(src: &Path, near: &Path, far: &Path, writer: usize, round: usiz
     copy_file(&staged, &near.join(name)).expect("publish");
 }
 
+/// Poll `writes` every `poll` until it has held still for `quiet`, measured
+/// from the last change observed. `Ok` carries the settled count; `Err` the
+/// count read when `deadline` (from the call) passed without a quiet span.
+fn wait_quiescent(
+    writes: impl Fn() -> usize,
+    poll: Duration,
+    quiet: Duration,
+    deadline: Duration,
+) -> Result<usize, usize> {
+    let deadline = std::time::Instant::now() + deadline;
+    let mut settled = writes();
+    let mut quiet_since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(poll);
+        let now = writes();
+        if now != settled {
+            settled = now;
+            quiet_since = std::time::Instant::now();
+        } else if quiet_since.elapsed() >= quiet {
+            return Ok(settled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(now);
+        }
+    }
+}
+
+/// A counter that keeps moving on a cycle well under the quiet span (a
+/// self-feed, slowed) never settles: the wait ends at its deadline.
+#[test]
+fn wait_quiescent_never_settles_on_a_counter_moving_inside_the_span() {
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let verdict = wait_quiescent(
+            || count.load(std::sync::atomic::Ordering::Relaxed),
+            Duration::from_millis(20),
+            Duration::from_millis(600),
+            Duration::from_secs(3),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(verdict.is_err(), "a moving counter settled: {verdict:?}");
+    });
+}
+
+/// A counter that moves late and then stops settles on its last value, however
+/// late its last move lands before the deadline.
+#[test]
+fn wait_quiescent_settles_on_a_counter_that_stops() {
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(150));
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let verdict = wait_quiescent(
+            || count.load(std::sync::atomic::Ordering::Relaxed),
+            Duration::from_millis(20),
+            Duration::from_millis(600),
+            Duration::from_secs(5),
+        );
+        assert_eq!(verdict, Ok(3), "the counter settles on its last value");
+    });
+}
+
 /// `LinkMode::Fake` shares ONE tree across every session of a profile, so
 /// `copy_tree`, `merge_path` and `mirror_credentials` publish into it
 /// concurrently — one set per live session. Under a storm of those publishes the
@@ -12999,43 +13072,37 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         // A convergent mirror stops PUBLISHING once the writers stop. It may
         // still run any number of passes — a notify reader draining the writer
         // phase's backlog keeps waking it, which is correct — so the oracle is
-        // bytes moved, not passes taken. And its LAST legitimate publish can
-        // land arbitrarily late on a loaded box (the debounce + cooldown
-        // pacing runs behind the backlog), so quiescence is measured from an
-        // OBSERVED plateau, never a fixed sleep: a fixed pre-sample wait
-        // turned exactly one late-but-correct convergence pass into a
-        // "feeding on its own writes" verdict on the Windows runner. A real
-        // self-feed never plateaus and exits through the deadline instead.
-        let deadline = std::time::Instant::now() + cooldown * 40;
-        let mut settled = mirror.writes();
-        loop {
-            std::thread::sleep(cooldown * 4);
-            let now = mirror.writes();
-            if now == settled {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
+        // bytes moved, not passes taken, and its last legitimate publish can
+        // land late behind that backlog (at most WRITERS * ROUNDS publishes, which
+        // one whole-tree pass propagates). The verdict is therefore a quiet
+        // span measured from the last observed publish (`wait_quiescent`). A
+        // self-feed republishes once per cooldown plus its own pass time; while
+        // that cycle plus one poll stays under the span, every publish restarts
+        // it and the deadline is the only way out. The span is 16 cooldowns,
+        // far above the cycle any self-feed has under these timings. Residuals
+        // it cannot see: a self-feed whose cycle plus one poll outgrows the
+        // span, and one
+        // that rewrites byte-identical content inside one mtime tick of a
+        // coarse-granularity filesystem (the counter keys on name, length and
+        // mtime).
+        let settled = wait_quiescent(
+            || mirror.writes(),
+            cooldown * 2,
+            cooldown * 16,
+            cooldown * 200,
+        )
+        .unwrap_or_else(|now| {
+            panic!(
                 "the mirror was still publishing {now} passes in with no writer \
                  running: it is feeding on its own writes"
-            );
-            settled = now;
-        }
-        std::thread::sleep(cooldown * 8);
-        let after = mirror.writes();
+            )
+        });
         drop(shutdown_tx);
 
         assert!(
             settled >= 2,
             "fixture: the mirror published {settled} times during the soak, \
-             so quiescence below would hold no matter what the code does"
-        );
-        assert_eq!(
-            after,
-            settled,
-            "the mirror published {} more times with no writer running: it is \
-             feeding on its own writes",
-            after - settled
+             so the quiet span above would hold no matter what the code does"
         );
         assert!(
             mirror.torn().is_empty(),
