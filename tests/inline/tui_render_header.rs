@@ -2021,3 +2021,127 @@ fn the_cut_outs_stay_black_on_the_compatible_tier() {
     ];
     assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
 }
+
+// ── Pulse grapheme safety ────────────────────────────────────────────────
+
+/// Mid-sweep the pulse splits its text one span per unit, so a VS16 sequence
+/// (`⚠️`, U+26A0 + U+FE0F, one grapheme) must stay inside one span: split
+/// across spans, the bare base renders a cell narrow and the selector lands
+/// alone, which the buffer draws as nothing. The buffer's measure — each
+/// span's own graphemes, widths summed (`grapheme_cells`) — must equal the
+/// text's at-rest width at the sampled mid-sweep frames (450ms and 675ms of
+/// the 900ms sweep), and the bytes must survive whole.
+///
+/// Widths are hand-derived off the width rules, never read off the code:
+/// `⚠️` is an emoji-presentation sequence, 2 cells; each of ` `, `p`, `r`,
+/// `o`, `d` is 1 — `⚠️ prod` sits on 7.
+fn pulse_keeps_rest_width(build: impl Fn(&str, u64) -> Vec<Span<'static>>) {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for elapsed_ms in [450, 675] {
+        let spans = build("⚠️ prod", elapsed_ms);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text, "⚠️ prod",
+            "the sweep must keep every byte at {elapsed_ms}ms"
+        );
+        let cells: usize = spans
+            .iter()
+            .map(|s| super::super::format::grapheme_cells(s.content.as_ref()))
+            .sum();
+        assert_eq!(
+            cells, 7,
+            "mid-sweep width must equal the at-rest width at {elapsed_ms}ms"
+        );
+    }
+    // Control: the sweep really animates, so the width checks above cannot be
+    // greened by a flat render. At 0ms the envelope is sin(0) = 0, so every
+    // span leans 0 and sits on the base fg; at 450ms (progress 0.5, envelope
+    // sin(π/2) = 1) the crest grapheme leans crest 1 × envelope 1 ×
+    // PULSE_DEPTH 0.4 = 0.4, and a tint that moved nothing would make the
+    // whole pulse invisible.
+    let flat = build("⚠️ prod", 0);
+    let base = flat
+        .first()
+        .and_then(|s| s.style.fg)
+        .expect("the pulse always emits at least one span");
+    assert!(
+        flat.iter().all(|s| s.style.fg == Some(base)),
+        "control: at 0ms the envelope is 0, so every span sits on the base color"
+    );
+    assert!(
+        build("⚠️ prod", 450)
+            .iter()
+            .any(|s| s.style.fg != Some(base)),
+        "control: at 450ms the sweep must tint at least one grapheme"
+    );
+}
+
+#[test]
+fn the_gauge_name_pulse_keeps_whole_graphemes_across_sweep_frames() {
+    // The header gauge's own seam: `gauge_spans` fits the name, then pulses
+    // it; its trailing name-to-percent gap is dropped before the checks.
+    pulse_keeps_rest_width(|name, elapsed_ms| {
+        let fit = GaugeFit {
+            name_w: 8,
+            bar_cells: 0,
+            visible: true,
+        };
+        let mut spans = gauge_spans(fit, name, None, elapsed_ms);
+        spans.pop();
+        spans
+    });
+}
+
+#[test]
+fn the_accent_pulse_keeps_whole_graphemes_across_sweep_frames() {
+    // The bare pulse in ACCENT, the colour the Services value pulses in (the
+    // Overview kind cell pulses in DIM); the Services seam itself is pinned
+    // through `field_text_spans` in the services render tests.
+    pulse_keeps_rest_width(|name, elapsed_ms| pulse_name_spans(name, theme::accent(), elapsed_ms));
+}
+
+/// The composed row keeps the emoji grapheme whole mid-sweep: the buffer draws
+/// `⚠️` as one 2-cell glyph (the selector never draws alone; the skip cell
+/// after a wide glyph reads as an extra space in the row's symbol concat), and
+/// the sweep's per-grapheme recolor cannot move a cell — every drawn row is
+/// symbol-identical to the at-rest (1000ms) row, the 900ms sweep being over.
+#[test]
+fn the_drawn_row_keeps_the_emoji_name_whole_mid_sweep() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(vec![oauth_profile("⚠️ prod", 49.0)], Some("⚠️ prod"));
+    app.tab = Tab::Usage;
+    let rows: Vec<Vec<String>> = [0, 450, 675, 1000]
+        .iter()
+        .map(|&phase| {
+            app.anim_phase_ms = Some(phase);
+            render_header_rows(&app, 45)
+        })
+        .collect();
+    // The rest frame first: 0ms is a sweep frame too, so only the at-rest
+    // comparison catches a sweep path that moves a cell.
+    assert_eq!(
+        rows[1], rows[3],
+        "the 450ms sweep frame must draw the at-rest (1000ms) row cell for cell"
+    );
+    for (phase, rows_at) in [0, 450, 675, 1000].iter().zip(&rows) {
+        let row = &rows_at[1];
+        assert!(
+            row.contains("⚠️"),
+            "row 1 must draw the whole emoji grapheme at {phase}ms: {row:?}"
+        );
+        assert!(
+            row.contains("prod 49%") && row.contains("● status.claude.ai"),
+            "the compose after the name must stay whole at {phase}ms: {row:?}"
+        );
+    }
+    assert_eq!(
+        rows[0], rows[1],
+        "the sweep must not move a cell between 0ms and 450ms"
+    );
+    assert_eq!(
+        rows[1], rows[2],
+        "the sweep must not move a cell between 450ms and 675ms"
+    );
+}

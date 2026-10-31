@@ -213,16 +213,27 @@ pub(super) fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec
     let progress = t / sweep;
     let envelope = (PI * progress).sin();
     let head = progress * TAU;
-    let len = name.chars().count().max(1) as f32;
+    // One span per grapheme, never per char: `⚠️` (U+26A0 + U+FE0F) is one
+    // grapheme, and a split leaves the base a cell narrow with the selector
+    // drawn as nothing. `styled_graphemes` is the same segmentation the
+    // buffer draws from (control graphemes dropped), so each unit keeps its
+    // bytes and width across sweep frames.
+    let source = Span::raw(name);
+    let graphemes: Vec<&str> = source
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol)
+        .collect();
+    let len = graphemes.len().max(1) as f32;
     let base = style.fg.unwrap_or_else(theme::text_color);
-    name.chars()
+    graphemes
+        .iter()
         .enumerate()
-        .map(|(i, ch)| {
+        .map(|(i, symbol)| {
             let col = (i as f32 / len) * TAU;
             let crest = ((col - head).cos() * 0.5 + 0.5).powi(2);
             let lean = f64::from(crest * envelope * PULSE_DEPTH);
             let fg = theme::blend_over(base, theme::accent_2_color(), lean);
-            Span::styled(ch.to_string(), style.fg(fg))
+            Span::styled((*symbol).to_string(), style.fg(fg))
         })
         .collect()
 }

@@ -586,3 +586,38 @@ fn a_command_ending_in_whitespace_keeps_a_space_before_glued_prose() {
 fn a_whitespace_only_command_adds_no_blank_cell() {
     assert_eq!(row_texts(&format!("a {} b", cmd("  ")), 40), vec!["a b"]);
 }
+
+/// A hard split at an emoji-presentation sequence keeps `⚠️` whole: the cut
+/// never lands between U+26A0 and its VS16, which would leave a row ending in
+/// a bare `⚠` (a cell narrow) and the lone selector leading the next row,
+/// drawn as nothing. Widths hand-derived: `⚠️` is one grapheme at 2 cells, so
+/// a 5-cell row holds two whole pairs, and 12 pairs after `spawned by` split
+/// 7 + 5 at a 14-cell row.
+#[test]
+fn a_hard_split_at_an_emoji_sequence_keeps_the_whole_grapheme() {
+    assert_eq!(
+        super::super::panes::wrap_words("⚠️⚠️⚠️⚠️⚠️", 5),
+        vec!["⚠️⚠️", "⚠️⚠️", "⚠️"]
+    );
+    // The delegate-facts shape: services wraps `spawned by {account}`, and the
+    // account name is one token wider than the row, so the cut lands inside it.
+    assert_eq!(
+        super::super::panes::wrap_words("spawned by ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️", 14),
+        vec!["spawned by", "⚠️⚠️⚠️⚠️⚠️⚠️⚠️", "⚠️⚠️⚠️⚠️⚠️"]
+    );
+}
+
+/// A plain-path break never parts a space from the combining mark the buffer
+/// glues to it: the pair is one grapheme, so the mark rides the space it tints
+/// and never leads a row, where it would draw as nothing. Hand-derived at 4
+/// cells: `ab` (2) leaves room for the glued space (1) and `y` (1) but not the
+/// `z`, so the rows are `["ab \u{0301}y", "z"]`; a break at the space would
+/// drop the separator and lead the next row with a bare mark
+/// (`["ab", "\u{0301}yz"]`).
+#[test]
+fn a_plain_wrap_break_never_parts_a_glued_space() {
+    assert_eq!(
+        super::super::panes::wrap_words("ab \u{0301}yz", 4),
+        vec!["ab \u{0301}y", "z"]
+    );
+}

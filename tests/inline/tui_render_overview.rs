@@ -1428,14 +1428,14 @@ fn no_tier_type_cell_does_not_pulse() {
 
     // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
     // one value a ONE-CHARACTER label cannot express. `pulse_name_spans` weights
-    // char `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
+    // grapheme `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
     // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
-    // char sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
+    // grapheme sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
     // `crest = ((−1) · 0.5 + 0.5)² = 0`: no tint, landing on the same base color
     // as the flat 0ms frame, whose `envelope = sin(0)` is 0 for its own reason.
     // A `—` cell would then compare equal at both phases whether or not it
     // pulsed, and the mutation deleting the guard stays green. 135ms is near the
-    // peak `crest × envelope` for one char, where the tint is observable.
+    // peak `crest × envelope` for one grapheme, where the tint is observable.
     assert_eq!(
         snapshot(0, 0),
         snapshot(0, 135),

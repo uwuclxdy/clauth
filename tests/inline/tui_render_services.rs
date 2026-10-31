@@ -8239,6 +8239,42 @@ fn a_saving_value_carries_the_shimmer_crest() {
     );
 }
 
+/// A saving gateway value keeps `⚠️` whole at a mid-sweep frame: the row's
+/// field text runs through `field_text_spans`, whose saving branch pulses per
+/// grapheme, so the VS16 stays with its base and the drawn cells stay at the
+/// at-rest width. Hand-derived: `⚠️` is one grapheme at 2 cells, each of
+/// ` prod` 1 — 7; a per-char pulse sums 5 (the lone selector draws 0).
+#[test]
+fn a_saving_gateway_value_keeps_its_emoji_grapheme_mid_sweep() {
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, ShuntSaveKey, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for frame_ms in [450, 675] {
+        let save = ShuntSave {
+            key: ShuntSaveKey::Field(ShuntFieldKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+                field: UpstreamFieldKind::Effort,
+            }),
+            started: std::time::Instant::now() - std::time::Duration::from_millis(frame_ms),
+            value: Some("⚠️ prod".into()),
+            entry: None,
+        };
+        let spans = super::field_text_spans(Some("⚠️ prod"), 20, Some(&save));
+        assert!(
+            spans.len() > 1,
+            "control: {frame_ms}ms into the 900ms sweep the value pulses per grapheme"
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "⚠️ prod", "{frame_ms}ms");
+        let cells: usize = spans
+            .iter()
+            .map(|s| super::super::format::grapheme_cells(s.content.as_ref()))
+            .sum();
+        assert_eq!(cells, 7, "{frame_ms}ms: ⚠️ is 2 cells, each of ` prod` 1");
+    }
+}
+
 /// Focus is held by the entry's identity, never a line index: a recompute that
 /// reorders the upstreams keeps focus on the same entry.
 #[test]

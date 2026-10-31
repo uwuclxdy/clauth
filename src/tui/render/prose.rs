@@ -475,14 +475,17 @@ fn tokens(
     glue_aware: bool,
     drop_controls: bool,
 ) -> Vec<Token> {
-    // A prose break is whitespace the wrapper may cut at. On a marked line the
-    // glue spaces are data and a space that carries a combining mark stays
-    // inside its grapheme; prose-only copy keeps the full-whitespace rule.
+    // A prose break is whitespace the wrapper may cut at, except a space the
+    // buffer draws as one grapheme with the char after it
+    // (`space_glued_to_next`), on both paths: a cut there would part one
+    // grapheme across two rows. The marked line keeps its remaining stricter
+    // rule: a non-breaking space is data there, while prose-only copy may
+    // still cut at it.
     let is_break = |at: usize| {
         if glue_aware {
             marked_break(chars, at)
         } else {
-            chars[at].0.is_whitespace()
+            chars[at].0.is_whitespace() && !space_glued_to_next(chars, at)
         }
     };
     let mut out: Vec<Token> = Vec::new();
@@ -794,7 +797,7 @@ fn break_at_spaces(
         if glue_aware {
             marked_break(chars, at)
         } else {
-            chars[at].0.is_whitespace()
+            chars[at].0.is_whitespace() && !space_glued_to_next(chars, at)
         }
     };
     let mut pieces: Vec<Piece> = Vec::new();
