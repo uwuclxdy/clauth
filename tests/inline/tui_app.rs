@@ -20362,6 +20362,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     }
 }
 

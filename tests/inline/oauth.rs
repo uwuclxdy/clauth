@@ -76,6 +76,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -203,6 +204,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -275,6 +277,7 @@ fn profile_without_refresh_token_excluded() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -375,6 +378,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -415,6 +419,7 @@ fn third_party_config(name: &str) -> AppConfig {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let mut config = AppConfig {
         state: AppState::default(),

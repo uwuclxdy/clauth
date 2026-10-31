@@ -48,6 +48,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     }
 }
 
@@ -80,6 +81,7 @@ fn endpoint_profile(name: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     }
 }
 
@@ -112,6 +114,7 @@ fn blank_profile(name: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     }
 }
 

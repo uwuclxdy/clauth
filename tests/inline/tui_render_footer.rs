@@ -66,6 +66,7 @@ fn the_usage_hints_advertise_the_note_key() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     let with_account = App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),

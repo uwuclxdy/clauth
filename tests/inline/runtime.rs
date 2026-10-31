@@ -5006,7 +5006,8 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
         // legs that run BEFORE the gate (`arm_rolling_from_disk` -> `load_profile`
         // -> `maybe_rewrite_config_toml`) are inert for a cleanly deleted name
         // only by CONVENTION — `effective_base_url(None, false, None, &BTreeMap::new())` returning
-        // `None` and the default render round-tripping — and `atomic_write_600`
+        // `None` and the default profile's canonical config equalling `ProfileConfig::default()`
+        // (so the load sees no drift) — and `atomic_write_600`
         // creates the missing parent. Should either drift, `load_profile` becomes
         // a resurrector sitting ahead of the gate and this assertion is what
         // reds. Do not weaken it to match the narrower claim it reads as.
@@ -11243,10 +11244,9 @@ fn the_shared_target_check_resolves_an_adoptable_pending_sidecar_like_a_full_loa
 /// leaves both for the next ordinary load. The `[env]` key `A.B` keeps the
 /// check on its `Ok` path (a launch carrying the same env), so the read reaches
 /// past the transport gate. The fixture is asserted LIVE: a full load on a
-/// sibling copy still writes — it lands the sidecar as `credentials.json` — so
-/// the pin stays armed. Residual: no valid `config.toml` makes a full load
-/// rewrite it anymore (the render round-trips), so the control observes the
-/// sidecar write-through, never a config rewrite.
+/// sibling copy still writes — it normalizes the `check_weekly = true` hand
+/// edit away and lands the sidecar as `credentials.json` — so the pin stays
+/// armed.
 #[test]
 fn the_shared_target_check_does_not_rewrite_config_toml() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -11261,8 +11261,8 @@ fn the_shared_target_check_does_not_rewrite_config_toml() {
             let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
                 .expect("profile dir");
             let config = dir.join("config.toml");
-            std::fs::write(&config, "[env]\n\"A.B\" = \"x\"\n")
-                .expect("write the launch-matching env config");
+            std::fs::write(&config, "check_weekly = true\n[env]\n\"A.B\" = \"x\"\n")
+                .expect("write the launch-matching env config with a non-canonical hand edit");
             let creds = dir.join("credentials.json");
             // An adoptable legacy `.pending` sidecar, written after
             // `credentials.json` so its mtime is not older: an ordinary load
@@ -11276,12 +11276,23 @@ fn the_shared_target_check_does_not_rewrite_config_toml() {
             (config, creds, pending)
         };
 
-        // The fixture is live: a full load lands the sidecar, rewriting
-        // `credentials.json`.
-        let (_, live_creds, live_pending) = seed("scc-rewrite-live");
+        // The fixture is live: a full load normalizes the hand edit away and
+        // lands the sidecar, rewriting `credentials.json`.
+        let (live_config, live_creds, live_pending) = seed("scc-rewrite-live");
         let live_creds_before = std::fs::read(&live_creds).expect("read live credentials before");
         crate::profile::load_profile(&crate::profile::ProfileName::from("scc-rewrite-live"))
             .expect("load live profile");
+        assert!(
+            !std::fs::read_to_string(&live_config)
+                .expect("read live config after")
+                .contains("check_weekly"),
+            "fixture liveness: a full load normalizes the hand edit away"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&live_config).expect("read live config after"),
+            "[env]\n\"A.B\" = \"x\"\n",
+            "fixture liveness: a full load normalizes the hand edit to the exact bytes"
+        );
         assert_ne!(
             std::fs::read(&live_creds).expect("read live credentials after"),
             live_creds_before,

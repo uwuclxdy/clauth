@@ -52,6 +52,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )

@@ -2488,6 +2488,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.
@@ -3011,8 +3012,8 @@ fn profile_config_reads_models_table() {
 }
 
 // Model config must survive a config.toml render→parse round-trip, or
-// `maybe_rewrite_config_toml` would either drop a hand-set value or thrash the
-// file on every reload.
+// a load would normalize a hand-set value away or thrash the file on every
+// reload.
 #[test]
 fn model_settings_round_trip_through_config_toml() {
     let mut profile = Profile::new("p".to_string(), None, None);
@@ -8423,4 +8424,914 @@ fn clearing_a_subkey_before_a_dotted_subkey_keeps_the_comment_above_it() {
         save_profile_config(&profile).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
     }
+}
+
+/// Writes `body` as `name`'s `config.toml` and returns its path, without
+/// loading it (`hand_written_config` loads, which would run the normalizing
+/// write before the test looks).
+fn raw_config(name: &str, body: &str) -> PathBuf {
+    let path = profile_config_path(&ProfileName::from(name)).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// Loads `name` once more and asserts the load wrote nothing: the file's
+/// mtime, pushed an hour into the past first, does not move, and its bytes
+/// equal `expected`.
+fn assert_next_load_writes_nothing(name: &str, path: &Path, expected: &str) {
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(path, past);
+    let before = std::fs::metadata(path).unwrap().modified().unwrap();
+    load_profile(&ProfileName::from(name)).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().modified().unwrap(),
+        before,
+        "the second load wrote the file"
+    );
+}
+
+/// `check_weekly = true` is the default spelled out: the load drops the key
+/// in place, and the next load finds nothing to change.
+#[test]
+fn a_load_normalizes_check_weekly_true_away_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "cw",
+        "base_url = \"x\"\ncheck_weekly = true\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("cw")).unwrap();
+    assert!(profile.check_weekly);
+    let expected = "base_url = \"x\"\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("cw", &path, expected);
+}
+
+/// A value the load clamps is written clamped, in place, keeping the comment
+/// above it and the one trailing it.
+#[test]
+fn a_load_writes_a_clamped_value_in_place_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "clamp",
+        "# my line\nfallback_threshold = 120  # too high\nmax_auto_spend = -5\n",
+    );
+    let profile = load_profile(&ProfileName::from("clamp")).unwrap();
+    assert_eq!(profile.fallback_threshold, Some(100.0));
+    let expected = "# my line\nfallback_threshold = 100.0  # too high\nmax_auto_spend = 0.0\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("clamp", &path, expected);
+}
+
+/// A value the load ignores outright is commented out where it sits, as
+/// typed: the file stops claiming a value clauth does not use.
+#[test]
+fn a_load_comments_out_an_ignored_weekly_threshold_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "wt",
+        "base_url = \"x\"\nweekly_threshold = 0.98\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("wt")).unwrap();
+    assert_eq!(profile.weekly_threshold, None);
+    let expected = "base_url = \"x\"\n# weekly_threshold = 0.98\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("wt", &path, expected);
+}
+
+/// The comment-out keeps what the user typed, never the template's example:
+/// under the template's own doc block, `weekly_threshold = 0.98` becomes
+/// `# weekly_threshold = 0.98`, not `# weekly_threshold = 98.0`.
+#[test]
+fn a_commented_out_value_keeps_the_typed_text_under_the_template_doc() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("wtt".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("wtt")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(template.matches("# weekly_threshold = 98.0\n").count(), 1);
+    std::fs::write(
+        &path,
+        template.replace("# weekly_threshold = 98.0\n", "weekly_threshold = 0.98\n"),
+    )
+    .unwrap();
+    load_profile(&ProfileName::from("wtt")).unwrap();
+    let expected = template.replace("# weekly_threshold = 98.0\n", "# weekly_threshold = 0.98\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("wtt", &path, expected.as_str());
+}
+
+/// A typo'd weekday: the whole typed line stays above as a comment and the
+/// list without the typo becomes the key.
+#[test]
+fn a_load_keeps_a_typoed_weekday_line_commented_above_the_fixed_one() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "days",
+        "preferred_days = [\"sat\", \"Saturdy\"]\nlast_resort = true\n",
+    );
+    load_profile(&ProfileName::from("days")).unwrap();
+    let expected = "# preferred_days = [\"sat\", \"Saturdy\"]\npreferred_days = [\"sat\"]\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("days", &path, expected);
+}
+
+/// Every weekday a typo: the line is just commented out, no empty list.
+#[test]
+fn a_load_comments_out_a_weekday_line_with_no_valid_entry() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "nodays",
+        "preferred_days = [\"Saturdy\"]\nlast_resort = true\n",
+    );
+    load_profile(&ProfileName::from("nodays")).unwrap();
+    let expected = "# preferred_days = [\"Saturdy\"]\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("nodays", &path, expected);
+}
+
+/// A canonical hand edit stays byte for byte and the load writes nothing,
+/// comments, blank lines, an unknown key and the `kick_timer` alias included.
+#[test]
+fn a_canonical_hand_edit_is_never_written() {
+    let _home = HomeSandbox::new();
+    let body = "# mine\n\nkick_timer = true\nsome_future_knob = 3\n\n[env]\nA = \"b\"  # note\n";
+    let path = raw_config("canon", body);
+    assert_next_load_writes_nothing("canon", &path, body);
+}
+
+/// A file the load cannot parse fails the load and is never written.
+#[test]
+fn an_unparseable_config_load_fails_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"x\"\nbroken [ =\n";
+    let path = raw_config("unparseable", body);
+    assert!(load_profile(&ProfileName::from("unparseable")).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A value to normalize in a shape the writer refuses to edit (a multi-line
+/// array) loads with the normalized value and leaves the file as written: the
+/// load never fails over a value it can read.
+#[test]
+fn a_load_over_a_refused_shape_keeps_the_value_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "preferred_days = [\n  \"sat\",\n  \"Saturdy\",\n]\nlast_resort = true\n";
+    let path = raw_config("multiline", body);
+    let profile = load_profile(&ProfileName::from("multiline")).unwrap();
+    assert!(profile.last_resort);
+    assert_next_load_writes_nothing("multiline", &path, body);
+}
+
+/// A CRLF `config.toml` that drifts is normalized in place and stays CRLF, and
+/// the next load settles.
+#[test]
+fn a_load_normalizes_a_crlf_file_in_place_and_keeps_crlf() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("crlf", "base_url = \"x\"\r\nweekly_threshold = 0.98\r\n");
+    let profile = load_profile(&ProfileName::from("crlf")).unwrap();
+    assert_eq!(profile.weekly_threshold, None);
+    let expected = "base_url = \"x\"\r\n# weekly_threshold = 0.98\r\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("crlf", &path, expected);
+}
+
+/// A non-finite threshold is ignored outright: the load comments the typed
+/// value out in place and settles.
+#[test]
+fn a_load_comments_out_a_non_finite_threshold_in_place() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("nan", "fallback_threshold = nan\nlast_resort = true\n");
+    let profile = load_profile(&ProfileName::from("nan")).unwrap();
+    assert_eq!(profile.fallback_threshold, None);
+    let expected = "# fallback_threshold = nan\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("nan", &path, expected);
+}
+
+/// The normalizing write re-reads `config.toml` under the state flock: a peer
+/// write landing after the pre-flock read but before the flock is never
+/// overwritten by a stale edit. Driven through the seam the load already has —
+/// `maybe_rewrite_config_toml`'s `raw_config`/`profile` arguments ARE the
+/// pre-flock read's products, so the test feeds them while the file has since
+/// moved on.
+#[test]
+fn the_rmw_re_read_never_overwrites_a_peer_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw");
+    let path = raw_config("rmw", "fallback_threshold = 120\nlast_resort = true\n");
+    // The pre-flock read: the load parsed `120` and clamped it to 100 in memory.
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    assert_eq!(stale_profile.fallback_threshold, Some(100.0));
+    // A peer write lands between the pre-flock read and the flock: the operator
+    // sets a canonical in-range value.
+    let peer = "fallback_threshold = 85\nlast_resort = true\n";
+    std::fs::write(&config_path, peer).unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        peer,
+        "the stale edit must not overwrite the peer's write"
+    );
+}
+
+/// A peer write that still needs normalizing is edited from its own fresh
+/// bytes and the profile rebuilt from them, never from the pre-flock copy:
+/// the peer's comment and `last_resort = false` survive, its out-of-range
+/// threshold is clamped.
+#[test]
+fn the_rmw_edit_uses_the_fresh_bytes_and_profile() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw2");
+    let path = raw_config("rmw2", "fallback_threshold = 120\nlast_resort = true\n");
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    let peer = "# peer note\nfallback_threshold = 130\nlast_resort = false\n";
+    std::fs::write(&config_path, peer).unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# peer note\nfallback_threshold = 100.0\nlast_resort = false\n"
+    );
+}
+
+/// A peer write that is already canonical is never rewritten: its mtime does
+/// not move.
+#[test]
+fn the_rmw_never_rewrites_a_canonical_peer_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw3");
+    let path = raw_config("rmw3", "fallback_threshold = 120\nlast_resort = true\n");
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    let peer = "fallback_threshold = 85\nlast_resort = true\n";
+    std::fs::write(&config_path, peer).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(&path, past);
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+/// Commenting out an ignored value never loses it when the next root item is
+/// an implicit table (`[foo.bar]` opens no `foo` header): the doc line and the
+/// commented-out line stay above that header.
+#[test]
+fn a_comment_out_before_an_implicit_table_keeps_the_lines() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "implicitnext",
+        "last_resort = true\n# my doc\nweekly_threshold = 0.98\n\n[foo.bar]\nx = 1\n",
+    );
+    load_profile(&ProfileName::from("implicitnext")).unwrap();
+    let expected = "last_resort = true\n# my doc\n# weekly_threshold = 0.98\n\n[foo.bar]\nx = 1\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("implicitnext", &path, expected);
+}
+
+/// The save's unset keeps the comment above the unset key when the next root
+/// item is an implicit table, in a table or an array of tables.
+#[test]
+fn an_unset_before_an_implicit_table_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "implicittable",
+            "# my note\ndisabled = true\n\n[foo.bar]\nx = 1\n",
+            "# my note\n\n[foo.bar]\nx = 1\n",
+        ),
+        (
+            "implicitaot",
+            "# my note\ndisabled = true\n\n[[foo.bar]]\nx = 1\n",
+            "# my note\n\n[[foo.bar]]\nx = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.disabled = false;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// The load never edits an endpoint key it ignores for a reason outside
+/// `config.toml`: a `base_url` beside a `credentials.json` holding no usable
+/// key (with or without a blank `api_key`), and a `[console]` table whose
+/// token is blank, stay exactly as typed, and the next load writes nothing.
+#[test]
+fn a_load_never_edits_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    for (name, body, with_store) in [
+        (
+            "ignoredurl",
+            "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+            true,
+        ),
+        (
+            "ignoredkey",
+            "base_url = \"https://x.example\"  # mine\napi_key = \"\"\nlast_resort = true\n",
+            true,
+        ),
+        (
+            "ignoredconsole",
+            "last_resort = true\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+            false,
+        ),
+    ] {
+        let path = raw_config(name, body);
+        if with_store {
+            std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+        }
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert!(profile.last_resort, "{name}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body, "{name}");
+        assert_next_load_writes_nothing(name, &path, body);
+    }
+}
+
+/// An ignored endpoint key beside a value the load does normalize: only the
+/// normalized value moves.
+#[test]
+fn a_load_normalizes_beside_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nweekly_threshold = 0.98\n";
+    let path = raw_config("ignoredbeside", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    load_profile(&ProfileName::from("ignoredbeside")).unwrap();
+    let expected = "base_url = \"https://x.example\"  # mine\n# weekly_threshold = 0.98\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("ignoredbeside", &path, expected);
+}
+
+/// A save edits an endpoint key only when the profile's value differs from
+/// what the on-disk file loads as: a save changing another key keeps an
+/// ignored `base_url` and an ignored `[console]` table as typed.
+#[test]
+fn a_save_keeps_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    for (name, body, with_store, expected) in [
+        (
+            "savedurl",
+            "base_url = \"https://x.example\"  # mine\nfallback_threshold = 50.0\n",
+            true,
+            "base_url = \"https://x.example\"  # mine\nfallback_threshold = 60.0\n",
+        ),
+        (
+            "savedconsole",
+            "fallback_threshold = 50.0\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+            false,
+            "fallback_threshold = 60.0\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+        ),
+    ] {
+        let path = raw_config(name, body);
+        if with_store {
+            std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+        }
+        let mut profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(profile.fallback_threshold, Some(50.0), "{name}");
+        profile.fallback_threshold = Some(60.0);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// A `base_url` the profile sets to a new value is still written over an
+/// ignored one: the save compares against the loaded view, so a real change
+/// is never mistaken for the ignored value.
+#[test]
+fn a_save_writes_a_new_base_url_over_an_ignored_one() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("savednewurl", "base_url = \"https://x.example\"  # mine\n");
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("savednewurl")).unwrap();
+    profile.base_url = Some("https://y.example".to_owned());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://y.example\"  # mine\n"
+    );
+}
+
+/// A logout's save judges an ignored `base_url` against the login state the
+/// file had before the save, so the typed line stays and the next load,
+/// with no store left, reads it.
+#[test]
+fn a_logout_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nlast_resort = true\n";
+    let path = raw_config("logoutkeep", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("logoutkeep")).unwrap();
+    assert_eq!(profile.base_url, None);
+    profile.credentials = None;
+    save_profile(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    assert_eq!(
+        load_profile(&ProfileName::from("logoutkeep"))
+            .unwrap()
+            .base_url
+            .as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A logout through the real action, then an unrelated toggle on the same
+/// in-memory profile, keeps the typed `base_url`: the profile follows the disk
+/// after the logout, so the toggle never reads the old ignore as a cleared URL.
+#[test]
+fn a_logout_then_a_toggle_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "lt",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    crate::testutil::register_names(&["lt"]);
+    let name = ProfileName::from("lt");
+    let mut config = load_config().unwrap();
+    crate::actions::clear_profile_credentials(&mut config, &name).unwrap();
+    let p = config.find_mut(&name).unwrap();
+    p.check_weekly = false;
+    save_profile_config(p).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\ncheck_weekly = false\n"
+    );
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A login over a live keyless `base_url` keeps the typed line: ignored while
+/// the login exists, live again once the store is gone.
+#[test]
+fn a_login_keeps_a_live_keyless_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"http://127.0.0.1:1234\"\nlast_resort = true\n";
+    let path = raw_config("loginkeep", body);
+    let name = ProfileName::from("loginkeep");
+    let mut profile = load_profile(&name).unwrap();
+    assert_eq!(profile.base_url.as_deref(), Some("http://127.0.0.1:1234"));
+    crate::lock::with_state_lock(|held| {
+        profile.set_credentials(Some(serde_json::from_str("{}").unwrap()), held);
+        Ok(())
+    })
+    .unwrap();
+    save_profile(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    assert_eq!(load_profile(&name).unwrap().base_url, None);
+    std::fs::remove_file(path.with_file_name("credentials.json")).unwrap();
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+}
+
+/// A login adopted in-process over a keyless live `base_url` routes the
+/// account to Anthropic for the rest of that process: switching away and back
+/// writes no `ANTHROPIC_BASE_URL`, as a fresh process would not.
+#[test]
+fn an_adopted_login_over_a_keyless_url_never_routes_to_it() {
+    let _home = HomeSandbox::new();
+    raw_config(
+        "e",
+        "base_url = 'http://127.0.0.1:1234'  # mine\nlast_resort = true\n",
+    );
+    let mut o = Profile::new("o".to_string(), None, None);
+    o.credentials = Some(
+        serde_json::from_str(
+            "{\"claudeAiOauth\":{\"accessToken\":\"oa\",\"refreshToken\":\"or\",\"expiresAt\":4102444800000}}",
+        )
+        .unwrap(),
+    );
+    save_profile(&o).unwrap();
+    crate::testutil::register_names(&["e", "o"]);
+    let mut state = load_app_state().unwrap();
+    state.active_profile = Some("e".into());
+    save_app_state(&state).unwrap();
+    let mut cfg = load_config().unwrap();
+    let e = ProfileName::from("e");
+    crate::testutil::write_live_creds(
+        &serde_json::from_str(
+            "{\"claudeAiOauth\":{\"accessToken\":\"ea\",\"refreshToken\":\"er\",\"expiresAt\":4102444800000}}",
+        )
+        .unwrap(),
+    );
+    crate::claude::adopt_first_login(&mut cfg, &e).unwrap();
+    assert_eq!(cfg.find(&e).unwrap().base_url, None);
+    crate::actions::switch_profile_locked(&mut cfg, &ProfileName::from("o")).unwrap();
+    crate::actions::switch_profile_locked(&mut cfg, &e).unwrap();
+    // A switch with nothing to apply creates no `settings.json`: absent reads
+    // as no `ANTHROPIC_BASE_URL`.
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(crate::claude::claude_settings_path().unwrap())
+            .unwrap_or_else(|_| "{}".to_owned()),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"].get("ANTHROPIC_BASE_URL"),
+        None,
+        "{settings}"
+    );
+}
+
+/// A peer process logging out between this process's load and its next
+/// config save never turns the toggle into a cleared URL: the typed line stays.
+#[test]
+fn a_toggle_after_a_peer_logout_keeps_the_typed_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "peerout",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    let cred = path.with_file_name("credentials.json");
+    std::fs::write(&cred, "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("peerout")).unwrap();
+    assert_eq!(profile.base_url, None);
+    std::fs::remove_file(&cred).unwrap();
+    profile.check_weekly = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\ncheck_weekly = false\n"
+    );
+}
+
+/// A fresh login profile created over a leftover dir resets the typed
+/// `base_url` like every other key: nothing of the orphan's endpoint survives.
+#[test]
+fn a_fresh_profile_over_a_leftover_dir_drops_its_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "orphan",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    let mut fresh = Profile::new("orphan".into(), None, None);
+    fresh.credentials = Some(serde_json::from_str("{}").unwrap());
+    save_profile(&fresh).unwrap();
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("base_url ="),
+        "{}",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::remove_file(path.with_file_name("credentials.json")).unwrap();
+    assert_eq!(
+        load_profile(&ProfileName::from("orphan")).unwrap().base_url,
+        None
+    );
+}
+
+/// A reauth through the real capture action over a keyless live URL keeps
+/// the typed line, and the in-memory profile reads it as hidden.
+#[test]
+fn a_reauth_keeps_a_live_keyless_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"http://127.0.0.1:1234\"\nlast_resort = true\n";
+    let path = raw_config("rk", body);
+    crate::testutil::register_names(&["rk"]);
+    let name = ProfileName::from("rk");
+    let mut config = load_config().unwrap();
+    let account = crate::testutil::profile_id("rk");
+    let after_claim = std::fs::read_to_string(&path).unwrap();
+    crate::actions::overwrite_captured_profile(
+        &mut config,
+        &name,
+        &account,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(
+                serde_json::from_str(
+                    "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"r\",\"expiresAt\":1}}",
+                )
+                .unwrap(),
+            ),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), after_claim);
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+}
+
+fn oauth_pair(tag: &str) -> ClaudeCredentials {
+    serde_json::from_str(&format!(
+        "{{\"claudeAiOauth\":{{\"accessToken\":\"{tag}a\",\"refreshToken\":\"{tag}r\",\"expiresAt\":4102444800000}}}}"
+    ))
+    .unwrap()
+}
+
+/// `settings.json`'s `env.ANTHROPIC_BASE_URL`, `None` when the file or key is
+/// absent.
+fn settings_base_url() -> Option<String> {
+    let raw = std::fs::read_to_string(crate::claude::claude_settings_path().unwrap())
+        .unwrap_or_else(|_| "{}".to_owned());
+    let settings: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    settings["env"]
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// Registers `names`, makes `active` the active profile, and loads the config.
+fn active_config(names: &[&str], active: &str) -> AppConfig {
+    crate::testutil::register_names(names);
+    let mut state = load_app_state().unwrap();
+    state.active_profile = Some(active.into());
+    save_app_state(&state).unwrap();
+    load_config().unwrap()
+}
+
+/// A second account `o` on its own OAuth pair, to switch away to and back.
+fn save_other_account() {
+    let mut o = Profile::new("o".to_string(), None, None);
+    crate::lock::with_state_lock(|held| {
+        o.set_credentials(Some(oauth_pair("o")), held);
+        Ok(())
+    })
+    .unwrap();
+    save_profile(&o).unwrap();
+}
+
+/// A capture whose snapshot carries a key and no URL replaces the stored
+/// endpoint as a pair: the hidden typed URL goes, and the key never reaches it.
+#[test]
+fn a_key_capture_replaces_a_hidden_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "h",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("h")).unwrap(),
+    )
+    .unwrap();
+    let mut config = active_config(&["h"], "h");
+    let name = ProfileName::from("h");
+    let account = crate::testutil::profile_id("h");
+    crate::actions::overwrite_captured_profile(
+        &mut config,
+        &name,
+        &account,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(oauth_pair("n")),
+            base_url: None,
+            api_key: Some("sk-ant-api03-livekey".into()),
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.lines().any(|l| l.starts_with("base_url")), "{body}");
+    assert!(
+        body.lines()
+            .any(|l| l == "api_key = \"sk-ant-api03-livekey\""),
+        "{body}"
+    );
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+    assert_eq!(settings_base_url(), None);
+    assert_eq!(load_profile(&name).unwrap().base_url, None);
+}
+
+/// Clearing the api key of a hybrid account (OAuth pair + key + URL) hides
+/// the URL in this process at once: a switch away and back routes the OAuth
+/// login to Anthropic, as a fresh process does.
+#[test]
+fn clearing_a_hybrids_key_hides_its_url_in_process() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "y",
+        "base_url = \"https://x.example\"  # mine\napi_key = \"sk-third-party\"\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("y")).unwrap(),
+    )
+    .unwrap();
+    save_other_account();
+    let mut config = active_config(&["y", "o"], "y");
+    let name = ProfileName::from("y");
+    crate::actions::clear_profile_api_key(&mut config, &name).unwrap();
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+    crate::actions::switch_profile_locked(&mut config, &ProfileName::from("o")).unwrap();
+    crate::actions::switch_profile_locked(&mut config, &name).unwrap();
+    assert_eq!(settings_base_url(), None);
+}
+
+/// An env inference token added beside a hidden URL makes it live in this
+/// process at once, as the next load reads it.
+#[test]
+fn an_env_token_beside_a_hidden_url_makes_it_live_in_process() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "h",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("h")).unwrap(),
+    )
+    .unwrap();
+    let mut config = active_config(&["h"], "h");
+    let name = ProfileName::from("h");
+    let mut env = config.find(&name).unwrap().env.clone();
+    env.insert("ANTHROPIC_API_KEY".into(), "sk-env-key".into());
+    crate::actions::edit_profile_env(&mut config, &name, |e| *e = env).unwrap();
+    assert_eq!(
+        config.find(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A capture into a new profile of an OAuth login pointed at a keyless URL
+/// writes the typed URL, as a capture over a leftover `config.toml` does: it
+/// is hidden under the login and live once the store is gone.
+#[test]
+fn a_capture_into_a_new_profile_keeps_its_keyless_url() {
+    let _home = HomeSandbox::new();
+    let mut config = load_config().unwrap();
+    crate::actions::capture_into_profile(
+        &mut config,
+        "cn".into(),
+        ModelSettings::default(),
+        crate::actions::CaptureSnapshot {
+            credentials: Some(oauth_pair("c")),
+            base_url: Some("http://127.0.0.1:1234".into()),
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    let name = ProfileName::from("cn");
+    let body = std::fs::read_to_string(profile_config_path(&name).unwrap()).unwrap();
+    assert!(
+        body.lines()
+            .any(|l| l == "base_url = \"http://127.0.0.1:1234\""),
+        "{body}"
+    );
+    std::fs::remove_file(profile_credentials_path(&name).unwrap()).unwrap();
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+}
+
+/// A preset that repoints an account, then one that clears its `base_url`,
+/// leaves no `base_url` line: the clear is the caller's edit, never a cue to
+/// write back the URL the login was hiding.
+#[test]
+fn a_preset_clear_after_a_repoint_never_restores_a_hidden_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "pr",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    crate::testutil::register_names(&["pr"]);
+    let name = ProfileName::from("pr");
+    let mut config = load_config().unwrap();
+    crate::actions::edit_profile_preset(
+        &mut config,
+        &name,
+        |url, models| {
+            *url = Some("https://y.example".to_owned());
+            *models = ModelSettings::default();
+            Ok(())
+        },
+    )
+    .unwrap();
+    crate::actions::edit_profile_preset(
+        &mut config,
+        &name,
+        |url, models| {
+            *url = None;
+            *models = ModelSettings::default();
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# mine\nlast_resort = true\n"
+    );
+}
+
+/// A console login over an ignored `[console]` table, then an endpoint move
+/// off Alibaba, drops the table: the move clears the session the login stored
+/// and never restores the table the load ignored.
+#[test]
+fn an_endpoint_move_after_a_console_login_drops_the_console_table() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "al",
+        "base_url = \"https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic\"\napi_key = \"sk-sp-k\"\n\n[console]\ntoken = \"\"\nsite = \"domestic\"\n",
+    );
+    crate::testutil::register_names(&["al"]);
+    let name = ProfileName::from("al");
+    let mut config = load_config().unwrap();
+    let account = crate::testutil::profile_id("al");
+    crate::actions::store_console_login(
+        &mut config,
+        &name,
+        &account,
+        ConsoleCredential {
+            token: "t".to_owned(),
+            site: ConsoleSite::default(),
+            region: "cn-beijing".to_owned(),
+        },
+    )
+    .unwrap();
+    crate::actions::edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://api.deepseek.com/anthropic".to_owned());
+        *key = Some("sk-k".to_owned());
+    })
+    .unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("[console]"), "{body}");
+    assert!(
+        body.lines()
+            .any(|l| l == "base_url = \"https://api.deepseek.com/anthropic\""),
+        "{body}"
+    );
+    assert!(body.lines().any(|l| l == "api_key = \"sk-k\""), "{body}");
+}
+
+/// A store torn after the load still counts as a login: a toggle keeps the
+/// ignored `base_url` instead of reading it as live and the in-memory `None`
+/// as a cleared URL.
+#[test]
+fn a_toggle_over_a_torn_store_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "torn",
+        "base_url = \"https://x.example\"  # mine\ncheck_weekly = false\n",
+    );
+    let cred = path.with_file_name("credentials.json");
+    std::fs::write(&cred, "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("torn")).unwrap();
+    assert_eq!(profile.base_url, None);
+    std::fs::write(&cred, "{\"claudeAiOauth\":").unwrap();
+    profile.check_weekly = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\n"
+    );
+}
+
+/// A save adding an api key beside an ignored `base_url` keeps the line, and
+/// the next load reads the URL as live: the key decides.
+#[test]
+fn a_save_adding_a_key_keeps_an_ignored_base_url_live() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "addkeylive",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("addkeylive")).unwrap();
+    assert_eq!(profile.base_url, None);
+    profile.api_key = Some("sk-ant-k".to_owned());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\napi_key = \"sk-ant-k\"\n"
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("addkeylive"))
+            .unwrap()
+            .base_url
+            .as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A load whose only drift is an ignored endpoint key returns before the
+/// state flock.
+#[test]
+fn a_load_over_an_ignored_endpoint_key_takes_no_flock() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "noflock",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let flocks = || crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get);
+    let before = flocks();
+    load_profile(&ProfileName::from("noflock")).unwrap();
+    assert_eq!(flocks() - before, 0, "the load took the state flock");
 }

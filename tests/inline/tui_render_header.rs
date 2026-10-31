@@ -42,6 +42,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -83,6 +84,7 @@ fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         None,
     )

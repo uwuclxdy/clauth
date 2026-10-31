@@ -6587,9 +6587,9 @@ impl ServerHandler for ClauthServer {
 ///
 /// Loads through [`load_config_without_rewrite`]: this answers `initialize` and
 /// `server/discover`, and the handshake never waits on the state flock — the
-/// rewrite path would for a profile whose `config.toml` does not round-trip,
-/// and a legacy `.pending` sidecar adoption would too, so the no-rewrite read
-/// answers lock-free and writes nothing.
+/// rewrite path would for a profile whose `config.toml` a full load normalizes
+/// (a non-canonical hand edit), and a legacy `.pending` sidecar adoption would
+/// too, so the no-rewrite read answers lock-free and writes nothing.
 fn build_instructions() -> String {
     let Ok(config) = load_config_without_rewrite() else {
         return "clauth manages multiple Claude Code accounts (\"profiles\"). \

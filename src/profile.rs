@@ -466,6 +466,41 @@ pub(crate) struct Profile {
     pub(crate) setup_token_digest: Option<u64>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
+    /// What `config.toml` typed for the endpoint keys the load derives, beside
+    /// the derived values as of the last load or credentials change; in memory
+    /// only. [`Profile::new`] and a struct literal hold `Default` (nothing
+    /// typed).
+    pub(crate) typed_endpoint: TypedEndpoint,
+}
+
+/// The endpoint keys as typed, beside what clauth derived from them. `base_url`
+/// is derived under the login state (`effective_base_url`), `[console]`
+/// through `console_credential`; a save writes the typed value back unless the
+/// caller moved the derived one off its snapshot, so a value clauth hid is
+/// never read as the caller's edit.
+#[derive(Clone, Default)]
+pub(crate) struct TypedEndpoint {
+    base_url: Option<String>,
+    console: ConsoleConfig,
+    derived_base_url: Option<String>,
+    derived_console: Option<ConsoleCredential>,
+}
+
+impl std::fmt::Debug for TypedEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The typed `[console]` token is a credential: only its presence prints.
+        f.debug_struct("TypedEndpoint")
+            .field("base_url", &self.base_url)
+            .field(
+                "console_token",
+                &self.console.token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("console_site", &self.console.site)
+            .field("console_region", &self.console.region)
+            .field("derived_base_url", &self.derived_base_url)
+            .field("derived_console", &self.derived_console)
+            .finish()
+    }
 }
 
 /// The one judgment behind both login reads — [`Profile::holds_login`] over
@@ -506,6 +541,7 @@ impl Profile {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider,
+            typed_endpoint: TypedEndpoint::default(),
         }
     }
 
@@ -649,13 +685,108 @@ impl Profile {
     /// the slot is read-modify-written cross-process, so an unlocked write can
     /// clobber a concurrent rotation. Any install or blanking replaces whatever
     /// bytes the disk held, so the unreadable-store fact clears with it.
+    ///
+    /// `base_url` follows the login state, so the store is written first and
+    /// then re-derived, the way the next load derives it: a login hides a
+    /// keyless URL and a logout makes it live, in memory as on disk.
     pub(crate) fn set_credentials(
         &mut self,
         credentials: Option<ClaudeCredentials>,
-        _held: &StateLockHeld,
+        held: &StateLockHeld,
     ) {
         self.unreadable_credentials_store = None;
-        self.credentials.set(credentials, _held);
+        self.credentials.set(credentials, held);
+        self.rederive_base_url();
+    }
+
+    /// Derive `base_url` and `provider` again from the typed value after a
+    /// change to what decides them — the login, `api_key`, `[env]` — the way
+    /// the next load derives them: a keyless URL under a login hides in memory
+    /// as on disk, and an inference token beside it makes it live again.
+    pub(crate) fn rederive_base_url(&mut self) {
+        self.fold_base_url_edit();
+        let base_url = self.derived_base_url(self.credentials.is_some());
+        if base_url != self.base_url {
+            self.provider = base_url.as_deref().and_then(Provider::from_base_url);
+        }
+        self.typed_endpoint.derived_base_url.clone_from(&base_url);
+        self.base_url = base_url;
+    }
+
+    /// Set `base_url` to the caller's own value. A value that differs from what
+    /// clauth derived becomes the typed value; one equal to it leaves the typed
+    /// value as it was, so re-committing a URL clauth hides keeps the line. A
+    /// caller replacing the endpoint outright wants
+    /// [`Profile::replace_base_url`].
+    pub(crate) fn set_base_url(&mut self, base_url: Option<String>) {
+        self.base_url = base_url;
+        self.fold_endpoint_edits();
+    }
+
+    /// Replace `base_url` with a value the caller states outright (a captured
+    /// endpoint): it becomes the typed value even where it equals the derived
+    /// one, so a snapshot carrying a key and no URL drops the stored host
+    /// instead of pairing its key with it.
+    pub(crate) fn replace_base_url(&mut self, base_url: Option<String>) {
+        self.set_base_url(base_url.clone());
+        self.typed_endpoint.base_url = base_url;
+    }
+
+    /// Set the console session to the caller's own value, as
+    /// [`Profile::set_base_url`] does for `base_url`.
+    pub(crate) fn set_console(&mut self, console: Option<ConsoleCredential>) {
+        self.console = console;
+        self.fold_endpoint_edits();
+    }
+
+    /// The `base_url` this profile routes to once its login state is
+    /// `has_credentials`, derived from what a save would write, the way the
+    /// next load derives it.
+    pub(crate) fn derived_base_url(&self, has_credentials: bool) -> Option<String> {
+        effective_base_url(
+            self.saved_base_url(),
+            has_credentials,
+            self.api_key.as_deref(),
+            &self.env,
+        )
+    }
+
+    /// The `base_url` a save writes: the in-memory value when the caller moved
+    /// it off the derived snapshot, else the typed one.
+    fn saved_base_url(&self) -> Option<String> {
+        if self.base_url == self.typed_endpoint.derived_base_url {
+            self.typed_endpoint.base_url.clone()
+        } else {
+            self.base_url.clone()
+        }
+    }
+
+    /// The `[console]` table a save writes, by the same rule as
+    /// [`Profile::saved_base_url`].
+    fn saved_console(&self) -> ConsoleConfig {
+        if self.console == self.typed_endpoint.derived_console {
+            self.typed_endpoint.console.clone()
+        } else {
+            console_config(self.console.as_ref())
+        }
+    }
+
+    /// Make a caller's edit of `base_url` the typed value and its new snapshot.
+    fn fold_base_url_edit(&mut self) {
+        self.typed_endpoint.base_url = self.saved_base_url();
+        self.typed_endpoint
+            .derived_base_url
+            .clone_from(&self.base_url);
+    }
+
+    /// Make a caller's edit of an endpoint key the typed value and its new
+    /// snapshot.
+    fn fold_endpoint_edits(&mut self) {
+        self.fold_base_url_edit();
+        self.typed_endpoint.console = self.saved_console();
+        self.typed_endpoint
+            .derived_console
+            .clone_from(&self.console);
     }
 }
 
@@ -1863,7 +1994,7 @@ impl std::fmt::Debug for ConsoleCredential {
 /// On-disk `[console]` table. Every field is optional so an absent table, a
 /// half-filled one, and a hand-edited one all parse; [`load_profile`]
 /// normalizes it into an `Option<ConsoleCredential>` at the load boundary.
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct ConsoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -4163,10 +4294,9 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
 /// [`load_profile`]'s read-only form, used by the shared swap-target check and
 /// the `clauth mcp` handshake: the same read, but never through
 /// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
-/// write-through, both of which take the state flock — a `config.toml` whose
-/// canonical render does not parse back is left as it is, and an adoptable
-/// sidecar is answered from memory and left for the next ordinary load to
-/// land.
+/// write-through, both of which take the state flock — a `config.toml` a full
+/// load would normalize is left as it is, and an adoptable sidecar is answered
+/// from memory and left for the next ordinary load to land.
 pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, false)
 }
@@ -4495,13 +4625,20 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
     };
 
     let base_url = effective_base_url(
-        config.base_url,
+        config.base_url.clone(),
         credentials.is_some() || unreadable_credentials_store.is_some(),
         config.api_key.as_deref(),
         &config.env,
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
+    let console = console_credential(&config.console);
+    let typed_endpoint = TypedEndpoint {
+        base_url: config.base_url,
+        console: config.console,
+        derived_base_url: base_url.clone(),
+        derived_console: console.clone(),
+    };
 
     let profile = Profile {
         name: name.clone(),
@@ -4540,13 +4677,14 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         check_credit_cap: config.check_credit_cap.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
-        console: console_credential(&config.console),
+        console,
         credentials: slot(credentials),
         has_long_lived_sidecar: crate::claude::has_session_token(name),
         unreadable_credentials_store,
         setup_token_digest: crate::claude::installed_session_token(name)
             .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
+        typed_endpoint,
     };
 
     (profile, config_path, raw_config)
@@ -4554,10 +4692,13 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
 
 /// The canonical typed [`ProfileConfig`] for a loaded [`Profile`] — what the
 /// save writer persists and what the load's drift comparison compares against.
-/// One construction, so the two paths cannot drift.
+/// One construction, so the two paths cannot drift. The endpoint keys clauth
+/// derives at load go back as typed unless the caller moved them
+/// ([`Profile::saved_base_url`]), so a freshly loaded profile is canonical in
+/// them and the load never edits one.
 fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
     ProfileConfig {
-        base_url: profile.base_url.clone(),
+        base_url: profile.saved_base_url(),
         api_key: profile.api_key.clone(),
         auto_start: profile.auto_start,
         usage_probe: profile.usage_probe,
@@ -4582,43 +4723,51 @@ fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
         check_credit_cap: (!profile.check_credit_cap).then_some(false),
         bell_threshold: profile.bell_threshold,
         disabled: profile.disabled,
-        console: console_config(profile.console.as_ref()),
+        console: profile.saved_console(),
     }
 }
 
-/// Rewrite config.toml only when the canonical render of the loaded profile does
-/// not parse back to it. The parsed comparison never reads the raw file: a hand
-/// edit that parses stays on disk as written until the next save, so the TUI's
-/// reload on every state-file change never touches disk. A render that does not
-/// parse is compared byte-wise against the raw file instead.
+/// The normalizing write of a full load: when the raw file's typed
+/// [`ProfileConfig`] differs from the canonical form derived from the loaded
+/// [`Profile`], edit the file in place to the canonical value of only the keys
+/// that differ. The comparison is typed-vs-typed, never raw bytes or a
+/// `toml::Value` table, so an unmodelled key, a comment, a blank line, the key
+/// order and the `kick_timer` alias never trigger a write. The
+/// read-compare-write runs under the state flock and re-reads `config.toml`
+/// inside it, writing only if still different, so a peer write landing between
+/// the pre-flock read and the flock is never overwritten by a stale edit. The
+/// write never fails the load: an edit the writer refuses loads with the
+/// normalized in-memory value and writes nothing.
 fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
-    let rendered = render_config_toml(profile);
-    let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
-        Ok(canonical) => canonical != canonical_profile_config(profile),
-        Err(_) => raw_config != rendered,
-    };
-    if needs_rewrite {
-        let _ = with_state_lock(|_held| {
-            // The render came from a read taken before this hold: write it only
-            // while the file still holds what that read saw, so a peer's write
-            // landed in between is never rewound. The next load renders it.
-            let now = match std::fs::read_to_string(config_path) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(_) => return Ok(()),
-            };
-            if now != raw_config {
-                return Ok(());
-            }
-            // Read under the hold: a claim may have minted one since the load.
-            let id = profile_id_at(config_path);
-            // config.toml can carry `api_key` — same 0600 rule as save_profile.
-            let rendered =
-                preserving_config_render(&with_profile_id(rendered, id.as_ref()), config_path);
-            let _ = atomic_write_600(config_path, &rendered);
-            Ok(())
-        });
+    if on_disk_profile_config(raw_config)
+        .is_ok_and(|on_disk| on_disk == canonical_profile_config(profile))
+    {
+        return;
     }
+    let name = profile.name.clone();
+    let _ = with_state_lock(|_held| {
+        // Re-read and re-parse under the flock, then re-derive the canonical
+        // diff against the fresh bytes and write only if STILL different.
+        let Ok(source) = read_profile_source(&name) else {
+            return Ok(());
+        };
+        let (fresh_profile, _, fresh_raw) = build_profile(&name, source);
+        if on_disk_profile_config(&fresh_raw)
+            .is_ok_and(|on_disk| on_disk == canonical_profile_config(&fresh_profile))
+        {
+            return Ok(());
+        }
+        // An edit the writer refuses (a non-plain or unreadable shape) is a
+        // no-op for the load: the value is already normalized in memory.
+        let _ = edit_existing_config_toml(
+            config_path,
+            &fresh_raw,
+            &fresh_profile,
+            ConfigEditMode::Load,
+            None,
+        );
+        Ok(())
+    });
 }
 
 /// Serialize `creds` for the profile store at `cred_path`, re-attaching every
@@ -5016,15 +5165,37 @@ fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> 
             return Err(e).with_context(|| format!("failed to read {}/config.toml", profile.name));
         }
     };
+    edit_existing_config_toml(&config_path, &raw, profile, ConfigEditMode::Save, id)
+}
+
+/// Which edit step a config write runs: the save writes every drifted key; the
+/// load comments out a tuning value it ignores outright.
+#[derive(Clone, Copy)]
+enum ConfigEditMode {
+    Save,
+    Load,
+}
+
+/// The read-edit-write core of a config write over a file that already exists:
+/// parse, refuse a non-plain or unreadable shape, apply the edit step, and
+/// write atomically (a CRLF file stays CRLF). Shared by the save writer and the
+/// normalizing load so the two cannot drift.
+fn edit_existing_config_toml(
+    config_path: &Path,
+    raw: &str,
+    profile: &Profile,
+    mode: ConfigEditMode,
+    id: Option<&ProfileId>,
+) -> Result<()> {
     let lf = raw.replace("\r\n", "\n");
     let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
         // A file that is not TOML refuses with the load's own parse error: the
         // user's bytes are never replaced by the template, and the position
         // rides on a typed error the rollback warning names without matching
         // text.
-        return Err(ConfigParseRefusal::new(profile.name.as_str(), &raw).into());
+        return Err(ConfigParseRefusal::new(profile.name.as_str(), raw).into());
     };
-    let on_disk = on_disk_profile_config(&raw);
+    let on_disk = on_disk_profile_config(raw);
     let canonical = canonical_profile_config(profile);
     if let Some(key) = non_plain_edit(&doc, on_disk.as_ref().ok(), &canonical) {
         return Err(ConfigEditRefusal::new(profile.name.as_str(), key).into());
@@ -5036,11 +5207,11 @@ fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> 
         Err(e) => {
             return Err(crate::format::parse_error(
                 format!("{}/config.toml", profile.name),
-                crate::format::toml_parse_position(&raw, &e),
+                crate::format::toml_parse_position(raw, &e),
             ));
         }
     };
-    apply_config_edits(&mut doc, &on_disk, &canonical);
+    apply_config_edits(&mut doc, &on_disk, &canonical, mode);
     if let Some(id) = id
         && doc.get("id").and_then(|v| v.as_str()) != Some(id.0.as_str())
     {
@@ -5054,7 +5225,13 @@ fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> 
         // blanket replace writes a bare `\r` the file no longer parses.
         out = out.replace("\r\n", "\n").replace('\n', "\r\n");
     }
-    atomic_write_600(&config_path, out).context("failed to write config.toml")
+    // A load whose edit leaves the bytes unchanged writes nothing: an edit that
+    // computes the same bytes as the raw file is a no-op, not a rewrite that
+    // bumps the mtime and flips the reload fingerprint.
+    if matches!(mode, ConfigEditMode::Load) && out == raw {
+        return Ok(());
+    }
+    atomic_write_600(config_path, out).context("failed to write config.toml")
 }
 
 /// `rendered` with `id = "…"` as its first key, under the header comment.
@@ -5197,86 +5374,6 @@ pub(crate) fn write_profile_credentials(
         None => {}
     }
     Ok(())
-}
-
-/// `render_config_toml`'s output with every key the config already holds that
-/// `ProfileConfig` does not model re-attached under a marker — the
-/// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
-/// states for the credential store. The writers that put such keys there are
-/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
-/// `fallback_threshold` ancestors were themselves once new keys) and an
-/// operator's hand-edit; deleting them on every config mutation (issue #75's
-/// `clauth disable` erasure) loses data no other writer holds.
-///
-/// "Modelled" is decided by round-tripping the ON-DISK file through
-/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
-/// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
-/// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. The same three
-/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
-/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
-/// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
-/// them does not add write thrash.
-pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return rendered.to_string(); // no file yet: nothing to preserve
-    };
-    let Ok(disk) = raw.parse::<toml::Table>() else {
-        return rendered.to_string(); // unparseable: not ours to resurrect keys from
-    };
-    let Ok((modelled, modelled_nested)) = modelled_config_shape(&raw) else {
-        // Same refusal as the profiles.toml carry: an unparseable config
-        // cannot be classified, and carrying everything would duplicate the
-        // modelled keys already in the render — a duplicate top-level key is
-        // a hard parse error on the next load.
-        return rendered.to_string();
-    };
-    // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
-        return rendered.to_string(); // a render that does not parse: merge nothing
-    };
-    let baseline = parsed_as::<ProfileConfig>(rendered);
-    let merged = nested_carry_if_inert::<ProfileConfig>(
-        rendered.to_string(),
-        baseline.as_deref(),
-        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
-    );
-    let carried: Vec<(String, toml::Value)> = disk
-        .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| {
-            carry_is_inert::<ProfileConfig>(baseline.as_deref(), &rendered_table, k, v)
-        })
-        .collect();
-    if carried.is_empty() {
-        return merged; // the common case
-    }
-    merge_carried_keys(merged, &carried)
-}
-
-/// What `ProfileConfig` holds, derived by round-tripping `raw` through the
-/// type: the top-level keys it recognizes, plus the sub-keys of every modelled
-/// table — the same derivation [`modelled_state_shape`] runs for
-/// `profiles.toml`, so a future sub-key inside a modelled table is recognized
-/// as unmodelled rather than silently deleted. Err on a file that does not
-/// parse as `ProfileConfig` — the caller must refuse to carry rather than
-/// guess.
-fn modelled_config_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
-    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
-    toml::to_string(&config)
-        .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|table| {
-            let nested = table
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_table()
-                        .map(|t| (k.clone(), t.keys().cloned().collect()))
-                })
-                .collect();
-            (table.keys().cloned().collect(), nested)
-        })
-        .ok_or(())
 }
 
 /// Write a legacy `credentials.json.pending` sidecar the way a binary predating
@@ -5745,7 +5842,7 @@ fn render_config_toml(profile: &Profile) -> String {
     let mut out = String::from("# clauth profile configuration\n\n");
 
     push_scalar_doc(&mut out, "base_url");
-    match profile.base_url.as_deref() {
+    match profile.saved_base_url().as_deref() {
         Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
         None => out.push_str(scalar_example("base_url")),
     }
@@ -6422,6 +6519,14 @@ fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
         prepend_to_first_leaf(t, prefix);
         return;
     }
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_implicit())
+    {
+        prepend_to_first_header(t, prefix);
+        return;
+    }
     if doc.get(key).is_some_and(|i| i.as_table().is_some()) {
         if let Some(tm) = doc.get_mut(key).and_then(|i| i.as_table_mut()) {
             let existing = tm
@@ -6442,6 +6547,52 @@ fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
         km.leaf_decor_mut()
             .set_prefix(format!("{prefix}{existing}"));
     }
+}
+
+/// The document position of the first header `item` renders: its own for a
+/// header table, its first element's for an array of tables, and its earliest
+/// child's for an implicit table, which renders no header of its own.
+fn first_header_position(item: &toml_edit::Item) -> Option<isize> {
+    match item {
+        toml_edit::Item::Table(t) if t.is_implicit() => {
+            t.iter().filter_map(|(_, c)| first_header_position(c)).min()
+        }
+        toml_edit::Item::Table(t) => t.position(),
+        toml_edit::Item::ArrayOfTables(a) => a.get(0).and_then(toml_edit::Table::position),
+        _ => None,
+    }
+}
+
+/// An implicit table (`foo` of `[foo.bar]`) renders no decor of its own, so a
+/// comment moved onto it goes on the first header rendered beneath it.
+fn prepend_to_first_header(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t
+        .iter()
+        .filter_map(|(k, c)| first_header_position(c).map(|p| (p, k.to_string())))
+        .min()
+        .map(|(_, k)| k)
+    else {
+        return;
+    };
+    let target = match t.get_mut(&first) {
+        Some(toml_edit::Item::Table(c)) if c.is_implicit() => {
+            prepend_to_first_header(c, prefix);
+            return;
+        }
+        Some(toml_edit::Item::Table(c)) => c,
+        Some(toml_edit::Item::ArrayOfTables(a)) => match a.get_mut(0) {
+            Some(c) => c,
+            None => return,
+        },
+        _ => return,
+    };
+    let existing = target
+        .decor()
+        .prefix()
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    target.decor_mut().set_prefix(format!("{prefix}{existing}"));
 }
 
 /// A dotted line (`env.A = "b"`) renders the prefix of its first leaf key,
@@ -7009,14 +7160,19 @@ fn non_plain_edit(
     None
 }
 
+/// The one per-key edit list both writes share, so a key added here reaches the
+/// save and the load alike. The mode picks the arms that differ: the load
+/// comments out a threshold it ignores and keeps a typo'd weekday's line.
 fn apply_config_edits(
     doc: &mut toml_edit::DocumentMut,
     on_disk: &ProfileConfig,
     canonical: &ProfileConfig,
+    mode: ConfigEditMode,
 ) {
     let od = on_disk;
     edit_string_scalar(doc, &od.base_url, &canonical.base_url, "base_url");
     edit_string_scalar(doc, &od.api_key, &canonical.api_key, "api_key");
+    edit_console(doc, &od.console, &canonical.console);
     if od.auto_start != canonical.auto_start {
         if doc.contains_key("kick_timer") {
             remove_key_keeping_comments(doc, "kick_timer", &[], "");
@@ -7027,29 +7183,54 @@ fn apply_config_edits(
             unset_scalar(doc, "auto_start");
         }
     }
-    edit_f64_scalar(
-        doc,
-        od.fallback_threshold,
-        canonical.fallback_threshold,
-        "fallback_threshold",
-    );
-    edit_f64_scalar(
-        doc,
-        od.weekly_threshold,
-        canonical.weekly_threshold,
-        "weekly_threshold",
-    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_f64_scalar(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_threshold_load(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+    }
     edit_bool_scalar(doc, od.last_resort, canonical.last_resort, "last_resort");
     edit_bool_scalar(doc, od.preferred, canonical.preferred, "preferred");
-    if od.preferred_days != canonical.preferred_days {
-        if canonical.preferred_days.is_empty() {
-            unset_scalar(doc, "preferred_days");
-        } else {
-            set_scalar(
-                doc,
-                "preferred_days",
-                preferred_days_value(&canonical.preferred_days),
-            );
+    match mode {
+        ConfigEditMode::Save => {
+            if od.preferred_days != canonical.preferred_days {
+                if canonical.preferred_days.is_empty() {
+                    unset_scalar(doc, "preferred_days");
+                } else {
+                    set_scalar(
+                        doc,
+                        "preferred_days",
+                        preferred_days_value(&canonical.preferred_days),
+                    );
+                }
+            }
+        }
+        ConfigEditMode::Load => {
+            edit_preferred_days_load(doc, &od.preferred_days, &canonical.preferred_days);
         }
     }
     edit_bool_scalar(
@@ -7072,16 +7253,142 @@ fn apply_config_edits(
         canonical.check_credit_cap,
         "check_credit_cap",
     );
-    edit_f64_scalar(
-        doc,
-        od.bell_threshold,
-        canonical.bell_threshold,
-        "bell_threshold",
-    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+    }
     edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
-    edit_console(doc, &od.console, &canonical.console);
     edit_models(doc, &od.models, &canonical.models);
     edit_env(doc, &od.env, &canonical.env);
+}
+
+/// A threshold the load clamps is written clamped; one it ignores outright (a
+/// non-finite value, or a `weekly_threshold` outside 0..=100) is commented out
+/// in place.
+fn edit_threshold_load(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<f64>,
+    ca: Option<f64>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_none() {
+        comment_out_scalar(doc, key);
+    } else {
+        edit_f64_scalar(doc, od, ca, key);
+    }
+}
+
+/// A typo'd weekday keeps the whole typed line commented above the fixed list;
+/// any other drift (a case or duplicate spelling) is written in place.
+fn edit_preferred_days_load(doc: &mut toml_edit::DocumentMut, od: &[String], ca: &[String]) {
+    if od == ca {
+        return;
+    }
+    if has_typoed_weekday(od) {
+        if ca.is_empty() {
+            comment_out_scalar(doc, "preferred_days");
+        } else {
+            comment_out_and_set_preferred_days(doc, preferred_days_value(ca));
+        }
+    } else if ca.is_empty() {
+        unset_scalar(doc, "preferred_days");
+    } else {
+        set_scalar(doc, "preferred_days", preferred_days_value(ca));
+    }
+}
+
+/// Whether an entry of the on-disk weekday list does not parse: the load drops
+/// it, so the line is commented out rather than rewritten in place.
+fn has_typoed_weekday(raw: &[String]) -> bool {
+    raw.iter().any(|e| e.trim().parse::<Weekday>().is_err())
+}
+
+/// Comment a modelled scalar out in place: the key's own line becomes `# ` plus
+/// the line's text (key, separator, value, trailing comment), its leading
+/// comments stay, and the key is removed so the file stops claiming the value.
+fn comment_out_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    let Some((kept, next)) = take_comment_out_line(doc, key) else {
+        return;
+    };
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+/// Remove `key`, returning the text that replaces it in place — its leading
+/// comments (the doc block) followed by its own line commented out — plus the
+/// next root key, if any, the caller places the text before.
+fn take_comment_out_line(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+) -> Option<(String, Option<String>)> {
+    let (lead, comment, next) = {
+        let table = doc.as_table();
+        let (k, item) = table.get_key_value(key)?;
+        let v = item.as_value()?;
+        let lead = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        // The key's own line text: the key name, its separator suffix, the `=`,
+        // then the value's own rendered text. `Value`'s `Display` already
+        // carries its decor (the separator space and any trailing comment), so
+        // what was typed stays visible byte for byte.
+        let key_suffix = k
+            .leaf_decor()
+            .suffix()
+            .and_then(|r| r.as_str())
+            .unwrap_or(" ");
+        let comment = format!("# {}{}={}", k, key_suffix, v);
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        let next = keys
+            .iter()
+            .position(|x| x == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned();
+        (lead, comment, next)
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    kept.push_str(&comment);
+    kept.push('\n');
+    Some((kept, next))
+}
+
+/// A typo'd `preferred_days` with some valid entries: the typed line stays as a
+/// comment above the fixed list, which becomes the key where the typed line was.
+fn comment_out_and_set_preferred_days(doc: &mut toml_edit::DocumentMut, value: toml_edit::Value) {
+    let Some((kept, next)) = take_comment_out_line(doc, "preferred_days") else {
+        return;
+    };
+    match next {
+        Some(next_key) => {
+            insert_root_value_before(doc, &next_key, "preferred_days", value, Some(kept));
+        }
+        None => insert_root_value(doc, "preferred_days", value, Some(kept)),
+    }
 }
 
 #[cfg(test)]

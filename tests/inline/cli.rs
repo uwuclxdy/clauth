@@ -2472,10 +2472,10 @@ mod api_key_helper_tests {
     }
 
     /// The helper never rewrites `config.toml`, and never lands a legacy
-    /// `.pending` sidecar: it reads the config alone. Residual: no valid
-    /// `config.toml` makes a full load rewrite it anymore (the render
-    /// round-trips), so the closing `load_profile` control observes the sidecar
-    /// write-through a full load still does, never a config rewrite.
+    /// `.pending` sidecar: it reads the config alone. The closing `load_profile`
+    /// is the control: a non-canonical hand edit (`check_weekly = true`) makes a
+    /// full load normalize it away, and the adoptable sidecar makes it land as
+    /// `credentials.json`, so both no-rewrite assertions stay armed.
     #[test]
     fn api_key_for_profile_never_rewrites_config_toml() {
         let _home = HomeSandbox::new();
@@ -2483,7 +2483,7 @@ mod api_key_helper_tests {
         let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
             .expect("profile dir");
         let config = dir.join("config.toml");
-        let raw = "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n";
+        let raw = "api_key = \"sk-test-12345\"\ncheck_weekly = true\n";
         std::fs::write(&config, raw).expect("write config");
         // An adoptable legacy `.pending` sidecar (no `credentials.json` to be
         // newer than): a full load takes the state flock and writes it through.
@@ -2508,6 +2508,11 @@ mod api_key_helper_tests {
             "the helper leaves the sidecar"
         );
         let _ = crate::profile::load_profile(&crate::profile::ProfileName::from("acme"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("re-read config after the control load"),
+            "api_key = \"sk-test-12345\"\n",
+            "control: a full profile load normalizes the hand edit away"
+        );
         assert!(
             dir.join("credentials.json").exists(),
             "control: a full profile load still lands the sidecar"

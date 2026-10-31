@@ -27017,8 +27017,9 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
 /// `AppConfig` directly (`app.config()`), so the flag renders next frame with
 /// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
-/// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
-/// `config.toml` write doesn't bump the mtime the periodic reload watches.
+/// `is_disabled`) the same way `toggle_auto_start` does — the per-profile
+/// `config.toml` write flips the reload fingerprint (it folds `config.toml`
+/// mtime), and the rebuild lands now rather than on the next reload.
 fn toggle_profile_disabled(app: &mut App, name: &ProfileName, direction: DisableDirection) {
     let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
     if gated {
@@ -27085,11 +27086,12 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
         ),
         Outcome::Saved(_now_on) => {
             // Rebuild the scheduler's token snapshot so the new `auto_start` flag
-            // reaches the fetch leg's window-lapsed gate. The per-profile
-            // config.toml write doesn't bump the profiles.toml mtime that
-            // `reload_if_state_changed` watches, so without this the toggle would
-            // lag until the next unrelated snapshot rebuild. The periodic tick
-            // then opens a window if this profile now lacks a live one.
+            // reaches the fetch leg's window-lapsed gate this frame. The
+            // per-profile config.toml write flips the reload fingerprint (it
+            // folds config.toml mtime), so the periodic reload would rebuild
+            // the snapshot anyway — this just does not wait for it. The
+            // periodic tick then opens a window if this profile now lacks a
+            // live one.
             app.refresh_tokens();
         }
         Outcome::SaveFailed(e) => {

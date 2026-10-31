@@ -192,6 +192,7 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         status,
     )

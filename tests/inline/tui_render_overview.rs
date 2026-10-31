@@ -305,6 +305,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
     )
@@ -369,6 +370,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: Some(crate::providers::Provider::DeepSeek),
+            typed_endpoint: Default::default(),
         },
         snap_with_stats(ReadingsSnapshot::default(), name, stats),
     )
@@ -446,6 +448,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
@@ -1303,6 +1306,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         ReadingsSnapshot::default(),
     )

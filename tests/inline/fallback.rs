@@ -114,6 +114,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
         },
         usage,
         fresh: false,

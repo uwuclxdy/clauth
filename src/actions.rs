@@ -1614,7 +1614,14 @@ pub(crate) fn edit_profile_endpoint(
         // copy moves only once the save landed, so a failed save leaves memory
         // matching disk.
         let (fresh, plan) = update_profile_config(name, |fresh| {
+            let old_api_key = fresh.api_key.clone();
             edit(&mut fresh.base_url, &mut fresh.api_key);
+            let base_url = fresh.base_url.clone();
+            fresh.set_base_url(base_url);
+            let key_moved = old_api_key != fresh.api_key;
+            if key_moved {
+                fresh.rederive_base_url();
+            }
             // Re-derive the provider — the in-memory config is authoritative
             // until the next disk reload, so a stale value here would keep (or
             // block) third-party fetches against the wrong endpoint.
@@ -1630,7 +1637,7 @@ pub(crate) fn edit_profile_endpoint(
             // still the right one, and a genuinely wrong site answers
             // `AuthExpired`, which is visible and one re-login from fixed.
             if provider != Some(crate::providers::Provider::Alibaba) {
-                fresh.console = None;
+                fresh.set_console(None);
             }
             fresh.provider = provider;
             let plan = endpoint_identity_plan(
@@ -1654,6 +1661,7 @@ pub(crate) fn edit_profile_endpoint(
             profile.api_key = fresh.api_key.clone();
             profile.console = fresh.console.clone();
             profile.provider = fresh.provider;
+            profile.typed_endpoint = fresh.typed_endpoint.clone();
         }
 
         if active {
@@ -1698,7 +1706,7 @@ pub(crate) fn store_console_login(
             if fresh.console_login_target().map(|(site, _)| site) != Some(console.site) {
                 bail!("'{name}' no longer points at the console this session came from");
             }
-            fresh.console = Some(console);
+            fresh.set_console(Some(console));
             let after = third_party_identity(
                 fresh.provider,
                 fresh.api_key.as_deref(),
@@ -1716,6 +1724,7 @@ pub(crate) fn store_console_login(
         note_forget_plan(name, plan);
         if let Some(profile) = config.find_mut(name) {
             profile.console = fresh.console;
+            profile.typed_endpoint = fresh.typed_endpoint.clone();
         }
         Ok(())
     })
@@ -1837,6 +1846,8 @@ pub(crate) fn edit_profile_preset(
         let before = read_before_identities(name);
         let (fresh, plan) = update_profile_config(name, |fresh| {
             apply(&mut fresh.base_url, &mut fresh.models)?;
+            let base_url = fresh.base_url.clone();
+            fresh.set_base_url(base_url);
             // Re-derive the provider exactly like `edit_profile_endpoint`: a
             // stale value here keeps (or blocks) third-party fetches against
             // the wrong endpoint. The api_key is unchanged, so only a moved
@@ -1863,6 +1874,7 @@ pub(crate) fn edit_profile_preset(
             profile.base_url = fresh.base_url.clone();
             profile.models = fresh.models.clone();
             profile.provider = fresh.provider;
+            profile.typed_endpoint = fresh.typed_endpoint.clone();
         }
 
         if active {
@@ -1975,6 +1987,9 @@ pub(crate) fn edit_profile_env(
             // the user's.
             let disk_before = fresh.env.clone();
             edit(&mut fresh.env);
+            // An env token is inference auth, so it decides `base_url` as the
+            // login does; the next load derives it, and memory has to agree.
+            fresh.rederive_base_url();
             let after_throughput = throughput_for_endpoint(
                 &before.oauth,
                 fresh.base_url.as_deref(),
@@ -1995,7 +2010,13 @@ pub(crate) fn edit_profile_env(
         // or the one this process last stamped.
         let memory_before = config
             .find_mut(name)
-            .map(|profile| std::mem::replace(&mut profile.env, fresh.env.clone()))
+            .map(|profile| {
+                let before = std::mem::replace(&mut profile.env, fresh.env.clone());
+                profile.base_url = fresh.base_url.clone();
+                profile.provider = fresh.provider;
+                profile.typed_endpoint = fresh.typed_endpoint.clone();
+                before
+            })
             .unwrap_or_default();
 
         if active {
@@ -4743,22 +4764,28 @@ pub(crate) fn overwrite_captured_profile_held(
             // vendor's stored key with another vendor's incoming host — a
             // live-read snapshot (the divergence adopt) can fill either field
             // alone — and that key then travels to a host it does not belong to.
-            let keep_stored_endpoint = base_url.is_none()
-                && api_key.is_none()
-                && crate::claude::has_own_inference_endpoint(profile);
-            let (base_url, api_key) = if keep_stored_endpoint {
-                (profile.base_url.clone(), profile.api_key.clone())
-            } else {
-                (base_url, api_key)
-            };
+            let carries_endpoint = base_url.is_some() || api_key.is_some();
+            let keep_stored_endpoint =
+                !carries_endpoint && crate::claude::has_own_inference_endpoint(profile);
+            if !keep_stored_endpoint {
+                // A snapshot carrying an endpoint replaces the stored one as a
+                // pair: a key with no URL drops the hidden URL instead of pairing
+                // that key with the stored host. A snapshot carrying neither keeps
+                // the typed URL, so a login hides a keyless one rather than
+                // deleting it.
+                if carries_endpoint {
+                    profile.replace_base_url(base_url);
+                }
+                profile.api_key = api_key;
+            }
+            // The `base_url` the login lands, the one `set_credentials` derives.
+            let base_url = profile.derived_base_url(credentials.is_some());
             let provider = base_url.as_deref().and_then(Provider::from_base_url);
-            profile.base_url = base_url;
-            profile.api_key = api_key;
             profile.provider = provider;
             // Same rule as `edit_profile_endpoint`: a reauth replaces the
             // credential set, and the console session is one of them.
             if provider != Some(Provider::Alibaba) {
-                profile.console = None;
+                profile.set_console(None);
             }
             // The changed halves, from the values about to be written. The
             // OAuth identity follows the anchor action: a proven re-login
@@ -4778,7 +4805,7 @@ pub(crate) fn overwrite_captured_profile_held(
                 &before,
                 &after_oauth,
                 &StoredEndpointIdentity {
-                    base_url: profile.base_url.clone(),
+                    base_url,
                     api_key: profile.api_key.clone(),
                     console: profile.console.clone(),
                     env: profile.env.clone(),
@@ -4836,6 +4863,7 @@ pub(crate) fn overwrite_captured_profile_held(
             profile.api_key = fresh.api_key.clone();
             profile.provider = fresh.provider;
             profile.console = fresh.console.clone();
+            profile.typed_endpoint = fresh.typed_endpoint.clone();
             profile.set_credentials(fresh.credentials.clone().into_inner(), held);
         }
 
