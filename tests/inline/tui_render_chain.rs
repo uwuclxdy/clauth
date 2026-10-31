@@ -3588,6 +3588,7 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
         "re-login with clauth login a",
         "clauth login a",
         false,
+        crate::tui::theme::faint(),
     );
 
     let row = FALLBACK_ROWS
@@ -3614,12 +3615,24 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     let (plain, _readings) =
         config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let card = |day_picker: Option<usize>| card_of(&plain, day_picker);
-    assert_prose_part(&card(None), "· ↵ picks days one by one", "↵", true);
+    assert_prose_part(
+        &card(None),
+        "· ↵ picks days one by one",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
 
     let (mut dead, dead_readings) = profile("a", 95.0, 20.0, 3600);
     dead.disabled = true;
     let (dead, _readings) = config_with(vec![(dead, dead_readings)], Some("other"), vec!["a"]);
-    assert_prose_part(&card_of(&dead, None), "disabled · ↵ picks days", "↵", true);
+    assert_prose_part(
+        &card_of(&dead, None),
+        "disabled · ↵ picks days",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
 
     let (mut shared, shared_readings) = profile("a", 95.0, 20.0, 3600);
     shared.preferred_days = vec![chrono::Weekday::Sat];
@@ -3630,7 +3643,13 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
         Some("a"),
         vec!["a", "b"],
     );
-    assert_prose_part(&card_of(&shared, None), "first · ↵ picks days", "↵", true);
+    assert_prose_part(
+        &card_of(&shared, None),
+        "first · ↵ picks days",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
     let picking = card(Some(0));
     for (phrase, part) in [
         ("← → walk", "← →"),
@@ -3638,7 +3657,7 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
         ("· ↵ esc done", "↵ esc"),
         ("· ↑ ↓ leave", "↑ ↓"),
     ] {
-        assert_prose_part(&picking, phrase, part, true);
+        assert_prose_part(&picking, phrase, part, true, crate::tui::theme::faint());
     }
 }
 

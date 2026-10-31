@@ -1599,6 +1599,17 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 
 const GAUGE_W: usize = 12;
 
+/// The cells a wrapped line may fill inside a pane: the exact budget whenever
+/// there is one, so no row wraps past the pane edge (the detail `Paragraph`
+/// has no `Wrap`, so an over-wide row is cut with no mark). A zero budget —
+/// the chip and its lead alone overrunning the pane, or no pane at all — takes
+/// the sibling hint wrappers' 8-cell floor (panes.rs rail and tooltip legs,
+/// status.rs, services.rs): nothing there can render, so the floor only bounds
+/// the row count `chain_panel_height` reads.
+fn wrap_budget(budget: usize) -> usize {
+    if budget == 0 { 8 } else { budget }
+}
+
 fn fallback_flow_lines(
     app: &App,
     width: usize,
@@ -1625,7 +1636,7 @@ fn fallback_flow_lines(
             wrap_words(
                 "add accounts on the fallback tab and clauth switches between them \
                  as each runs out.",
-                width,
+                wrap_budget(width),
             )
             .into_iter()
             .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
@@ -1794,7 +1805,7 @@ fn fallback_flow_lines(
     // The first line also carries the 2-cell lead before the chip, so the tail
     // wraps to `width - chip - 2` — else the caption's first line overruns the
     // pane by exactly those two cells and clips without a mark.
-    for (i, seg) in wrap_words(tail, width.saturating_sub(chip_w + 2))
+    for (i, seg) in wrap_words(tail, wrap_budget(width.saturating_sub(chip_w + 2)))
         .into_iter()
         .enumerate()
     {

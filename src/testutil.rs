@@ -2801,14 +2801,18 @@ pub(crate) fn lines_buffer(
 }
 
 /// Asserts how `phrase` renders where its `part` is a key or a typed command
-/// in prose: every non-space
-/// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
-/// other non-space cell of `phrase` is `ACCENT`.
+/// in prose: every non-space cell of `part` is `ACCENT`, bold for a key and
+/// not for a command, and every other non-space cell of `phrase` is the prose
+/// tier `prose` — its fg, its bg when it sets one, and its net modifiers — and
+/// never `ACCENT` alone. The modifier comparison pins `add_modifier` only, so
+/// a tier that expresses itself by removing a modifier is indistinguishable
+/// from an unstyled cell here.
 pub(crate) fn assert_prose_part(
     buf: &ratatui::buffer::Buffer,
     phrase: &str,
     part: &str,
     is_key: bool,
+    prose: ratatui::style::Style,
 ) {
     let cells = needle_cells(buf, phrase)
         .unwrap_or_else(|| panic!("`{phrase}` missing:\n{}", buffer_rows(buf).join("\n")));
@@ -2828,6 +2832,21 @@ pub(crate) fn assert_prose_part(
             assert_eq!(bold, is_key, "`{part}` in `{phrase}`: cell {i} bold");
         } else {
             assert_ne!(cell.fg, accent, "`{phrase}` outside `{part}`: cell {i} fg");
+            assert_eq!(
+                Some(cell.fg),
+                prose.fg,
+                "`{phrase}` outside `{part}`: cell {i} fg is not the prose tier {prose:?}"
+            );
+            if let Some(bg) = prose.bg {
+                assert_eq!(
+                    cell.bg, bg,
+                    "`{phrase}` outside `{part}`: cell {i} bg is not the prose tier's {prose:?}"
+                );
+            }
+            assert_eq!(
+                cell.modifier, prose.add_modifier,
+                "`{phrase}` outside `{part}`: cell {i} modifiers are not the prose tier's {prose:?}"
+            );
         }
     }
 }

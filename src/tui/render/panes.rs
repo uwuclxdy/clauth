@@ -961,11 +961,10 @@ pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Ve
 
 /// Chunk `text` into `width`-cell runs, splitting between graphemes by their
 /// display width and never on whitespace: every byte lands in exactly one
-/// chunk. A path whose name holds spaces keeps them.
+/// chunk. A path whose name holds spaces keeps them. At width 0 no row holds
+/// a grapheme, so each takes a run of its own — the rule the modal chunker
+/// keeps too, so the two walkers agree at every width.
 pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
     let mut lines = Vec::new();
     let mut chunk = String::new();
     let mut chunk_w = 0;

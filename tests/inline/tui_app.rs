@@ -31235,6 +31235,7 @@ fn app_prose_styles_keys_and_commands_on_every_surface() {
         "press d to resolve",
         " d ",
         true,
+        crate::tui::theme::warning(),
     );
     app.banner = None;
 
@@ -31245,6 +31246,7 @@ fn app_prose_styles_keys_and_commands_on_every_surface() {
         "press q again to quit",
         " q ",
         true,
+        crate::tui::theme::dim(),
     );
     app.disarm_quit();
 
@@ -31263,6 +31265,7 @@ fn app_prose_styles_keys_and_commands_on_every_surface() {
         "validates the result with herdr config check.",
         "herdr config check",
         false,
+        crate::tui::theme::dim(),
     );
 }
 
@@ -31277,9 +31280,27 @@ fn help_descriptions_style_the_keys_they_name() {
     app.tab = Tab::Setup;
     app.open_modal(super::Modal::Help);
     let buf = prose_frame(&app, 140, 80);
-    assert_prose_part(&buf, "edit inline; ↵ again saves", "↵", true);
-    assert_prose_part(&buf, "+ add env · ↵ edits a value", "↵", true);
-    assert_prose_part(&buf, "↵ once to arm, again to confirm", "↵", true);
+    assert_prose_part(
+        &buf,
+        "edit inline; ↵ again saves",
+        "↵",
+        true,
+        crate::tui::theme::body(),
+    );
+    assert_prose_part(
+        &buf,
+        "+ add env · ↵ edits a value",
+        "↵",
+        true,
+        crate::tui::theme::body(),
+    );
+    assert_prose_part(
+        &buf,
+        "↵ once to arm, again to confirm",
+        "↵",
+        true,
+        crate::tui::theme::body(),
+    );
 
     app.modals.pop();
     app.tab = Tab::Config;
@@ -31289,6 +31310,7 @@ fn help_descriptions_style_the_keys_they_name() {
         "same as space ·",
         "space",
         true,
+        crate::tui::theme::body(),
     );
 }
 
@@ -31312,6 +31334,7 @@ fn update_banner_and_row_text_prose_style_their_keys_and_commands() {
         "reinstall with cargo install clauth",
         "cargo install clauth",
         false,
+        crate::tui::theme::dim(),
     );
     app.toasts.clear();
 
@@ -31329,6 +31352,7 @@ fn update_banner_and_row_text_prose_style_their_keys_and_commands() {
         "no longer matches 'work' · press d to resolve",
         " d ",
         true,
+        crate::tui::theme::warning(),
     );
 
     let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
@@ -31353,6 +31377,7 @@ fn update_banner_and_row_text_prose_style_their_keys_and_commands() {
             "validated by herdr config check;",
             "herdr config check",
             false,
+            crate::tui::theme::dim(),
         );
         app.modals.pop();
     }
@@ -31371,7 +31396,13 @@ fn a_shared_diagnostic_toast_styles_its_backticked_command() {
         crate::format::login_expired(&crate::profile::ProfileName::from("work")).toast(),
     );
     let buf = prose_frame(&app, 120, 30);
-    assert_prose_part(&buf, "run clauth login work", "clauth login work", false);
+    assert_prose_part(
+        &buf,
+        "run clauth login work",
+        "clauth login work",
+        false,
+        crate::tui::theme::dim(),
+    );
     assert!(
         crate::testutil::needle_cells(&buf, "`").is_none(),
         "no literal backtick reaches the toast"
@@ -31410,6 +31441,7 @@ fn the_capture_refusal_styles_the_owners_switch_command() {
         "switch to it with: clauth play",
         "clauth play",
         false,
+        crate::tui::theme::dim(),
     );
 }
 

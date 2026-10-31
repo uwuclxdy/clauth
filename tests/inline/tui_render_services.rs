@@ -603,7 +603,13 @@ fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
 
     // An unfocused fix line: `f` is a key in prose (ACCENT + bold, cloudy
     // 2026-10-02), the verb dim, pinned off the styled buffer.
-    crate::testutil::assert_prose_part(&buf, "f  wire mcp server", "f", true);
+    crate::testutil::assert_prose_part(
+        &buf,
+        "f  wire mcp server",
+        "f",
+        true,
+        crate::tui::theme::dim(),
+    );
     let verb = crate::testutil::needle_cells(&buf, "wire mcp server").expect("verb renders");
     assert!(
         verb.iter()
@@ -5384,11 +5390,23 @@ fn service_detail_lines_style_their_key_and_command() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let (_, buf) = render(&app_with(plugin_check_with_problems()));
-    crate::testutil::assert_prose_part(&buf, "press r to probe", " r ", true);
+    crate::testutil::assert_prose_part(
+        &buf,
+        "press r to probe",
+        " r ",
+        true,
+        crate::tui::theme::body(),
+    );
 
     let not_installed = herdr_check(&probe(Some("0.8.0"), None, None), Some(&healthy_config()));
     let (_, buf) = render(&app_with(not_installed));
-    crate::testutil::assert_prose_part(&buf, "clauth herdr install", "clauth herdr install", false);
+    crate::testutil::assert_prose_part(
+        &buf,
+        "clauth herdr install",
+        "clauth herdr install",
+        false,
+        crate::tui::theme::dim(),
+    );
 }
 
 /// A herdr probe error naming a command in backticks (the shared CLI form)
@@ -5411,6 +5429,7 @@ fn a_herdr_probe_error_styles_its_backticked_command() {
         "/opt/bin/herdr plugin list --json failed",
         "/opt/bin/herdr plugin list --json",
         false,
+        crate::tui::theme::dim(),
     );
 }
 

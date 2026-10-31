@@ -552,6 +552,78 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     assert!(hint.contains("resumes: a in ~"), "{hint}");
 }
 
+/// The all-spent caption takes the sibling 8-cell floor only when the pane
+/// leaves no budget at all: at width 10 the 11-cell lead + chip already
+/// overruns the pane, so every caption row is clipped whatever the wrap does
+/// and the floor only bounds the row count (`chain_panel_height` reads it).
+/// The band where the lead + chip fit never takes the floor — the probe below
+/// pins that nothing is clipped there.
+#[test]
+fn the_all_spent_caption_tail_wraps_at_the_floor_when_the_chip_overruns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+    config.state.switch_off_when_spent = true;
+    let app = App::new(config);
+    let lines = fallback_flow_lines(&app, 10, &readings).0;
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    let at = texts
+        .iter()
+        .position(|t| t.contains("[ stop ]"))
+        .expect("the all-spent caption renders");
+    let caption: Vec<String> = texts[at..]
+        .iter()
+        .take_while(|t| !t.contains("resumes:"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        caption,
+        ["  [ stop ] when all", "  spent"],
+        "a chip that alone overruns the pane still wraps its tail at the 8-cell floor"
+    );
+}
+
+/// No caption row may wrap wider than the pane leaves after its lead and chip:
+/// from width 12 up the 11-cell lead + chip fits, so the tail's real budget is
+/// the rest of the row and the wrap must use it — a floor there overdraws the
+/// pane and the `Paragraph` (no `Wrap`) cuts the tail with no mark. At width 18
+/// the budget is 7 cells, so each word takes its own row whole.
+#[test]
+fn the_all_spent_caption_tail_fits_every_pane_from_the_chip_and_lead_up() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+    config.state.switch_off_when_spent = true;
+    let app = App::new(config);
+    for width in 12..=24usize {
+        let lines = fallback_flow_lines(&app, width, &readings).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let at = texts
+            .iter()
+            .position(|t| t.contains("[ stop ]"))
+            .unwrap_or_else(|| panic!("the all-spent caption renders at width {width}"));
+        let caption: Vec<String> = texts[at..]
+            .iter()
+            .take_while(|t| !t.contains("resumes:"))
+            .cloned()
+            .collect();
+        assert!(!caption.is_empty(), "width {width}: no caption row");
+        for row in &caption {
+            assert!(
+                Span::raw(row.as_str()).width() <= width,
+                "width {width}: caption row {row:?} overruns the pane"
+            );
+        }
+        if width == 18 {
+            assert_eq!(
+                caption,
+                ["  [ stop ] when", "  all", "  spent"],
+                "width 18 leaves a 7-cell budget: each tail word takes its own row whole"
+            );
+        }
+    }
+}
+
 // b still has headroom — the chain is not all-exhausted, so the caption must
 // stay hidden (recovery would relink b on the next tick regardless).
 #[test]
@@ -5388,7 +5460,13 @@ fn overview_more_line_styles_the_arrow_as_a_key() {
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     let buf = term.backend().buffer();
-    crate::testutil::assert_prose_part(buf, "+19 more · → fallback tab", "→", true);
+    crate::testutil::assert_prose_part(
+        buf,
+        "+19 more · → fallback tab",
+        "→",
+        true,
+        crate::tui::theme::faint(),
+    );
     // The words beside the arrow are the caption style, faint — pinned by
     // equality, not just "not accent".
     let faint = crate::tui::theme::text_faint_color();

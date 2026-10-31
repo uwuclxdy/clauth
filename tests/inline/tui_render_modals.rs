@@ -2569,6 +2569,7 @@ fn the_preset_picker_styles_its_delete_key() {
         "d deletes a saved preset",
         "d",
         true,
+        crate::tui::theme::dim(),
     );
 }
 
@@ -4239,15 +4240,61 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
                 check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w));
                 checked += 1;
             }
-            // (f) `w == 0` keeps the early return: the line, whole (tabs as
-            // one space).
+            // (f) `w == 0` tokenizes like every other width: a grapheme wider
+            // than the row takes a row of its own, so every visible grapheme
+            // sits alone on its row, in order, and only break whitespace
+            // drops (a leading indent or an all-whitespace line keeps its
+            // space cells). The counts are graphemes, the unit the row holds,
+            // not chars; the sweep's alphabet carries no combining mark, so a
+            // multi-char grapheme cannot appear and the two counts agree. An
+            // empty source draws its one empty row, as every width does.
             let rows = chunk_line(Line::from(s.as_str()), 0);
-            assert_eq!(rows.len(), 1, "w=0 keeps the line whole for {s:?}");
-            let normalized: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+            assert!(!rows.is_empty(), "w=0 still draws the line for {s:?}");
+            // A source that carries a visible grapheme must never draw a row
+            // with no cell at all. A row may still hold only break whitespace
+            // — a leading indent keeps its space cells at every width, and at
+            // width 0 an indent fits no row with its word — so a row without
+            // a visible cell of its own is the contract's, not a defect.
+            let source_has_content = s.chars().any(|c| !is_break_space(c));
+            let mut visible_before = String::new();
+            let mut visible_before_graphemes: Vec<String> = Vec::new();
+            let mut visible_after = String::new();
+            for (i, r) in rows.iter().enumerate() {
+                let t = line_text(r);
+                let vis: Vec<char> = t.chars().filter(|c| !is_break_space(*c)).collect();
+                assert!(
+                    vis.len() <= 1,
+                    "w=0 leaves two visible characters on row {i} for {s:?}: {t:?}"
+                );
+                let graphemes: Vec<String> = Span::raw(t.as_str())
+                    .styled_graphemes(Style::default())
+                    .map(|g| g.symbol.to_string())
+                    .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                    .collect();
+                assert!(
+                    graphemes.len() <= 1,
+                    "w=0 leaves two visible graphemes on row {i} for {s:?}: {t:?}"
+                );
+                assert!(
+                    !t.is_empty() || !source_has_content,
+                    "w=0 draws a row with no cell at row {i} for {s:?}"
+                );
+                visible_before.extend(vis);
+                visible_before_graphemes.extend(graphemes);
+            }
+            visible_after.extend(s.chars().filter(|c| !is_break_space(*c)));
             assert_eq!(
-                line_text(&rows[0]),
-                normalized,
-                "w=0 keeps the content for {s:?}"
+                visible_before, visible_after,
+                "w=0 keeps the visible content in order for {s:?}"
+            );
+            let visible_after_graphemes: Vec<String> = Span::raw(s.as_str())
+                .styled_graphemes(Style::default())
+                .map(|g| g.symbol.to_string())
+                .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                .collect();
+            assert_eq!(
+                visible_before_graphemes, visible_after_graphemes,
+                "w=0 keeps the visible graphemes in order for {s:?}"
             );
             checked += 1;
         }
@@ -4353,6 +4400,31 @@ fn chunk_line_treats_a_tab_as_one_break_space() {
         Some(theme::text_dim_color()),
         "the break keeps the second span's style"
     );
+}
+
+/// At width 0 the modal chunker tokenizes like every other width: a grapheme
+/// wider than the row takes a row of its own, so no row holds two visible
+/// graphemes, only break whitespace drops, and the visible content survives
+/// in order.
+#[test]
+fn chunk_line_at_width_zero_tokenizes_like_any_other_width() {
+    use ratatui::text::Line;
+
+    let rows = |text: &str| -> Vec<String> {
+        chunk_line(Line::from(text), 0)
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+    // A tab is one break space: it separates, then drops like any break.
+    assert_eq!(rows("a \tb"), ["a", "b"]);
+    // A wide grapheme takes a row of its own.
+    assert_eq!(rows("漢字"), ["漢", "字"]);
+    // A grapheme of two chars (a base plus its combining mark) is one row,
+    // not one row per char: the row holds the unit the buffer draws.
+    assert_eq!(rows("e\u{301}e"), ["e\u{301}", "e"]);
+    // An empty line is still one empty row.
+    assert_eq!(rows(""), [""]);
 }
 
 /// A check-output body keeps the tab between stderr fields as one space: the

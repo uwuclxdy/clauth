@@ -132,8 +132,10 @@ pub(crate) fn mark_commands(text: &str) -> String {
 /// Every prefix ending at a space is a candidate binary, so a path holding a
 /// space (`C:\Program Files\…\shunt.exe`) still counts; a candidate with a
 /// separator must start like a path, one without must be a single word, so
-/// `foo /usr/bin/clauth x` is no command. Both separators are split by hand so
-/// a Windows path reads the same on every host.
+/// `foo /usr/bin/clauth x` is no command. A drive letter opens a path only as
+/// an ASCII letter, `:`, then a separator — a bare colon at the second byte
+/// (`a:b/clauth`) is no path start. Both separators are split by hand so a
+/// Windows path reads the same on every host.
 fn is_command(span: &str) -> bool {
     !span.contains('\n')
         && span
@@ -143,7 +145,8 @@ fn is_command(span: &str) -> bool {
                 let candidate = &span[..at];
                 let shaped = if candidate.contains(['/', '\\']) {
                     candidate.starts_with(['/', '\\', '~', '.'])
-                        || candidate.as_bytes().get(1) == Some(&b':')
+                        || matches!(candidate.as_bytes(), [letter, b':', sep, ..]
+                            if letter.is_ascii_alphabetic() && (*sep == b'/' || *sep == b'\\'))
                 } else {
                     !candidate.contains(' ')
                 };
@@ -588,9 +591,6 @@ fn fill(chars: &[(char, Kind)], width: usize, marked_line: bool) -> Vec<Vec<(cha
     } else {
         chars
     };
-    if width == 0 {
-        return vec![chars.to_vec()];
-    }
     let cells: Measure = if marked_line { drawn_cells } else { width_of };
     // A control-only word or marked run draws nothing; the buffer drops it,
     // never the wrapper, except on a marked line long enough to wrap, where

@@ -1829,6 +1829,7 @@ fn session_token_fix_lines_style_their_commands() {
         "re-mint with clauth login acct --setup-token",
         "clauth login acct --setup-token",
         false,
+        crate::tui::theme::faint(),
     );
     let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, false, "acct", now, w);
     assert_prose_part(
@@ -1836,6 +1837,7 @@ fn session_token_fix_lines_style_their_commands() {
         "· clauth rolling-token acct re-arms",
         "clauth rolling-token acct",
         false,
+        crate::tui::theme::faint(),
     );
 }
 

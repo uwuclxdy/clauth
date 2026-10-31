@@ -486,6 +486,79 @@ fn wrap_collapses_whitespace_inside_a_fitting_command() {
     );
 }
 
+/// A wrap at width 0 tokenizes like every other width: a whitespace run
+/// between words collapses to the one separator (dropped when no row can hold
+/// a second word), never leaving a raw tab or a doubled cell in the output.
+#[test]
+fn wrap_at_width_zero_collapses_whitespace_like_any_other_width() {
+    assert_eq!(super::plain_wrap("a \tb", 0), vec!["a", "b"]);
+    assert_eq!(super::super::panes::wrap_words("a \tb", 0), vec!["a", "b"]);
+    assert_eq!(super::plain_wrap("a \tb", 5), vec!["a b"]);
+}
+
+/// A width-0 wrap splits a word no row can hold the way every other width
+/// does, one grapheme per row — the contract the modal chunker's `chunk_line`
+/// keeps, so the two walkers agree at 0 instead of one row of the whole word.
+#[test]
+fn wrap_at_width_zero_hard_splits_a_word_one_grapheme_per_row() {
+    assert_eq!(super::plain_wrap("abc", 0), vec!["a", "b", "c"]);
+    assert_eq!(
+        super::super::panes::wrap_words("abc", 0),
+        vec!["a", "b", "c"]
+    );
+    assert_eq!(
+        super::super::panes::chunk_graphemes("abc", 0),
+        vec!["a", "b", "c"]
+    );
+}
+
+/// A wrap at width 0 keeps the `\t`-delimited key segmentation: the key takes
+/// its own row styled, and a newline in the copy breaks rows instead of
+/// riding one span.
+#[test]
+fn wrap_at_width_zero_keeps_the_key_styled_and_breaks_at_a_newline() {
+    let text = format!("a \t{} b", key("k"));
+    let lines = wrap(&text, 0, dim());
+    assert_eq!(
+        lines,
+        vec![
+            vec![Span::styled("a", dim())],
+            vec![Span::styled("k", key_style(dim()))],
+            vec![Span::styled("b", dim())],
+        ],
+        "the key keeps its kind at width 0"
+    );
+    let nl = format!("a \t{}\nb", key("k"));
+    assert_eq!(wrap(&nl, 0, dim()), lines, "a newline breaks at width 0");
+}
+
+/// A drive-letter prefix shapes a command only when a real drive letter
+/// (ASCII letter, `:`, then a path separator) opens it: `C:\…` stays a
+/// command, while a colon in any other spot leaves the span literal. Drive
+/// letters are case-insensitive on Windows, so a lowercase one styles too.
+#[test]
+fn a_drive_letter_needs_a_letter_colon_and_separator_to_shape_a_command() {
+    use super::mark_commands;
+    // A colon that a separator does not follow is no drive letter.
+    assert_eq!(mark_commands("`a:b/clauth y` x"), "`a:b/clauth y` x");
+    // A digit before the colon is no drive letter.
+    assert_eq!(mark_commands("`1:/clauth y` x"), "`1:/clauth y` x");
+    // A real drive letter with either separator is a command, lowercase
+    // included — a letter arm narrowed to uppercase must red here.
+    assert_eq!(
+        mark_commands("`C:/tools/clauth y` x"),
+        format!("{} x", cmd("C:/tools/clauth y"))
+    );
+    assert_eq!(
+        mark_commands("`x:/clauth y` x"),
+        format!("{} x", cmd("x:/clauth y"))
+    );
+    assert_eq!(
+        mark_commands("`c:\\Program Files\\clauth.exe check` refused"),
+        format!("{} refused", cmd("c:\\Program Files\\clauth.exe check"))
+    );
+}
+
 fn row_texts(text: &str, width: usize) -> Vec<String> {
     wrap(text, width, dim())
         .into_iter()

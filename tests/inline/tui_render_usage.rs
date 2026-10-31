@@ -5341,6 +5341,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         "re-login with clauth login kerry",
         "clauth login kerry",
         false,
+        crate::tui::theme::faint(),
     );
 
     let mut qwen = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
@@ -5373,6 +5374,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         "console login expired, run clauth login",
         "clauth login",
         false,
+        crate::tui::theme::faint(),
     );
     qwen.console = None;
     let rows = build_tp_rows(
@@ -5389,6 +5391,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         "console login needed, run clauth login",
         "clauth login",
         false,
+        crate::tui::theme::faint(),
     );
 
     assert_prose_part(
@@ -5396,6 +5399,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         "press n to add notes",
         " n ",
         true,
+        crate::tui::theme::faint(),
     );
 }
 

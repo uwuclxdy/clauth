@@ -5681,7 +5681,13 @@ fn the_empty_state_hotkey_renders_as_a_key() {
     });
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
-    crate::testutil::assert_prose_part(term.backend().buffer(), "n to create one", "n", true);
+    crate::testutil::assert_prose_part(
+        term.backend().buffer(),
+        "n to create one",
+        "n",
+        true,
+        crate::tui::theme::dim(),
+    );
 }
 
 /// Hand-pinned page landings for the focus-following forms and the Overview

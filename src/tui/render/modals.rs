@@ -748,7 +748,7 @@ fn chunk_line_units(
     } else {
         line_cells(&line) <= w
     };
-    if w == 0 || fits {
+    if fits {
         return vec![line];
     }
 
