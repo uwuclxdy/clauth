@@ -651,13 +651,53 @@ impl Profile {
     }
 }
 
-/// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
-/// the file stays human-readable: `theme = "full"` / `theme = "compatible"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Theme tier a `profiles.toml` theme name maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThemeName {
     Full,
     Compatible,
+}
+
+impl ThemeName {
+    const ALL: [ThemeName; 2] = [ThemeName::Full, ThemeName::Compatible];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Full => "full",
+            ThemeName::Compatible => "compatible",
+        }
+    }
+}
+
+/// Theme selection in `profiles.toml`: the scalar `theme = "full"` or the table
+/// `[theme] name = "full"`. The form the file held is kept, so a save never
+/// rewrites an older reader's scalar into a form it refuses; a pick writes the
+/// table, and a name this build does not know rides every save verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, expecting = "a theme name, or a [theme] table with a name")]
+pub(crate) enum ThemeSetting {
+    Scalar(String),
+    Table { name: String },
+}
+
+impl AppState {
+    /// The configured theme tier, `None` when the file names none this build
+    /// knows.
+    pub(crate) fn theme_tier(&self) -> Option<ThemeName> {
+        let name = match self.theme.as_ref()? {
+            ThemeSetting::Scalar(name) | ThemeSetting::Table { name } => name,
+        };
+        ThemeName::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == name.as_str())
+    }
+
+    /// Record a theme pick for the next save.
+    pub(crate) fn set_theme(&mut self, name: ThemeName) {
+        self.theme = Some(ThemeSetting::Table {
+            name: name.as_str().to_string(),
+        });
+    }
 }
 
 /// How a usage window's reset renders across the TUI (`AppState.reset_display`,
@@ -1021,9 +1061,10 @@ pub(crate) struct AppState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) auto_start_queue: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
-    /// detect applies when this is `None` and no flag was passed.
+    /// detect applies when this is `None` and no flag was passed. Read through
+    /// [`AppState::theme_tier`], written through [`AppState::set_theme`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) theme: Option<ThemeName>,
+    pub(crate) theme: Option<ThemeSetting>,
     /// Shape of every reset countdown in the TUI. `None` = the
     /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
     /// this key nor [`AppState::clock_format`] and renders exactly as it did

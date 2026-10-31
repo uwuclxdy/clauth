@@ -501,7 +501,10 @@ pub(super) fn picker_row(
 ) -> Line<'static> {
     // Caret only in the focused pane; blurred rows keep BG_HOVER via select_line.
     let arrow = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled(
+            format!("{} ", theme::CARET),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     };
@@ -651,10 +654,10 @@ pub(super) fn draw_scrollbar(
         let cell = buf.cell_mut((col_x, col_y + row as u16));
         if let Some(cell) = cell {
             if row >= thumb_top && row < thumb_end {
-                cell.set_symbol("┃");
+                cell.set_symbol(theme::BAR);
                 cell.set_style(Style::default().fg(theme::text_dim_color()));
             } else {
-                cell.set_symbol("┊");
+                cell.set_symbol(theme::TRACK);
                 cell.set_style(Style::default().fg(theme::line_color()));
             }
         }

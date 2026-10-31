@@ -461,8 +461,11 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     lines.push(Line::from(vec![
         key_span("status"),
         match row.fetched_at {
-            Some(stamp) => Span::styled(format!("◌ read {}", relative_age(stamp)), theme::dim()),
-            None => Span::styled("◌ not read yet", theme::dim()),
+            Some(stamp) => Span::styled(
+                format!("{} read {}", theme::WAITING, relative_age(stamp)),
+                theme::dim(),
+            ),
+            None => Span::styled(format!("{} not read yet", theme::WAITING), theme::dim()),
         },
     ]));
     lines.push(Line::from(""));
@@ -1929,7 +1932,7 @@ fn status_lines(
             // A scheduled refresh is work lined up — the `queued` dot (`◌` in
             // ACCENT), not a spinner: nothing is running yet.
             Some(c) => spans.extend([
-                Span::styled("◌ ", theme::accent()),
+                Span::styled(format!("{} ", theme::WAITING), theme::accent()),
                 Span::styled(format!("refresh in {c}"), theme::dim()),
             ]),
             None => {
@@ -1965,7 +1968,7 @@ fn status_lines(
                     // differs from `queued` above by color alone, so the label
                     // carries the meaning on a monochrome read.
                     None => spans.extend([
-                        Span::styled("◌ ", theme::dim()),
+                        Span::styled(format!("{} ", theme::WAITING), theme::dim()),
                         Span::styled("up to date", theme::dim()),
                     ]),
                 }

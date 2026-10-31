@@ -570,3 +570,33 @@ fn the_colour_scan_flags_sgr_literals_and_overrides_and_skips_other_escapes() {
         Vec::<String>::new()
     );
 }
+
+/// Every mark the render code draws comes from this module: a literal in a
+/// render file is a second copy that drifts from its theme constant.
+#[test]
+fn no_mark_glyph_is_spelled_in_a_render_file() {
+    const MARKS: [char; 10] = ['❯', '●', '○', '✓', '▶', '▼', '✎', '┃', '┊', '◌'];
+    let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/render");
+    let scanned = crate::testutil::rs_files(&render);
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/tui/render — it is not reading the tree",
+        scanned.len()
+    );
+    let mut offenders = Vec::new();
+    for file in scanned {
+        let text = std::fs::read_to_string(&file).expect("readable render file");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or_default();
+            for mark in MARKS {
+                if code.contains(mark) {
+                    offenders.push(format!("{}:{}: {mark}", file.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "draw marks through the theme module: {offenders:?}"
+    );
+}

@@ -18888,8 +18888,9 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     }
 }
 
-/// Cycle the active theme tier, persist it to `[theme]`, and live-swap the
-/// palette so the next frame renders in the new tier without a restart.
+/// Cycle the active theme tier, persist it to `[theme]`, and, once that save
+/// lands, live-swap the palette so the next frame renders in the new tier
+/// without a restart; a failed save leaves the old tier everywhere.
 fn cycle_theme(app: &mut App) {
     let next = match theme::tier() {
         theme::Tier::Full => theme::Tier::Compatible,
@@ -18899,7 +18900,9 @@ fn cycle_theme(app: &mut App) {
         theme::Tier::Full => ThemeName::Full,
         theme::Tier::Compatible => ThemeName::Compatible,
     };
-    app.save_state_delta(|s, _held| s.theme = Some(name));
+    if !app.save_state_delta(|s, _held| s.set_theme(name)) {
+        return;
+    }
     app.apply_forgets();
     theme::set_tier(next);
 }

@@ -3047,10 +3047,17 @@ fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend
             row.contains("CHECK OUTPUT")
         })
         .expect("modal top border");
-    let x = (0..area.width)
-        .find(|&xx| buf[(xx, top)].symbol() == "C")
-        .map(|c| c - 3)
-        .expect("modal left corner");
+    let title_len = u16::try_from("CHECK OUTPUT".len()).expect("title fits a u16");
+    let title = (0..area.width)
+        .find(|&xx| {
+            (xx..area.width.min(xx + title_len))
+                .map(|x| buf[(x, top)].symbol())
+                .collect::<String>()
+                == "CHECK OUTPUT"
+        })
+        .expect("modal title");
+    // `╭─ ` sits three cells left of the title's first glyph.
+    let x = title - 3;
     let width = (x..area.width)
         .find(|&xx| buf[(xx, top)].symbol() == "╮")
         .map(|xx| xx - x + 1)

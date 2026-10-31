@@ -691,7 +691,7 @@ fn draw_codex_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selected = actions_focused && i == cursor;
         starts.push(lines.len());
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         };
@@ -836,7 +836,7 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("{} ", spinner_frame(app.tick_count)),
                 theme::accent(),
             ),
-            _ if selected => Span::styled("❯ ", theme::accent().bold()),
+            _ if selected => Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
             _ => Span::raw("  "),
         };
         let (label, style) = match row_kind {
@@ -1475,7 +1475,7 @@ fn detail_row(
     let arrow = if editing {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -1518,7 +1518,7 @@ fn detail_row(
         // focusable but inert, the tooltip (below) naming what happens on save.
         ConfigRow::ApiKey if snap.mint_armed => {
             let row_arrow = if selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 Span::raw("  ")
             };
@@ -1611,7 +1611,7 @@ fn detail_row(
         ConfigRow::Disabled => {
             let gated = snap.is_active || snap.has_live_session;
             let row_arrow = if gated && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1713,7 +1713,7 @@ fn detail_row(
                 Line::from(vec![
                     arrow,
                     Span::styled(
-                        "✓ captured current login",
+                        format!("{} captured current login", theme::DONE),
                         bold_when(theme::success(), selected),
                     ),
                 ])
@@ -1733,7 +1733,7 @@ fn detail_row(
             // its `└` line (via `row_hint`).
             if snap.login_disabled_reason.is_some() {
                 let row_arrow = if selected {
-                    Span::styled("❯ ", theme::faint())
+                    Span::styled(format!("{} ", theme::CARET), theme::faint())
                 } else {
                     Span::raw("  ")
                 };
@@ -1747,7 +1747,10 @@ fn detail_row(
             if snap.captured || snap.captured_codex_mint {
                 Line::from(vec![
                     arrow,
-                    Span::styled("✓ logged in", bold_when(theme::success(), selected)),
+                    Span::styled(
+                        format!("{} logged in", theme::DONE),
+                        bold_when(theme::success(), selected),
+                    ),
                 ])
             } else {
                 let label = if snap.logged_in {
@@ -1773,7 +1776,7 @@ fn detail_row(
         ConfigRow::ClearSessionToken => {
             let gated = snap.clear_gated();
             let row_arrow = if gated && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };

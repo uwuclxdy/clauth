@@ -2707,7 +2707,7 @@ fn labelled_value(label: &str, value: String, focused: bool) -> Line<'static> {
     let value_style = if focused {
         Style::default()
             .fg(theme::text_color())
-            .bg(theme::bg_sunken())
+            .bg(theme::sunken_fill())
     } else {
         Style::default().fg(theme::text_color())
     };
@@ -2835,7 +2835,10 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
             theme::base()
         };
         let glyph = if focused {
-            Span::styled("❯ ", Style::default().fg(theme::accent_color()).bold())
+            Span::styled(
+                format!("{} ", theme::CARET),
+                Style::default().fg(theme::accent_color()).bold(),
+            )
         } else {
             Span::styled("  ", Style::default())
         };

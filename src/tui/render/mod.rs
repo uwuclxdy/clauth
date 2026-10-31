@@ -62,15 +62,16 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let readings = app.readings_snapshot();
 
     // Content frame's top border doubles as the header/content separator; the
-    // header is always 3 rows (brand / count+status / tabs+gauge).
-    let [header_area, content_area, footer_area] = Layout::vertical([
-        Constraint::Length(header::header_height(app)),
+    // header is 3 rows with the art (brand / live+gauge+status / tabs), 2
+    // without it (brand+tabs / live+gauge+status).
+    let [_, content_area, footer_area] = Layout::vertical([
+        Constraint::Length(header::header_height(area)),
         Constraint::Min(5),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    header::draw(frame, header_area, app, &readings);
+    header::draw(frame, area, app, &readings);
 
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {

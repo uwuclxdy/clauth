@@ -1,10 +1,13 @@
 //! Top bar: the Clawd mascot on the left; brand, usage gauge and status source
-//! in the text column to the right. Three rows always — [`header_height`] keeps
-//! `render::draw`'s layout in step.
+//! in the text column to the right. The art header is three rows; when the
+//! frame cannot hold the art it falls back to two, carrying the tab bar on the
+//! brand row. [`header_height`] keeps `render::draw`'s layout in step.
 //!
 //! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
-//! and the `[ shunt ]  [ daemon ]` service chips on the right edge; it sheds
-//! the tag first, then the shunt chip, then the daemon chip. Row 1 carries
+//! and the `[ shunt ]  [ daemon ]` service chips on the right edge. The art
+//! row sheds the tag first, then the shunt chip, then the daemon chip; the
+//! no-art row also carries the tab bar, which collapses to its overflow form
+//! between the tag and the chips. Row 1 carries
 //! the fleet's live-session chip, the tok/s chip, the active-profile usage
 //! gauge with its speed suffix and the status indicator: the account counts
 //! and the harness filter live on the accounts panel's title row, as meta
@@ -26,6 +29,12 @@ use super::services::health_color;
 use crate::format::format_pct;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BRAND: &str = "clauth";
+
+/// The version suffix that rides the brand: ` v0.18.0`.
+fn version_label() -> String {
+    format!(" v{VERSION}")
+}
 
 // ── Account gauge ────────────────────────────────────────────────────────
 //
@@ -240,8 +249,25 @@ pub(super) fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec
 
 // ── Height ───────────────────────────────────────────────────────────────
 
-pub(super) fn header_height(_app: &App) -> u16 {
-    3
+/// The art's own columns.
+const LOGO_COLS: u16 = 10;
+/// Rows the art header needs: the art's three plus a usable body.
+const ART_MIN_ROWS: u16 = 14;
+
+/// Whether `area` holds the art header: enough rows for the art and a usable
+/// body, and enough columns for the logo slot, the brand, the version and the
+/// daemon chip with the content gap.
+fn art_fits(area: Rect) -> bool {
+    let brand = BRAND.chars().count();
+    let ver = version_label().chars().count();
+    let daemon = spans_width(&service_chip("daemon", ratatui::style::Color::Reset));
+    area.height >= ART_MIN_ROWS
+        && usize::from(area.width) >= usize::from(LOGO_COLS) + brand + ver + CONTENT_GAP + daemon
+}
+
+/// Header rows `area` gets: three with the art, two without it.
+pub(super) fn header_height(area: Rect) -> u16 {
+    if art_fits(area) { 3 } else { 2 }
 }
 
 // ── Draw ─────────────────────────────────────────────────────────────────
@@ -249,12 +275,26 @@ pub(super) fn header_height(_app: &App) -> u16 {
 const CONTENT_GAP: usize = 3;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
-    let cols: [Rect; 2] =
-        Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
+    let art = art_fits(area);
+    let header = Rect {
+        height: header_height(area),
+        ..area
+    };
+    let info_area = if art {
+        let cols: [Rect; 2] =
+            Layout::horizontal([Constraint::Length(LOGO_COLS), Constraint::Min(20)]).areas(header);
+        draw_logo(frame, cols[0], app);
+        cols[1]
+    } else {
+        header
+    };
 
-    draw_logo(frame, cols[0], app);
-
-    let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(cols[1]);
+    let rows: [Rect; 3] = if art {
+        Layout::vertical([Constraint::Length(1); 3]).areas(info_area)
+    } else {
+        let two: [Rect; 2] = Layout::vertical([Constraint::Length(1); 2]).areas(info_area);
+        [two[0], two[1], Rect::default()]
+    };
 
     let info_width = rows[0].width as usize;
 
@@ -265,47 +305,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     };
 
     // ── Row 0: clauth [herdr tag] vX.Y.Z ....... [ shunt ]  [ daemon ] ─────
-    let brand = "clauth";
-    let ver = format!(" v{VERSION}");
-    let mut row0: Vec<Span<'static>> = vec![
-        Span::styled(brand, Style::default().fg(theme::text_color()).bold()),
-        Span::styled(ver, theme::dim()),
-    ];
-    let mut used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
-    // Service chips, stuck to the right edge in a fixed order two cells apart.
-    // Always present: an absent service dims its chip rather than hiding it.
-    // They shed after the tag, the shunt chip before the daemon chip, each only
-    // once brand + version + the chips left no longer fit with the content gap
-    // the chips keep from what sits to their left.
-    let shunt = service_chip("shunt", shunt_chip_color(app));
-    let daemon = service_chip("daemon", daemon_chip_color(app));
-    let daemon_w = spans_width(&daemon);
-    let chips_w = spans_width(&shunt) + CHIP_GAP.len() + daemon_w;
-    // `[ herdr ]` context tag, between the brand and the version. It is the
-    // first span this row sheds, so it renders only while it still leaves room
-    // for both chips — brand and version never clip.
-    if app.herdr_mode {
-        let tag = "  [ herdr ]";
-        if used + tag.chars().count() + chips_w + CONTENT_GAP <= info_width {
-            row0.insert(1, Span::styled(tag, theme::dim()));
-            used += tag.chars().count();
-        }
-    }
-    let chips: Vec<Span<'static>> = if used + chips_w + CONTENT_GAP <= info_width {
-        let mut both = Vec::from(shunt);
-        both.push(Span::raw(CHIP_GAP));
-        both.extend(daemon);
-        both
-    } else if used + daemon_w + CONTENT_GAP <= info_width {
-        Vec::from(daemon)
+    let row0 = if art {
+        art_row0(app, info_width)
     } else {
-        Vec::new()
+        fallback_row0(app, info_width)
     };
-    if !chips.is_empty() {
-        let gap = info_width - used - spans_width(&chips);
-        row0.push(Span::raw(" ".repeat(gap)));
-        row0.extend(chips);
-    }
     frame.render_widget(
         Paragraph::new(Line::from(row0)).style(theme::base()),
         rows[0],
@@ -323,7 +327,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     // own ladder, then the indicator.
     let row1_width = rows[1].width as usize;
     let feed = "status.claude.ai";
-    let status_head = "● ";
+    let status_head = format!("{} ", theme::DOT_ON);
     let status_w = status_head.chars().count() + feed.chars().count();
     // Right-aligned columns keep a minimum 3-cell gap from the content to
     // their left (`CONTENT_GAP`, the same gap row 0 keeps): the indicator sheds
@@ -439,8 +443,162 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         rows[1],
     );
 
-    // ── Row 2: tabs ──────────────────────────────────────────────────────
-    super::tabs::draw(frame, rows[2], app);
+    // ── Row 2: tabs (the art header only; without the art they ride row 0) ──
+    if art {
+        super::tabs::draw(frame, rows[2], app);
+    }
+}
+
+/// Row 0 with the art beside it: brand, the `[ herdr ]` tag between brand and
+/// version, then the service chips on the right edge.
+fn art_row0(app: &App, info_width: usize) -> Vec<Span<'static>> {
+    let mut row0: Vec<Span<'static>> = vec![
+        Span::styled(BRAND, Style::default().fg(theme::text_color()).bold()),
+        Span::styled(version_label(), theme::dim()),
+    ];
+    let mut used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    // Service chips, stuck to the right edge in a fixed order two cells apart.
+    // Always present: an absent service dims its chip rather than hiding it.
+    // They shed after the tag, the shunt chip before the daemon chip, each only
+    // once brand + version + the chips left no longer fit with the content gap
+    // the chips keep from what sits to their left.
+    let shunt = service_chip("shunt", shunt_chip_color(app));
+    let daemon = service_chip("daemon", daemon_chip_color(app));
+    let daemon_w = spans_width(&daemon);
+    let chips_w = spans_width(&shunt) + CHIP_GAP.len() + daemon_w;
+    // `[ herdr ]` context tag, between the brand and the version. It is the
+    // first span this row sheds, so it renders only while it still leaves room
+    // for both chips — brand and version never clip.
+    if app.herdr_mode {
+        let tag = "  [ herdr ]";
+        if used + tag.chars().count() + chips_w + CONTENT_GAP <= info_width {
+            row0.insert(1, Span::styled(tag, theme::dim()));
+            used += tag.chars().count();
+        }
+    }
+    // The daemon chip always fits: [`art_fits`] guarantees the columns for it.
+    let chips: Vec<Span<'static>> = if used + chips_w + CONTENT_GAP <= info_width {
+        let mut both = Vec::from(shunt);
+        both.push(Span::raw(CHIP_GAP));
+        both.extend(daemon);
+        both
+    } else {
+        Vec::from(daemon)
+    };
+    let gap = info_width.saturating_sub(used + spans_width(&chips));
+    row0.push(Span::raw(" ".repeat(gap)));
+    row0.extend(chips);
+    row0
+}
+
+/// Which service chips the no-art row carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chips {
+    None,
+    Daemon,
+    Both,
+}
+
+impl Chips {
+    /// `(width, gap before the chips)` for this set. With no chip there is no
+    /// gap to keep.
+    fn metrics(self, shunt_w: usize, daemon_w: usize) -> (usize, usize) {
+        match self {
+            Chips::Both => (shunt_w + CHIP_GAP.len() + daemon_w, CONTENT_GAP),
+            Chips::Daemon => (daemon_w, CONTENT_GAP),
+            Chips::None => (0, 0),
+        }
+    }
+}
+
+/// Whether the no-art row's tab bar renders in full, in its overflow form, or
+/// not at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabStrip {
+    Full,
+    Collapsed,
+    None,
+}
+
+/// Row 0 without the art: brand and version at column 0, the no-logo
+/// separator, the tab bar, then the service chips on the right edge. It sheds
+/// the `[ herdr ]` tag, then collapses the tab bar to its overflow form, then
+/// sheds the shunt chip, then the daemon chip. Brand and version never shed,
+/// and the ladder is monotone: a wider row never shows fewer chips or a
+/// narrower tab form. The collapse and the chip seams charge the widest
+/// overflow bar over every tab, so neither depends on which tab is active;
+/// the bar itself draws at the active tab's own width. Under that reserved
+/// width the bar and its separator drop whole.
+fn fallback_row0(app: &App, width: usize) -> Vec<Span<'static>> {
+    let tag = "  [ herdr ]";
+    let sep = "  •  ";
+    let shunt = service_chip("shunt", shunt_chip_color(app));
+    let daemon = service_chip("daemon", daemon_chip_color(app));
+    let shunt_w = spans_width(&shunt);
+    let daemon_w = spans_width(&daemon);
+    let brand_w = BRAND.chars().count();
+    let tag_w = tag.chars().count();
+    let sep_w = sep.chars().count();
+    let prefix_w = brand_w + version_label().chars().count();
+    let strip_w = super::tabs::full_strip_width();
+    let collapsed_w = super::tabs::overflow_width_max();
+
+    // Widest rung first; the first that fits wins. The tag rides only while
+    // both chips fit beside the full strip.
+    let ladder = [
+        (true, Chips::Both, TabStrip::Full),
+        (false, Chips::Both, TabStrip::Full),
+        (false, Chips::Both, TabStrip::Collapsed),
+        (false, Chips::Daemon, TabStrip::Collapsed),
+        (false, Chips::None, TabStrip::Collapsed),
+        (false, Chips::None, TabStrip::None),
+    ];
+    let chosen = ladder.into_iter().find(|&(tag_on, chips, strip)| {
+        if tag_on && !app.herdr_mode {
+            return false;
+        }
+        let head_w = prefix_w + if tag_on { tag_w } else { 0 };
+        let (tabs_w, strip_sep_w) = match strip {
+            TabStrip::Full => (strip_w, sep_w),
+            TabStrip::Collapsed => (collapsed_w, sep_w),
+            TabStrip::None => (0, 0),
+        };
+        let (chips_w, gap) = chips.metrics(shunt_w, daemon_w);
+        head_w + strip_sep_w + tabs_w + gap + chips_w <= width
+    });
+    // Below the last rung the brand and version still hold the row.
+    let (tag_on, chips, strip) = chosen.unwrap_or((false, Chips::None, TabStrip::None));
+
+    let head_w = prefix_w + if tag_on { tag_w } else { 0 };
+    let (chips_w, gap) = chips.metrics(shunt_w, daemon_w);
+    let avail = width.saturating_sub(head_w + sep_w + chips_w + gap);
+    let mut row0 = vec![Span::styled(
+        BRAND,
+        Style::default().fg(theme::text_color()).bold(),
+    )];
+    if tag_on {
+        row0.push(Span::styled(tag, theme::dim()));
+    }
+    row0.push(Span::styled(version_label(), theme::dim()));
+    if strip != TabStrip::None {
+        row0.push(Span::styled(sep, theme::dim()));
+        let tabs = if strip == TabStrip::Full {
+            super::tabs::spans(app, avail)
+        } else {
+            super::tabs::spans(app, 0)
+        };
+        row0.extend(tabs);
+    }
+    if chips != Chips::None {
+        let used: usize = row0.iter().map(Span::width).sum();
+        row0.push(Span::raw(" ".repeat(width.saturating_sub(used + chips_w))));
+        if chips == Chips::Both {
+            row0.extend(shunt);
+            row0.push(Span::raw(CHIP_GAP));
+        }
+        row0.extend(daemon);
+    }
+    row0
 }
 
 /// `[ N live ]` or its split form `[ N+M live ]`: brackets and unit dim, the

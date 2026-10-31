@@ -406,7 +406,7 @@ fn detail_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -942,7 +942,7 @@ fn dimmed_cycle_row(
     width: usize,
 ) -> Vec<Line<'static>> {
     let arrow = if selected {
-        Span::styled("❯ ", theme::faint())
+        Span::styled(format!("{} ", theme::CARET), theme::faint())
     } else {
         Span::raw("  ")
     };
@@ -976,7 +976,7 @@ fn dimmed_cycle_row(
 /// keeps meaning "can't touch this".
 fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
     let arrow = if selected {
-        Span::styled("❯ ", theme::faint())
+        Span::styled(format!("{} ", theme::CARET), theme::faint())
     } else {
         Span::raw("  ")
     };

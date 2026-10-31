@@ -4481,6 +4481,65 @@ fn a_self_write_over_a_torn_store_never_adopts_the_fingerprint() {
     );
 }
 
+/// A Config-tab pick writes the `[theme]` table; an unrelated save before and
+/// after keeps whichever form the file held.
+#[test]
+fn a_theme_pick_writes_the_table_and_unrelated_saves_keep_the_read_form() {
+    use crate::profile::ThemeName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("profiles.toml");
+    std::fs::write(&path, "profiles = []\ntheme = \"full\"\n").expect("seed");
+    let read = |path: &std::path::Path| -> toml::Value {
+        toml::from_str(&std::fs::read_to_string(path).expect("read")).expect("parse")
+    };
+    let table = |v: &toml::Value| {
+        v.get("theme")
+            .and_then(|t| t.get("name"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut app = app_with(vec![]);
+    assert!(app.save_state_delta(|s, _| s.auto_start_queue = true));
+    assert_eq!(
+        read(&path).get("theme").and_then(toml::Value::as_str),
+        Some("full")
+    );
+    super::cycle_theme(&mut app);
+    assert_eq!(table(&read(&path)).as_deref(), Some("compatible"));
+    assert_eq!(app.config().state.theme_tier(), Some(ThemeName::Compatible));
+    assert!(app.save_state_delta(|s, _| s.auto_start_queue = false));
+    assert_eq!(table(&read(&path)).as_deref(), Some("compatible"));
+}
+
+/// A theme pick whose save fails keeps the old tier everywhere: the palette
+/// the next frame paints, the in-memory state and the file.
+#[test]
+fn a_theme_pick_whose_save_fails_keeps_the_old_tier() {
+    use crate::profile::ThemeName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("profiles.toml");
+    std::fs::write(&path, "profiles = []\ntheme = \"full\"\n").expect("seed");
+    let mut app = app_with(vec![]);
+    // A landed save first: the in-memory state then holds the old tier, and
+    // the state lock file exists, so the fault below fails the save's write.
+    assert!(app.save_state_delta(|s, _| s.set_theme(ThemeName::Full)));
+    let before = std::fs::read(&path).expect("saved file");
+    let theme_before = app.config().state.theme_tier();
+    assert_eq!(theme_before, Some(ThemeName::Full));
+    let locked = crate::testutil::UnwritableDir::new(&dir);
+    super::cycle_theme(&mut app);
+    drop(locked);
+    assert_eq!(crate::tui::theme::tier(), crate::tui::theme::Tier::Full);
+    assert_eq!(app.config().state.theme_tier(), theme_before);
+    assert_eq!(std::fs::read(&path).expect("file"), before);
+}
+
 /// The TUI's real log-out path (`run_confirm_action(BlankCredentials)`)
 /// followed by a reload compare advances the epoch exactly once.
 #[test]

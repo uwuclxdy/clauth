@@ -4,7 +4,12 @@ use crate::tui::app::{App, Tab};
 use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
 use ratatui::style::Color;
+
+/// Tall enough that the art header renders at the widths these pins use, so a
+/// width-only pin still exercises the art rows.
+const HEADER_TEST_ROWS: u16 = 24;
 use std::collections::BTreeMap;
 
 fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
@@ -104,10 +109,9 @@ fn app_with(profiles: Vec<(Profile, Option<UsageInfo>)>, active: Option<&str>) -
     app
 }
 
-/// Renders only the header block (sized by `header_height`).
+/// Renders the header into a `HEADER_TEST_ROWS`-row frame.
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
-    let height = header_height(app);
-    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
     let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
@@ -120,8 +124,7 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
 /// The logo column's cells as `(glyph, fg, bg)`: a style claim pins the whole
 /// row rather than the cells a defect happens to leave alone.
 fn styled_logo_rows(app: &App, width: u16) -> Vec<Vec<(String, Color, Color)>> {
-    let height = header_height(app);
-    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
     let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
@@ -129,7 +132,7 @@ fn styled_logo_rows(app: &App, width: u16) -> Vec<Vec<(String, Color, Color)>> {
     })
     .unwrap();
     let buf = term.backend().buffer();
-    (0..header_height(app))
+    (0..header_height(Rect::new(0, 0, width, HEADER_TEST_ROWS)))
         .map(|y| {
             (0..10)
                 .map(|x| {
@@ -157,7 +160,8 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
 /// A wide-glyph active name sizes the row-1 gauge and the right-edge gap by
 /// cells, not chars, so `● status.claude.ai` stays whole at every width — the
 /// char sum left it mid-word off the edge. Pinned whole-row for an ASCII, a
-/// CJK and an emoji active name at every width.
+/// CJK and an emoji active name at every width; under the art's fit width the
+/// row carries no logo column, so the no-art header's whole row is pinned.
 #[test]
 fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -165,27 +169,27 @@ fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
         (
             "abcdefghijklmnopqrstuvwxyz",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "abcdefg… 49%    ● status.claude.ai"),
                 (45, "▝▜██████▀ abcdefgh… 49%    ● status.claude.ai"),
             ],
         ),
         (
             "cjk-日本語アカウント",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "cjk-日 … 49%     ● status.claude.ai"),
                 (45, "▝▜██████▀ cjk-日 本 … 49%    ● status.claude.ai"),
             ],
         ),
         (
             "emoji-🧭⚠️-account",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "emoji-… 49%     ● status.claude.ai"),
                 (45, "▝▜██████▀ emoji-🧭 … 49%    ● status.claude.ai"),
             ],
         ),
@@ -281,17 +285,18 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
 // ── `header_height` ─────────────────────────────────────────────────────
 
 #[test]
-fn header_height_is_always_three() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let with_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    assert_eq!(header_height(&with_active), 3);
+fn header_height_follows_the_art_fit() {
+    let fit = 10
+        + "clauth".len()
+        + format!(" v{}", env!("CARGO_PKG_VERSION")).len()
+        + 3
+        + "[ daemon ]".len();
+    let fit = u16::try_from(fit).expect("narrow");
 
-    let no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
-    assert_eq!(header_height(&no_active), 3);
-
-    let mut compact = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    compact.compact = true;
-    assert_eq!(header_height(&compact), 3);
+    assert_eq!(header_height(Rect::new(0, 0, fit, 14)), 3);
+    assert_eq!(header_height(Rect::new(0, 0, fit - 1, 24)), 2);
+    assert_eq!(header_height(Rect::new(0, 0, 120, 14)), 3);
+    assert_eq!(header_height(Rect::new(0, 0, 120, 13)), 2);
 }
 
 // ── Row 1: the live count, the gauge and the status indicator ────────────
@@ -402,7 +407,7 @@ fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
     );
     for (case, app) in [("compact", &compact), ("no active profile", &no_active)] {
         let rows = render_header_rows(app, 90);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(header_height(Rect::new(0, 0, 90, HEADER_TEST_ROWS)), 3);
         assert!(
             !rows.iter().any(|r| r.contains("uwuclxdy")),
             "{case}: the gauge is on no header row"
@@ -439,7 +444,8 @@ fn row1_gauge_falls_to_the_name_and_percent_before_the_name_clips() {
 
 /// The gauge's last rung is the percent alone, and the indicator is charged
 /// the gauge as rendered: it holds the row at that rung and one column under
-/// it, when the gauge has gone.
+/// it, when the gauge has gone. Both widths sit under the art's fit, so the
+/// no-art row's whole width is the budget.
 #[test]
 fn row1_gauge_falls_to_the_percent_alone_and_then_away() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -447,12 +453,12 @@ fn row1_gauge_falls_to_the_percent_alone_and_then_away() {
     app.tab = Tab::Tokens;
 
     assert_eq!(
-        row_content(&app, 35, 1).trim_end(),
+        render_header_rows(&app, 25)[1].trim_end(),
         "42%    ● status.claude.ai",
-        "the percent holds a `W - 31 >= 4` budget down to 35"
+        "the percent holds a `W - 21 >= 4` budget down to 25"
     );
     assert_eq!(
-        row_content(&app, 34, 1).trim_end(),
+        render_header_rows(&app, 24)[1].trim_end(),
         "      ● status.claude.ai",
         "one column narrower the gauge is gone, the indicator staying"
     );
@@ -631,8 +637,7 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
         let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(n));
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -750,8 +755,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(crate::live_sessions::LiveTally::unread());
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -789,8 +793,7 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 80.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -839,8 +842,7 @@ fn the_split_live_chip_renders_own_then_delegates_with_their_styles() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(split_tally(6, 7));
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -900,8 +902,7 @@ fn a_lone_delegate_part_renders_in_accent_alone() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(split_tally(0, 7));
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -1040,8 +1041,7 @@ fn the_daemon_chip_cells_carry_the_pill_grammar() {
     ] {
         app.daemon_health = health;
         let width = 100;
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1147,7 +1147,7 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
         app.gateway_state = state;
         let expected = expected_shunt_color(state);
         let width = 100;
-        let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1190,23 +1190,21 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
 
 /// The status indicator is right-aligned across an elastic gap, and it DROPS
 /// whole when the row cannot hold it: a dot left to render would clip the feed
-/// mid-word. With no gauge on the row, the indicator's own fit (`col >= 18 + 3`)
-/// never passes inside the sub-30 band — there the logo column yields its
-/// cells to the `Min(20)` text column, capping it at 20 — so the gate decides
-/// at the band's edge: at 31 the text column is 21 and the indicator renders
-/// with its 3-cell gap; at 30 it drops whole.
+/// mid-word. With the art gone the row has the whole frame width, so with no
+/// gauge on it the indicator's own fit (`col >= 18 + 3`) decides: at 21 it
+/// renders with its 3-cell gap; at 20 it drops whole.
 #[test]
 fn the_status_indicator_drops_rather_than_clipping_when_the_row_runs_short() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
 
     assert_eq!(
-        row_content(&app, 31, 1),
+        render_header_rows(&app, 21)[1],
         "   ● status.claude.ai",
         "exact fit: the indicator renders with its 3-cell gap"
     );
     assert_eq!(
-        row_content(&app, 30, 1).trim_end(),
+        render_header_rows(&app, 20)[1].trim_end(),
         "",
         "one column narrower it drops whole rather than clipping the feed"
     );
@@ -1298,7 +1296,11 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
-    for (y, row) in rows.iter().take(header_height(&app) as usize).enumerate() {
+    for (y, row) in rows
+        .iter()
+        .take(header_height(Rect::new(0, 0, 100, 30)) as usize)
+        .enumerate()
+    {
         assert!(
             !row.contains("ACCOUNTS"),
             "header row {y} carries no ACCOUNTS: {row:?}"
@@ -1515,8 +1517,7 @@ fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(0));
         app.set_tps(Some(tps_snapshot(1_000, rate, None)));
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1574,8 +1575,7 @@ fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(0));
         app.set_tps(None);
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1969,7 +1969,8 @@ fn a_launcher_exited_bg_job_and_a_held_row_render_two_live_sessions() {
 }
 
 /// On an xterm-256 terminal the cut-outs take palette index 16, the cube's
-/// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint.
+/// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint; the
+/// body surface itself is unpainted.
 #[test]
 fn the_cut_outs_stay_black_on_the_compatible_tier() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1977,7 +1978,7 @@ fn the_cut_outs_stay_black_on_the_compatible_tier() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
-    let bg = Color::Indexed(235);
+    let bg = Color::Reset;
     let body = Color::Indexed(173);
     let text = Color::Indexed(189);
     let black = Color::Indexed(16);

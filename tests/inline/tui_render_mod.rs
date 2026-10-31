@@ -603,10 +603,10 @@ fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
         })
         .collect();
     app.services.cursor = 3;
-    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     let bottom = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(bottom[6].contains("herdr"), "last service is visible");
+    assert!(bottom[5].contains("herdr"), "last service is visible");
     assert_eq!(
         app.services.selector.offset.get(),
         1,
@@ -616,11 +616,11 @@ fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let adjacent = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
-        adjacent[5].contains("plugin"),
+        adjacent[4].contains("plugin"),
         "cursor moves inside the viewport"
     );
     assert!(
-        adjacent[6].contains("herdr"),
+        adjacent[5].contains("herdr"),
         "lower context remains visible"
     );
     assert_eq!(
@@ -656,42 +656,42 @@ fn a_three_line_status_viewport_shows_only_whole_incidents() {
         .collect();
     app.tab = Tab::Status;
     app.status.cursor = 11;
-    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(rows[4].contains("incident-11"), "selected title is visible");
+    assert!(rows[3].contains("incident-11"), "selected title is visible");
     assert_eq!(
-        rows[5].chars().take(22).collect::<String>(),
+        rows[4].chars().take(22).collect::<String>(),
         "│        ● monitoring ",
         "selected phase line is visible"
     );
-    assert!(!rows[6].contains("incident-"), "no orphan title at bottom");
+    assert!(!rows[5].contains("incident-"), "no orphan title at bottom");
     assert_eq!(app.status.selector.offset.get(), 22);
     assert_eq!(
-        term.backend().buffer().cell((22, 6)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 5)).unwrap().symbol(),
         "┃",
         "thumb reaches the bottom of the full panel viewport"
     );
     assert_eq!(
-        term.backend().buffer().cell((22, 5)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 4)).unwrap().symbol(),
         "┊",
         "track occupies the whole panel above the bottom thumb"
     );
     app.status.cursor = 0;
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(rows[4].contains("incident-00"), "first title is reachable");
+    assert!(rows[3].contains("incident-00"), "first title is reachable");
     assert_eq!(
-        rows[5].chars().take(22).collect::<String>(),
+        rows[4].chars().take(22).collect::<String>(),
         "│        ● monitoring ",
         "first phase line is visible"
     );
     assert!(
-        !rows[6].contains("incident-"),
+        !rows[5].contains("incident-"),
         "bottom stays whole at the top"
     );
     assert_eq!(
-        term.backend().buffer().cell((22, 4)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 3)).unwrap().symbol(),
         "┃",
         "thumb reaches the top"
     );
@@ -6018,7 +6018,7 @@ fn forms_and_overview_codex_page_by_hand_pinned_cursors() {
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
-    assert_eq!(app.fallback_detail_cursor, 2, "fallback card page");
+    assert_eq!(app.fallback_detail_cursor, 3, "fallback card page");
 
     // Fallback `+ add` picker: 24 candidates at 80x24, page = 17.
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
@@ -8475,9 +8475,9 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
     app.tab = Tab::Tokens;
     app.anim_phase_ms = Some(5_000);
     let want: &[(&str, u16, &str)] = &[
-        ("alpha", 28, "▝▜██████"),
-        ("bravo", 28, "▝▜██████"),
-        ("charlie", 28, "▝▜██████"),
+        ("alpha", 28, "1%        ● status.claude.ai"),
+        ("bravo", 28, "73.42%    ● status.claude.ai"),
+        ("charlie", 28, "100%      ● status.claude.ai"),
         ("alpha", 45, "▝▜██████▀ alpha 1%         ● status.claude.ai"),
         ("bravo", 45, "▝▜██████▀ bravo 73.42%     ● status.claude.ai"),
         (
@@ -9398,5 +9398,437 @@ fn the_empty_state_keeps_its_action_line_on_a_short_pane() {
         pane_interior_rows(&services, 45, 20, "SERVICES"),
         ["no services yet", "r to run", ""],
         "services rows"
+    );
+}
+
+fn header_app(tab: crate::tui::app::Tab) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work", false)],
+    });
+    app.tab = tab;
+    app
+}
+
+/// The cell column where `needle` starts on `row`, counted in cells.
+fn cell_col(row: &str, needle: &str) -> Option<usize> {
+    row.find(needle).map(|at| row[..at].chars().count())
+}
+
+/// Which service chips a no-art header shows depends on the terminal width
+/// alone: switching tabs at a fixed width never shows or hides a chip.
+#[test]
+fn the_no_art_chips_hold_across_a_tab_switch() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let tabs = [
+        Tab::Overview,
+        Tab::Usage,
+        Tab::Tokens,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Config,
+        Tab::Status,
+        Tab::Services,
+    ];
+    for width in 40..=70u16 {
+        let chips: Vec<(bool, bool)> = tabs
+            .iter()
+            .map(|&tab| {
+                let frame = dump(&header_app(tab), width, 13);
+                let row0 = frame.lines().next().unwrap_or_default().to_string();
+                (row0.contains("[ shunt ]"), row0.contains("[ daemon ]"))
+            })
+            .collect();
+        assert!(
+            chips.windows(2).all(|pair| pair[0] == pair[1]),
+            "at {width} columns the chips change with the tab: {chips:?}"
+        );
+    }
+}
+
+/// The service chips outrank the full tab strip: at 80 columns the tab bar
+/// collapses to its overflow form and both chips keep the right edge.
+#[test]
+fn the_no_art_header_keeps_both_chips_beside_a_collapsed_tab_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 80, 13);
+    let rows: Vec<&str> = frame.lines().collect();
+    let left = format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"));
+    let chips = "[ shunt ]  [ daemon ]";
+    let gap = 80 - left.chars().count() - chips.chars().count();
+    assert_eq!(rows[0], format!("{left}{}{chips}", " ".repeat(gap)));
+}
+
+/// The two-row header at 80x13: brand and version at column 0, the no-logo
+/// separator, the overflow tabs, both chips on the right edge, and the status
+/// line below. Whole rows by equality.
+#[test]
+fn the_no_art_header_at_eighty_by_thirteen() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 80, 13);
+    let rows: Vec<&str> = frame.lines().collect();
+    let left = format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"));
+    let chips = "[ shunt ]  [ daemon ]";
+    let gap = 80 - left.chars().count() - chips.chars().count();
+    assert_eq!(rows[0], format!("{left}{}{chips}", " ".repeat(gap)));
+    assert_eq!(
+        rows[1],
+        format!("{:<62}● status.claude.ai", "[ 0 live ]  [ — tok/s ]")
+    );
+}
+
+/// The two-row header at 36x24 (under the art's fit width): same shape, the
+/// status line left of the live/tok-s chips' budget. The row is 30 cells, so
+/// neither chip fits and the overflow bar stands whole.
+#[test]
+fn the_no_art_header_at_thirty_six_by_twenty_four() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 36, 24);
+    let rows: Vec<&str> = frame.lines().collect();
+    assert_eq!(
+        rows[0],
+        format!(
+            "{:<36}",
+            format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"))
+        )
+    );
+    assert_eq!(rows[1], format!("{:<18}● status.claude.ai", ""));
+}
+
+/// The no-art row's shed ladder, each seam pinned on both sides by whole-row
+/// equality: the `[ herdr ]` tag, then the tab bar's collapse to its overflow
+/// form, then the shunt chip, then the daemon chip.
+///
+/// The spans: `clauth` (6) + ` v<version>` (8) = 14, the no-logo separator
+/// `  •  ` (5), the full strip 73 (8 labels, seven 3-cell separators), the
+/// widest overflow bar 14 (`‹  fallback  ›`, the middle tab), the tag
+/// `  [ herdr ]` (11), the 3-cell gap before a chip set, both chips
+/// `[ shunt ]` (9) + `  ` (2) + `[ daemon ]` (10) = 21, the daemon chip (10).
+/// The collapse and the chip seams charge the widest bar over every tab, so a
+/// tab switch never moves one.
+#[test]
+fn the_no_art_row_sheds_the_tag_then_collapses_then_the_chips() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let strip = "overview   usage   tokens   setup   fallback   config   status   services";
+    let bar = "overview  ›";
+    let chips = "[ shunt ]  [ daemon ]";
+    let daemon = "[ daemon ]";
+
+    // 6 + 8 + 11 + 5 + 73 + 3 + 21 = 127: the tag rides only while the full
+    // strip and both chips fit beside it.
+    let herdr = header_app(crate::tui::app::Tab::Overview).with_herdr_mode(true);
+    let at = dump(&herdr, 127, 13);
+    let at: Vec<&str> = at.lines().collect();
+    assert_eq!(
+        at[0],
+        format!(
+            "clauth  [ herdr ] v{version}  •  {strip}{}{chips}",
+            " ".repeat(3)
+        )
+    );
+    // Without the tag the chips keep the right edge, 13 cells off the tabs.
+    let off = dump(&herdr, 126, 13);
+    let off: Vec<&str> = off.lines().collect();
+    assert_eq!(
+        off[0],
+        format!("clauth v{version}  •  {strip}{}{chips}", " ".repeat(13))
+    );
+
+    // 6 + 8 + 5 + 73 + 3 + 21 = 116: the full strip with both chips. One
+    // column narrower and the bar collapses to its widest overflow form,
+    // 6 + 8 + 5 + 14 + 3 + 21 = 57, while both chips stay.
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let both = dump(&app, 116, 13);
+    let both: Vec<&str> = both.lines().collect();
+    assert_eq!(
+        both[0],
+        format!("clauth v{version}  •  {strip}{}{chips}", " ".repeat(3))
+    );
+    let collapsed = dump(&app, 115, 13);
+    let collapsed: Vec<&str> = collapsed.lines().collect();
+    assert_eq!(
+        collapsed[0],
+        format!("clauth v{version}  •  {bar}{}{chips}", " ".repeat(64))
+    );
+
+    // At 57 the shunt chip is the next to go; one column narrower and only
+    // the daemon chip rides the row (6 + 8 + 5 + 14 + 3 + 10 = 46), 16 cells
+    // off the bar.
+    let shunt_at = dump(&app, 57, 13);
+    let shunt_at: Vec<&str> = shunt_at.lines().collect();
+    assert_eq!(
+        shunt_at[0],
+        format!("clauth v{version}  •  {bar}{}{chips}", " ".repeat(6))
+    );
+    let shunt_gone = dump(&app, 56, 13);
+    let shunt_gone: Vec<&str> = shunt_gone.lines().collect();
+    assert_eq!(
+        shunt_gone[0],
+        format!("clauth v{version}  •  {bar}{}{daemon}", " ".repeat(16))
+    );
+
+    // At 46 the daemon chip is the last to fit; one column narrower sheds it
+    // and the bar alone reads 6 + 8 + 5 + 14 = 33 cells.
+    let daemon_at = dump(&app, 46, 13);
+    let daemon_at: Vec<&str> = daemon_at.lines().collect();
+    assert_eq!(
+        daemon_at[0],
+        format!("clauth v{version}  •  {bar}{}{daemon}", " ".repeat(6))
+    );
+    let no_chip = dump(&app, 45, 13);
+    let no_chip: Vec<&str> = no_chip.lines().collect();
+    assert_eq!(
+        no_chip[0],
+        format!("{:<45}", format!("clauth v{version}  •  {bar}"))
+    );
+    let bar_at = dump(&app, 33, 13);
+    let bar_at: Vec<&str> = bar_at.lines().collect();
+    assert_eq!(
+        bar_at[0],
+        format!("{:<33}", format!("clauth v{version}  •  {bar}"))
+    );
+}
+
+/// Under the widest overflow bar's reserved slot (33 columns) the bar and its
+/// separator drop whole rather than a label cut mid-word; brand and version
+/// still hold the row.
+#[test]
+fn the_no_art_bar_drops_whole_below_its_reserved_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let left = format!("clauth v{version}");
+    for width in [20usize, 29, 32] {
+        let app = header_app(crate::tui::app::Tab::Overview);
+        let frame = dump(&app, width as u16, 13);
+        let rows: Vec<&str> = frame.lines().collect();
+        assert_eq!(rows[0], format!("{left:<width$}"), "{width} columns");
+    }
+}
+
+/// The overflow bar's chevrons follow the active tab: none to the left at the
+/// first tab, both around a middle one, none to the right at the last.
+#[test]
+fn the_no_art_overflow_bar_marks_the_active_tabs_edges() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    for (tab, bar) in [
+        (crate::tui::app::Tab::Overview, "overview  ›"),
+        (crate::tui::app::Tab::Tokens, "‹  tokens  ›"),
+        (crate::tui::app::Tab::Services, "‹  services"),
+    ] {
+        let app = header_app(tab);
+        let frame = dump(&app, 36, 24);
+        let rows: Vec<&str> = frame.lines().collect();
+        assert_eq!(
+            rows[0],
+            format!("{:<36}", format!("clauth v{version}  •  {bar}")),
+            "{tab:?}"
+        );
+    }
+}
+
+/// The art header at 80x24 and at its exact fit width, 37x14
+/// (10 logo + 6 brand + 8 version + 3 gap + 10 daemon chip): whole rows by
+/// equality, so the three-row shape is pinned above its gate too.
+#[test]
+fn the_art_header_rows_at_twenty_four_rows_and_at_the_exact_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let version = env!("CARGO_PKG_VERSION");
+
+    let wide = dump(&app, 80, 24);
+    let wide: Vec<&str> = wide.lines().collect();
+    // 10 logo + 14 brand+version + 35 gap + 21 chips = 80.
+    assert_eq!(
+        wide[0],
+        format!(
+            " ▐▛███▛█  clauth v{version}{}[ shunt ]  [ daemon ]",
+            " ".repeat(35)
+        )
+    );
+    assert_eq!(wide[2], format!("{:<80}", " ▝▝   ▝▝  overview  ›"));
+
+    let fit = dump(&app, 37, 14);
+    let fit: Vec<&str> = fit.lines().collect();
+    assert_eq!(
+        fit[0],
+        format!(
+            "{:<37}",
+            format!(" ▐▛███▛█  clauth v{version}   [ daemon ]")
+        )
+    );
+    assert_eq!(fit[2], format!("{:<37}", " ▝▝   ▝▝  overview  ›"));
+}
+
+/// The art header needs the art's rows plus a usable body: under 14 rows the
+/// header drops the art and carries the tabs on its brand row.
+#[test]
+fn the_art_header_needs_fourteen_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+
+    let tall = dump(&app, 80, 14);
+    let tall: Vec<&str> = tall.lines().collect();
+    assert_eq!(
+        cell_col(tall[0], "clauth"),
+        Some(10),
+        "at 14 rows the brand sits right of the art: {tall:?}"
+    );
+    assert!(
+        !tall[0].contains("overview") && tall[2].contains("overview"),
+        "at 14 rows the tabs keep their own row: {tall:?}"
+    );
+
+    let short = dump(&app, 80, 13);
+    let short: Vec<&str> = short.lines().collect();
+    assert!(
+        cell_col(short[0], "clauth").is_some_and(|c| c < 10),
+        "at 13 rows no art sits left of the brand: {short:?}"
+    );
+    assert!(
+        short[0].contains("overview"),
+        "at 13 rows the active tab rides the brand row: {short:?}"
+    );
+    assert!(
+        short[1].contains("status.claude.ai"),
+        "the status line keeps the second row: {short:?}"
+    );
+}
+
+/// The art header needs width for the art plus brand, version and the daemon
+/// chip with the content gap; one column less drops the art.
+#[test]
+fn the_art_header_needs_room_for_brand_version_and_the_daemon_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let fit = 10
+        + "clauth".len()
+        + format!(" v{}", env!("CARGO_PKG_VERSION")).len()
+        + 3
+        + "[ daemon ]".len();
+    let fit = u16::try_from(fit).expect("narrow");
+
+    let wide = dump(&app, fit, 24);
+    let wide: Vec<&str> = wide.lines().collect();
+    assert_eq!(
+        cell_col(wide[0], "clauth"),
+        Some(10),
+        "at {fit} columns the art fits: {wide:?}"
+    );
+    assert!(
+        wide[0].contains("[ daemon ]"),
+        "at {fit} columns the daemon chip fits beside the art: {wide:?}"
+    );
+
+    let narrow = dump(&app, fit - 1, 24);
+    let narrow: Vec<&str> = narrow.lines().collect();
+    assert!(
+        cell_col(narrow[0], "clauth").is_some_and(|c| c < 10),
+        "at {} columns the art drops: {narrow:?}",
+        fit - 1
+    );
+    assert!(
+        narrow[0].contains("overview"),
+        "at {} columns the active tab rides the brand row: {narrow:?}",
+        fit - 1
+    );
+    assert!(
+        narrow[0].contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "brand and version never clip: {narrow:?}"
+    );
+}
+
+/// The Tokens tab's loading panel is the screen's only panel, so it owns the
+/// focus border.
+#[test]
+fn the_sole_tokens_loading_panel_takes_the_focused_border() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = header_app(crate::tui::app::Tab::Tokens);
+    app.token_stats = None;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let corner = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .find(|&p| buf[p].symbol() == "╭")
+        .expect("the loading panel draws a top-left corner");
+    assert_eq!(
+        buf[corner].style().fg,
+        Some(crate::tui::theme::line_strong_color()),
+        "the sole panel's border is the focused LINE_STRONG"
+    );
+}
+
+fn surface_cells(app: &App, w: u16, h: u16) -> Vec<(u16, u16, ratatui::style::Color)> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let mut cells = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if let Some(bg) = buf[(x, y)].style().bg {
+                cells.push((x, y, bg));
+            }
+        }
+    }
+    cells
+}
+
+/// On the compatible tier the surfaces inherit the terminal's own background:
+/// no cell carries the base or sunken fill, while the selected-row tint stays.
+#[test]
+fn the_compatible_tier_paints_no_surface_fill() {
+    use crate::tui::app::Tab;
+    use ratatui::style::Color;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    for tab in [
+        Tab::Overview,
+        Tab::Usage,
+        Tab::Tokens,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Config,
+        Tab::Status,
+        Tab::Services,
+    ] {
+        let app = header_app(tab);
+        let cells = surface_cells(&app, 100, 30);
+        let painted: Vec<_> = cells
+            .iter()
+            .filter(|(_, _, bg)| matches!(bg, Color::Indexed(235) | Color::Indexed(233)))
+            .collect();
+        assert!(
+            painted.is_empty(),
+            "{tab:?} paints a surface fill on the compatible tier at {:?}",
+            painted.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+    let app = header_app(Tab::Overview);
+    assert!(
+        surface_cells(&app, 100, 30)
+            .iter()
+            .any(|(_, _, bg)| *bg == Color::Indexed(236)),
+        "the selected-row tint survives the compatible tier"
+    );
+}
+
+/// The full tier keeps painting its base surface.
+#[test]
+fn the_full_tier_paints_the_base_surface() {
+    use ratatui::style::Color;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = header_app(crate::tui::app::Tab::Overview);
+    assert!(
+        surface_cells(&app, 100, 30)
+            .iter()
+            .any(|(_, _, bg)| *bg == Color::Rgb(30, 30, 46)),
+        "the full tier paints BG"
     );
 }

@@ -144,7 +144,7 @@ fn selector_row(
 
     let caret = if selected && focused {
         Span::styled(
-            "❯ ",
+            format!("{} ", theme::CARET),
             with_bg(
                 Style::default()
                     .fg(theme::accent_color())
@@ -156,7 +156,7 @@ fn selector_row(
         Span::styled("  ", with_bg(Style::default(), tint))
     };
     let dot = Span::styled(
-        "● ",
+        format!("{} ", theme::DOT_ON),
         with_bg(Style::default().fg(health_color(health)), tint),
     );
     let label_style = if selected && focused {
@@ -1020,14 +1020,14 @@ fn token_row_lines(name: &str, selected: bool, app: &App, width: usize) -> Vec<L
             && at.elapsed().as_millis() < SHUNT_OK_MS as u128
     });
     let caret = if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if saving {
         Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
@@ -1069,7 +1069,7 @@ fn add_token_line(selected: bool, app: &App) -> Line<'static> {
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
@@ -1235,13 +1235,17 @@ pub(super) fn route_label(r: &RouteView, room: usize) -> String {
 /// success, `SHUNT_OK_MS`) replaces the caret the way a field row's does.
 fn entry_lead(expanded: bool, selected: bool, ok: bool) -> Vec<Span<'static>> {
     let caret = if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
-    let glyph = if expanded { "▼" } else { "▶" };
+    let glyph = if expanded {
+        theme::DISCLOSURE_OPEN
+    } else {
+        theme::DISCLOSURE_SHUT
+    };
     let glyph_style = if expanded {
         theme::accent()
     } else {
@@ -1260,7 +1264,7 @@ fn action_lead(saving: bool, selected: bool, app: &App) -> Span<'static> {
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     }
@@ -1576,11 +1580,11 @@ fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
             theme::accent(),
         )
     } else if editing {
-        Span::styled("✎ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     }
@@ -1622,9 +1626,9 @@ fn bind_suffix(server: &ServerView) -> Option<String> {
 }
 
 /// One field row (plus, under an edited field, its refusal `└` line): the caret
-/// slot, the label, then the value — the typed buffer on `bg_sunken` while its
-/// editor is open, a cycle run at rest or over a pending pick, and while the
-/// save runs a shimmer crest over the value with a dim `checking` trail.
+/// slot, the label, then the value — the typed buffer while its editor is
+/// open, a cycle run at rest or over a pending pick, and while the save runs a
+/// shimmer crest over the value with a dim `checking` trail.
 fn field_row_lines(
     view: &ConfigView,
     key: &ShuntFieldKey,
@@ -1693,9 +1697,9 @@ fn field_row_lines(
         return vec![Line::from(spans)];
     }
 
-    // The typed editor: the buffer on `bg_sunken` (the shared Setup editor
-    // body, `DANGER` while a refusal shows), the native cursor owns the caret
-    // glyph (no simulated block). The refusal line trails under it.
+    // The typed editor: the buffer (the shared Setup editor body, `DANGER`
+    // while a refusal shows), the native cursor owns the caret glyph (no
+    // simulated block). The refusal line trails under it.
     if let Some(edit) = edit_state {
         match &edit.edit {
             ShuntFieldEdit::Typed { input, .. } => {
@@ -1878,7 +1882,14 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
         ShuntFocus::Fix { .. } => {
             if inert {
                 Line::from(vec![
-                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled(
+                        if selected {
+                            format!("{} ", theme::CARET)
+                        } else {
+                            "  ".to_string()
+                        },
+                        theme::faint(),
+                    ),
                     Span::styled(text.to_string(), theme::faint()),
                 ])
             } else {
@@ -1894,12 +1905,19 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
                 .unwrap_or(false);
             let (arrow, label) = if inert {
                 (
-                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled(
+                        if selected {
+                            format!("{} ", theme::CARET)
+                        } else {
+                            "  ".to_string()
+                        },
+                        theme::faint(),
+                    ),
                     Span::styled("enabled  ", theme::faint()),
                 )
             } else if selected {
                 (
-                    Span::styled("❯ ", theme::accent().bold()),
+                    Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
                     Span::styled("enabled  ", label_style(true)),
                 )
             } else {
@@ -2264,9 +2282,9 @@ fn option_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected && inert {
-        Span::styled("❯ ", theme::faint())
+        Span::styled(format!("{} ", theme::CARET), theme::faint())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -2427,7 +2445,7 @@ fn is_path_key(key: &str) -> bool {
 fn problem_line(text: &str, selected: bool) -> Line<'static> {
     let (lead, base) = if selected {
         (
-            Span::styled("❯ ", theme::accent().bold()),
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
             label_style(true),
         )
     } else {
@@ -2561,7 +2579,10 @@ fn delegate_row_line(
     focused: bool,
 ) -> Line<'static> {
     let caret = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled(
+            format!("{} ", theme::CARET),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     };
@@ -2610,8 +2631,8 @@ fn delegate_row_line(
 /// gone: the contract's active / disconnected dot pair.
 fn state_mark(phase: JobPhase) -> &'static str {
     match phase {
-        JobPhase::Running | JobPhase::Blocking | JobPhase::Done => "●",
-        JobPhase::Orphaned => "○",
+        JobPhase::Running | JobPhase::Blocking | JobPhase::Done => theme::DOT_ON,
+        JobPhase::Orphaned => theme::DOT_OFF,
     }
 }
 

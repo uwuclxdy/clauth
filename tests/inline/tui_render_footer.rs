@@ -2132,7 +2132,11 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
         )
     }
 
-    fn check(app: &App, name: &str, w: u16) {
+    fn check(app: &App, name: &str, w: u16, tier: crate::tui::theme::Tier) {
+        let fill = match tier {
+            crate::tui::theme::Tier::Full => ratatui::style::Color::Rgb(30, 30, 46),
+            crate::tui::theme::Tier::Compatible => ratatui::style::Color::Reset,
+        };
         let (row, cells) = footer_at(app, w, 24);
         let expected = format!(" i saving {name}\u{2026} · \u{2303}c \u{2303}c quit now");
         assert_eq!(row.trim_end(), expected, "whole row at {w}, got {row:?}");
@@ -2153,7 +2157,7 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
                 bold,
                 "cell {i} bold at {w}"
             );
-            assert_eq!(cell.bg, crate::tui::theme::bg(), "cell {i} bg at {w}");
+            assert_eq!(cell.bg, fill, "cell {i} bg at {w}");
         }
     }
 
@@ -2169,15 +2173,15 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
             app.tab = tab;
             app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
             app.exit_wait = true;
-            check(&app, "bind", 80);
-            check(&app, "bind", 34);
+            check(&app, "bind", 80, tier);
+            check(&app, "bind", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
             app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
             app.exit_wait = true;
-            check(&app, "upstream", 80);
-            check(&app, "upstr", 34);
+            check(&app, "upstream", 80, tier);
+            check(&app, "upstr", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
@@ -2186,8 +2190,8 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
                 occurrence: 0,
             })));
             app.exit_wait = true;
-            check(&app, "a", 80);
-            check(&app, "a", 34);
+            check(&app, "a", 80, tier);
+            check(&app, "a", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
@@ -2197,15 +2201,15 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
             ));
             app.pool_mutation_kind = Some(PoolMutationKind::Remove);
             app.exit_wait = true;
-            check(&app, "alpha", 80);
-            check(&app, "alpha", 34);
+            check(&app, "alpha", 80, tier);
+            check(&app, "alpha", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
             app.services.shunt_action.running = true;
             app.exit_wait = true;
-            check(&app, "shunt", 80);
-            check(&app, "shunt", 34);
+            check(&app, "shunt", 80, tier);
+            check(&app, "shunt", 34, tier);
         }
     }
 
@@ -2220,16 +2224,18 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
         app.tab = Tab::Overview;
         app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
         app.loss_pending = Some(LossWarningTarget::Quit);
-        check(&app, "upstream", 80);
+        check(&app, "upstream", 80, tier);
     }
 
     // The hints return once the wait ends.
+    let tier = crate::tui::theme::Tier::Full;
+    let _tier = crate::testutil::TierSandbox::new(tier);
     let mut app = bare_app();
     app.tab = Tab::Services;
     let at_rest = settled_footer(&app, 80, 24);
     app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
     app.exit_wait = true;
-    check(&app, "bind", 80);
+    check(&app, "bind", 80, tier);
     app.exit_wait = false;
     app.services.shunt_save = None;
     assert_eq!(

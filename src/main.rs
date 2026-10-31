@@ -3028,9 +3028,10 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
     runtime::gc_stale_runtimes();
     completions::auto_install_once();
     let config = load_config()?;
-    // Config-file tier: profiles.toml `theme = "full"|"compatible"`.
-    // CLI flag beats config; both beat auto-detect.
-    let config_tier = config.state.theme.map(|t| match t {
+    // Config-file tier: profiles.toml `[theme] name = "full"|"compatible"`
+    // (an older scalar `theme = "..."` still reads). CLI flag beats config;
+    // both beat auto-detect.
+    let config_tier = config.state.theme_tier().map(|t| match t {
         ThemeName::Full => tui::theme::Tier::Full,
         ThemeName::Compatible => tui::theme::Tier::Compatible,
     });

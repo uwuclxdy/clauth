@@ -894,7 +894,8 @@ fn failed_cache_line() -> Line<'static> {
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
         let area = clamp_width(area, DASH_MAX_W);
-        let block = section_box("tokens", false, true, area.width);
+        // The screen's only panel, so it owns the focus border.
+        let block = section_box("tokens", true, true, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = if app.tokens_failed {

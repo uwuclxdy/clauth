@@ -179,6 +179,13 @@ fn pick(full: Color, compatible: Color) -> Color {
 }
 
 // ── Surfaces ──────────────────────────────────────────────────────────────────
+//
+// The painted surface colours are the full tier's fills and, on the compatible
+// tier, the colour a surface's text rides when it sits on an inverse fill. A
+// surface fill paints only on the full tier; the selected-row tint (`bg_hover`)
+// and the toast glass (`bg_sunken` blended) paint on both. Otherwise the
+// compatible tier leaves a surface unpainted so the terminal's own background
+// shows through, and elevation falls to borders and colour alone.
 #[inline]
 pub(crate) fn bg() -> Color {
     pick(Color::Rgb(30, 30, 46), Color::Indexed(235))
@@ -186,6 +193,18 @@ pub(crate) fn bg() -> Color {
 #[inline]
 pub(crate) fn bg_sunken() -> Color {
     pick(Color::Rgb(17, 17, 27), Color::Indexed(233))
+}
+
+/// The base surface fill (`BG`), unpainted on the compatible tier.
+#[inline]
+pub(crate) fn surface_fill() -> Color {
+    pick(Color::Rgb(30, 30, 46), Color::Reset)
+}
+
+/// The sunken surface fill (`BG_SUNKEN`), unpainted on the compatible tier.
+#[inline]
+pub(crate) fn sunken_fill() -> Color {
+    pick(Color::Rgb(17, 17, 27), Color::Reset)
 }
 #[inline]
 pub(crate) fn bg_hover() -> Color {
@@ -396,6 +415,27 @@ fn nearest_index(rgb: (u8, u8, u8)) -> u8 {
     best
 }
 
+// ── Marks (tier-independent) ──────────────────────────────────────────────────
+
+/// Selection caret, drawn only inside the focused pane.
+pub(crate) const CARET: &str = "❯";
+/// Filled status dot — active / online.
+pub(crate) const DOT_ON: &str = "●";
+/// Hollow status dot — inactive / disconnected.
+pub(crate) const DOT_OFF: &str = "○";
+/// Done / captured mark.
+pub(crate) const DONE: &str = "✓";
+/// Collapsed disclosure arrow.
+pub(crate) const DISCLOSURE_SHUT: &str = "▶";
+/// Expanded disclosure arrow.
+pub(crate) const DISCLOSURE_OPEN: &str = "▼";
+/// Heavy vertical: the toast's left bar and the scrollbar's thumb.
+pub(crate) const BAR: &str = "┃";
+/// Scrollbar track.
+pub(crate) const TRACK: &str = "┊";
+/// Static waiting mark — `queued` / `idle`.
+pub(crate) const WAITING: &str = "◌";
+
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
 
 /// Toggle switch in the **on** state.
@@ -470,7 +510,7 @@ pub(crate) fn dead_credential_glyph() -> &'static str {
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn base() -> Style {
-    Style::default().fg(text_color()).bg(bg())
+    Style::default().fg(text_color()).bg(surface_fill())
 }
 
 /// Plain body text — foreground only.

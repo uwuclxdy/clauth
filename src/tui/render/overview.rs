@@ -944,7 +944,7 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     // The two-cell cursor prefix keeps Codex markers under the Claude column.
     let mut spans = vec![
         if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         },
@@ -1055,7 +1055,7 @@ fn render_pool_row(
     };
     let mut spans = vec![
         if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         },
@@ -1187,7 +1187,7 @@ fn render_overview_row(
     // reads off the timer instead of the bar brackets.
     let cue = fetch_cue_color(profile, readings.status_of(&profile.name));
     let cursor = if selected && focused {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };

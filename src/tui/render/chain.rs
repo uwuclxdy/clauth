@@ -111,7 +111,10 @@ fn draw_chain_selector(
                             // downstream shifts.
                             let ord = format!("#{}", i + 1);
                             let rail = if selected && focused {
-                                Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
+                                Span::styled(
+                                    format!("{} {ord:>3} ", theme::CARET),
+                                    theme::accent().bold(),
+                                )
                             } else {
                                 Span::styled(format!("  {ord:>3} "), theme::faint())
                             };
@@ -172,7 +175,7 @@ fn draw_chain_selector(
                         }
                         ChainItemKind::Add => {
                             let arrow = if selected && focused {
-                                Span::styled("❯ ", theme::accent().bold())
+                                Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
                             } else {
                                 Span::raw("  ")
                             };
@@ -1495,7 +1498,7 @@ fn detail_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -1560,7 +1563,7 @@ fn detail_row(
             // it) — same disabled-row contract as the budget-off ceiling.
             let dimmed = !check_weekly && editing.is_none();
             let arrow = if dimmed && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1669,7 +1672,7 @@ fn detail_row(
             // `max_spend_hint` names the holding half.
             let dimmed = !spend_budget && editing.is_none();
             let arrow = if dimmed && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1882,7 +1885,7 @@ fn day_picker_lines(days: &[Weekday], caret: usize, width: usize) -> Vec<Line<'s
                 }
                 let picked = days.contains(&WEEKDAYS_ALL[i]);
                 spans.push(if i == caret {
-                    Span::styled("❯", theme::accent().bold())
+                    Span::styled(theme::CARET, theme::accent().bold())
                 } else {
                     Span::raw(" ")
                 });
@@ -1969,7 +1972,7 @@ fn add_detail(
             focus.0 = lines.len();
         }
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         };

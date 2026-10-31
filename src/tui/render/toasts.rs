@@ -44,7 +44,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .rows
             .into_iter()
             .map(|wrapped| {
-                let mut spans = vec![Span::styled("┃ ", bar_style)];
+                let mut spans = vec![Span::styled(format!("{} ", theme::BAR), bar_style)];
                 spans.extend(wrapped);
                 Line::from(spans)
             })

@@ -6681,3 +6681,81 @@ fn a_store_already_sharing_a_chain_still_rewrites_it() {
         "b's store"
     );
 }
+
+#[test]
+fn the_scalar_theme_key_still_reads() {
+    let state: AppState =
+        toml::from_str("profiles = []\ntheme = \"compatible\"\n").expect("parses");
+    assert_eq!(state.theme_tier(), Some(ThemeName::Compatible));
+}
+
+#[test]
+fn the_theme_table_names_the_tier() {
+    for (name, want) in [
+        ("full", ThemeName::Full),
+        ("compatible", ThemeName::Compatible),
+    ] {
+        let state: AppState =
+            toml::from_str(&format!("profiles = []\n[theme]\nname = \"{name}\"\n"))
+                .expect("parses");
+        assert_eq!(state.theme_tier(), Some(want), "{name}");
+    }
+}
+
+/// A name this build does not know leaves the tier to auto-detection and is
+/// kept, so a later build that knows it still finds it after any save.
+#[test]
+fn an_unknown_theme_name_reads_as_unset_and_survives_a_save() {
+    let mut state: AppState = toml::from_str("profiles = []\n[theme]\nname = \"dracula\"\n")
+        .expect("an unknown theme name parses");
+    assert_eq!(state.theme_tier(), None);
+    state.auto_start_queue = true;
+    let written = toml::to_string(&state).expect("serializes");
+    let back: toml::Value = toml::from_str(&written).expect("reparses");
+    assert_eq!(
+        back.get("theme")
+            .and_then(|t| t.get("name"))
+            .and_then(toml::Value::as_str),
+        Some("dracula"),
+        "the unknown name rides an unrelated save: {written}"
+    );
+}
+
+/// A save that picks no theme writes the form it read: an older clauth reads
+/// only the scalar, so an unrelated save never turns it into the table.
+#[test]
+fn a_save_without_a_theme_pick_keeps_the_scalar_form() {
+    let mut state: AppState = toml::from_str("profiles = []\ntheme = \"full\"\n").expect("parses");
+    state.auto_start_queue = true;
+    let written = toml::to_string(&state).expect("serializes");
+    let back: toml::Value = toml::from_str(&written).expect("reparses");
+    assert_eq!(
+        back.get("theme").and_then(toml::Value::as_str),
+        Some("full"),
+        "the scalar rides an unrelated save: {written}"
+    );
+}
+
+/// A pick writes the table form, never the scalar.
+#[test]
+fn a_theme_pick_writes_the_table_form() {
+    for scalar_first in [false, true] {
+        let mut state: AppState = if scalar_first {
+            toml::from_str("profiles = []\ntheme = \"full\"\n").expect("parses")
+        } else {
+            AppState::default()
+        };
+        state.set_theme(ThemeName::Compatible);
+        let written = toml::to_string(&state).expect("serializes");
+        let back: toml::Value = toml::from_str(&written).expect("reparses");
+        assert_eq!(
+            back.get("theme")
+                .and_then(|t| t.get("name"))
+                .and_then(toml::Value::as_str),
+            Some("compatible"),
+            "scalar first: {scalar_first}: {written}"
+        );
+        let reread: AppState = toml::from_str(&written).expect("reads back");
+        assert_eq!(reread.theme_tier(), Some(ThemeName::Compatible));
+    }
+}
