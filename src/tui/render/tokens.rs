@@ -2155,15 +2155,14 @@ fn draw_model_detail(
     period: TokenPeriod,
     app: Option<&App>,
 ) {
-    let title = model
-        .map(|m| model_display_name(&m.model))
-        .unwrap_or_else(|| "model".to_string());
-    let block = section_box_verbatim(
-        &title,
-        app.is_some_and(|app| app.model_detail_focus == StatusFocus::Detail),
-        false,
-        area.width,
-    );
+    let focused = app.is_some_and(|app| app.model_detail_focus == StatusFocus::Detail);
+    // The title IS the selected model's own identity, so it keeps its case (the
+    // Panel proper-noun exception); the no-selection fallback is a structural
+    // label and titles the detail uppercase.
+    let block = match model {
+        Some(m) => section_box_verbatim(&model_display_name(&m.model), focused, false, area.width),
+        None => section_box("model", focused, false, area.width),
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

@@ -1125,6 +1125,54 @@ fn short_model_detail_has_no_scrollbar() {
     );
 }
 
+/// The model detail is titled by the selected model's own display name, so it
+/// keeps that name's case (the Panel proper-noun exception); with no model
+/// selected it falls back to the uppercase structural `MODEL` label. Pinned
+/// through the whole Tokens tab, so the `model` the detail is titled with is
+/// whatever `draw_models` hands it — the empty list's `None` included.
+#[test]
+fn the_model_detail_title_keeps_the_selected_models_case() {
+    use crate::tui::app::TokenView;
+
+    fn tab_rows(app: &App) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+    // An unrecognized id passes `model_display_name` through untouched, so
+    // "keeps the case" must mean exactly these bytes — a forced lowercase
+    // would pass an all-lowercase fixture and a forced uppercase a structural
+    // label.
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_stats.as_mut().unwrap().models[0].model = "Llama-4-Maverick".into();
+    app.token_view = TokenView::Models;
+    let rows = tab_rows(&app);
+    let title = rows
+        .iter()
+        .find(|r| r.contains("╭─ Llama-4-Maverick"))
+        .expect("the detail title renders");
+    assert!(
+        title.contains("╭─ Llama-4-Maverick "),
+        "the selected model's identity keeps its case: {title:?}"
+    );
+
+    // No model in the list → the structural `MODEL` title stays uppercase.
+    let mut bare = app_with_stats(TokenPeriod::Lifetime);
+    bare.token_stats.as_mut().unwrap().models.clear();
+    bare.token_view = TokenView::Models;
+    let rows = tab_rows(&bare);
+    assert!(
+        rows.iter().any(|r| r.contains("─ MODEL ")),
+        "the empty list's structural title is uppercase: {rows:?}"
+    );
+    assert!(
+        rows.concat().contains("no model data"),
+        "the empty detail still renders its placeholder"
+    );
+}
+
 #[test]
 fn cost_lens_reads_rates_unavailable_after_a_failed_fetch() {
     let _home = crate::testutil::HomeSandbox::new();
