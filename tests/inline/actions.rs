@@ -8082,6 +8082,398 @@ fn a_failed_endpoint_save_restores_the_in_memory_profile() {
     );
 }
 
+/// A preset carrying a base URL, applied to an OAuth account with no key, saves
+/// the URL unused: memory and the live settings hide it as a load would.
+#[test]
+fn a_url_preset_on_an_oauth_account_stays_out_of_memory_and_settings() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+
+    edit_profile_preset(
+        &mut config,
+        &name,
+        |url, models| {
+            *url = Some("https://y.example".to_string());
+            *models = ModelSettings::default();
+            Ok(())
+        },
+    )
+    .expect("the preset apply saves");
+
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert_eq!(
+        loaded.base_url, None,
+        "a load hides a keyless URL behind the login"
+    );
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "memory derives the URL the way the load does"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the OAuth login: {live:?}"
+    );
+}
+
+/// A preset that moves an account off Alibaba drops its Model Studio console
+/// session, in memory and on disk, as an endpoint edit off Alibaba does.
+#[test]
+fn a_preset_off_alibaba_drops_the_console_session() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("qwen");
+    let mut p = Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        Some("sk-sp-key".to_string()),
+    );
+    p.set_console(Some(crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    }));
+    save_profile(&p).expect("save the Alibaba profile");
+    crate::testutil::register_names(&["qwen"]);
+    let mut config = inactive_config(p);
+
+    edit_profile_preset(
+        &mut config,
+        &name,
+        |url, models| {
+            *url = Some("https://api.deepseek.com/anthropic".to_string());
+            *models = ModelSettings::default();
+            Ok(())
+        },
+    )
+    .expect("the preset apply saves");
+
+    assert!(
+        config
+            .find(&name)
+            .expect("qwen in the roster")
+            .console
+            .is_none(),
+        "memory drops the console session off Alibaba"
+    );
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert!(
+        loaded.console.is_none(),
+        "disk drops the console session off Alibaba"
+    );
+}
+
+/// Duplicating an OAuth account whose saved base URL is unused copies the URL it
+/// routes to (none): the copy holds no login, so carrying the saved URL would
+/// make it an endpoint account with no key.
+#[test]
+fn a_duplicate_of_an_unused_url_account_carries_no_url() {
+    let _home = HomeSandbox::new();
+    let mut p = Profile::new("src".to_string(), None, None);
+    p.credentials = Some(oauth_pair("access-A"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    save_profile(&p).expect("save the source");
+    crate::testutil::register_names(&["src"]);
+    let mut config = inactive_config(p);
+
+    duplicate_profile(&mut config, &ProfileName::from("src"), "dup".to_string())
+        .expect("duplicate");
+
+    let dup = ProfileName::from("dup");
+    let in_memory = config.find(&dup).expect("dup in the roster");
+    assert_eq!(in_memory.base_url, None, "the copy routes nowhere new");
+    assert_eq!(in_memory.saved_base_url(), None, "the copy saves no URL");
+    let loaded = crate::profile::load_profile(&dup).expect("load the copy");
+    assert_eq!(
+        loaded.saved_base_url(),
+        None,
+        "disk holds no URL for the copy"
+    );
+}
+
+/// A base URL committed with no key on an OAuth account is saved but unused:
+/// the next load hides it behind the login, so memory hides it too. Left live
+/// in memory, the active-profile settings write would put the host in
+/// `ANTHROPIC_BASE_URL` beside the OAuth login, and Claude Code would send the
+/// account's OAuth bearer to it.
+#[test]
+fn a_keyless_url_on_an_oauth_account_stays_out_of_memory_and_settings() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the endpoint edit saves");
+
+    let on_disk = std::fs::read_to_string(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("config.toml"),
+    )
+    .expect("read config.toml");
+    assert!(
+        on_disk.contains("base_url = \"https://y.example\""),
+        "the typed URL is saved"
+    );
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert_eq!(
+        loaded.base_url, None,
+        "a load hides a keyless URL behind the login"
+    );
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "memory derives the URL the way the load does"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the OAuth login: {live:?}"
+    );
+}
+
+/// A failed env save restores the in-memory profile to exactly its pre-call
+/// value, as a failed endpoint save does: the env edit re-derives the URL, so a
+/// kept edit would route an unsaved inference token to a URL the disk hides.
+#[cfg(unix)]
+#[test]
+fn a_failed_env_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut p = Profile::new(
+        "acct".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    );
+    p.credentials = Some(oauth_pair("access-A"));
+    crate::profile::save_profile(&p).expect("save the profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    let mut config = inactive_config(crate::profile::load_profile(&name).expect("load"));
+    let before = config.find(&name).expect("acct in the roster").clone();
+    let mut env = BTreeMap::new();
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-unsaved".to_string(),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_env(&mut config, &name, |e| *e = env).expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&name)
+        .expect("acct still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// Committing an EMPTY base-url row on an unused saved URL clears it on disk:
+/// the row states the user's value outright, so emptying a saved-but-unused URL
+/// is not a no-op that leaves the typed value in place.
+#[test]
+fn clearing_an_unused_url_removes_it_from_disk() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .saved_base_url()
+            .as_deref(),
+        Some("https://y.example"),
+        "the keyless commit saves the typed URL"
+    );
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = None;
+        *key = None;
+    })
+    .expect("the clear saves");
+
+    let p = config.find(&name).expect("acct in the roster");
+    assert_eq!(
+        p.saved_base_url(),
+        None,
+        "the cleared row drops the saved URL"
+    );
+    assert_eq!(p.base_url, None, "routing stays on the login");
+    let on_disk = std::fs::read_to_string(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("config.toml"),
+    )
+    .expect("read config.toml");
+    assert!(
+        !on_disk.lines().any(|l| l.starts_with("base_url")),
+        "no base_url line survives on disk:\n{on_disk}"
+    );
+}
+
+/// A preset apply whose save fails restores the in-memory profile: the next
+/// unrelated save must not persist an endpoint the error said did not land.
+#[cfg(unix)]
+#[test]
+fn a_failed_preset_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let p = Profile::new(
+        "acct".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    let mut config = inactive_config(crate::profile::load_profile(&name).expect("load"));
+    let before = config.find(&name).expect("acct in the roster").clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_preset(
+        &mut config,
+        &name,
+        |url, models| {
+            *url = Some("https://api.example.com".to_string());
+            *models = ModelSettings::default();
+            Ok(())
+        },
+    )
+    .expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&name)
+        .expect("acct still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// Adding a key beside a previously unused URL makes memory live and the
+/// active-profile settings carry the URL — the complement of the keyless case,
+/// so the unconditional re-derive cannot strand a now-usable URL.
+#[test]
+fn adding_a_key_beside_an_unused_url_goes_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "the keyless URL stays hidden in memory"
+    );
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = Some("sk-1".to_string());
+    })
+    .expect("the keyed endpoint edit saves");
+
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .base_url
+            .as_deref(),
+        Some("https://y.example"),
+        "adding a key makes the saved URL live in memory"
+    );
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .api_key
+            .as_deref(),
+        Some("sk-1"),
+        "the key lands beside the URL"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry the URL once the key lands: {live:?}"
+    );
+}
+
+/// The shunt mint shape — a gateway URL with a freshly minted client token —
+/// keeps both halves live; the unconditional re-derive must not change it.
+#[test]
+fn the_shunt_mint_shape_stays_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = Profile::new("acct".to_string(), None, None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("http://127.0.0.1:9101".to_string());
+        *key = Some("minted-token".to_string());
+    })
+    .expect("the mint edit saves");
+
+    let p = config.find(&name).expect("acct in the roster");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("http://127.0.0.1:9101"),
+        "the mint keeps the gateway URL live"
+    );
+    assert_eq!(
+        p.api_key.as_deref(),
+        Some("minted-token"),
+        "the mint keeps the client token"
+    );
+    assert_eq!(
+        p.saved_base_url().as_deref(),
+        Some("http://127.0.0.1:9101"),
+        "the mint shape's saved URL equals its live URL"
+    );
+}
+
 /// A failed endpoint save leaves the profile's IDENTITY on disk unchanged —
 /// the in-memory profile is restored to its snapshot, so the next write cannot
 /// persist a change the error said did not happen. `FailProfileConfigSave`

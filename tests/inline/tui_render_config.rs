@@ -352,6 +352,110 @@ fn the_no_five_hour_verdict_reads_the_oauth_store_not_the_picked_reading() {
     }
 }
 
+/// A saved base URL an OAuth account does not use (no api key, no env token)
+/// shows on the row with a dim inline note, blurred and focused alike, and its
+/// help line names where requests really go. A used URL keeps the plain row.
+#[test]
+fn an_unused_saved_base_url_says_so_on_its_row() {
+    let input = InputState::new("");
+    let mut snap = Snap::blank("a");
+    snap.base_url = "https://y.example".into();
+    snap.base_url_unused = true;
+    for selected in [false, true] {
+        let line = one_row(ConfigRow::BaseUrl, selected, false, None, &snap, &input);
+        let text = line_text(&line);
+        assert!(
+            text.trim_end()
+                .ends_with("https://y.example  · unused until an api key is set"),
+            "selected={selected}: {text:?}"
+        );
+        let note = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("unused until an api key is set"))
+            .expect("the note is its own span");
+        assert_eq!(note.style.fg, theme::dim().fg, "selected={selected}");
+    }
+    assert_eq!(
+        row_hint(ConfigRow::BaseUrl, &snap).as_deref(),
+        Some("this account calls claude.ai until it has an api key")
+    );
+
+    snap.base_url_unused = false;
+    let used = line_text(&one_row(
+        ConfigRow::BaseUrl,
+        false,
+        false,
+        None,
+        &snap,
+        &input,
+    ));
+    assert!(
+        used.trim_end().ends_with("https://y.example"),
+        "a used URL carries no note: {used:?}"
+    );
+    assert_eq!(
+        row_hint(ConfigRow::BaseUrl, &snap).as_deref(),
+        Some("the API endpoint this account calls instead of claude.ai")
+    );
+}
+
+/// After a keyless base-url commit on an OAuth account the type line still
+/// reads `oauth`: the reseeded draft carries the saved URL without routing to
+/// it, so it must not flip the endpoint-shaped rows to api.
+#[test]
+fn a_reseeded_unused_url_draft_keeps_the_oauth_type() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_login());
+    profile.replace_base_url(Some("https://y.example".to_string()));
+    profile.rederive_base_url();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("acct")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    // The reseeded draft a commit or ⎋ revert leaves: the saved URL in the
+    // buffer, no active field.
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://y.example");
+    app.config_draft = Some(draft);
+
+    let snap = build_snap(&app, &app.readings_snapshot(), false);
+    let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[ConfigRow::Name, ConfigRow::BaseUrl],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        );
+    })
+    .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let type_line = rows
+        .iter()
+        .find(|r| r.starts_with("type"))
+        .unwrap_or_else(|| panic!("type row renders:\n{}", rows.join("\n")));
+    assert!(
+        type_line.trim_end().ends_with("oauth"),
+        "the reseeded unused URL keeps the oauth type: {type_line:?}"
+    );
+}
+
 /// Field rows whose labels self-describe carry no hint (a hint restating the
 /// label reads as noise); the siblings that keep one are pinned whole.
 #[test]
@@ -903,6 +1007,7 @@ fn email_header(
     let mut snap = Snap::blank("acct");
     snap.email = email.map(str::to_string);
     snap.base_url = base_url.to_string();
+    snap.base_url_derived = base_url.to_string();
     snap.session_token = token;
     let app = App::new(AppConfig {
         state: AppState::default(),

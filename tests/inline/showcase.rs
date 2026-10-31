@@ -814,7 +814,7 @@ fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> boo
 fn base_url_of(app: &app::App, name: &str) -> Option<String> {
     app.config()
         .find(&crate::profile::ProfileName::from(name))
-        .and_then(|p| p.base_url.clone())
+        .and_then(|p| p.saved_base_url())
 }
 
 fn auto_start_of(app: &app::App, name: &str) -> bool {

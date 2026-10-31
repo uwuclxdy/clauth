@@ -23096,13 +23096,16 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let profile = cfg.profiles.get(profile_idx);
     // `is_api` tracks the base-url buffer live (draft wins): api key shows only
     // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
-    // instant a base url is typed.
+    // instant a base url is typed. An unused saved URL keeps the OAuth rows
+    // whatever the buffer holds: the account routes to claude.ai until a key
+    // commits.
+    let unused = profile.is_some_and(|p| p.saved_base_url().is_some() && p.base_url.is_none());
     let is_api = match draft {
-        Some(d) => !d.base_url.value.trim().is_empty(),
+        Some(d) => !unused && !d.base_url.value.trim().is_empty(),
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
     let mut rows = vec![ConfigRow::Name];
-    // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
+    // auto-start sits right below name (OAuth-routed accounts).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
         // The probe below it, only where `/usage` has nothing to read and a
@@ -23120,7 +23123,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     }
     rows.push(ConfigRow::BellThreshold);
     rows.push(ConfigRow::BaseUrl);
-    if is_api {
+    // A saved URL the account does not route to still shows the api key row (the
+    // note says "until an api key is set"), beside auto-start (its real routing).
+    if is_api || unused {
         rows.push(ConfigRow::ApiKey);
     }
     rows.push(ConfigRow::Model);
@@ -23458,7 +23463,12 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     let mut draft = ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
-        base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
+        base_url: InputState::new(
+            profile
+                .and_then(|p| p.saved_base_url())
+                .as_deref()
+                .unwrap_or(""),
+        ),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
         effort: InputState::new(profile.and_then(|p| p.effort.as_deref()).unwrap_or("")),
@@ -24045,7 +24055,7 @@ fn start_api_relogin(app: &mut App) {
         let cfg = app.config();
         let p = name.as_ref().and_then(|n| cfg.find(n));
         (
-            p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+            p.and_then(|p| p.saved_base_url()).unwrap_or_default(),
             p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         )
     };
@@ -24453,7 +24463,7 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
 fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: ConfigRow) -> String {
     match row {
         ConfigRow::Name => name.to_string(),
-        ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+        ConfigRow::BaseUrl => profile.and_then(|p| p.saved_base_url()).unwrap_or_default(),
         ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         ConfigRow::Model => profile
             .and_then(|p| p.models.default.clone())
@@ -25837,7 +25847,7 @@ fn commit_endpoint(app: &mut App, field: ConfigRow) -> bool {
                 let cfg = app.config();
                 let p = cfg.find(&name);
                 (
-                    p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+                    p.and_then(|p| p.saved_base_url()).unwrap_or_default(),
                     p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
                 )
             };
@@ -26708,7 +26718,7 @@ fn preset_target_block(
         PresetTarget::Account(name) => {
             let cfg = app.config();
             cfg.find(&ProfileName::from(name.as_str()))
-                .map(|p| (p.base_url.clone(), p.models.clone()))
+                .map(|p| (p.saved_base_url(), p.models.clone()))
         }
     }
 }
@@ -26959,7 +26969,7 @@ fn save_preset_from(app: &mut App, source: &str, preset: &str) {
     let fields = {
         let cfg = app.config();
         cfg.find(&ProfileName::from(source))
-            .map(|p| (p.base_url.clone(), p.models.clone()))
+            .map(|p| (p.saved_base_url(), p.models.clone()))
     };
     let Some((base_url, models)) = fields else {
         app.toast(ToastKind::Danger, format!("'{source}' is gone"));

@@ -1614,14 +1614,17 @@ pub(crate) fn edit_profile_endpoint(
         // copy moves only once the save landed, so a failed save leaves memory
         // matching disk.
         let (fresh, plan) = update_profile_config(name, |fresh| {
-            let old_api_key = fresh.api_key.clone();
             edit(&mut fresh.base_url, &mut fresh.api_key);
+            // `replace_base_url`, not `set_base_url`: the row now shows the
+            // saved URL, so its commit states that value outright even where it
+            // equals the derived one — clearing a saved-but-unused URL has to
+            // drop it on disk, not leave the typed value in place.
             let base_url = fresh.base_url.clone();
-            fresh.set_base_url(base_url);
-            let key_moved = old_api_key != fresh.api_key;
-            if key_moved {
-                fresh.rederive_base_url();
-            }
+            fresh.replace_base_url(base_url);
+            // Every endpoint edit re-derives the in-memory URL the way the next
+            // load does, key moved or not: a keyless URL hides in memory as on
+            // disk, and a key edit beside it makes it live again.
+            fresh.rederive_base_url();
             // Re-derive the provider — the in-memory config is authoritative
             // until the next disk reload, so a stale value here would keep (or
             // block) third-party fetches against the wrong endpoint.
@@ -1644,7 +1647,7 @@ pub(crate) fn edit_profile_endpoint(
                 &before,
                 &before.oauth,
                 &StoredEndpointIdentity {
-                    base_url: fresh.base_url.clone(),
+                    base_url: fresh.saved_base_url(),
                     api_key: fresh.api_key.clone(),
                     console: fresh.console.clone(),
                     env: fresh.env.clone(),
@@ -1847,18 +1850,26 @@ pub(crate) fn edit_profile_preset(
         let (fresh, plan) = update_profile_config(name, |fresh| {
             apply(&mut fresh.base_url, &mut fresh.models)?;
             let base_url = fresh.base_url.clone();
-            fresh.set_base_url(base_url);
+            fresh.replace_base_url(base_url);
+            // Every endpoint edit re-derives the in-memory URL the way the next
+            // load does: a keyless URL on an OAuth account hides in memory as
+            // on disk. The api_key is unchanged — a preset never carries one.
+            fresh.rederive_base_url();
             // Re-derive the provider exactly like `edit_profile_endpoint`: a
             // stale value here keeps (or blocks) third-party fetches against
-            // the wrong endpoint. The api_key is unchanged, so only a moved
-            // endpoint can flip the provider — no need to clear
-            // `third_party_usage` on a key rotation.
-            fresh.provider = fresh.base_url.as_deref().and_then(Provider::from_base_url);
+            // the wrong endpoint.
+            let provider = fresh.base_url.as_deref().and_then(Provider::from_base_url);
+            // The console session means nothing off Alibaba, as in
+            // `edit_profile_endpoint`.
+            if provider != Some(Provider::Alibaba) {
+                fresh.set_console(None);
+            }
+            fresh.provider = provider;
             let plan = endpoint_identity_plan(
                 &before,
                 &before.oauth,
                 &StoredEndpointIdentity {
-                    base_url: fresh.base_url.clone(),
+                    base_url: fresh.saved_base_url(),
                     api_key: fresh.api_key.clone(),
                     console: fresh.console.clone(),
                     env: fresh.env.clone(),
@@ -5025,7 +5036,11 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 /// its base url is still wired, only the key is gone.
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|held| {
-        edit_profile_endpoint(config, name, |_, api_key| *api_key = None)?;
+        let saved_base_url = config.find(name).and_then(|p| p.saved_base_url());
+        edit_profile_endpoint(config, name, |url, api_key| {
+            *url = saved_base_url;
+            *api_key = None;
+        })?;
         // The torn store is re-read under this hold too: a login a peer landed
         // since the caller's read repaired it, and that store is not this
         // log-out's to delete.

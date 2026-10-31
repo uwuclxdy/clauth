@@ -217,7 +217,15 @@ fn setup_selector_row(
 struct Snap {
     title: String,
     name: String,
+    /// The saved (typed) base URL — what the base-url row shows at rest, even
+    /// while a keyless URL is hidden behind the login.
     base_url: String,
+    /// The derived base URL — where the profile routes once its login state is
+    /// folded in. Empty while a keyless URL hides.
+    base_url_derived: String,
+    /// The profile holds a saved base URL it does not route to (no api key or
+    /// env token): the row notes it until one is set.
+    base_url_unused: bool,
     api_key: String,
     model: String,
     effort: String,
@@ -368,6 +376,8 @@ impl Snap {
             title: title.to_string(),
             name: String::new(),
             base_url: String::new(),
+            base_url_derived: String::new(),
+            base_url_unused: false,
             api_key: String::new(),
             model: String::new(),
             effort: String::new(),
@@ -474,6 +484,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
     match cfg.profiles.get(profile_idx) {
         Some(p) => {
             let sidecar = crate::claude::sidecar_summary(&p.name);
+            let saved_url = p.saved_base_url();
             Snap {
                 title: p.name.to_string(),
                 name: if with_text {
@@ -481,7 +492,9 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 } else {
                     String::new()
                 },
-                base_url: text(&p.base_url),
+                base_url: text(&saved_url),
+                base_url_derived: text(&p.base_url),
+                base_url_unused: saved_url.is_some() && p.base_url.is_none(),
                 api_key: text(&p.api_key),
                 model: text(&p.models.default),
                 effort: text(&p.effort),
@@ -1051,11 +1064,15 @@ fn draw_settings_rows(
     let editing = draft.and_then(|d| d.active);
     let armed_action = draft.and_then(|d| d.armed_action);
 
-    // Derived from the base-url buffer so it tracks the draft live.
-    let is_api = !row_input(draft, snap, ConfigRow::BaseUrl)
-        .value
-        .trim()
-        .is_empty();
+    // The endpoint-shaped typing reads the derived URL (the draft buffer live,
+    // else the profile's routing URL), never the saved value the base-url row
+    // shows: a keyless saved URL still types the account oauth. An unused saved
+    // URL keeps the OAuth rows whatever the buffer holds: the account routes to
+    // claude.ai until a key commits.
+    let is_api = match draft {
+        Some(d) => !snap.base_url_unused && !d.base_url.value.trim().is_empty(),
+        None => !snap.base_url_derived.trim().is_empty(),
+    };
     let (type_value, type_style) = if is_api {
         ("api", theme::accent())
     } else {
@@ -1302,6 +1319,9 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
+        ConfigRow::BaseUrl if snap.base_url_unused => {
+            "this account calls claude.ai until it has an api key"
+        }
         ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
             "leave empty for a Claude account, or set an API endpoint"
         }
@@ -1531,9 +1551,31 @@ fn detail_row(
             return cycle_row_lines(lead, &options, None, None, selected, width);
         }
         ConfigRow::BaseUrl => {
-            return kv_field(
-                arrow, "base url", input, editing, selected, false, true, width,
+            // At rest the row shows the saved URL from the snapshot — a keyless
+            // saved URL still shows, with its note. The `+ new` form holds no
+            // saved URL, so its value stays the draft buffer; while editing the
+            // draft buffer is the value and the caret renders.
+            if editing {
+                return kv_field(
+                    arrow, "base url", input, editing, selected, false, true, width,
+                );
+            }
+            let value = if snap.base_url.is_empty() {
+                input.value.as_str()
+            } else {
+                snap.base_url.as_str()
+            };
+            let at_rest = InputState::new(value);
+            let mut lines = kv_field(
+                arrow, "base url", &at_rest, false, selected, false, true, width,
             );
+            if snap.base_url_unused && !value.is_empty() {
+                let note = Span::styled("  · unused until an api key is set", theme::dim());
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(note);
+                }
+            }
+            return lines;
         }
         // The mint-seeded key row is a Disabled row: whole line faint,
         // focusable but inert, the tooltip (below) naming what happens on save.

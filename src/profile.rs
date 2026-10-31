@@ -753,7 +753,7 @@ impl Profile {
 
     /// The `base_url` a save writes: the in-memory value when the caller moved
     /// it off the derived snapshot, else the typed one.
-    fn saved_base_url(&self) -> Option<String> {
+    pub(crate) fn saved_base_url(&self) -> Option<String> {
         if self.base_url == self.typed_endpoint.derived_base_url {
             self.typed_endpoint.base_url.clone()
         } else {

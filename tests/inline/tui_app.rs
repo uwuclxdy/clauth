@@ -3478,6 +3478,226 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     );
 }
 
+/// An OAuth account with a saved URL that its login hides: `saved_base_url` is
+/// set, the derived `base_url` is `None` — the Setup "unused" state.
+fn unused_url_oauth(name: &str) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(login_creds("ref"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    assert_eq!(p.base_url, None, "the URL hides behind the login");
+    assert_eq!(
+        p.saved_base_url().as_deref(),
+        Some("https://y.example"),
+        "the typed URL is saved"
+    );
+    p
+}
+
+/// The base-url draft buffer seeds from the saved URL, not the derived one: a
+/// keyless URL hidden behind the login still fills the editor (and the focused
+/// row's value) instead of opening empty.
+#[test]
+fn build_draft_existing_seeds_the_saved_url_of_an_unused_keyless_url() {
+    use super::build_draft_existing;
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = unused_url_oauth("acct");
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    let draft = build_draft_existing(&app, &ProfileName::from("acct"));
+    assert_eq!(
+        draft.base_url.value, "https://y.example",
+        "the editor opens holding the saved URL, not the hidden derived one"
+    );
+}
+
+/// The preset-apply target block reads the saved URL, so the confirm and the
+/// keep/clear offer name the URL the row shows, not the hidden derived one.
+#[test]
+fn preset_target_block_reads_the_saved_url() {
+    use super::{PresetTarget, preset_target_block};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = unused_url_oauth("acct");
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    let (base_url, _models) = preset_target_block(&app, &PresetTarget::Account("acct".to_string()))
+        .expect("the target resolves");
+    assert_eq!(
+        base_url.as_deref(),
+        Some("https://y.example"),
+        "the preset target names the saved URL"
+    );
+}
+
+/// `save_preset_from` captures the saved URL into the preset template, so the
+/// template keeps the field the account's row shows.
+#[test]
+fn save_preset_from_captures_the_saved_url() {
+    use super::save_preset_from;
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = unused_url_oauth("acct");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    save_preset_from(&mut app, "acct", "P");
+    let saved = crate::presets::load_saved_preset("P").expect("the preset landed");
+    assert_eq!(
+        saved.base_url.as_deref(),
+        Some("https://y.example"),
+        "the preset template holds the saved URL"
+    );
+}
+
+/// Enter on the base-url row of an unused-URL OAuth account opens the editor on
+/// that row and moves no other row: the buffer holds the saved URL, but the
+/// account still routes to claude.ai, so the layout stays the OAuth one.
+#[test]
+fn enter_on_an_unused_base_url_keeps_the_cursor_and_layout() {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = crate::profile::Profile::new("acct".to_string(), None, None);
+    p.credentials = Some(login_creds("ref"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    let before = config_rows(&app);
+    app.config_action_cursor = before
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("base url row");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(ConfigRow::BaseUrl),
+        "Enter opens the base-url editor"
+    );
+    let after = config_rows(&app);
+    assert_eq!(
+        after.get(app.config_action_cursor),
+        Some(&ConfigRow::BaseUrl),
+        "the cursor stays on the row being edited"
+    );
+    assert_eq!(before, after, "Enter alone keeps the layout");
+}
+
+/// Focused inside the detail pane (the snapshot carries no text there, the
+/// draft buffer renders), an unused saved URL's row still shows the URL and its
+/// note.
+#[test]
+fn the_focused_unused_url_row_shows_its_note_inside_the_pane() {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail};
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = crate::profile::Profile::new("acct".to_string(), None, None);
+    p.credentials = Some(login_creds("ref"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("base url row");
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter()
+            .any(|r| r
+                .contains("❯ base url        https://y.example  · unused until an api key is set")),
+        "the focused row shows the saved URL and its note"
+    );
+}
+
+/// ⎋ on the base-url row of an unused-URL OAuth account reverts the buffer to
+/// the saved URL through the real key handler: the revert source must read the
+/// saved value, not the hidden derived one (which would revert to empty).
+#[test]
+fn the_base_url_revert_restores_the_saved_url() {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = unused_url_oauth("acct");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("base url row");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value != "https://y.example"),
+        "precondition: the buffer was edited away from the saved value"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.base_url.value.as_str()),
+        Some("https://y.example"),
+        "⎋ restores the saved URL"
+    );
+}
+
+/// An OAuth account with an unused saved URL shows the api key row AND keeps
+/// auto-start, at rest (fresh entry / re-entry) and with the reseeded draft
+/// (commit / ⎋ revert): rows follow the real routing, never the base-url text.
+#[test]
+fn an_unused_url_account_shows_the_api_key_row_and_keeps_auto_start() {
+    use super::{ConfigRow, build_draft_existing, config_rows};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = unused_url_oauth("acct");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+
+    app.config_draft = None;
+    let rows = config_rows(&app);
+    assert!(
+        rows.contains(&ConfigRow::ApiKey) && rows.contains(&ConfigRow::AutoStart),
+        "at rest the unused-URL account shows both the api key row and auto-start: {rows:?}"
+    );
+
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+    let rows = config_rows(&app);
+    assert!(
+        rows.contains(&ConfigRow::ApiKey) && rows.contains(&ConfigRow::AutoStart),
+        "the reseeded draft keeps both rows: {rows:?}"
+    );
+}
+
 /// A hybrid account: a stored OAuth pair AND a base url on one profile. Capture
 /// reads the two live files independently, and setting a base url on an OAuth
 /// account never drops its credentials — so this shape is reachable from both
