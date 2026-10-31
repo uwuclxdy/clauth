@@ -50295,6 +50295,326 @@ fn a_reload_keeps_setups_new_selection_open_or_at_rest() {
     );
 }
 
+/// Persist `profiles` as both the roster and each profile's record, so a tick
+/// reload reads the same list the in-memory fixture holds.
+fn persist_roster(profiles: &[crate::profile::Profile]) {
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist the roster");
+    for profile in profiles {
+        crate::profile::save_profile(profile).expect("persist a profile");
+    }
+}
+
+/// A reload landing while the `+ new` draft is mounted keeps Setup's cursor on
+/// the trailing `+ new` row (index `profile_count()`), not on the last saved
+/// account the draft is being typed beside.
+#[test]
+fn a_reload_under_a_mounted_new_draft_keeps_the_cursor_on_the_new_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    persist_roster(std::slice::from_ref(&a));
+    let mut app = app_with(vec![a]);
+    app.tab = super::Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.config_draft.is_some(),
+        "precondition: the `+ new` draft is mounted"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "precondition: the cursor rests on `+ new`"
+    );
+
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the reload keeps the cursor on `+ new`, not on account a"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "the selection still resolves to `+ new`"
+    );
+    assert!(
+        app.config_draft.is_some(),
+        "the mounted draft survives the reload"
+    );
+
+    // The clamp is the changed mechanism: without the mounted bound it caps at
+    // the last saved account, the row the draft is not on.
+    app.clamp_profile_cursor();
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the clamp keeps the mounted `+ new` form's row"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "the clamp leaves the selection on `+ new`"
+    );
+}
+
+/// A reload that grows the roster under a mounted `+ new` draft leaves the
+/// clamp's cursor on the account that took the draft's old trailing index; the
+/// re-pin is what puts it back on `+ new`.
+#[test]
+fn a_reload_that_grows_the_roster_under_a_mounted_draft_keeps_the_new_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    persist_roster(std::slice::from_ref(&a));
+    let mut app = app_with(vec![a.clone()]);
+    app.tab = super::Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.config_draft.is_some(),
+        "precondition: the `+ new` draft is mounted"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "precondition: the mounted draft sits on the trailing row"
+    );
+
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    persist_roster(&[a, b]);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(app.profile_count(), 2, "precondition: the roster grew");
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "the pre-swap re-pin restores `+ new` past the account the growth put there"
+    );
+    assert_eq!(app.setup_selection(), super::SetupSelection::New);
+    assert!(
+        app.config_draft.is_some(),
+        "the mounted draft survives the grown reload"
+    );
+}
+
+/// A reload that shrinks the roster under a mounted `+ new` draft lands the
+/// cursor on the new trailing row: the draft's row moves with the roster.
+#[test]
+fn a_reload_that_shrinks_the_roster_under_a_mounted_draft_lands_on_the_new_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let c = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
+    persist_roster(&[a.clone(), b.clone(), c.clone()]);
+    let mut app = app_with(vec![a.clone(), b, c]);
+    app.tab = super::Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(
+        app.profile_cursor.read(),
+        3,
+        "precondition: the mounted draft sits on the trailing row"
+    );
+
+    persist_roster(std::slice::from_ref(&a));
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(app.profile_count(), 1, "precondition: the roster shrank");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the cursor lands on the shrunk roster's trailing `+ new` row"
+    );
+    assert_eq!(app.setup_selection(), super::SetupSelection::New);
+}
+
+/// The mounted branch admits the trailing `+ new` row, never a cursor past it:
+/// a roster that shrank under a mounted draft caps the cursor at the new
+/// trailing row.
+#[test]
+fn the_clamp_caps_a_mounted_drafts_cursor_at_a_shrunk_rosters_trailing_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let c = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
+    let mut app = app_with(vec![a, b, c]);
+    app.tab = super::Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(
+        app.profile_cursor.read(),
+        3,
+        "precondition: the mounted draft sits on the trailing row"
+    );
+
+    app.config().profiles.truncate(1);
+    app.clamp_profile_cursor();
+
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the clamp caps the mounted draft's cursor at the shrunk trailing row"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "the selection stays on `+ new`"
+    );
+}
+
+/// Deleting an account while a `+ new` draft is mounted keeps the draft and
+/// lands the cursor on the draft's trailing row, never on the last remaining
+/// account: the drain keeps a draft opened on another account.
+#[test]
+fn deleting_an_account_under_a_mounted_new_draft_lands_the_cursor_on_the_new_row() {
+    use super::{SetupSelection, perform_delete};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    persist_roster(&[a.clone(), b.clone()]);
+    let mut app = app_with(vec![a, b]);
+    app.tab = super::Tab::Setup;
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("b"));
+    assert!(
+        app.deleting.is_some(),
+        "precondition: the delete worker is in flight"
+    );
+    // Mount the `+ new` form while the worker runs; the drain keeps a draft
+    // opened on another account.
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none()),
+        "precondition: the `+ new` draft is mounted"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "precondition: the mounted draft sits on the trailing row"
+    );
+
+    drain_delete(&mut app);
+
+    assert_eq!(app.profile_count(), 1, "precondition: b is deleted");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the delete lands on the mounted `+ new` row, not on account a"
+    );
+    assert_eq!(app.setup_selection(), SetupSelection::New);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none()),
+        "the mounted `+ new` draft survives the delete"
+    );
+}
+
+/// Deleting the last of two accounts lands Setup's cursor on the remaining
+/// account, never on the `+ new` row the delete exposes.
+#[test]
+fn deleting_the_last_account_lands_the_cursor_on_the_remaining_one() {
+    use super::{MainItemKind, SetupSelection, perform_delete};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    persist_roster(&[a.clone(), b.clone()]);
+    let mut app = app_with(vec![a, b]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor.set(1);
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("b"));
+    drain_delete(&mut app);
+
+    assert_eq!(app.profile_count(), 1, "precondition: b is deleted");
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "the cursor lands on the remaining account, not on `+ new`"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "the selection is the remaining account"
+    );
+}
+
+/// A reload that grows the roster while the cursor rests on `+ new` keeps it
+/// on the trailing row: the pre-swap capture re-pins it past the new account.
+#[test]
+fn a_reload_that_grows_the_roster_keeps_the_cursor_on_the_new_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    persist_roster(std::slice::from_ref(&a));
+    let mut app = app_with(vec![a.clone()]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor.set(1);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "precondition: the cursor rests on `+ new`"
+    );
+
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    persist_roster(&[a, b]);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(app.profile_count(), 2, "precondition: the roster grew");
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "the cursor follows `+ new` to its new trailing index"
+    );
+    assert_eq!(app.setup_selection(), super::SetupSelection::New);
+}
+
+/// A reload with the cursor on a real account leaves it there: the re-pin is
+/// gated on the pre-swap `+ new` selection, never applied to every reload. Two
+/// saved accounts put the clamp's bound above the cursor, so a clamp that
+/// forces its bound moves the cursor off 0; one more account on disk makes the
+/// reload observable.
+#[test]
+fn a_reload_keeps_the_cursor_on_the_real_account_it_rests_on() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let c = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
+    persist_roster(&[a.clone(), b.clone(), c]);
+    let mut app = app_with(vec![a, b]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor.set(0);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "precondition: the cursor rests on account a"
+    );
+
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.profile_count(),
+        3,
+        "precondition: the reload grew the roster past the in-memory fixture"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "a reload leaves a real-account selection on that account"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "the selection stays the account at index 0"
+    );
+}
+
 // ── Services tab activity (out of view) ──────────────────────────────────────
 
 /// A herdr probe whose config file the test owns in the sandbox, so the

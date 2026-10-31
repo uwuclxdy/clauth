@@ -5238,10 +5238,12 @@ pub(crate) struct App {
     /// pick sequence can reverse it losslessly.
     pub(crate) preset_picker_open: PresetPickerOpen,
     /// Set by [`App::reload_if_state_changed`] before the swap: Setup's
-    /// selection was `+ new` before the reload, so the tick's clamp keeps it
-    /// on the trailing row (a reload that moves the roster must never demote
-    /// `+ new` onto the last account). Read once by the tick, never by the
-    /// tab-switch or delete clamps.
+    /// selection was `+ new` before the reload, so the tick re-lands the cursor
+    /// on the trailing row after the clamp. A mounted `+ new` form keeps its
+    /// row through the clamp while the roster holds still or shrinks; a grown
+    /// roster turns that row into a real account, and the clamp demotes an
+    /// at-rest `+ new` on every reload — this re-land puts back both.
+    /// Read once by the tick, never by the tab-switch or delete clamps.
     pub(crate) reload_was_on_new: bool,
     /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
@@ -7768,9 +7770,23 @@ impl App {
         self.config().profiles.get(idx).map(|p| p.name.clone())
     }
 
-    /// Clamp `profile_cursor` to `0..profile_count`.
+    /// Clamp `profile_cursor` to `0..profile_count`, or to `0..=profile_count`
+    /// while a `+ new` form is mounted on Setup: that form's row IS the trailing
+    /// `+ new` row, so the clamp every in-place roster path ends with (a reload,
+    /// a delete landing) must not pull the user's draft off it. Every other
+    /// call (a tab switch, an at-rest selector) lands on a saved account
+    /// whenever one exists; an empty roster holds only `+ new`.
     pub(crate) fn clamp_profile_cursor(&mut self) {
-        let max = self.profile_count().saturating_sub(1);
+        let mounted_new = self.tab == Tab::Setup
+            && self
+                .config_draft
+                .as_ref()
+                .is_some_and(|d| d.editing_name.is_none());
+        let max = if mounted_new {
+            self.profile_count()
+        } else {
+            self.profile_count().saturating_sub(1)
+        };
         self.profile_cursor.set(self.profile_cursor.read().min(max));
         self.place_overview_cursor();
         // Every reload path lands here (a roster change can move or remove the
@@ -29215,12 +29231,15 @@ pub(crate) fn on_tick(app: &mut App) {
     refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
-        // Setup's `+ new` selection is the trailing row, never an index: a
-        // reload that moves the roster keeps it there instead of demoting it
-        // onto the last account. Captured pre-swap (`reload_was_on_new`) so a
-        // deleted last account (whose cursor reads `New` post-swap) is not
-        // mistaken for `+ new`. The Overview's own cursor rules are
-        // `place_overview_cursor`'s, already run by the clamp.
+        // Setup's `+ new` selection is the trailing row, never an index. A
+        // mounted form keeps its row through the clamp while the roster holds
+        // still or shrinks; a grown roster turns that row into a real account,
+        // and an at-rest `+ new` is demoted by the clamp on every reload — the
+        // pre-swap flag re-lands the cursor on the trailing row for both.
+        // Captured pre-swap (`reload_was_on_new`) so a deleted last account
+        // (whose cursor reads `New` post-swap) is not mistaken for `+ new`. The
+        // Overview's own cursor rules are `place_overview_cursor`'s, already
+        // run by the clamp.
         if app.reload_was_on_new {
             app.profile_cursor.set(app.profile_count());
         }
