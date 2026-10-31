@@ -3459,8 +3459,8 @@ where
 /// Whether carrying `key = value` beside `rendered` leaves what the file parses
 /// to exactly as the render alone has it (`baseline`, the render's
 /// [`parsed_as`]): the last word on every top-level carry. The round-trip that
-/// decides "modelled" cannot see a serde alias (`kick_timer` for
-/// `auto_start`): the alias parses into its field and re-emits under the
+/// decides "modelled" cannot see a serde alias: the alias parses into its
+/// field and re-emits under the
 /// field's own name, so the alias reads as unmodelled. Serde counts an alias
 /// and its field as ONE field, so carried beside the render's copy it is a
 /// duplicate field and the next load fails outright; carried where the render
@@ -3520,8 +3520,7 @@ const PRESERVED_KEYS_MARKER: &str =
     "# keys preserved from the previous file; not modelled by this clauth:";
 
 /// Splice `carried` top-level keys into a rendered TOML document, preserving
-/// table-header scoping — the shared core of the `profiles.toml` and
-/// `config.toml` carries. Appending everything as trailing text (the shape this
+/// table-header scoping — the core of the `profiles.toml` carry. Appending everything as trailing text (the shape this
 /// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
 /// inside that table: into `[env]` it is a type error that bricks
 /// `load_profile`, into `[herdr]` it is silently dropped on the next load.
@@ -7277,7 +7276,7 @@ fn apply_config_edits(
 }
 
 /// A threshold the load clamps is written clamped; one it ignores outright (a
-/// non-finite value, or a `weekly_threshold` outside 0..=100) is commented out
+/// non-finite value, or a `weekly_threshold` outside 50..=100) is commented out
 /// in place.
 fn edit_threshold_load(
     doc: &mut toml_edit::DocumentMut,
