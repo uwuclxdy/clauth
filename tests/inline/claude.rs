@@ -7859,6 +7859,41 @@ fn item_with(access: &str) -> serde_json::Value {
     })
 }
 
+/// The item side of the re-point rule alone: the item still holds exactly the
+/// revoked bearer, refreshless. Whatever the sidecar holds, an item failing
+/// this has nothing to re-point, now or later.
+#[test]
+fn an_item_holds_the_revoked_bearer_only_as_its_exact_refreshless_copy() {
+    assert!(item_holds_revoked(&item_with("old"), "old"));
+    assert!(
+        !item_holds_revoked(&item_with("other"), "old"),
+        "another bearer"
+    );
+    assert!(
+        !item_holds_revoked(&item_with("old"), ""),
+        "an empty revoked bearer"
+    );
+    let mut with_refresh = item_with("old");
+    with_refresh["claudeAiOauth"]["refreshToken"] = serde_json::json!("rt");
+    assert!(!item_holds_revoked(&with_refresh, "old"), "a real login");
+    let mut misfilled = item_with("old");
+    misfilled["claudeAiOauth"]["refreshToken"] = serde_json::json!("");
+    assert!(!item_holds_revoked(&misfilled, "old"), "a mis-fill");
+    assert!(
+        !item_holds_revoked(&serde_json::json!({ "mcpOAuth": {} }), "old"),
+        "no login block"
+    );
+    assert!(
+        !item_holds_revoked(&serde_json::json!({ "claudeAiOauth": 7 }), "old"),
+        "a garbage block"
+    );
+    assert!(
+        item_holds_revoked(&item_with("old"), "old")
+            && !copied_bearer_repoint(&item_with("old"), "old", &rolled("new", i64::MAX), 0, true),
+        "an item holding the revoked bearer while the sidecar is behind its chain is not yet re-pointable, not settled"
+    );
+}
+
 #[test]
 fn a_stamp_revokes_only_a_rolling_bearer_it_replaces() {
     let token =
