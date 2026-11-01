@@ -61,6 +61,8 @@ clauth completions bash             # print the script to stdout instead
 
 `CLAUTH_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
+On Windows, completions work in Git Bash; cmd and PowerShell get none.
+
 `clauth resume` and `clauth info` complete session ids (and `latest`), and codex profile names complete beside the Claude Code ones after `clauth`, `start`, `delete` and `switch`, and alone after `limit-reset`. An installed script never updates by itself: when the script at the path `clauth completions install` writes (`~/.clauth/completions/clauth.<shell>`; fish `~/.config/fish/completions/clauth.fish`) differs from what this clauth prints, select the `plugin` row and press <kbd>f</kbd> until `update completions` is focused, then <kbd>⏎</kbd>, or run `clauth completions install`.
 
 ## Claude Code plugin
