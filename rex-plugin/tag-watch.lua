@@ -44,8 +44,8 @@ end
 local function resolve(pid)
   local r = rex.exec({ "sh", resolver, tostring(pid) }, { timeout = 10 })
   if not (r and r.ok) then return nil end
-  local profile, how = r.stdout:match("^([^\t\n]+)\t([^\t\n]+)")
-  return profile, how
+  local profile, how, agent = r.stdout:match("^([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)")
+  return profile, how, agent
 end
 
 local function label_of(session_id, block_id)
@@ -84,8 +84,8 @@ end
 
 local function apply(session_id, block_id, pid)
   local t = tracked[block_id]
-  local profile, how
-  if pid then profile, how = resolve(pid) end
+  local profile, how, agent
+  if pid then profile, how, agent = resolve(pid) end
   local current = label_of(session_id, block_id)
 
   if not profile then
@@ -107,7 +107,9 @@ local function apply(session_id, block_id, pid)
 
   local base = t.orig
   if base == nil or base == "" or base == "shell" then
-    base = how == "codex" and "codex" or "claude"
+    -- The resolver names the agent: a `clauth start` pane runs the clauth
+    -- supervisor whether it hosts Claude Code or codex.
+    base = agent
   end
   local want = base .. SEP .. profile
   if how == "global" then want = want .. " (global)" end
