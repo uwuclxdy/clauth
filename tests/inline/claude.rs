@@ -8029,3 +8029,90 @@ fn a_copied_bearer_is_repointed_only_when_it_is_the_revoked_one() {
         assert_eq!(copy, garbage);
     }
 }
+
+// ── stale copies no stamp names ─────────────────────────────────────────────
+
+fn sidecar_token(access: &str, expires_at: i64) -> crate::profile::OAuthToken {
+    serde_json::from_value(rolled(access, expires_at)["claudeAiOauth"].clone()).expect("rolled")
+}
+
+/// The sweep's item rule: a rolling copy that differs from the member's live
+/// sidecar and is no other profile's current bearer is stale; the sidecar
+/// itself, a real login, a mint, a foreign bearer and garbage are not.
+#[test]
+fn a_stale_copied_bearer_is_only_an_older_rolling_copy_of_the_members_sidecar() {
+    let now = 1_000;
+    let live = sidecar_token("new", now + 60_000);
+    assert_eq!(
+        stale_copied_bearer(&item_with("old"), &live, now, false, &[]),
+        Some("old".to_string())
+    );
+    assert_eq!(
+        stale_copied_bearer(&item_with("new"), &live, now, false, &[]),
+        None,
+        "the item already holds the current bearer"
+    );
+    let mut with_refresh = item_with("old");
+    with_refresh["claudeAiOauth"]["refreshToken"] = serde_json::json!("r");
+    assert_eq!(
+        stale_copied_bearer(&with_refresh, &live, now, false, &[]),
+        None,
+        "a real login"
+    );
+    let mint = serde_json::json!({ "claudeAiOauth": {
+        "accessToken": "old", "expiresAt": 5, "scopes": ["user:inference"]
+    }});
+    assert_eq!(
+        stale_copied_bearer(&mint, &live, now, false, &[]),
+        None,
+        "a static mint"
+    );
+    assert_eq!(
+        stale_copied_bearer(&item_with("old"), &live, now, false, &["old".to_string()]),
+        None,
+        "another profile's current bearer"
+    );
+    for garbage in [
+        serde_json::json!({ "mcpOAuth": {} }),
+        serde_json::json!({ "claudeAiOauth": 7 }),
+        item_with(""),
+    ] {
+        assert_eq!(stale_copied_bearer(&garbage, &live, now, false, &[]), None);
+    }
+}
+
+/// Nothing is stale against a sidecar that could not replace it: one behind
+/// its chain, one past its expiry, one with no expiry and a static mint.
+#[test]
+fn nothing_is_stale_against_a_sidecar_that_cannot_replace_it() {
+    let now = 1_000;
+    let item = item_with("old");
+    let live = sidecar_token("new", now + 60_000);
+    assert!(sidecar_can_replace_copy(&live, now, false));
+    assert_eq!(
+        stale_copied_bearer(&item, &live, now, true, &[]),
+        None,
+        "behind its chain"
+    );
+    let expired = sidecar_token("new", now);
+    assert_eq!(
+        stale_copied_bearer(&item, &expired, now, false, &[]),
+        None,
+        "expired"
+    );
+    let mut no_expiry = live.clone();
+    no_expiry.expires_at = None;
+    assert_eq!(
+        stale_copied_bearer(&item, &no_expiry, now, false, &[]),
+        None,
+        "no expiry"
+    );
+    let mut mint = live;
+    mint.subscription_type = None;
+    mint.scopes = Some(vec!["user:inference".to_string()]);
+    assert_eq!(
+        stale_copied_bearer(&item, &mint, now, false, &[]),
+        None,
+        "a static mint"
+    );
+}

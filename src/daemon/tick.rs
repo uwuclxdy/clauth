@@ -75,6 +75,12 @@ impl super::Daemon {
             {
                 crate::claude::correct_bare_keychain_item_detached();
             }
+            if self
+                .bare_item_scan_ticks
+                .is_multiple_of(super::STALE_COPY_SWEEP_EVERY_TICKS)
+            {
+                crate::runtime::sweep_stale_copied_bearers_detached();
+            }
             self.bare_item_scan_ticks = self.bare_item_scan_ticks.wrapping_add(1);
         }
         if !self.next_drain_skipped(deadline) {

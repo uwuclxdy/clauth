@@ -1152,6 +1152,70 @@ pub(crate) fn repoint_copied_bearer(
     true
 }
 
+/// Whether `sidecar`, a member's `session-token.json` block, can stand in for
+/// a stale copy right now: a live rolling bearer that is not behind its chain
+/// (`sidecar_behind_chain`, from [`rolling_sidecar_behind_chain`]). The same
+/// sidecar test [`copied_bearer_repoint`] makes before a write, checked early
+/// so the stale-copy sweep reads no item it could not re-point. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS stale-copy sweep; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn sidecar_can_replace_copy(
+    sidecar: &crate::profile::OAuthToken,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    !sidecar_behind_chain
+        && sidecar_kind_of(sidecar) == SidecarKind::Rolling
+        && !sidecar.access_token.is_empty()
+        && sidecar.expires_at.is_some_and(|exp| exp > now)
+}
+
+/// The bearer a live session's per-session item holds when it is a stale copy
+/// of a member's rolling bearer that no queued stamp names, such as one an
+/// earlier daemon, or a process that has since exited, re-stamped away. The
+/// item's `claudeAiOauth` must classify as [`SidecarKind::Rolling`] (no
+/// refresh token, not a mint), differ from the member's current `sidecar`
+/// bearer, and be none of `foreign`, the other profiles' current sidecar and
+/// chain bearers; the sidecar must pass [`sidecar_can_replace_copy`].
+///
+/// The caller vouches for where the copy came from: the session launched on
+/// this member's sidecar and never ran on another member
+/// (`runtime::row_copies_only_member_sidecar`), so a rolling bearer in its item
+/// can only be one this member's sidecar held. That provenance, not "differs",
+/// is what keeps a static mint, another account's login and anything clauth
+/// did not write for this member out. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS stale-copy sweep; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn stale_copied_bearer(
+    item: &serde_json::Value,
+    sidecar: &crate::profile::OAuthToken,
+    now: i64,
+    sidecar_behind_chain: bool,
+    foreign: &[String],
+) -> Option<String> {
+    if !sidecar_can_replace_copy(sidecar, now, sidecar_behind_chain) {
+        return None;
+    }
+    let held = item
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())?;
+    (sidecar_kind_of(&held) == SidecarKind::Rolling
+        && !held.access_token.is_empty()
+        && held.access_token != sidecar.access_token
+        && !foreign.contains(&held.access_token))
+    .then_some(held.access_token)
+}
+
 /// [`rolling_bearer_behind_chain`] over `name`'s files on disk: the
 /// `session-token.json` sidecar against the `credentials.json` chain, now.
 /// Either one absent or unreadable reads `false`.

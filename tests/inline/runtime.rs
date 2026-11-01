@@ -21148,3 +21148,114 @@ fn the_adopting_witness_refuses_foreign_trees_and_in_flight_deletes() {
     );
     assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
 }
+
+// ── stale copies no stamp names: which sessions the sweep may judge ─────────
+
+fn copy_row(start: &str, launch_store: Option<&str>) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: "4242-0".to_string(),
+        start_profile: start.to_string(),
+        harness: crate::harness::Harness::Claude,
+        pid: 4242,
+        claude_pid: None,
+        launch_families: None,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: launch_store.map(PathBuf::from),
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+        visited_members: vec![],
+    }
+}
+
+/// Only a foreground session that launched on the member's own sidecar and
+/// never ran on another member proves its item's rolling bearer is a copy of
+/// that sidecar.
+#[test]
+fn a_row_proves_its_copy_came_from_the_members_sidecar_only_when_it_never_left() {
+    let member = crate::profile::ProfileName::from("work");
+    let sidecar = Path::new("/p/work/session-token.json");
+    let store = Some("/p/work/session-token.json");
+    assert!(row_copies_only_member_sidecar(
+        &copy_row("work", store),
+        &member,
+        sidecar
+    ));
+
+    let mut stayed = copy_row("work", store);
+    stayed.current_member = Some("work".to_string());
+    stayed.visited_members = vec!["work".to_string()];
+    assert!(
+        row_copies_only_member_sidecar(&stayed, &member, sidecar),
+        "never left"
+    );
+
+    let refused = [
+        ("no launch store", copy_row("work", None)),
+        (
+            "another store",
+            copy_row("work", Some("/p/work/credentials.json")),
+        ),
+        ("another start", copy_row("home", store)),
+        ("swapped away", {
+            let mut row = copy_row("work", store);
+            row.current_member = Some("home".to_string());
+            row
+        }),
+        ("visited another member", {
+            let mut row = copy_row("work", store);
+            row.visited_members = vec!["work".to_string(), "home".to_string()];
+            row
+        }),
+        ("background", {
+            let mut row = copy_row("work", store);
+            row.background = true;
+            row
+        }),
+    ];
+    for (why, row) in refused {
+        assert!(
+            !row_copies_only_member_sidecar(&row, &member, sidecar),
+            "{why}"
+        );
+    }
+}
+
+/// The sweep skips a pair the queue already holds, so a pair still retrying is
+/// neither logged again nor re-armed.
+#[test]
+fn the_sweep_sees_a_pair_the_queue_already_holds() {
+    let _ = take_revoked_bearers();
+    let a = crate::profile::ProfileName::from("a");
+    let b = crate::profile::ProfileName::from("b");
+    assert!(!revoked_bearer_queued(&a, "old"));
+    note_revoked_rolling_bearer(&a, "old".to_string());
+    assert!(revoked_bearer_queued(&a, "old"));
+    assert!(!revoked_bearer_queued(&b, "old"), "another member");
+    assert!(!revoked_bearer_queued(&a, "older"), "another bearer");
+    let _ = take_revoked_bearers();
+}
+
+/// A runtime still holding its `.credentials.json`, even as a dangling link,
+/// reads the file the re-stamp writes; one Claude Code removed it from does not.
+#[test]
+fn a_runtime_reads_its_file_until_claude_code_removes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(!runtime_reads_its_file(dir.path()));
+    create_symlink(
+        &dir.path().join("gone"),
+        &dir.path().join(".credentials.json"),
+    )
+    .expect("link");
+    assert!(runtime_reads_its_file(dir.path()), "a dangling link");
+}

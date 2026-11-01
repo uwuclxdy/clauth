@@ -89,6 +89,13 @@ const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 /// every tick would spend one per second.
 #[cfg(target_os = "macos")]
 const BARE_ITEM_SCAN_EVERY_TICKS: u64 = 30;
+/// How often (in `TICK`s) the tick sweeps live sessions' per-session Keychain
+/// items for a stale copy of a rolling bearer that no stamp will re-point
+/// (`runtime::sweep_stale_copied_bearers_detached`): at boot, then every
+/// ~5 min. Each sweep reads only the items of sessions that lost their
+/// `.credentials.json`, one `security` read each.
+#[cfg(target_os = "macos")]
+const STALE_COPY_SWEEP_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
@@ -1805,7 +1812,8 @@ struct Daemon {
     /// The daemon's holds on the per-account background trees.
     background: BackgroundHolds,
     /// Ticks since boot, for the bare-item leg's cadence
-    /// ([`BARE_ITEM_SCAN_EVERY_TICKS`]).
+    /// ([`BARE_ITEM_SCAN_EVERY_TICKS`]) and the stale-copy sweep's
+    /// ([`STALE_COPY_SWEEP_EVERY_TICKS`]).
     #[cfg(target_os = "macos")]
     bare_item_scan_ticks: u64,
 }

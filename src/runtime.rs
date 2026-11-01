@@ -10865,6 +10865,219 @@ pub(crate) fn repoint_copied_bearers_detached() {
     }
 }
 
+/// Whether `row` proves that its session's per-session item can only hold a
+/// copy of `member`'s sidecar: a foreground row that started on `member`,
+/// launched on `sidecar` (that member's `session-token.json`), and never ran
+/// on another member. A swapped row, a row that names no launch store and a
+/// background row, whose `runtime-bg` tree every job on the account shares,
+/// prove nothing. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS stale-copy sweep; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn row_copies_only_member_sidecar(
+    row: &crate::live_sessions::LiveSession,
+    member: &ProfileName,
+    sidecar: &Path,
+) -> bool {
+    !row.background
+        && row.start_profile == member.as_str()
+        && row
+            .current_member
+            .as_deref()
+            .is_none_or(|m| m == member.as_str())
+        && row.visited_members.iter().all(|m| m == member.as_str())
+        && row.launch_store.as_deref() == Some(sidecar)
+}
+
+/// Whether `runtime` still holds the `.credentials.json` link (or file) its
+/// session reads. Claude Code deletes it when it copies the login into the
+/// per-session item, so a session that still has it reads the file the
+/// re-stamp writes and has no copy to go stale. A dangling link counts as
+/// present: Claude Code has not touched it.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS stale-copy sweep")
+)]
+fn runtime_reads_its_file(runtime: &Path) -> bool {
+    std::fs::symlink_metadata(runtime.join(".credentials.json")).is_ok()
+}
+
+/// The current sidecar and chain bearers of every profile but `member`: what a
+/// rolling bearer in one of `member`'s sessions' items must not be before the
+/// stale-copy sweep calls it a copy of `member`'s. Unreadable stores add
+/// nothing.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS stale-copy sweep")
+)]
+fn current_bearers_except(member: &ProfileName) -> Vec<String> {
+    let Some(entries) = profiles_root_dir()
+        .ok()
+        .and_then(|root| std::fs::read_dir(root).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        if entry.file_name().to_str() == Some(member.as_str()) {
+            continue;
+        }
+        for store in ["session-token.json", "credentials.json"] {
+            if let Some(oauth) =
+                crate::profile::read_json_file::<ClaudeCredentials>(&entry.path().join(store))
+                    .ok()
+                    .and_then(|c| c.claude_ai_oauth)
+                && !oauth.access_token.is_empty()
+            {
+                out.push(oauth.access_token);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `(member, revoked)` is already queued for [`repoint_copied_bearers`].
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS stale-copy sweep")
+)]
+fn revoked_bearer_queued(member: &ProfileName, revoked: &str) -> bool {
+    with_revoked_bearers(|q| {
+        q.iter()
+            .any(|e| &e.member == member && e.revoked == revoked)
+    })
+}
+
+/// Sessions whose item the stale-copy sweep failed to read for a reason other
+/// than a locked keychain: an access dialog denied or left unanswered, a read
+/// that ran out of time, an item that does not parse. The sweep never reads
+/// them again, as the re-point drain gives such a session up, since a read of
+/// an item Claude Code created can raise a dialog on every attempt.
+#[cfg(target_os = "macos")]
+static STALE_SWEEP_GAVE_UP: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Queue the stale copies no stamp will name for [`repoint_copied_bearers`].
+///
+/// A stamp queues the one bearer it replaced, and only in the process that
+/// made it. A session that copied an earlier bearer misses every later stamp:
+/// one that detached before the daemon running this build started, one whose
+/// stamp ran in a process that exited before its drain landed, or one whose
+/// stamping process could not reach the login Keychain. This sweep finds them
+/// from the session side. For each live foreground session whose runtime has
+/// lost its `.credentials.json` and whose row proves its copy can only come
+/// from its member's sidecar ([`row_copies_only_member_sidecar`]), it reads the
+/// item and, when [`crate::claude::stale_copied_bearer`] names a stale bearer,
+/// queues `(member, that bearer)`. The drain then writes it with every check
+/// a stamp's pair gets. macOS only; a no-op elsewhere and under `cfg(test)`,
+/// and inside a state-flock hold or an armed subprocess budget.
+pub(crate) fn sweep_stale_copied_bearers() {
+    #[cfg(target_os = "macos")]
+    {
+        if !crate::keychain::enabled()
+            || crate::lock::state_lock_held()
+            || crate::lock::armed_budget_remaining().is_some()
+        {
+            return;
+        }
+        let now = crate::usage::now_ms() as i64;
+        for live in live_session_runtime_dirs() {
+            if live.background || runtime_reads_its_file(&live.runtime) {
+                continue;
+            }
+            let gave_up = STALE_SWEEP_GAVE_UP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&live.session);
+            if gave_up {
+                continue;
+            }
+            let Some(row) = crate::live_sessions::get(&live.session) else {
+                continue;
+            };
+            let Ok(sidecar_path) =
+                crate::profile::profile_dir(&live.profile).map(|d| d.join("session-token.json"))
+            else {
+                continue;
+            };
+            if !row_copies_only_member_sidecar(&row, &live.profile, &sidecar_path) {
+                continue;
+            }
+            let Some((_, sidecar)) = crate::claude::sidecar_summary(&live.profile) else {
+                continue;
+            };
+            let behind = crate::claude::rolling_sidecar_behind_chain(&live.profile);
+            if !crate::claude::sidecar_can_replace_copy(&sidecar, now, behind) {
+                continue;
+            }
+            let item = match crate::keychain::read_config_dir_item(&live.runtime) {
+                Ok(Some(item)) => item,
+                Ok(None) => continue,
+                Err(e) => {
+                    if !crate::keychain::failed_on_locked_keychain(&e) {
+                        STALE_SWEEP_GAVE_UP
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(live.session.clone());
+                        logline!(
+                            "clauth: could not read session {}'s per-session Keychain item to \
+                             check it for a stale '{}' rolling bearer: {e:#}. Not checking it again",
+                            live.session,
+                            live.profile
+                        );
+                    }
+                    continue;
+                }
+            };
+            let foreign = current_bearers_except(&live.profile);
+            let Some(stale) =
+                crate::claude::stale_copied_bearer(&item, &sidecar, now, behind, &foreign)
+            else {
+                continue;
+            };
+            if revoked_bearer_queued(&live.profile, &stale) {
+                continue;
+            }
+            logline!(
+                "clauth: session {}'s per-session Keychain item holds an older '{}' rolling \
+                 bearer than its sidecar; queued to re-point it",
+                live.session,
+                live.profile
+            );
+            note_revoked_rolling_bearer(&live.profile, stale);
+        }
+    }
+}
+
+/// [`sweep_stale_copied_bearers`] on a detached thread, for the daemon tick:
+/// its Keychain reads never spend the tick's watchdog window, and a sweep
+/// still running when the next is due is left to finish. The run loop's
+/// [`repoint_copied_bearers_detached`] drains what it queues.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS daemon tick")
+)]
+pub(crate) fn sweep_stale_copied_bearers_detached() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if cfg!(test) || IN_FLIGHT.swap(true, O::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("clauth-stale-copy-sweep".into())
+        .spawn(|| {
+            sweep_stale_copied_bearers();
+            IN_FLIGHT.store(false, O::Release);
+        });
+    if spawned.is_err() {
+        IN_FLIGHT.store(false, O::Release);
+    }
+}
+
 /// Which Keychain arm a session start takes, derived from the install source
 /// alone. PURE so the arm selection is pinned on every platform: the seeding
 /// itself is macOS-only and unreachable by `cfg(test)` (`keychain::enabled()`
