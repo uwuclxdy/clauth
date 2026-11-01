@@ -80,7 +80,7 @@ A codex chain's refresh token is single-use too, and the server answers a replay
 
 ## Account-change detection
 
-If Claude Code logged into a different account while clauth was closed, the next launch asks before overwriting anything: keep the stored login, capture the live one as a new profile, or discard it. Config tab `on mismatch` picks an answer up front.
+If Claude Code logged into a different account while clauth was closed, the next launch asks before overwriting anything: keep the stored login, capture the live one as a new profile, or discard it. Config tab `on mismatch` picks an answer up front; an `overwrite` answer is skipped for an account running on a long-lived token, which asks instead.
 
 ## Switching things off
 

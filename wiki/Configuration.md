@@ -161,7 +161,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
-| `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard` |
+| `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard`; on an account running on a long-lived token, `Overwrite` is skipped: the launch asks instead, and a headless switch (the plugin, the API) refuses |
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
