@@ -13602,6 +13602,13 @@ fn wait_quiescent(
     }
 }
 
+/// The mirror test's verdict: poll every 2 cooldowns, settle after 16 quiet,
+/// give up after 200. Shared with the pin below so a span narrowed to 4
+/// cooldowns reds it.
+fn mirror_settled(writes: impl Fn() -> usize, cooldown: Duration) -> Result<usize, usize> {
+    wait_quiescent(writes, cooldown * 2, cooldown * 16, cooldown * 200)
+}
+
 /// A counter that keeps moving on a cycle well under the quiet span (a
 /// self-feed, slowed) never settles: the wait ends at its deadline.
 #[test]
@@ -13611,23 +13618,26 @@ fn wait_quiescent_never_settles_on_a_counter_moving_inside_the_span() {
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(150));
                 count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
-        let verdict = wait_quiescent(
+        // cooldown 25 ms: poll 50 ms, span 400 ms, deadline 5 s. The counter
+        // moves every 6 cooldowns: 250 ms under the 16-cooldown span, so only a
+        // counter-thread stall past 250 ms settles it, and above a span
+        // narrowed to 4 cooldowns, so that narrowing settles the counter and
+        // reds this pin. A narrowing that stays above 6 cooldowns goes unseen.
+        let verdict = mirror_settled(
             || count.load(std::sync::atomic::Ordering::Relaxed),
-            Duration::from_millis(20),
-            Duration::from_millis(600),
-            Duration::from_secs(3),
+            Duration::from_millis(25),
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(verdict.is_err(), "a moving counter settled: {verdict:?}");
     });
 }
 
-/// A counter that moves late and then stops settles on its last value, however
-/// late its last move lands before the deadline.
+/// A counter that moves and then stops settles on its last value once it has
+/// held still for the span.
 #[test]
 fn wait_quiescent_settles_on_a_counter_that_stops() {
     let count = std::sync::atomic::AtomicUsize::new(0);
@@ -13689,9 +13699,9 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
     };
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
-    // Armed before the spawn, as `acquire` does it. The soak used to outlast the
-    // arm by sheer length, which made the fixture's own "published 0 times"
-    // guard the only thing standing between a slow arm and a vacuous pass.
+    // Armed before the spawn, as `acquire` does it: a soak that outran a slow
+    // arm would leave the fixture's `settled >= 2` guard below as the only thing
+    // between it and a vacuous pass.
     let watcher = crate::watchdog::try_start(&specs, timings.debounce);
     let requested = specs.len();
     let (shutdown, t, rec) = (&shutdown_rx, &timings, &mirror);
@@ -13734,19 +13744,13 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         // self-feed republishes once per cooldown plus its own pass time; while
         // that cycle plus one poll stays under the span, every publish restarts
         // it and the deadline is the only way out. The span is 16 cooldowns,
-        // far above the cycle any self-feed has under these timings. Residuals
-        // it cannot see: a self-feed whose cycle plus one poll outgrows the
-        // span, and one
+        // about seven times a self-feed's cycle under these timings (~0.22 s
+        // per publish at load 60, measured 2026-11-01). Residuals it cannot
+        // see: a self-feed whose cycle plus one poll outgrows the span, and one
         // that rewrites byte-identical content inside one mtime tick of a
         // coarse-granularity filesystem (the counter keys on name, length and
         // mtime).
-        let settled = wait_quiescent(
-            || mirror.writes(),
-            cooldown * 2,
-            cooldown * 16,
-            cooldown * 200,
-        )
-        .unwrap_or_else(|now| {
+        let settled = mirror_settled(|| mirror.writes(), cooldown).unwrap_or_else(|now| {
             panic!(
                 "the mirror was still publishing {now} passes in with no writer \
                  running: it is feeding on its own writes"
