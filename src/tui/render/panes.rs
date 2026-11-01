@@ -435,11 +435,12 @@ impl QueueView {
         kick_lifts: &std::collections::HashMap<String, i64>,
         anchor: Option<i64>,
         canceled: impl Fn(&crate::profile::ProfileName) -> bool,
+        marked: impl Fn(&crate::profile::ProfileName) -> bool,
     ) -> Self {
         let blocked: Vec<crate::profile::ProfileName> =
             kick_lifts.keys().map(|k| k.as_str().into()).collect();
         Self {
-            members: crate::usage::auto_start_queue_members(cfg, &blocked, canceled),
+            members: crate::usage::auto_start_queue_members(cfg, &blocked, canceled, marked),
             anchor,
             interval_ms: cfg.state.refresh_interval_ms,
             now_secs: crate::usage::now_epoch_secs(),

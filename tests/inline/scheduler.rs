@@ -1036,6 +1036,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -1806,6 +1807,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         status,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -1994,6 +1996,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::RateLimited,
             rotated: None,
             from_fetch: false,
+            from_headers: false,
             refresh_failed: false,
             login_gone: false,
             plan_override: None,
@@ -2035,6 +2038,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::Cached,
             rotated: None,
             from_fetch: false,
+            from_headers: false,
             refresh_failed: false,
             login_gone: false,
             plan_override: None,
@@ -2383,6 +2387,7 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             status: FetchStatus::Fresh,
             rotated: None,
             from_fetch: true,
+            from_headers: false,
             refresh_failed: false,
             login_gone: false,
             plan_override: None,
@@ -2555,6 +2560,488 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
     assert!(
         !window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
         "a future resets_at is a live window — no kick"
+    );
+}
+
+/// A plan with no 5h limit has no window to open: it is never lapsed, so the
+/// auto-start kick never fires for it and the queue never elects it.
+#[test]
+fn an_account_without_a_five_hour_limit_is_never_lapsed() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let now = 1_780_000_000i64;
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
+        "a plan with no 5h limit wants no window opened"
+    );
+}
+
+/// A fresh `/usage`-body outcome for `name`, its OAuth epoch already at spawn.
+fn fresh_outcome(name: &str, info: crate::usage::UsageInfo) -> super::FetchOutcome {
+    let profile = crate::profile::ProfileName::from(name);
+    let mut outcome = super::FetchOutcome::live(&profile, info, None);
+    outcome.epoch_at_spawn = crate::usage::epoch_value(&profile, crate::usage::Half::OAuth);
+    outcome
+}
+
+/// Land one outcome through the real landing (`apply_outcome`) with empty
+/// status/cadence stores, so a test reads only what the store then holds.
+fn land_outcome(store: &super::UsageStore, outcome: super::FetchOutcome) {
+    use super::{StatusStore, apply_outcome};
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    apply_outcome(
+        outcome,
+        store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+}
+
+/// The auto-start seam fires no kick for a plan with no 5h limit — neither the
+/// lapsed leg nor the live-window re-test a standing block would otherwise
+/// drive on a windowless entry.
+#[test]
+fn the_auto_start_seam_never_fires_for_a_plan_with_no_five_hour_limit() {
+    use super::{KickBlock, PollStreaks, UsageStore, WeeklyResetKicks, auto_start_should_kick};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let kick_blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let hosts: HashSet<String> = HashSet::new();
+    let name = crate::profile::ProfileName::from("a");
+    let now = 1_780_000_000i64;
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !auto_start_should_kick(
+            &streaks,
+            &store,
+            &kick_blocks,
+            &weekly_reset_kicks,
+            &hosts,
+            &name,
+            now,
+            true,
+        ),
+        "a plan with no 5h limit never kicks"
+    );
+
+    // A standing, due block is what fires the live-window re-test on any other
+    // account; it fires none here either.
+    kick_blocks.lock().unwrap().insert(
+        "a".to_string(),
+        KickBlock {
+            streak: 1,
+            rejected: true,
+            until: Some(now + 600),
+            next_retry: now,
+        },
+    );
+    assert!(
+        !auto_start_should_kick(
+            &streaks,
+            &store,
+            &kick_blocks,
+            &weekly_reset_kicks,
+            &hosts,
+            &name,
+            now,
+            true,
+        ),
+        "not even a re-test: there is no window to test"
+    );
+
+    // Control: the same standing block on an unmarked, windowless entry does
+    // fire — the fixture's block is live.
+    store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), UsageInfo::default());
+    assert!(
+        auto_start_should_kick(
+            &streaks,
+            &store,
+            &kick_blocks,
+            &weekly_reset_kicks,
+            &hosts,
+            &name,
+            now,
+            true,
+        ),
+        "an unmarked windowless entry with a due block still re-tests"
+    );
+}
+
+/// A header reading carries the windows the response sent but no verdict on the
+/// plan: landing over a marked entry keeps the mark, where a `/usage` body with
+/// a 5h window is what clears it.
+#[test]
+fn a_header_reading_landing_keeps_a_stored_no_five_hour_limit_mark() {
+    use super::{UsageStore, probe_outcome};
+    use crate::usage::inference::anthropic::ProbeAnswer;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    let name = crate::profile::ProfileName::from("a");
+    // The header set of an ordinary plan: a `5h` window and a `7d` one.
+    let header_info = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 12.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 3.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    let mut outcome = probe_outcome(
+        &name,
+        ProbeAnswer::Reading {
+            info: Box::new(header_info),
+            retry_after: None,
+            limited: None,
+        },
+    );
+    outcome.epoch_at_spawn = crate::usage::epoch_value(&name, crate::usage::Half::OAuth);
+    land_outcome(&store, outcome);
+    let stored = store.lock().unwrap();
+    let info = stored.get("a").expect("the landing stored the reading");
+    assert!(
+        info.no_five_hour_limit,
+        "a header reading never clears the stored plan verdict"
+    );
+    let window = info
+        .five_hour
+        .as_ref()
+        .expect("the reading's own 5h window is the reading's to store");
+    assert_eq!(
+        window.utilization, 12.0,
+        "the header reading's own 5h utilization reaches the store"
+    );
+    assert_eq!(
+        window.resets_at.as_deref(),
+        Some("2999-01-01T00:00:00+00:00"),
+        "the header reading's own 5h reset reaches the store"
+    );
+}
+
+/// A `/usage` body that carries neither window states no verdict on the plan:
+/// the landing keeps the stored mark rather than reading absence as one.
+#[test]
+fn a_body_with_no_windows_leaves_the_stored_no_five_hour_limit_mark() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    // The `{}`-shaped body: no 5h window and no weekly one.
+    land_outcome(&store, fresh_outcome("a", UsageInfo::default()));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get("a")
+            .is_some_and(|info| info.no_five_hour_limit),
+        "a body carrying neither window leaves the stored mark alone"
+    );
+}
+
+/// A `/usage` body that carries a weekly window and no 5h one marks the plan
+/// through the landing, over a stored entry that is unmarked: the body's own
+/// verdict, not the absence of a 5h window alone, is what sets the mark.
+#[test]
+fn a_weekly_only_body_landing_marks_an_unmarked_entry() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 3.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    // The body the `/usage` assembly builds from a weekly-only capture: the
+    // aggregate weekly window, no 5h window, its own verdict.
+    let body = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    land_outcome(&store, fresh_outcome("a", body));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get("a")
+            .is_some_and(|info| info.no_five_hour_limit),
+        "a body carrying a weekly window and no 5h window marks the plan"
+    );
+}
+
+/// The same landing for a body whose only weekly window is a per-model one:
+/// the verdict does not need the aggregate `seven_day` entry.
+#[test]
+fn a_scoped_weekly_only_body_marks_through_the_landing() {
+    use super::UsageStore;
+    use crate::usage::{ScopedWindow, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), UsageInfo::default());
+    // The assembly's shape for a `weekly_scoped`-only capture.
+    let body = UsageInfo {
+        weekly_scoped: vec![ScopedWindow {
+            label: "7d fable".to_string(),
+            window: UsageWindow {
+                utilization: 0.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            },
+        }],
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    land_outcome(&store, fresh_outcome("a", body));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get("a")
+            .is_some_and(|info| info.no_five_hour_limit),
+        "a per-model weekly window is a weekly window: the landing marks the plan"
+    );
+}
+
+/// A `/usage` body that carries a 5h window clears the mark through the same
+/// landing: the plan's own body outranks the previous verdict.
+#[test]
+fn a_usage_body_with_a_five_hour_window_clears_the_mark_through_the_landing() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    let body = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 3.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    land_outcome(&store, fresh_outcome("a", body));
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .get("a")
+            .is_some_and(|info| info.no_five_hour_limit),
+        "a body carrying a 5h window clears the mark"
+    );
+}
+
+/// A landing that marks the plan as having no 5h limit never stores a
+/// just-kicked synthetic window from `prev`: the plan has no window to show, so
+/// the kick's optimistic window must not resurface on the store-backed surfaces.
+#[test]
+fn a_marked_body_never_stores_a_just_kicked_synthetic_window() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let now = now_epoch_secs();
+    let seven_day = Some(UsageWindow {
+        utilization: 1.0,
+        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+    });
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            // A kick landed in the same tick: a live synthetic window and its
+            // stamp, inside the lag horizon.
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now + 5 * 3600)),
+            }),
+            open_at: Some(now),
+            seven_day: seven_day.clone(),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    land_outcome(
+        &store,
+        fresh_outcome(
+            "a",
+            UsageInfo {
+                seven_day,
+                no_five_hour_limit: true,
+                ..Default::default()
+            },
+        ),
+    );
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get("a")
+            .is_some_and(|info| info.five_hour.is_none()),
+        "a marked body never stores a just-kicked synthetic 5h window"
+    );
+}
+
+/// The dead-reading bypass is for a blind channel, not for a plan that has no
+/// 5h window at all: a stuck reading channel never reports a marked member.
+#[test]
+fn reading_dead_names_never_flags_a_plan_with_no_five_hour_limit() {
+    use super::{
+        ACTIVE_CAP_MAX_STREAK, FetchStatus, PollStreaks, StatusStore, StreakCounts,
+        ThirdPartyStatusStore, ThirdPartyStreaks, reading_dead_names,
+    };
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        FetchStatus::RateLimited,
+    )])));
+    let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        StreakCounts {
+            rate_limit: ACTIVE_CAP_MAX_STREAK + 1,
+            refresh_fail: 0,
+        },
+    )])));
+    let tp_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let marked = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let mut usage: HashMap<String, UsageInfo> = HashMap::new();
+    usage.insert("a".to_string(), marked);
+    let names = reading_dead_names(
+        &[reset_member("a")],
+        &status,
+        &tp_status,
+        &streaks,
+        &tp_streaks,
+        &HashSet::new(),
+        &usage,
+    );
+    assert!(
+        names.is_empty(),
+        "a plan with no 5h limit has a live channel, just no window: {names:?}"
+    );
+
+    // Control: the same stuck channel over a windowless entry WITHOUT the mark
+    // is exactly what the bypass exists for.
+    usage.insert("a".to_string(), UsageInfo::default());
+    let names = reading_dead_names(
+        &[reset_member("a")],
+        &status,
+        &tp_status,
+        &streaks,
+        &tp_streaks,
+        &HashSet::new(),
+        &usage,
+    );
+    assert_eq!(
+        names,
+        vec![crate::profile::ProfileName::from("a")],
+        "an unmarked windowless member on a dead channel still qualifies"
     );
 }
 
@@ -3111,6 +3598,7 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         status: FetchStatus::Fresh,
         rotated: None,
         from_fetch: true,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -3505,6 +3993,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         status: FetchStatus::Fresh,
         rotated: None,
         from_fetch: true,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -12324,6 +12813,7 @@ fn retry_after_defers_next_fetch_slot() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -12503,6 +12993,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         status,
         rotated: None,
         from_fetch,
+        from_headers: false,
         retry_after: None,
         oauth_identity: crate::usage::OAuthIdentity::default(),
         sent_access_token: String::new(),
@@ -12610,6 +13101,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -12679,6 +13171,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         status: kind,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -16366,6 +16859,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -16488,6 +16982,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         status: super::FetchStatus::Cached,
         rotated: None,
         from_fetch: false,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,
@@ -21769,6 +22264,177 @@ fn the_queue_open_line_counts_no_account_canceled_in_the_store() {
         line,
         Some("b: 5h auto-start window opened (queue 1/1, next in 4h 58m)".to_string()),
         "the canceled account holds no queue slot in the open line"
+    );
+}
+
+/// A plan with no 5h limit is no queue member: the election builds its roster
+/// from the in-memory usage store, so a roster holding one sizes the gap
+/// without it. Between `5h / 2` and `5h / 1` a two-member queue would be due and
+/// elect; the one-member queue is still inside its gap. The live member heads
+/// the chain, so a roster that wrongly kept the marked one elects the head and
+/// stamps it open — visible on the head itself, where a marked member winning
+/// the slot would not be (a non-member is never stamped shut).
+#[test]
+fn auto_start_queue_election_leaves_out_a_plan_with_no_five_hour_limit() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::UsageInfo;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    let warming = |name: &str| {
+        let mut e = token(name);
+        e.auto_start = true;
+        e
+    };
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "m".into()],
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("m"), opted_in("a")],
+    }));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        (
+            "m".to_string(),
+            UsageInfo {
+                no_five_hour_limit: true,
+                ..UsageInfo::default()
+            },
+        ),
+        ("a".to_string(), UsageInfo::default()),
+    ])));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store,
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - 9000);
+    let mut due = vec![warming("m"), warming("a")];
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter()
+            .find(|e| e.name.as_str() == "a")
+            .is_some_and(|e| !e.may_open_window),
+        "a plan with no 5h limit takes no slot, so the one-member gap still holds"
+    );
+
+    // Control: the same roster with `m` unmarked is a two-member queue, due at
+    // this anchor, and the chain head is elected.
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("m".to_string(), UsageInfo::default());
+    let mut due = vec![warming("m"), warming("a")];
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let elected: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        elected,
+        vec!["a"],
+        "unmarked control: the chain head is elected from a two-member queue"
+    );
+}
+
+/// The queue-open line sizes its queue off the same store the election reads:
+/// a plan with no 5h limit in the store is no member, so `a`'s line names `1/1`
+/// and the one-member gap, never `2/2` and `2h 28m`.
+#[test]
+fn the_queue_open_line_counts_no_account_with_a_plan_having_no_five_hour_limit() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::UsageInfo;
+    let _home = crate::testutil::HomeSandbox::new();
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "m".into()],
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("m")],
+    }));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "m".to_string(),
+        UsageInfo {
+            no_five_hour_limit: true,
+            ..UsageInfo::default()
+        },
+    )])));
+    let kick_blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let line = super::queue_open_line(
+        &config,
+        &kick_blocks,
+        &store,
+        "a",
+        REFRESH_INTERVAL_MS,
+        crate::usage::now_epoch_secs(),
+    );
+    assert_eq!(
+        line,
+        Some("a: 5h auto-start window opened (queue 1/1, next in 4h 58m)".to_string()),
+        "a plan with no 5h limit holds no queue slot in the open line"
+    );
+
+    // Control: the same roster with `m` unmarked is a two-member queue, and the
+    // line names its shorter gap.
+    store
+        .lock()
+        .unwrap()
+        .insert("m".to_string(), UsageInfo::default());
+    let line = super::queue_open_line(
+        &config,
+        &kick_blocks,
+        &store,
+        "a",
+        REFRESH_INTERVAL_MS,
+        crate::usage::now_epoch_secs(),
+    );
+    assert_eq!(
+        line,
+        Some("a: 5h auto-start window opened (queue 1/2, next in 2h 28m)".to_string()),
+        "unmarked control: the second member sizes the gap"
     );
 }
 
@@ -30651,6 +31317,7 @@ fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fres
         },
         rotated: None,
         from_fetch: fresh,
+        from_headers: false,
         refresh_failed: false,
         login_gone: false,
         plan_override: None,

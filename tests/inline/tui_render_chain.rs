@@ -140,7 +140,7 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
     cfg.state.auto_start_queue = true;
 
     let none = std::collections::HashMap::new();
-    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false, |_| false);
     let slot = view.slot("a").expect("an opted-in member holds a slot");
     assert_eq!((slot.position, slot.total), (1, 2));
     assert_eq!(view.slot("b").map(|s| s.position), Some(2));
@@ -152,13 +152,13 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
 
     // A switch-grade-blocked member holds no slot, and the queue re-sizes.
     let lifts = std::collections::HashMap::from([("a".to_string(), 0i64)]);
-    let view = super::super::panes::QueueView::new(&cfg, &lifts, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &lifts, None, |_| false, |_| false);
     assert_eq!(view.slot("a"), None, "blocked: no slot");
     assert_eq!(view.slot("b").map(|s| (s.position, s.total)), Some((1, 1)));
 
     // The toggle off is a real off switch on this surface too.
     cfg.state.auto_start_queue = false;
-    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false, |_| false);
     assert_eq!(view.slot("a"), None);
 }
 

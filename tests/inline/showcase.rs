@@ -303,6 +303,7 @@ fn oauth_profile(
         codex_reset_credits: None,
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     };
     (
         Profile {

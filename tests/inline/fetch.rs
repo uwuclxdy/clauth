@@ -1210,6 +1210,141 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     );
 }
 
+/// The `/usage` body of a plan with no 5h limit, trimmed from a real capture
+/// (2026-10-31): `five_hour` is null and `limits[]` holds no `session` entry.
+const NO_FIVE_HOUR_BODY: &str = r#"{
+  "five_hour": null,
+  "seven_day": {"utilization": 1.0, "resets_at": "2026-11-07T16:00:00.207828+00:00"},
+  "limits": [
+    {"kind": "weekly_all", "group": "weekly", "percent": 1, "resets_at": "2026-11-07T16:00:00.207828+00:00", "scope": null, "is_active": true},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+  ]
+}"#;
+
+#[test]
+fn a_body_with_no_five_hour_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let info = assemble_usage(Ok(NO_FIVE_HOUR_BODY.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.no_five_hour_limit,
+        "a null five_hour with no session limit marks the plan as having no 5h limit"
+    );
+    assert_eq!(
+        info.seven_day.as_ref().map(|w| w.utilization),
+        Some(1.0),
+        "the weekly window still reads"
+    );
+}
+
+#[test]
+fn an_idle_five_hour_window_is_not_a_missing_one() {
+    // An idle account's window: 0% with a reset ~5h ahead, as `limits[]` sends it.
+    let idle = r#"{
+      "five_hour": {"utilization": 0.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"},
+      "limits": [
+        {"kind": "session", "percent": 0, "resets_at": "2026-10-31T21:00:00+00:00"},
+        {"kind": "weekly_all", "percent": 3, "resets_at": "2026-11-07T16:00:00+00:00"}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(idle.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a 0% session window is a 5h limit"
+    );
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(0.0));
+
+    // The legacy shape: a top-level five_hour object and no limits[] at all.
+    let legacy = r#"{
+      "five_hour": {"utilization": 12.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"}
+    }"#;
+    let info = assemble_usage(Ok(legacy.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a legacy five_hour object is a 5h limit"
+    );
+
+    // A session limit with the top-level field null still counts.
+    let session_only = r#"{
+      "five_hour": null,
+      "limits": [{"kind": "session", "percent": 40, "resets_at": "2026-10-31T21:00:00+00:00"}]
+    }"#;
+    let info = assemble_usage(Ok(session_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a session limit alone is a 5h limit"
+    );
+
+    // A body naming no window at all says nothing about the plan.
+    let info = assemble_usage(Ok("{}".to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a body with no weekly window either is no evidence of a plan without a 5h limit"
+    );
+}
+
+/// The verdict keys on any weekly window, not on the aggregate one: a body
+/// whose only weekly limits are per-model (`weekly_scoped`) entries still says
+/// the plan has no 5h limit.
+#[test]
+fn a_body_with_only_a_scoped_weekly_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let scoped_only = r#"{
+      "five_hour": null,
+      "limits": [
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(scoped_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.seven_day.is_none(),
+        "the body sends no aggregate weekly window"
+    );
+    assert_eq!(
+        info.weekly_scoped.len(),
+        1,
+        "the per-model weekly window still reads"
+    );
+    assert!(
+        info.no_five_hour_limit,
+        "a per-model weekly window is a weekly window: the plan has no 5h limit"
+    );
+}
+
+/// The mark is a field of the stored body, so it rides `usage_cache.json`'s
+/// serde: a marked entry round-trips marked, and an unmarked one writes no key
+/// at all (a cold cache file never grows a false verdict).
+#[test]
+fn a_marked_usage_info_round_trips_through_the_cache_serde_and_an_unmarked_one_writes_no_key() {
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&marked).expect("a marked body serializes");
+    assert_eq!(
+        json.get("no_five_hour_limit"),
+        Some(&serde_json::Value::Bool(true)),
+        "a marked body writes the key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("a marked body parses");
+    assert!(back.no_five_hour_limit, "the mark survives the round trip");
+
+    let json = serde_json::to_value(UsageInfo::default()).expect("an unmarked body serializes");
+    assert!(
+        json.get("no_five_hour_limit").is_none(),
+        "an unmarked body writes no key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("an unmarked body parses");
+    assert!(!back.no_five_hour_limit, "an absent key reads unmarked");
+}
+
 #[test]
 fn short_label_drops_claude_prefix() {
     assert_eq!(PlanTier::Max(None).short_label().as_deref(), Some("Max"));

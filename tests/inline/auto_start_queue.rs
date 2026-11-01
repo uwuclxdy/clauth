@@ -66,7 +66,7 @@ fn auto_start_queue_members_orders_by_chain_position_then_display_order() {
     );
 
     assert_eq!(
-        auto_start_queue_members(&config, &[], |_| false),
+        auto_start_queue_members(&config, &[], |_| false, |_| false),
         vec!["first", "second", "alpha", "zulu"],
         "chain members lead in chain order, the rest follow alphabetically"
     );
@@ -99,10 +99,34 @@ fn auto_start_queue_members_excludes_everything_that_cannot_open_a_window() {
     config.state.auth_broken = vec!["quarantined".into()];
 
     assert_eq!(
-        auto_start_queue_members(&config, &["kick-blocked".into()], |_| false),
+        auto_start_queue_members(&config, &["kick-blocked".into()], |_| false, |_| false),
         vec!["live"],
         "no auto-start, disabled, no OAuth pair, auth-broken, and a switch-grade \
          kick block each cost the slot"
+    );
+}
+
+/// A plan with no 5h limit can never open a window, so it holds no queue slot
+/// and sizes no part of the gap: the `N` in `5h / N` is the members that can
+/// open one.
+#[test]
+fn auto_start_queue_members_excludes_a_plan_with_no_five_hour_limit() {
+    let config = config_of(
+        vec![warming("live-a"), warming("marked"), warming("live-b")],
+        vec![],
+    );
+    let members = auto_start_queue_members(&config, &[], |_| false, |n| n.as_str() == "marked");
+    assert_eq!(
+        members,
+        vec!["live-a", "live-b"],
+        "a plan with no 5h limit takes no slot"
+    );
+    let now = 1_780_000_000i64;
+    let slot = queue_slot(&members, "live-b", Some(now - 60), INTERVAL_MS, now)
+        .expect("the live members keep their slots");
+    assert_eq!(
+        slot.total, 2,
+        "the gap is sized by the two members that can open a window"
     );
 }
 
@@ -119,7 +143,7 @@ fn auto_start_queue_members_keeps_a_hybrid_that_stores_an_oauth_pair() {
     let config = config_of(vec![hybrid], vec![]);
 
     assert_eq!(
-        auto_start_queue_members(&config, &[], |_| false),
+        auto_start_queue_members(&config, &[], |_| false, |_| false),
         vec!["hybrid"]
     );
 }
@@ -131,7 +155,7 @@ fn auto_start_queue_members_is_empty_with_the_queue_toggle_off() {
     let mut config = config_of(vec![warming("a"), warming("b")], vec![]);
     config.state.auto_start_queue = false;
 
-    assert!(auto_start_queue_members(&config, &[], |_| false).is_empty());
+    assert!(auto_start_queue_members(&config, &[], |_| false, |_| false).is_empty());
 }
 
 /// `queue_slot` is the render read: a 1-based position, the queue size the gap is
@@ -1077,7 +1101,7 @@ fn auto_start_queue_anchor_replays_non_member_profiles() {
     outsider.auto_start = false;
     let config = config_of(vec![warming("member"), outsider], vec![]);
     assert_eq!(
-        auto_start_queue_members(&config, &[], |_| false),
+        auto_start_queue_members(&config, &[], |_| false, |_| false),
         vec!["member"],
         "the outsider holds no queue slot"
     );
@@ -1106,7 +1130,7 @@ fn auto_start_queue_anchor_replays_non_member_profiles() {
     // The member list alone — the pre-ruling anchor input — would have
     // answered with the member's older open, so the full-list input is what
     // the two legs now agree on.
-    let members = auto_start_queue_members(&config, &[], |_| false);
+    let members = auto_start_queue_members(&config, &[], |_| false, |_| false);
     let old_input = super::new_state();
     assert_eq!(
         super::queue_anchor(&old_input, &members, now, gap),

@@ -1462,8 +1462,12 @@ pub(crate) fn rotate_one(
 ///
 /// The just-switched profile is active and freshly reconciled, so the diverged-
 /// active guard the steady-state path needs doesn't apply here; opt-in + OAuth
-/// is the whole gate.
+/// is the whole gate, less a plan with no 5h limit, which has no window to open
+/// and so gets no kick.
 pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &ProfileName) -> bool {
+    if crate::usage::no_five_hour_limit_cached(name) {
+        return false;
+    }
     let (access_token, refresh_token, expires_at) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");

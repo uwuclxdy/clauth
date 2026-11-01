@@ -3033,6 +3033,42 @@ fn a_captured_window_exhaustion_429_carries_the_limiters_rejection() {
     );
 }
 
+/// `clauth switch`'s prime is skipped on a plan with no 5h limit: the stored
+/// body says there is no window to open, so no request may leave. An
+/// endpoint-seam pin — a bare "no kick" could not tell a skip from a dead
+/// network.
+#[test]
+fn prime_window_sends_no_kick_for_a_plan_with_no_five_hour_limit() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("prime-no-5h");
+    // Zero expected requests: reaching the listener at all is the failure.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| (200, String::new()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&name);
+    config.lock().expect("config lock").profiles[0].auto_start = true;
+    crate::testutil::register_names(&["prime-no-5h"]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 1.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+
+    let primed = prime_window(&config, &name);
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.is_empty(),
+        "a plan with no 5h limit has no window to prime: {seen:?}"
+    );
+    assert!(!primed, "nothing opened");
+}
+
 // ── ureq's non-2xx default on the token/kick agent ───────────────────────────
 
 /// The sibling of `non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable`

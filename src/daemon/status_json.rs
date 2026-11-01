@@ -92,8 +92,10 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
-    /// The scheduler's OAuth usage store snapshot, for the canceled-exclusion
-    /// the queue membership rule reads (the daemon's own context).
+    /// The scheduler's OAuth usage store snapshot, for the two exclusions the
+    /// queue membership rule reads off it (the daemon's own context): a
+    /// canceled plan, and one whose stored verdict says its plan has no 5h
+    /// limit.
     pub(crate) usage: &'a HashMap<String, UsageInfo>,
     /// The gateway slot the daemon's supervisor last published. `None`
     /// single-shot or before the supervisor's first publish, where the slot
@@ -316,13 +318,15 @@ pub(crate) fn build_profile_entries(
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     // Interleaved auto-start queue (`usage::auto_start_queue`), hoisted so the
-    // membership and anchor are resolved once rather than per profile. Both
-    // inputs come from the same places the scheduler's own election reads them,
-    // so the published slot cannot disagree with the one being gated: a live
-    // daemon passes its in-memory blocks and anchor through `LiveSignals`, and
-    // the daemonless `status --json` re-derives each from disk — the
-    // `kick_block.json` caches the scheduler writes through, and the
-    // usage-history series. Both derivations are one pass per invocation, a
+    // membership and anchor are resolved once rather than per profile. All
+    // three membership inputs — the switch-grade blocks, the canceled plan and
+    // the stored plan verdict — and the anchor come from the same places the
+    // scheduler's own election reads them, so the published slot cannot
+    // disagree with the one being gated: a live daemon passes its in-memory
+    // blocks, usage store and anchor through `LiveSignals`, and the daemonless
+    // `status --json` re-derives each from disk — the `kick_block.json` caches
+    // the scheduler writes through, the per-profile usage cache, and the
+    // usage-history series. Every derivation is one pass per invocation, a
     // cost the per-tick daemon feed must not pay.
     let blocked = match live {
         Some(l) => l.queue_blocked.to_vec(),
@@ -336,12 +340,22 @@ pub(crate) fn build_profile_entries(
         ),
     };
     let queue_members = match live {
-        Some(l) => crate::usage::auto_start_queue_members(config, &blocked, |n| {
-            crate::fallback::refuses_service_from_usage(n, l.usage)
-        }),
-        None => crate::usage::auto_start_queue_members(config, &blocked, |n| {
-            crate::profile_json::refuses_service_cached(n)
-        }),
+        Some(l) => crate::usage::auto_start_queue_members(
+            config,
+            &blocked,
+            |n| crate::fallback::refuses_service_from_usage(n, l.usage),
+            |n| {
+                l.usage
+                    .get(n.as_str())
+                    .is_some_and(|i| i.no_five_hour_limit)
+            },
+        ),
+        None => crate::usage::auto_start_queue_members(
+            config,
+            &blocked,
+            crate::profile_json::refuses_service_cached,
+            crate::usage::no_five_hour_limit_cached,
+        ),
     };
     let queue_anchor = match live {
         Some(l) => l.queue_anchor,

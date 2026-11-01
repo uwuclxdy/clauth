@@ -734,6 +734,18 @@ pub(crate) struct UsageInfo {
     /// STALE with no age published rather than fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
+    /// The account's plan carries no 5h limit at all: a live `/usage` body sent
+    /// neither a `session` limit nor a top-level `five_hour` object while it did
+    /// carry a weekly window (the aggregate one or a per-model `weekly_scoped`
+    /// one). Absence alone is ordinary (an unread body, a header reading, a cold
+    /// cache), so this is a verdict about the PLAN, not about a reading. The
+    /// `/usage` body assembly ([`body_plan_verdict`]) sets it from the body's own
+    /// windows — `true` with no 5h window but a weekly one, `false` with a 5h
+    /// window — and the landing keeps the stored value for a body that states
+    /// none; a header reading never moves it, and every other writer carries the
+    /// stored value forward.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) no_five_hour_limit: bool,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -1079,6 +1091,29 @@ fn windows_from_raw(raw: &RawUsage) -> DerivedWindows {
         seven_day: seven.or_else(|| raw.seven_day.as_ref().map(RawWindow::to_window)),
         weekly_scoped: scoped,
         window_dollars,
+    }
+}
+
+/// The plan verdict a `/usage` body states, read off the windows it carries:
+/// `Some(true)` when it has no 5h window while it does carry a weekly one —
+/// the aggregate `weekly_all` entry or any per-model `weekly_scoped` one —
+/// `Some(false)` when it carries a 5h window, and `None` when it carries no
+/// window at all, which states nothing about the plan.
+///
+/// One predicate for both readers, so they cannot disagree: [`assemble_usage`]
+/// stores it as [`UsageInfo::no_five_hour_limit`], and the scheduler's landing
+/// keeps the stored mark for the `None` case.
+pub(crate) fn body_plan_verdict(
+    five_hour: Option<&UsageWindow>,
+    seven_day: Option<&UsageWindow>,
+    weekly_scoped: &[ScopedWindow],
+) -> Option<bool> {
+    if five_hour.is_some() {
+        Some(false)
+    } else if seven_day.is_some() || !weekly_scoped.is_empty() {
+        Some(true)
+    } else {
+        None
     }
 }
 
@@ -1728,6 +1763,18 @@ fn assemble_usage(
             let plan = fetch_plan().or(prev_plan);
             let windows = windows_from_raw(&raw);
             let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
+            // The body's own plan verdict: no 5h window while a weekly one is
+            // present is a plan without a 5h limit, not an unread 5h window. A
+            // body carrying neither window states nothing about the plan; the
+            // landing keeps the stored mark for it.
+            let no_five_hour_limit = matches!(
+                body_plan_verdict(
+                    windows.five_hour.as_ref(),
+                    windows.seven_day.as_ref(),
+                    &windows.weekly_scoped,
+                ),
+                Some(true)
+            );
             Ok(UsageInfo {
                 plan,
                 five_hour: windows.five_hour,
@@ -1743,6 +1790,7 @@ fn assemble_usage(
                 codex_reset_credits: None,
                 open_at: None,
                 fetched_at: None,
+                no_five_hour_limit,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
@@ -2065,6 +2113,17 @@ pub(crate) fn seed_plan_cache(
     if let Err(e) = crate::profile::atomic_write_600(&path, json) {
         logline!("clauth: {name}: could not save the login's plan: {e}");
     }
+}
+
+/// Whether `name`'s stored `/usage` body says its plan has no 5h limit. Reads
+/// the cache file, not an in-memory store: the CLI's one-shot paths
+/// (`clauth switch`'s window prime) have no scheduler behind them.
+pub(crate) fn no_five_hour_limit_cached(name: &ProfileName) -> bool {
+    crate::profile_cache::load_profile_cache::<UsageInfo>(
+        name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .is_some_and(|info| info.no_five_hour_limit)
 }
 
 /// Remove a profile's durable `/profile` stamp — the cross-process half of

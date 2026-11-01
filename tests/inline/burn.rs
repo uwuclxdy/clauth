@@ -76,6 +76,7 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         codex_reset_credits: None,
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     }
 }
 

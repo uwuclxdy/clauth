@@ -10,8 +10,9 @@ use crate::oauth::RefreshError;
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
-    FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso, fetch_raw,
-    five_hour_live, humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms, windows_maxed,
+    FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, body_plan_verdict,
+    epoch_secs_to_iso, fetch_raw, five_hour_live, humanize_duration, iso_to_epoch_secs,
+    now_epoch_secs, now_ms, windows_maxed,
 };
 use crate::oauth::KickRateLimit;
 use crate::profile::ProfileName;
@@ -1700,6 +1701,10 @@ struct FetchOutcome {
     /// `info` is a live API body (not a disk-cache fallback). Only live bodies
     /// may overwrite the store / disk cache in [`apply_outcome`].
     from_fetch: bool,
+    /// `info` was read off rate-limit headers, not a `/usage` body: it carries
+    /// the windows the response sent but no verdict on whether the plan has a
+    /// 5h limit, so [`apply_outcome`] carries the stored mark forward.
+    from_headers: bool,
     /// Server `retry-after` hint from a 429; [`apply_outcome`] turns it into a
     /// deferred next-fetch slot for this profile.
     retry_after: Option<Duration>,
@@ -1746,6 +1751,7 @@ impl FetchOutcome {
             status: FetchStatus::Fresh,
             rotated,
             from_fetch: true,
+            from_headers: false,
             retry_after: None,
             refresh_failed: false,
             login_gone: false,
@@ -1757,6 +1763,13 @@ impl FetchOutcome {
             profile_attempt_at: None,
             reanchored: false,
         }
+    }
+
+    /// Mark this live body as a header reading, whose window set is the
+    /// server's but carries no plan verdict.
+    fn with_headers(mut self) -> Self {
+        self.from_headers = true;
+        self
     }
 
     /// Carry the worker's `/profile` decision (wanted, attempt instant, re-anchor)
@@ -1798,6 +1811,7 @@ impl FetchOutcome {
             status,
             rotated,
             from_fetch: false,
+            from_headers: false,
             retry_after,
             refresh_failed: false,
             login_gone: false,
@@ -1841,8 +1855,9 @@ const KICK_LAG_HORIZON_SECS: i64 = 300;
 /// tick re-derives the bound instead of carrying the window until its own
 /// `resets_at`. Any other live `prev` (wire-sourced, or a kick past the horizon
 /// — e.g. a server-side reset such as a subscription upgrade) takes `fresh`
-/// verbatim, so the wire's verdict wins once the kick's lag can have passed. A genuine new window (live in
-/// `fresh`) or a still-closed `prev` is left untouched.
+/// verbatim, so the wire's verdict wins once the kick's lag can have passed. A
+/// genuine new window (live in `fresh`) or a still-closed `prev` is left
+/// untouched.
 fn preserve_live_window(
     mut fresh: UsageInfo,
     prev: Option<&UsageInfo>,
@@ -1862,10 +1877,11 @@ fn preserve_live_window(
 }
 
 /// True iff we hold a fetched usage entry for `name` whose 5h window is absent
-/// or already past its reset — the signal to open a fresh window. An ABSENT
-/// store entry (never fetched this run) returns false on purpose: fetch first,
-/// kick next tick, so a cold cache never kicks blind on a window that may
-/// already be live.
+/// or already past its reset — the signal to open a fresh window. A plan with
+/// no 5h limit has no window to open, so a marked entry is never lapsed. An
+/// ABSENT store entry (never fetched this run) returns false on purpose: fetch
+/// first, kick next tick, so a cold cache never kicks blind on a window that
+/// may already be live.
 ///
 /// Reads the OAuth store, NOT the picker: the auto-start kick spends the stored
 /// OAuth access token and never routes through `base_url`
@@ -1879,7 +1895,7 @@ fn window_lapsed(store: &UsageStore, name: &ProfileName, now_secs: i64) -> bool 
     let Some(info) = s.get(name.as_str()) else {
         return false;
     };
-    !five_hour_live(info, now_secs)
+    !info.no_five_hour_limit && !five_hour_live(info, now_secs)
 }
 
 /// A fresh body shows the aggregate 7d window rolled over from the hard cap
@@ -2133,6 +2149,18 @@ fn auto_start_should_kick(
     now_secs: i64,
     queue_due: bool,
 ) -> bool {
+    // A plan with no 5h limit has no window for either leg to open or re-test:
+    // the lapsed leg is already false for it, and a standing block would
+    // otherwise keep firing the live-window re-test for a window that cannot
+    // exist. Read alone and released before any other store.
+    let no_five_hour_limit = store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(name.as_str()).map(|i| i.no_five_hour_limit))
+        .unwrap_or(false);
+    if no_five_hour_limit {
+        return false;
+    }
     let block = kick_block(kick_blocks, name);
     let weekly_reset_pending = weekly_reset_kicks
         .lock()
@@ -2508,9 +2536,12 @@ fn elect_auto_start_queue(
         .lock()
         .map(|c| {
             (
-                crate::usage::auto_start_queue_members(&c, &blocked, |n| {
-                    crate::fallback::refuses_service_from_usage(n, &usage)
-                }),
+                crate::usage::auto_start_queue_members(
+                    &c,
+                    &blocked,
+                    |n| crate::fallback::refuses_service_from_usage(n, &usage),
+                    |n| usage.get(n.as_str()).is_some_and(|i| i.no_five_hour_limit),
+                ),
                 c.profiles
                     .iter()
                     .map(|p| p.name.clone())
@@ -2610,9 +2641,12 @@ fn queue_open_line(
     let queue = config
         .lock()
         .map(|c| {
-            crate::usage::auto_start_queue_members(&c, &blocked, |n| {
-                crate::fallback::refuses_service_from_usage(n, &usage)
-            })
+            crate::usage::auto_start_queue_members(
+                &c,
+                &blocked,
+                |n| crate::fallback::refuses_service_from_usage(n, &usage),
+                |n| usage.get(n.as_str()).is_some_and(|i| i.no_five_hour_limit),
+            )
         })
         .unwrap_or_default();
     let slot = crate::usage::queue_slot(&queue, name, Some(now_secs), interval_ms, now_secs)?;
@@ -3118,7 +3152,30 @@ fn apply_outcome_flagged(
             }
             return info;
         }
+        // The body's own window set, read before the kick-lag carry adds a
+        // window back: only what the wire sent is a reading of the plan.
+        let body_verdict = body_plan_verdict(
+            info.five_hour.as_ref(),
+            info.seven_day.as_ref(),
+            &info.weekly_scoped,
+        );
+        // The drop gate reads the same verdict, so the two cannot disagree.
+        let body_five_hour = matches!(body_verdict, Some(false));
         let mut info = preserve_live_window(info.clone(), prev.as_ref(), now_epoch_secs());
+        // One derivation for both halves: a header reading says nothing about
+        // the plan, and a body carrying no window is no evidence either, so
+        // both keep the stored mark; a body that states a verdict stores it.
+        let stored_mark = prev.as_ref().is_some_and(|p| p.no_five_hour_limit);
+        info.no_five_hour_limit = if outcome.from_headers {
+            stored_mark
+        } else {
+            body_verdict.unwrap_or(stored_mark)
+        };
+        // A marked plan's own body carries no 5h window, so any window here is
+        // the kick-lag carry, never the wire's.
+        if info.no_five_hour_limit && !body_five_hour {
+            info.five_hour = None;
+        }
         // The age clock: only a live fetch re-ages the body, so the plan ride
         // above keeps whatever stamp the loaded snapshot already carried.
         info.fetched_at = Some(now.as_millis());
@@ -3149,6 +3206,13 @@ fn apply_outcome_flagged(
         .filter(|_| merged.is_none())
         .map(|plan| UsageInfo {
             plan: Some(plan),
+            // No body to rebuild from: the one stored verdict this plan-only
+            // fill must not drop is the plan shape itself.
+            no_five_hour_limit: store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(outcome.name.as_str()).map(|i| i.no_five_hour_limit))
+                .unwrap_or(false),
             ..Default::default()
         });
 
@@ -6470,7 +6534,7 @@ fn probe_outcome(
         ProbeAnswer::Reading {
             info, retry_after, ..
         } => {
-            let mut outcome = FetchOutcome::live(name, *info, None);
+            let mut outcome = FetchOutcome::live(name, *info, None).with_headers();
             outcome.retry_after = retry_after;
             outcome
         }
@@ -7548,8 +7612,9 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
 /// ([`is_stuck_rate_limited`]) whose usage-store entry carries no 5h window at
 /// all — windowless or absent, the shape a persistent `/usage` 429 leaves (a
 /// 429 outcome never inserts windows; the plan-only cold fill records at most
-/// the tier). Filled by both chain-driving scans beside
-/// `kick_rejected`/`fresh` and consulted by the walk as the fourth
+/// the tier). A plan with no 5h limit never qualifies: its channel is not
+/// blind, the window simply does not exist. Filled by both chain-driving scans
+/// beside `kick_rejected`/`fresh` and consulted by the walk as the fourth
 /// exhaustion-gate bypass: a dead-reading ACTIVE's exhaustion evidence can
 /// never arrive, so the gate must not hold the chain on it (issue #83). A
 /// member holding ANY window — lapsed or headroom — never qualifies: that
@@ -7576,7 +7641,7 @@ pub(crate) fn reading_dead_names(
         .filter(|m| {
             usage
                 .get(m.name.as_str())
-                .is_none_or(|i| i.five_hour.is_none())
+                .is_none_or(|i| i.five_hour.is_none() && !i.no_five_hour_limit)
         })
         .collect();
     windowless

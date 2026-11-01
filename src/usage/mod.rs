@@ -45,10 +45,11 @@ pub(crate) use fetch::{
     WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch, epoch_secs_to_iso,
     expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
     forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
-    long_window_live, mark_profile_read_stale, ms_to_iso, note_profile_memo, now_epoch_secs,
-    now_ms, parse_retry_after, parse_retry_after_at, probe_account_uuid, probe_login_profile,
-    reconcile_identity_anchor_to_held, seed_login_anchor, seed_plan_cache, spent_resume_in_secs,
-    stamp_profile_fetch, window_avg_pace_per_day, window_duration_secs, windows_maxed,
+    long_window_live, mark_profile_read_stale, ms_to_iso, no_five_hour_limit_cached,
+    note_profile_memo, now_epoch_secs, now_ms, parse_retry_after, parse_retry_after_at,
+    probe_account_uuid, probe_login_profile, reconcile_identity_anchor_to_held, seed_login_anchor,
+    seed_plan_cache, spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day,
+    window_duration_secs, windows_maxed,
 };
 pub(crate) use scheduler::{
     ActivityStore, DeadLoginStats, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt,

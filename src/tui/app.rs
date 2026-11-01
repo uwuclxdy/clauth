@@ -5898,8 +5898,9 @@ pub(crate) struct ReadingsSnapshot {
     /// Raw provider stats per profile name (the balance rows' source).
     pub(crate) third_party: HashMap<String, crate::providers::ThirdPartyStats>,
     /// Raw OAuth store per profile name, unpicked: the queue chips' canceled
-    /// source, the same one the scheduler's election reads, so a hybrid whose
-    /// OAuth plan is canceled drops from both.
+    /// source and their plan verdict, the same ones the scheduler's election
+    /// reads, so a hybrid whose OAuth plan is canceled or has no 5h limit drops
+    /// from both.
     pub(crate) oauth: HashMap<String, UsageInfo>,
     /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
     pub(crate) stale: HashMap<String, bool>,

@@ -10,6 +10,18 @@ fn snap_with_usage(
     s.usage.insert(name.to_string(), u);
     s
 }
+/// The raw OAuth store entry, as the snapshot builder keeps it. An OAuth-typed
+/// name gets the same entry here and (through the picker) in `usage`; a hybrid
+/// keeps its provider reading in `usage`, and only this map says what its own
+/// plan is.
+fn snap_with_oauth_usage(
+    mut s: ReadingsSnapshot,
+    name: &str,
+    u: crate::usage::UsageInfo,
+) -> ReadingsSnapshot {
+    s.oauth.insert(name.to_string(), u);
+    s
+}
 fn snap_with_status(mut s: ReadingsSnapshot, name: &str, st: FetchStatus) -> ReadingsSnapshot {
     s.fetch_status.insert(name.to_string(), st);
     s
@@ -40,6 +52,7 @@ fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
         reset_secs: None,
         trailing: String::new(),
         note: None,
+        value: None,
     };
     let lines = stat.render(6, 20, 0, 0);
     assert_eq!(
@@ -3065,6 +3078,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
                 codex_reset_credits: None,
                 open_at: None,
                 fetched_at: None,
+                no_five_hour_limit: false,
             },
         );
         collect_stats(
@@ -3125,6 +3139,7 @@ fn credit_stats(
             codex_reset_credits: None,
             open_at: None,
             fetched_at: None,
+            no_five_hour_limit: false,
         },
     );
     collect_stats(
@@ -3222,8 +3237,149 @@ fn an_unread_legacy_extra_figure_renders_a_dash_never_zero() {
 /// Render the usage pane (90×24) for one OAuth profile seeded with `u`, as
 /// plain per-row strings. The credit rows live in the right-hand detail pane.
 fn render_usage_rows(u: crate::usage::UsageInfo) -> Vec<String> {
+    render_usage_rows_with_auto_start(u, false)
+}
+
+/// [`render_usage_rows`] with the account's `auto_start` opt-in set, so the
+/// header's kick countdown is judged both ways.
+fn render_usage_rows_with_auto_start(u: crate::usage::UsageInfo, auto_start: bool) -> Vec<String> {
+    crate::testutil::buffer_rows(&render_usage_buffer(u, auto_start))
+}
+
+/// [`render_usage_rows_with_auto_start`]'s frame kept as a buffer, so a test can
+/// read a cell's style as well as its glyph.
+fn render_usage_buffer(u: crate::usage::UsageInfo, auto_start: bool) -> ratatui::buffer::Buffer {
     use crate::profile::{AppConfig, AppState, ProfileName};
     use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.auto_start = auto_start;
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    // Both maps hold the reading, as the snapshot builder fills them for an
+    // OAuth account: the picked entry IS the raw store entry.
+    let readings = snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "a", u.clone()),
+        "a",
+        u,
+    );
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        .expect("draw");
+    term.backend().buffer().clone()
+}
+
+/// A plan with no 5h limit keeps its 5h row — the value names the plan in the
+/// figure's place, in `TEXT_DIM`, with no bar — and carries no auto-start
+/// countdown, since there is no window the kick could open. An unmarked
+/// account (a body that merely lost this reading's window) still shows it.
+#[test]
+fn a_plan_with_no_five_hour_limit_names_the_plan_and_drops_the_auto_start_line() {
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let seven_day = Some(UsageWindow {
+        utilization: 0.0,
+        resets_at: None,
+    });
+    let buf = render_usage_buffer(
+        UsageInfo {
+            seven_day: seven_day.clone(),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let rows = crate::testutil::buffer_rows(&buf);
+    // The bordered pane's 90 cells less its two borders and one padding cell on
+    // each side.
+    const INNER_W: usize = 86;
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("│ 5h"))
+        .unwrap_or_else(|| panic!("the 5h row stays: {rows:?}"));
+    assert_eq!(
+        rows[at],
+        format!(
+            "│ 5h{}no limit on this plan │",
+            " ".repeat(INNER_W - "5h".chars().count() - "no limit on this plan".chars().count())
+        ),
+        "the whole 5h row, value right-aligned in the figure's column: {rows:?}"
+    );
+    assert!(
+        !rows[at].contains('█') && !rows[at].contains('░'),
+        "no bar in the value row: {rows:?}"
+    );
+    assert_eq!(
+        rows[at + 1],
+        format!("│{}│", " ".repeat(88)),
+        "and no bar line under it: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("usage auto-start")),
+        "no countdown for a window the plan does not have: {rows:?}"
+    );
+    // The value's cells carry the secondary text tone: a phrase standing in the
+    // figure's place, not the faint dash of a figure clauth failed to read.
+    let value: Vec<char> = "no limit on this plan".chars().collect();
+    let value_x = rows[at]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(value.len())
+        .position(|w| w == value.as_slice())
+        .unwrap_or_else(|| panic!("the value's own cells: {rows:?}"));
+    for (dx, ch) in value.iter().enumerate() {
+        let cell = buf
+            .cell((value_x as u16 + dx as u16, at as u16))
+            .expect("a value cell");
+        assert_eq!(
+            Some(cell.fg),
+            theme::dim().fg,
+            "the value's cell {ch:?} at {} is TEXT_DIM: {rows:?}",
+            value_x + dx
+        );
+    }
+
+    // Control: the same account unmarked, opted in — the countdown renders.
+    let rows = render_usage_rows_with_auto_start(
+        UsageInfo {
+            seven_day,
+            ..Default::default()
+        },
+        true,
+    );
+    let expected = format!(
+        "│ plan      —{}usage auto-start due now │",
+        " ".repeat(
+            INNER_W - "plan      —".chars().count() - "usage auto-start due now".chars().count()
+        )
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.contains("usage auto-start"))
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "an unmarked windowless account still names its next kick: {rows:?}"
+    );
+}
+
+/// A plan with no 5h limit takes no burn figure, even when a stored body still
+/// carries a 5h window (a header reading's window survives the verdict) and the
+/// history series has a slope for it: `· X %/h` beside `no limit on this plan`
+/// would name a window the plan does not have.
+#[test]
+fn a_plan_with_no_five_hour_limit_takes_no_burn_rate() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+    use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["a"]);
@@ -3235,12 +3391,245 @@ fn render_usage_rows(u: crate::usage::UsageInfo) -> Vec<String> {
         profiles: vec![crate::testutil::blank_profile(&ProfileName::from("a"))],
     });
     app.profile_cursor.set(0);
-    let readings = snap_with_usage(ReadingsSnapshot::default(), "a", u);
+    let now_ms = crate::usage::now_ms();
+    let sample = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    // Three distinct samples inside the 1h lookback: enough for a %/h slope.
+    app.history_cache.insert(
+        "a".to_string(),
+        vec![
+            (now_ms - 8 * 60_000, sample(1.0)),
+            (now_ms - 4 * 60_000, sample(2.0)),
+        ],
+    );
+    let marked = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 3.0,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: None,
+        }),
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let readings = snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "a", marked.clone()),
+        "a",
+        marked,
+    );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
     term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
         .expect("draw");
-    crate::testutil::buffer_rows(term.backend().buffer())
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("│ 5h"))
+        .unwrap_or_else(|| panic!("the 5h row stays: {rows:?}"));
+    assert_eq!(
+        rows[at],
+        format!(
+            "│ 5h{}no limit on this plan │",
+            " ".repeat(86 - "5h".chars().count() - "no limit on this plan".chars().count())
+        ),
+        "no rate attaches to the plan phrase: {rows:?}"
+    );
+}
+
+/// The Usage tab's queue countdown for an unmarked opted-in member of a roster
+/// that holds a plan with no 5h limit: the render pass builds the roster from
+/// the per-frame usage snapshot, so the marked member takes no slot and does not
+/// size `N`. A call site handing the roster a constant closure would render the
+/// three-member gap here.
+#[test]
+fn the_usage_tab_sizes_the_queue_without_a_plan_that_has_no_five_hour_limit() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let queued = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.auto_start = true;
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        p
+    };
+    let names = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("m"),
+        ]
+    };
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names(),
+            fallback_chain: names(),
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("m")],
+    });
+    // Row `b`: an unmarked member behind the marked one in queue order.
+    app.profile_cursor.set(1);
+    let anchor = crate::usage::now_epoch_secs() - 60;
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(anchor);
+    let rows_of = |readings: &ReadingsSnapshot| -> Vec<String> {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    // The plan row: `plan` column, no tier known, the countdown flush right in
+    // the 86-cell content. Two members that can open a window: 5h/2 less the
+    // 90 s interval tolerance (8910 s), minus the 60 s since the anchor.
+    let plan_row = |kick: &str| {
+        format!(
+            "│ plan      —{}{} │",
+            " ".repeat(86 - "plan      —".chars().count() - kick.chars().count()),
+            kick
+        )
+    };
+    let marked = crate::usage::UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let marked_rows = rows_of(&snap_with_usage(
+        snap_with_oauth_usage(ReadingsSnapshot::default(), "m", marked.clone()),
+        "m",
+        marked,
+    ));
+    let at = marked_rows
+        .iter()
+        .position(|row| row.starts_with("│ plan"))
+        .unwrap_or_else(|| panic!("the plan row renders: {marked_rows:?}"));
+    assert_eq!(
+        marked_rows[at],
+        plan_row("usage auto-start in 2h 27m"),
+        "the marked member sizes no part of the gap: {marked_rows:?}"
+    );
+
+    // Control: the same roster with nothing marked is a three-member queue, and
+    // the countdown names its shorter gap.
+    let unmarked_rows = rows_of(&ReadingsSnapshot::default());
+    let at = unmarked_rows
+        .iter()
+        .position(|row| row.starts_with("│ plan"))
+        .unwrap_or_else(|| panic!("the plan row renders: {unmarked_rows:?}"));
+    assert_eq!(
+        unmarked_rows[at],
+        plan_row("usage auto-start in 1h 37m"),
+        "unmarked control: three members size the gap: {unmarked_rows:?}"
+    );
+}
+
+/// A hybrid (an OAuth login plus a provider endpoint) keeps its own plan's
+/// verdict in the raw OAuth store while its picked reading is the provider's:
+/// the countdown gate and the queue chip read that store, the same one the
+/// scheduler's election reads, so the marked account shows no countdown and
+/// sizes no part of the next member's gap.
+#[test]
+fn a_hybrid_plan_with_no_five_hour_limit_is_judged_off_its_oauth_entry() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let queued = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.auto_start = true;
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        p
+    };
+    let names = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("m"),
+        ]
+    };
+    let mut hybrid = queued("m");
+    hybrid.provider = Some(crate::providers::Provider::Zai);
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "the picker routes a hybrid to its provider"
+    );
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names(),
+            fallback_chain: names(),
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), hybrid],
+    });
+    let anchor = crate::usage::now_epoch_secs() - 60;
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(anchor);
+    // What the snapshot builder produces for a hybrid: the picked map holds the
+    // provider reading, the OAuth map the raw store entry that carries the plan
+    // verdict.
+    let readings = snap_with_oauth_usage(
+        ReadingsSnapshot::default(),
+        "m",
+        crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 1.0,
+                resets_at: None,
+            }),
+            no_five_hour_limit: true,
+            ..Default::default()
+        },
+    );
+    let readings = snap_with_usage(
+        readings,
+        "m",
+        crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 3.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let mut rows_of = |cursor: usize| -> Vec<String> {
+        app.profile_cursor.set(cursor);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    // Row `b`: the marked hybrid takes no slot, so the two live members size the
+    // gap — 5h/2 less the 90 s interval tolerance, minus the 60 s since the
+    // anchor.
+    let rows = rows_of(1);
+    let expected = format!(
+        "│ plan      —{}usage auto-start in 2h 27m │",
+        " ".repeat(
+            86 - "plan      —".chars().count() - "usage auto-start in 2h 27m".chars().count()
+        )
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.starts_with("│ plan"))
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "the marked hybrid sizes no part of the gap: {rows:?}"
+    );
+    // Row `m` itself: no countdown for a kick that never fires.
+    let rows = rows_of(2);
+    assert!(
+        !rows.iter().any(|row| row.contains("usage auto-start")),
+        "the marked hybrid shows no countdown: {rows:?}"
+    );
 }
 
 /// A spend block whose billing is off must not dress its stale cap as a live
@@ -5026,6 +5415,7 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
         reset_secs: None,
         trailing: String::new(),
         note: None,
+        value: None,
     };
     let max_rate_w = stat.rate_section_width();
     let lines = stat.render(8, 20, max_rate_w, 5);

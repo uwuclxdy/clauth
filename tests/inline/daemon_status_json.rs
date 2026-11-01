@@ -514,6 +514,114 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     }
 }
 
+/// A plan with no 5h limit holds no published queue slot on EITHER arm, and
+/// the members that can open a window size the gap: the daemonless arm reads
+/// the disk usage cache, the live arm the daemon's in-memory usage store. A
+/// call site handing the roster a constant closure would publish the marked
+/// member's slot and size every other member's `next_open_at` off an inflated
+/// `N`.
+#[test]
+fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() {
+    use crate::usage::UsageInfo;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "m".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("m")],
+    };
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &"m".into(),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &marked,
+    );
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Daemonless arm: the disk usage cache is the marked source.
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the disk arm publishes no slot for a plan with no 5h limit"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+
+    // Live arm: the daemon's in-memory usage store is the marked source.
+    let anchor = 1_780_000_000i64;
+    let usage: HashMap<String, UsageInfo> = HashMap::from([("m".to_string(), marked.clone())]);
+    let empty_status = HashMap::new();
+    let empty_next = HashMap::new();
+    let empty_streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+    };
+    let v = status_value(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the live arm publishes no slot for a plan with no 5h limit"
+    );
+    let published = queue_of(&v, "b")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap comes from the two members that can open a window"
+    );
+
+    // Control: the same roster with nothing marked keeps N = 3.
+    let unmarked = LiveSignals {
+        usage: &Default::default(),
+        ..live
+    };
+    let v = status_value(&config, 300_000, Some(&unmarked), false);
+    assert_eq!(
+        queue_of(&v, "m")["position"],
+        3,
+        "unmarked control: m takes the third slot"
+    );
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(3, 300_000)),
+        "unmarked control: the gap is sized by three"
+    );
+}
+
 /// An api-key profile's freshness derives from ITS cache
 /// (`THIRD_PARTY_CACHE_FILE`), and a name the live stores don't carry falls
 /// back to the same derivation — pre-fix both keyed on the OAuth
@@ -2262,9 +2370,12 @@ fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
 
     let config = crate::profile::load_config().unwrap();
     let interval_ms = 300_000u64;
-    let members = crate::usage::auto_start_queue_members(&config, &[], |n| {
-        crate::profile_json::is_canceled_cached(n)
-    });
+    let members = crate::usage::auto_start_queue_members(
+        &config,
+        &[],
+        crate::profile_json::is_canceled_cached,
+        crate::usage::no_five_hour_limit_cached,
+    );
     let anchor = crate::usage::history_anchor(
         &config
             .profiles
