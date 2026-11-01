@@ -16225,7 +16225,7 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
     let (_, out) = through_handle(stale, |h| switch_profile_reconciled(h, &b, Some(&a)));
     assert_eq!(
         out.expect_err("the switch refuses").to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(
         live_regular_refresh().as_deref(),
@@ -16264,7 +16264,7 @@ fn a_reconciled_switch_answered_for_another_account_captures_nothing() {
     let (_, out) = through_handle(stale, |h| switch_profile_reconciled(h, &a, Some(&a)));
     assert_eq!(
         out.expect_err("the switch refuses").to_string(),
-        "'b' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'b' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(
         store_refresh("a").as_deref(),
@@ -16302,7 +16302,7 @@ fn a_discard_answered_for_another_account_drops_nothing() {
     let (_, out) = through_handle(stale, |h| switch_profile_discard(h, &a, Some(&a)));
     assert_eq!(
         out.expect_err("the discard refuses").to_string(),
-        "'b' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'b' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(
         live_regular_refresh().as_deref(),
@@ -16980,7 +16980,7 @@ fn a_switch_off_a_long_lived_account_never_offers_to_save_into_it() {
             .next(),
         Some(
             "Error: 'a' runs on a long-lived token and cannot hold this login; save it as \
-             another account first"
+             another account first: `clauth capture <new name>`"
         )
     );
     assert_eq!(
@@ -17474,7 +17474,7 @@ fn a_relogin_during_the_gates_refresh_is_never_captured_on_the_prompts_answer() 
     };
     assert_eq!(
         err.to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(
         store_refresh("a").as_deref(),
@@ -17515,7 +17515,7 @@ fn a_relogin_on_the_active_account_during_the_wait_is_never_saved() {
     let err = result.expect_err("the newer login refuses");
     assert_eq!(
         err.to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(
         store_refresh("a").as_deref(),

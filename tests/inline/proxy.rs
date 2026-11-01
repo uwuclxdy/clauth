@@ -1205,7 +1205,8 @@ fn disable_of_an_unregistered_service_names_enable() {
     assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
     assert_eq!(
         err.to_string(),
-        "no proxy \"qwen\" is registered; register it with `clauth proxy enable qwen`"
+        "no proxy \"qwen\" is registered; register it with `clauth proxy enable qwen` \
+         (`clauth proxy list` names every proxy found)"
     );
     assert!(!registry_path().unwrap().exists(), "nothing written");
 }

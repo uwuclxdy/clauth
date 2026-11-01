@@ -1035,7 +1035,7 @@ fn a_peer_switch_and_relogin_inside_the_gate_is_the_account_the_refusal_names() 
     .expect_err("no default resolves the peer's divergence");
     assert_eq!(
         err.to_string(),
-        "'peer' has a login clauth hasn't saved, resolve the divergence in the clauth TUI"
+        "'peer' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
     );
     assert_eq!(stored_refresh_of("active").as_deref(), Some("stored-r"));
     assert_eq!(stored_refresh_of("peer").as_deref(), Some("peer-r"));

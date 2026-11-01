@@ -2948,7 +2948,7 @@ pub(crate) fn try_adopt_live_rotation(
             logline!(
                 "clauth: live login for '{name}' is newer but its identity can't be proven \
                  (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login {name}"
+                 resolve in the `clauth` TUI or re-run clauth login {name}"
             );
         }
         return None;
@@ -2964,7 +2964,7 @@ pub(crate) fn try_adopt_live_rotation(
         if adopt_refusal_should_announce(name, &refusal_key) {
             logline!(
                 "clauth: live login for '{name}' belongs to a DIFFERENT account. Not adopting; \
-                 capture it via the clauth TUI divergence flow if that was intentional"
+                 capture it via the `clauth` TUI divergence flow if that was intentional"
             );
         }
         return None;

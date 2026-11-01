@@ -1632,7 +1632,7 @@ mod adopt_live_rotation {
             vec![
                 "clauth: live login for 'adopt-refusal-once' is newer but its identity can't \
                  be proven (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login adopt-refusal-once"
+                 resolve in the `clauth` TUI or re-run clauth login adopt-refusal-once"
                     .to_string(),
             ],
         );
@@ -1697,10 +1697,10 @@ mod adopt_live_rotation {
             vec![
                 "clauth: live login for 'adopt-refusal-flip' is newer but its identity can't \
                  be proven (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login adopt-refusal-flip"
+                 resolve in the `clauth` TUI or re-run clauth login adopt-refusal-flip"
                     .to_string(),
                 "clauth: live login for 'adopt-refusal-flip' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 Not adopting; capture it via the `clauth` TUI divergence flow if that was \
                  intentional"
                     .to_string(),
             ],
@@ -1888,11 +1888,11 @@ mod adopt_live_rotation {
             sink.snapshot(),
             vec![
                 "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 Not adopting; capture it via the `clauth` TUI divergence flow if that was \
                  intentional"
                     .to_string(),
                 "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 Not adopting; capture it via the `clauth` TUI divergence flow if that was \
                  intentional"
                     .to_string(),
             ],

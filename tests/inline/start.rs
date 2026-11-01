@@ -399,7 +399,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     assert_eq!(
         err.to_string(),
         "'loner': --with-fallback needs a fallback-chain member; add 'loner' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let member = chain_ready_config("loner");
@@ -492,7 +492,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     assert_eq!(
         err.to_string(),
         "'onlyone': --with-fallback needs a second account in the fallback chain to \
-         move to; add one on the fallback tab, or start without it"
+         move to; add one on the fallback tab of the `clauth` TUI, or start without it"
     );
 
     let paired = chain_ready_config("onlyone");
@@ -609,7 +609,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     assert_eq!(
         err.to_string(),
         "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let err = run(

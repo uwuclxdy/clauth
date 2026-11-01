@@ -1327,7 +1327,8 @@ fn an_unregistered_service_is_refused_naming_enable() {
     assert_eq!(
         resolved(resolve_target("zcode", None, None, no_profiles)),
         Err(
-            "no proxy \"zcode\" is registered; register it with `clauth proxy enable zcode`"
+            "no proxy \"zcode\" is registered; register it with `clauth proxy enable zcode` \
+             (`clauth proxy list` names every proxy found)"
                 .to_string()
         )
     );

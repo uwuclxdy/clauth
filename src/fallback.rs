@@ -2440,7 +2440,7 @@ pub(crate) fn start_pick(
     anyhow::ensure!(
         !config.state.fallback_chain.is_empty(),
         "--auto picks from the fallback chain and it is empty; add accounts on the \
-         fallback tab, or name one"
+         fallback tab of the `clauth` TUI, or name one"
     );
     // A chain whose every name has left the profile list judges nothing, so the
     // headroom refusal below would blame usage for a chain the user has to

@@ -884,8 +884,8 @@ impl LoginError {
     ///
     /// The operative fact is that this function has NO retry path around
     /// `exchange_code`: whatever the status, the failure unwinds out of
-    /// [`PendingLogin::run`] and the only action left to anyone is running
-    /// `clauth login` again. So the refresh path's `Wait` — right for a 429 it
+    /// [`PendingLogin::run`] and the only action left to anyone is starting
+    /// the login again (CLI or TUI). So the refresh path's `Wait` — right for a 429 it
     /// will re-attempt on its next tick — names an action that does not exist
     /// here.
     ///

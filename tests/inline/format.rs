@@ -299,10 +299,7 @@ fn every_transient_cause_renders_its_own_copy() {
         for (retry, suffix) in [
             (Retry::Wait, ": retry in a moment"),
             (Retry::Connection, ": check your connection and retry"),
-            (
-                Retry::Restart,
-                ": run `clauth login` again for a fresh code",
-            ),
+            (Retry::Restart, ": start the login again for a fresh code"),
         ] {
             let retry_name = format!("{retry:?}");
             if names_next_step {
@@ -388,7 +385,33 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 
 #[test]
 fn resolve_in_tui_names_the_clauth_surface() {
-    assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
+    assert!(RESOLVE_IN_TUI.contains("`clauth` TUI"));
+}
+
+/// The follow-up each of these messages names has to be runnable as typed: the
+/// dead-refresh pointer says what to redo instead of repeating the command that
+/// just failed, and the divergence and long-lived pointers name the surface and
+/// the command that clears them.
+#[test]
+fn the_relogin_and_divergence_pointers_name_the_follow_up_exactly() {
+    assert_eq!(
+        Transient::new(
+            Cause::Endpoint("anthropic is throttling requests"),
+            Retry::Restart
+        )
+        .text(),
+        "anthropic is throttling requests: start the login again for a fresh code"
+    );
+    assert_eq!(RESOLVE_IN_TUI, "resolve the divergence in the `clauth` TUI");
+    assert_eq!(
+        unsaved_live_login("work"),
+        "'work' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(
+        long_lived_cannot_hold_login("work"),
+        "'work' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
+    );
 }
 
 #[test]

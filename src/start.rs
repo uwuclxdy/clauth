@@ -115,7 +115,7 @@ fn refuse_unless_chain_eligible(
     if !config.state.fallback_chain.iter().any(|n| n == name) {
         anyhow::bail!(
             "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on \
-             the fallback tab, or start without it"
+             the fallback tab of the `clauth` TUI, or start without it"
         );
     }
     // Membership alone is not enough: a chain holding only this profile gives
@@ -124,7 +124,7 @@ fn refuse_unless_chain_eligible(
     if !config.state.fallback_chain.iter().any(|n| n != name) {
         anyhow::bail!(
             "'{name}': --with-fallback needs a second account in the fallback chain to \
-             move to; add one on the fallback tab, or start without it"
+             move to; add one on the fallback tab of the `clauth` TUI, or start without it"
         );
     }
     // Only the daemon's decision leg writes `intended_member`, so with no daemon

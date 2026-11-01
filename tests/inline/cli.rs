@@ -4834,7 +4834,7 @@ fn cmd_start_auto_refuses_an_empty_chain() {
     .expect_err("an empty fallback chain must refuse --auto");
     assert_eq!(
         err.to_string(),
-        "--auto picks from the fallback chain and it is empty; add accounts on the fallback tab, or name one"
+        "--auto picks from the fallback chain and it is empty; add accounts on the fallback tab of the `clauth` TUI, or name one"
     );
 }
 
@@ -4866,7 +4866,7 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
     .expect_err("--with-fallback under --auto --explain must run the chain refusals");
     assert_eq!(
         err.to_string(),
-        "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
+        "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab of the `clauth` TUI, or start without it"
     );
 }
 

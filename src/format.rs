@@ -86,7 +86,7 @@ pub(crate) enum Retry {
     Stated,
     /// There is nothing left to retry in-process: `PendingLogin::run` has no
     /// retry path around its code exchange, so whatever the status, the only
-    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// action available is starting the login again (CLI or TUI). Stated as the ABSENCE
     /// of a retry loop rather than as a fact about the code or the listener,
     /// because this correctly stops being true the moment someone adds one.
     Restart,
@@ -359,7 +359,7 @@ impl Transient {
             Retry::Connection => ": check your connection and retry",
             Retry::Wait => ": retry in a moment",
             Retry::Stated => "",
-            Retry::Restart => ": run `clauth login` again for a fresh code",
+            Retry::Restart => ": start the login again for a fresh code",
         }
     }
 
@@ -587,7 +587,7 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
 pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
     format!(
         "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
-         account first"
+         account first: `clauth capture <new name>`"
     )
 }
 
@@ -603,7 +603,7 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 
 /// The one spelling for "go fix this in the app". The surface is the `clauth`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
-pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
+pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the `clauth` TUI";
 
 /// The one spelling for a stored login that exists but cannot be read.
 pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";

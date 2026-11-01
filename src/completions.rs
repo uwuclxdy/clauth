@@ -42,8 +42,13 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
-        COMPREPLY=( $(compgen -W "--json --tokens --live" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "sessions" ]; then
+        local f remaining
+        remaining=()
+        for f in --json --tokens --live; do
+            printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -qxF -- "$f" || remaining+=("$f")
+        done
+        COMPREPLY=( $(compgen -W "${remaining[*]}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
         local profiles codex sids
         profiles=$(clauth __complete 2>/dev/null)
@@ -227,10 +232,13 @@ _clauth() {
             '--sessions[the device may mint sessions through the API]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
-        _values 'flag' '--json[emit the stable machine-readable array]' \
-            '--tokens[add token totals + cost; reads every transcript in full]' \
-            '--live[only the sessions running now; opens no transcript]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == sessions ]]; then
+        local -a flags
+        flags=()
+        (( ${#${(@M)words[3,CURRENT-1]:#--json}} )) || flags+=('--json[emit the stable machine-readable array]')
+        (( ${#${(@M)words[3,CURRENT-1]:#--tokens}} )) || flags+=('--tokens[add token totals + cost; reads every transcript in full]')
+        (( ${#${(@M)words[3,CURRENT-1]:#--live}} )) || flags+=('--live[only the sessions running now; opens no transcript]')
+        (( ${#flags} )) && _values 'flag' $flags
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles codex sids
         profiles=(${(f)"$(clauth __complete 2>/dev/null)"})

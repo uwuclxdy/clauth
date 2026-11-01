@@ -188,7 +188,7 @@ fn oauth_token_refuses_an_active_profiles_live_login_from_another_account() {
     assert_eq!(out.stdout, Vec::<u8>::new());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: 'live' has a login clauth hasn't saved, resolve the divergence in the clauth TUI\n"
+        "Error: 'live' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI\n"
     );
 }
 

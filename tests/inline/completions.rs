@@ -669,6 +669,95 @@ _describe() { print -r -- "describe $1: ${(P)2}" }
     }
 }
 
+/// `sessions` owes its remaining flags at any later word: bash sourced for
+/// real, zsh driven like `zsh_offers_resume_words_by_position`, the `clauth`
+/// shellout stubbed. A flag already on the line is not offered again.
+#[cfg(unix)]
+#[test]
+fn bash_and_zsh_offer_sessions_flags_past_the_first_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let bash_reply = |words: &str, cword: usize| -> Vec<String> {
+        let driver = format!(
+            r#"clauth() {{ :; }}
+source "{script}"
+COMP_WORDS=({words})
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        bash_reply(r#"clauth sessions """#, 2),
+        vec!["--json", "--tokens", "--live"],
+        "the first flag position after `sessions`"
+    );
+    assert_eq!(
+        bash_reply(r#"clauth sessions --json """#, 3),
+        vec!["--tokens", "--live"],
+        "the flags left once --json is on the line"
+    );
+    assert!(
+        bash_reply(r#"clauth sessions --json --tokens --live """#, 5).is_empty(),
+        "nothing is owed once every flag is typed"
+    );
+
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { :; }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    let zsh_offered = |before: &str, current: usize| -> String {
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let offered = zsh_offered("clauth sessions", 3);
+    assert!(
+        offered.contains("--json[") && offered.contains("--tokens[") && offered.contains("--live["),
+        "the first flag position after `sessions`: {offered:?}"
+    );
+    let offered = zsh_offered("clauth sessions --json", 4);
+    assert!(
+        offered.contains("--live[")
+            && offered.contains("--tokens[")
+            && !offered.contains("--json["),
+        "the flags left once --json is on the line: {offered:?}"
+    );
+    let offered = zsh_offered("clauth sessions --json --tokens --live", 6);
+    assert!(
+        !offered.contains("--json[")
+            && !offered.contains("--tokens[")
+            && !offered.contains("--live["),
+        "nothing is owed once every flag is typed: {offered:?}"
+    );
+}
+
 /// Where a name may be a codex profile (`clauth <name>`, `start`, `delete`,
 /// `switch <name>`), every shell offers the codex roster beside the claude
 /// one; `switch <sid> <profile>` moves a live Claude Code session, so its

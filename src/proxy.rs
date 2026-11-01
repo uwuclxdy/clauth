@@ -384,10 +384,12 @@ pub(crate) fn misconfigured_error(reason: &str) -> Result<anyhow::Error> {
     ))
 }
 
-/// The refusal for a service with no row, naming the verb that writes one.
+/// The refusal for a service with no row, naming the verb that writes one and
+/// the listing that shows which services exist, for a mistyped name.
 pub(crate) fn not_registered(service: &Service) -> anyhow::Error {
     crate::usage_error(format!(
-        "no proxy {:?} is registered; register it with `clauth proxy enable {service}`",
+        "no proxy {:?} is registered; register it with `clauth proxy enable {service}` \
+         (`clauth proxy list` names every proxy found)",
         service.as_str()
     ))
 }
