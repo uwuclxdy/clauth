@@ -1733,3 +1733,82 @@ fn list_stays_empty_on_an_unlistable_registry() {
     block_dir(&registry_dir().expect("registry dir"));
     assert!(list().is_empty());
 }
+
+/// The rule one level below an unlistable dir: an ENTRY the OS fails to yield
+/// leaves the tally's registry listing unknown, so the fleet total reads unread
+/// rather than shorter. `list` and `live_rows` stay lenient on purpose — the
+/// daemon decision leg sweeps every row it can read — so the SAME listing still
+/// reads as known there.
+#[test]
+fn an_unreadable_registry_entry_leaves_the_tallys_listing_unknown() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = row("4242-0", "work");
+    std::fs::write(
+        dir.path().join("4242-0.json"),
+        serde_json::to_vec(&live).expect("row json"),
+    )
+    .expect("write the row");
+
+    let failing = || -> crate::runtime::DirListing {
+        std::fs::read_dir(dir.path())
+            .expect("list the fixture")
+            .chain(std::iter::once(Err(std::io::Error::from(
+                std::io::ErrorKind::InvalidData,
+            ))))
+            .collect()
+    };
+
+    assert_eq!(
+        read_registry_tally(failing()),
+        None,
+        "an entry the OS fails to yield leaves the tally's listing unknown"
+    );
+    assert_eq!(
+        read_registry(failing()),
+        Some(vec![live.clone()]),
+        "the decision leg's sweep keeps every row it could read"
+    );
+    assert_eq!(
+        list_in(Some(failing())),
+        vec![live],
+        "list keeps every row it could read beside an entry the OS fails to yield"
+    );
+    // The fixture's row holds no marker flock, so `live_rows` filters it out:
+    // a lenient read is an empty vec, a strict one would be `None`.
+    assert_eq!(
+        live_rows_in(Some(failing())),
+        Some(Vec::new()),
+        "live_rows reads the listing as known beside an entry the OS fails to yield"
+    );
+}
+
+/// The same failure through the tally the header renders: its total reads
+/// unread, because the tally's rows come from the strict registry reader and
+/// never from `list`'s lenient one. Pinned here because no real dir yields an
+/// entry error — the listing is handed in where [`LiveTally::collect_in`] would
+/// read it.
+#[test]
+fn a_failing_registry_listing_leaves_the_tally_unread() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![], "work");
+    let jobs = crate::claude_jobs::job_trees();
+
+    assert_eq!(
+        LiveTally::collect_with_registry(&config, &jobs, Some(Vec::new())).total(),
+        Some(0),
+        "an empty listing is a reading, never an unknown"
+    );
+    assert_eq!(
+        LiveTally::collect_with_registry(
+            &config,
+            &jobs,
+            Some(vec![Err(std::io::Error::from(
+                std::io::ErrorKind::InvalidData
+            ))]),
+        )
+        .total(),
+        None,
+        "an entry the OS fails to yield leaves the fleet total unread"
+    );
+}

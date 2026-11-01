@@ -7001,6 +7001,40 @@ fn live_sessions_at_reports_unknown_separately_from_zero() {
     fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");
 }
 
+/// The rule one level below the unreadable dir: an ENTRY the OS fails to yield
+/// leaves the marker listing unknown too, so a count taken from it (and the
+/// bare-marker count the fleet total folds) never reads as a shorter one.
+#[test]
+fn an_unreadable_marker_entry_leaves_the_listing_unknown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions = tmp.path().join("sessions-9004-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    fs::write(sessions.join("4242-0"), b"").expect("write a dead marker");
+
+    assert_eq!(
+        live_sessions_at(&sessions),
+        Some(0),
+        "the clean dir reads its one dead marker as zero, never as unknown"
+    );
+    assert_eq!(
+        live_marker_names(entries_in(&sessions).expect("list the fixture")),
+        Some(Vec::new()),
+        "every entry the OS yields is read, so the failure below is the entry error alone"
+    );
+
+    let failing: DirListing = std::fs::read_dir(&sessions)
+        .expect("list the fixture")
+        .chain(std::iter::once(Err(std::io::Error::from(
+            std::io::ErrorKind::InvalidData,
+        ))))
+        .collect();
+    assert_eq!(
+        live_marker_names(failing),
+        None,
+        "an entry the OS fails to yield leaves the marker listing unknown"
+    );
+}
+
 /// The same rule at the DESTRUCTIVE level. `prune_stale_sessions` unlinks what
 /// `is_session_alive` reads as dead, and its zero is what three callers turn into
 /// `remove_dir_all` of a runtime tree — shared across the profile's sessions

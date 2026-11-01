@@ -1419,7 +1419,7 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
         return true;
     };
     for dir in &dirs {
-        let Some(ids) = live_marker_names(dir) else {
+        let Some(ids) = entries_in(dir).and_then(live_marker_names) else {
             return true;
         };
         for id in ids {
@@ -1814,27 +1814,69 @@ pub(crate) fn live_session_count(name: &ProfileName) -> usize {
         .unwrap_or(1)
 }
 
-/// Names of the markers currently flock-held in `sessions`. `None` when the dir
-/// could not be read for any reason other than being absent, or an entry could
-/// not be read — never fold either into a zero, per [`has_live_session`].
+/// One directory listing as [`fold_entries`] takes it: every entry the OS
+/// yielded, with a failed entry kept as its `Err` for the caller's policy.
+pub(crate) type DirListing = Vec<std::io::Result<std::fs::DirEntry>>;
+
+/// Every entry `dir` yields, in ONE read, for [`fold_entries`] to fold. An
+/// absent dir is an EMPTY listing and a dir that cannot be opened is `None`,
+/// the absent-versus-unknown split every caller of this seam relies on.
+pub(crate) fn entries_in(dir: &Path) -> Option<DirListing> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => Some(entries.collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
+/// What one directory entry the OS fails to yield does to the listing it sits
+/// in. Both directions are load-bearing, so the caller picks one: a count read
+/// from a dir that lost an entry would show a figure clauth never read, while a
+/// sweep that must keep going keeps every row it could read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EntryFailure {
+    /// The whole listing is unknown: no value comes back.
+    Unknown,
+    /// The failed entry is skipped and every readable one kept.
+    Skip,
+}
+
+/// Fold ONE directory listing into values, answering an entry the OS fails to
+/// yield per `on_failure`. An `Ok` entry the fold itself drops (a dead marker,
+/// an unparseable row) is skipped either way, so only the OS's own failure
+/// reaches the policy. Split from [`entries_in`] so a test can feed in a
+/// listing the OS cannot be made to produce.
+pub(crate) fn fold_entries<T>(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    mut fold: impl FnMut(&std::fs::DirEntry) -> Option<T>,
+    on_failure: EntryFailure,
+) -> Option<Vec<T>> {
+    let mut values = Vec::new();
+    for entry in entries {
+        match (entry, on_failure) {
+            (Ok(entry), _) => values.extend(fold(&entry)),
+            (Err(_), EntryFailure::Skip) => {}
+            (Err(_), EntryFailure::Unknown) => return None,
+        }
+    }
+    Some(values)
+}
+
+/// The marker name `entry` holds while its flock is live.
+fn marker_name(entry: &std::fs::DirEntry) -> Option<std::ffi::OsString> {
+    is_session_alive(&entry.path()).then(|| entry.file_name())
+}
+
+/// Names of the markers currently flock-held among `entries`: `None` when the
+/// listing holds an entry the OS failed to yield — never fold that into a zero,
+/// per [`has_live_session`]. The listing is taken by the caller ([`entries_in`])
+/// so a test can replay the failure.
 ///
 /// Read-only (unlike [`prune_stale_sessions`], it drops nothing), so it needs no
 /// state lock — a caller reading its own dir always counts ITSELF, since a second
 /// fd's `try_lock` conflicts with the one `acquire` holds.
-fn live_marker_names(sessions: &Path) -> Option<Vec<std::ffi::OsString>> {
-    let entries = match std::fs::read_dir(sessions) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.ok()?;
-        if is_session_alive(&entry.path()) {
-            names.push(entry.file_name());
-        }
-    }
-    Some(names)
+fn live_marker_names(entries: DirListing) -> Option<Vec<std::ffi::OsString>> {
+    fold_entries(entries, marker_name, EntryFailure::Unknown)
 }
 
 /// How many live sessions hold a marker in `sessions`. `Some(0)` only when the
@@ -1842,7 +1884,7 @@ fn live_marker_names(sessions: &Path) -> Option<Vec<std::ffi::OsString>> {
 /// which way an unknown falls, because the safe direction differs: the rotation
 /// gate must read it as live, and so must anything moving state out of a runtime.
 pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
-    live_marker_names(sessions).map(|names| names.len())
+    live_marker_names(entries_in(sessions)?).map(|names| names.len())
 }
 
 /// Liveness markers standing in for BARE `claude` sessions — the ones started
@@ -9848,7 +9890,8 @@ fn try_real_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
 /// Caller holds the cross-process state lock so two simultaneous starts can't
 /// both conclude "no other sessions" and tear down the runtime under each other.
 ///
-/// Same `Some(0)`-is-absent / `None`-is-unknown shape as [`live_marker_names`],
+/// Same `Some(0)`-is-absent / `None`-is-unknown shape as [`live_marker_names`]
+/// over [`entries_in`],
 /// and the reason is sharper here because this is the DESTRUCTIVE level: all
 /// three callers turn a zero into retiring a runtime tree, which under
 /// [`LinkMode::Fake`] is shared by every session of the profile+flavor. An

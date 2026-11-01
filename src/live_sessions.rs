@@ -391,9 +391,10 @@ pub(crate) struct LiveTally {
     /// [`LiveTally::total`] only.
     unattributed: usize,
     /// The registry, the bare-marker dir, the job store or a profile dir could
-    /// not be listed (it exists but refuses, or `~/.clauth` itself does not
-    /// resolve), or a running job's supervisor record could not be read, so
-    /// [`LiveTally::total`] has no reading to give.
+    /// not be listed (it exists but refuses, the OS fails to yield one of its
+    /// entries, or `~/.clauth` itself does not resolve), or a running job's
+    /// supervisor record could not be read, so [`LiveTally::total`] has no
+    /// reading to give.
     unread: bool,
 }
 
@@ -431,7 +432,19 @@ impl LiveTally {
     /// pass-level caller reads the store once and shares that snapshot (the
     /// [`crate::runtime::has_live_session_in`] precedent).
     pub(crate) fn collect_in(config: &AppConfig, jobs: &crate::claude_jobs::JobTrees) -> Self {
-        let rows = read_registry();
+        Self::collect_with_registry(config, jobs, registry_listing())
+    }
+
+    /// [`LiveTally::collect_in`] against a registry listing the caller already
+    /// took, so a test can replay an entry the OS fails to yield. The rows come
+    /// from [`read_registry_tally`], never [`read_registry`]: the total counts
+    /// every session, so it may not be built from a dir clauth only half read.
+    fn collect_with_registry(
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        registry: Option<crate::runtime::DirListing>,
+    ) -> Self {
+        let rows = registry.and_then(read_registry_tally);
         let unread = rows.is_none();
         let rows = rows.unwrap_or_default();
         let live: Vec<LiveSession> = rows
@@ -663,9 +676,15 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// Snapshot of every registered row. Read-only: the returned rows are owned
 /// copies, so nothing a caller does to one reaches disk. An unreadable or
 /// unparseable file is skipped rather than failing the sweep, and so is an
-/// unlistable registry.
+/// entry the OS fails to yield, and an unlistable registry.
 pub(crate) fn list() -> Vec<LiveSession> {
-    read_registry().unwrap_or_default()
+    list_in(registry_listing())
+}
+
+/// [`list`] over a registry listing the caller already took, so a test can
+/// replay an entry the OS fails to yield through `list`'s own reader choice.
+fn list_in(registry: Option<crate::runtime::DirListing>) -> Vec<LiveSession> {
+    registry.and_then(read_registry).unwrap_or_default()
 }
 
 /// The running sessions' rows: drop the daemon's hold of the account's fixed
@@ -675,28 +694,50 @@ pub(crate) fn list() -> Vec<LiveSession> {
 /// stays. `None` when the registry cannot be listed or located, an empty vec
 /// when no row is live.
 pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
-    read_registry().map(|rows| {
+    live_rows_in(registry_listing())
+}
+
+/// [`live_rows`] over a registry listing the caller already took, the
+/// [`list_in`] split.
+fn live_rows_in(registry: Option<crate::runtime::DirListing>) -> Option<Vec<LiveSession>> {
+    registry.and_then(read_registry).map(|rows| {
         rows.into_iter()
             .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
             .collect()
     })
 }
 
-/// [`list`], telling an absent registry (nothing ever registered: empty) from
-/// one that cannot be listed or located (`None`).
-fn read_registry() -> Option<Vec<LiveSession>> {
-    let dir = registry_dir().ok()?;
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
-    };
-    Some(
-        entries
-            .flatten()
-            .filter_map(|entry| read_row(&entry.path()))
-            .collect(),
+/// Every row `entries` yields. An entry the OS fails to yield is skipped,
+/// because the daemon decision leg and GC sweep every row they can read — the
+/// tally's stricter reading is [`read_registry_tally`]. Whether the registry
+/// could be listed at all is [`registry_listing`]'s answer.
+fn read_registry(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(
+        entries,
+        |entry| read_row(&entry.path()),
+        crate::runtime::EntryFailure::Skip,
     )
+}
+
+/// [`read_registry`] as the fleet total counts it: an entry the OS fails to
+/// yield leaves the listing unknown, the reading
+/// [`crate::runtime::live_sessions_at`] already gives a failed bare-marker
+/// entry. Folding one in as a skip would render a total built from a dir clauth
+/// only half read.
+fn read_registry_tally(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(
+        entries,
+        |entry| read_row(&entry.path()),
+        crate::runtime::EntryFailure::Unknown,
+    )
+}
+
+/// The registry dir's ONE listing, through the same [`crate::runtime::entries_in`]
+/// read the bare markers are counted by, so an entry error has one reading
+/// across the two dirs the total counts from. `None` when the dir cannot be
+/// located or opened; an absent registry is an empty listing, not an unknown.
+fn registry_listing() -> Option<crate::runtime::DirListing> {
+    crate::runtime::entries_in(&registry_dir().ok()?)
 }
 
 fn read_row(path: &Path) -> Option<LiveSession> {
