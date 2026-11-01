@@ -286,6 +286,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   .claude-json-sync.lock   # the flock serializing every `.claude.json` merge, switch strip, session seed and `wire mcp server` across live clauth processes, so one Claude Code write costs each copy at most one rewrite; empty, 0600
   .claude-json-sync-written.json # the `.claude.json` copies clauth wrote: path, mtime, size, a SHA-256 of the bytes and the rank of the Claude Code write they came from; tells clauth's own unchanged copies apart from Claude Code's writes, no config content (0600)
   .settings-sync-written.json # the same record for `settings.json` (0600)
+  backups/<file>.<utc stamp> # a byte copy of `~/.claude.json` or `~/.claude/settings.json`, saved after a sync pass refused to delete more than 3 of its shared top-level keys (or `cleanupPeriodDays` from `settings.json`); the file itself is left alone and each clauth process logs one line naming its copy (several running `clauth start` sessions can each save one), and the newest 10 per file are kept, each 0600 in a 0700 dir
   .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
   jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
