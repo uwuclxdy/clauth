@@ -71,10 +71,10 @@ The plugin also carries a small module that runs inside every Claude Code sessio
 
 ```
   Bash  cargo test
-  Allow this? Answer here or on your phone.   1: Allow   2: Deny   Esc denies
+  Allow this? Answer here or on your phone.   1: Allow   2: Deny
 ```
 
-The first answer wins, desk or phone. `1` and `2` answer once the row has the keyboard: if a digit lands in your prompt instead (the first seconds after the ask opens, while the model still streams), clear it and press Tab first. Esc denies. With no listening daemon or no control device, or if either goes away mid-wait, the module steps aside and Claude Code draws its usual dialog. A session with no one at it never holds an ask (`claude -p`, a clauth delegate); a `claude --bg` session holds like any other, since the phone may be the only place to answer it. Several asks held at once (parallel subagents) are each answerable from your phone; the desk row shows the oldest first. Past eight at once, the rest get Claude Code's own dialog.
+The first answer wins, desk or phone. `1` and `2` answer once the row has the keyboard: if a digit lands in your prompt instead (in about the first second after the row appears, whether or not the model is streaming), clear it and press the digit again. Esc is Claude Code's own interrupt, not an answer: it stops the main turn, so a tool the main turn asked about does not run, while a background subagent's ask stays until it is answered. With no listening daemon or no control device, or if either goes away mid-wait, the module steps aside and Claude Code draws its usual dialog. A session with no one at it never holds an ask (`claude -p`, a clauth delegate); a `claude --bg` session holds like any other, since the phone may be the only place to answer it. Several asks held at once (parallel subagents) are each answerable from your phone; the desk row shows the oldest first. Past eight at once, the rest get Claude Code's own dialog.
 
 **Questions.** An `AskUserQuestion` the phone can answer is held the same way, with a row offering the desk the question instead:
 
