@@ -7443,6 +7443,7 @@ impl App {
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
             repin_member_edit(self);
+            drop_gone_edit_hold(self);
             true
         } else {
             false
@@ -16070,8 +16071,8 @@ fn start_pool_remove(
     );
 }
 
-/// The toast for a pool pick whose account left the listing while the menu was
-/// open: the pick acts on nothing and says so.
+/// Why a pool action whose account left the listing acts on nothing: a pick
+/// from a menu opened before the account left, and a held `e` on that row.
 const POOL_ROW_GONE: &str = "that account is gone from the pool listing";
 
 /// Resolve a menu's stored pool identity `(family, name)` against the current
@@ -22681,18 +22682,14 @@ fn start_edit_selected(app: &mut App, item: MainItemKind) {
 /// `start_edit_selected`'s landing: switch to Setup, select the item the way an
 /// Overview pick does, open its editor, then put the action cursor on the row
 /// the dead-credential ladder names. An identity the current roster or listing
-/// no longer holds lands nowhere.
+/// no longer holds lands nowhere, and says the account is gone.
 fn land_edit_account(app: &mut App, target: EditTarget) {
-    let item = match &target {
-        EditTarget::Profile(name) => app
-            .config()
-            .profiles
-            .iter()
-            .position(|p| p.name == *name)
-            .map(MainItemKind::Profile),
-        EditTarget::Item(item) => app.resolve_setup_item(item),
+    let Some(item) = edit_target_item(app, &target) else {
+        if edit_target_gone(app, &target) {
+            warn_edit_target_gone(app, &target);
+        }
+        return;
     };
-    let Some(item) = item else { return };
     do_switch(app, Tab::Setup);
     let pos = app.flat_index_of(item);
     app.place_setup_selection(pos);
@@ -22707,6 +22704,64 @@ fn land_edit_account(app: &mut App, target: EditTarget) {
         // The codex and pool panes open on their first row.
         EditTarget::Item(_) => 0,
     };
+}
+
+/// The item a held `e`'s landing opens, `None` when the roster or the listing
+/// does not resolve the target — an unread pool included.
+fn edit_target_item(app: &App, target: &EditTarget) -> Option<MainItemKind> {
+    match target {
+        EditTarget::Profile(name) => app
+            .config()
+            .profiles
+            .iter()
+            .position(|p| p.name == *name)
+            .map(MainItemKind::Profile),
+        EditTarget::Item(item) => app.resolve_setup_item(item),
+    }
+}
+
+/// Whether a held `e`'s target has left the roster or the listing. A claude row
+/// resolves exactly by roster membership, so [`edit_target_item`] is its
+/// answer; an item can be unresolved without being gone — [`App::holds_setup_item`]
+/// owns that rule, and a pool whose listing is unread (`NotRead` / `Absent`)
+/// hides its rows without dropping them.
+fn edit_target_gone(app: &App, target: &EditTarget) -> bool {
+    match target {
+        EditTarget::Profile(_) => edit_target_item(app, target).is_none(),
+        EditTarget::Item(item) => !app.holds_setup_item(item),
+    }
+}
+
+/// Say a held `e`'s target left the roster or the listing, in the Usage note
+/// editor's gone-target save shape (`couldn't save the note: <reason>`): the
+/// press says the account is gone, and the screen stays where it was.
+fn warn_edit_target_gone(app: &mut App, target: &EditTarget) {
+    let reason = match target {
+        EditTarget::Item(SetupItem::Pool { .. }) => POOL_ROW_GONE,
+        EditTarget::Profile(_) | EditTarget::Item(SetupItem::Codex(_)) => {
+            crate::profile_notes::ACCOUNT_GONE
+        }
+    };
+    app.toast(
+        ToastKind::Danger,
+        format!("couldn't open the editor: {reason}"),
+    );
+}
+
+/// Drop a held `e` whose account the roster or a listing no longer holds, at the
+/// reconcile that saw it move — the roster reload or the tick's listing reads:
+/// the Overview stays put and the press says so, instead of the hold swallowing
+/// every switch until a save lands.
+fn drop_gone_edit_hold(app: &mut App) {
+    let target = match app.loss_pending.as_ref() {
+        Some(LossWarningTarget::EditAccount(target)) => target.clone(),
+        _ => return,
+    };
+    if edit_target_gone(app, &target) {
+        app.loss_pending = None;
+        app.loss_pending_sync = None;
+        warn_edit_target_gone(app, &target);
+    }
 }
 
 /// The Setup action row `e` lands a claude account on: the dead-credential
@@ -29280,6 +29335,12 @@ pub(crate) fn on_tick(app: &mut App) {
     // dropped one).
     app.rehome_setup_selection();
     app.rehome_usage_selection();
+
+    // The codex rows and the pool listing above are the tick's current view: the
+    // roster reconcile's own drop ran before both reads, so a held `e` whose row
+    // one of them dropped drops here too. A hold the reconcile already dropped
+    // makes this a no-op.
+    drop_gone_edit_hold(app);
 
     warn_day_claim_notices(app);
     update_banner(app);

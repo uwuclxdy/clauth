@@ -101,6 +101,12 @@ fn a_note_for_a_deleted_account_is_refused() {
     let name = ProfileName::from("ghost");
     let err = super::save_note(&name, "boo").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.to_string(),
+        super::ACCOUNT_GONE,
+        "the refusal gives the reason the held-`e` toast shares"
+    );
+    assert_eq!(err.to_string(), "account is no longer in the roster");
     assert!(
         !crate::profile_cache::profile_cache_path(&name, super::NOTE_FILE)
             .unwrap()

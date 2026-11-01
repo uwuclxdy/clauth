@@ -55958,6 +55958,54 @@ fn e_on_a_codex_row_over_a_suspended_claude_field_leaves_no_field_open() {
     );
 }
 
+/// `e` on a pool row over a suspended claude field draft lands on the pool pane
+/// with no field owning the keyboard: the hidden account's name field never
+/// takes the keys pressed on the pool pane. The codex and pool landings share
+/// the arm that drops the claude draft, so both are pinned.
+#[test]
+fn e_on_a_pool_row_over_a_suspended_claude_field_leaves_no_field_open() {
+    use super::{MainItemKind, SetupSelection, handle_key, keyboard_owner};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        keyboard_owner(&app),
+        Some(super::KeyOwner::SetupField),
+        "precondition: a's clean name field owns the keyboard"
+    );
+
+    handle_key(&mut app, alt_digit('1'));
+    focus_overview_item(&mut app, MainItemKind::Shunt(0, 0));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    assert_eq!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Shunt(0, 0)),
+        "`e` opens the pool pane"
+    );
+    assert_eq!(
+        keyboard_owner(&app),
+        None,
+        "the pool pane owns no field, so no hidden draft keeps the keyboard"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('z')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let names: Vec<String> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a".to_string()],
+        "the pool pane's keys never reached a's hidden name field"
+    );
+}
+
 /// `e` on `want` (a claude, codex or pool row) over a suspended `+ new` draft
 /// holding a minted login keeps that draft: it moves to `new_account_draft`
 /// with no toast, and returning to `+ new` restores the captured login. The
@@ -56276,53 +56324,9 @@ fn a_refused_suspended_form_keeps_the_live_form_on_its_pane() {
 #[cfg(unix)]
 #[test]
 fn a_held_e_opens_the_account_it_was_pressed_on() {
-    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
     let home = crate::testutil::HomeSandbox::new();
     let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    crate::testutil::register_names(&["first", "second"]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    let mut app = app_with(vec![healthy_api("first"), healthy_api("second")]);
-    app.tab = super::Tab::Services;
-    app.services.shunt_action.prober = Some(super::run_shunt_action);
-    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
-    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
-    rig.app = app;
-    // A typed `+ add upstream` draft beside an effort field save in flight.
-    rig.open_add(ShuntAddKind::Upstream);
-    rig.focus_draft_field(
-        ShuntAddKind::Upstream,
-        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
-    );
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
-    rig.type_and_commit("deepseek");
-    rig.focus_field(ShuntFieldKey::Upstream {
-        name: "a".into(),
-        occurrence: 0,
-        field: UpstreamFieldKind::Effort,
-    });
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
-    rig.type_and_commit("high");
-    assert!(
-        rig.app.services.shunt_save.is_some(),
-        "precondition: the effort save is in flight"
-    );
-
-    // Back to the Overview through the loss warning's discard.
-    super::handle_key(&mut rig.app, alt_digit('1'));
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Left));
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
-    assert_eq!(
-        rig.app.tab,
-        Tab::Overview,
-        "precondition: the discard lands on the Overview"
-    );
-
-    focus_overview_item(&mut rig.app, super::MainItemKind::Profile(1));
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('e')));
-    assert!(
-        rig.app.loss_pending.is_some(),
-        "precondition: the running save holds the landing"
-    );
+    let mut rig = held_e_over_second(&home);
     super::handle_key(
         &mut rig.app,
         ratatui::crossterm::event::KeyEvent::new(
@@ -56349,6 +56353,327 @@ fn a_held_e_opens_the_account_it_was_pressed_on() {
         edited_row(&rig.app, "second"),
         super::ConfigRow::Name,
         "the held `e` opens the account it was pressed on"
+    );
+}
+
+/// A press-and-hold `e`'s rig: `app` in the sandbox, with a typed `+ add
+/// upstream` draft beside a shunt effort save in flight, back on the Overview
+/// through the loss warning's `discard` so the next `e` waits on that save. The
+/// caller holds the sandbox and its `EnvPin`.
+#[cfg(unix)]
+fn held_e_rig(home: &crate::testutil::HomeSandbox, mut app: App) -> ConfigEditRig {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let mut rig = config_edit_rig(home, RIG_TEXT);
+    app.tab = super::Tab::Services;
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    rig.app = app;
+    // A typed `+ add upstream` draft keeps changed work on the card, so the
+    // jump back to the Overview raises the loss warning whose `discard` lands
+    // there while the effort save below still runs.
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("deepseek");
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the effort save is in flight"
+    );
+
+    // Back to the Overview through the loss warning's discard.
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Left));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "precondition: the discard lands on the Overview"
+    );
+    rig
+}
+
+/// Press `e` on `item` and assert the running save holds the landing.
+#[cfg(unix)]
+fn hold_e_over(rig: &mut ConfigEditRig, item: super::MainItemKind) {
+    focus_overview_item(&mut rig.app, item);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('e')));
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "precondition: the running save holds the landing"
+    );
+}
+
+/// [`held_e_rig`] over a two-account claude roster, with `e` held on `second`
+/// (Overview row 1).
+#[cfg(unix)]
+fn held_e_over_second(home: &crate::testutil::HomeSandbox) -> ConfigEditRig {
+    crate::testutil::register_names(&["first", "second"]);
+    let mut rig = held_e_rig(
+        home,
+        app_with(vec![healthy_api("first"), healthy_api("second")]),
+    );
+    hold_e_over(&mut rig, super::MainItemKind::Profile(1));
+    rig
+}
+
+/// [`held_e_rig`] over `pool_rows_app`'s listing, with `e` held on its first
+/// pool row (`claude-main`'s `alpha`).
+#[cfg(unix)]
+fn held_e_over_a_pool_row(home: &crate::testutil::HomeSandbox) -> ConfigEditRig {
+    let mut rig = held_e_rig(home, pool_rows_app());
+    hold_e_over(&mut rig, super::MainItemKind::Shunt(0, 0));
+    rig
+}
+
+/// [`held_e_rig`] over an app whose codex roster holds `cx1`, with `e` held on
+/// that row.
+#[cfg(unix)]
+fn held_e_over_a_codex_row(home: &crate::testutil::HomeSandbox) -> ConfigEditRig {
+    crate::testutil::write_codex_roster(&["cx1"]);
+    crate::testutil::register_names(&["first"]);
+    let mut rig = held_e_rig(home, app_with(vec![healthy_api("first")]));
+    hold_e_over(&mut rig, super::MainItemKind::Codex(0));
+    rig
+}
+
+/// A held `e` whose account is deleted before its landing drops the hold where
+/// the app reconciles the roster change: the Overview stays put, no other row
+/// opens, and the press says once that the account is gone. A reconcile that
+/// leaves the held account in the roster keeps the hold.
+#[cfg(unix)]
+#[test]
+fn a_held_e_drops_its_hold_when_its_account_is_deleted() {
+    use super::ToastKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = held_e_over_second(&home);
+
+    n24_delete(&rig.app, "first");
+    assert!(
+        rig.app.reload_if_state_changed(),
+        "precondition: the delete moved the roster fingerprint"
+    );
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "a reconcile that leaves the held account keeps the hold"
+    );
+    assert!(rig.app.toasts.is_empty(), "a kept hold says nothing");
+
+    n24_delete(&rig.app, "second");
+    assert!(
+        rig.app.reload_if_state_changed(),
+        "precondition: the delete moved the roster fingerprint"
+    );
+
+    assert!(
+        rig.app.loss_pending.is_none(),
+        "the roster reconcile drops a hold whose account the delete took"
+    );
+    let said: Vec<(ToastKind, String)> = rig
+        .app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![(
+            ToastKind::Danger,
+            "couldn't open the editor: account is no longer in the roster".to_string()
+        )],
+        "the dropped press says the account is gone, once"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "the gone target leaves the Overview up"
+    );
+    assert!(rig.app.config_draft.is_none(), "no editor opened");
+
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "the save's landing never opens another row"
+    );
+    assert!(
+        rig.app.config_draft.is_none(),
+        "the save's landing opened an editor"
+    );
+    assert_eq!(rig.app.toasts.len(), 1, "the landing says nothing more");
+}
+
+/// A held `e` whose account is deleted before the save lands, with no roster
+/// reload in between: the landing opens nothing and says the account is gone.
+#[cfg(unix)]
+#[test]
+fn a_held_e_on_a_gone_account_lands_nowhere_and_says_so() {
+    use super::ToastKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = held_e_over_second(&home);
+
+    n24_delete(&rig.app, "second");
+    rig.drain();
+
+    assert_eq!(rig.app.tab, Tab::Overview, "a gone target lands nowhere");
+    assert!(
+        rig.app.config_draft.is_none(),
+        "a gone target opens no editor"
+    );
+    let said: Vec<(ToastKind, String)> = rig
+        .app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![(
+            ToastKind::Danger,
+            "couldn't open the editor: account is no longer in the roster".to_string()
+        )],
+        "the landing says the account is gone"
+    );
+}
+
+/// A held `e` on a pool row whose account leaves the listing lands nowhere and
+/// says so in the pool listing's own words, never the roster's.
+#[cfg(unix)]
+#[test]
+fn a_held_e_on_a_gone_pool_row_lands_nowhere_and_says_so() {
+    use super::ToastKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = held_e_over_a_pool_row(&home);
+
+    // alpha leaves the listing under the hold.
+    {
+        let super::ShuntPool::Read(providers) = &mut rig.app.shunt_pool else {
+            panic!("precondition: the pool listing was read");
+        };
+        providers[0].accounts.clear();
+    }
+    rig.drain();
+
+    assert_eq!(rig.app.tab, Tab::Overview, "a gone target lands nowhere");
+    assert!(
+        rig.app.config_draft.is_none(),
+        "a gone target opens no editor"
+    );
+    let said: Vec<(ToastKind, String)> = rig
+        .app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![(
+            ToastKind::Danger,
+            "couldn't open the editor: that account is gone from the pool listing".to_string()
+        )],
+        "the landing says the pool listing dropped the account"
+    );
+}
+
+/// A held `e` on a codex row whose account leaves the roster lands nowhere and
+/// says the account is gone, the reason the note editor gives too.
+#[cfg(unix)]
+#[test]
+fn a_held_e_on_a_gone_codex_row_lands_nowhere_and_says_so() {
+    use super::ToastKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = held_e_over_a_codex_row(&home);
+
+    // cx1 leaves the codex roster under the hold.
+    rig.app.codex_rows.clear();
+    rig.drain();
+
+    assert_eq!(rig.app.tab, Tab::Overview, "a gone target lands nowhere");
+    assert!(
+        rig.app.config_draft.is_none(),
+        "a gone target opens no editor"
+    );
+    let said: Vec<(ToastKind, String)> = rig
+        .app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![(
+            ToastKind::Danger,
+            "couldn't open the editor: account is no longer in the roster".to_string()
+        )],
+        "the landing says the account is gone"
+    );
+}
+
+/// A held `e` whose pool row a tick's own listing read drops drops the hold in
+/// that same tick: the drop runs after the reads the tick lands, not at the
+/// roster reconcile that precedes them.
+#[cfg(unix)]
+#[test]
+fn a_tick_that_drops_a_held_pools_row_drops_the_hold_too() {
+    use super::{EditTarget, LossWarningTarget, SetupItem, ToastKind};
+    /// The read the tick lands: `claude-main` no longer lists alpha.
+    fn pool_without_alpha() -> super::ShuntPool {
+        one_provider_pool(&[])
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    // The hold `e` takes on alpha's pool row: no save is waited on here, so
+    // the tick's own drop is what this pins.
+    app.loss_pending = Some(LossWarningTarget::EditAccount(EditTarget::Item(
+        SetupItem::Pool {
+            provider: "claude-main".to_string(),
+            account: "alpha".to_string(),
+        },
+    )));
+
+    // Queue the read; the tick below lands it after its roster reconcile.
+    app.shunt_pool_probe.prober = Some(pool_without_alpha);
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::on_tick(&mut app);
+
+    assert!(
+        app.loss_pending.is_none(),
+        "the tick that drops alpha's row drops its hold too"
+    );
+    let said: Vec<(ToastKind, String)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![(
+            ToastKind::Danger,
+            "couldn't open the editor: that account is gone from the pool listing".to_string()
+        )],
+        "the dropped hold says the account is gone, once"
+    );
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "the drop leaves the screen where it was"
     );
 }
 
