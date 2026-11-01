@@ -289,32 +289,31 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     } else {
         None
     };
-    let lines: Vec<Line<'static>> = check
-        .detail
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, line)| match problem_index(check, idx) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (idx, line) in check.detail.iter().enumerate() {
+        match problem_index(check, idx) {
             Some(pidx) => {
                 let selected = problem_focus == Some(pidx);
                 let line = problem_line(line, selected);
-                vec![if selected {
-                    highlight_row(line, inner.width as usize)
+                if selected {
+                    lines.push(highlight_row(line, inner.width as usize));
                 } else {
-                    line
-                }]
+                    lines.push(line);
+                }
             }
             // Wrapped, never cut: its tail is the command that clears it.
-            None if Some(line.as_str()) == daemon_line => prose::wrap(
-                &prose::mark_commands(line),
-                inner.width as usize,
-                theme::warning(),
-            )
-            .into_iter()
-            .map(Line::from)
-            .collect(),
-            None => vec![detail_line(line, key_w, inner.width as usize)],
-        })
-        .collect();
+            None if Some(line.as_str()) == daemon_line => lines.extend(
+                prose::wrap(
+                    &prose::mark_commands(line),
+                    inner.width as usize,
+                    theme::warning(),
+                )
+                .into_iter()
+                .map(Line::from),
+            ),
+            None => lines.push(detail_line(line, key_w, inner.width as usize)),
+        }
+    }
 
     // The herdr detail appends its options section and takes per-row focus;
     // every other detail keeps the scroll-only path below.

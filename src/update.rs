@@ -518,6 +518,26 @@ fn fetch_asset(url: &str, size: u64, budget: Duration) -> anyhow::Result<Vec<u8>
         .map_err(|e| anyhow::anyhow!("asset read failed: {e}"))
 }
 
+/// The replace step — staging, self-replace, cleanup — holds the gate so an
+/// exit wait never detaches mid-replace; the download before it is not gated. A
+/// refused begin (the exit wait already gave up) is silent: `Ok(false)`, so no
+/// log line and no `Installed` event — the process is exiting. The replace call
+/// itself is injected, so a test drives the step to failure without replacing
+/// the running binary.
+fn replace_verified(
+    bytes: &[u8],
+    gate: &ReplaceGate,
+    replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> anyhow::Result<bool> {
+    let Some(_replace) = gate.begin() else {
+        return Ok(false);
+    };
+    let (_staging_dir, staged) = stage_verified(bytes)?;
+    replace_marked(&staged, replace)?;
+    // `_staging_dir` drops here, removing the staged file.
+    Ok(true)
+}
+
 fn download_and_replace(
     url: &str,
     sums_url: &str,
@@ -552,18 +572,7 @@ fn download_and_replace(
         );
     }
 
-    // The replace step — staging, self-replace, cleanup — holds the gate so an
-    // exit wait never detaches mid-replace; the download above is not gated. A
-    // refused begin (the exit wait already gave up) is silent: `Ok(false)`, so
-    // no log line and no `Installed` event — the process is exiting.
-    let Some(_replace) = gate.begin() else {
-        return Ok(false);
-    };
-    let (_staging_dir, staged) = stage_verified(&bytes)?;
-    replace_marked(&staged, |staged| self_replace::self_replace(staged))?;
-    // `_staging_dir` drops here, removing the staged file.
-
-    Ok(true)
+    replace_verified(&bytes, gate, |staged| self_replace::self_replace(staged))
 }
 
 /// Runs `replace(staged)` under the self-update mark. The mark is set before

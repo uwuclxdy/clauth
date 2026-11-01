@@ -25,6 +25,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -84,33 +86,73 @@ pub(crate) enum DaemonHealth {
 /// (the chip simply dims — never a false "daemon up"). Never CREATES the
 /// lock file: a missing file means no daemon has ever started here.
 pub(crate) fn daemon_health() -> DaemonHealth {
-    let Ok(dir) = clauth_dir() else {
+    if !daemon_lock_held() {
         return DaemonHealth::Absent;
+    }
+    // Present. A missing/unreadable feed = booted-but-not-yet-published → amber.
+    let body = read_feed();
+    if body
+        .as_deref()
+        .is_some_and(|body| status_is_fresh(body, crate::usage::now_ms()))
+    {
+        DaemonHealth::Fresh
+    } else {
+        DaemonHealth::Stale
+    }
+}
+
+/// Whether a daemon holds the singleton lock, probed the way [`daemon_health`]
+/// probes it: an unreadable or free lock reads `false` — never a false "daemon
+/// up" — and the probe's own try-lock drops at once. Never creates the file: a
+/// missing one means no daemon has ever started here.
+fn daemon_lock_held() -> bool {
+    let Ok(dir) = clauth_dir() else {
+        return false;
     };
     let Ok(lock_file) = OpenOptions::new()
         .read(true)
         .write(true)
         .open(dir.join(super::LOCK_FILE))
     else {
-        return DaemonHealth::Absent;
+        return false;
     };
     match lock_file.try_lock() {
-        // We took it → nobody holds it → no live daemon. Dropping releases it.
-        Ok(()) => return DaemonHealth::Absent,
-        // Held → a daemon is present; fall through to the health read.
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        // Can't tell (io error): dim the chip rather than assert a daemon.
-        Err(std::fs::TryLockError::Error(_)) => return DaemonHealth::Absent,
+        // We took it → nobody holds it. Dropping releases it.
+        Ok(()) => false,
+        // Held → a daemon is present.
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        // Can't tell (io error): read absent rather than assert a daemon.
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
-    // Present. A missing/unreadable feed = booted-but-not-yet-published → amber.
-    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
-        return DaemonHealth::Stale;
-    };
-    if status_is_fresh(&body, crate::usage::now_ms()) {
-        DaemonHealth::Fresh
-    } else {
-        DaemonHealth::Stale
-    }
+}
+
+/// One read of the daemon's published `status.json` body, `None` when it is
+/// absent or unreadable. Every feed reader in this module goes through here, so
+/// the one-read pin counts them all.
+fn read_feed() -> Option<String> {
+    #[cfg(test)]
+    FEED_READS.fetch_add(1, Ordering::Relaxed);
+    let dir = clauth_dir().ok()?;
+    std::fs::read_to_string(dir.join(super::STATUS_FILE)).ok()
+}
+
+/// How many `status.json` reads this process has made through [`read_feed`]
+/// (test builds only), so a pin can count a probe tick's reads.
+#[cfg(test)]
+static FEED_READS: AtomicUsize = AtomicUsize::new(0);
+
+/// Start counting feed reads from zero for the next test. The counter is
+/// process-global: reset and read it under a `HomeSandbox`, which serializes
+/// every sandboxed test.
+#[cfg(test)]
+pub(crate) fn reset_feed_reads() {
+    FEED_READS.store(0, Ordering::Relaxed);
+}
+
+/// The feed reads counted since the last reset (test builds only).
+#[cfg(test)]
+pub(crate) fn feed_reads() -> usize {
+    FEED_READS.load(Ordering::Relaxed)
 }
 
 /// Pure freshness test: `body`'s `generated_at` stamp is within [`DAEMON_STALE_MS`]
@@ -118,20 +160,26 @@ pub(crate) fn daemon_health() -> DaemonHealth {
 /// never render a feed we can't read as fresh. A stamp in the FUTURE counts as
 /// fresh (clock skew must not flap the chip).
 pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(stamp) = v.get("generated_at").and_then(|g| g.as_str()) else {
-        return false;
-    };
-    let Some(secs) = crate::usage::iso_to_epoch_secs(stamp) else {
-        return false;
-    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|v| status_is_fresh_value(&v, now_ms))
+}
+
+/// [`status_is_fresh`] over an already-parsed feed, so a probe that reads the
+/// feed once also parses it once.
+fn status_is_fresh_value(v: &serde_json::Value, now_ms: u64) -> bool {
+    stamp_age_ms(v, now_ms).is_some_and(|age| age <= DAEMON_STALE_MS)
+}
+
+/// The feed's `generated_at` age in ms, `None` when the stamp is missing or
+/// malformed (a stamp in the future reads as age 0).
+fn stamp_age_ms(v: &serde_json::Value, now_ms: u64) -> Option<u64> {
+    let stamp = v.get("generated_at").and_then(|g| g.as_str())?;
+    let secs = crate::usage::iso_to_epoch_secs(stamp)?;
     if secs < 0 {
-        return false;
+        return None;
     }
-    let generated_ms = (secs as u64).saturating_mul(1000);
-    now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
+    Some(now_ms.saturating_sub((secs as u64).saturating_mul(1000)))
 }
 
 /// The managed-gateway slot for the Services tab's `shunt` row: with a fresh
@@ -153,40 +201,44 @@ pub(crate) fn gateway_slot(health: DaemonHealth) -> (super::gateway::GatewaySlot
     if health != DaemonHealth::Fresh {
         return (super::gateway::unsupervised_slot(), false);
     }
-    let Ok(dir) = clauth_dir() else {
-        return (super::gateway::unsupervised_slot(), false);
-    };
-    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
-        return (super::gateway::unsupervised_slot(), false);
-    };
-    // Parse only the `gateway` key: one unrelated profile entry or codex slot
-    // that this binary cannot read must not discard a fresh daemon's slot.
-    #[derive(serde::Deserialize)]
-    struct GatewayFeed {
-        #[serde(default)]
-        gateway: Option<super::gateway::GatewaySlot>,
+    // Parsed straight from the text: the struct parse skips every other key, so
+    // a caller polling every tick builds no tree of the whole feed.
+    match read_feed() {
+        Some(body) => gateway_slot_of(serde_json::from_str::<GatewayFeed>(&body)),
+        None => (super::gateway::unsupervised_slot(), false),
     }
-    let Ok(feed) = serde_json::from_str::<GatewayFeed>(&body) else {
-        return (super::gateway::unsupervised_slot(), false);
-    };
-    match feed.gateway {
+}
+
+/// The `gateway` key alone, so one unparseable key never discards a fresh
+/// daemon's slot.
+#[derive(serde::Deserialize)]
+struct GatewayFeed {
+    #[serde(default)]
+    gateway: Option<super::gateway::GatewaySlot>,
+}
+
+/// The slot a parsed [`GatewayFeed`] names, else the record verdict as
+/// not-from-daemon.
+fn gateway_slot_of(
+    feed: Result<GatewayFeed, serde_json::Error>,
+) -> (super::gateway::GatewaySlot, bool) {
+    match feed.ok().and_then(|feed| feed.gateway) {
         Some(slot) => (slot, true),
         None => (super::gateway::unsupervised_slot(), false),
     }
 }
 
-/// How a fresh daemon's own executable changed since it started, so its plugin
-/// heal stands down until it restarts: `binary_removed: true` reads as removed,
-/// else `binary_replaced: true` as replaced. Any other daemon health, an
-/// unreadable feed, absent keys (an older daemon) or a value this binary cannot
-/// parse reads `None` — the [`gateway_slot`] discipline: a dead daemon's last
-/// write says nothing.
-pub(crate) fn daemon_binary_change(health: DaemonHealth) -> Option<ExeChange> {
-    if health != DaemonHealth::Fresh {
-        return None;
-    }
-    let body = std::fs::read_to_string(clauth_dir().ok()?.join(super::STATUS_FILE)).ok()?;
-    // Parse only the two binary keys, as `gateway_slot` parses its own.
+/// [`gateway_slot`]'s mapping over a feed [`probe_daemon`] already parsed.
+fn gateway_slot_value(v: &serde_json::Value) -> (super::gateway::GatewaySlot, bool) {
+    gateway_slot_of(<GatewayFeed as serde::Deserialize>::deserialize(v))
+}
+
+/// How a daemon's own executable changed since it started, so its plugin heal
+/// stands down until it restarts: `binary_removed: true` reads as removed, else
+/// `binary_replaced: true` as replaced. Absent keys (an older daemon) or a feed
+/// this binary cannot parse read `None` — the two binary keys alone, as
+/// [`gateway_slot_value`] parses its own.
+fn binary_change_value(v: &serde_json::Value) -> Option<ExeChange> {
     #[derive(serde::Deserialize)]
     struct BinaryFeed {
         #[serde(default)]
@@ -194,13 +246,58 @@ pub(crate) fn daemon_binary_change(health: DaemonHealth) -> Option<ExeChange> {
         #[serde(default)]
         binary_removed: bool,
     }
-    let feed = serde_json::from_str::<BinaryFeed>(&body).ok()?;
+    let feed = <BinaryFeed as serde::Deserialize>::deserialize(v).ok()?;
     if feed.binary_removed {
         Some(ExeChange::Removed)
     } else if feed.binary_replaced {
         Some(ExeChange::Replaced)
     } else {
         None
+    }
+}
+
+/// One probe's whole take: the lock verdict plus ONE read and parse of the
+/// feed, shared by the consumers that would otherwise each re-read the file
+/// (the freshness verdict, [`gateway_slot_value`]'s slot,
+/// [`binary_change_value`]'s flags). The TUI's per-second tick and the tab
+/// re-probe drive this instead of the three readers.
+pub(crate) struct DaemonProbe {
+    /// The header chip's verdict.
+    pub(crate) health: DaemonHealth,
+    /// The gateway slot, as [`gateway_slot`] reports it.
+    pub(crate) gateway: (super::gateway::GatewaySlot, bool),
+    /// The binary-change flags, as [`binary_change_value`] reads them.
+    pub(crate) binary_change: Option<ExeChange>,
+}
+
+/// Run one probe: the lock verdict, then one read and one parse shared by every
+/// consumer. A non-fresh verdict short-circuits the two feed consumers to their
+/// no-fresh-daemon answers, exactly as [`gateway_slot`] does when its health
+/// gate fails.
+pub(crate) fn probe_daemon() -> DaemonProbe {
+    if !daemon_lock_held() {
+        return DaemonProbe {
+            health: DaemonHealth::Absent,
+            gateway: (super::gateway::unsupervised_slot(), false),
+            binary_change: None,
+        };
+    }
+    let body = read_feed();
+    let value = body
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok());
+    let health = match value.as_ref() {
+        Some(v) if status_is_fresh_value(v, crate::usage::now_ms()) => DaemonHealth::Fresh,
+        _ => DaemonHealth::Stale,
+    };
+    let (gateway, binary_change) = match value.as_ref() {
+        Some(v) if health == DaemonHealth::Fresh => (gateway_slot_value(v), binary_change_value(v)),
+        _ => ((super::gateway::unsupervised_slot(), false), None),
+    };
+    DaemonProbe {
+        health,
+        gateway,
+        binary_change,
     }
 }
 
@@ -215,10 +312,7 @@ pub(crate) fn proxy_slots(health: DaemonHealth) -> Vec<super::proxies::ProxySlot
     if health != DaemonHealth::Fresh {
         return super::proxies::entries(None);
     }
-    let Ok(dir) = clauth_dir() else {
-        return super::proxies::entries(None);
-    };
-    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
+    let Some(body) = read_feed() else {
         return super::proxies::entries(None);
     };
     // Parse only the `proxies` key: one unrelated profile entry that this

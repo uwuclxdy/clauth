@@ -5401,11 +5401,10 @@ pub(crate) struct App {
     /// ([`crate::daemon::gateway::left_behind_gateway_runs`]), which picks the
     /// no-daemon toast's copy.
     pub(crate) left_behind_probe: ProbeWorker<bool>,
-    /// How a fresh daemon's binary changed, as last read beside
-    /// `daemon_health` ([`crate::daemon::daemon_binary_change`]): the plugin
-    /// card's line for that kind holds exactly while it is set, and each change
-    /// into `Some` tints the Services tab. Starts `None`, so a first changed
-    /// reading counts.
+    /// How a fresh daemon's binary changed, as last read beside `daemon_health`
+    /// ([`crate::daemon::probe_daemon`]): the plugin card's line for that kind
+    /// holds exactly while it is set, and each change into `Some` tints the
+    /// Services tab. Starts `None`, so a first changed reading counts.
     pub(crate) daemon_binary_change: Option<ExeChange>,
     /// The kinds of daemon binary change whose toast was raised; each kind
     /// toasts once per run.
@@ -21833,9 +21832,10 @@ fn drain_daemon_control(app: &mut App) {
 /// Re-probe the header chip and the menu's verb at once rather than at the
 /// next throttled probe.
 fn reprobe_daemon(app: &mut App) {
-    app.daemon_health = crate::daemon::daemon_health();
-    sync_gateway_state(app);
-    sync_daemon_binary_change(app);
+    let probe = crate::daemon::probe_daemon();
+    app.daemon_health = probe.health;
+    app.set_gateway_state(probe.gateway.0.state);
+    apply_daemon_binary_change(app, probe.binary_change);
     app.last_daemon_probe = Instant::now();
 }
 
@@ -29412,9 +29412,10 @@ fn poll_daemon_health(app: &mut App) {
         return;
     }
     app.last_daemon_probe = Instant::now();
-    app.daemon_health = crate::daemon::daemon_health();
-    sync_gateway_state(app);
-    sync_daemon_binary_change(app);
+    let probe = crate::daemon::probe_daemon();
+    app.daemon_health = probe.health;
+    app.set_gateway_state(probe.gateway.0.state);
+    apply_daemon_binary_change(app, probe.binary_change);
     // The image this process runs never comes back, so each kind's toast
     // latches once raised; a removal can precede a replacement (a Windows
     // self-update leaves the path empty mid-swap), so the replacement still
@@ -29522,13 +29523,12 @@ fn own_binary_completions_refusal(change: ExeChange, stale: bool) -> String {
     }
 }
 
-/// Re-read how a fresh daemon's binary changed under the health the app holds
-/// now. A change into `Some` tints the Services tab and raises its kind's
+/// Apply how a fresh daemon's binary changed, from the probe the caller already
+/// read. A change into `Some` tints the Services tab and raises its kind's
 /// toast, once per kind per run; any change rebuilds the plugin card, so its
 /// line follows the feed on this cadence rather than waiting for a Services
 /// recompute.
-fn sync_daemon_binary_change(app: &mut App) {
-    let change = crate::daemon::daemon_binary_change(app.daemon_health);
+fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
     if change == app.daemon_binary_change {
         return;
     }

@@ -47899,20 +47899,12 @@ fn the_shunt_add_disabled_reason_starts_at_adopted_then_running() {
 }
 
 /// Pose a healthy gateway for the disabled-reason rungs past "not running":
-/// hold the daemon lock and write a fresh `status.json` naming a healthy slot.
-/// The returned lock file keeps `daemon_health` reading `Fresh` for the test's
-/// life.
-fn pose_healthy_gateway(home: &crate::testutil::HomeSandbox) -> std::fs::File {
-    let dir = home.home().join(".clauth");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join("clauthd.lock"))
-        .expect("open the daemon lock");
-    lock.lock().expect("hold the daemon lock");
+/// hold the daemon lock via the shared helper and write a fresh `status.json`
+/// naming a healthy slot. The returned lock file keeps `daemon_health` reading
+/// `Fresh` for the test's life.
+fn pose_healthy_gateway() -> std::fs::File {
+    let lock = crate::daemon::hold_daemon_lock();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
     let secs = (crate::usage::now_ms() / 1000) as i64;
     let body = serde_json::json!({
         "generated_at": crate::usage::epoch_secs_to_iso(secs),
@@ -47939,7 +47931,7 @@ fn every_shunt_add_disabled_reason_by_equality() {
     );
 
     // Healthy gateway, but the config is unreadable: the read error's own rung.
-    let _lock = pose_healthy_gateway(&home);
+    let _lock = pose_healthy_gateway();
     crate::testutil::write_adopted_record(&home, false, "[server\n");
     let reason = super::shunt_add_disabled_reason().expect("a config read error disables");
     assert!(
@@ -54831,7 +54823,7 @@ fn plugin_card_carries_daemon_line(app: &App) -> bool {
 fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     use crate::daemon::DaemonHealth;
     let _home = crate::testutil::HomeSandbox::new();
-    let _lock = hold_daemon_lock();
+    let _lock = crate::daemon::hold_daemon_lock();
     let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
 
     let mut app = bare_app();
@@ -54915,19 +54907,7 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
 fn a_dead_daemons_replaced_flag_raises_nothing() {
     use crate::daemon::DaemonHealth;
     let _home = crate::testutil::HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let body = serde_json::json!({
-        "schema": 1,
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "profiles": [],
-        "binary_replaced": true,
-    });
-    std::fs::write(
-        dir.join("status.json"),
-        serde_json::to_vec(&body).expect("serialize"),
-    )
-    .expect("write the feed");
+    write_replaced_feed(&chrono::Utc::now().to_rfc3339(), true);
 
     let mut app = bare_app();
     stub_left_behind(&mut app, false);
@@ -54950,7 +54930,7 @@ fn a_dead_daemons_replaced_flag_raises_nothing() {
 #[test]
 fn a_daemon_whose_binary_was_removed_names_the_removal() {
     let _home = crate::testutil::HomeSandbox::new();
-    let _lock = hold_daemon_lock();
+    let _lock = crate::daemon::hold_daemon_lock();
     let now = || chrono::Utc::now().to_rfc3339();
 
     let mut app = bare_app();
@@ -55378,19 +55358,42 @@ fn write_binary_feed(generated_at: &str, replaced: bool, removed: bool) {
     .expect("write the feed");
 }
 
-/// Hold the daemon's singleton lock, posing a live daemon.
-fn hold_daemon_lock() -> std::fs::File {
+/// One 1 Hz probe tick reads `status.json` once: the header chip's health
+/// verdict, the gateway slot and the binary-change flags share the same read
+/// (counted by the daemon module's feed-read seam).
+#[test]
+fn one_daemon_probe_tick_reads_status_json_once() {
+    use crate::daemon::{DaemonHealth, feed_reads, reset_feed_reads};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let secs = (crate::usage::now_ms() / 1000) as i64;
+    let body = serde_json::json!({
+        "schema": 1,
+        "generated_at": crate::usage::epoch_secs_to_iso(secs),
+        "profiles": [],
+        "binary_replaced": false,
+        "binary_removed": false,
+        "gateway": { "state": "healthy", "floor": "0.48.0", "restarts": 0 },
+    });
     let dir = crate::profile::clauth_dir().expect("clauth dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join("clauthd.lock"))
-        .expect("open the daemon lock");
-    lock.try_lock().expect("pose a live daemon");
-    lock
+    std::fs::write(dir.join("status.json"), body.to_string()).expect("write the feed");
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    reset_feed_reads();
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "the posed daemon reads live"
+    );
+    assert_eq!(feed_reads(), 1, "one probe tick reads status.json once");
+    assert_eq!(
+        app.gateway_state,
+        crate::daemon::gateway::GatewayState::Healthy,
+        "the same read landed the daemon's gateway slot"
+    );
 }
 
 /// A live daemon whose feed went stale (wedging, or a dead writer's last
@@ -55400,7 +55403,7 @@ fn hold_daemon_lock() -> std::fs::File {
 fn a_stale_daemons_replaced_flag_raises_nothing() {
     use crate::daemon::DaemonHealth;
     let _home = crate::testutil::HomeSandbox::new();
-    let _lock = hold_daemon_lock();
+    let _lock = crate::daemon::hold_daemon_lock();
     write_replaced_feed("2026-01-01T00:00:00+00:00", true);
 
     let mut app = bare_app();
@@ -55428,7 +55431,7 @@ fn a_stale_daemons_replaced_flag_raises_nothing() {
 #[test]
 fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     let _home = crate::testutil::HomeSandbox::new();
-    let _lock = hold_daemon_lock();
+    let _lock = crate::daemon::hold_daemon_lock();
     let now = || chrono::Utc::now().to_rfc3339();
 
     let mut app = bare_app();

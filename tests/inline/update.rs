@@ -928,6 +928,66 @@ fn the_replace_gate_refuses_a_replace_after_the_exit_gave_up() {
     assert!(gate.begin().is_none());
 }
 
+// ── the replace step ────────────────────────────────────────────────────────
+
+/// An abandoned gate refuses the replace step without touching the bytes: no
+/// replace starts once the exit wait has given up.
+#[test]
+fn the_replace_step_refuses_an_abandoned_gate() {
+    let gate = ReplaceGate::new();
+    gate.abandon();
+    assert!(
+        !replace_verified(b"payload", &gate, |_| Ok(())).expect("the step answers"),
+        "no replace starts after the give-up"
+    );
+}
+
+/// A failed replace fails the whole step: the error passes through unchanged,
+/// the self-update mark clears, and the gate returns to idle.
+#[test]
+fn the_injected_replace_failure_fails_the_replace_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let gate = ReplaceGate::new();
+    let err = replace_verified(b"payload", &gate, |_| {
+        Err(std::io::Error::other("rename refused"))
+    })
+    .expect_err("the failed replace fails the step");
+    assert_eq!(
+        err.to_string(),
+        "rename refused",
+        "the error passes through"
+    );
+    assert!(!replaced_by_self_update(), "the mark clears on the failure");
+    assert!(!gate.is_replacing(), "the gate returns to idle");
+}
+
+/// A successful replace marks the run as self-replaced from before the call,
+/// holds the gate while it runs, and returns both to their rest states after.
+#[test]
+fn the_injected_replace_success_marks_the_run() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let gate = ReplaceGate::new();
+    let mut seen_during = None;
+    let replaced = replace_verified(b"payload", &gate, |staged| {
+        assert!(staged.is_file(), "the staged file exists at the call");
+        seen_during = Some((replaced_by_self_update(), gate.is_replacing()));
+        Ok(())
+    })
+    .expect("the replace succeeds");
+    assert!(replaced, "the step reports the replace");
+    assert_eq!(
+        seen_during,
+        Some((true, true)),
+        "the mark is set and the gate held while the call runs"
+    );
+    assert!(replaced_by_self_update(), "the mark stays after success");
+    assert!(!gate.is_replacing(), "the gate returns to idle");
+}
+
 // ── replace_marked ─────────────────────────────────────────────────────────
 
 /// Clears the process-global self-update mark when a test ends, failing or

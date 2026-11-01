@@ -30,13 +30,13 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{
-    DaemonHealth, FetchLease, daemon_binary_change, daemon_health, gateway_slot, proxy_slots,
+    DaemonHealth, FetchLease, daemon_health, gateway_slot, probe_daemon, proxy_slots,
     singleton_held,
 };
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};
 #[cfg(test)]
-pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
+pub(crate) use probe::{daemon_lock_path, feed_reads, hold_daemon_lock, reset_feed_reads};
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
 /// referencing them as `super::…` after the extraction.
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
