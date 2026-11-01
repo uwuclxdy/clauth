@@ -6467,9 +6467,8 @@ fn an_over_wide_word_keeps_its_glue_in_the_overflow_path() {
 }
 
 /// The prose walker settles a marked run's edges the way the modal does: a
-/// run's leading and trailing whitespace drops against a separator, a control
-/// char pressed against a run keeps its trailing space, and a whitespace-only
-/// run collapses to the one separator cell.
+/// run's leading and trailing whitespace drops against a separator, and a
+/// whitespace-only run collapses to the one separator cell.
 #[test]
 fn settled_marked_run_edges_match_the_modal() {
     for (text, w, want) in [
@@ -6480,11 +6479,6 @@ fn settled_marked_run_edges_match_the_modal() {
         ),
         (format!("{}\u{a0}", prose::cmd("QA ")), 40, vec!["QA\u{a0}"]),
         (format!("\u{7} {}", prose::key("QA")), 20, vec!["\u{7} QA"]),
-        (
-            format!("\u{6f22}\u{5b57}{}\u{1b}", prose::cmd("\u{6f22}\u{5b57} ")),
-            8,
-            vec!["\u{6f22}\u{5b57}", "\u{6f22}\u{5b57} "],
-        ),
         (
             format!("b{} \u{301}", prose::cmd(" ")),
             40,
@@ -6538,4 +6532,224 @@ fn joining_glue_with_one_kept_tab_never_carries_the_next_word() {
         assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
         assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
     }
+}
+
+/// `text` with every control character but the tab removed (a tab draws as a
+/// space): the line a control char changes nothing about.
+fn without_controls(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// A control character draws no cell and is never a break, so on each marked
+/// line below each wrapper draws exactly the rows it draws for the same line
+/// with the control removed: no separator cell for it, no kept edge space
+/// pressed against it, no break at it. A tab is no control here: it draws as
+/// a space.
+#[test]
+fn a_control_char_on_a_marked_line_changes_no_drawn_row() {
+    for (text, w, want) in [
+        (
+            format!("x \u{1b}{}){}y,", prose::key("    ZONE"), prose::cmd("xx")),
+            7,
+            vec!["x", "ZONE)xx", "y,"],
+        ),
+        (
+            format!("\u{7}{}y,;", prose::cmd(" \u{a0} login")),
+            7,
+            vec!["\u{a0} login", "y,;"],
+        ),
+        (
+            format!("\u{6f22}\u{5b57}{}\u{1b}", prose::cmd("\u{6f22}\u{5b57} ")),
+            8,
+            vec!["\u{6f22}\u{5b57}\u{6f22}\u{5b57}"],
+        ),
+        (format!("{}\rb", prose::cmd("x")), 8, vec!["xb"]),
+        (
+            format!("QZ{}\n \u{301}", prose::key("x")),
+            4,
+            vec!["QZx \u{301}"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), w);
+        assert_eq!(drawn(bare_prose), want, "bare prose at {w}: {text:?}");
+        assert_eq!(drawn(bare_modal), want, "bare modal at {w}: {text:?}");
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// The same property where the two wrappers already part on the bare line (a
+/// trailing tab after an over-wide run keeps a blank cell in the modal only):
+/// the control after it still changes neither wrapper's rows.
+#[test]
+fn a_control_after_a_trailing_tab_changes_neither_wrapper() {
+    let text = format!("{}\t\u{7}", prose::cmd("\u{6f22}\u{5b57}"));
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 3);
+    let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), 3);
+    assert_eq!(drawn(prose_rows), drawn(bare_prose), "prose: {text:?}");
+    assert_eq!(drawn(modal_rows), drawn(bare_modal), "modal: {text:?}");
+}
+
+/// Inside an over-wide marked run, a non-ASCII space (U+2003) at a run edge is
+/// data: the prose wrapper keeps that char where the modal does, never a plain
+/// space in its place and never dropped as a trailing break.
+#[test]
+fn an_em_space_at_a_run_edge_keeps_its_own_char() {
+    for (text, w, want) in [
+        (
+            format!(
+                "{}\u{6f22}\u{5b57}{}",
+                prose::key("\t\t\u{2003} "),
+                prose::key("x\u{2003}")
+            ),
+            3,
+            vec!["\u{6f22}", "\u{5b57}", "x\u{2003}"],
+        ),
+        (
+            format!(
+                "{}\t\u{200d}{}a{}",
+                prose::key("QA   \u{2003}"),
+                prose::key("  \u{202f}\u{6f22}\u{5b57}"),
+                prose::cmd("x")
+            ),
+            6,
+            vec!["QA \u{2003} \u{200d}", "\u{202f}\u{6f22}\u{5b57}a", "x"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// On each line below, a control character inside, between or beside marked
+/// runs is absent too: it keeps no run's edge space, holds no whitespace-only
+/// run's separator open, splits no two runs that meet across it, starts or
+/// ends no join, bounds no run, forces no split, and takes no row or
+/// separator of its own, so each wrapper draws the rows of the same line with
+/// it removed. A tab is no control here. Not covered: a control-only word
+/// beside prose whitespace on a line that fits, the whitespace runs beside a
+/// dropped one, and a control between a breaking space and the joiner or
+/// combining mark after it.
+#[test]
+fn a_control_char_inside_a_marked_run_changes_no_drawn_row() {
+    for (text, w, want) in [
+        (
+            format!(
+                "{};{}",
+                prose::cmd(" \u{1b} \r;"),
+                prose::key("  )\u{6f22}\u{6f22}b")
+            ),
+            9,
+            vec![";; )\u{6f22}\u{6f22}b"],
+        ),
+        (
+            format!("{}{}", prose::key("\u{7} ("), prose::key("QA\u{a0}\t\t")),
+            2,
+            vec!["(", "QA", "\u{a0}"],
+        ),
+        (
+            format!(
+                "\u{a0}\u{200d})\u{2003}{}\u{7}{}",
+                prose::key("QA \u{1b}"),
+                prose::cmd(" )")
+            ),
+            6,
+            vec!["\u{a0}\u{200d})", "QA )"],
+        ),
+        (
+            format!("{}\u{5b57}", prose::cmd(" \r\n")),
+            1,
+            vec!["\u{5b57}"],
+        ),
+        (prose::key("\n  \u{5b57}"), 1, vec!["\u{5b57}"]),
+        (
+            format!("{}a\r\u{7}\u{6f22}", prose::key("a\r\r  \u{c}")),
+            1,
+            vec!["a", "a", "\u{6f22}"],
+        ),
+        (
+            format!("b{}{}", prose::key("\u{7}QA\n"), prose::cmd(" b")),
+            3,
+            vec!["bQA", "b"],
+        ),
+        (
+            format!(
+                "{}ZONE\u{6f22}{}",
+                prose::cmd("ZONEb"),
+                prose::key("\n  bb")
+            ),
+            8,
+            vec!["ZONEbZON", "E\u{6f22} bb"],
+        ),
+        (
+            format!("{}\n {}QA", prose::key("\nZONE"), prose::key("\n(ZONE")),
+            5,
+            vec!["ZONE", "(ZONE", "QA"],
+        ),
+        (
+            format!(
+                "{};{}\tZONE\t",
+                prose::key("QA\u{6f22} "),
+                prose::key("\u{85}  \u{85}(")
+            ),
+            4,
+            vec!["QA\u{6f22}", ";", "(", "ZONE"],
+        ),
+        (format!("{}\tx", prose::cmd("a ")), 3, vec!["a x"]),
+        (format!("\u{7}{}b", prose::key("  ")), 5, vec!["b"]),
+        (format!("a{}\u{7}", prose::key("  ")), 5, vec!["a"]),
+        (
+            format!("x\u{a0}\u{7}{}y", prose::key("  ")),
+            10,
+            vec!["x\u{a0}y"],
+        ),
+        (format!("x\n{}y", prose::key("  ")), 10, vec!["x y"]),
+        (format!("x{}\u{7} y", prose::key("  ")), 10, vec!["x y"]),
+        (format!("a {} b", prose::key(" \u{7} ")), 10, vec!["a b"]),
+        (format!("({})", prose::cmd("a\nb")), 3, vec!["(ab", ")"]),
+        (
+            format!("ab {} \u{5b57}", prose::cmd("\r\n")),
+            3,
+            vec!["ab", "\u{5b57}"],
+        ),
+        (prose::key("QA\u{2003}\u{7}\u{2003}QB"), 4, vec!["QA", "QB"]),
+        (
+            format!("x {}){}", prose::cmd("ZONE"), prose::key("\u{7}QB")),
+            6,
+            vec!["x ZONE", ")", "QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), w);
+        assert_eq!(drawn(bare_prose), want, "bare prose at {w}: {text:?}");
+        assert_eq!(drawn(bare_modal), want, "bare modal at {w}: {text:?}");
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Inside a marked run wider than the row, a breaking non-ASCII space between
+/// two words that share a row draws as written, never as a plain space.
+#[test]
+fn a_break_space_inside_an_over_wide_run_keeps_its_own_char() {
+    let text = prose::key("QA\u{2003}QB ZONEZONE");
+    let want = vec!["QA\u{2003}QB", "ZONEZO", "NE"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A marked run of breaking non-ASCII spaces alone, wider than the row, is a
+/// line of whitespace: both wrappers split it by cell and draw every char.
+#[test]
+fn a_whitespace_only_run_wider_than_the_row_splits_by_cell() {
+    let text = prose::key("\u{2003}\u{2003}\u{2003}");
+    let want = vec!["\u{2003}\u{2003}", "\u{2003}"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 2);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
 }
