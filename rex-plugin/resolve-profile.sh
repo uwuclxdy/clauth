@@ -1,9 +1,11 @@
 #!/bin/sh
 # Prints the clauth account a Rex terminal's foreground process spends, as
-# "<profile><TAB><how>", or nothing when that process is neither Claude Code
-# nor codex. <how> is `clauth` for a session clauth launched, `global` for a
-# bare `claude`, which burns whatever owns the global credentials, and `codex`
-# for a codex whose login clauth adopted.
+# "<profile><TAB><how><TAB><agent>", or nothing when that process is neither
+# Claude Code nor codex. <how> is `clauth` for a session clauth launched,
+# `global` for a bare `claude`, which burns whatever owns the global
+# credentials, and `codex` for a codex whose login clauth adopted. <agent> is
+# `claude` or `codex`, so the watcher can name a pane whose own label says
+# nothing: a `clauth start` pane runs the clauth supervisor for either agent.
 #
 # $1 is the foreground pid Rex reports for the terminal. For a pane started
 # with `clauth start` that is the clauth supervisor, and the live-session
@@ -102,7 +104,12 @@ row=$(session_row "$pid") || row=""
 if [ -n "$row" ]; then
     profile=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$row")
     [ -n "$profile" ] || profile=$(sed -n 's/.*"start_profile":"\([^"]*\)".*/\1/p' "$row")
-    [ -n "$profile" ] && printf '%s\tclauth\n' "$profile"
+    # The row's harness is the only place the agent shows: the pane's process
+    # is the clauth supervisor either way. Rows from before the field are
+    # Claude Code, as clauth itself reads them.
+    agent=$(sed -n 's/.*"harness":"\([^"]*\)".*/\1/p' "$row")
+    [ "$agent" = codex ] || agent=claude
+    [ -n "$profile" ] && printf '%s\tclauth\t%s\n' "$profile" "$agent"
     exit 0
 fi
 
@@ -133,10 +140,10 @@ case "$kind" in
     clauth) exit 0 ;;
     codex)
         profile=$(adopted_codex_profile)
-        [ -n "$profile" ] && printf '%s\tcodex\n' "$profile"
+        [ -n "$profile" ] && printf '%s\tcodex\tcodex\n' "$profile"
         exit 0
         ;;
 esac
 profile=$(clauth which 2>/dev/null) || exit 0
 case "$profile" in '' | unknown) exit 0 ;; esac
-printf '%s\tglobal\n' "$profile"
+printf '%s\tglobal\tclaude\n' "$profile"
