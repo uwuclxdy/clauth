@@ -5919,6 +5919,14 @@ impl ReadingsSnapshot {
     pub(crate) fn stale_of(&self, name: &str) -> bool {
         self.stale.get(name).copied().unwrap_or(false)
     }
+    /// Whether `name`'s UNPICKED OAuth reading carries the no-5h-limit mark
+    /// ([`crate::usage::UsageInfo::no_five_hour_limit`]) — the store the
+    /// scheduler's election reads. The picked reading (`usage_of`) is the
+    /// provider's on a hybrid and never carries the verdict, so a plan
+    /// verdict reads only off the raw OAuth store.
+    pub(crate) fn no_five_hour_limit(&self, name: &str) -> bool {
+        self.oauth.get(name).is_some_and(|u| u.no_five_hour_limit)
+    }
 }
 
 impl App {

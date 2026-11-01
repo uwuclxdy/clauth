@@ -346,8 +346,9 @@ pub(crate) struct Profile {
     /// Opt-in usage probe for an account `/usage` cannot read: a
     /// `claude setup-token` login with no OAuth pair stored. A 1-token Haiku
     /// message every [`Profile::usage_probe_interval_ms`], read for the usage
-    /// its response headers carry; it may start the 5h window. Inert while a
-    /// pair is stored, since `/usage` reads that account.
+    /// its response headers carry; it may start the 5h window, on a plan
+    /// that has one. Inert while a pair is stored, since `/usage` reads
+    /// that account.
     pub(crate) usage_probe: bool,
     /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
     /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
@@ -5317,6 +5318,7 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
     out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
     out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+    out.push_str("# A plan with no 5-hour limit gets no ping.\n");
     out.push_str("# Old name `kick_timer = true` is still accepted.\n");
     if profile.auto_start {
         out.push_str("auto_start = true\n");
@@ -5328,7 +5330,8 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
     out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
     out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
-    out.push_str("# window. Inert while an OAuth pair is stored. OAuth profiles only.\n");
+    out.push_str("# window. A plan with no 5-hour limit has none to start. Inert while an\n");
+    out.push_str("# OAuth pair is stored. OAuth profiles only.\n");
     if profile.usage_probe {
         out.push_str("usage_probe = true\n");
     } else {

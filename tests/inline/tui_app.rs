@@ -32529,6 +32529,108 @@ fn the_probe_rows_show_the_switch_its_cadence_and_its_cost() {
     );
 }
 
+/// The probe app with `auto-start` set to `auto_start`, the cursor on `focus`,
+/// and, when `marked`, an OAuth reading saying the plan has no 5h limit.
+fn no_five_hour_app(probe: bool, auto_start: bool, marked: bool, focus: super::ConfigRow) -> App {
+    let name = crate::profile::ProfileName::from("acct");
+    let mut app = probe_app(probe, 120_000);
+    app.config().find_mut(&name).expect("acct").auto_start = auto_start;
+    if marked {
+        app.usage_store.lock().expect("usage").insert(
+            name.to_string(),
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 10.0,
+                    resets_at: None,
+                }),
+                no_five_hour_limit: true,
+                ..Default::default()
+            },
+        );
+    }
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == focus)
+        .expect("the focused row is listed");
+    app
+}
+
+/// On a plan with no 5h limit the auto-start hint says nothing is sent, in
+/// both states, and the probe hints stop naming a 5h window the plan does not
+/// have. The same rows on an unmarked account keep their window wording.
+#[test]
+fn a_plan_with_no_five_hour_limit_rewords_its_auto_start_and_probe_hints() {
+    use super::ConfigRow::{AutoStart, UsageProbe};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for auto_start in [true, false] {
+        let toggle = if auto_start { "─●" } else { "○─" };
+        assert_eq!(
+            probe_rows(&no_five_hour_app(false, auto_start, true, AutoStart)),
+            [
+                format!(" ❯ auto-start      {toggle}"),
+                "  └ this plan has no 5h limit, so nothing is sent".to_string(),
+                "   usage probe     ○─".to_string(),
+                "   alert at        off".to_string(),
+            ],
+            "marked, auto-start {auto_start}"
+        );
+    }
+    assert_eq!(
+        probe_rows(&no_five_hour_app(true, false, true, UsageProbe)),
+        [
+            "   auto-start      ○─",
+            " ❯ usage probe     ─●",
+            "  └ a 1-token request to Haiku reads usage",
+            "   probe every     120s",
+            "   alert at        off",
+        ],
+        "marked, probe on"
+    );
+    assert_eq!(
+        probe_rows(&no_five_hour_app(false, false, true, UsageProbe)),
+        [
+            "   auto-start      ○─",
+            " ❯ usage probe     ○─",
+            "  └ usage goes unread; a probe is a 1-token request to Haiku",
+            "   alert at        off",
+        ],
+        "marked, probe off"
+    );
+
+    // Controls: the same rows unmarked keep the window wording.
+    assert_eq!(
+        probe_rows(&no_five_hour_app(false, true, false, AutoStart)),
+        [
+            " ❯ auto-start      ─●",
+            "  └ sends a 1-token request to Haiku at every 5h usage reset",
+            "   usage probe     ○─",
+            "   alert at        off",
+        ],
+        "unmarked, auto-start on"
+    );
+    assert_eq!(
+        probe_rows(&no_five_hour_app(false, false, false, AutoStart)),
+        [
+            " ❯ auto-start      ○─",
+            "  └ 5h usage window stays closed after reset",
+            "   usage probe     ○─",
+            "   alert at        off",
+        ],
+        "unmarked, auto-start off"
+    );
+    assert_eq!(
+        probe_rows(&no_five_hour_app(true, false, false, UsageProbe))[2],
+        "  └ a 1-token request to Haiku reads usage and may start the 5h window",
+        "unmarked, probe on"
+    );
+    assert_eq!(
+        probe_rows(&no_five_hour_app(false, false, false, UsageProbe))[2],
+        "  └ usage goes unread; a probe is a 1-token request that may start the 5h window",
+        "unmarked, probe off"
+    );
+}
+
 // ── settings edits save config.toml only ─────────────────────────────────────
 
 /// The daemon's rotation landed a new pair while the TUI's in-memory profile

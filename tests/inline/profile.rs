@@ -54,6 +54,34 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// The generated auto-start comment says a plan with no 5-hour limit gets no
+// ping, beside the cost line it qualifies.
+#[test]
+fn the_auto_start_comment_names_a_plan_with_no_five_hour_limit() {
+    let profile = Profile::new("p".to_string(), None, None);
+    let rendered = render_config_toml(&profile);
+    let block = "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+                 # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+                 # no running window. ~0.001¢ per ping. OAuth profiles only.\n\
+                 # A plan with no 5-hour limit gets no ping.\n\
+                 # Old name `kick_timer = true` is still accepted.\n\
+                 # auto_start = true\n";
+    assert!(
+        rendered.contains(block),
+        "the auto-start block, whole, in order"
+    );
+    let probe = "# Probe this account's usage with a 1-token Haiku message, for a\n\
+                 # `claude setup-token` login that /usage cannot read (no OAuth pair\n\
+                 # stored). Every probe is an inference request and may start the 5h\n\
+                 # window. A plan with no 5-hour limit has none to start. Inert while an\n\
+                 # OAuth pair is stored. OAuth profiles only.\n\
+                 # usage_probe = true\n";
+    assert!(
+        rendered.contains(probe),
+        "the usage-probe block, whole, in order"
+    );
+}
+
 // `preferred_days` must default to empty so every config.toml written before
 // the field existed keeps loading with `preferred` alone in charge.
 #[test]

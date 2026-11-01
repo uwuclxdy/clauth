@@ -305,12 +305,7 @@ fn draw_usage_detail(
             &kick_lifts,
             queue_anchor,
             |n| crate::fallback::refuses_service_from_usage(n, &readings.oauth),
-            |n| {
-                readings
-                    .oauth
-                    .get(n.as_str())
-                    .is_some_and(|i| i.no_five_hour_limit)
-            },
+            |n| readings.no_five_hour_limit(n.as_str()),
         )
         .slot(&profile.name),
         peak: app.peak_state_for(profile),
@@ -1360,13 +1355,8 @@ fn header_lines(
     let left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
     // A plan with no 5h limit has no window the kick could open, so the
-    // countdown would name a kick that never fires. Read the unpicked OAuth
-    // store, the one the election reads: a hybrid's picked reading is its
-    // provider's and never carries the verdict.
-    let no_five_hour_limit = readings
-        .oauth
-        .get(profile.name.as_str())
-        .is_some_and(|usage| usage.no_five_hour_limit);
+    // countdown would name a kick that never fires.
+    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
     if profile.auto_start && !no_five_hour_limit {
         plan_spans.extend(kick_spans(
             &kick_text(profile, header, readings),

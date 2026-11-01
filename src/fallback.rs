@@ -642,7 +642,8 @@ pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
 /// The one fix line for a member clauth cannot measure ([`no_usage_source`]),
 /// naming both ways to a reading while sessions keep running on the session
 /// token: the login that gives `/usage` a pair to poll, or the usage probe,
-/// which reads the account off that token itself and may start its 5h window.
+/// which reads the account off that token itself and may start its 5h window
+/// on a plan that has one.
 /// Shared by the member card, the daemon boot line, the add confirm and the
 /// line after `clauth login <name> --setup-token`, the way
 /// [`uncapped_spend_fix`] is, so none of them can drift; `names` carries every

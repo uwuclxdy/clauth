@@ -228,6 +228,9 @@ struct Snap {
     env: Vec<(String, String)>,
     auto_start: bool,
     usage_probe: bool,
+    /// [`ReadingsSnapshot::no_five_hour_limit`] for this account: rewords the
+    /// auto-start + usage-probe hints on a plan with no 5h limit.
+    no_five_hour_limit: bool,
     /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
     /// buffer spells it.
     usage_probe_interval: String,
@@ -369,6 +372,7 @@ impl Snap {
             env: Vec::new(),
             auto_start: false,
             usage_probe: false,
+            no_five_hour_limit: false,
             usage_probe_interval: String::new(),
             bell_threshold: String::new(),
             disabled: false,
@@ -481,6 +485,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 auto_start: p.auto_start,
                 usage_probe: p.usage_probe,
+                no_five_hour_limit: readings.no_five_hour_limit(p.name.as_str()),
                 usage_probe_interval: (p.usage_probe_interval_ms / 1000).to_string(),
                 bell_threshold: p
                     .bell_threshold
@@ -1271,7 +1276,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
 /// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
-/// on their own value.
+/// on their own value, and auto-start and the usage probe also on whether the
+/// plan has a 5h limit at all.
 fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
@@ -1297,11 +1303,25 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Disabled => {
             "excludes this account from auto-switch, usage polling, and status until re-enabled"
         }
+        // A plan with no 5h limit never gets a ping: the scheduler's election
+        // skips a marked account, so the window arms below would promise work
+        // that never happens. The toggle itself stays live and unchanged.
+        ConfigRow::AutoStart if snap.no_five_hour_limit => {
+            "this plan has no 5h limit, so nothing is sent"
+        }
         ConfigRow::AutoStart if snap.auto_start => {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
-        // Both states name the cost, since turning it on is what pays it.
+        // Both states name the cost, since turning it on is what pays it. On a
+        // plan with no 5h limit there is no window to start, so the cost line
+        // drops it and only the read remains.
+        ConfigRow::UsageProbe if snap.no_five_hour_limit && snap.usage_probe => {
+            "a 1-token request to Haiku reads usage"
+        }
+        ConfigRow::UsageProbe if snap.no_five_hour_limit => {
+            "usage goes unread; a probe is a 1-token request to Haiku"
+        }
         ConfigRow::UsageProbe if snap.usage_probe => {
             "a 1-token request to Haiku reads usage and may start the 5h window"
         }

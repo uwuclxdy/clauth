@@ -205,6 +205,32 @@ fn setup_hints_follow_the_row_value() {
     let off = row_hint(ConfigRow::AutoStart, &snap).unwrap();
     assert_eq!(off, "5h usage window stays closed after reset");
 
+    // A plan with no 5h limit: both auto-start states say nothing is sent, and
+    // the probe hints stop naming a window the plan does not have.
+    snap.no_five_hour_limit = true;
+    for auto_start in [true, false] {
+        snap.auto_start = auto_start;
+        assert_eq!(
+            row_hint(ConfigRow::AutoStart, &snap).unwrap(),
+            "this plan has no 5h limit, so nothing is sent",
+            "marked, auto-start {auto_start}"
+        );
+    }
+    snap.auto_start = false;
+    snap.usage_probe = true;
+    assert_eq!(
+        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        "a 1-token request to Haiku reads usage",
+        "marked, probe on"
+    );
+    snap.usage_probe = false;
+    assert_eq!(
+        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        "usage goes unread; a probe is a 1-token request to Haiku",
+        "marked, probe off"
+    );
+    snap.no_five_hour_limit = false;
+
     snap.base_url = String::new();
     let empty = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
     assert_eq!(
@@ -217,6 +243,50 @@ fn setup_hints_follow_the_row_value() {
         set,
         "the API endpoint this account calls instead of claude.ai"
     );
+}
+
+/// The plan verdict the hints read comes from the unpicked OAuth store alone:
+/// a picked reading saying otherwise (a hybrid's provider side) moves nothing.
+#[test]
+fn the_no_five_hour_verdict_reads_the_oauth_store_not_the_picked_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::UsageInfo;
+
+    let name = ProfileName::from("acct");
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&name)],
+    });
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let readings = |oauth: bool, picked: bool| {
+        let mut r = ReadingsSnapshot::default();
+        let pick = |on: bool| {
+            if on {
+                marked.clone()
+            } else {
+                UsageInfo::default()
+            }
+        };
+        r.oauth.insert(name.to_string(), pick(oauth));
+        r.usage.insert(name.to_string(), pick(picked));
+        r
+    };
+    for (oauth, picked) in [(true, false), (false, true), (true, true), (false, false)] {
+        let snap = build_snap(&app, &readings(oauth, picked), true);
+        assert_eq!(snap.title, "acct", "the snap is the account's own");
+        assert_eq!(
+            snap.no_five_hour_limit, oauth,
+            "oauth marked {oauth}, picked marked {picked}"
+        );
+    }
 }
 
 /// Field rows whose labels self-describe carry no hint (a hint restating the
