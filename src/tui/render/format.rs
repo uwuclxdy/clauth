@@ -6,6 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
+pub(super) use crate::format::grapheme_cells;
 use crate::format::{account_tier, format_pct};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
@@ -16,18 +17,6 @@ pub(super) fn fixed(value: &str, width: usize) -> String {
     let (mut content, pad) = fixed_split(value, width);
     content.push_str(&pad);
     content
-}
-
-/// The rendered cell width of `value`: each grapheme's own width summed, the
-/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
-/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
-/// cell while the buffer draws it per grapheme as two, so that measure lets a
-/// value overrun its budget.
-pub(super) fn grapheme_cells(value: &str) -> usize {
-    Span::raw(value)
-        .styled_graphemes(Style::default())
-        .map(|g| Span::raw(g.symbol).width())
-        .sum()
 }
 
 /// Keep whole graphemes from `value`, front to back, while they fit `budget`

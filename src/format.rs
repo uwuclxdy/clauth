@@ -1,14 +1,19 @@
-//! Pure profile/usage → display-string formatters, plus the cross-surface
-//! diagnostic messages. No UI dependencies, so the TUI, the CLI subcommands
-//! (e.g. `clauth which`), and the headless daemon all share one spelling.
+//! Profile/usage → display-string formatters (pure but for
+//! [`credit_refused_label`]'s clock read), plus the cross-surface diagnostic
+//! messages, so the TUI, the CLI subcommands (e.g. `clauth which`), and the
+//! headless daemon all share one spelling. No entry emits a `Span`/`Style`;
+//! the one ratatui dependency is [`grapheme_cells`], which counts the cells a
+//! terminal draws so a CLI table pads by the same measure.
 //!
-//! Deliberately the ratatui-free tier only. Helpers that emit `Span`/`Style`
-//! live in `tui/render/format.rs`; single-screen or domain-local display glue
-//! stays with its owner. Folding those in would force ratatui into this shared
-//! module or mint one-caller abstractions, so the split stands over a single
-//! grab-bag `format.rs` (surveyed 2026-07-16).
+//! Helpers that emit `Span`/`Style` live in `tui/render/format.rs`, beside the
+//! theme they style with, so this tier never carries TUI styling;
+//! single-screen or domain-local display glue stays with its owner, since
+//! folding it in would mint one-caller abstractions. The split stands over a
+//! single grab-bag `format.rs` (surveyed 2026-07-16).
 
 use chrono::{DateTime, Datelike, Local, Timelike};
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
 use crate::profile::{Profile, ProfileName};
@@ -624,6 +629,18 @@ pub(crate) fn humanize_span(secs: u64) -> String {
         return "0s".to_string();
     }
     humanize_duration(secs as i64)
+}
+
+/// The rendered cell width of `value`: each grapheme's own width summed, the
+/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
+/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
+/// cell while the buffer draws it per grapheme as two, so that measure lets a
+/// value overrun its budget.
+pub(crate) fn grapheme_cells(value: &str) -> usize {
+    Span::raw(value)
+        .styled_graphemes(Style::default())
+        .map(|g| Span::raw(g.symbol).width())
+        .sum()
 }
 
 /// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).

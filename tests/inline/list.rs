@@ -112,6 +112,79 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     );
 }
 
+/// A server plan name in a wide script (`プロプラン`: five chars, ten cells,
+/// and it passes the plan-name rule) sizes and pads the PLAN column by the
+/// cells a terminal draws, so the columns after it stay aligned with the
+/// header and with an ASCII plan's row; a hand-edited wide profile name
+/// (`プロファイル`: six chars, twelve cells, wider than the header) sizes and
+/// pads the PROFILE column the same way.
+#[test]
+fn list_table_aligns_columns_after_a_wide_script_plan_name() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("home"), oauth("プロファイル")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("home", 41.5, 3.2);
+    warm_usage("プロファイル", 12.5, 2.2);
+    crate::testutil::register_names(&["work"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Max(Some(5)),
+                plan_display_name: Some("プロプラン".to_string()),
+                subscription_status: None,
+                codex_plan: None,
+                email: None,
+            }),
+            five_hour: Some(UsageWindow {
+                utilization: 42.4,
+                resets_at: None,
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 17.6,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..Default::default()
+        },
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    // PLAN is ten cells wide (the wide name), so `PLAN` and `Max` take six
+    // and seven cells of padding, and `プロプラン` none; PROFILE is twelve
+    // cells wide (the wide name), so `PROFILE` takes five, the ASCII names
+    // eight, and `プロファイル` none.
+    let header = format!(
+        "  PROFILE{}  PLAN{}  5H USED  7D USED  ENDPOINT",
+        " ".repeat(5),
+        " ".repeat(6)
+    );
+    let work = format!("* work{}  プロプラン    42.4%    17.6%  -", " ".repeat(8));
+    let home = format!(
+        "  home{}  Max{}    41.5%     3.2%  -",
+        " ".repeat(8),
+        " ".repeat(7)
+    );
+    let wide = format!("  プロファイル  Max{}    12.5%     2.2%  -", " ".repeat(7));
+    let mut lines: Vec<&str> = table.lines().collect();
+    lines[1..].sort_unstable();
+    let mut expected = vec![header.as_str(), home.as_str(), work.as_str(), wide.as_str()];
+    expected[1..].sort_unstable();
+    assert_eq!(lines, expected, "{table}");
+}
+
 #[test]
 fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     let _home = HomeSandbox::new();
