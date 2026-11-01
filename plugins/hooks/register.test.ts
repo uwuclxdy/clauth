@@ -234,7 +234,6 @@ const permissionRow = (line1: string) => ({
         { type: 'Button', props: { key: 'allow', label: 'Allow', hotkey: '1', plain: true }, press: { plugin: 'clauth', handle: expect.any(Number) } },
         { type: 'Text', children: ['   '] },
         { type: 'Button', props: { key: 'deny', label: 'Deny', hotkey: '2', plain: true }, press: { plugin: 'clauth', handle: expect.any(Number) } },
-        { type: 'Text', children: ['   Esc denies'] },
       ],
     },
   ],

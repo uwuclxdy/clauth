@@ -689,7 +689,6 @@ export const register: Register = on => {
               Button({ key: 'allow', plain: true, hotkey: '1', label: 'Allow', onPress: () => answerFromDesk($, row.ask, 'allow') }),
               Text({ children: '   ' }),
               Button({ key: 'deny', plain: true, hotkey: '2', label: 'Deny', onPress: () => answerFromDesk($, row.ask, 'deny') }),
-              Text({ children: '   Esc denies' }),
             ],
           })
         : Box({
