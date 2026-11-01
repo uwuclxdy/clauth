@@ -68,7 +68,7 @@ require("clauth").setup{
 
 ## Pane labels
 
-Each pane running Claude Code gets the account appended to its label: `claude · work`, `codex · codex` for a codex whose login clauth adopted, or `claude · main (global)` for a bare `claude` running on the global login. The pane's own label comes back when the agent exits, unless someone relabeled the pane meanwhile. Only a suffix naming a known clauth profile is ever taken for a tag, so a label such as `deploy · prod` is left alone. Rex has no custom sidebar field, so the label is where the account goes.
+Each pane running Claude Code gets the account appended to its label: `claude · work`, `codex · codex` for a codex started through clauth or on a login clauth adopted, or `claude · main (global)` for a bare `claude` running on the global login. The pane's own label comes back when the agent exits, unless someone relabeled the pane meanwhile. Only a suffix naming a known clauth profile is ever taken for a tag, so a label such as `deploy · prod` is left alone. Rex has no custom sidebar field, so the label is where the account goes.
 
 Rex runs event handlers only in `rex do` scripts, not in `init.lua`, so on every config load `init.lua` starts `start-watch.sh`, which runs one `rex do --all tag-watch.lua` per Rex server, pinned to that server's `--listen` socket (several Rex versions can run at once). The watcher hears `terminal.process_changed`, and for a foreground `claude`, `clauth` or `codex` runs `resolve-profile.sh`, which joins the pid against `~/.clauth/live_sessions/` the same way the herdr plugin's `report-profile.sh` does. A timer re-resolves tagged panes every 10 s, because a `--with-fallback` swap and a `clauth switch` fire no Rex event.
 

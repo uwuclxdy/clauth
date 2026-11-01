@@ -8,8 +8,8 @@ its Lua API can still change under this plugin. It does three things:
   with headroom and moves on as each account runs out. `clauth_claude_tab` opens a tab instead.
 - **Open the clauth dashboard** in a floating pane (`clauth_dashboard`). A second press closes it.
 - **Label each pane with the account it spends**: `claude · work`, `codex · codex` for a
-  codex whose login clauth adopted, or `claude · main (global)` for a bare `claude` running on
-  the global login.
+  codex started through clauth or on a login clauth adopted, or `claude · main (global)` for a
+  bare `claude` running on the global login.
 
 All three actions are in the command palette under "clauth".
 
