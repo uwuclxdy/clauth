@@ -1187,6 +1187,16 @@ mod adopt_live_rotation {
             .expect("stored access token")
     }
 
+    /// Pins the identity anchor in the cache so a fixture reaches the adopt's
+    /// later gates without depending on the process-global stored-token probe.
+    fn anchor_from_cache(name: &str) {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1",
+        );
+    }
+
     #[test]
     fn adopts_a_fresher_same_account_pair() {
         let _home = HomeSandbox::new();
@@ -1214,6 +1224,261 @@ mod adopt_live_rotation {
             .as_deref(),
             Some("uuid-1")
         );
+    }
+
+    /// Another process installs a login into the active profile's store while
+    /// the adopt waits on its identity probe (`clauth login <active>` takes the
+    /// state flock, never the rotation guard this leg holds). The installed
+    /// pair expires BEFORE the live mirror, so an expiry check alone still
+    /// reads the mirror as an advance: only noticing that the store moved
+    /// since this leg read it keeps the install.
+    #[test]
+    fn an_install_landing_during_the_identity_probe_survives_the_adopt() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-install-race";
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json");
+        let installed = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| {
+                if !installed.replace(true) {
+                    std::fs::write(
+                        &store,
+                        serde_json::to_vec(&creds_with(
+                            "at-installed",
+                            Some(stored_expiry + 1_800_000),
+                        ))
+                        .expect("serialize the installed pair"),
+                    )
+                    .expect("land the install");
+                }
+                Some("uuid-1".into())
+            },
+        );
+        assert!(installed.get(), "the identity probe never ran");
+        assert_eq!(adopted, None);
+        let on_disk: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&store).expect("read store");
+        assert_eq!(on_disk.refresh_token(), Some("at-installed-refresh"));
+    }
+
+    /// A peer removing the active profile's store during the identity probe
+    /// (`clauth login` clears, or an operator's delete) must not be answered
+    /// with the adopt recreating it: the leg's write would resurrect a store
+    /// another process just destroyed. Absent at both reads is the pair state
+    /// the comparison passes on, so the snapshot records absence as its own
+    /// answer.
+    #[test]
+    fn a_store_removed_during_the_probe_is_not_recreated_by_the_adopt() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-removed-store";
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json");
+        let removed = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| {
+                if !removed.replace(true) {
+                    std::fs::remove_file(&store).expect("remove the store");
+                }
+                Some("uuid-1".into())
+            },
+        );
+        assert!(removed.get(), "the identity probe never ran");
+        assert_eq!(adopted, None);
+        assert!(!store.exists(), "the adopt recreated a removed store");
+    }
+
+    /// A store unreadable at the snapshot — a disk or permission fault
+    /// landing before the next hot reload: a read this leg could not perform
+    /// is never the "absent" a later read matches, so the leg stands down
+    /// before any identity probe, writing nothing and spending nothing.
+    #[test]
+    fn an_unreadable_store_at_the_snapshot_is_not_written_over() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-unreadable-snapshot";
+        let pn = crate::profile::ProfileName::from(name);
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        let store = crate::profile::profile_dir(&pn)
+            .expect("profile dir")
+            .join("credentials.json");
+        std::fs::write(&store, b"{ not json").expect("corrupt the store");
+        let probed = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(&handle, &pn, &guard(name), &|_| {
+            probed.set(true);
+            Some("uuid-1".into())
+        });
+        assert_eq!(adopted, None);
+        assert!(
+            !probed.get(),
+            "the leg probed past a store it could not read"
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("read store"),
+            b"{ not json",
+            "the adopt wrote over a store it could not read"
+        );
+    }
+
+    /// The store matches memory when this leg snapshots it, then a writer this
+    /// leg never read leaves bytes at its path it cannot parse. The re-read
+    /// stands the adopt down instead of folding the failed read into
+    /// "unchanged": the write after it would replace that store.
+    #[test]
+    fn a_store_a_probe_makes_unreadable_is_not_written_over() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-unreadable-after-snapshot";
+        let pn = crate::profile::ProfileName::from(name);
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        anchor_from_cache(name);
+        let store = crate::profile::profile_dir(&pn)
+            .expect("profile dir")
+            .join("credentials.json");
+        let corrupted = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(&handle, &pn, &guard(name), &|_| {
+            if !corrupted.replace(true) {
+                std::fs::write(&store, b"{ not json").expect("corrupt the store");
+            }
+            Some("uuid-1".into())
+        });
+        assert!(corrupted.get(), "the identity probe never ran");
+        assert_eq!(adopted, None);
+        assert_eq!(
+            std::fs::read(&store).expect("read store"),
+            b"{ not json",
+            "the adopt wrote over a store it could not read"
+        );
+    }
+
+    /// A login installed into the store BEFORE this leg snapshotted it, while
+    /// memory still holds the pair it superseded: the live mirror is newer than
+    /// memory but not than the installed login, so judging the advance against
+    /// memory would overwrite the install.
+    #[test]
+    fn an_install_that_lands_before_the_snapshot_is_not_adopted_over() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-install-before-snapshot";
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json");
+        std::fs::write(
+            &store,
+            serde_json::to_vec(&creds_with("at-installed", Some(stored_expiry + 5_000_000)))
+                .expect("serialize the installed pair"),
+        )
+        .expect("land the install");
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
+        assert_eq!(adopted, None);
+        let on_disk: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&store).expect("read store");
+        assert_eq!(
+            on_disk.refresh_token(),
+            Some("at-installed-refresh"),
+            "the install landed before the leg read the store and must survive"
+        );
+    }
+
+    /// The store's only movement during the probe is its access token: same
+    /// refresh chain, same expiry. The pair comparison must notice the access
+    /// half too, since the login it overwrites would be one this leg never read.
+    #[test]
+    fn an_access_only_store_change_during_the_probe_stands_the_adopt_down() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-access-only-change";
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json");
+        let mut swapped = creds_with("at-other", Some(stored_expiry));
+        swapped
+            .claude_ai_oauth
+            .as_mut()
+            .expect("oauth block")
+            .refresh_token = Some("at-old-refresh".to_string());
+        let changed = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| {
+                if !changed.replace(true) {
+                    std::fs::write(
+                        &store,
+                        serde_json::to_vec(&swapped).expect("serialize the swapped pair"),
+                    )
+                    .expect("swap the access token");
+                }
+                Some("uuid-1".into())
+            },
+        );
+        assert!(changed.get(), "the identity probe never ran");
+        assert_eq!(adopted, None);
+        let on_disk: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&store).expect("read store");
+        assert_eq!(on_disk.access_token(), Some("at-other"));
+    }
+
+    /// The store's only movement during the probe is its refresh token: same
+    /// access token, same expiry, so only the refresh half of the comparison
+    /// can refuse the adopt. The login it would overwrite is a chain this leg
+    /// never read.
+    #[test]
+    fn a_refresh_only_store_change_during_the_probe_stands_the_adopt_down() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refresh-only-change";
+        let stored_expiry = future_expiry();
+        let handle = setup(name, stored_expiry, stored_expiry + 3_600_000);
+        anchor_from_cache(name);
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir")
+            .join("credentials.json");
+        let mut swapped = creds_with("at-old", Some(stored_expiry));
+        swapped
+            .claude_ai_oauth
+            .as_mut()
+            .expect("oauth block")
+            .refresh_token = Some("at-rotated-refresh".to_string());
+        let changed = std::cell::Cell::new(false);
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| {
+                if !changed.replace(true) {
+                    std::fs::write(
+                        &store,
+                        serde_json::to_vec(&swapped).expect("serialize the swapped pair"),
+                    )
+                    .expect("swap the refresh token");
+                }
+                Some("uuid-1".into())
+            },
+        );
+        assert!(changed.get(), "the identity probe never ran");
+        assert_eq!(adopted, None);
+        let on_disk: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&store).expect("read store");
+        assert_eq!(on_disk.refresh_token(), Some("at-rotated-refresh"));
     }
 
     #[test]
@@ -1259,24 +1524,19 @@ mod adopt_live_rotation {
         assert_eq!(stored_access(&handle, name), "at-old");
     }
 
-    /// Memory holds P1, the live slot a later-expiring P2 whose refresh token
-    /// the record names spent (fp("at-mirror-refresh"), hand-computed: the
-    /// first 8 bytes of its SHA-256, hex), and the store the landed P3. The
-    /// adopt refuses: a spent live pair never rewinds the store.
+    /// The store and memory agree at the snapshot, so only the spent-record
+    /// gate can refuse this live pair: its refresh token is recorded spent, and
+    /// a pair the server consumed never rewinds the store.
     #[test]
-    fn refuses_a_live_pair_whose_refresh_token_is_spent() {
+    fn refuses_a_spent_live_pair_when_the_store_is_in_step_with_memory() {
         let _home = HomeSandbox::new();
-        let name = "adopt-spent-live";
+        let name = "adopt-spent-live-in-step";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
             .expect("profile dir");
-        std::fs::write(
-            dir.join("credentials.json"),
-            serde_json::to_vec(&creds_with("at-p3", Some(future_expiry() + 7_200_000)))
-                .expect("serialize P3"),
-        )
-        .expect("land P3");
-        std::fs::write(dir.join("auth.spent.json"), r#"["141ccd5b485cec0b"]"#).expect("record P2");
+        // fp("at-mirror-refresh"): the first 8 bytes of its SHA-256, hex.
+        std::fs::write(dir.join("auth.spent.json"), r#"["141ccd5b485cec0b"]"#)
+            .expect("record the live token spent");
 
         let adopted = try_adopt_live_rotation(
             &handle,
@@ -1286,9 +1546,7 @@ mod adopt_live_rotation {
         );
 
         assert_eq!(adopted, None);
-        let store: crate::profile::ClaudeCredentials =
-            crate::profile::read_json_file(&dir.join("credentials.json")).expect("read store");
-        assert_eq!(store.refresh_token(), Some("at-p3-refresh"));
+        assert_eq!(stored_access(&handle, name), "at-old");
     }
 
     /// The live mirror is a later-expiring login of the same account that

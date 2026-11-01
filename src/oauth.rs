@@ -2866,16 +2866,39 @@ pub(crate) fn try_adopt_live_rotation(
     }
 
     // Snapshot the store side under the config lock, then drop it — the
-    // identity fetches below are HTTP and must never hold the mutex.
-    let (stored_access, stored_expires) = {
+    // identity fetches below are HTTP and must never hold the mutex. The
+    // committed store is snapshotted beside the memory pair because the probe
+    // is an unlocked window a flock-only writer — a peer install, a log-out,
+    // the legacy `.pending` land, never a rotation (which takes this leg's
+    // rotation guard) — can move the store in; a fresh read inside the flock
+    // hold below compares against it.
+    let (stored_access, stored_expires, store_snapshot) = {
         let Ok(cfg) = config.lock() else { return None };
         if !cfg.is_active(name) {
             return None;
         }
         let p = cfg.find(name)?;
+        // The expiry gate below weighs the live mirror against memory, and
+        // memory is a fair yardstick only while the store carries that same
+        // login pair: a store this leg cannot read, or one whose pair differs
+        // from memory's, is one that gate cannot judge against memory, so the
+        // leg stands down. Such a store is one this leg cannot vouch for: a
+        // peer's landing this process has not loaded, a log-out (the Setup
+        // tab's OAuth log-out deletes `credentials.json` and deactivates the
+        // profile on disk, while a long-lived process's memory can still read
+        // it active), the base under a staged rotation already loaded into
+        // memory and not yet landed by the next tick's catch-up, or a file it
+        // cannot read at all. An adopt would write over any of them.
+        let Ok(store_snapshot) = committed_store_pair(name) else {
+            return None;
+        };
+        if store_snapshot != p.credentials.as_ref().map(login_pair) {
+            return None;
+        }
         (
             p.access_token().map(str::to_string),
             p.access_token_expires_at(),
+            store_snapshot,
         )
     };
 
@@ -2904,10 +2927,9 @@ pub(crate) fn try_adopt_live_rotation(
     if live_expires <= stored_expires {
         return None;
     }
-    // Expiry is compared against memory, which can lag a store another process
-    // landed since: a live pair the server already consumed (or one the record
-    // cannot vouch for) is a rewind of that store, never an advance. The
-    // predicate the watchdog's copy-back gates use.
+    // A live pair the server already consumed (or one the record cannot vouch
+    // for) is never an advance, whatever its expiry says. The predicate the
+    // watchdog's copy-back gates use.
     if SpentRecord::read(name).spent(live_refresh) != Some(false) {
         return None;
     }
@@ -2996,6 +3018,16 @@ pub(crate) fn try_adopt_live_rotation(
         {
             return Ok(false);
         }
+        // A store that moved during the unlocked identity-probe window is a
+        // login this leg never read, so writing the live pair over it would
+        // replace whatever landed there. This leg writes nothing: a store
+        // replaced with a new chain is carried by the caller's carry leg with
+        // no token request, and a deleted one stays deleted — a log-out stays a
+        // log-out — the caller's refresh leg spending the old token once and
+        // ending that profile's polling until a login.
+        if committed_store_pair(name)? != store_snapshot {
+            return Ok(false);
+        }
         // The login alone: the adopt changes nothing in `config.toml`, and a
         // whole-profile save from this long-lived config would revert another
         // process's settings edit. Memory follows only a write that landed: a
@@ -3059,6 +3091,30 @@ pub(crate) fn try_adopt_live_rotation(
         live_oauth.access_token.clone(),
         live_oauth.refresh_token.clone(),
     ))
+}
+
+/// One reading of a login pair, the mapper both sides of the adopt's store
+/// comparison go through: the committed store on disk and the in-memory
+/// profile are compared by the same pair, so the two sides cannot drift apart
+/// in what they compare.
+fn login_pair(creds: &ClaudeCredentials) -> (Option<String>, Option<String>) {
+    (
+        creds.access_token().map(str::to_string),
+        creds.refresh_token().map(str::to_string),
+    )
+}
+
+/// The profile's committed store, as the adopt judges it: `Ok(Some)` its
+/// parsed login pair, `Ok(None)` the store absent, `Err` a store that cannot
+/// be read at all. [`read_raw_store`] reads exactly the file
+/// [`crate::profile::write_profile_credentials`] writes, so the pair a caller
+/// compares is the pair a write would replace. The `Err` must never read as
+/// "unchanged": a store this leg cannot see is a store it must not overwrite,
+/// so every caller stands the adopt down on it.
+fn committed_store_pair(
+    name: &ProfileName,
+) -> anyhow::Result<Option<(Option<String>, Option<String>)>> {
+    Ok(read_raw_store(name)?.as_ref().map(login_pair))
 }
 
 /// Whether the live `.credentials.json` holds a login clauth does NOT own —
