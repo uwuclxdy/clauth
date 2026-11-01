@@ -1779,6 +1779,10 @@ struct Daemon {
     /// changes at the midnight rollover and on a config edit, and is
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
+    /// The kind of the last background-hold strip-list read that failed and
+    /// was logged, `None` once one reads: the read runs every tick, so a
+    /// failure logs once per kind rather than once per tick.
+    strip_list_failure: Option<String>,
     /// The headless bell's latch over the published `profiles[]` figures.
     bells: crate::bell::BellLatch,
     /// The push sender's inbox, while the REST API serves; `None` otherwise.
@@ -1868,6 +1872,7 @@ impl Daemon {
             switch_backoff: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            strip_list_failure: None,
             credit_capped: HashSet::new(),
             credit_refusals: crate::profile_cache::CreditRefusalWatch::default(),
             dead_login_stats: crate::usage::DeadLoginStats::new(),

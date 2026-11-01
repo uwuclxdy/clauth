@@ -183,8 +183,8 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     // The union must cover every profile the MEMBER SET can contain, and the
     // members (`known_paths` → `shared_runtime_dirs`) are DIRECTORY-derived —
     // so the union walks the same directory listing. A roster-driven union
-    // would let an off-roster dir (the partial-save drift
-    // `sync_state_profiles` exists to repair) keep merging its runtime
+    // would let an off-roster dir (a profile dir written but its roster entry
+    // never saved) keep merging its runtime
     // settings while its `[env]` keys read as shared: the exact leak this fn
     // fails closed against. What the codex split changes is only WHOSE dirs
     // belong to this subsystem: a dir the codex roster claims is skipped — it

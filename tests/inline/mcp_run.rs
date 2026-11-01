@@ -13303,3 +13303,204 @@ fn an_isolated_run_splits_its_receipt_after_the_rescue() {
          permission denials: Grep"
     );
 }
+
+// ── the delegate strip lists read the account a peer's switch made active ──
+
+/// The capped target's refusal of a run naming no model: what its demand
+/// reads once the env a peer's switch stamped live is stripped.
+const REFUSES_NO_MODEL: &str = "credit cap spent: capped names no model to run, and its default \
+    may bill usage credits; name another account or a model";
+
+/// `work` active and linked beside the capped target, and `peer`, whose
+/// `[env]` routes Claude Code to fable.
+fn seed_work_and_a_fable_routing_peer() {
+    let pair = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut work = crate::profile::Profile::new("work".to_string(), None, None);
+    work.credentials = Some(pair("work"));
+    let mut peer = crate::profile::Profile::new("peer".to_string(), None, None);
+    peer.credentials = Some(pair("peer"));
+    peer.env
+        .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+    crate::profile::save_profile(&work).expect("save work");
+    crate::profile::save_profile(&peer).expect("save peer");
+    crate::testutil::register_names(&["work", "peer"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("work active");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("work")).expect("link work");
+}
+
+/// Arm a peer's switch to `peer` right after the next delegate config load:
+/// the delegate's copy names `work`, while the live settings carry `peer`'s
+/// fable routing.
+fn peer_switch_after_the_next_config_load(home: &HomeSandbox) {
+    after_next_delegate_config_load(home, || {
+        let mut peer = crate::profile::load_config().expect("peer read");
+        assert!(
+            crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("peer"))
+                .expect("peer switch"),
+            "fixture: the peer switched"
+        );
+    });
+}
+
+/// The hook ran: disk names `peer` and the live settings carry its routing.
+fn assert_the_peer_switched() {
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(ProfileName::from("peer")),
+        "fixture: the peer's switch landed"
+    );
+    assert!(
+        crate::claude::claude_settings_env_keys()
+            .expect("live settings")
+            .contains(&"ANTHROPIC_MODEL".to_string()),
+        "fixture: the peer's switch stamped its routing live"
+    );
+}
+
+/// `delegate` through the tool handler at depth 0, `cwd` pointing at nothing
+/// so an admitted run stops at the cwd gate before any spawn.
+fn delegate_through_the_handler(
+    home: &HomeSandbox,
+    profiles: &[&str],
+    background: bool,
+) -> CallToolResult {
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by the caller's `HomeSandbox` lock, and
+    // the prior value is restored below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt.block_on(
+        server.delegate_with(
+            DelegateArgs {
+                profiles: Some(profiles.iter().map(|p| (*p).to_string()).collect()),
+                prompt: Some("hello".to_string()),
+                model: None,
+                cwd: Some(
+                    home.home()
+                        .join("does-not-exist")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                env: None,
+                args: None,
+                session_id: None,
+                subagent_type: None,
+                allowed_tools: None,
+                permission_mode: None,
+                result: None,
+                isolated: None,
+                background: Some(background),
+            },
+            ProgressSink::none(),
+        ),
+    );
+    // SAFETY: same as above — restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+    result.expect("delegate returns a tool result, never a transport error")
+}
+
+/// The refusal the handler returns for `reason`.
+fn handler_refusal_text(reason: &str) -> String {
+    render::delegate_refusal_prose(&serde_json::json!({ "is_error": true, "result": reason }))
+}
+
+fn result_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("payload text")
+}
+
+/// A peer's switch between `run_delegate`'s config read and its strip list:
+/// the strip list reads the account disk names active, so the fable routing
+/// its switch stamped live never becomes the capped target's demand.
+#[test]
+fn a_delegate_strips_the_routing_a_peer_switch_stamped_after_its_config_read() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+    seed_work_and_a_fable_routing_peer();
+    peer_switch_after_the_next_config_load(&home);
+    let err = delegate_to_capped(None, &cwd).expect_err("the capped target refuses");
+    assert_the_peer_switched();
+    assert_eq!(err, REFUSES_NO_MODEL);
+}
+
+/// `work` credit-capped with no default model like `capped`, so a fan-out
+/// member the pre-flight admits still refuses before any spawn.
+fn cap_the_work_member() {
+    let work = ProfileName::from("work");
+    crate::profile::update_profile_config(&work, |p| {
+        p.check_credit_cap = true;
+        p.models.default = None;
+        Ok(())
+    })
+    .expect("cap work")
+    .expect("work on the roster");
+    let usage = crate::usage::UsageInfo {
+        spend: Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    assert!(usage.credit_capped(), "fixture control: work reads capped");
+    crate::profile_cache::write_profile_cache(
+        &work,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+/// The fan-out pre-flight's twin: one strip list for every member, read off
+/// the account disk names active after the handler's config read.
+#[test]
+fn a_fanout_preflight_strips_the_routing_a_peer_switch_stamped_after_its_config_read() {
+    let home = HomeSandbox::new();
+    let _cwd = seed_credit_spend_target(&home, None, true, true);
+    seed_work_and_a_fable_routing_peer();
+    cap_the_work_member();
+    peer_switch_after_the_next_config_load(&home);
+    let result = delegate_through_the_handler(&home, &["capped", "work"], false);
+    assert_the_peer_switched();
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(result_text(&result), handler_refusal_text(REFUSES_NO_MODEL));
+}
+
+/// The single background target's pre-flight twin.
+#[test]
+fn a_background_preflight_strips_the_routing_a_peer_switch_stamped_after_its_config_read() {
+    let home = HomeSandbox::new();
+    let _cwd = seed_credit_spend_target(&home, None, true, true);
+    seed_work_and_a_fable_routing_peer();
+    peer_switch_after_the_next_config_load(&home);
+    let result = delegate_through_the_handler(&home, &["capped"], true);
+    assert_the_peer_switched();
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(result_text(&result), handler_refusal_text(REFUSES_NO_MODEL));
+}

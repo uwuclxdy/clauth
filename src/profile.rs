@@ -1159,6 +1159,42 @@ impl AppState {
         }
     }
 
+    /// Drop `name` from every name list and clear the active marker when it
+    /// named `name`. State-only mirror of [`AppConfig::remove`] so a caller can
+    /// apply the delete onto a freshly read state rather than its stale copy.
+    pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
+        self.profiles.retain(|n| n != name);
+        self.fallback_chain.retain(|n| n != name);
+        self.auth_broken.retain(|n| n != name);
+        if self.active_profile.as_ref() == Some(name) {
+            self.set_active(None, held);
+        }
+    }
+
+    /// Replace `old` with `new` in every name list and the active marker.
+    /// State-only mirror of [`AppConfig::rename_all_occurrences`] so a caller
+    /// can apply the rename onto a freshly read state rather than its stale
+    /// copy.
+    pub(crate) fn rename_all_occurrences(
+        &mut self,
+        old: &ProfileName,
+        new: &ProfileName,
+        held: &StateLockHeld,
+    ) {
+        if let Some(slot) = self.profiles.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.fallback_chain.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.auth_broken.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if self.active_profile.as_ref() == Some(old) {
+            self.set_active(Some(new.clone()), held);
+        }
+    }
+
     /// The effective reset-countdown shape (unset = the stock relative form).
     pub(crate) fn reset_display(&self) -> ResetDisplay {
         self.reset_display.unwrap_or_default()
@@ -1577,8 +1613,8 @@ impl AppConfig {
     }
 
     /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
-    /// actually changed, so the caller can skip a redundant `save_app_state`.
-    /// Pure in-memory mutation — the caller persists via `save_app_state`.
+    /// actually changed. Pure in-memory mutation — the caller persists via
+    /// `set_auth_broken_persisted`.
     pub(crate) fn set_auth_broken(&mut self, name: &ProfileName, broken: bool) -> bool {
         self.state.set_auth_broken(name, broken)
     }
@@ -1618,17 +1654,7 @@ impl AppConfig {
 
     pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
         self.profiles.retain(|p| p.name != *name);
-        self.state.profiles.retain(|n| n != name);
-        self.state.fallback_chain.retain(|n| n != name);
-        self.state.auth_broken.retain(|n| n != name);
-        if self.is_active(name) {
-            self.state.set_active(None, held);
-        }
-    }
-
-    /// Resync `state.profiles` from in-memory list to fix length drift from partial saves.
-    pub(crate) fn sync_state_profiles(&mut self) {
-        self.state.profiles = self.profiles.iter().map(|p| p.name.clone()).collect();
+        self.state.remove(name, held);
     }
 
     /// Replace `old` with `new` in every name list and the active marker.
@@ -1641,18 +1667,7 @@ impl AppConfig {
         if let Some(profile) = self.find_mut(old) {
             profile.name = new.clone();
         }
-        if let Some(slot) = self.state.profiles.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if self.is_active(old) {
-            self.state.set_active(Some(new.clone()), held);
-        }
+        self.state.rename_all_occurrences(old, new, held);
     }
 }
 
@@ -2926,6 +2941,83 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     Ok(state)
 }
 
+/// The fresh-read proof for [`save_app_state`]. Sealed inside this module: only
+/// [`FreshState`] (and, in test builds, an [`AppState`] a fixture authored) can
+/// be handed to a save. The proof says the value came from a load inside a
+/// flock hold, not what it holds: a caller can still overwrite it through
+/// [`DerefMut`](std::ops::DerefMut).
+mod fresh {
+    pub(crate) trait Sealed {}
+}
+
+/// What [`save_app_state`] accepts. Closed by the private [`fresh::Sealed`]
+/// supertrait, so no caller outside this module can implement it for a stale
+/// snapshot of its own.
+pub(crate) trait SaveState: fresh::Sealed {
+    fn app_state(&self) -> &AppState;
+}
+
+/// An [`AppState`] read fresh from `profiles.toml` inside a state flock hold,
+/// carrying the proof that [`save_app_state`] requires. [`Deref`]/[`DerefMut`]
+/// keep field and method access the same as a bare [`AppState`], so a caller
+/// can still overwrite the fresh value through [`DerefMut`].
+///
+/// It borrows the hold it was read under, so it cannot outlive that hold's
+/// closure: a read in one hold saved after it, across a slow step, does not
+/// compile (`with_state_lock(|h| load_fresh_state(h))` fails with "lifetime
+/// may not live long enough", measured 2026-10-29). No test pins that, since a
+/// compile failure cannot run in this suite.
+pub(crate) struct FreshState<'h> {
+    state: AppState,
+    _hold: std::marker::PhantomData<&'h StateLockHeld>,
+}
+
+impl fresh::Sealed for FreshState<'_> {}
+impl SaveState for FreshState<'_> {
+    fn app_state(&self) -> &AppState {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+impl fresh::Sealed for AppState {}
+#[cfg(test)]
+impl SaveState for AppState {
+    fn app_state(&self) -> &AppState {
+        self
+    }
+}
+
+impl FreshState<'_> {
+    pub(crate) fn into_inner(self) -> AppState {
+        self.state
+    }
+}
+
+impl std::ops::Deref for FreshState<'_> {
+    type Target = AppState;
+    fn deref(&self) -> &AppState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for FreshState<'_> {
+    fn deref_mut(&mut self) -> &mut AppState {
+        &mut self.state
+    }
+}
+
+/// Read `profiles.toml` fresh inside the caller's state flock hold, returning
+/// the value with the proof [`save_app_state`] requires. The proof says the
+/// value came from a load inside this hold, and lives no longer than it; a
+/// caller can still overwrite it through [`DerefMut`].
+pub(crate) fn load_fresh_state<'h>(_held: &'h StateLockHeld) -> Result<FreshState<'h>> {
+    Ok(FreshState {
+        state: load_app_state()?,
+        _hold: std::marker::PhantomData,
+    })
+}
+
 /// Test seam: [`save_app_state`] writes fail the way the read-only `~/.clauth`
 /// leg would (`atomic_write_600`'s temp create refuses), so a test can land the
 /// profile save and fail only the state write. Armed through the RAII
@@ -2959,13 +3051,43 @@ impl Drop for FailAppStateSave<'_> {
     }
 }
 
-pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
+/// Test seam: [`update_profile_config`]'s next write fails the way a read-only
+/// profile dir would, after its fresh read landed, so a test can fail the save
+/// alone. Armed through [`FailProfileConfigSave`], [`FailAppStateSave`]'s twin.
+#[cfg(test)]
+static FAIL_PROFILE_CONFIG_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`update_profile_config`] write failure for the
+/// guard's lifetime, borrowing the home sandbox as [`FailAppStateSave`] does.
+#[cfg(test)]
+pub(crate) struct FailProfileConfigSave<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailProfileConfigSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_PROFILE_CONFIG_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailProfileConfigSave<'_> {
+    fn drop(&mut self) {
+        FAIL_PROFILE_CONFIG_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
     #[cfg(test)]
     if FAIL_APP_STATE_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow::anyhow!(
             "failed to write profiles.toml: Permission denied (os error 13)"
         ));
     }
+    let state = state.app_state();
     with_state_lock(|_held| {
         mkdir_700(&clauth_dir()?)?;
         let path = app_state_path()?;
@@ -3518,8 +3640,8 @@ fn is_bare_key(segment: &str) -> bool {
 /// profile that is still present from one deleted and re-logged-in under the
 /// same name.
 pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Result<bool> {
-    with_state_lock(|_held| {
-        let mut state = load_app_state()?;
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
         if broken && !state.profiles.iter().any(|n| n == name) {
             return Ok(false);
         }
@@ -3528,6 +3650,22 @@ pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Res
         }
         save_app_state(&state)?;
         Ok(true)
+    })
+}
+
+/// Fresh read-modify-write of `profiles.toml` under the state flock: load the
+/// current state, apply `f` with the flock witness, save, and return the saved
+/// state. A closure that changes nothing writes nothing, so a no-op never
+/// re-renders a hand-edited file or moves every peer's reload fingerprint.
+pub(crate) fn update_app_state(f: impl FnOnce(&mut AppState, &StateLockHeld)) -> Result<AppState> {
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
+        let before = toml::to_string_pretty(&*state).context("failed to render profiles.toml")?;
+        f(&mut state, held);
+        if toml::to_string_pretty(&*state).context("failed to render profiles.toml")? != before {
+            save_app_state(&state)?;
+        }
+        Ok(state.into_inner())
     })
 }
 
@@ -4378,6 +4516,17 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     };
     if needs_rewrite {
         let _ = with_state_lock(|_held| {
+            // The render came from a read taken before this hold: write it only
+            // while the file still holds what that read saw, so a peer's write
+            // landed in between is never rewound. The next load renders it.
+            let now = match std::fs::read_to_string(config_path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(_) => return Ok(()),
+            };
+            if now != raw_config {
+                return Ok(());
+            }
             // Read under the hold: a claim may have minted one since the load.
             let id = profile_id_at(config_path);
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
@@ -4552,17 +4701,69 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
     })
 }
 
-/// The whole-profile save: the credential store, then `config.toml`. Only a
-/// caller that sets or blanks the login (an install, a capture, an adopt, a
-/// clear) saves through here; a settings edit saves [`save_profile_config`],
-/// because an in-memory pair can lag a rotation another process landed and
-/// writing it back rewinds the store to a spent token.
+/// The whole-profile save: the credential store, then `config.toml`, both from
+/// `profile` as given. A test fixture's write: outside tests a login install,
+/// adopt or clear saves through [`update_profile`] and a settings edit through
+/// [`update_profile_config`], so no caller can persist a profile it read before
+/// a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     save_profile_with_id(profile, None)
 }
 
-/// [`save_profile`] for a create: the new account gets a fresh [`ProfileId`],
-/// whatever a leftover directory under its name still holds.
+/// Fresh read-modify-write of one profile's credential store and `config.toml`
+/// under the state flock: `None` (nothing read, nothing written) when the
+/// roster on disk no longer holds `name`; else `f` edits the profile re-read
+/// off disk, which is then saved whole, the credential store before
+/// `config.toml`, and comes back with `f`'s value.
+/// So a login install, adopt or clear changes only the fields `f` sets, and
+/// the caller mirrors those into memory once this returns.
+pub(crate) fn update_profile<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let out = f(&mut fresh)?;
+        save_profile_with_id(&fresh, None)?;
+        Ok(Some((fresh, out)))
+    })
+}
+
+/// [`update_profile`] for a capture that sets the stored login alone, coming
+/// back with the login it stored (`None` when the roster on disk no longer
+/// holds `name`). A `config.toml` that does not parse is left as it is and the
+/// credential store is still written: a hand-edit typo in the outgoing account
+/// must not block every switch away from it, while a failed store write still
+/// fails the capture.
+pub(crate) fn update_profile_login(
+    name: &ProfileName,
+    credentials: ClaudeCredentials,
+    held: &StateLockHeld,
+) -> Result<Option<ClaudeCredentials>> {
+    if !is_configured(name)? {
+        return Ok(None);
+    }
+    // A parse failure carries no `io::Error` (`read_profile_source`'s split);
+    // a read failure does, and fails below as `update_profile` would.
+    if let Err(e) = read_profile_config_source(name)
+        && e.downcast_ref::<std::io::Error>().is_none()
+    {
+        write_profile_credentials(name, Some(&credentials), held)?;
+        return Ok(Some(credentials));
+    }
+    Ok(update_profile(name, |fresh| {
+        fresh.set_credentials(Some(credentials), held);
+        Ok(())
+    })?
+    .and_then(|(fresh, ())| fresh.credentials.into_inner()))
+}
+
+/// The whole-profile save for a create: the new account gets a fresh
+/// [`ProfileId`], whatever a leftover directory under its name still holds.
 pub(crate) fn save_new_profile(profile: &Profile) -> Result<()> {
     save_profile_with_id(profile, Some(ProfileId::mint()?))
 }
@@ -4581,10 +4782,49 @@ fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<(
 }
 
 /// The config leg of [`save_profile`] alone: `config.toml`, never the store.
+/// A test fixture's whole-profile write: outside tests the one `config.toml`
+/// settings writer is [`update_profile_config`], so no caller can persist a
+/// profile it read before a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     with_state_lock(|_held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
         write_profile_config(profile)
+    })
+}
+
+/// Fresh read-modify-write of one profile's `config.toml` under the state
+/// flock: `None` (nothing read, nothing created) when the roster on disk no
+/// longer holds `name`; else `f` edits the profile re-read off disk, which is
+/// saved unless `f` errs or changed nothing a `config.toml` on disk holds, and
+/// comes back with `f`'s value.
+/// So a settings edit changes only its own fields, never rewinding a peer's
+/// edit to another one or recreating a peer-deleted account's directory; the
+/// caller mirrors its fields into memory once this returns.
+pub(crate) fn update_profile_config<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let before = profile_config_path(name)?
+            .exists()
+            .then(|| render_config_toml(&fresh));
+        let out = f(&mut fresh)?;
+        if before.as_deref() != Some(render_config_toml(&fresh).as_str()) {
+            #[cfg(test)]
+            if FAIL_PROFILE_CONFIG_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow::anyhow!(
+                    "failed to write config.toml: Permission denied (os error 13)"
+                ));
+            }
+            mkdir_700(&profile_dir(name)?)?;
+            write_profile_config(&fresh)?;
+        }
+        Ok(Some((fresh, out)))
     })
 }
 
@@ -4623,18 +4863,119 @@ fn with_profile_id(rendered: String, id: Option<&ProfileId>) -> String {
     rendered.replacen("\n\n", &line, 1)
 }
 
+/// A login write refused because another roster profile's `credentials.json`
+/// already holds its refresh token: a single-use chain lives in one store, or
+/// the first refresh through either store kills the other.
+#[derive(Debug)]
+pub(crate) struct ChainHeldElsewhere {
+    pub(crate) owner: ProfileName,
+}
+
+impl std::fmt::Display for ChainHeldElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this login is already saved in '{}'", self.owner)
+    }
+}
+
+impl std::error::Error for ChainHeldElsewhere {}
+
+impl ChainHeldElsewhere {
+    /// The refusal anywhere in `e`'s chain.
+    pub(crate) fn find(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+/// Refuse writing `credentials` into `store` while another roster profile's
+/// `credentials.json` holds its refresh token. A login with no refresh token
+/// passes, and so does a store that already holds this chain: rewriting it
+/// (a re-capture, a tier stamp) puts it in no store it was not in. A store
+/// that does not read or parse holds no chain this can see. The caller holds
+/// the state flock, so the roster and the stores read here are the ones the
+/// write lands beside.
+pub(crate) fn refuse_chain_held_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    match chain_holder_elsewhere(store, credentials)? {
+        Some(owner) => Err(ChainHeldElsewhere { owner }.into()),
+        None => Ok(()),
+    }
+}
+
+/// The roster profile other than `store`'s whose `credentials.json` holds
+/// `credentials`' refresh token, on [`refuse_chain_held_elsewhere`]'s rules.
+/// Every store of `store`'s own profile (its `credentials.json` and its
+/// `session-token.json` sidecar share one dir) is that profile's, never
+/// another's. Reads only, so a caller without the state flock gets a
+/// best-effort answer a peer's write can move.
+pub(crate) fn chain_holder_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+) -> Result<Option<ProfileName>> {
+    let Some(refresh) = credentials.refresh_token().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let holds = |path: &Path| {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok())
+            .is_some_and(|stored| stored.refresh_token() == Some(refresh))
+    };
+    if holds(store) {
+        return Ok(None);
+    }
+    // A caller can hand the store in its resolved spelling (a session tree's
+    // link target), so the dirs compare by identity as well as by spelling.
+    let own_dir = store.parent();
+    let own_identity = own_dir.and_then(|dir| crate::canonical::identity(dir).ok());
+    let is_own = |path: &Path| {
+        let dir = path.parent();
+        dir == own_dir
+            || own_identity.is_some()
+                && dir.and_then(|d| crate::canonical::identity(d).ok()) == own_identity
+    };
+    for name in load_app_state()?.profiles {
+        let path = profile_credentials_path(&name)?;
+        if !is_own(&path) && holds(&path) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// [`refuse_chain_held_elsewhere`] for `name`'s `credentials.json`, asked by a
+/// writer before the first write it makes ahead of the store write (a
+/// forget, a seed, a detach), so the refusal leaves everything as it was.
+pub(crate) fn refuse_login_held_elsewhere(
+    name: &ProfileName,
+    credentials: Option<&ClaudeCredentials>,
+    held: &StateLockHeld,
+) -> Result<()> {
+    match credentials {
+        Some(credentials) => {
+            refuse_chain_held_elsewhere(&profile_credentials_path(name)?, credentials, held)
+        }
+        None => Ok(()),
+    }
+}
+
 /// The credential leg every store writer shares: `Some` writes the login
 /// through the preserving serializer, so `mcpOAuth` and every other top-level
 /// block the store holds survive, and restores whatever MCP logins the profile
-/// parked; `None` parks those logins and removes the store.
+/// parked; `None` parks those logins and removes the store. A login whose
+/// chain another profile's store holds is refused before anything is written
+/// ([`refuse_chain_held_elsewhere`]).
 pub(crate) fn write_profile_credentials(
     name: &ProfileName,
     credentials: Option<&ClaudeCredentials>,
-    _held: &StateLockHeld,
+    held: &StateLockHeld,
 ) -> Result<()> {
     let cred_path = profile_credentials_path(name)?;
     match credentials {
         Some(creds) => {
+            refuse_chain_held_elsewhere(&cred_path, creds, held)?;
             let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
             atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
             // This profile has a store again, so whatever it parked when it

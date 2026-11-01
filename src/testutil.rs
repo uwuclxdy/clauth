@@ -931,14 +931,18 @@ pub(crate) fn rotation_fixture_config(
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    crate::profile::save_profile(&profile).expect("save profile");
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
-        profiles: vec![profile],
+        profiles: vec![],
     };
     config.state.profiles.push(name.clone());
     config.state.active_profile = Some(name.clone());
+    // The roster first: it names this profile alone, so an earlier fixture's
+    // profile in the same sandbox holds no store this one's chain is checked
+    // against.
     crate::profile::save_app_state(&config.state).expect("save app state");
+    crate::profile::save_profile(&profile).expect("save profile");
+    config.profiles.push(profile);
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
 
@@ -2176,6 +2180,17 @@ pub(crate) fn register_names(names: &[&str]) {
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
+/// Hold `profiles` the way a loaded config does: each one's files on disk and
+/// its name on the roster, so a settings writer re-reading the account off
+/// disk finds what the in-memory fixture holds.
+pub(crate) fn persist_profiles(profiles: &[crate::profile::Profile]) {
+    for profile in profiles {
+        crate::profile::save_profile(profile).expect("save the fixture profile");
+    }
+    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+    register_names(&names);
+}
+
 /// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
 pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
     let path = crate::profile::claude_dir()
@@ -2183,6 +2198,40 @@ pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
         .join(".credentials.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
     std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
+}
+
+/// A test-only seam a race test plants: a closure the switch entry points run
+/// between their gate decision and the state hold, posing a peer write. The
+/// closure runs once and is cleared, so the next switch on the thread is clean.
+pub(crate) mod switch_race_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PLANTED: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Plant the peer write to run at the next seam point. One at a time.
+    pub(crate) fn plant(f: impl FnOnce() + 'static) {
+        PLANTED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "a seam closure is already planted");
+            *slot = Some(Box::new(f));
+        });
+    }
+
+    /// Run (and clear) the planted closure, if any.
+    pub(crate) fn run() {
+        PLANTED.with(|slot| {
+            if let Some(f) = slot.borrow_mut().take() {
+                f();
+            }
+        });
+    }
+
+    /// Test hygiene: nothing left planted after a run.
+    pub(crate) fn assert_empty() {
+        PLANTED.with(|slot| assert!(slot.borrow().is_none(), "seam closure left planted"));
+    }
 }
 
 // ── provider-cache fixtures ──────────────────────────────────────────────────

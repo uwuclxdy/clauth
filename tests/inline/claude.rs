@@ -1,5 +1,5 @@
 use super::*;
-use crate::profile::{ClaudeCredentials, OAuthToken};
+use crate::profile::{ClaudeCredentials, OAuthToken, save_profile};
 use std::fs;
 
 fn creds(access: &str, refresh: Option<&str>) -> ClaudeCredentials {
@@ -913,7 +913,7 @@ fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
 
     let mut real_config = seed_relogin_scenario(
         "real-active",
-        creds("stored-access", Some("stored-refresh")),
+        creds("stored-access", Some("real-stored-refresh")),
         creds("relogin-access", Some("relogin-refresh")),
     );
     force_snapshot_active_credentials(&mut real_config).expect("force snapshot real");

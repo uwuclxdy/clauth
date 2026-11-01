@@ -5,7 +5,7 @@
 //! is macOS-only; these run on every platform.
 
 use super::*;
-use crate::profile::{AccountId, ProfileName};
+use crate::profile::{AccountId, ProfileName, save_profile};
 use crate::testutil::HomeSandbox;
 use std::cell::RefCell;
 use std::fs;
@@ -1088,4 +1088,19 @@ fn the_leg_puts_the_active_login_back_over_a_spent_item() {
              rotated); put a back"
         )
     );
+}
+
+/// The carry into an owner refuses an item whose chain another roster
+/// profile's store already holds: that login is saved, and copying it would
+/// put one single-use chain in two stores.
+#[test]
+fn a_carry_never_copies_a_chain_another_store_holds() {
+    let _home = HomeSandbox::new();
+    profile_holding("a", &pair("at-a", "rt-a", 1), None);
+    profile_holding("b", &pair("at-x", "rt-x", 1), None);
+    roster(&["a", "b"], "a");
+    let err = carry("a", &pair("at-x-later", "rt-x", 5)).expect_err("b's chain refuses");
+    assert_eq!(err.to_string(), "this login is already saved in 'b'");
+    assert_eq!(read_json(&store("a")), pair("at-a", "rt-a", 1), "a's store");
+    assert_eq!(read_json(&store("b")), pair("at-x", "rt-x", 1), "b's store");
 }

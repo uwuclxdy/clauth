@@ -1601,6 +1601,36 @@ fn non_finite_percent_fields_read_as_unset_at_load() {
     }
 }
 
+/// A load's canonical rewrite writes only while the file still holds what the
+/// load read: a peer's write landed between that read and the rewrite's flock
+/// is kept. The profile's NaN ceiling renders differently from the file the
+/// load read, so the render reads as non-canonical.
+#[test]
+fn a_load_rewrite_keeps_a_peer_write_landed_before_its_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p");
+    save_profile(&Profile::new("p".to_string(), None, None)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.max_auto_spend = Some(f64::NAN);
+
+    let read = std::fs::read_to_string(&config_path).expect("the load's read");
+    maybe_rewrite_config_toml(&config_path, &read, &profile);
+    let rewritten = std::fs::read_to_string(&config_path).expect("after the rewrite");
+    assert_ne!(
+        rewritten, read,
+        "control: an unchanged file takes the rewrite"
+    );
+
+    std::fs::write(&config_path, "max_auto_spend = 7.0\n").expect("peer write");
+    maybe_rewrite_config_toml(&config_path, &read, &profile);
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("after the skipped rewrite"),
+        "max_auto_spend = 7.0\n",
+        "the peer's write survives the rewrite rendered from the earlier read"
+    );
+}
+
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
 /// to it (pair present + no usable key AND no env token — an
 /// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` env entry authenticates the
@@ -6469,5 +6499,130 @@ fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
     assert!(
         crate::fallback::durable_key_rejected_seed([loaded]).contains_key("refused"),
         "the verdict binds to the digest the loader read"
+    );
+}
+
+/// A rotating pair whose refresh token is `refresh`.
+fn chain(refresh: &str, access: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The refresh token `name`'s `credentials.json` holds, read raw.
+fn raw_store_refresh(name: &str) -> Option<String> {
+    let path = profile_subpath(&ProfileName::from(name), "credentials.json").expect("path");
+    let creds: ClaudeCredentials = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    creds.refresh_token().map(str::to_string)
+}
+
+/// The store write refuses a chain another roster profile's store holds,
+/// naming that profile; the profile rewriting its own chain, and a chain no
+/// store holds, still land.
+#[test]
+fn a_store_write_refuses_a_chain_another_profile_holds() {
+    let _home = HomeSandbox::new();
+    for (name, refresh) in [("a", "rt-a"), ("b", "rt-b")] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain(refresh, &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    let write = |name: &str, creds: &ClaudeCredentials| {
+        with_state_lock(|held| {
+            write_profile_credentials(&ProfileName::from(name), Some(creds), held)
+        })
+    };
+    let err = write("b", &chain("rt-a", "at-b-copy")).expect_err("a's chain refuses");
+    assert_eq!(err.to_string(), "this login is already saved in 'a'");
+    assert_eq!(raw_store_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(raw_store_refresh("b").as_deref(), Some("rt-b"), "b's store");
+
+    write("a", &chain("rt-a", "at-a-refreshed")).expect("a rewrites its own chain");
+    write("b", &chain("rt-b-new", "at-b-new")).expect("a chain no store holds");
+    assert_eq!(raw_store_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(
+        raw_store_refresh("b").as_deref(),
+        Some("rt-b-new"),
+        "b's store"
+    );
+}
+
+/// A write into a profile's `session-token.json` sidecar never counts that
+/// profile's own `credentials.json` as another holder, whether the sidecar's
+/// path is spelled as the roster spells it or through a link to the profile's
+/// dir (unix); another profile's store still is one.
+#[test]
+fn a_sidecar_store_never_counts_its_own_profile_as_another_holder() {
+    let _home = HomeSandbox::new();
+    for (name, refresh) in [("a", "rt-a"), ("b", "rt-b")] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain(refresh, &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    let a_dir = profile_dir(&ProfileName::from("a")).expect("dir");
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut sidecars = vec![a_dir.join("session-token.json")];
+    #[cfg(unix)]
+    {
+        let link = home_dir().expect("home").join("a-dir-link");
+        std::os::unix::fs::symlink(&a_dir, &link).expect("link a's dir");
+        sidecars.push(link.join("session-token.json"));
+    }
+    for sidecar in sidecars {
+        assert_eq!(
+            chain_holder_elsewhere(&sidecar, &chain("rt-a", "at-a-item")).expect("roster"),
+            None,
+            "a's own chain at {}",
+            sidecar.display()
+        );
+        assert_eq!(
+            chain_holder_elsewhere(&sidecar, &chain("rt-b", "at-b-item")).expect("roster"),
+            Some(ProfileName::from("b")),
+            "b's chain at {}",
+            sidecar.display()
+        );
+    }
+}
+
+/// Two stores already holding one chain (written before the refusal
+/// existed) can each still rewrite it: the rewrite adds it to no store.
+#[test]
+fn a_store_already_sharing_a_chain_still_rewrites_it() {
+    let _home = HomeSandbox::new();
+    for name in ["a", "b"] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain("rt-shared", &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    with_state_lock(|held| {
+        write_profile_credentials(
+            &ProfileName::from("a"),
+            Some(&chain("rt-shared", "at-a-stamped")),
+            held,
+        )
+    })
+    .expect("a rewrites the chain it holds");
+    let stored = profile_subpath(&ProfileName::from("a"), "credentials.json").expect("path");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(stored).expect("read")).expect("parse");
+    assert_eq!(
+        creds.access_token(),
+        Some("at-a-stamped"),
+        "the rewrite landed"
+    );
+    assert_eq!(
+        raw_store_refresh("b").as_deref(),
+        Some("rt-shared"),
+        "b's store"
     );
 }

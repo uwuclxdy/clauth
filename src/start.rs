@@ -990,8 +990,9 @@ pub(crate) fn run(
     // marker to read (`switch_off` clears it without touching the file) the
     // helper answers every configured profile's keys, so a departed account's
     // entries are stripped too rather than landing in front of the started
-    // account's endpoint.
-    let stale_env_keys = crate::actions::outgoing_env_keys(config);
+    // account's endpoint. The outgoing account is read off disk too: a peer's
+    // switch since this config was read stamped that account's keys.
+    let stale_env_keys = crate::actions::outgoing_env_keys_now(config)?;
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");

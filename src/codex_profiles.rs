@@ -56,9 +56,9 @@ use crate::profile::{
 /// all-`pub(crate)` shape: every mutation goes through a writer on this type,
 /// and persistence happens only inside [`CodexState::update`], which holds the
 /// state lock across its load → mutate → save. That closes by construction the
-/// stale-snapshot class `save_profile` callers had to dodge by convention
-/// (load under the guard, mutate one field, never write a pre-prompt snapshot
-/// back).
+/// stale-snapshot class the claude profile writers close with a fresh re-read
+/// under the lock (load under the guard, mutate one field, never write a
+/// pre-prompt snapshot back).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CodexState {
     active_profile: Option<ProfileName>,

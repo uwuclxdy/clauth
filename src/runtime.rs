@@ -6462,7 +6462,7 @@ impl ProfileRuntime {
     /// a same-version REMOVAL cannot be posed from a second thread, because
     /// delete/rename `try_acquire` the rotation guard and give up rather than
     /// queue (see `refuse_if_unconfigured`), while a field edit persists
-    /// through `save_profile` under the state flock alone and never touches
+    /// through `update_profile_config` under the state flock alone and never touches
     /// the rotation guard — so a concurrent edit is ordinary, not exotic, and
     /// the thing that keeps it off a session is the in-hold re-read below,
     /// serialized against that same flock. Neither seam can pose the narrower
@@ -11114,6 +11114,11 @@ fn drain_session_login(link_path: &Path, canonical: &Path) -> Result<Drain> {
                  (canonical written more recently than runtime); \
                  not overwriting with runtime re-login bytes"
             );
+        } else if crate::profile::chain_holder_elsewhere(canonical, &runtime_creds)?.is_some() {
+            // The store-write guard's comparison: another account's store
+            // holds this chain, so copying it here would put one single-use
+            // chain in two stores. It stays saved there; the relink below
+            // drops nothing.
         } else {
             atomic_write_600(canonical, &runtime_bytes)?;
             // Mark the `/profile` reading stale only when the copied LOGIN
@@ -11375,17 +11380,21 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<bool> {
     let canonical_meta = canonical.metadata().ok();
 
     if let Some((src, dst)) = newer_side(runtime_path, canonical, runtime_meta, canonical_meta) {
-        // A newer runtime copy whose refresh token the server already consumed
-        // never reaches the store; canonical flows back over it instead, the
-        // fake-mode counterpart of the real-mode relink. One the record beside
-        // the store cannot judge is copied neither way.
+        // A newer runtime copy whose refresh token the server already consumed,
+        // or whose chain another account's store holds, never reaches the
+        // store; canonical flows back over it instead, the fake-mode
+        // counterpart of the real-mode relink. One the record beside the store
+        // cannot judge is copied neither way.
         if src == runtime_path
             && let Ok(bytes) = std::fs::read(runtime_path)
             && let Ok(runtime_creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes)
         {
             match crate::oauth::session_login_copy(canonical, &runtime_creds) {
-                crate::oauth::SessionLoginCopy::Copyable => {}
-                crate::oauth::SessionLoginCopy::Spent => {
+                crate::oauth::SessionLoginCopy::Copyable
+                    if crate::profile::chain_holder_elsewhere(canonical, &runtime_creds)?
+                        .is_none() => {}
+                crate::oauth::SessionLoginCopy::Copyable
+                | crate::oauth::SessionLoginCopy::Spent => {
                     if canonical.exists() {
                         copy_if_valid_creds(canonical, runtime_path)?;
                     }

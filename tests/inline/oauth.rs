@@ -1291,6 +1291,90 @@ mod adopt_live_rotation {
         assert_eq!(store.refresh_token(), Some("at-p3-refresh"));
     }
 
+    /// The live mirror is a later-expiring login of the same account that
+    /// another roster profile already stores. The store write refuses the
+    /// adoption, and memory stays on the profile's own login: the next
+    /// rotation spends the profile's own refresh token, never the holder's.
+    #[test]
+    fn a_refused_adoption_leaves_the_next_rotation_on_the_profiles_own_chain() {
+        let home = HomeSandbox::new();
+        let (base, server) = crate::testutil::serve_endpoints_recording(1, |_, _| {
+            (
+                200,
+                r#"{"access_token":"at-minted","refresh_token":"rt-minted","expires_in":28800}"#
+                    .to_string(),
+            )
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        let name = "adopt-held-elsewhere";
+        let pn = crate::profile::ProfileName::from(name);
+        let mirror_expiry = future_expiry() + 3_600_000;
+        let handle = setup(name, future_expiry(), mirror_expiry);
+        let mut holder = crate::profile::Profile::new("holder".to_string(), None, None);
+        holder.credentials = Some(creds_with("at-mirror", Some(mirror_expiry)));
+        crate::profile::save_profile(&holder).expect("save the holder");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: vec![name.into(), "holder".into()],
+            active_profile: Some(name.into()),
+            ..crate::profile::AppState::default()
+        })
+        .expect("persist state");
+
+        let adopted =
+            try_adopt_live_rotation(&handle, &pn, &guard(name), &|_| Some("uuid-1".into()));
+        assert_eq!(adopted, None, "the store write refuses the holder's chain");
+        assert_eq!(
+            stored_access(&handle, name),
+            "at-old",
+            "memory kept its own"
+        );
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        rotate_one_inner(&handle, &pn, None, None, &tx);
+        let sent: Vec<Option<String>> = server
+            .join()
+            .expect("listener")
+            .iter()
+            .filter(|(path, _)| path == "/v1/oauth/token")
+            .map(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v["refresh_token"].as_str().map(str::to_string))
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![Some("at-old-refresh".to_string())],
+            "the rotation spends the profile's own chain"
+        );
+        let store_refresh = |profile: &str| {
+            let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(profile))
+                .expect("profile dir")
+                .join("credentials.json");
+            crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
+                .expect("read store")
+                .refresh_token()
+                .map(str::to_string)
+        };
+        assert_eq!(store_refresh(name).as_deref(), Some("rt-minted"));
+        assert_eq!(
+            store_refresh("holder").as_deref(),
+            Some("at-mirror-refresh"),
+            "the holder keeps its chain"
+        );
+        let live: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+            &crate::profile::claude_dir()
+                .expect("claude dir")
+                .join(".credentials.json"),
+        )
+        .expect("read live");
+        assert_eq!(
+            live.refresh_token(),
+            Some("at-mirror-refresh"),
+            "the live login"
+        );
+    }
+
     #[test]
     fn cached_anchor_allows_adopt_even_with_a_dead_stored_token() {
         let _home = HomeSandbox::new();
@@ -7228,6 +7312,7 @@ fn a_reconciled_switch_during_a_rotation_keeps_its_snapshot() {
             crate::actions::switch_profile_reconciled(
                 &switched,
                 &crate::profile::ProfileName::from("sink-target"),
+                Some(&crate::profile::ProfileName::from(name)),
             )
             .expect("the reconciled switch");
         }

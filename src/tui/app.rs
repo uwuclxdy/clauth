@@ -30,13 +30,14 @@ use crate::actions::{
     edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
     overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
     set_chain_order, set_member_threshold, set_wrap_off, snapshot_is_empty, switch_off,
-    switch_profile, validate_foreign_harness_free, validate_name_chars, validate_profile_name,
+    switch_profile_gated, validate_foreign_harness_free, validate_name_chars,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
-    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, live_credentials_are_shell, read_claude_credentials,
-    snapshot_active_credentials,
+    creds_fingerprint, detach_credentials_link, force_link_profile_credentials, is_first_login,
+    link_profile_credentials, live_credentials_are_shell, live_creds_fingerprint,
+    read_claude_credentials, snapshot_active_credentials,
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
@@ -45,17 +46,17 @@ use crate::fallback::{
 };
 use crate::format::format_threshold_tokens;
 use crate::harness::Harness;
-use crate::lock::with_state_lock;
+use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::plugin_host::ExeChange;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings, HomeTab,
-    MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    AppConfig, AppState, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
+    HomeTab, MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
     PopupWidth, Profile, ProfileId, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
-    WalkOrder, claim_profile_id, load_config, reload_fingerprint, save_app_state,
-    save_profile_config,
+    WalkOrder, claim_profile_id, load_config, reload_fingerprint, require_profile_id,
+    update_app_state, update_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -1426,24 +1427,29 @@ pub(crate) struct PresetApplyForm {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
-    /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
-    CaptureConflict(Box<CaptureSnapshot>, bool),
+    /// `Option<String>` = `from_divergence`, carried through for
+    /// deferred-detach semantics.
+    CaptureConflict(Box<CaptureSnapshot>, Option<String>),
     /// Capture-name collision (issue #7): the typed name already belongs to
     /// another profile. `String` = that profile's existing (canonical-cased)
     /// name, `ProfileId` = the account it named when the confirm opened,
-    /// `bool` = `from_divergence`, all carried through to
+    /// `Option<String>` = `from_divergence`, all carried through to
     /// `overwrite_captured_profile` the same way `CaptureConflict` carries them
     /// to `capture_into_profile`.
-    CaptureOverwrite(Box<CaptureSnapshot>, String, ProfileId, bool),
-    /// Divergence "save elsewhere" → a chosen (non-active) profile. `String` =
-    /// that profile, `ProfileId` = the account it named when the confirm
-    /// opened. Saves the live login into it and force-links it active —
-    /// the guarded relink can't resolve a CC-written divergence (the on-disk
-    /// byte formats differ), so this path forces the live link onto the target.
-    AdoptDivergence(Box<CaptureSnapshot>, String, ProfileId),
+    CaptureOverwrite(Box<CaptureSnapshot>, String, ProfileId, Option<String>),
+    /// Divergence "save elsewhere" → a chosen (non-active) profile. The first
+    /// `String` = that profile, `ProfileId` = the account it named when the
+    /// confirm opened, the last `String` = the active account whose divergence
+    /// the prompt showed. Saves the live login into the target and force-links
+    /// it active — the guarded relink can't resolve a CC-written divergence
+    /// (the on-disk byte formats differ), so this path forces the live link
+    /// onto the target.
+    AdoptDivergence(Box<CaptureSnapshot>, String, ProfileId, String),
     Switch(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
-    DiscardDivergence(String),
+    /// `Option<u64>` = the live login's fingerprint when the confirm opened
+    /// ([`live_creds_fingerprint`]): the discard drops only that login.
+    DiscardDivergence(String, Option<u64>),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
     /// Force-rotate one account's refresh token (action-menu "rotate access
@@ -1711,9 +1717,11 @@ pub(crate) struct PresetPickerForm {
 pub(crate) struct CaptureNameForm {
     pub(crate) snapshot: Box<CaptureSnapshot>,
     pub(crate) input: InputState,
-    /// Set when initiated by `NewProfile` divergence. Detach + deactivate of
-    /// the prior profile is deferred to the success arm so cancel leaves it intact.
-    pub(crate) from_divergence: bool,
+    /// The active account whose divergence the prompt showed, when initiated
+    /// by `NewProfile` divergence. Detach + deactivate of the prior profile is
+    /// deferred to the success arm so cancel leaves it intact, and runs only
+    /// while disk still names this account active.
+    pub(crate) from_divergence: Option<String>,
 }
 
 /// Credential-divergence prompt. Raised on demand (the <kbd>d</kbd> key from
@@ -1730,6 +1738,13 @@ pub(crate) struct DivergenceForm {
     /// it" action — the near-always-right resolution for a CC re-login into a
     /// known account, which the generic three options all get wrong.
     pub(crate) sibling: Option<ProfileName>,
+    /// The active account runs on a long-lived token
+    /// ([`crate::claude::has_session_token`]): its store cannot hold an OAuth
+    /// login, so the prompt does not offer to overwrite it with one.
+    pub(crate) long_lived: bool,
+    /// The live login's fingerprint when the prompt opened
+    /// ([`live_creds_fingerprint`]): every answer acts only on that login.
+    pub(crate) seen: Option<u64>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
     pub(crate) viewport: std::cell::Cell<usize>,
@@ -1795,21 +1810,23 @@ pub(crate) enum BareItemWrite {
         snapshot: Box<CaptureSnapshot>,
         name: String,
         account: ProfileId,
-        from_divergence: bool,
+        from_divergence: Option<String>,
     },
     AdoptDivergence {
         snapshot: Box<CaptureSnapshot>,
         name: String,
         account: ProfileId,
+        from: String,
     },
     BlankCredentials(String),
-    DiscardDivergence(String),
-    /// The divergence prompt's `overwrite` of the active profile.
-    DivergenceOverwrite(String),
+    DiscardDivergence(String, Option<u64>),
+    /// The divergence prompt's `overwrite` of the active profile, with the
+    /// live login's fingerprint the prompt read.
+    DivergenceOverwrite(String, Option<u64>),
     CaptureName {
         name: String,
         snapshot: Box<CaptureSnapshot>,
-        from_divergence: bool,
+        from_divergence: Option<String>,
     },
     /// A finished browser login applied without a confirm.
     Login {
@@ -1832,8 +1849,8 @@ impl BareItemWrite {
             | Self::NewAccount
             | Self::CaptureOverwrite { .. }
             | Self::AdoptDivergence { .. }
-            | Self::DiscardDivergence(_)
-            | Self::DivergenceOverwrite(_)
+            | Self::DiscardDivergence(..)
+            | Self::DivergenceOverwrite(..)
             | Self::CaptureName { .. }
             | Self::Login { .. } => crate::claude::BareItemWriter::Switch,
         }
@@ -1848,10 +1865,10 @@ impl BareItemWrite {
             Self::Rename => "rename failed",
             Self::NewAccount => "create failed",
             Self::Delete { .. } => "delete failed",
-            Self::CaptureOverwrite { .. } | Self::DivergenceOverwrite(_) => "overwrite failed",
+            Self::CaptureOverwrite { .. } | Self::DivergenceOverwrite(..) => "overwrite failed",
             Self::AdoptDivergence { .. } => "save failed",
             Self::BlankCredentials(_) => "log out failed",
-            Self::DiscardDivergence(_) => "discard failed",
+            Self::DiscardDivergence(..) => "discard failed",
             Self::CaptureName { .. } => "capture failed",
             Self::Login { .. } => "login failed",
         }
@@ -2046,8 +2063,10 @@ impl DivergenceForm {
         if let Some(owner) = &self.sibling {
             v.push(DivergenceAction::SwitchToOwner(owner.to_string()));
         }
+        if !self.long_lived {
+            v.push(DivergenceAction::Choice(DivergenceChoice::Overwrite));
+        }
         v.extend([
-            DivergenceAction::Choice(DivergenceChoice::Overwrite),
             DivergenceAction::Choice(DivergenceChoice::NewProfile),
             DivergenceAction::Choice(DivergenceChoice::Discard),
         ]);
@@ -2061,6 +2080,10 @@ impl DivergenceForm {
 /// pre-selected so re-logging an account you already hold is one keypress.
 #[derive(Debug, Clone)]
 pub(crate) struct DivergenceTargetForm {
+    /// The active account whose divergence the prompt showed.
+    pub(crate) from: String,
+    /// The live login's fingerprint when the divergence prompt opened.
+    pub(crate) seen: Option<u64>,
     pub(crate) targets: Vec<String>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
@@ -6439,11 +6462,7 @@ impl App {
             // Land on the herdr row by label once its probe resolves.
             self.services.land_on_herdr = true;
             recompute_services_checks(&mut self, false, ShuntRefresh::Keep);
-            {
-                let mut cfg = self.config();
-                cfg.state.herdr.first_landing_done = true;
-                let _ = save_app_state(&cfg.state);
-            }
+            self.save_state_delta(|s, _held| s.herdr.first_landing_done = true);
             // Drain any forgets the marker write noted. The write is left
             // unadopted, so the first tick's reload re-reads and adopts it.
             self.apply_forgets();
@@ -7022,6 +7041,27 @@ impl App {
     /// config guard held (the stores rank BELOW `Config`).
     fn apply_forgets(&self) {
         apply_pending_forgets(&self.memory_stores());
+    }
+
+    /// Save one in-TUI state delta: apply `f` to a fresh read under the state
+    /// flock, adopt the saved state, and toast the house `save failed` copy
+    /// when the write fails, leaving the in-memory state as it was. Returns
+    /// whether the save landed.
+    fn save_state_delta(&mut self, f: impl FnOnce(&mut AppState, &StateLockHeld)) -> bool {
+        let result = {
+            let mut cfg = self.config();
+            update_app_state(f).map(|state| cfg.state = state)
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+                false
+            }
+        }
     }
 
     /// Build the per-frame readings snapshot. The picker's per-name
@@ -12295,7 +12335,7 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
 
 /// Apply space/⏎ to the focused options row: cycle, toggle, open the tag
 /// editor, or confirm the delegate-row rewrite. Every change persists
-/// immediately through `save_app_state` (the `cycle_theme` shape).
+/// immediately through `update_app_state` (the `cycle_theme` shape).
 fn activate_herdr_option(app: &mut App, row: HerdrOption) {
     match row {
         HerdrOption::PopupWidth => cycle_herdr_popup_width(app),
@@ -12334,27 +12374,20 @@ fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
     if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
         return;
     }
-    {
-        let mut cfg = app.config();
-        let cur = cfg.state.herdr.tag_watch_secs;
-        cfg.state.herdr.tag_watch_secs = if delta > 0 {
-            cur.saturating_add(1)
-        } else {
-            cur.saturating_sub(1).max(1)
-        };
-        let _ = save_app_state(&cfg.state);
-    }
+    let cur = app.config().state.herdr.tag_watch_secs;
+    let next = if delta > 0 {
+        cur.saturating_add(1)
+    } else {
+        cur.saturating_sub(1).max(1)
+    };
+    app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = next);
     app.apply_forgets();
 }
 
 /// Flip one herdr bool knob and persist immediately (the `cycle_theme` save
 /// shape — no separate save step).
 fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
-    {
-        let mut cfg = app.config();
-        flip(&mut cfg.state.herdr);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| flip(&mut s.herdr));
     app.apply_forgets();
 }
 
@@ -12431,16 +12464,13 @@ fn rerun_pane_report(script: &str, pane: &str) {
 /// Advance the popup-width knob to the next shape, wrapping past `split-top`
 /// back to `fit` — space always cycles forward, never clamps.
 fn cycle_herdr_popup_width(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.herdr.popup_width = match cfg.state.herdr.popup_width {
-            PopupWidth::Fit => PopupWidth::Half,
-            PopupWidth::Half => PopupWidth::SplitRight,
-            PopupWidth::SplitRight => PopupWidth::SplitTop,
-            PopupWidth::SplitTop => PopupWidth::Fit,
-        };
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = match app.config().state.herdr.popup_width {
+        PopupWidth::Fit => PopupWidth::Half,
+        PopupWidth::Half => PopupWidth::SplitRight,
+        PopupWidth::SplitRight => PopupWidth::SplitTop,
+        PopupWidth::SplitTop => PopupWidth::Fit,
+    };
+    app.save_state_delta(|s, _held| s.herdr.popup_width = next);
     app.apply_forgets();
 }
 
@@ -12482,16 +12512,7 @@ fn commit_herdr_tag_edit(app: &mut App) -> bool {
     let Some(secs) = parse_herdr_tag_secs(raw) else {
         return false;
     };
-    let saved = {
-        let mut cfg = app.config();
-        cfg.state.herdr.tag_watch_secs = secs;
-        save_app_state(&cfg.state)
-    };
-    if let Err(e) = saved {
-        app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
-        );
+    if !app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = secs) {
         return false;
     }
     app.apply_forgets();
@@ -16754,12 +16775,10 @@ fn run_add_client_token(
         }
     };
     let mut cfg = App::lock_config(&config.0);
-    match crate::actions::edit_profile_endpoint(
-        &mut cfg,
-        &profile_name,
-        Some(url.to_string()),
-        Some(token.expose().to_string()),
-    ) {
+    match crate::actions::edit_profile_endpoint(&mut cfg, &profile_name, |base_url, api_key| {
+        *base_url = Some(url.to_string());
+        *api_key = Some(token.expose().to_string());
+    }) {
         Ok(()) => ShuntActionOutcome::TokenAdded {
             profile: profile.to_string(),
             require,
@@ -17612,14 +17631,35 @@ enum SwitchGate {
 /// Switch the active profile to `name`. The AUTH-1 pre-install gate
 /// (`ensure_installable`) may refresh the target's token over HTTP, so it runs
 /// off the UI thread; `drain_switch_gates` completes the relink when it
-/// answers. The already-active target skips the gate — nothing new to install
-/// (`switch_profile` no-ops on `is_active`), and gating it races a live
-/// `claude` refreshing through the symlink — the same exemption as the
-/// CLI/MCP paths.
+/// answers. The disk-active target skips the gate only while the live slot
+/// serves no login another account stores (its own login, an unsaved login, or
+/// no login): then there is nothing to install, and gating it races a live
+/// `claude` refreshing through the symlink. When the live slot serves another
+/// account's saved login the switch installs the target's stored login, so it
+/// takes the gate like any other target. The exemption is decided on the disk
+/// read (the memory copy can lag a peer's switch) and re-checked under the
+/// switch's state hold, so a peer write that would make the switch install the
+/// stored login sends it back through `spawn_switch_gate`.
 fn perform_switch(app: &mut App, name: &ProfileName) {
-    let active = app.config().state.active_profile.as_ref().cloned();
-    if active.as_deref() == Some(name) {
-        finalize_switch(app, name, None);
+    // The mirror also moves the in-memory active account to disk's.
+    let disk = {
+        let mut cfg = app.config();
+        with_state_lock(|held| crate::actions::mirror_active_on_disk(&mut cfg, held))
+    };
+    let disk_active = match disk {
+        Ok(active) => active,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    if disk_active.as_deref() == Some(name) && !crate::claude::live_login_saved_elsewhere(name) {
+        #[cfg(test)]
+        crate::testutil::switch_race_seam::run();
+        finalize_switch(app, name, None, false);
         return;
     }
     spawn_switch_gate(app, name.clone(), oauth::refresh_result);
@@ -17747,6 +17787,8 @@ fn open_divergence_modal(app: &mut App, active: &str) {
     app.open_modal(Modal::Divergence(DivergenceForm {
         active: active.to_string(),
         sibling,
+        long_lived: crate::claude::has_session_token(&ProfileName::from(active)),
+        seen: live_creds_fingerprint(),
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -18020,15 +18062,19 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
             snapshot,
             name,
             account,
+            from,
         } => {
-            run_confirm_action(app, ConfirmAction::AdoptDivergence(snapshot, name, account));
+            run_confirm_action(
+                app,
+                ConfirmAction::AdoptDivergence(snapshot, name, account, from),
+            );
         }
         BareItemWrite::BlankCredentials(name) => {
             run_confirm_action(app, ConfirmAction::BlankCredentials(name));
         }
-        BareItemWrite::DiscardDivergence(name) => run_discard_divergence(app, &name),
-        BareItemWrite::DivergenceOverwrite(active) => {
-            run_divergence_choice(app, &active, DivergenceChoice::Overwrite);
+        BareItemWrite::DiscardDivergence(name, seen) => run_discard_divergence(app, &name, seen),
+        BareItemWrite::DivergenceOverwrite(active, seen) => {
+            run_divergence_choice(app, &active, DivergenceChoice::Overwrite, seen);
         }
         BareItemWrite::CaptureName {
             name,
@@ -18267,9 +18313,13 @@ fn settle_after_save(
 /// Complete a switch on the UI thread: divergence guard, relink via
 /// `switch_profile` holding the bare-item placement the gate's settle left,
 /// token-snapshot refresh. No HTTP — the bare item settled and the AUTH-1
-/// gate answered on the worker (or the target is the already-active
-/// exemption) before this runs.
-fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>) {
+/// gate answered on the worker, or the target is the already-active account
+/// whose live slot holds no login another account stores (the exemption)
+/// before this runs. `gated` names whether the AUTH-1 gate ran for this
+/// switch: the worker path passes `true`, the exemption path `false`, and a
+/// `false` switch whose hold finds it would install the stored login is sent
+/// back through `spawn_switch_gate` instead.
+fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>, gated: bool) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -18284,19 +18334,25 @@ fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>) 
         return;
     }
     let _placed = enter_bare_item_placement(placed);
-    let result = switch_profile(&app.config, name);
+    let result = switch_profile_gated(&app.config, name, gated);
     clear_activity(&app.activity, name);
     match result {
-        Ok(()) => {
+        Ok(_switched) => {
             app.refresh_tokens();
             app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
-        Err(e) => app.toast(
-            ToastKind::Danger,
-            format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
-        ),
+        Err(e) if !gated && e.downcast_ref::<crate::actions::GateNeeded>().is_some() => {
+            spawn_switch_gate(app, name.clone(), oauth::refresh_result);
+        }
+        Err(e) => match chain_held_skipped("switch", &e) {
+            Some(skipped) => app.toast(ToastKind::Warning, skipped),
+            None => app.toast(
+                ToastKind::Danger,
+                format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+            ),
+        },
     }
 }
 
@@ -18457,10 +18513,22 @@ fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
     }
 }
 
-fn begin_capture(app: &mut App, from_divergence: bool) {
+/// Read the live login for a capture. From a divergence about
+/// `from_divergence`, the read must be the login the prompt showed (`seen`,
+/// its fingerprint), else nothing is captured.
+fn begin_capture(app: &mut App, from_divergence: Option<String>, seen: Option<u64>) {
     let Some(snapshot) = capture_live_or_toast(app) else {
         return;
     };
+    if let Some(from) = &from_divergence
+        && creds_fingerprint(snapshot.credentials.as_ref()) != seen
+    {
+        app.toast(
+            ToastKind::Warning,
+            DivergenceMoved::Login.skipped("capture", from),
+        );
+        return;
+    }
     let existing_match = {
         let cfg = app.config();
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
@@ -18781,11 +18849,7 @@ fn cycle_theme(app: &mut App) {
         theme::Tier::Full => ThemeName::Full,
         theme::Tier::Compatible => ThemeName::Compatible,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.theme = Some(name);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.theme = Some(name));
     app.apply_forgets();
     theme::set_tier(next);
 }
@@ -19018,11 +19082,7 @@ pub(crate) fn next_reset_display(current: ResetDisplay) -> ResetDisplay {
 
 fn cycle_reset_display(app: &mut App) {
     let next = next_reset_display(app.config().state.reset_display());
-    {
-        let mut cfg = app.config();
-        cfg.state.reset_display = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.reset_display = Some(next));
     app.apply_forgets();
 }
 
@@ -19031,32 +19091,20 @@ fn cycle_clock_format(app: &mut App) {
         ClockFormat::H24 => ClockFormat::H12,
         ClockFormat::H12 => ClockFormat::H24,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.clock_format = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.clock_format = Some(next));
     app.apply_forgets();
 }
 
 fn cycle_home_tab(app: &mut App) {
     let next: Tab = app.config().state.home_tab().into();
     let next = next.next();
-    {
-        let mut cfg = app.config();
-        cfg.state.home_tab = Some(next.into());
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.home_tab = Some(next.into()));
     app.apply_forgets();
 }
 
 fn cycle_divergence_default(app: &mut App) {
     let next = next_divergence_default(app.config().state.default_divergence);
-    {
-        let mut cfg = app.config();
-        cfg.state.default_divergence = next;
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.default_divergence = next);
     app.apply_forgets();
 }
 
@@ -19077,22 +19125,19 @@ fn toggle_wrap_off(app: &mut App) {
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `save_app_state`, drain forgets — no separate propagation to the
+/// `update_app_state`, drain forgets — no separate propagation to the
 /// scheduler is needed since `next_auto_switch_target` reads the flag straight
 /// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.burn_aware_switching;
+    app.save_state_delta(|s, _held| s.burn_aware_switching = next);
     app.apply_forgets();
 }
 
 /// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
 /// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
-/// `AppConfig`, `save_app_state`, drain forgets — no separate
+/// `AppConfig`, `update_app_state`, drain forgets — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
 /// shared `config` (`snapshot_chain` copies it into `ChainSnapshot` like
 /// `burn_aware`).
@@ -19102,11 +19147,7 @@ fn cycle_walk_order(app: &mut App) {
         WalkOrder::SoonestWeeklyReset => WalkOrder::MostWeeklyHeadroom,
         WalkOrder::MostWeeklyHeadroom => WalkOrder::Chain,
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.walk_order = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.walk_order = Some(next));
     app.apply_forgets();
 }
 
@@ -19122,11 +19163,7 @@ fn step_burn_floor(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(BURN_FLOOR_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_switch_floor_pct = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.burn_switch_floor_pct = Some(next));
     app.apply_forgets();
 }
 
@@ -19139,11 +19176,7 @@ fn step_burn_horizon(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(BURN_HORIZON_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.burn_horizon_cap_ms = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.burn_horizon_cap_ms = Some(next));
     app.apply_forgets();
 }
 
@@ -19154,11 +19187,8 @@ fn step_burn_horizon(app: &mut App) {
 /// (`snapshot_chain` mirrors it into `ChainSnapshot`). Flipping this on alone
 /// still spends nothing — every member's ceiling defaults to $0.
 fn toggle_spend_budget_switching(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.spend_budget_switching;
+    app.save_state_delta(|s, _held| s.spend_budget_switching = next);
     app.apply_forgets();
 }
 
@@ -19166,11 +19196,8 @@ fn toggle_spend_budget_switching(app: &mut App) {
 /// (`AppState.switch_off_when_budget_spent`). Same persistence shape as
 /// `toggle_spend_budget_switching`.
 fn toggle_budget_wrap_off(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.switch_off_when_budget_spent = !cfg.state.switch_off_when_budget_spent;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.switch_off_when_budget_spent;
+    app.save_state_delta(|s, _held| s.switch_off_when_budget_spent = next);
     app.apply_forgets();
 }
 
@@ -19179,11 +19206,8 @@ fn toggle_budget_wrap_off(app: &mut App) {
 /// the flag off the shared config each rotation-leg entry, so no separate
 /// propagation is needed.
 fn toggle_preemptive_rotation(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.preemptive_rotation;
+    app.save_state_delta(|s, _held| s.preemptive_rotation = next);
     app.apply_forgets();
 }
 
@@ -19194,11 +19218,8 @@ fn toggle_preemptive_rotation(app: &mut App) {
 /// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
 /// env var keeps overriding it until it goes.
 fn toggle_auto_update(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.update.auto_update = !cfg.state.update.auto_update;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.update.auto_update;
+    app.save_state_delta(|s, _held| s.update.auto_update = next);
     app.apply_forgets();
 }
 
@@ -19208,11 +19229,8 @@ fn toggle_auto_update(app: &mut App) {
 /// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
 /// so the next relink in any process acts on the flip.
 fn toggle_preserve_non_login_keys(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.preserve_non_login_keys;
+    app.save_state_delta(|s, _held| s.preserve_non_login_keys = next);
     app.apply_forgets();
 }
 
@@ -19221,50 +19239,35 @@ fn toggle_preserve_non_login_keys(app: &mut App) {
 /// `toggle_preemptive_rotation`; the scheduler reads the flag off the shared
 /// config each tick, so no separate propagation is needed.
 fn toggle_refresh_spent_accounts(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.refresh_spent_accounts;
+    app.save_state_delta(|s, _held| s.refresh_spent_accounts = next);
     app.apply_forgets();
 }
 
 /// Interleave the auto-start kick across accounts, or let every window reopen the
 /// instant it lapses (`usage::auto_start_queue`).
 fn toggle_auto_start_queue(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.auto_start_queue = !cfg.state.auto_start_queue;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.auto_start_queue;
+    app.save_state_delta(|s, _held| s.auto_start_queue = next);
     app.apply_forgets();
 }
 
 fn toggle_show_estimates(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.show_estimates = !cfg.state.show_estimates;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.show_estimates;
+    app.save_state_delta(|s, _held| s.show_estimates = next);
     app.apply_forgets();
 }
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
 fn toggle_count_cache(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.count_cache = !cfg.state.count_cache;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.count_cache;
+    app.save_state_delta(|s, _held| s.count_cache = next);
     app.apply_forgets();
 }
 
 fn toggle_show_pace(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.show_pace = !cfg.state.show_pace;
-        let _ = save_app_state(&cfg.state);
-    }
+    let next = !app.config().state.show_pace;
+    app.save_state_delta(|s, _held| s.show_pace = next);
     app.apply_forgets();
 }
 
@@ -19280,10 +19283,8 @@ fn step_refresh_interval(app: &mut App) {
         .find(|&p| p > current)
         .unwrap_or(PRESETS[0]);
     app.refresh_interval.store(new_interval, Ordering::Relaxed);
-    {
-        let mut cfg = app.config();
-        cfg.state.refresh_interval_ms = new_interval;
-        let _ = save_app_state(&cfg.state);
+    if !app.save_state_delta(|s, _held| s.refresh_interval_ms = new_interval) {
+        app.refresh_interval.store(current, Ordering::Relaxed);
     }
     app.apply_forgets();
 }
@@ -19294,16 +19295,11 @@ fn step_refresh_interval(app: &mut App) {
 /// past the top preset it wraps to off, the cycle's first step.
 fn step_context_nudge(app: &mut App) {
     const PRESETS: [u64; 4] = [300_000, 400_000, 600_000, 900_000];
-    let current = app.config().state.context_nudge_threshold_tokens();
-    let next = match current {
+    let next = match app.config().state.context_nudge_threshold_tokens() {
         None => Some(PRESETS[0]),
         Some(v) => PRESETS.iter().copied().find(|&p| p > v),
     };
-    {
-        let mut cfg = app.config();
-        cfg.state.context_nudge_threshold_tokens = next;
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.context_nudge_threshold_tokens = next);
     app.apply_forgets();
 }
 
@@ -19343,17 +19339,9 @@ fn commit_refresh_interval_edit(app: &mut App) -> bool {
     let Some(ms) = parse_refresh_secs(raw) else {
         return false;
     };
-    app.refresh_interval.store(ms, Ordering::Relaxed);
-    let saved = {
-        let mut cfg = app.config();
-        cfg.state.refresh_interval_ms = ms;
-        save_app_state(&cfg.state)
-    };
-    if let Err(e) = saved {
-        app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
-        );
+    let previous = app.refresh_interval.swap(ms, Ordering::Relaxed);
+    if !app.save_state_delta(|s, _held| s.refresh_interval_ms = ms) {
+        app.refresh_interval.store(previous, Ordering::Relaxed);
         return false;
     }
     app.apply_forgets();
@@ -19406,16 +19394,7 @@ fn commit_context_nudge_edit(app: &mut App) -> bool {
     let Some(tokens) = parse_context_nudge_tokens(raw) else {
         return false;
     };
-    let saved = {
-        let mut cfg = app.config();
-        cfg.state.context_nudge_threshold_tokens = Some(tokens);
-        save_app_state(&cfg.state)
-    };
-    if let Err(e) = saved {
-        app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
-        );
+    if !app.save_state_delta(|s, _held| s.context_nudge_threshold_tokens = Some(tokens)) {
         return false;
     }
     app.apply_forgets();
@@ -19449,11 +19428,7 @@ fn step_weekly_threshold(app: &mut App) {
         .copied()
         .find(|&p| p > current)
         .unwrap_or(WEEKLY_PRESETS[0]);
-    {
-        let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(next);
-        let _ = save_app_state(&cfg.state);
-    }
+    app.save_state_delta(|s, _held| s.weekly_switch_threshold = Some(next));
     app.apply_forgets();
 }
 
@@ -19493,16 +19468,7 @@ fn commit_weekly_threshold_edit(app: &mut App) -> bool {
     let Some(pct) = parse_weekly_pct(raw) else {
         return false;
     };
-    let saved = {
-        let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(pct);
-        save_app_state(&cfg.state)
-    };
-    if let Err(e) = saved {
-        app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
-        );
+    if !app.save_state_delta(|s, _held| s.weekly_switch_threshold = Some(pct)) {
         return false;
     }
     app.apply_forgets();
@@ -19727,11 +19693,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
 /// reports the house `save failed` toast and skips the success toast and the
 /// focus re-homing: the chain is still without the member.
 fn commit_chain_add(app: &mut App, name: &ProfileName) {
-    if let Err(e) = add_chain_candidate(app, name) {
-        app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
-        );
+    if !add_chain_candidate(app, name) {
         return;
     }
     app.toast(ToastKind::Success, format!("added '{name}' to chain"));
@@ -19975,13 +19937,18 @@ fn selected_weekly_override(app: &App) -> Option<(Option<f64>, bool)> {
 fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) -> bool {
     let save_err = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
-            Some(profile) => {
+        update_profile_config(name, |p| {
+            p.weekly_threshold = value;
+            Ok(())
+        })
+        .map(|saved| {
+            if saved.is_some()
+                && let Some(profile) = cfg.find_mut(name)
+            {
                 profile.weekly_threshold = value;
-                save_profile_config(profile).err()
             }
-            None => None,
-        }
+        })
+        .err()
     };
     if let Some(e) = save_err {
         app.toast(
@@ -20018,13 +19985,18 @@ fn selected_max_spend(app: &App) -> Option<f64> {
 fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) -> bool {
     let save_err = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
-            Some(profile) => {
+        update_profile_config(name, |p| {
+            p.max_auto_spend = Some(value);
+            Ok(())
+        })
+        .map(|saved| {
+            if saved.is_some()
+                && let Some(profile) = cfg.find_mut(name)
+            {
                 profile.max_auto_spend = Some(value);
-                save_profile_config(profile).err()
             }
-            None => None,
-        }
+        })
+        .err()
     };
     if let Some(e) = save_err {
         app.toast(
@@ -20344,13 +20316,20 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
                 MemberFlag::CreditCap => &mut p.check_credit_cap,
             }
         }
-        *field(profile, flag) = !*field(profile, flag);
-        match save_profile_config(profile) {
-            Ok(()) => None,
-            Err(e) => {
-                *field(profile, flag) = !*field(profile, flag);
-                Some(e)
+        // The flip is the value the row shows, turned over.
+        let next = !*field(profile, flag);
+        match update_profile_config(&name, |p| {
+            *field(p, flag) = next;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {
+                if let Some(profile) = cfg.find_mut(&name) {
+                    *field(profile, flag) = next;
+                }
+                None
             }
+            Ok(None) => return,
+            Err(e) => Some(e),
         }
     };
     match failed {
@@ -20386,48 +20365,39 @@ fn toggle_last_resort(app: &mut App) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
+        match cfg.find(&name).map(|p| !p.last_resort) {
             None => Outcome::Missing,
-            Some(profile) => {
-                profile.last_resort = !profile.last_resort;
-                let now_on = profile.last_resort;
+            Some(now_on) => {
                 // Never both on one profile: "park here to the end" and "always
-                // come home here" are contradictory. Clear preferred before the
-                // single save so the pair persists atomically; remember the
-                // prior value so a save failure rolls back both.
-                let cleared_preferred = now_on && profile.preferred;
-                if now_on {
-                    profile.preferred = false;
-                }
-                match save_profile_config(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.last_resort && p.name != name)
-                            {
-                                p.last_resort = false;
-                                match save_profile_config(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.last_resort = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
+                // come home here" are contradictory. Clear preferred in the
+                // same save so the pair persists atomically.
+                let saved = update_profile_config(&name, |p| {
+                    p.last_resort = now_on;
+                    if now_on {
+                        p.preferred = false;
                     }
-                    Err(e) => {
+                    Ok(())
+                });
+                match saved {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(&name) {
-                            p.last_resort = !now_on;
-                            if cleared_preferred {
-                                p.preferred = true;
+                            p.last_resort = now_on;
+                            if now_on {
+                                p.preferred = false;
                             }
                         }
-                        Outcome::SaveFailed(e)
+                        let moved_from = if now_on {
+                            clear_radio_elsewhere(&mut cfg, &name, |p| &mut p.last_resort)
+                        } else {
+                            Ok(None)
+                        };
+                        match moved_from {
+                            Ok(moved_from) => Outcome::Saved { moved_from },
+                            Err(e) => Outcome::SaveFailed(e),
+                        }
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -20466,46 +20436,38 @@ fn toggle_preferred(app: &mut App) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
+        match cfg.find(&name).map(|p| !p.preferred) {
             None => Outcome::Missing,
-            Some(profile) => {
-                profile.preferred = !profile.preferred;
-                let now_on = profile.preferred;
+            Some(now_on) => {
                 // Reciprocal of the clear in `toggle_last_resort` — the two
                 // flags never coexist on one profile.
-                let cleared_last_resort = now_on && profile.last_resort;
-                if now_on {
-                    profile.last_resort = false;
-                }
-                match save_profile_config(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.preferred && p.name != name)
-                            {
-                                p.preferred = false;
-                                match save_profile_config(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.preferred = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
+                let saved = update_profile_config(&name, |p| {
+                    p.preferred = now_on;
+                    if now_on {
+                        p.last_resort = false;
                     }
-                    Err(e) => {
+                    Ok(())
+                });
+                match saved {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(&name) {
-                            p.preferred = !now_on;
-                            if cleared_last_resort {
-                                p.last_resort = true;
+                            p.preferred = now_on;
+                            if now_on {
+                                p.last_resort = false;
                             }
                         }
-                        Outcome::SaveFailed(e)
+                        let moved_from = if now_on {
+                            clear_radio_elsewhere(&mut cfg, &name, |p| &mut p.preferred)
+                        } else {
+                            Ok(None)
+                        };
+                        match moved_from {
+                            Ok(moved_from) => Outcome::Saved { moved_from },
+                            Err(e) => Outcome::SaveFailed(e),
+                        }
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -20525,31 +20487,69 @@ fn toggle_preferred(app: &mut App) {
     }
 }
 
-/// Add a profile to the chain (seeding default threshold if unset) and
-/// persist. On a failed whole-state save the in-memory chain rolls back and
-/// the profile's config.toml is never touched — the threshold seed writes only
-/// after the chain save lands — so a failed add leaves both files as they
-/// were; the caller reports the error on the house `save failed` toast.
-fn add_chain_candidate(app: &mut App, name: &ProfileName) -> anyhow::Result<()> {
-    let mut cfg = app.config();
-    let seeded = cfg
-        .find(name)
-        .is_some_and(|profile| profile.fallback_threshold.is_none());
-    cfg.state.fallback_chain.push(name.clone());
-    if let Err(e) = save_app_state(&cfg.state) {
-        cfg.state.fallback_chain.pop();
-        return Err(e);
-    }
-    if seeded && let Some(profile) = cfg.find_mut(name) {
-        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        // The add landed, so this is not a failed add: a failed seed save
-        // keeps memory in step with the disk it failed to write — the
-        // threshold stays unset on both sides, the member stays added.
-        if save_profile_config(profile).is_err() {
-            profile.fallback_threshold = None;
+/// Clear one chain radio (`last_resort` or `preferred`) on every account but
+/// `keep`, deciding off each account's `config.toml` re-read under one state
+/// flock hold, so a mark a peer set after this app's read is cleared too. Each
+/// clear saves on its own, and a failed one leaves only that account marked.
+/// Memory mirrors every clear; the first account cleared, in roster order,
+/// comes back. A hold or roster read that fails clears nothing and is the
+/// error.
+fn clear_radio_elsewhere(
+    cfg: &mut AppConfig,
+    keep: &ProfileName,
+    flag: fn(&mut Profile) -> &mut bool,
+) -> Result<Option<String>> {
+    let cleared = with_state_lock(|_held| {
+        let mut cleared = Vec::new();
+        for name in crate::profile::claude_roster_names()? {
+            if name == *keep {
+                continue;
+            }
+            if let Ok(Some((_, true))) =
+                update_profile_config(&name, |p| Ok(std::mem::replace(flag(p), false)))
+            {
+                cleared.push(name);
+            }
+        }
+        Ok(cleared)
+    })?;
+    for name in &cleared {
+        if let Some(p) = cfg.find_mut(name) {
+            *flag(p) = false;
         }
     }
-    Ok(())
+    Ok(cleared.first().map(ToString::to_string))
+}
+
+/// Add a profile to the chain (seeding default threshold if unset) and
+/// persist, onto a fresh state read under the flock; returns whether the chain
+/// now holds it. A failed chain save leaves memory and both files as they
+/// were and raises the house `save failed` toast; an account a peer deleted
+/// meanwhile is not added, and the toast says it is gone. The threshold is seeded after the push, on the
+/// profile re-read off disk: a threshold a peer set meanwhile is kept, and a
+/// failed seed leaves the member added with memory mirroring the disk it
+/// failed to write.
+fn add_chain_candidate(app: &mut App, name: &ProfileName) -> bool {
+    if !app.save_state_delta(|s, _held| {
+        if !s.fallback_chain.contains(name) && s.profiles.contains(name) {
+            s.fallback_chain.push(name.clone());
+        }
+    }) {
+        return false;
+    }
+    if !app.config().state.fallback_chain.contains(name) {
+        app.toast(ToastKind::Danger, format!("'{name}' is gone"));
+        return false;
+    }
+    let mut cfg = app.config();
+    if let Ok(Some((fresh, ()))) = update_profile_config(name, |p| {
+        p.fallback_threshold.get_or_insert(DEFAULT_THRESHOLD);
+        Ok(())
+    }) && let Some(profile) = cfg.find_mut(name)
+    {
+        profile.fallback_threshold = fresh.fallback_threshold;
+    }
+    true
 }
 
 /// Remove `name` from the chain, persist, and return focus to the list. On a
@@ -20557,34 +20557,18 @@ fn add_chain_candidate(app: &mut App, name: &ProfileName) -> anyhow::Result<()> 
 /// cursor stay put, and the error surfaces on the house `save failed` toast —
 /// never the removal toast.
 fn remove_chain_member(app: &mut App, name: &ProfileName) {
-    let outcome = {
-        let mut cfg = app.config();
-        let Some(pos) = cfg.state.fallback_chain.iter().position(|n| n == name) else {
-            return;
-        };
-        cfg.state.fallback_chain.remove(pos);
-        match save_app_state(&cfg.state) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                cfg.state.fallback_chain.insert(pos, name.clone());
-                Err(e)
-            }
-        }
-    };
-    match outcome {
-        Ok(()) => {
-            leave_fallback_detail(app);
-            let items_len = chain_items(app).len();
-            if app.chain_cursor >= items_len {
-                app.chain_cursor = items_len.saturating_sub(1);
-            }
-            app.toast(ToastKind::Info, format!("removed '{name}' from chain"));
-        }
-        Err(e) => app.toast(
-            ToastKind::Danger,
-            format!("save failed\n{}", escape_control(&e.to_string())),
-        ),
+    if !app.config().state.fallback_chain.contains(name) {
+        return;
     }
+    if !app.save_state_delta(|s, _held| s.fallback_chain.retain(|n| n != name)) {
+        return;
+    }
+    leave_fallback_detail(app);
+    let items_len = chain_items(app).len();
+    if app.chain_cursor >= items_len {
+        app.chain_cursor = items_len.saturating_sub(1);
+    }
+    app.toast(ToastKind::Info, format!("removed '{name}' from chain"));
 }
 
 // ── Modal handling ────────────────────────────────────────────────────────────
@@ -23227,22 +23211,28 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     }
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
-        // The PERSIST is written from the same under-guard disk read, never
-        // the in-memory snapshot — another process's config edit may have
-        // landed since the last reload, and `save_profile_config` writes the
-        // whole config back. The renderer's in-memory flag flips only AFTER that
+        // The PERSIST is written onto a fresh disk read, never the in-memory
+        // snapshot — another process's config edit may have landed since the
+        // last reload. The renderer's in-memory flag flips only AFTER that
         // write lands: flipped first, a failed save leaves the config lying
         // (`reload_fingerprint` never corrects it — config mtime did not move)
         // until an unrelated save makes the lie durable, and the end state is
         // a live rolling sidecar nothing re-stamps.
-        let mut disarmed = on_disk.clone();
-        disarmed.rolling_token = false;
-        if let Err(e) = save_profile_config(&disarmed) {
-            app.toast(
-                ToastKind::Danger,
-                format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
-            );
-            return;
+        match update_profile_config(name, |p| {
+            p.rolling_token = false;
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            // The account left the roster since the app's read: nothing of
+            // it is left to clear.
+            Ok(None) => return,
+            Err(e) => {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+                return;
+            }
         }
         let mut cfg = app.config();
         if let Some(p) = cfg.find_mut(name) {
@@ -23718,15 +23708,7 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
 /// active profile's live settings lose the key too. On a failed persist the
 /// editor and the flag stay, so a retry still removes the row.
 fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
-    let new_env = {
-        let cfg = app.config();
-        cfg.find(name).map(|p| {
-            let mut env = p.env.clone();
-            env.remove(key);
-            env
-        })
-    };
-    let Some(new_env) = new_env else {
+    if app.config().find(name).is_none() {
         // The profile vanished from the in-memory config (an out-of-band
         // delete/rename); disarm the cancel and end the edit instead of
         // leaving the editor stuck open with a zombie flag.
@@ -23735,10 +23717,12 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
             d.active = None;
         }
         return;
-    };
+    }
     let result = {
         let mut cfg = app.config();
-        edit_profile_env(&mut cfg, name, new_env)
+        edit_profile_env(&mut cfg, name, |env| {
+            env.remove(key);
+        })
     };
     match result {
         Ok(()) => {
@@ -23748,26 +23732,13 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
                 d.active = None;
             }
         }
-        Err(e) => {
-            // `edit_profile_env` mutates the in-memory profile BEFORE its
-            // disk writes, so a failed persist leaves memory without the key
-            // while the placeholder stays on disk — put it back so memory
-            // matches disk and a retry's index lookup finds the same row it
-            // cancelled.
-            {
-                let mut cfg = app.config();
-                if let Some(p) = cfg.find_mut(name) {
-                    p.env.insert(key.to_string(), String::new());
-                }
-            }
-            app.toast(
-                ToastKind::Danger,
-                format!(
-                    "env update failed\n{}",
-                    escape_control(&error_toast_detail(&e))
-                ),
-            )
-        }
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "env update failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
     }
 }
 
@@ -23843,7 +23814,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
     }
     match field {
         ConfigRow::Name => CommitResult::from(commit_rename(app)),
-        ConfigRow::BaseUrl | ConfigRow::ApiKey => CommitResult::from(commit_endpoint(app)),
+        ConfigRow::BaseUrl | ConfigRow::ApiKey => CommitResult::from(commit_endpoint(app, field)),
         ConfigRow::Model
         | ConfigRow::OpusModel
         | ConfigRow::SonnetModel
@@ -23888,16 +23859,11 @@ fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
         .and_then(|d| d.field(field))
         .map(|i| i.trimmed().to_string())
         .unwrap_or_default();
-    let mut models = {
-        let cfg = app.config();
-        cfg.find(&name)
-            .map(|p| p.models.clone())
-            .unwrap_or_default()
-    };
-    apply_model_field(&mut models, field, &raw);
     let result = {
         let mut cfg = app.config();
-        edit_profile_model(&mut cfg, &name, models)
+        edit_profile_model(&mut cfg, &name, |models| {
+            apply_model_field(models, field, &raw);
+        })
     };
     match result {
         Ok(()) => {
@@ -23993,19 +23959,21 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) -> bool {
     let value = value.map(|v| v + 0.0);
     let result = {
         let mut cfg = app.config();
-        match cfg.find_mut(&name) {
+        match cfg.find(&name) {
             None => None,
-            Some(profile) => {
-                let before = profile.bell_threshold;
-                profile.bell_threshold = value;
-                let saved = save_profile_config(profile);
-                if saved.is_err()
-                    && let Some(p) = cfg.find_mut(&name)
-                {
-                    p.bell_threshold = before;
+            Some(_) => match update_profile_config(&name, |p| {
+                p.bell_threshold = value;
+                Ok(())
+            }) {
+                Ok(None) => None,
+                Ok(Some(_)) => {
+                    if let Some(p) = cfg.find_mut(&name) {
+                        p.bell_threshold = value;
+                    }
+                    Some(Ok(()))
                 }
-                Some(saved)
-            }
+                Err(e) => Some(Err(e)),
+            },
         }
     };
     match result {
@@ -24095,16 +24063,11 @@ fn cycle_model(app: &mut App) {
         }
         return;
     };
-    let mut models = {
-        let cfg = app.config();
-        cfg.find(&name)
-            .map(|p| p.models.clone())
-            .unwrap_or_default()
-    };
-    models.default = next_model_preset(models.default.as_deref());
     let result = {
         let mut cfg = app.config();
-        edit_profile_model(&mut cfg, &name, models)
+        edit_profile_model(&mut cfg, &name, |models| {
+            models.default = next_model_preset(models.default.as_deref());
+        })
     };
     match result {
         Ok(()) => {
@@ -24502,35 +24465,33 @@ fn commit_env_value(app: &mut App, i: usize) -> bool {
         .as_ref()
         .map(|d| d.env_value.trimmed().to_string())
         .unwrap_or_default();
-    let key = {
+    let (present, key) = {
         let cfg = app.config();
-        cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+        let profile = cfg.find(&name);
+        (
+            profile.is_some(),
+            profile.and_then(|p| p.env.keys().nth(i).cloned()),
+        )
     };
-    let new_env = {
-        let cfg = app.config();
-        cfg.find(&name).map(|p| {
-            let mut env = p.env.clone();
-            if let Some(key) = key.clone() {
-                if value.is_empty() {
-                    // Unset, not blank: `edit_profile_env` strips the dropped
-                    // key from the live settings on its own (prev-key removal).
-                    env.remove(&key);
-                } else {
-                    env.insert(key, value.clone());
-                }
-            }
-            env
-        })
-    };
-    let Some(new_env) = new_env else {
+    if !present {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
         return true;
-    };
+    }
     let result = {
         let mut cfg = app.config();
-        edit_profile_env(&mut cfg, &name, new_env)
+        edit_profile_env(&mut cfg, &name, |env| {
+            if let Some(key) = &key {
+                if value.is_empty() {
+                    // Unset, not blank: `edit_profile_env` strips the dropped
+                    // key from the live settings on its own (prev-key removal).
+                    env.remove(key);
+                } else {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+        })
     };
     match result {
         Ok(()) => {
@@ -24638,20 +24599,20 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
             .unwrap_or(false)
     };
     if !exists {
-        let new_env = {
-            let cfg = app.config();
-            cfg.find(name).map(|p| {
-                let mut env = p.env.clone();
-                env.insert(key.to_string(), String::new());
-                env
-            })
-        };
-        let Some(new_env) = new_env else {
+        if app.config().find(name).is_none() {
             return false;
-        };
+        }
+        // An existing key is never re-blanked: one a peer added since the
+        // app's read keeps its value, and the cancel stays disarmed for it.
+        let mut added = false;
         if let Err(e) = {
             let mut cfg = app.config();
-            edit_profile_env(&mut cfg, name, new_env)
+            edit_profile_env(&mut cfg, name, |env| {
+                if !env.contains_key(key) {
+                    env.insert(key.to_string(), String::new());
+                    added = true;
+                }
+            })
         } {
             app.toast(
                 ToastKind::Danger,
@@ -24664,7 +24625,7 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
         }
         // The add persisted an empty placeholder; arm the cancel so an escape
         // in the value editor removes the row instead of keeping `key = ""`.
-        if let Some(d) = app.config_draft.as_mut() {
+        if added && let Some(d) = app.config_draft.as_mut() {
             d.env_just_added = Some(key.to_string());
         }
     }
@@ -24931,7 +24892,7 @@ fn commit_rename(app: &mut App) -> bool {
     }
 }
 
-fn commit_endpoint(app: &mut App) -> bool {
+fn commit_endpoint(app: &mut App, field: ConfigRow) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
         return false;
     };
@@ -24940,15 +24901,22 @@ fn commit_endpoint(app: &mut App) -> bool {
     };
     let active_field = d.active;
     let base_url = d.base_url.trimmed_some();
-    // An API key only makes sense with a base URL; drop it for OAuth.
-    let api_key = if base_url.is_some() {
-        d.api_key.trimmed_some()
-    } else {
-        None
-    };
+    let api_key = d.api_key.trimmed_some();
     let result = {
         let mut cfg = app.config();
-        edit_profile_endpoint(&mut cfg, &name, base_url, api_key)
+        // Only the committed row moves; the other half is the one disk holds
+        // now, so a peer's edit to it survives this commit.
+        edit_profile_endpoint(&mut cfg, &name, |url, key| {
+            if field == ConfigRow::ApiKey {
+                *key = api_key;
+            } else {
+                *url = base_url;
+            }
+            // An API key only makes sense with a base URL; drop it for OAuth.
+            if url.is_none() {
+                *key = None;
+            }
+        })
     };
     match result {
         Ok(()) => {
@@ -25165,61 +25133,55 @@ fn commit_new_account(app: &mut App) {
             }
         }
         Err(e) => {
-            let Some((mint, token)) = minted else {
-                // `config.add` is the event that makes the profile exist in this
-                // session, and every create helper runs it only after its
-                // `save_profile` succeeded — so the roster, never a disk read,
-                // answers "did the profile land" (`load_profile` returns a
-                // default-valued profile for one that was never written). A
-                // failed `save_profile` (nothing on disk, nothing in memory, or
-                // a rolled-back first-account link) keeps the form open with its
-                // draft and any captured login; a failure after the save (state
-                // write) closes onto the created profile, else `create failed`
-                // leaves the pane editing a profile that already exists.
-                if app
-                    .config()
-                    .find(&crate::profile::ProfileName::from(name.as_str()))
-                    .is_some()
-                {
-                    finish_created_profile(app, &name);
-                }
+            // `config.add` is the event that makes the profile exist in this
+            // session, and every create helper runs it only once the roster
+            // write landed — so memory, never a disk read, answers "did the
+            // profile land". A create that failed before that left nothing
+            // behind (its undo took back the dir and the live link it made), so
+            // the form stays open with its draft and any captured login; a
+            // failure after it (the first account's live settings write) closes
+            // onto the created profile, else `create failed` leaves the pane
+            // editing a profile that already exists.
+            let landed = app
+                .config()
+                .find(&crate::profile::ProfileName::from(name.as_str()))
+                .is_some();
+            if landed {
+                finish_created_profile(app, &name);
                 app.toast(
                     ToastKind::Danger,
                     format!("create failed\n{}", escape_control(&error_toast_detail(&e))),
                 );
                 return;
-            };
-            // Decide the rollback from the profile as saved on disk after the
-            // error (`run_add_client_token`'s shape, off `config.toml` alone):
-            // the profile save landed and only the state write failed -> it
-            // holds the minted key, keep the token; the save itself failed ->
-            // remove it. The token takes part in the comparison, never in a
-            // message.
-            let kept =
-                crate::profile::read_api_key(&crate::profile::ProfileName::from(name.as_str()))
-                    .ok()
-                    .flatten()
-                    .is_some_and(|saved| saved == token.expose());
-            if kept {
-                finish_created_profile(app, &name);
-                app.toast(
-                    ToastKind::Danger,
-                    format!(
-                        "create failed\n{} was created, but {e:#}",
-                        escape_control(&name)
-                    ),
-                );
-                return;
             }
+            let Some((mint, _token)) = minted else {
+                match chain_held_skipped("create", &e) {
+                    Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                    None => app.toast(
+                        ToastKind::Danger,
+                        format!("create failed\n{}", escape_control(&error_toast_detail(&e))),
+                    ),
+                }
+                return;
+            };
+            // No profile holds the minted token, so it is revoked; a revoke
+            // that fails names the token left stored, and any dir the undo
+            // left beside it.
             match crate::gateway_tokens::remove_client_token(&mint.record, &name) {
                 Ok(_) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
-                Err(removal) => app.toast(
-                    ToastKind::Danger,
-                    format!(
-                        "create failed\nthe token for {} is stored but no profile was created: {removal:#}",
-                        escape_control(&name),
-                    ),
-                ),
+                Err(removal) => {
+                    let left = e
+                        .downcast_ref::<crate::actions::CreateUndoIncomplete>()
+                        .map(crate::actions::CreateUndoIncomplete::note)
+                        .unwrap_or_default();
+                    app.toast(
+                        ToastKind::Danger,
+                        format!(
+                            "create failed\nthe token for {} is stored but no profile was created: {removal:#}{left}",
+                            escape_control(&name),
+                        ),
+                    );
+                }
             }
         }
     }
@@ -25837,6 +25799,23 @@ fn preset_target_block(
     }
 }
 
+/// The preset apply's re-check found the confirmed lists moved under the
+/// write, carrying the block as the write read it: the caller mirrors it and
+/// asks again over the fresh diff. Never rendered.
+#[derive(Debug)]
+struct PresetDiffMoved {
+    base_url: Option<String>,
+    models: ModelSettings,
+}
+
+impl std::fmt::Display for PresetDiffMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the preset's diff moved before the write")
+    }
+}
+
+impl std::error::Error for PresetDiffMoved {}
+
 /// Apply `preset` to `target`, asking first whenever it would change a value:
 /// the keep / clear confirm when the target holds a value the preset leaves
 /// unset, the plain confirm when it only replaces values, straight through
@@ -25955,10 +25934,44 @@ fn apply_preset_to(
         }
         PresetTarget::Account(name) => ProfileName::from(name.as_str()),
     };
-    let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
+    // Stamped onto the fields disk holds, never this copy: a field the preset
+    // does not set keeps a peer's edit, and a clear empties only the fields the
+    // confirm named.
+    let cleared: &[&str] = match leftover {
+        crate::presets::Leftover::Keep => &[],
+        crate::presets::Leftover::Clear => leaves,
+    };
+    // Re-checked against the fields as the write re-reads them: a field the
+    // preset replaces that the confirm did not name (a peer filled it after
+    // the check above) asks again. A leftover the confirm did not name is kept
+    // in both modes, so it needs no ask.
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(&mut cfg, &name, new_url, new_models)
+        edit_profile_preset(&mut cfg, &name, |url, models| {
+            let (fresh_replaces, _) = preset.apply_diff(url.as_deref(), models);
+            if !fresh_replaces.iter().all(|field| replaces.contains(field)) {
+                return Err(anyhow::Error::new(PresetDiffMoved {
+                    base_url: url.clone(),
+                    models: models.clone(),
+                }));
+            }
+            (*url, *models) = preset.applied_clearing(url, models, cleared);
+            Ok(())
+        })
+    };
+    let result = match result {
+        Err(e) => match e.downcast::<PresetDiffMoved>() {
+            Ok(moved) => {
+                if let Some(profile) = app.config().find_mut(&name) {
+                    profile.base_url = moved.base_url;
+                    profile.models = moved.models;
+                }
+                offer_preset_apply(app, target.clone(), &preset);
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        Ok(()) => Ok(()),
     };
     match result {
         Ok(()) => {
@@ -26128,20 +26141,23 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     }
     let outcome = {
         let mut cfg = app.config();
-        match cfg.find_mut(name) {
+        match cfg.find(name) {
             None => Outcome::Missing,
             Some(profile) if !profile.is_oauth() => Outcome::NotOAuth,
             Some(profile) => {
-                profile.auto_start = !profile.auto_start;
-                let now_on = profile.auto_start;
-                match save_profile_config(profile) {
-                    Ok(()) => Outcome::Saved(now_on),
-                    Err(e) => {
+                let now_on = !profile.auto_start;
+                match update_profile_config(name, |p| {
+                    p.auto_start = now_on;
+                    Ok(())
+                }) {
+                    Ok(None) => Outcome::Missing,
+                    Ok(Some(_)) => {
                         if let Some(p) = cfg.find_mut(name) {
-                            p.auto_start = !now_on;
+                            p.auto_start = now_on;
                         }
-                        Outcome::SaveFailed(e)
+                        Outcome::Saved(now_on)
                     }
+                    Err(e) => Outcome::SaveFailed(e),
                 }
             }
         }
@@ -26170,22 +26186,29 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     }
 }
 
-/// Flip `name`'s usage probe and save it, rolling memory back on a failed
-/// save. The probe leg reads the shared config each tick, so the switch
+/// Flip `name`'s usage probe onto its `config.toml` re-read under the flock,
+/// mirroring the saved switch into memory; a failed save leaves memory as it
+/// was. The probe leg reads the shared config each tick, so the switch
 /// reaches it without a token-list rebuild.
 fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
     let saved = {
         let mut cfg = app.config();
-        let Some(profile) = cfg.find_mut(name) else {
+        let Some(now_on) = cfg.find(name).map(|p| !p.usage_probe) else {
             return;
         };
-        profile.usage_probe = !profile.usage_probe;
-        let saved = save_profile_config(profile)
-            .map(|()| (profile.usage_probe, profile.usage_probe_interval_ms));
-        if saved.is_err() {
-            profile.usage_probe = !profile.usage_probe;
+        match update_profile_config(name, |p| {
+            p.usage_probe = now_on;
+            Ok(())
+        }) {
+            Ok(None) => return,
+            Ok(Some((fresh, ()))) => {
+                if let Some(p) = cfg.find_mut(name) {
+                    p.usage_probe = fresh.usage_probe;
+                }
+                Ok((fresh.usage_probe, fresh.usage_probe_interval_ms))
+            }
+            Err(e) => Err(e),
         }
-        saved
     };
     match saved {
         // Off, nothing reads the account any more.
@@ -26266,25 +26289,23 @@ fn write_usage_probe_interval(app: &mut App, ms: u64) -> bool {
         crate::profile::MIN_USAGE_PROBE_INTERVAL_MS,
         crate::profile::MAX_USAGE_PROBE_INTERVAL_MS,
     );
+    // Decided on the profile re-read under the flock, never memory's copy: a
+    // value a peer changed on disk is written back even when memory already
+    // shows the typed one, and an unchanged value writes nothing.
     let result = {
         let mut cfg = app.config();
-        match cfg.find_mut(&name) {
-            None => None,
-            Some(profile) => {
-                let before = profile.usage_probe_interval_ms;
-                profile.usage_probe_interval_ms = ms;
-                let saved = if ms == before {
-                    Ok(())
-                } else {
-                    save_profile_config(profile)
-                };
-                if saved.is_err()
-                    && let Some(p) = cfg.find_mut(&name)
-                {
-                    p.usage_probe_interval_ms = before;
+        match update_profile_config(&name, |p| {
+            p.usage_probe_interval_ms = ms;
+            Ok(())
+        }) {
+            Ok(None) => None,
+            Ok(Some((fresh, ()))) => {
+                if let Some(p) = cfg.find_mut(&name) {
+                    p.usage_probe_interval_ms = fresh.usage_probe_interval_ms;
                 }
-                Some(saved)
+                Some(Ok(()))
             }
+            Err(e) => Some(Err(e)),
         }
     };
     match result {
@@ -27115,10 +27136,11 @@ fn handle_rebind_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Store the current digest and mirror it into the in-memory state, so a later
-/// in-TUI `save_app_state` never writes it back absent. A failed store raises
-/// the house `save failed` toast and leaves memory unset — the confirm re-offers
-/// next launch.
+/// Store the current digest and mirror it into the in-memory state, so the
+/// running session reads the value it just stored; `cfg.state` is replaced by
+/// the next fresh save, and only the mirror keeps this process's view current
+/// until then. A failed store raises the house `save failed` toast and leaves
+/// memory unset — the confirm re-offers next launch.
 fn store_rebind_digest(app: &mut App, digest: &str) {
     match crate::actions::store_preset_binds_offered(digest.to_string()) {
         Ok(()) => {
@@ -27259,6 +27281,18 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
 /// before the yes.
 const NO_ADOPTED_CONFIG: &str = "no shunt config is adopted any more";
 
+/// Make the account an AdoptDivergence overwrite just wrote active. The
+/// activation runs in its own hold, so it re-checks the id there: a delete or
+/// rename landing after the overwrite's hold released must refuse the
+/// activation rather than write an off-roster marker.
+fn activate_adopted(cfg: &mut AppConfig, name: &ProfileName, account: &ProfileId) -> Result<()> {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        update_app_state(|s, held| s.set_active(Some(name.clone()), held))
+            .map(|state| cfg.state = state)
+    })
+}
+
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
@@ -27273,7 +27307,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // becomes the active one, a divergence's capture always (it
             // deactivates the prior one first). Settled before that detach,
             // so a held overwrite has changed nothing.
-            let relinks = from_divergence || {
+            let relinks = from_divergence.is_some() || {
                 let cfg = app.config();
                 cfg.is_active(&ProfileName::from(name.as_str()))
                     || cfg.state.active_profile.is_none()
@@ -27285,7 +27319,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         snapshot: snapshot.clone(),
                         name: name.clone(),
                         account: account.clone(),
-                        from_divergence,
+                        from_divergence: from_divergence.clone(),
                     },
                 ) else {
                     return;
@@ -27302,16 +27336,36 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
-                crate::actions::overwrite_captured_profile_with(
-                    &mut cfg,
-                    &name,
-                    &account,
-                    *snapshot,
-                    from_divergence,
-                )
+                match &from_divergence {
+                    Some(from) => while_divergence_stands(
+                        &mut cfg,
+                        &ProfileName::from(from.as_str()),
+                        *snapshot,
+                        |cfg, snapshot| {
+                            crate::actions::overwrite_captured_profile_held(
+                                cfg, &name, &account, snapshot, true,
+                            )
+                        },
+                    )
+                    .map(|outcome| {
+                        outcome.map(|oauth_moved| {
+                            if oauth_moved {
+                                crate::usage::expire_profile_ttl(&name);
+                            }
+                        })
+                    }),
+                    None => crate::actions::overwrite_captured_profile_with(
+                        &mut cfg, &name, &account, *snapshot, false,
+                    )
+                    .map(Ok),
+                }
             };
             match result {
-                Ok(()) => {
+                Ok(Err(moved)) => {
+                    let from = from_divergence.unwrap_or_default();
+                    app.toast(ToastKind::Warning, moved.skipped("overwrite", &from));
+                }
+                Ok(Ok(())) => {
                     app.refresh_tokens();
                     app.apply_forgets();
                     app.refresh_unsaved_live_login();
@@ -27320,18 +27374,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         format!("overwrote '{name}' with the captured login"),
                     );
                 }
-                Err(e) => {
-                    app.toast(
+                Err(e) => match chain_held_skipped("overwrite", &e) {
+                    Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                    None => app.toast(
                         ToastKind::Danger,
                         format!(
                             "overwrite failed\n{}",
                             escape_control(&error_toast_detail(&e))
                         ),
-                    );
-                }
+                    ),
+                },
             }
         }
-        ConfirmAction::AdoptDivergence(snapshot, name, account) => {
+        ConfirmAction::AdoptDivergence(snapshot, name, account, from) => {
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
@@ -27343,39 +27398,74 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     snapshot: snapshot.clone(),
                     name: name.clone(),
                     account: account.clone(),
+                    from: from.clone(),
                 },
             ) else {
                 return;
             };
             let name = ProfileName::from(name);
-            // Captured before the activation replaces the marker, through the
-            // one helper that also answers for a CLEARED marker — this arm can
-            // run after a `switch_off` left the departed account's `[env]` in
-            // the live file.
-            let outgoing_env_keys = crate::actions::outgoing_env_keys(&app.config());
+            // The store, the activation and the relink share one hold with the
+            // check that the divergence the prompt showed still stands.
             let result = {
                 let mut cfg = app.config();
-                overwrite_captured_profile(&mut cfg, &name, &account, *snapshot).and_then(|()| {
-                    with_state_lock(|held| {
-                        cfg.state.set_active(Some(name.clone()), held);
-                        save_app_state(&cfg.state)
-                    })
-                })
+                while_divergence_stands(
+                    &mut cfg,
+                    &ProfileName::from(from.as_str()),
+                    *snapshot,
+                    |cfg, snapshot| {
+                        // Captured before the activation replaces the marker,
+                        // through the one helper that also answers for a
+                        // CLEARED marker — this arm can run after a
+                        // `switch_off` left the departed account's `[env]` in
+                        // the live file — plus the keys disk holds for the
+                        // account it names active.
+                        let keys = crate::actions::outgoing_env_keys_now(cfg)?;
+                        let oauth_moved = crate::actions::overwrite_captured_profile_held(
+                            cfg, &name, &account, snapshot, false,
+                        )?;
+                        // This arm activates OUTSIDE `overwrite_captured_profile`,
+                        // so the settings write its own activate arms make has
+                        // to happen here too: an endpoint that never reaches
+                        // `settings.json` routes the live session at Anthropic
+                        // under a profile that says otherwise. In this hold, so
+                        // a peer's switch cannot land between the activation
+                        // and the write and have its settings overwritten. The
+                        // profile as disk holds it: the overwrite mirrored only
+                        // its own fields into memory, and a peer may have
+                        // edited the rest meanwhile.
+                        let activated = activate_adopted(cfg, &name, &account)
+                            .and_then(|()| force_link_profile_credentials(&name))
+                            .and_then(|()| {
+                                let fresh = crate::profile::read_profile(&name)?;
+                                crate::claude::apply_profile_to_claude_settings(&fresh, &keys)
+                            });
+                        Ok((oauth_moved, activated))
+                    },
+                )
             };
-            let result = result
-                .and_then(|()| force_link_profile_credentials(&name))
-                .and_then(|()| {
-                    // This arm activates OUTSIDE `overwrite_captured_profile`,
-                    // so the settings write its own activate arms make has to
-                    // happen here too: an endpoint that never reaches
-                    // `settings.json` routes the live session at Anthropic
-                    // under a profile that says otherwise.
-                    let cfg = app.config();
-                    let Some(profile) = cfg.find(&name) else {
-                        return Ok(());
-                    };
-                    crate::claude::apply_profile_to_claude_settings(profile, &outgoing_env_keys)
-                });
+            #[cfg(test)]
+            run_after_adopt_hold_hook();
+            let result = match result {
+                Ok(Ok((oauth_moved, activated))) => {
+                    // After the hold (the TTL store ranks below the flock),
+                    // whether or not the activation landed: the store moved.
+                    if oauth_moved {
+                        crate::usage::expire_profile_ttl(&name);
+                    }
+                    activated
+                }
+                Ok(Err(moved)) => {
+                    app.toast(ToastKind::Warning, moved.skipped("save", &from));
+                    return;
+                }
+                Err(e) => {
+                    if let Some(skipped) = chain_held_skipped("save", &e) {
+                        app.toast(ToastKind::Warning, skipped);
+                        return;
+                    }
+                    Err(e)
+                }
+            };
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
@@ -27410,7 +27500,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             perform_switch(app, &name);
         }
-        ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
+        ConfirmAction::DiscardDivergence(name, seen) => run_discard_divergence(app, &name, seen),
         ConfirmAction::RotateAll => {
             // Refuse if anything is in-flight. Bootstrap is a whole-worker
             // signal separate from per-profile activity; the flag covers the
@@ -27525,11 +27615,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // the state (the way `install` reads it), so heal writes the row the
             // user just asked for. Cancel never reaches here — the modal pops
             // without running the action.
-            {
-                let mut cfg = app.config();
-                cfg.state.herdr.delegate_row_text = !cfg.state.herdr.delegate_row_text;
-                let _ = save_app_state(&cfg.state);
-            }
+            let next = !app.config().state.herdr.delegate_row_text;
+            app.save_state_delta(|s, _held| s.herdr.delegate_row_text = next);
             app.apply_forgets();
             run_herdr_heal(app, &path);
         }
@@ -27856,15 +27943,25 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             let action = actions[state.cursor.min(last)].clone();
             let active = state.active.clone();
+            let seen = state.seen;
             app.pop_modal();
             match action {
                 DivergenceAction::SwitchToOwner(owner) => {
                     // Same confirmed path as the "save elsewhere" picker: the
                     // live login is captured into its own profile, which then
                     // becomes active. Nothing is lost, nothing else rewritten.
+                    // The owner was named for the login the prompt read, so
+                    // only that login is captured.
                     let Some(snapshot) = capture_live_or_toast(app) else {
                         return;
                     };
+                    if creds_fingerprint(snapshot.credentials.as_ref()) != seen {
+                        app.toast(
+                            ToastKind::Warning,
+                            DivergenceMoved::Login.skipped("save", &active),
+                        );
+                        return;
+                    }
                     let Some(account) = claim_or_toast(app, &owner, "save failed") else {
                         return;
                     };
@@ -27880,40 +27977,82 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                             Box::new(snapshot),
                             owner,
                             account,
+                            active,
                         ),
                     }));
                 }
-                DivergenceAction::Choice(choice) => run_divergence_choice(app, &active, choice),
+                DivergenceAction::Choice(choice) => {
+                    run_divergence_choice(app, &active, choice, seen);
+                }
             }
         }
         _ => {}
     }
 }
 
-fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
+/// Act on a divergence answer about `active`, whose live login the prompt read
+/// as `seen` (its fingerprint): every capture, relink or drop the answer makes
+/// is of that login only.
+fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, seen: Option<u64>) {
     match choice {
         DivergenceChoice::Overwrite => {
             // The relink below replaces the bare item: settled before the
             // snapshot, so a held overwrite has changed nothing.
-            let Some(_placed) =
-                bare_item_gate(app, BareItemWrite::DivergenceOverwrite(active.to_string()))
-            else {
+            let Some(_placed) = bare_item_gate(
+                app,
+                BareItemWrite::DivergenceOverwrite(active.to_string(), seen),
+            ) else {
                 return;
             };
-            let oauth_moved = {
+            let name = ProfileName::from(active);
+            // The capture and the relink share one hold with the check that
+            // disk still names the modal's account active and the live login
+            // is still the one the modal read.
+            let outcome = {
                 let mut cfg = app.config();
-                force_snapshot_active_credentials(&mut cfg)
+                crate::actions::while_disk_names_active(&mut cfg, &name, |cfg| {
+                    if live_creds_fingerprint() != seen {
+                        return Ok(Err(DivergenceMoved::Login));
+                    }
+                    // A login another account already stores is saved: the
+                    // answer captures nothing and only relinks `active`.
+                    let owner = crate::claude::live_login_owner_elsewhere(&name);
+                    let oauth_moved = if owner.is_some() {
+                        false
+                    } else {
+                        crate::actions::force_capture_live_login(cfg)?
+                    };
+                    Ok(Ok((
+                        oauth_moved,
+                        owner,
+                        force_link_profile_credentials(&name),
+                    )))
+                })
             };
-            let oauth_moved = match oauth_moved {
-                Ok(oauth_moved) => oauth_moved,
-                Err(e) => {
+            let (oauth_moved, saved_in, relinked) = match outcome {
+                Ok(Some(Ok(Ok(captured)))) => captured,
+                Ok(None) => {
                     app.toast(
-                        ToastKind::Danger,
-                        format!(
-                            "overwrite failed\n{}",
-                            escape_control(&error_toast_detail(&e))
-                        ),
+                        ToastKind::Warning,
+                        DivergenceMoved::Active.skipped("overwrite", active),
                     );
+                    return;
+                }
+                Ok(Some(Ok(Err(moved)))) => {
+                    app.toast(ToastKind::Warning, moved.skipped("overwrite", active));
+                    return;
+                }
+                Ok(Some(Err(e))) | Err(e) => {
+                    match chain_held_skipped("overwrite", &e) {
+                        Some(skipped) => app.toast(ToastKind::Warning, skipped),
+                        None => app.toast(
+                            ToastKind::Danger,
+                            format!(
+                                "overwrite failed\n{}",
+                                escape_control(&error_toast_detail(&e))
+                            ),
+                        ),
+                    }
                     return;
                 }
             };
@@ -27921,12 +28060,26 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 // A force snapshot removes the anchor, so an anchored profile
                 // forgets once and its `/profile` clock expires; only an
                 // unanchored snapshot of the same token forgets nothing.
-                crate::usage::expire_profile_ttl(&ProfileName::from(active));
+                crate::usage::expire_profile_ttl(&name);
             }
-            if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
+            if let Err(e) = relinked {
                 app.toast(
                     ToastKind::Danger,
                     format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+                );
+                return;
+            }
+            if let Some(owner) = saved_in {
+                // Nothing was saved into `active`, so no save is claimed and
+                // no quarantine lifts.
+                app.refresh_tokens();
+                app.refresh_unsaved_live_login();
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "nothing saved\n{}",
+                        crate::profile::ChainHeldElsewhere { owner }
+                    ),
                 );
                 return;
             }
@@ -27944,7 +28097,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 format!("saved live credentials into '{active}'"),
             );
         }
-        DivergenceChoice::NewProfile => open_divergence_target_picker(app),
+        DivergenceChoice::NewProfile => open_divergence_target_picker(app, active, seen),
         DivergenceChoice::Discard => {
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("discard the new login and restore '{active}'?"),
@@ -27953,28 +28106,57 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 ),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
+                on_confirm: ConfirmAction::DiscardDivergence(active.to_string(), seen),
             }));
         }
     }
 }
 
-fn run_discard_divergence(app: &mut App, active: &str) {
+/// Drop the live login the discard confirm showed (`seen`, its fingerprint)
+/// and relink `active`, in one hold with the check that disk still names
+/// `active` and the live login is still that one.
+fn run_discard_divergence(app: &mut App, active: &str, seen: Option<u64>) {
     // Discarding drops the live file's login, never a Keychain login no store
     // saved: the settle saves that into its owner first.
-    let Some(_placed) = bare_item_gate(app, BareItemWrite::DiscardDivergence(active.to_string()))
-    else {
+    let Some(_placed) = bare_item_gate(
+        app,
+        BareItemWrite::DiscardDivergence(active.to_string(), seen),
+    ) else {
         return;
     };
-    if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
-        app.toast(
-            ToastKind::Danger,
-            format!(
-                "discard failed\n{}",
-                escape_control(&error_toast_detail(&e))
-            ),
-        );
-        return;
+    let name = ProfileName::from(active);
+    let discarded = {
+        let mut cfg = app.config();
+        crate::actions::while_disk_names_active(&mut cfg, &name, |_| {
+            if live_creds_fingerprint() != seen {
+                return Ok(Err(DivergenceMoved::Login));
+            }
+            force_link_profile_credentials(&name).map(Ok)
+        })
+    };
+    match discarded {
+        Ok(Some(Ok(Ok(())))) => {}
+        Ok(None) => {
+            app.toast(
+                ToastKind::Warning,
+                DivergenceMoved::Active.skipped("discard", active),
+            );
+            return;
+        }
+        Ok(Some(Ok(Err(moved)))) => {
+            app.toast(ToastKind::Warning, moved.skipped("discard", active));
+            return;
+        }
+        Ok(Some(Err(e))) | Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "discard failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return;
+        }
     }
     app.toast(
         ToastKind::Warning,
@@ -27982,19 +28164,93 @@ fn run_discard_divergence(app: &mut App, active: &str) {
     );
 }
 
-/// Open the "save elsewhere" picker from the Divergence modal. Lists every
-/// profile except the active (diverged) one; a refresh-token match is
+/// The toast for a divergence answer about `active` that a peer's switch
+/// outran: disk names another account active, so nothing was captured,
+/// dropped or relinked.
+fn divergence_answer_skipped(action: &str, active: &str) -> String {
+    format!("{action} skipped\n'{active}' is no longer the active account")
+}
+
+/// What moved under a divergence answer while its prompt was open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergenceMoved {
+    /// Disk names another account active, or none.
+    Active,
+    /// The live credentials file holds another login than the prompt read.
+    Login,
+}
+
+impl DivergenceMoved {
+    /// The toast for an answer about `active`'s divergence that this outran:
+    /// nothing was stored, captured or relinked.
+    fn skipped(self, action: &str, active: &str) -> String {
+        match self {
+            Self::Active => divergence_answer_skipped(action, active),
+            Self::Login => {
+                format!("{action} skipped\nthe live login changed after the prompt opened")
+            }
+        }
+    }
+}
+
+/// Test seam: what a peer does right after the next divergence adopt's hold
+/// releases, run once.
+#[cfg(test)]
+static AFTER_ADOPT_HOLD: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn after_the_next_adopt_hold(f: impl FnOnce() + Send + 'static) {
+    if let Ok(mut hook) = AFTER_ADOPT_HOLD.lock() {
+        *hook = Some(Box::new(f));
+    }
+}
+
+#[cfg(test)]
+fn run_after_adopt_hold_hook() {
+    let hook = AFTER_ADOPT_HOLD
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+/// Run `act` with `snapshot` under one state flock hold only while the
+/// divergence the prompt showed still stands: disk names `from` active
+/// (mirrored into `cfg`) and the live credentials file still holds the
+/// snapshot's login. A peer's switch, a re-login or a refresh landing while
+/// the prompt was open would otherwise have the answer store a login the user
+/// never saw, or relink away one nobody saved.
+fn while_divergence_stands<T>(
+    cfg: &mut AppConfig,
+    from: &ProfileName,
+    snapshot: CaptureSnapshot,
+    act: impl FnOnce(&mut AppConfig, CaptureSnapshot) -> Result<T>,
+) -> Result<std::result::Result<T, DivergenceMoved>> {
+    let outcome = crate::actions::while_disk_names_active(cfg, from, |cfg| {
+        let live = serde_json::to_value(read_claude_credentials()?)?;
+        if live != serde_json::to_value(&snapshot.credentials)? {
+            return Ok(Err(DivergenceMoved::Login));
+        }
+        act(cfg, snapshot).map(Ok)
+    })?;
+    outcome.unwrap_or(Ok(Err(DivergenceMoved::Active)))
+}
+
+/// Open the "save elsewhere" picker from the Divergence modal about `active`.
+/// Lists every profile except that diverged one; a refresh-token match is
 /// pre-selected. With no other profile to pick, drops straight into a
 /// new-profile capture.
-fn open_divergence_target_picker(app: &mut App) {
+fn open_divergence_target_picker(app: &mut App, active: &str, seen: Option<u64>) {
     let (targets, preselect) = {
         let cfg = app.config();
-        let active = cfg.state.active_profile.as_deref();
         let targets: Vec<String> = cfg
             .profiles
             .iter()
             .map(|p| p.name.as_str().to_string())
-            .filter(|n| Some(n.as_str()) != active)
+            .filter(|n| n != active)
             .collect();
         let live = read_claude_credentials().ok().flatten();
         let preselect = find_matching_oauth_profile(&cfg, live.as_ref())
@@ -28003,10 +28259,12 @@ fn open_divergence_target_picker(app: &mut App) {
         (targets, preselect)
     };
     if targets.is_empty() {
-        begin_capture(app, true);
+        begin_capture(app, Some(active.to_string()), seen);
         return;
     }
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: active.to_string(),
+        seen,
         targets,
         cursor: preselect,
         scroll: std::cell::Cell::new(0),
@@ -28081,7 +28339,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if cursor == 0 {
-                begin_capture(app, true);
+                begin_capture(app, Some(form.from), form.seen);
                 return;
             }
             let Some(target) = form.targets.get(cursor - 1).cloned() else {
@@ -28090,6 +28348,13 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
+            if creds_fingerprint(snapshot.credentials.as_ref()) != form.seen {
+                app.toast(
+                    ToastKind::Warning,
+                    DivergenceMoved::Login.skipped("save", &form.from),
+                );
+                return;
+            }
             let Some(account) = claim_or_toast(app, &target, "save failed") else {
                 return;
             };
@@ -28108,7 +28373,12 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 )),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target, account),
+                on_confirm: ConfirmAction::AdoptDivergence(
+                    Box::new(snapshot),
+                    target,
+                    account,
+                    form.from,
+                ),
             }));
         }
         _ => {}
@@ -28262,19 +28532,19 @@ fn commit_capture_name(
     app: &mut App,
     name: String,
     snapshot: Box<CaptureSnapshot>,
-    from_divergence: bool,
+    from_divergence: Option<String>,
 ) {
     // The new profile becomes the active one, linking the live slot over the
     // bare item, when none is active or a divergence deactivates the prior
     // one. Settled before that detach, so a held capture has changed nothing.
-    let relinks = from_divergence || app.config().state.active_profile.is_none();
+    let relinks = from_divergence.is_some() || app.config().state.active_profile.is_none();
     let _placed = if relinks {
         let Some(placed) = bare_item_gate(
             app,
             BareItemWrite::CaptureName {
                 name: name.clone(),
                 snapshot: snapshot.clone(),
-                from_divergence,
+                from_divergence: from_divergence.clone(),
             },
         ) else {
             return;
@@ -28286,34 +28556,69 @@ fn commit_capture_name(
     // Divergence capture: detach + deactivate only after name is
     // confirmed so `capture_into_profile` sees `active_profile.is_none()`
     // and links the new one. On Esc this never runs. One hold, the name
-    // check first: a name taken meanwhile refuses with nothing detached.
-    let result = {
-        let mut cfg = app.config();
+    // check first: a name taken meanwhile refuses with nothing detached; a
+    // divergence that no longer stands captures and detaches nothing.
+    let capture = |cfg: &mut AppConfig, snapshot: CaptureSnapshot, detach: bool| {
         with_state_lock(|held| {
+            // Every refusal the create can raise, before the detach: a refused
+            // capture leaves the active account and its live link as they were.
             validate_profile_name(&name, Harness::Claude, None)?;
-            if from_divergence {
+            let profile = ProfileName::from(name.as_str());
+            crate::actions::refuse_leftover_login(&profile)?;
+            crate::profile::refuse_login_held_elsewhere(
+                &profile,
+                snapshot.credentials.as_ref(),
+                held,
+            )?;
+            if detach {
                 let _ = detach_credentials_link();
-                cfg.state.set_active(None, held);
-                let _ = save_app_state(&cfg.state);
+                if let Ok(saved) = update_app_state(|s, held| s.set_active(None, held)) {
+                    cfg.state = saved;
+                }
             }
-            capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
+            capture_into_profile(cfg, name.clone(), Default::default(), snapshot)
         })
     };
+    let result = {
+        let mut cfg = app.config();
+        match &from_divergence {
+            Some(from) => while_divergence_stands(
+                &mut cfg,
+                &ProfileName::from(from.as_str()),
+                *snapshot,
+                |cfg, snapshot| capture(cfg, snapshot, true),
+            ),
+            None => capture(&mut cfg, *snapshot, false).map(Ok),
+        }
+    };
     match result {
-        Ok(()) => {
+        Ok(Err(moved)) => {
+            let from = from_divergence.unwrap_or_default();
+            app.toast(ToastKind::Warning, moved.skipped("capture", &from));
+        }
+        Ok(Ok(())) => {
             app.refresh_tokens();
             app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("captured '{name}'"));
         }
-        Err(e) => app.toast(
-            ToastKind::Danger,
-            format!(
-                "capture failed\n{}",
-                escape_control(&error_toast_detail(&e))
+        Err(e) => match chain_held_skipped("capture", &e) {
+            Some(skipped) => app.toast(ToastKind::Warning, skipped),
+            None => app.toast(
+                ToastKind::Danger,
+                format!(
+                    "capture failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
             ),
-        ),
+        },
     }
+}
+
+/// The toast for an answer refused because another account already stores
+/// the login it would save, if `e` is that refusal: nothing was written.
+fn chain_held_skipped(action: &str, e: &anyhow::Error) -> Option<String> {
+    crate::profile::ChainHeldElsewhere::find(e).map(|held| format!("{action} skipped\n{held}"))
 }
 
 fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
@@ -28680,7 +28985,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
                 Box::new(snapshot),
                 session.name,
                 account,
-                false,
+                None,
             ),
         }));
         return;
@@ -29717,10 +30022,10 @@ fn drain_switch_gates(app: &mut App) {
             app.toast(ToastKind::Warning, notice);
         }
         match gate {
-            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed),
+            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed, true),
             oauth::AuthGate::Refreshed => {
                 app.refresh_tokens();
-                finalize_switch(app, &name, settled.placed);
+                finalize_switch(app, &name, settled.placed, true);
             }
             oauth::AuthGate::Broken => app.toast(
                 ToastKind::Danger,
@@ -29926,8 +30231,11 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
     // banner. This clears clauth's own symlink AND the macOS regular-file mirror CC
     // writes over it. The switch/defer gates apply the same exemption through
     // `live_diverged_and_unsaved`; the poll must adopt a first login before this
-    // point, so it checks the predicate directly here instead.
-    if crate::claude::live_login_is_stored(active) {
+    // point, so it checks the predicate directly here instead. The own-store
+    // half only: a login a sibling account stores is saved too, but it still
+    // raises the banner naming that owner, whose "switch to it" is the
+    // resolution (no default captures it, and a switch passes it as saved).
+    if crate::claude::live_login_in_own_store(active) {
         app.divergence_pending = None;
         return DivergenceVerdict::Clean;
     }
@@ -29955,7 +30263,8 @@ fn resolve_or_note_divergence(app: &mut App, active: &str) {
         // The default IS the resolution, so drop the banner it would otherwise
         // paint for the tick between resolving and the next poll's re-classify.
         app.divergence_pending = None;
-        run_divergence_choice(app, active, choice);
+        // No prompt waits here: the login the default resolves is the one live now.
+        run_divergence_choice(app, active, choice, live_creds_fingerprint());
     }
 }
 
@@ -29996,7 +30305,12 @@ fn startup_default(app: &App, active: &str) -> Option<crate::profile::Divergence
     if live_login_sibling_owner(app, active).is_some() {
         return None;
     }
-    app.config().state.default_divergence
+    // An `Overwrite` default cannot land on an account running on a
+    // long-lived token, which the prompt does not offer it for either.
+    app.config().state.default_divergence.filter(|choice| {
+        *choice != DivergenceChoice::Overwrite
+            || !crate::claude::has_session_token(&ProfileName::from(active))
+    })
 }
 
 /// Whether [`resolve_or_note_divergence`] will resolve a divergence on
@@ -30005,19 +30319,6 @@ fn startup_default(app: &App, active: &str) -> Option<crate::profile::Divergence
 /// default).
 fn divergence_resolves_to_banner(app: &App, active: &str) -> bool {
     startup_default(app, active).is_none()
-}
-
-/// SipHash of the live access token — a cheap identity for "which login sits in
-/// `~/.claude/.credentials.json` right now". It changes on every re-login and
-/// every refresh, so the banner's owner lookup re-runs exactly when the creds
-/// change. `None` when no readable OAuth login is present.
-fn live_creds_fingerprint() -> Option<u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let creds = read_claude_credentials().ok().flatten()?;
-    let token = creds.access_token().filter(|t| !t.is_empty())?;
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    Some(hasher.finish())
 }
 
 /// Clears `bootstrap_active` and posts `BootstrapDone` when dropped — success
@@ -30226,7 +30527,6 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
-        let _ = save_app_state(&cfg.state);
     }
     let _ = detach_credentials_link();
     Ok(())

@@ -20177,3 +20177,101 @@ fn a_gc_pass_spares_a_chain_row_whose_job_lands_after_its_snapshot() {
         "the job re-read spares the handed-off row"
     );
 }
+
+/// A rotating login whose refresh token is `refresh`, far from expiry.
+fn store_login(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: Some(4_102_444_800_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The refresh token `name`'s `credentials.json` holds.
+fn stored_refresh(name: &str) -> Option<String> {
+    let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("credentials.json");
+    let creds: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    creds.refresh_token().map(str::to_string)
+}
+
+/// Roster accounts `a` (`rt-A`) and `b` (`rt-B`), and a session file holding
+/// `a`'s stored login byte for byte, newer than `b`'s store: what a session
+/// tree drained or mirrored against `b` would carry. Returns the tree's dir
+/// guard, the session file and `b`'s store.
+fn a_session_file_holding_as_chain_beside_bs_older_store()
+-> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    for name in ["a", "b"] {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(store_login(
+            &format!("rt-{}", name.to_uppercase()),
+            &format!("at-{name}"),
+        ));
+        crate::profile::save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    let store = |name: &str| {
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("credentials.json")
+    };
+    let tree = tempfile::tempdir().expect("session tree");
+    let session_file = tree.path().join(".credentials.json");
+    fs::write(&session_file, fs::read(store("a")).expect("a's store")).expect("session file");
+    let b_store = store("b");
+    set_mtime(&b_store, SystemTime::now() - Duration::from_secs(600));
+    (tree, session_file, b_store)
+}
+
+/// Every store keeps its own chain: `a`'s single-use chain sits in `a`'s
+/// store alone.
+fn assert_each_store_keeps_its_own_chain() {
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-A"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-B"), "b's store");
+}
+
+/// The real-mode drain never copies a session file holding another account's
+/// stored chain into the member's store; it relinks the session onto the
+/// member's store, which drops nothing (the chain stays in `a`).
+#[test]
+fn the_drain_never_copies_a_chain_another_store_holds() {
+    let _home = HomeSandbox::new();
+    let (_tree, session_file, b_store) = a_session_file_holding_as_chain_beside_bs_older_store();
+    let drained =
+        crate::lock::with_state_lock(|_held| sync_credentials_unlocked(&session_file, &b_store))
+            .expect("the drain");
+    assert!(!drained, "no login reached the store");
+    assert_each_store_keeps_its_own_chain();
+    assert_eq!(
+        fs::read_link(&session_file).expect("relinked"),
+        b_store,
+        "the session links b's store"
+    );
+}
+
+/// The fake-mode mirror never copies a newer session file holding another
+/// account's stored chain into the member's store; the store's login flows
+/// back over the session file, the relink's fake-mode counterpart.
+#[test]
+fn the_mirror_never_copies_a_chain_another_store_holds() {
+    let _home = HomeSandbox::new();
+    let (_tree, session_file, b_store) = a_session_file_holding_as_chain_beside_bs_older_store();
+    let wrote = crate::lock::with_state_lock(|_held| mirror_credentials(&session_file, &b_store))
+        .expect("the mirror");
+    assert!(!wrote, "no login reached the store");
+    assert_each_store_keeps_its_own_chain();
+    let session: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&fs::read(&session_file).expect("session file")).expect("parse");
+    assert_eq!(
+        session.refresh_token(),
+        Some("rt-B"),
+        "b's login flows back over the session file"
+    );
+}

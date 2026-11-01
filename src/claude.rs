@@ -11,7 +11,7 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
-    profile_dir, read_json_file, read_json_file_capped, save_profile,
+    profile_dir, read_json_file, read_json_file_capped, update_profile_login,
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
@@ -1229,7 +1229,28 @@ pub(crate) fn is_first_login(active: &ProfileName) -> Result<bool> {
     // CLA-SPLIT: a profile whose install source is its session token is never
     // "credential-less" — a live OAuth login must not be adopted over it.
     let expected = install_source_path(active)?;
-    Ok(is_first_login_at(&link, &expected))
+    // A login another account already stores is that account's, never
+    // `active`'s first: adopting it would put its chain in a second store.
+    Ok(is_first_login_at(&link, &expected) && !live_login_saved_elsewhere(active))
+}
+
+/// Whether the live login's refresh token sits in the stored
+/// `credentials.json` of a roster profile other than `active`: that login is
+/// saved, so no unsaved-login gate guards it and no capture may copy it. Reads
+/// the live file on every platform (on macOS, the Keychain mirror Claude Code
+/// keeps there) and the stores without the state flock; a read that fails
+/// answers "not saved", which keeps the gates armed.
+pub(crate) fn live_login_saved_elsewhere(active: &ProfileName) -> bool {
+    live_login_owner_elsewhere(active).is_some()
+}
+
+/// The account [`live_login_saved_elsewhere`] finds storing the live login.
+pub(crate) fn live_login_owner_elsewhere(active: &ProfileName) -> Option<ProfileName> {
+    let live = read_claude_credentials().ok()??;
+    let store = profile_dir(active).ok()?.join("credentials.json");
+    crate::profile::chain_holder_elsewhere(&store, &live)
+        .ok()
+        .flatten()
 }
 
 /// Path-based core of [`is_first_login`], split for testing. The OAuth check
@@ -1284,7 +1305,20 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
 /// resolve in the TUI" until its retry TTL, and the TUI prompts about
 /// credentials that are fully saved (observed live 2026-07-21 on the macOS
 /// fork as a symlink; recurs there as a regular file after any CC session).
+///
+/// A third way: another account's store holds the live login's chain
+/// ([`live_login_saved_elsewhere`]). It is saved there, and re-installing over
+/// it loses nothing.
 pub(crate) fn live_login_is_stored(active: &ProfileName) -> bool {
+    live_login_in_own_store(active) || live_login_saved_elsewhere(active)
+}
+
+/// [`live_login_is_stored`]'s first two ways alone: clauth's own symlink, or
+/// `active`'s own store holding the live login. The TUI's divergence verdict
+/// asks this one, so a login a sibling account stores still raises the banner
+/// naming that owner (the switch gates, through [`live_diverged_and_unsaved`],
+/// let it pass as saved).
+pub(crate) fn live_login_in_own_store(active: &ProfileName) -> bool {
     let Ok(link) = claude_credentials_path() else {
         return false;
     };
@@ -1326,6 +1360,25 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     read_json_file(&path).map(Some)
 }
 
+/// SipHash of the live access token — a cheap identity for "which login sits in
+/// `~/.claude/.credentials.json` right now". It changes on every re-login and
+/// every refresh, so the banner's owner lookup re-runs exactly when the creds
+/// change, and a prompt about the live login can tell whether it is still the
+/// one it asked about. `None` when no readable OAuth login is present.
+pub(crate) fn live_creds_fingerprint() -> Option<u64> {
+    creds_fingerprint(read_claude_credentials().ok().flatten().as_ref())
+}
+
+/// [`live_creds_fingerprint`]'s identity of one read of the live login, so a
+/// snapshot taken after a prompt compares against the read the prompt made.
+pub(crate) fn creds_fingerprint(creds: Option<&ClaudeCredentials>) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let token = creds?.access_token().filter(|t| !t.is_empty())?;
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// True when the credentials hold NO usable login: no OAuth block, or one whose
 /// access AND refresh tokens are both absent/blank — Claude Code's logged-out
 /// shell (it blanks the tokens and zeroes `expiresAt` when its own refresh
@@ -1352,8 +1405,10 @@ pub(crate) fn live_credentials_are_shell() -> bool {
 /// a login worth protecting. Three diverging states carry nothing unsaved and are
 /// exempt — a first-login adoption (captured on switch, not stranded), a logged-out
 /// shell (blank tokens, see [`live_credentials_are_shell`]), and a login already
-/// saved in the profile's store (its content is captured, so re-installing loses
-/// no login, see [`live_login_is_stored`]). Routing every gate through this one
+/// saved in the profile's store or in another account's (its content is
+/// captured, so re-installing loses no login, see [`live_login_is_stored`]). A
+/// first login another account stores is no first login ([`is_first_login`]),
+/// so it reaches the stored exemption rather than a capture. Routing every gate through this one
 /// predicate keeps the exemptions from drifting apart. The underlying reads
 /// propagate their error; a boolean gate maps that to `false` with `.unwrap_or(false)`.
 pub(crate) fn live_diverged_and_unsaved(active: &ProfileName) -> Result<bool> {
@@ -1587,10 +1642,16 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
     if parsed.claude_ai_oauth.is_none() {
         return Ok(());
     }
-    crate::lock::with_state_lock(|_held| {
+    crate::lock::with_state_lock(|held| {
         let store_bytes = std::fs::read(store).ok();
         if store_bytes.as_deref() == Some(bytes.as_slice()) {
             return Ok(());
+        }
+        // Another account's store holds the item's chain: it is saved, and a
+        // carry would put it in a second store.
+        match crate::profile::refuse_chain_held_elsewhere(store, &parsed, held) {
+            Err(e) if crate::profile::ChainHeldElsewhere::find(&e).is_some() => return Ok(()),
+            other => other?,
         }
         if store.file_name().is_some_and(|f| f == "session-token.json") {
             logline!(
@@ -2270,6 +2331,7 @@ pub(crate) fn carry_bare_item_login_into(
             crate::oauth::SessionLoginCopy::Spent => return Ok(BareItemCarry::Kept),
             crate::oauth::SessionLoginCopy::Unknown => return Ok(BareItemCarry::Refused),
         }
+        crate::profile::refuse_chain_held_elsewhere(store, &parsed, held)?;
         let store_creds =
             store_value.and_then(|v| serde_json::from_value::<ClaudeCredentials>(v).ok());
         let bytes = crate::profile::serialize_credentials_preserving_extra(&parsed, store)?;
@@ -4106,7 +4168,7 @@ fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
 }
 
 /// Park `name`'s MCP-server logins out of a credential store about to be
-/// removed. `save_profile` deletes that file whenever a profile stops storing a
+/// removed. `write_profile_credentials` deletes that file whenever a profile stops storing a
 /// login (a recapture onto a third-party endpoint, a blanked OAuth login), and
 /// where the live slot is clauth's symlink that file IS what the slot resolves
 /// to — so the logins are already unreachable by the time any relink runs, and
@@ -5547,10 +5609,16 @@ fn snapshot_active_credentials_unchecked(
     // Fresh, not just the in-memory active marker: the active profile may have
     // been deleted or renamed out-of-process since this caller's config was
     // loaded (a daemon switch/switch-off holds a stale config between reloads).
-    // `save_profile` would recreate the deleted directory, so consult the
-    // on-disk list before writing. Callers run this under the state flock, so
-    // the read is stable.
+    // A write would recreate the deleted directory, so consult the on-disk
+    // list before writing. Callers run this under the state flock, so the read
+    // is stable.
     if !crate::profile::is_configured(active)? {
+        return Ok(false);
+    }
+    // The live login is the account disk names active: a caller whose copy
+    // predates a peer's switch would capture the peer's account's login into
+    // `active`'s store, two profiles then holding one single-use chain.
+    if crate::profile::load_app_state()?.active_profile.as_ref() != Some(active) {
         return Ok(false);
     }
     let credentials = read_claude_credentials()?;
@@ -5567,9 +5635,18 @@ fn snapshot_active_credentials_unchecked(
     if live_login_is_empty(&credentials) {
         return Ok(false);
     }
-    let Some(profile) = config.find_mut(active) else {
+    // A live login another account already stores is saved: capture nothing
+    // (no forget either), so the switch or answer riding on this goes on and
+    // the chain stays in its one store. Asked under the caller's hold, before
+    // the forget below.
+    if crate::profile::chain_holder_elsewhere(
+        &profile_dir(active)?.join("credentials.json"),
+        &credentials,
+    )?
+    .is_some()
+    {
         return Ok(false);
-    };
+    }
     // A disk-read login proves no uuid, so an anchored profile's identity moves
     // (an Unproven re-login forgets once); the non-force LinkedTo snapshot's
     // bytes are the store's own, so nothing is forgotten.
@@ -5599,8 +5676,16 @@ fn snapshot_active_credentials_unchecked(
     } else {
         None
     };
-    profile.set_credentials(Some(credentials), held);
-    save_profile(profile)?;
+    // The login lands on the profile re-read off disk: the caller's copy can
+    // predate a peer's edit to any other field of this account, or predate the
+    // account itself (a peer created and switched to it), which must not cost
+    // the login.
+    let Some(stored) = update_profile_login(active, credentials, held)? else {
+        return Ok(false);
+    };
+    if let Some(profile) = config.find_mut(active) {
+        profile.set_credentials(Some(stored), held);
+    }
     let oauth_changed = match plan {
         Some(plan) => {
             note_forget_plan(active, plan);

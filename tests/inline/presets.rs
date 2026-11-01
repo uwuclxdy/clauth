@@ -696,3 +696,59 @@ fn the_shipped_binds_digest_is_a_stable_literal() {
         "2903a49cd2ef4476f104b8bd169e0a29475727ce7505914b8bd7f1e4f3de3585"
     );
 }
+
+/// A model block whose every field holds its own value, prefixed `tag`.
+fn every_field(tag: &str) -> ModelSettings {
+    ModelSettings {
+        default: Some(format!("{tag}-default")),
+        opus: Some(format!("{tag}-opus")),
+        sonnet: Some(format!("{tag}-sonnet")),
+        haiku: Some(format!("{tag}-haiku")),
+        fable: Some(format!("{tag}-fable")),
+        subagent: Some(format!("{tag}-subagent")),
+    }
+}
+
+/// Applying a preset lands each of its values in the field of its own row, and
+/// a clear list clears only the field its label names: every value distinct,
+/// so a value bound to a neighbour's field reds.
+#[test]
+fn a_preset_applies_and_clears_each_field_by_its_own_row() {
+    let full = super::Preset {
+        name: "full".to_string(),
+        base_url: Some("p-url".to_string()),
+        models: every_field("p"),
+        builtin: false,
+    };
+    assert_eq!(
+        full.applied_to(
+            &Some("t-url".to_string()),
+            &every_field("t"),
+            super::Leftover::Keep
+        ),
+        (Some("p-url".to_string()), every_field("p"))
+    );
+    let opus_only = super::Preset {
+        name: "opus-only".to_string(),
+        base_url: None,
+        models: ModelSettings {
+            opus: Some("p-opus".to_string()),
+            ..ModelSettings::default()
+        },
+        builtin: false,
+    };
+    assert_eq!(
+        opus_only.applied_clearing(&Some("t-url".to_string()), &every_field("t"), &["sonnet"]),
+        (
+            Some("t-url".to_string()),
+            ModelSettings {
+                default: Some("t-default".to_string()),
+                opus: Some("p-opus".to_string()),
+                sonnet: None,
+                haiku: Some("t-haiku".to_string()),
+                fable: Some("t-fable".to_string()),
+                subagent: Some("t-subagent".to_string()),
+            }
+        )
+    );
+}

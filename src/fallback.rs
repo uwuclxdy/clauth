@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::actions::{switch_off_locked, switch_profile_locked};
+use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
@@ -3609,7 +3609,17 @@ pub(crate) fn auto_switch_if_needed(
                 // lock of its own.
                 match crate::profile::stored_login(&ProfileName::from(target.clone())) {
                     crate::profile::StoredLogin::HoldsLogin => {
-                        switch_profile_locked(config, &ProfileName::from(target.clone()))?
+                        // No AUTH-1 gate runs at the one-shot, and `gated: true`
+                        // only keeps the hold from refusing every switch with a
+                        // `GateNeeded` the caller would swallow. The walk excluded
+                        // the members flagged in this process's config copy
+                        // (`snapshot.broken`); a flag that copy lacks is not
+                        // re-checked in this hold.
+                        switch_profile_locked_gated(
+                            config,
+                            &ProfileName::from(target.clone()),
+                            true,
+                        )?
                     }
                     crate::profile::StoredLogin::HoldsNone
                     | crate::profile::StoredLogin::Unknown => {

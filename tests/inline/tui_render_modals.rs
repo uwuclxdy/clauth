@@ -2195,6 +2195,8 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
     };
     let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
     let target = DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 24,
         scroll: std::cell::Cell::new(0),
@@ -2523,6 +2525,8 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
     let divergence = crate::tui::app::DivergenceForm {
         active: "work".into(),
         sibling: Some("other".into()),
+        long_lived: false,
+        seen: None,
         cursor: 3,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2577,6 +2581,8 @@ fn divergence_target_pages_lines_without_skipping_an_option() {
         .map(|i| format!("wrap{i:02} {}", "x".repeat(50)))
         .collect();
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
@@ -2795,6 +2801,8 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
     app.open_modal(Modal::Divergence(DivergenceForm {
         active: "work".into(),
         sibling: Some("other".into()),
+        long_lived: false,
+        seen: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2814,6 +2822,8 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
     let mut app = empty_app(Tab::Overview);
     let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
@@ -4577,7 +4587,7 @@ fn a_toast_over_the_modal_caret_hides_the_native_cursor() {
             plan: None,
         }),
         input: InputState::new("a name typed into the field"),
-        from_divergence: false,
+        from_divergence: None,
     }));
 
     // At 80x24 the caret is clear of the stack: it lands on the same cell it
@@ -4893,6 +4903,8 @@ fn pick_one_modals_take_the_action_menu_row_look() {
             Modal::Divergence(DivergenceForm {
                 active: "x".into(),
                 sibling: None,
+                long_lived: false,
+                seen: None,
                 cursor: 0,
                 scroll: Cell::new(0),
                 viewport: Cell::new(0),
@@ -4904,6 +4916,8 @@ fn pick_one_modals_take_the_action_menu_row_look() {
         (
             "divergence target",
             Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 cursor: 1,
                 scroll: Cell::new(0),
@@ -5064,6 +5078,8 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
         (
             "+ new account",
             Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 cursor: 0,
                 scroll: Cell::new(0),
@@ -5122,6 +5138,8 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
     // Unselected: cursor 1 leaves the `+ new` row one row above the caret.
     let mut app = empty_app(Tab::Overview);
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "x".into(),
+        seen: None,
         targets: vec!["b".into()],
         cursor: 1,
         scroll: Cell::new(0),
@@ -5363,6 +5381,8 @@ fn pick_one_suffix_env_and_wrapped_rows_tint_their_whole_block() {
     // row after it is untinted.
     let mut app = empty_app(Tab::Overview);
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "x".into(),
+        seen: None,
         targets: vec![
             "a-very-long-account-name-that-wraps-across-several-rows-in-the-picker".into(),
         ],

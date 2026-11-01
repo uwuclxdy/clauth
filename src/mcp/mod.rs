@@ -1425,6 +1425,7 @@ across accounts."
         };
 
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        delegate_config_loaded();
         let isolation = if isolated.unwrap_or(false) {
             Isolation::Isolated
         } else {
@@ -1491,7 +1492,8 @@ across accounts."
             // and the credit-billed families each demand is judged against. A
             // blocking single target never reaches this arm, so it pays no
             // read it would not use.
-            let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+            let stale_env_keys = crate::actions::outgoing_env_keys_now(&config)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             let credit_billed = crate::claude_json::credit_billed_families();
             // A fan-out carrying `session_id` resumes that session on every
             // member, so its pre-flight judges the resume's own workspace,
@@ -1565,7 +1567,8 @@ across accounts."
                     // read only here: a blocking target re-reads them inside
                     // `run_delegate`, so a handler-wide read would parse
                     // `~/.claude.json` twice for that path.
-                    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+                    let stale_env_keys = crate::actions::outgoing_env_keys_now(&config)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                     let credit_billed = crate::claude_json::credit_billed_families();
                     let extra_args = args.unwrap_or_default();
                     let caller_env = env.unwrap_or_default();
@@ -3950,6 +3953,40 @@ fn apply_delegate_env(
         .env(DELEGATE_SESSION_ENV, session_id);
 }
 
+/// Test seam: a hook run once, right after the next delegate config load, in
+/// the window a peer's switch can land in before the strip list reads disk.
+/// Set through [`after_next_delegate_config_load`] by a test holding the home
+/// sandbox, whose lock serializes every other delegate test.
+#[cfg(test)]
+type ConfigLoadHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static AFTER_DELEGATE_CONFIG_LOAD: std::sync::Mutex<Option<ConfigLoadHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn after_next_delegate_config_load(
+    _home: &crate::testutil::HomeSandbox,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    if let Ok(mut slot) = AFTER_DELEGATE_CONFIG_LOAD.lock() {
+        *slot = Some(Box::new(hook));
+    }
+}
+
+/// Where a delegate path has just loaded its config: runs the test seam's
+/// hook, and nothing outside tests.
+fn delegate_config_loaded() {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DELEGATE_CONFIG_LOAD
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    {
+        hook();
+    }
+}
+
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
 /// `claude -p` with piped stdio, enforce whichever deadlines that run has, and
 /// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse and a
@@ -3968,6 +4005,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let entered = Instant::now();
     let handoff = opts.handoff.clone();
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
+    delegate_config_loaded();
     let profile_name = ProfileName::from(opts.profile);
     let target = config
         .find(&profile_name)
@@ -3990,8 +4028,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // (`switch_off` clears it without touching the file), the departed
     // account whose entries are still in the live settings (mirrors
     // `clauth start`). Read once here: the pre-flight's demand and the
-    // runtime acquire below both consume it.
-    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+    // runtime acquire below both consume it, with the outgoing account's keys
+    // as disk holds them: a peer's switch since the config read stamped them.
+    let stale_env_keys = crate::actions::outgoing_env_keys_now(&config)
+        .map_err(|e| format!("failed to load config: {e}"))?;
     // A resume must land in the workspace its transcript was recorded under, so
     // that resolution REPLACES the caller's cwd instead of sitting beside it; a
     // `cwd` that disagrees is a mistake worth naming, not one to spawn into.

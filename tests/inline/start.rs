@@ -1150,6 +1150,99 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
     );
 }
 
+/// A peer's switch after the start's config read stamps the account it made
+/// active into the live settings: the runtime the start builds strips that
+/// account's custom env too, read off disk, so the started account's runtime
+/// never inherits it.
+#[cfg(unix)]
+#[test]
+fn a_start_strips_the_env_a_peer_switch_stamped_after_its_config_read() {
+    use crate::testutil::HomeSandbox;
+
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let pair = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.credentials = Some(pair("departing"));
+    let mut peer = Profile::new("peer".to_string(), None, None);
+    peer.credentials = Some(pair("peer"));
+    peer.env
+        .insert("PEER_ONLY_KEY".to_string(), "peer-secret".to_string());
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    for profile in [&departing, &peer, &target] {
+        crate::profile::save_profile(profile).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["departing".into(), "peer".into(), "target".into()],
+        active_profile: Some("departing".into()),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("departing"))
+        .expect("link departing");
+    let config = crate::profile::load_config().expect("the start's read");
+
+    let mut peer_config = crate::profile::load_config().expect("peer read");
+    assert!(
+        crate::actions::switch_profile_locked(
+            &mut peer_config,
+            &crate::profile::ProfileName::from("peer")
+        )
+        .expect("peer switch"),
+        "fixture: the peer switched"
+    );
+    assert!(
+        crate::claude::claude_settings_env_keys()
+            .expect("live settings")
+            .contains(&"PEER_ONLY_KEY".to_string()),
+        "fixture: the peer's switch stamped its key live"
+    );
+
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let target_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("target"))
+        .expect("profile dir");
+    let observer = std::thread::spawn(move || crate::testutil::runtime_settings_until(&target_dir));
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("start");
+    let settings = observer
+        .join()
+        .expect("observer thread")
+        .expect("the runtime settings never appeared");
+    drop(shim);
+
+    let json: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    assert_eq!(
+        json["env"]["ANTHROPIC_BASE_URL"],
+        serde_json::json!("https://api.deepseek.com/anthropic"),
+        "fixture: the merge ran, pointing the runtime at the started endpoint"
+    );
+    assert!(
+        json["env"].get("PEER_ONLY_KEY").is_none(),
+        "the peer-switched account's env must not ride into the started runtime: {settings}"
+    );
+}
+
 // ── the start producer's launcher choice ─────────────────────────────────
 
 /// A `clauth start` row reads own: the producer passes `Launcher::Own`, so a

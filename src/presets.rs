@@ -79,21 +79,55 @@ impl Preset {
         models: &ModelSettings,
         leftover: Leftover,
     ) -> (Option<String>, ModelSettings) {
-        let pick = |mine: &Option<String>, theirs: &Option<String>| match (mine, leftover) {
-            (Some(_), _) => mine.clone(),
-            (None, Leftover::Keep) => theirs.clone(),
-            (None, Leftover::Clear) => None,
+        self.applied_where(base_url, models, |_| leftover == Leftover::Clear)
+    }
+
+    /// [`Self::applied_to`] clearing an unset field only where `clear` names
+    /// its row label (an [`Self::apply_diff`] `leaves` list): a field the
+    /// confirm never showed keeps its value.
+    pub(crate) fn applied_clearing(
+        &self,
+        base_url: &Option<String>,
+        models: &ModelSettings,
+        clear: &[&str],
+    ) -> (Option<String>, ModelSettings) {
+        self.applied_where(base_url, models, |label| clear.contains(&label))
+    }
+
+    fn applied_where(
+        &self,
+        base_url: &Option<String>,
+        models: &ModelSettings,
+        clear: impl Fn(&str) -> bool,
+    ) -> (Option<String>, ModelSettings) {
+        // Keyed by `block_rows`' own labels, the ones `apply_diff` hands the
+        // confirm, so a `clear` list always names the row it clears.
+        // Each field is then bound by its label, never by its row's position.
+        let ours = block_rows(self.base_url.as_deref(), &self.models);
+        let theirs = block_rows(base_url.as_deref(), models);
+        let rows: [(&str, Option<String>); 7] = std::array::from_fn(|row| {
+            let ((label, mine), (_, theirs)) = (ours[row], theirs[row]);
+            let value = match mine {
+                Some(mine) => Some(mine.to_string()),
+                None if clear(label) => None,
+                None => theirs.map(str::to_string),
+            };
+            (label, value)
+        });
+        let get = |want: &str| {
+            rows.iter()
+                .find(|(label, _)| *label == want)
+                .and_then(|(_, value)| value.clone())
         };
-        let m = &self.models;
         (
-            pick(&self.base_url, base_url),
+            get("base url"),
             ModelSettings {
-                default: pick(&m.default, &models.default),
-                opus: pick(&m.opus, &models.opus),
-                sonnet: pick(&m.sonnet, &models.sonnet),
-                haiku: pick(&m.haiku, &models.haiku),
-                fable: pick(&m.fable, &models.fable),
-                subagent: pick(&m.subagent, &models.subagent),
+                default: get("model"),
+                opus: get("opus"),
+                sonnet: get("sonnet"),
+                haiku: get("haiku"),
+                fable: get("fable"),
+                subagent: get("subagent"),
             },
         )
     }

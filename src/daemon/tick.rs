@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::actions::{switch_off_locked, switch_profile_locked};
+use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::logline::logline;
 use crate::profile::{ProfileName, load_config, reload_fingerprint};
 use crate::usage::{
@@ -113,16 +113,40 @@ impl super::Daemon {
     /// names, and every handed-off `--with-fallback` per-launch tree a job
     /// names; release every hold no job names any more.
     ///
-    /// This reads the job store and a config snapshot and returns; the blocking
-    /// half — the rotation lock, the state flock, the tree build — runs on the
-    /// worker. A tick that waited for it here would spend the run loop's
-    /// watchdog budget on another process's lock.
-    fn reconcile_background_holds(&mut self) {
+    /// This reads the job store, a config snapshot and, for the strip list,
+    /// `profiles.toml` plus the `config.toml` of the account it names active
+    /// (of every roster account when it names none), without the state flock,
+    /// under the config mutex; then it returns. The blocking half — the
+    /// rotation lock, the state flock, the tree build — runs on the worker. A
+    /// tick that waited for it here would spend the run loop's watchdog budget
+    /// on another process's lock.
+    pub(super) fn reconcile_background_holds(&mut self) {
         let Ok(cfg) = self.config.lock() else {
             return;
         };
         let names: Vec<ProfileName> = cfg.profiles.iter().map(|p| p.name.clone()).collect();
-        let stale_env_keys = crate::actions::outgoing_env_keys(&cfg);
+        // A strip list that does not read off disk this tick strips the
+        // snapshot's keys alone; the next tick reads it again.
+        let stale_env_keys = match crate::actions::outgoing_env_keys_now(&cfg) {
+            Ok(keys) => {
+                self.strip_list_failure = None;
+                keys
+            }
+            Err(e) => {
+                let kind = e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .map_or_else(|| "unparsed".to_string(), |io| format!("{:?}", io.kind()));
+                if self.strip_list_failure.as_deref() != Some(kind.as_str()) {
+                    logline!(
+                        "clauth daemon: could not re-read the active account's env keys, \
+                         background sessions use the loaded copy: {e:#}"
+                    );
+                    self.strip_list_failure = Some(kind);
+                }
+                crate::actions::outgoing_env_keys(&cfg)
+            }
+        };
         drop(cfg);
         self.background.reconcile(names, stale_env_keys);
     }
@@ -567,7 +591,8 @@ impl super::Daemon {
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
-                let changed = switch_profile_locked(&mut cfg, &target)?;
+                // The AUTH-1 gate ran above (`ensure_installable_from_main_loop`).
+                let changed = switch_profile_locked_gated(&mut cfg, &target, true)?;
                 Ok((returning, changed))
             })
         };

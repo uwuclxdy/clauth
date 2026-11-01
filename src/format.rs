@@ -576,6 +576,16 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
+/// The CLI switch over an unsaved live login whose outgoing account runs on a
+/// long-lived token: that account's store cannot take an OAuth login, so the
+/// switch does not offer to save it there.
+pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
+    format!(
+        "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
+         account first"
+    )
+}
+
 /// `clauth __oauth-token` on an expired token it will not refresh itself (the
 /// active profile, or a live session's own chain): the chain is usually fine,
 /// so the fix is the `claude` run that refreshes it, not a re-login.

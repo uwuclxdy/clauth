@@ -2627,6 +2627,7 @@ fn api_relogin_chain_walks_base_url_then_api_key() {
         },
         profiles: vec![api],
     });
+    crate::testutil::persist_profiles(&app.config().profiles);
     app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     assert_eq!(app.config_focus, ConfigFocus::Actions);
@@ -2709,6 +2710,7 @@ fn api_relogin_chain_keeps_the_cursor_on_the_field_being_typed() {
         },
         profiles: vec![api],
     });
+    crate::testutil::persist_profiles(&app.config().profiles);
     app.tab = super::Tab::Setup;
     app.profile_cursor.set(0);
     enter_config_detail(&mut app);
@@ -2770,6 +2772,8 @@ fn rekeying_an_endpoint_drops_the_live_broken_mark_immediately() {
         Some("https://api.z.ai/api/anthropic".to_string()),
         Some("old-key".to_string()),
     );
+    // A key commit keeps the base url disk holds, so the account is on disk.
+    crate::profile::save_profile(&api).expect("save api");
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -3915,6 +3919,7 @@ fn the_durable_auth_verdict_seeds_the_key_rejected_set_at_construction() {
     })
     .expect("persist app state");
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
         .expect("the credential has a fingerprint");
@@ -4864,6 +4869,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -4901,7 +4907,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
         d.active = Some(super::ConfigRow::ApiKey);
         d.api_key = super::InputState::new("k2");
     }
-    super::commit_endpoint(&mut app);
+    super::commit_endpoint(&mut app, super::ConfigRow::ApiKey);
 
     {
         let m = app.third_party_status.lock().unwrap();
@@ -4954,6 +4960,7 @@ fn the_seeded_key_rejection_heals_when_another_process_clears_the_record() {
     })
     .expect("persist app state");
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
         .expect("the credential has a fingerprint");
@@ -5000,6 +5007,7 @@ fn a_record_written_by_another_process_seeds_the_key_rejected_set_on_the_cadence
     })
     .expect("persist app state");
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
         .expect("the credential has a fingerprint");
@@ -5043,6 +5051,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -5084,7 +5093,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
             }),
             "zai".to_string(),
             crate::testutil::profile_id("zai"),
-            false,
+            None,
         ),
     );
 
@@ -5135,6 +5144,7 @@ fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -5164,7 +5174,7 @@ fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
             }),
             "zai".to_string(),
             crate::testutil::profile_id("zai"),
-            false,
+            None,
         ),
     );
 
@@ -5311,6 +5321,7 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -5643,6 +5654,7 @@ fn a_preset_apply_clears_the_old_providers_streak() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -5719,6 +5731,7 @@ fn a_preset_apply_keeping_the_endpoint_keeps_the_providers_streak() {
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     crate::profile::save_profile(&zai).expect("save the profile");
+    crate::testutil::register_names(&["zai"]);
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("zai")],
@@ -5781,6 +5794,7 @@ fn a_divergence_overwrite_clears_the_stale_status_chrome() {
     work.credentials = Some(login_creds("rt-work"));
     save_app_state(&AppState {
         profiles: vec![ProfileName::from("work")],
+        active_profile: Some(ProfileName::from("work")),
         ..AppState::default()
     })
     .expect("persist app state");
@@ -5866,6 +5880,7 @@ fn a_divergence_overwrite_lifts_the_auth_broken_quarantine() {
     work.credentials = Some(login_creds("rt-work"));
     save_app_state(&AppState {
         profiles: vec![ProfileName::from("work")],
+        active_profile: Some(ProfileName::from("work")),
         auth_broken: vec![ProfileName::from("work")],
         ..AppState::default()
     })
@@ -5942,6 +5957,7 @@ fn an_adopted_first_login_lifts_the_auth_broken_quarantine() {
     let work = Profile::new("work".to_string(), None, None);
     save_app_state(&AppState {
         profiles: vec![ProfileName::from("work")],
+        active_profile: Some(ProfileName::from("work")),
         auth_broken: vec![ProfileName::from("work")],
         ..AppState::default()
     })
@@ -6015,8 +6031,11 @@ fn config_rows_hybrid_shows_the_logout_row_for_its_oauth_pair() {
 fn hybrid_logout_clears_the_oauth_pair_and_keeps_the_api_shell() {
     use super::{ConfirmAction, run_confirm_action};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["hybrid"]);
 
-    let mut app = app_with(vec![hybrid("hybrid", Some("sk-secret"))]);
+    let hybrid = hybrid("hybrid", Some("sk-secret"));
+    crate::profile::save_profile(&hybrid).expect("save hybrid");
+    let mut app = app_with(vec![hybrid]);
     run_confirm_action(&mut app, ConfirmAction::BlankCredentials("hybrid".into()));
 
     let cfg = app.config();
@@ -6076,6 +6095,7 @@ fn pure_api_logout_clears_only_the_api_key() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
     )]);
+    crate::testutil::persist_profiles(&app.config().profiles);
     run_confirm_action(&mut app, ConfirmAction::BlankCredentials("api".into()));
 
     let cfg = app.config();
@@ -6096,9 +6116,11 @@ fn pure_oauth_logout_clears_the_credentials() {
     use super::{ConfirmAction, run_confirm_action};
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["oauth"]);
 
     let mut oauth = Profile::new("oauth".to_string(), None, None);
     oauth.credentials = Some(login_creds("ref"));
+    crate::profile::save_profile(&oauth).expect("save oauth");
     let mut app = app_with(vec![oauth]);
     run_confirm_action(&mut app, ConfirmAction::BlankCredentials("oauth".into()));
 
@@ -6170,6 +6192,7 @@ fn logging_out_over_a_torn_store_deletes_it() {
     use super::{ConfirmAction, run_confirm_action};
     use crate::profile::{Profile, ProfileName};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["oauth-torn", "api-torn"]);
 
     let (oauth, oauth_store) =
         torn_store_profile(Profile::new("oauth-torn".to_string(), None, None));
@@ -6221,6 +6244,7 @@ fn keyless_api_account_over_a_torn_store_logs_out() {
         .env
         .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-token".to_string());
     let (api, store) = torn_store_profile(profile);
+    crate::testutil::register_names(&["api-keyless"]);
     let mut app = app_with(vec![api]);
     app.config_draft = None;
     app.profile_cursor.set(0);
@@ -6717,6 +6741,7 @@ fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
     let mut profile = Profile::new("acct".to_string(), None, None);
     profile.auto_start = true;
     let mut app = app_with(vec![profile]);
+    crate::testutil::persist_profiles(&app.config().profiles);
 
     toggle_profile_disabled(
         &mut app,
@@ -6853,6 +6878,7 @@ fn disable_row_arms_on_first_press_confirms_on_second() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    crate::testutil::persist_profiles(&app.config().profiles);
     app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
@@ -6905,6 +6931,7 @@ fn enable_row_fires_immediately_no_arm() {
     let mut acct = Profile::new("acct".to_string(), None, None);
     acct.disabled = true;
     let mut app = app_with(vec![acct]);
+    crate::testutil::persist_profiles(&app.config().profiles);
     app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
@@ -7287,6 +7314,7 @@ fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
     acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
     acct.rolling_token = true;
     crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["roll"]);
     // A mint first, then the rolling stamp: the first stamp preserves the mint
     // into the backup slot — the exact two-file state a rolling profile
     // carries in production.
@@ -7374,6 +7402,7 @@ fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
     let mut acct = Profile::new("solo".to_string(), None, None);
     acct.rolling_token = true;
     crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["solo"]);
 
     let mut app = app_with(vec![acct]);
     app.profile_cursor.set(0);
@@ -7611,6 +7640,7 @@ fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
     acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
     acct.rolling_token = true;
     crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["stuck"]);
     seed_session_token("stuck", None);
     let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("stuck"))
         .expect("profile dir");
@@ -9650,6 +9680,7 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
 
     let acct = Profile::new("acct".to_string(), None, None);
     crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
     let mut app = app_with(vec![acct]);
     app.tab = Tab::Overview;
     app.profile_cursor.set(0);
@@ -9700,6 +9731,7 @@ fn a_menu_pick_runs_its_own_direction_after_a_peer_flipped_the_account() {
     let name = ProfileName::from("acct");
     let acct = Profile::new("acct".to_string(), None, None);
     crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
     let mut app = app_with(vec![acct]);
     app.tab = Tab::Overview;
     app.profile_cursor.set(0);
@@ -11480,7 +11512,7 @@ fn relogin_gate_maps_divergence_defaults() {
         matches!(
             app.modals.last(),
             Some(Modal::Confirm(state))
-                if matches!(&state.on_confirm, ConfirmAction::CaptureOverwrite(_, name, _, false) if name == "work")
+                if matches!(&state.on_confirm, ConfirmAction::CaptureOverwrite(_, name, _, None) if name == "work")
         ),
         "an unset divergence default must ask before overwriting"
     );
@@ -11550,9 +11582,11 @@ fn relogin_gate_maps_divergence_defaults() {
     );
 
     // Credential-less profile: nothing diverges → silent apply even when unset.
+    let work = Profile::new("work".to_string(), None, None);
+    crate::profile::save_profile(&work).expect("save work");
     let mut app = App::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![Profile::new("work".to_string(), None, None)],
+        profiles: vec![work],
     });
     apply_login(
         &mut app,
@@ -11940,7 +11974,7 @@ fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
         panic!("enter on switch-to-owner raises the adopt confirm");
     };
     assert!(
-        matches!(&confirm.on_confirm, ConfirmAction::AdoptDivergence(_, owner, _) if owner == "play"),
+        matches!(&confirm.on_confirm, ConfirmAction::AdoptDivergence(_, owner, _, _) if owner == "play"),
         "the confirm adopts the live login into its owner 'play'",
     );
     assert!(!confirm.choice, "the adopt confirm defaults to cancel");
@@ -12028,9 +12062,17 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
         profiles: vec![work, spare],
     });
     crate::testutil::register_names(&["work", "spare"]);
+    // The app's active marker is what disk holds, as a loaded config's is.
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
 
     // "save elsewhere" opens the picker listing only the non-active profile.
-    run_divergence_choice(&mut app, "work", DivergenceChoice::NewProfile);
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
     let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
         panic!("expected the target picker, got {:?}", app.modals.last());
     };
@@ -12050,7 +12092,7 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
         );
     };
     assert!(
-        matches!(&state.on_confirm, ConfirmAction::AdoptDivergence(_, name, _) if name == "spare"),
+        matches!(&state.on_confirm, ConfirmAction::AdoptDivergence(_, name, _, _) if name == "spare"),
         "the confirm adopts the live login into the chosen profile"
     );
 
@@ -12451,6 +12493,8 @@ fn adopting_a_divergence_writes_the_targets_endpoint_into_the_live_settings() {
         profiles: vec![active, target],
     });
 
+    // The app's memory is what disk holds, as a loaded config's is.
+    crate::profile::save_app_state(&app.config().state).expect("persist the app's state");
     let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
     run_confirm_action(
         &mut app,
@@ -12458,6 +12502,7 @@ fn adopting_a_divergence_writes_the_targets_endpoint_into_the_live_settings() {
             Box::new(snapshot),
             "ds-target".to_string(),
             crate::testutil::profile_id("ds-target"),
+            "work".to_string(),
         ),
     );
 
@@ -13814,6 +13859,7 @@ mod env_editor {
     fn app_with_env(env: BTreeMap<String, String>) -> App {
         let mut profile = Profile::new("acct".to_string(), None, None);
         profile.env = env;
+        crate::testutil::persist_profiles(std::slice::from_ref(&profile));
         App::new(AppConfig {
             state: AppState::default(),
             profiles: vec![profile],
@@ -13884,6 +13930,7 @@ mod env_editor {
     }
 
     fn app_with_profile(profile: Profile) -> App {
+        crate::testutil::persist_profiles(std::slice::from_ref(&profile));
         App::new(AppConfig {
             state: AppState::default(),
             profiles: vec![profile],
@@ -14198,6 +14245,7 @@ mod env_editor {
         let name = crate::profile::ProfileName::from("acct");
         let profile = Profile::new("acct".to_string(), None, None);
         crate::profile::save_profile(&profile).expect("seed account");
+        crate::testutil::register_names(&["acct"]);
         let settings_path = crate::profile::claude_dir()
             .expect("claude dir")
             .join("settings.json");
@@ -14357,6 +14405,9 @@ mod env_editor {
         let mut profile = Profile::new("acct".to_string(), None, None);
         profile.env = env;
         crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::testutil::register_names(&["acct"]);
+        crate::profile::update_app_state(|s, held| s.set_active(Some(name.clone()), held))
+            .expect("persist the active marker");
 
         // The owner-reported pre-state: the key is ALREADY in the live settings
         // with its old value, so the settings assert below exercises the
@@ -14427,6 +14478,9 @@ mod env_editor {
         let name = crate::profile::ProfileName::from("acct");
         let profile = Profile::new("acct".to_string(), None, None);
         crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::testutil::register_names(&["acct"]);
+        crate::profile::update_app_state(|s, held| s.set_active(Some(name.clone()), held))
+            .expect("persist the active marker");
         let state = AppState {
             active_profile: Some(name.clone()),
             ..AppState::default()
@@ -14516,6 +14570,7 @@ mod env_editor {
         let mut profile = Profile::new("acct".to_string(), None, None);
         profile.env = env;
         crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::testutil::register_names(&["acct"]);
         crate::claude::apply_profile_to_claude_settings(&profile, &[])
             .expect("seed the live settings");
         let state = AppState {
@@ -14582,6 +14637,9 @@ mod env_editor {
         let name = crate::profile::ProfileName::from("acct");
         let profile = Profile::new("acct".to_string(), None, None);
         crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::testutil::register_names(&["acct"]);
+        crate::profile::update_app_state(|s, held| s.set_active(Some(name.clone()), held))
+            .expect("persist the active marker");
         let state = AppState {
             active_profile: Some(name.clone()),
             ..AppState::default()
@@ -14656,6 +14714,7 @@ mod env_editor {
         let name = crate::profile::ProfileName::from("acct");
         let profile = Profile::new("acct".to_string(), None, None);
         crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::testutil::register_names(&["acct"]);
         let state = AppState {
             active_profile: Some(name.clone()),
             ..AppState::default()
@@ -15150,6 +15209,8 @@ fn preferred_is_exclusive_across_the_chain() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     b.preferred = true;
+    // The radio clears off each account's config as disk holds it.
+    crate::profile::save_profile(&b).expect("persist b's mark");
     let mut app = app_with_unlinked_profiles(vec![
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
         b,
@@ -15824,6 +15885,8 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut b = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     b.last_resort = true;
+    // The radio clears off each account's config as disk holds it.
+    crate::profile::save_profile(&b).expect("persist b's mark");
     let mut app = app_with_unlinked_profiles(vec![
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
         b,
@@ -16321,7 +16384,7 @@ fn capture_refuses_empty_snapshot() {
     use super::ToastKind;
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    super::begin_capture(&mut app, false);
+    super::begin_capture(&mut app, None, None);
     assert!(app.modals.is_empty(), "no name prompt on an empty snapshot");
     assert!(
         app.toasts
@@ -16436,7 +16499,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
         .push(super::Modal::CaptureName(super::CaptureNameForm {
             snapshot: Box::new(snapshot),
             input: super::InputState::new("acme"),
-            from_divergence: false,
+            from_divergence: None,
         }));
 
     super::handle_capture_name_key(&mut app, key(KeyCode::Enter));
@@ -16450,7 +16513,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
             assert!(
                 matches!(
                     &state.on_confirm,
-                    super::ConfirmAction::CaptureOverwrite(_, name, _, false) if name.as_str() == "acme"
+                    super::ConfirmAction::CaptureOverwrite(_, name, _, None) if name.as_str() == "acme"
                 ),
                 "collision must route to CaptureOverwrite targeting the existing profile"
             );
@@ -16500,7 +16563,7 @@ fn x_dismisses_a_toast_under_a_modal_but_stays_data_in_name_entry() {
             plan: None,
         }),
         input: super::InputState::new("acme"),
-        from_divergence: false,
+        from_divergence: None,
     }));
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
     match app.modals.last() {
@@ -16603,7 +16666,7 @@ fn capture_overwrite_cancel_changes_nothing() {
             Box::new(snapshot),
             "acme".to_string(),
             account,
-            false,
+            None,
         ),
     }));
 
@@ -17119,6 +17182,609 @@ fn tui_switch_refuses_a_quarantined_target_with_login_hint() {
             .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login broken")),
         "the refusal names the recovery"
     );
+}
+
+/// A profile store's refresh token, read straight off disk.
+fn store_refresh(name: &str) -> Option<String> {
+    let path = crate::profile::profile_dir(&ProfileName::from(name))
+        .ok()?
+        .join("credentials.json");
+    let creds: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    creds.refresh_token().map(str::to_string)
+}
+
+/// `a` active in memory and on disk, `b` on the roster beside it, and the live
+/// slot holding `b`'s stored login as a regular file — what a Claude Code run
+/// leaves when another account's saved login is live under `a`.
+fn app_with_active_a_over_bs_saved_login(
+    a: crate::profile::Profile,
+    b: crate::profile::Profile,
+) -> App {
+    use crate::profile::{AppConfig, AppState, save_app_state};
+    let names = vec![a.name.clone(), b.name.clone()];
+    save_app_state(&AppState {
+        active_profile: Some(a.name.clone()),
+        profiles: names.clone(),
+        fallback_chain: names.clone(),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    write_live_creds(b.credentials.as_ref().expect("b stored a login"));
+    App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(a.name.clone()),
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    })
+}
+
+/// A switch onto the MEMORY-ACTIVE target takes the AUTH-1 gate when the live
+/// slot serves another account's saved login: the relink would install the
+/// active account's stored login, so a dead one is refused and nothing is
+/// installed — the same predicate the CLI and MCP paths gate on.
+#[test]
+fn tui_switch_gates_a_dead_active_target_over_another_accounts_saved_login() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut a_profile = stored_oauth_profile("a", far_future());
+    // `a`'s own login is dead: no refresh token, long expired.
+    a_profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-a".to_string(),
+            refresh_token: None,
+            expires_at: Some(1),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&a_profile).expect("save a's dead store");
+    let a_store_bytes = std::fs::read(
+        crate::profile::profile_dir(&a)
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read a's store bytes");
+    let mut app =
+        app_with_active_a_over_bs_saved_login(a_profile, stored_oauth_profile("b", far_future()));
+    crate::profile::set_auth_broken_persisted(&a, true).expect("flag a on disk");
+    app.config().set_auth_broken(&a, true);
+
+    super::perform_switch(&mut app, &a);
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-b"),
+        "the live slot still serves b's saved login, unrelinked"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        None,
+        "a's dead store is untouched"
+    );
+    assert!(
+        std::fs::read(
+            crate::profile::profile_dir(&a)
+                .expect("dir")
+                .join("credentials.json"),
+        )
+        .expect("read a's store bytes")
+            == a_store_bytes,
+        "a's dead store bytes are untouched"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a.clone()),
+        "a stays active"
+    );
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login a")),
+        "the refusal names the recovery"
+    );
+}
+
+/// A live stage a failed persist left beside the active account's store lands
+/// under the gate before the switch relinks that store: the gate runs for a
+/// switch onto the active account over another account's saved login.
+#[test]
+fn tui_switch_lands_a_live_stage_before_relinking_onto_the_active_account() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_over_bs_saved_login(
+        stored_oauth_profile("a", far_future()),
+        stored_oauth_profile("b", far_future()),
+    );
+    let dir = crate::profile::profile_dir(&a).expect("a's dir");
+    let stage = dir.join("credentials.json.staged");
+    std::fs::write(
+        &stage,
+        serde_json::json!({
+            "base": crate::codex_auth::token_fingerprint("rt-a"),
+            "base_access": "at-a",
+            "creds": {"claudeAiOauth": {"accessToken": "at-mid", "refreshToken": "rt-mid",
+                     "expiresAt": 4102444800000i64, "subscriptionType": "max"}},
+        })
+        .to_string(),
+    )
+    .expect("write the stage");
+
+    super::perform_switch(&mut app, &a);
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("rt-mid"),
+        "the live stage lands before the relink"
+    );
+    assert!(!stage.exists(), "the stage is gone");
+    assert_eq!(
+        std::fs::read_link(
+            crate::profile::claude_dir()
+                .expect("claude dir")
+                .join(".credentials.json")
+        )
+        .expect("linked"),
+        dir.join("credentials.json"),
+        "the live slot links a's store"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "a stays active"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body == "switched to 'a'"),
+        "the switch lands"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.kind == ToastKind::Danger),
+        "nothing is refused"
+    );
+}
+
+/// The live slot serving the active account's OWN login keeps the direct path:
+/// nothing new to install, so no gate answers and no refresh is spent — even on
+/// a flagged account.
+#[test]
+fn tui_switch_keeps_the_direct_path_over_the_active_accounts_own_login() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let a_profile = stored_oauth_profile("a", far_future());
+    let mut app =
+        app_with_active_a_over_bs_saved_login(a_profile, stored_oauth_profile("b", far_future()));
+    crate::claude::force_link_profile_credentials(&a).expect("link a's own login live");
+    crate::profile::set_auth_broken_persisted(&a, true).expect("flag a on disk");
+    app.config().set_auth_broken(&a, true);
+
+    super::perform_switch(&mut app, &a);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the exemption answers on the UI thread, never through the gate"
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        std::fs::read_link(
+            crate::profile::claude_dir()
+                .expect("claude dir")
+                .join(".credentials.json")
+        )
+        .expect("linked"),
+        crate::profile::profile_dir(&a)
+            .expect("a's dir")
+            .join("credentials.json"),
+        "the live slot still links a's own store"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("rt-a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a.clone()),
+        "a stays active"
+    );
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body == "switched to 'a'"),
+        "the direct switch lands"
+    );
+}
+
+/// A peer relinking the live slot onto `c`'s login: the live login is now one
+/// another account stores, the write a TUI switch's gate-decision/hold race
+/// plants.
+fn peer_relinks_live_to_c() {
+    crate::claude::force_link_profile_credentials(&ProfileName::from("c"))
+        .expect("relink live onto c's login");
+}
+
+/// A peer switching the active account away to `b`: the other write a TUI
+/// switch's gate-decision/hold race plants.
+fn peer_switches_active_away() {
+    let mut peer = crate::profile::load_config().expect("peer read");
+    crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("b")).expect("peer switch");
+}
+
+/// `a` active in memory and on disk with its OWN dead login live (the slot
+/// links `a`'s store), `b` and `c` beside it, `a` flagged: a switch onto `a`
+/// skips the gate unless a peer write changes what the hold reads, and the gate
+/// then refuses the dead flagged target offline.
+fn app_with_active_a_flagged_and_own_login_live() -> App {
+    let a = ProfileName::from("a");
+    let mut a_profile = stored_oauth_profile("a", far_future());
+    // `a`'s own login is dead: no refresh token, long expired.
+    a_profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-a".to_string(),
+            refresh_token: None,
+            expires_at: Some(1),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&a_profile).expect("save a's dead store");
+    let app =
+        app_with_active_a_over_bs_saved_login(a_profile, stored_oauth_profile("b", far_future()));
+    // `c` on the roster with its own login, for the peer's relink.
+    let mut c = crate::profile::Profile::new("c".to_string(), None, None);
+    c.credentials = Some(creds_ra("rt-c", "at-c"));
+    crate::profile::save_profile(&c).expect("save c's store");
+    let mut state = crate::profile::load_app_state().expect("state");
+    if !state.profiles.iter().any(|n| n.as_str() == "c") {
+        state.profiles.push(ProfileName::from("c"));
+        crate::profile::save_app_state(&state).expect("persist state");
+    }
+    crate::claude::force_link_profile_credentials(&a).expect("link a's own login live");
+    crate::profile::set_auth_broken_persisted(&a, true).expect("flag a on disk");
+    app.config().set_auth_broken(&a, true);
+    app
+}
+
+/// A peer saving the live login elsewhere after the TUI's gate decision must
+/// send the flagged active account back through the gate: the hold re-reads the
+/// predicate and refuses rather than install the stored login.
+#[test]
+fn tui_switch_gates_a_flagged_active_after_a_peer_saves_the_live_login_elsewhere() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_flagged_and_own_login_live();
+    let a_store_bytes = std::fs::read(
+        crate::profile::profile_dir(&a)
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read a's store bytes");
+    crate::testutil::switch_race_seam::plant(peer_relinks_live_to_c);
+
+    super::perform_switch(&mut app, &a);
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        None,
+        "the live slot links the peer's relink target (c's own store)"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        None,
+        "a's dead store is untouched"
+    );
+    assert!(
+        std::fs::read(
+            crate::profile::profile_dir(&a)
+                .expect("dir")
+                .join("credentials.json"),
+        )
+        .expect("read a's store bytes")
+            == a_store_bytes,
+        "a's dead store bytes are untouched"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("c").as_deref(),
+        Some("rt-c"),
+        "c keeps its own chain"
+    );
+    let state = crate::profile::load_app_state().expect("state");
+    assert_eq!(state.active_profile, Some(a.clone()), "a stays active");
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login a")),
+        "the refusal names the recovery"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.kind == ToastKind::Success),
+        "nothing is claimed switched"
+    );
+    crate::testutil::switch_race_seam::assert_empty();
+}
+
+/// A peer switching away from the target after the TUI's gate decision must
+/// send the flagged target back through the gate: the hold re-reads the
+/// predicate and finds the target no longer active on disk.
+#[test]
+fn tui_switch_gates_a_flagged_target_after_a_peer_switches_away() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_flagged_and_own_login_live();
+    let a_store_bytes = std::fs::read(
+        crate::profile::profile_dir(&a)
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read a's store bytes");
+    crate::testutil::switch_race_seam::plant(peer_switches_active_away);
+
+    super::perform_switch(&mut app, &a);
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        None,
+        "the live slot links the peer's switch target (b's own store)"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        None,
+        "a's dead store is untouched"
+    );
+    assert!(
+        std::fs::read(
+            crate::profile::profile_dir(&a)
+                .expect("dir")
+                .join("credentials.json"),
+        )
+        .expect("read a's store bytes")
+            == a_store_bytes,
+        "a's dead store bytes are untouched"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("c").as_deref(),
+        Some("rt-c"),
+        "c keeps its own chain"
+    );
+    let state = crate::profile::load_app_state().expect("state");
+    assert_eq!(
+        state.active_profile,
+        Some(ProfileName::from("b")),
+        "the peer's switch stays active"
+    );
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login a")),
+        "the refusal names the recovery"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.kind == ToastKind::Success),
+        "nothing is claimed switched"
+    );
+    crate::testutil::switch_race_seam::assert_empty();
+}
+
+/// With no peer write the TUI exemption holds: the live slot serving the active
+/// account's own login still skips the gate, so nothing is gated or changed.
+#[test]
+fn tui_switch_keeps_the_exemption_over_its_own_login_with_no_peer_write() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_flagged_and_own_login_live();
+    let a_store_bytes = std::fs::read(
+        crate::profile::profile_dir(&a)
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read a's store bytes");
+
+    super::perform_switch(&mut app, &a);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the exemption answers on the UI thread, never through the gate"
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        None,
+        "the live slot still links a's own store"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        None,
+        "a's dead store is untouched"
+    );
+    assert!(
+        std::fs::read(
+            crate::profile::profile_dir(&a)
+                .expect("dir")
+                .join("credentials.json"),
+        )
+        .expect("read a's store bytes")
+            == a_store_bytes,
+        "a's dead store bytes are untouched"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("c").as_deref(),
+        Some("rt-c"),
+        "c keeps its own chain"
+    );
+    let state = crate::profile::load_app_state().expect("state");
+    assert_eq!(state.active_profile, Some(a.clone()), "a stays active");
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body == "switched to 'a'"),
+        "the direct switch lands"
+    );
+    crate::testutil::switch_race_seam::assert_empty();
+}
+
+/// The exemption is wider than the account's OWN login: the active account
+/// skips the gate whenever the live slot holds no login another account stores
+/// — an unsaved regular-file login included. `a` active and flagged, live slot
+/// an unsaved login: no gate, `switched to 'a'`, nothing changes.
+#[test]
+fn tui_switch_skips_the_gate_when_the_live_slot_holds_an_unsaved_login() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_over_bs_saved_login(
+        stored_oauth_profile("a", far_future()),
+        stored_oauth_profile("b", far_future()),
+    );
+    relogin_live("rt-unsaved");
+    crate::profile::set_auth_broken_persisted(&a, true).expect("flag a on disk");
+    app.config().set_auth_broken(&a, true);
+
+    super::perform_switch(&mut app, &a);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the exemption answers on the UI thread, never through the gate"
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body == "switched to 'a'"),
+        "the direct switch lands"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.kind == ToastKind::Danger),
+        "nothing is refused"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-unsaved"),
+        "the unsaved live login is untouched"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("rt-a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    let state = crate::profile::load_app_state().expect("state");
+    assert_eq!(state.active_profile, Some(a.clone()), "a stays active");
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
+}
+
+/// The TUI's exemption is decided on the DISK-active account, not memory: with
+/// memory naming `b` while disk names `a` (a peer switch the TUI has not
+/// reloaded), a switch onto `a` over `a`'s own live login makes no gate call
+/// and lands directly.
+#[test]
+fn tui_switch_decides_the_exemption_on_disk_active_not_memory() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let mut app = app_with_active_a_over_bs_saved_login(
+        stored_oauth_profile("a", far_future()),
+        stored_oauth_profile("b", far_future()),
+    );
+    crate::claude::force_link_profile_credentials(&a).expect("link a's own login live");
+    crate::profile::set_auth_broken_persisted(&a, true).expect("flag a on disk");
+    app.config().set_auth_broken(&a, true);
+    app.config().state.active_profile = Some("b".into());
+
+    super::perform_switch(&mut app, &a);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the exemption answers on the UI thread, never through the gate"
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body == "switched to 'a'"),
+        "the direct switch lands"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.kind == ToastKind::Danger),
+        "nothing is refused"
+    );
+    assert_eq!(
+        live_link_target(),
+        Some(store_path("a")),
+        "the live slot still links a's own store"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("rt-a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(active_on_disk(), Some(a.clone()), "a stays active");
+    assert!(app.config().is_auth_broken(&a), "a stays flagged");
 }
 
 #[test]
@@ -18394,6 +19060,7 @@ fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
     config.state.active_profile = Some("active".into());
     config.state.profiles = vec!["active".into()];
     config.state.default_divergence = Some(DivergenceChoice::Overwrite);
+    crate::profile::save_app_state(&config.state).expect("the active marker on disk");
 
     let mut app = App::new(config);
 
@@ -18744,6 +19411,7 @@ fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
     use crate::profile::{AppConfig, AppState};
 
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alice", "carol"]);
 
     // `blank_profile` defaults to `api_key: None`, so both are oauth — the add
     // is same-kind to a homogeneous chain and must skip the modal.
@@ -19141,6 +19809,7 @@ fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm
         .expect("the saved row lists beside the built-in");
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    crate::testutil::persist_profiles(&app.config().profiles);
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
@@ -19599,6 +20268,8 @@ fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
         }),
     });
     crate::profile::save_profile(&src).expect("save source");
+    // The duplicate copies its source off the roster and the config on disk.
+    crate::testutil::register_names(&["src"]);
 
     let mut app = app_with(vec![src]);
     app.tab = Tab::Setup;
@@ -19707,6 +20378,7 @@ fn a_saved_preset_applies_onto_another_account() {
     let mut target = Profile::new("target".to_string(), None, Some("sk-target".to_string()));
     target.api_key = Some("sk-target".to_string());
     crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
 
     let mut app = app_with(vec![src, target]);
     app.tab = Tab::Setup;
@@ -19780,6 +20452,7 @@ fn preset_apply_target() -> super::App {
     target.models.fable = Some("old-fable".to_string());
     target.models.subagent = Some("old-subagent".to_string());
     crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
 
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
@@ -20028,6 +20701,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     target.models.default = Some("opus".to_string());
     target.models.opus = Some("old-opus".to_string());
     crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
@@ -20069,6 +20743,7 @@ fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
     let mut target = Profile::new("target".to_string(), None, None);
     target.models.opus = Some("old-opus".to_string());
     crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
 
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
@@ -20796,23 +21471,29 @@ fn the_disabled_toggle_toast_escapes_the_control_bytes_in_the_missing_profile_ca
 fn a_save_failed_toast_keeps_the_whole_anyhow_chain() {
     use crate::profile::{AppConfig, AppState, Profile, ProfileName};
     let _home = crate::testutil::HomeSandbox::new();
-    // A directory at the profile's `config.toml` path: the save's atomic
-    // rename onto it fails for every uid (a file never renames onto a
-    // directory), so the write's own context rides over a real io cause.
-    let config_path = crate::profile::clauth_dir()
+    // On the roster, or the settings writer's fresh read finds no account to
+    // save.
+    crate::testutil::register_names(&["weekly"]);
+    // A profile directory that refuses new files: the writer's fresh read
+    // passes, its write fails, so the write's own context rides over a real
+    // io cause.
+    let profile_dir = crate::profile::clauth_dir()
         .unwrap()
         .join("profiles")
-        .join("weekly")
-        .join("config.toml");
-    std::fs::create_dir_all(&config_path).unwrap();
+        .join("weekly");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let _unwritable = crate::testutil::UnwritableDir::new(&profile_dir);
     let mut app = super::App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![Profile::new("weekly".to_string(), None, None)],
     });
     super::toggle_auto_start(&mut app, &ProfileName::from("weekly"));
+    let cause = std::io::Error::from_raw_os_error(13).to_string();
     assert_eq!(
-        app.toasts.back().map(|t| t.body.as_str()),
-        Some("save failed\nIs a directory (os error 21) · failed to write config.toml"),
+        app.toasts.back().map(|t| t.body.clone()),
+        Some(format!(
+            "save failed\n{cause} · failed to write config.toml"
+        )),
         "the toast body carries the chain, root cause first"
     );
 }
@@ -36183,8 +36864,13 @@ fn adopt_token_record(
 /// the checks recomputed (the record and store already sit on disk).
 fn token_app(profiles: Vec<crate::profile::Profile>) -> super::App {
     use crate::profile::{AppConfig, AppState};
+    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+    crate::testutil::register_names(&names);
     let mut app = super::App::new(AppConfig {
-        state: AppState::default(),
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
         profiles,
     });
     app.tab = super::Tab::Services;
@@ -38093,84 +38779,83 @@ fn dropping_the_armed_save_failure_guard_unconsumed_then_saving_succeeds() {
     );
 }
 
-/// A create failure after the profile save landed (only the state write
-/// failed) keeps the minted token and reports the profile as created-but-errored.
+/// Nothing of `name` is left after a create undid itself: no dir, no roster
+/// row on disk, no account in memory.
+fn assert_create_left_nothing(app: &super::App, name: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    assert!(
+        !crate::profile::profile_dir(&name).unwrap().exists(),
+        "the dir the create made is gone"
+    );
+    assert!(
+        !crate::profile::load_app_state()
+            .unwrap()
+            .profiles
+            .contains(&name),
+        "the roster on disk never names the account"
+    );
+    assert!(
+        app.config().find(&name).is_none(),
+        "memory never gains the account"
+    );
+}
+
+/// The `+ new profile` mint form, its name typed and the cursor on its
+/// `create account` row.
+fn minted_form_named(app: &mut super::App, name: &str) {
+    open_minted_form(app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new(name);
+    let create = super::config_rows(app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+}
+
+/// A create whose `profiles.toml` write fails after the mint leaves nothing
+/// half-created: the create undoes itself, the minted token is revoked, and
+/// the form stays open with the failure shown.
 #[test]
-fn a_state_write_failure_after_the_profile_save_keeps_the_token() {
+fn a_state_write_failure_after_the_mint_undoes_the_create_and_revokes_the_token() {
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
     let _env = crate::testutil::no_shunt_env(&home);
     adopt_token_record(&home, TOKEN_CONFIG, "");
     let mut app = token_app(Vec::new());
-    open_minted_form(&mut app);
-    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
-    let create = super::config_rows(&app)
-        .iter()
-        .position(|r| *r == super::ConfigRow::Create)
-        .expect("create row");
-    app.config_action_cursor = create;
+    minted_form_named(&mut app, "alice");
     let _fail = crate::profile::FailAppStateSave::new(&home);
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    assert_eq!(token_names(), vec!["alice"], "the minted token is kept");
+    assert_eq!(
+        token_names(),
+        Vec::<String>::new(),
+        "the minted token is revoked"
+    );
     assert_eq!(
         app.toasts.back().map(|t| (t.kind, t.body.as_str())),
         Some((
             super::ToastKind::Danger,
-            "create failed\nalice was created, but failed to write profiles.toml: Permission denied (os error 13)"
+            "create failed\nfailed to write profiles.toml: Permission denied (os error 13)"
         )),
-        "the kept-token copy by equality"
+        "the revoked-token copy by equality"
     );
-    let saved = crate::profile::load_profile(&crate::profile::ProfileName::from("alice")).unwrap();
-    let token = crate::gateway_tokens::ClientTokens::load()
-        .unwrap()
-        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
-        .unwrap()
-        .strip_prefix("alice:")
-        .unwrap()
-        .to_string();
+    assert_create_left_nothing(&app, "alice");
     assert_eq!(
-        saved.api_key.as_deref(),
-        Some(token.as_str()),
-        "the profile on disk holds the minted key"
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.trimmed().to_string()),
+        Some("alice".to_string()),
+        "the form stays open on its typed draft"
     );
     assert!(
-        app.config_draft.is_none(),
-        "the form closes onto the created profile"
-    );
-    assert_eq!(
-        app.config_focus,
-        super::ConfigFocus::Profiles,
-        "the pane shows the profile, not the actions list"
-    );
-    assert_eq!(app.profile_cursor.read(), 0, "the cursor lands on alice");
-    assert_eq!(
-        super::config_rows(&app),
-        vec![
-            super::ConfigRow::Name,
-            super::ConfigRow::BellThreshold,
-            super::ConfigRow::BaseUrl,
-            super::ConfigRow::ApiKey,
-            super::ConfigRow::Model,
-            super::ConfigRow::ModelOverrideAdd,
-            super::ConfigRow::EnvAdd,
-            super::ConfigRow::Login,
-            super::ConfigRow::DeleteCreds,
-            super::ConfigRow::Disabled,
-            super::ConfigRow::Delete,
-        ],
-        "the pane shows alice's ordinary existing-account rows"
-    );
-    assert!(
-        !renders(&app, "minted on save"),
-        "the mint marker is gone with the draft"
+        renders(&app, "minted on save"),
+        "the mint marker stays with the draft"
     );
 }
 
-/// The plain create's state-write failure (profile saved, `profiles.toml`
-/// write failed) also runs the shared success tail: the form closes onto the
-/// created profile instead of leaving the pane editing a profile that exists.
+/// The plain create's state-write failure leaves nothing half-created either:
+/// the create undoes itself and the form stays open on its typed draft.
 #[test]
-fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
+fn a_plain_create_state_write_failure_undoes_the_create_and_keeps_the_form_open() {
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
@@ -38202,31 +38887,96 @@ fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
         )),
         "the plain create-failure toast by equality"
     );
-    assert!(
-        app.config_draft.is_none(),
-        "the form closes onto the created profile"
+    assert_create_left_nothing(&app, "alice");
+    let draft = app.config_draft.as_ref().expect("the form stays open");
+    assert_eq!(
+        (
+            draft.name.trimmed(),
+            draft.base_url.trimmed(),
+            draft.api_key.trimmed()
+        ),
+        ("alice", "https://api.example.com", "k"),
+        "with its typed draft"
     );
     assert_eq!(
         app.profile_cursor.read(),
-        1,
-        "the cursor lands on alice, not bob"
+        app.profile_count(),
+        "the cursor stays on the `+ new` row"
+    );
+}
+
+/// A create undo that cannot remove the dir it made says so in the failure's
+/// own toast, never swallowed.
+#[test]
+fn a_create_undo_that_cannot_remove_its_dir_names_it_in_the_toast() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(Vec::new());
+    app.tab = super::Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    let _stuck = crate::actions::FailCreateUndo::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.clone())),
+        Some((
+            super::ToastKind::Danger,
+            format!(
+                "create failed\nfailed to write profiles.toml: Permission denied (os error 13) (rollback could not remove the profile directory: {})",
+                std::io::Error::from_raw_os_error(13)
+            )
+        )),
+        "the undo-failure copy by equality"
+    );
+    assert!(app.config_draft.is_some(), "the form stays open");
+}
+
+/// A mint create whose undo can neither revoke the token (the gateway's last
+/// one while it requires tokens) nor remove its dir names both in one toast.
+#[test]
+fn a_mint_create_whose_revoke_and_undo_both_fail_names_both_in_the_toast() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(
+        &home,
+        "[server]\nbind = \"127.0.0.1:3001\"\n[server.auth]\n",
+        "",
+    );
+    let mut app = token_app(Vec::new());
+    minted_form_named(&mut app, "alice");
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    let _stuck = crate::actions::FailCreateUndo::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.clone())),
+        Some((
+            super::ToastKind::Danger,
+            format!(
+                "create failed\nthe token for alice is stored but no profile was created: cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first (rollback could not remove the profile directory: {})",
+                std::io::Error::from_raw_os_error(13)
+            )
+        )),
+        "the two-failure copy by equality"
     );
     assert_eq!(
-        super::config_rows(&app),
-        vec![
-            super::ConfigRow::Name,
-            super::ConfigRow::BellThreshold,
-            super::ConfigRow::BaseUrl,
-            super::ConfigRow::ApiKey,
-            super::ConfigRow::Model,
-            super::ConfigRow::ModelOverrideAdd,
-            super::ConfigRow::EnvAdd,
-            super::ConfigRow::Login,
-            super::ConfigRow::DeleteCreds,
-            super::ConfigRow::Disabled,
-            super::ConfigRow::Delete,
-        ],
-        "the pane shows alice's ordinary existing-account rows"
+        token_names(),
+        vec!["alice"],
+        "the refused revoke leaves the token stored"
     );
 }
 
@@ -38596,6 +39346,7 @@ fn require_rig(
     })
     .unwrap();
     use crate::profile::{AppConfig, AppState};
+    crate::testutil::persist_profiles(&profiles);
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles,
@@ -40469,6 +41220,19 @@ fn bootstrap_one_shot_leaves_a_durably_key_rejected_third_party_active() {
         app.config().state.active_profile.as_deref(),
         Some("bravo"),
         "a durably key-rejected active must be walked away from at startup"
+    );
+    // The live login is bravo's saved chain: the walk captured it nowhere.
+    assert!(
+        !crate::profile::profile_dir(&ProfileName::from("alpha"))
+            .expect("dir")
+            .join("credentials.json")
+            .exists(),
+        "alpha stores no login"
+    );
+    assert_eq!(
+        stored_refresh("bravo").as_deref(),
+        Some("rt-bravo"),
+        "bravo's store"
     );
 }
 
@@ -53343,12 +54107,10 @@ fn space_still_expands_a_shunt_entry_disclosure_row() {
 #[test]
 fn space_on_a_confirms_destructive_button_does_nothing_while_enter_fires_it() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![oauth_profile(
-        "acct-one",
-        "access-acct-one",
-        None,
-        None,
-    )]);
+    crate::testutil::register_names(&["acct-one"]);
+    let acct_one = oauth_profile("acct-one", "access-acct-one", None, None);
+    crate::profile::save_profile(&acct_one).expect("save acct-one");
+    let mut app = app_with(vec![acct_one]);
     app.open_modal(super::Modal::Confirm(super::ConfirmState {
         message: "delete acct-one?".into(),
         detail: None,
@@ -55555,16 +56317,23 @@ fn a_save_elsewhere_confirm_lands_nothing_on_a_target_recreated_while_it_was_ope
     spare.credentials = Some(login_creds("rt-spare"));
     save_profile(&spare).expect("save spare");
     crate::testutil::register_names(&["work", "spare"]);
+    let state = AppState {
+        active_profile: Some("work".into()),
+        profiles: vec![n24_name("work"), n24_name("spare")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
     write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
     let mut app = App::new(AppConfig {
-        state: AppState {
-            active_profile: Some("work".into()),
-            profiles: vec![n24_name("work"), n24_name("spare")],
-            ..AppState::default()
-        },
+        state,
         profiles: vec![work, spare],
     });
-    run_divergence_choice(&mut app, "work", DivergenceChoice::NewProfile);
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
     handle_key(&mut app, key(KeyCode::Down));
     handle_key(&mut app, key(KeyCode::Enter));
     let Some(Modal::Confirm(state)) = app.modals.pop() else {
@@ -55583,6 +56352,38 @@ fn a_save_elsewhere_confirm_lands_nothing_on_a_target_recreated_while_it_was_ope
     assert_eq!(
         app.toasts.back().map(|t| t.body.as_str()),
         Some("save failed\nprofile 'spare' no longer exists"),
+    );
+}
+
+/// Link the live slot onto a file no account's store is, holding the login
+/// the divergence prompt read (`rt-fresh`): the live slot is a link a detach
+/// would cut, while the live login stays the unsaved one the answer was
+/// about. A store serving that login would make it saved, which every
+/// capture of it then refuses on its own.
+fn link_live_to_an_unsaved_copy_of_the_read_login() {
+    let dir = crate::profile::claude_dir().expect("claude dir");
+    let copy = dir.join("unsaved-login.json");
+    std::fs::write(
+        &copy,
+        serde_json::to_vec(&creds_ra("rt-fresh", "at-fresh")).expect("serialize"),
+    )
+    .expect("the unsaved copy");
+    let live = dir.join(".credentials.json");
+    match std::fs::remove_file(&live) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("unlink: {e}"),
+        _ => {}
+    }
+    crate::claude::create_symlink(&copy, &live).expect("link the live slot");
+    assert!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .profiles
+            .iter()
+            .all(|name| crate::profile::load_profile(name)
+                .expect("profile")
+                .refresh_token()
+                != Some("rt-fresh")),
+        "fixture: no store holds the read login"
     );
 }
 
@@ -55617,7 +56418,11 @@ fn a_refused_divergence_overwrite_keeps_the_active_account() {
         profiles: vec![work, spare],
     });
 
-    begin_capture(&mut app, true);
+    begin_capture(
+        &mut app,
+        Some("work".to_string()),
+        super::live_creds_fingerprint(),
+    );
     let Some(Modal::CaptureName(form)) = app.modals.last_mut() else {
         panic!("the capture asks for a name");
     };
@@ -55627,8 +56432,9 @@ fn a_refused_divergence_overwrite_keeps_the_active_account() {
         panic!("an existing name asks before the overwrite");
     };
     // A live slot that points elsewhere is a divergence too, so the active
-    // account can hold a link the detach would cut.
-    crate::claude::force_link_profile_credentials(&n24_name("work")).expect("link work");
+    // account can hold a link the detach would cut. The file it links still
+    // serves the unsaved login the prompt read, so the answer is not outrun.
+    link_live_to_an_unsaved_copy_of_the_read_login();
     let live = crate::profile::claude_dir()
         .expect("dir")
         .join(".credentials.json");
@@ -55637,7 +56443,7 @@ fn a_refused_divergence_overwrite_keeps_the_active_account() {
             .expect("meta")
             .file_type()
             .is_symlink(),
-        "precondition: the active account is linked"
+        "precondition: the live slot is a link"
     );
 
     n24_delete(&app, "spare");
@@ -55736,12 +56542,16 @@ fn a_refused_divergence_capture_keeps_the_active_link() {
         profiles: vec![work],
     });
 
-    begin_capture(&mut app, true);
+    begin_capture(
+        &mut app,
+        Some("work".to_string()),
+        super::live_creds_fingerprint(),
+    );
     let Some(Modal::CaptureName(form)) = app.modals.last_mut() else {
         panic!("the capture asks for a name");
     };
     form.input = InputState::new("taken");
-    crate::claude::force_link_profile_credentials(&n24_name("work")).expect("link work");
+    link_live_to_an_unsaved_copy_of_the_read_login();
     let live = crate::profile::claude_dir()
         .expect("dir")
         .join(".credentials.json");
@@ -55750,7 +56560,7 @@ fn a_refused_divergence_capture_keeps_the_active_link() {
             .expect("meta")
             .file_type()
             .is_symlink(),
-        "precondition: the active account is linked"
+        "precondition: the live slot is a link"
     );
     // Another process takes the name while the prompt is open.
     crate::actions::create_blank_profile(
@@ -56647,12 +57457,12 @@ fn an_active_capture_overwrite_is_held_as_itself() {
             held_snapshot(),
             "work".to_string(),
             crate::testutil::profile_id("work"),
-            false,
+            None,
         ),
     );
     assert!(matches!(
         held_write(&mut app),
-        super::BareItemWrite::CaptureOverwrite { ref name, from_divergence: false, .. }
+        super::BareItemWrite::CaptureOverwrite { ref name, from_divergence: None, .. }
             if name == "work"
     ));
     assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
@@ -56668,11 +57478,13 @@ fn a_divergence_adoption_is_held_as_itself() {
             held_snapshot(),
             "spare".to_string(),
             crate::testutil::profile_id("spare"),
+            "work".to_string(),
         ),
     );
     assert!(matches!(
         held_write(&mut app),
-        super::BareItemWrite::AdoptDivergence { ref name, .. } if name == "spare"
+        super::BareItemWrite::AdoptDivergence { ref name, ref from, .. }
+            if name == "spare" && from == "work"
     ));
     assert_eq!(stored_refresh("spare").as_deref(), Some("rt-spare"));
     assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
@@ -56698,10 +57510,10 @@ fn a_divergence_discard_is_held_as_itself() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = asking_app();
     let toasts = app.toasts.len();
-    super::run_discard_divergence(&mut app, "work");
+    super::run_discard_divergence(&mut app, "work", super::live_creds_fingerprint());
     assert!(matches!(
         held_write(&mut app),
-        super::BareItemWrite::DiscardDivergence(ref name) if name == "work"
+        super::BareItemWrite::DiscardDivergence(ref name, _) if name == "work"
     ));
     // The tick's prune: the answered settle's Keychain-check toast goes.
     app.prune_toasts();
@@ -56717,10 +57529,11 @@ fn a_divergence_overwrite_is_held_as_itself() {
         &mut app,
         "work",
         crate::profile::DivergenceChoice::Overwrite,
+        super::live_creds_fingerprint(),
     );
     assert!(matches!(
         held_write(&mut app),
-        super::BareItemWrite::DivergenceOverwrite(ref name) if name == "work"
+        super::BareItemWrite::DivergenceOverwrite(ref name, _) if name == "work"
     ));
     // The tick's prune: the answered settle's Keychain-check toast goes.
     app.prune_toasts();
@@ -56732,11 +57545,16 @@ fn a_divergence_overwrite_is_held_as_itself() {
 fn a_divergence_capture_is_held_as_itself() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = asking_app();
-    super::commit_capture_name(&mut app, "fresh".to_string(), held_snapshot(), true);
+    super::commit_capture_name(
+        &mut app,
+        "fresh".to_string(),
+        held_snapshot(),
+        Some("work".to_string()),
+    );
     assert!(matches!(
         held_write(&mut app),
-        super::BareItemWrite::CaptureName { ref name, from_divergence: true, .. }
-            if name == "fresh"
+        super::BareItemWrite::CaptureName { ref name, from_divergence: Some(ref from), .. }
+            if name == "fresh" && from == "work"
     ));
     assert!(!has_profile(&app, "fresh"));
     assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
@@ -56813,7 +57631,7 @@ fn a_held_capture_overwrite_lands_nothing_on_an_account_recreated_while_asked() 
             held_snapshot(),
             "work".to_string(),
             crate::testutil::profile_id("work"),
-            false,
+            None,
         ),
     );
     land_bare_item_answers(&mut app);
@@ -57891,7 +58709,7 @@ fn the_divergence_prompts_capture_the_file_and_the_capture_row_reads_off_the_ui_
         let text = body(handler);
         assert!(
             text.contains("capture_live_or_toast(app)")
-                || text.contains("begin_capture(app, true)"),
+                || text.contains("begin_capture(app, Some("),
             "{handler} captures the diverged file"
         );
         assert!(!text.contains("capture_snapshot()"), "{handler}");
@@ -57931,4 +58749,2227 @@ fn the_divergence_prompts_capture_the_file_and_the_capture_row_reads_off_the_ui_
         calls(worker) + calls(refresh),
         "the Keychain-first capture runs only behind those two workers"
     );
+}
+
+/// A TUI cycle site saves only its own delta onto a fresh read, so a switch and
+/// chain edit a peer landed meanwhile survive the keypress.
+#[test]
+fn a_cycle_keeps_the_switch_and_chain_edit_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, ProfileName, ResetDisplay};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        fresh.fallback_chain = vec![b.clone()];
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    super::cycle_reset_display(&mut app);
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.active_profile.as_ref(), Some(&b), "keeps the switch");
+    assert_eq!(after.fallback_chain, vec![b.clone()], "keeps the chain");
+    assert_eq!(
+        after.reset_display,
+        Some(ResetDisplay::Clock),
+        "applies the cycle's own delta"
+    );
+}
+
+/// A TUI bool toggle site flips off the fresh state, so it too keeps a
+/// concurrent switch and chain edit rather than rewinding them.
+#[test]
+fn a_bool_toggle_keeps_the_switch_and_chain_edit_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        show_estimates: false,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        fresh.fallback_chain = vec![b.clone()];
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    super::toggle_show_estimates(&mut app);
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.active_profile.as_ref(), Some(&b), "keeps the switch");
+    assert_eq!(after.fallback_chain, vec![b.clone()], "keeps the chain");
+    assert!(after.show_estimates, "flips the toggle's own field");
+}
+
+/// A herdr nested-field site applies its delta to the fresh state, keeping a
+/// concurrent switch and chain edit.
+#[test]
+fn a_herdr_toggle_keeps_the_switch_and_chain_edit_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, PopupWidth, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        fresh.fallback_chain = vec![b.clone()];
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    super::cycle_herdr_popup_width(&mut app);
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.active_profile.as_ref(), Some(&b), "keeps the switch");
+    assert_eq!(after.fallback_chain, vec![b.clone()], "keeps the chain");
+    assert_eq!(
+        after.herdr.popup_width,
+        PopupWidth::Half,
+        "cycles the herdr knob's own field"
+    );
+}
+
+/// Adding to the fallback chain goes through the fresh state, so a concurrent
+/// switch survives the push.
+#[test]
+fn a_chain_add_keeps_the_switch_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let mut a_profile = crate::testutil::blank_profile(&a);
+    a_profile.fallback_threshold = Some(crate::fallback::DEFAULT_THRESHOLD);
+    let mut b_profile = crate::testutil::blank_profile(&b);
+    b_profile.fallback_threshold = Some(crate::fallback::DEFAULT_THRESHOLD);
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![a_profile, b_profile],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    assert!(super::add_chain_candidate(&mut app, &b), "chain add");
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.active_profile.as_ref(), Some(&b), "keeps the switch");
+    assert_eq!(
+        after.fallback_chain,
+        vec![a.clone(), b.clone()],
+        "appends the selected member"
+    );
+}
+
+/// Removing a member from the fallback chain goes through the fresh state, so a
+/// concurrent switch survives the retain.
+#[test]
+fn a_chain_remove_keeps_the_switch_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let mut a_profile = crate::testutil::blank_profile(&a);
+    a_profile.fallback_threshold = Some(crate::fallback::DEFAULT_THRESHOLD);
+    let mut b_profile = crate::testutil::blank_profile(&b);
+    b_profile.fallback_threshold = Some(crate::fallback::DEFAULT_THRESHOLD);
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone(), b.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![a_profile, b_profile],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    super::remove_chain_member(&mut app, &a);
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.active_profile.as_ref(), Some(&b), "keeps the switch");
+    assert_eq!(
+        after.fallback_chain,
+        vec![b.clone()],
+        "removes the selected member"
+    );
+}
+
+/// The divergence-overwrite deactivate arm clears the marker on the FRESH state,
+/// so the peer's chain edit survives while the arm's own clear lands.
+#[test]
+fn a_deactivate_before_overwrite_keeps_the_chain_edit_made_meanwhile() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let a_profile = crate::testutil::blank_profile(&a);
+    crate::profile::save_profile(&a_profile).expect("save a");
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone(), b.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![a_profile],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.set_active(Some(b.clone()), held);
+        fresh.fallback_chain = vec![b.clone(), a.clone()];
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("meantime switch");
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: Some("https://api.anthropic.com".to_string()),
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
+            }),
+            "a".to_string(),
+            crate::testutil::profile_id("a"),
+            // The divergence answered is the one disk names after the peer's
+            // switch: an answer about `a` is outrun and writes nothing.
+            Some("b".to_string()),
+        ),
+    );
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(
+        after.active_profile.as_ref(),
+        Some(&a),
+        "the overwrite re-activates its own profile after the deactivate"
+    );
+    assert_eq!(
+        after.fallback_chain,
+        vec![b.clone(), a.clone()],
+        "keeps the peer's chain edit"
+    );
+}
+
+/// A toggle after a peer's roster change must not pin the peer's drift: the
+/// tick's reload still lists the new account.
+#[test]
+fn a_toggle_after_a_peer_roster_change_still_reloads_the_new_account() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let x = ProfileName::from("x");
+    let a_profile = crate::testutil::blank_profile(&a);
+    let x_profile = crate::testutil::blank_profile(&x);
+    save_profile(&a_profile).expect("save a");
+    save_app_state(&AppState {
+        profiles: vec![a.clone()],
+        active_profile: Some(a.clone()),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: AppState {
+            profiles: vec![a.clone()],
+            active_profile: Some(a.clone()),
+            ..AppState::default()
+        },
+        profiles: vec![a_profile],
+    });
+
+    // A peer adds x on disk after the app baselined its fingerprint.
+    crate::lock::with_state_lock(|_held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        if !fresh.profiles.iter().any(|n| n == &x) {
+            fresh.profiles.push(x.clone());
+        }
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("peer add");
+    save_profile(&x_profile).expect("save x");
+
+    super::toggle_show_pace(&mut app);
+
+    assert!(
+        app.reload_if_state_changed(),
+        "the toggle must not pin the peer's roster drift"
+    );
+    let cfg = app.config();
+    let names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "x"], "the reload lists the peer's new account");
+}
+
+/// A chain add checks the fresh chain for the name before pushing, so a member
+/// a peer added meanwhile is not duplicated.
+#[test]
+fn a_chain_add_does_not_duplicate_a_member_a_peer_added() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let a_profile = crate::testutil::blank_profile(&a);
+    let b_profile = crate::testutil::blank_profile(&b);
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![a_profile, b_profile],
+    });
+    // A peer pushes b onto the chain while the TUI's view is stale.
+    crate::lock::with_state_lock(|_held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        if !fresh.fallback_chain.contains(&b) {
+            fresh.fallback_chain.push(b.clone());
+        }
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("peer push");
+    assert!(super::add_chain_candidate(&mut app, &b), "chain add");
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(
+        after.fallback_chain,
+        vec![a.clone(), b.clone()],
+        "the member a peer added is not pushed twice"
+    );
+}
+
+/// A Config-tab toggle whose save fails surfaces the house `save failed` toast
+/// instead of silently doing nothing.
+#[test]
+fn a_config_toggle_save_failure_toasts_the_house_copy() {
+    use crate::profile::{AppConfig, AppState, FailAppStateSave, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let a_profile = crate::testutil::blank_profile(&a);
+    save_app_state(&AppState {
+        profiles: vec![a.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+    let mut app = super::App::new(AppConfig {
+        state: AppState {
+            profiles: vec![a.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![a_profile],
+    });
+    let _fail = FailAppStateSave::new(&_home);
+    super::toggle_show_pace(&mut app);
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\nfailed to write profiles.toml: Permission denied (os error 13)"],
+        "the danger toast is the house failed-write copy"
+    );
+    assert!(
+        !app.config().state.show_pace,
+        "the toggle does not silently flip when the save fails"
+    );
+}
+
+/// A chain add re-checks the fresh roster too, so an account a peer deleted
+/// meanwhile never gains a chain row a later account of that name would
+/// inherit.
+#[test]
+fn a_chain_add_skips_an_account_a_peer_deleted() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a.clone()),
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("persist state");
+    let mut app = super::App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![
+            crate::testutil::blank_profile(&a),
+            crate::testutil::blank_profile(&b),
+        ],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.remove(&b, held);
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("peer delete");
+    assert!(
+        !super::add_chain_candidate(&mut app, &b),
+        "the deleted account is not added"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["'b' is gone".to_string()],
+        "the skipped add says why"
+    );
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(after.profiles, vec![a.clone()], "the peer's delete stands");
+    assert_eq!(
+        after.fallback_chain,
+        vec![a.clone()],
+        "the deleted account gets no chain row"
+    );
+}
+
+/// The AdoptDivergence activation runs in its own hold after the overwrite's
+/// released, so it re-checks the id there: a peer delete landing between the
+/// two refuses the activation and leaves no marker on the deleted account.
+#[test]
+fn an_adopt_activation_refuses_an_account_a_peer_deleted() {
+    use crate::profile::{AppState, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&a)).expect("save a");
+    save_app_state(&AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(b.clone()),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    let account = crate::testutil::profile_id("a");
+    let mut cfg = crate::profile::load_config().expect("config");
+    crate::lock::with_state_lock(|held| {
+        let mut fresh = crate::profile::load_app_state()?;
+        fresh.remove(&a, held);
+        crate::profile::save_app_state(&fresh)
+    })
+    .expect("peer delete");
+    let err = super::activate_adopted(&mut cfg, &a, &account).expect_err("must refuse");
+    assert_eq!(err.to_string(), "profile 'a' no longer exists");
+    let after = crate::profile::load_app_state().expect("after");
+    assert_eq!(
+        after.active_profile.as_ref(),
+        Some(&b),
+        "the marker stays off the deleted account"
+    );
+}
+
+/// A refresh-interval step whose save fails puts the scheduler's interval back,
+/// so the cadence never runs at a value the Config row does not show.
+#[test]
+fn a_refresh_step_whose_save_fails_keeps_the_old_cadence() {
+    use crate::profile::{AppConfig, AppState, FailAppStateSave, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = AppState {
+        profiles: vec![ProfileName::from("a")],
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("state");
+    let mut app = super::App::new(AppConfig {
+        state,
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("a"))],
+    });
+    let _fail = FailAppStateSave::new(&_home);
+    super::step_refresh_interval(&mut app);
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\nfailed to write profiles.toml: Permission denied (os error 13)"],
+        "the failed step toasts the house copy"
+    );
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        90_000,
+        "the cadence stays at the saved interval"
+    );
+    assert_eq!(app.config().state.refresh_interval_ms, 90_000);
+}
+
+/// Every `update_app_state(` call in `src/tui/app.rs` sits in a known fn: the
+/// shared delta-save helper, which toasts the house `save failed` copy on Err;
+/// the AdoptDivergence activation, whose Err reaches its arm's toast; and the
+/// divergence capture's best-effort deactivate, whose capture toasts the
+/// outcome. A save anywhere else, a toggle bypassing the helper and dropping
+/// its Err included, reds here. A call spelled through a `use .. as` alias is
+/// the known residual.
+#[test]
+fn every_tui_update_app_state_call_sits_in_a_known_fn() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/app.rs");
+    let text = std::fs::read_to_string(&path).expect("read src/tui/app.rs");
+    let mut current = String::new();
+    let mut fns_seen = 0usize;
+    let mut sites: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or_default();
+        let head = code.trim_start();
+        let head = head.strip_prefix("pub(crate) ").unwrap_or(head);
+        if let Some(rest) = head.strip_prefix("fn ") {
+            current = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            fns_seen += 1;
+        }
+        let n = code.matches("update_app_state(").count();
+        if n > 0 {
+            *sites.entry(current.clone()).or_default() += n;
+        }
+    }
+    assert!(
+        fns_seen > 100,
+        "the scan saw {fns_seen} fns: it is not reading the module"
+    );
+    assert_eq!(
+        sites,
+        std::collections::BTreeMap::from([
+            ("activate_adopted".to_string(), 1),
+            ("commit_capture_name".to_string(), 1),
+            ("save_state_delta".to_string(), 1),
+        ]),
+        "an update_app_state call outside its known fns: an in-TUI state save goes \
+         through App::save_state_delta, which toasts a failed write"
+    );
+}
+
+/// Shutdown's final flush owns no state delta, so it must not rewrite
+/// profiles.toml on exit (a no-op verb never moves the reload fingerprint).
+#[test]
+fn shutdown_does_not_rewrite_profiles_toml() {
+    use crate::profile::{AppState, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("a")],
+        ..AppState::default()
+    })
+    .expect("state");
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    crate::testutil::set_mtime(&path, past);
+    let mut app = bare_app();
+    super::shutdown(&mut app).expect("shutdown");
+    let mtime = std::fs::metadata(&path)
+        .expect("meta")
+        .modified()
+        .expect("mtime");
+    assert_eq!(mtime, past, "shutdown leaves profiles.toml unrewritten");
+}
+
+/// Each `fn` under `rel` (a file, or every `.rs` file below a directory) keyed
+/// `path::fn`, path relative to `rel`, with how many `tokens` its lines hold
+/// outside `//` comments, plus how many fns the scan saw.
+fn sites_by_fn(rel: &str, tokens: &[&str]) -> (std::collections::BTreeMap<String, usize>, usize) {
+    fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let mut paths = Vec::new();
+    if root.is_dir() {
+        files(&root, &mut paths);
+    } else {
+        paths.push(root.clone());
+    }
+    let mut sites = std::collections::BTreeMap::new();
+    let mut fns_seen = 0usize;
+    for path in &paths {
+        let shown = path
+            .strip_prefix(&root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path.file_name().expect("file name").as_ref())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(path).expect("read source");
+        let mut current = String::new();
+        for line in text.lines() {
+            let code = line.split("//").next().unwrap_or_default();
+            let mut head = code.trim_start();
+            for prefix in ["pub(crate) ", "pub(super) ", "pub ", "const ", "async "] {
+                head = head.strip_prefix(prefix).unwrap_or(head);
+            }
+            if let Some(rest) = head.strip_prefix("fn ") {
+                current = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                fns_seen += 1;
+            }
+            let n: usize = tokens.iter().map(|t| code.matches(t).count()).sum();
+            if n > 0 {
+                *sites.entry(format!("{shown}::{current}")).or_default() += n;
+            }
+        }
+    }
+    (sites, fns_seen)
+}
+
+/// Every state read-for-save and every state save under `src/tui/` sits in a
+/// known fn: the shared delta-save helper, which toasts the house `save failed`
+/// copy on Err; the AdoptDivergence activation, whose Err reaches its arm's
+/// toast; and the divergence capture's best-effort deactivate, whose capture
+/// toasts the outcome. A raw `with_state_lock` + `load_fresh_state` +
+/// `save_app_state` save anywhere else reds here, in any file under the dir.
+/// The residual it cannot see: a call through a `use .. as` alias or a fn
+/// pointer, and a `crate::actions` helper that saves with no toast.
+#[test]
+fn every_tui_state_save_sits_in_a_known_fn() {
+    let (sites, fns_seen) = sites_by_fn(
+        "src/tui",
+        &["update_app_state(", "save_app_state(", "load_fresh_state("],
+    );
+    assert!(
+        fns_seen > 100,
+        "the scan saw {fns_seen} fns: it is not reading the dir"
+    );
+    assert_eq!(
+        sites,
+        std::collections::BTreeMap::from([
+            ("app.rs::activate_adopted".to_string(), 1),
+            ("app.rs::commit_capture_name".to_string(), 1),
+            ("app.rs::save_state_delta".to_string(), 1),
+        ]),
+        "a state save outside its known fns: an in-TUI state save goes through \
+         App::save_state_delta, which toasts a failed write"
+    );
+}
+
+/// Only a constructor and a reload set a reload fingerprint, in the TUI and
+/// the daemon alike: a save that adopted one would mark a peer's roster change
+/// as seen, and the tick would never reload it. The residual it cannot see: a
+/// struct-literal `last_reload_fp: …` outside the constructors, and a write
+/// through another name for the field.
+#[test]
+fn every_reload_fingerprint_write_sits_in_a_constructor_or_a_reload() {
+    let (sites, fns_seen) = sites_by_fn("src", &["last_reload_fp ="]);
+    assert!(
+        fns_seen > 1000,
+        "the scan saw {fns_seen} fns: it is not reading the tree"
+    );
+    assert_eq!(
+        sites,
+        std::collections::BTreeMap::from([
+            ("daemon/mod.rs::new".to_string(), 1),
+            ("daemon/tick.rs::reload_if_changed".to_string(), 1),
+            ("tui/app.rs::new".to_string(), 1),
+            ("tui/app.rs::reload_if_state_changed".to_string(), 1),
+        ]),
+        "only the constructor and the reload may set the reload fingerprint"
+    );
+}
+
+/// A refresh-interval commit whose save fails puts the scheduler's interval
+/// back and keeps the editor open, so the cadence never runs at a value the
+/// Config row does not show.
+#[test]
+fn a_refresh_interval_commit_whose_save_fails_keeps_the_old_cadence() {
+    use crate::profile::{AppConfig, AppState, FailAppStateSave, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = AppState {
+        profiles: vec![ProfileName::from("a")],
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("state");
+    let mut app = super::App::new(AppConfig {
+        state,
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("a"))],
+    });
+    app.refresh_interval_draft = Some(SeededInput::new("150"));
+    let _fail = FailAppStateSave::new(&_home);
+    assert!(!super::commit_refresh_interval_edit(&mut app));
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        90_000,
+        "the cadence stays at the saved interval"
+    );
+    assert!(app.refresh_interval_draft.is_some(), "the draft stays open");
+}
+
+/// A delta that changes nothing writes nothing: a chain add the fresh roster
+/// skips leaves profiles.toml's mtime where it was.
+#[test]
+fn a_chain_add_the_fresh_roster_skips_leaves_profiles_toml_unwritten() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let mut a_p = crate::testutil::blank_profile(&a);
+    a_p.fallback_threshold = Some(0.9);
+    let mut b_p = crate::testutil::blank_profile(&b);
+    b_p.fallback_threshold = Some(0.9);
+    let state = AppState {
+        profiles: vec![a.clone(), b.clone()],
+        fallback_chain: vec![a.clone()],
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("state");
+    let mut app = super::App::new(AppConfig {
+        state,
+        profiles: vec![a_p, b_p],
+    });
+    crate::lock::with_state_lock(|held| {
+        let mut f = crate::profile::load_app_state()?;
+        f.remove(&b, held);
+        save_app_state(&f)
+    })
+    .expect("peer delete");
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    crate::testutil::set_mtime(&path, past);
+    assert!(
+        !super::add_chain_candidate(&mut app, &b),
+        "the deleted account is not added"
+    );
+    let mtime = std::fs::metadata(&path)
+        .expect("meta")
+        .modified()
+        .expect("mtime");
+    assert_eq!(mtime, past, "the skipped add rewrote nothing");
+}
+
+/// `a` active and `b` a chain member, both saved on disk, and an app read
+/// before any peer write.
+fn chain_writer_fixture() -> (App, crate::profile::ProfileName) {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    save_profile(&crate::testutil::blank_profile(&a)).expect("save a");
+    save_profile(&crate::testutil::blank_profile(&b)).expect("save b");
+    save_app_state(&AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a),
+        fallback_chain: vec![ProfileName::from("a"), b.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+    let mut app = super::App::new(crate::profile::load_config().expect("the app's read"));
+    app.chain_cursor = 1;
+    app.config_draft = Some(super::build_draft_existing(&app, &b));
+    (app, b)
+}
+
+/// Each per-profile TUI writer on `b`, and whether its own field landed.
+type ChainWriter = (
+    &'static str,
+    fn(&mut App, &crate::profile::ProfileName),
+    fn(&crate::profile::Profile) -> bool,
+);
+
+fn chain_writers() -> Vec<ChainWriter> {
+    vec![
+        (
+            "write_weekly_override",
+            |app, b| assert!(super::write_weekly_override(app, b, Some(50.0))),
+            |p| p.weekly_threshold == Some(50.0),
+        ),
+        (
+            "write_max_spend",
+            |app, b| assert!(super::write_max_spend(app, b, 7.0)),
+            |p| p.max_auto_spend == Some(7.0),
+        ),
+        (
+            "toggle_member_flag weekly",
+            |app, _| super::toggle_member_flag(app, super::MemberFlag::Weekly),
+            |p| !p.check_weekly,
+        ),
+        (
+            "toggle_member_flag scoped",
+            |app, _| super::toggle_member_flag(app, super::MemberFlag::Scoped),
+            |p| !p.check_scoped,
+        ),
+        (
+            "toggle_member_flag credit cap",
+            |app, _| super::toggle_member_flag(app, super::MemberFlag::CreditCap),
+            |p| !p.check_credit_cap,
+        ),
+        (
+            "toggle_last_resort",
+            |app, _| super::toggle_last_resort(app),
+            |p| p.last_resort,
+        ),
+        (
+            "toggle_preferred",
+            |app, _| super::toggle_preferred(app),
+            |p| p.preferred,
+        ),
+        (
+            "write_bell_threshold",
+            |app, _| assert!(super::write_bell_threshold(app, Some(80.0))),
+            |p| p.bell_threshold == Some(80.0),
+        ),
+        (
+            "toggle_auto_start",
+            |app, b| super::toggle_auto_start(app, b),
+            |p| p.auto_start,
+        ),
+    ]
+}
+
+/// Every per-profile TUI writer persists only its own field onto a fresh read:
+/// a peer's edit to another field of the same account survives it, and memory
+/// mirrors the saved field.
+#[test]
+fn every_tui_profile_writer_keeps_a_peer_edit_to_another_field() {
+    for (label, run, own_field_landed) in chain_writers() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = chain_writer_fixture();
+        let mut peer = crate::profile::load_profile(&b).expect("peer read");
+        peer.models.default = Some("peer-model".into());
+        crate::profile::save_profile_config(&peer).expect("peer edit");
+        run(&mut app, &b);
+        let on_disk = crate::profile::load_profile(&b).expect("reload");
+        assert!(own_field_landed(&on_disk), "{label}: its own field landed");
+        assert_eq!(
+            on_disk.models.default.as_deref(),
+            Some("peer-model"),
+            "{label}: the peer's edit survives"
+        );
+        assert!(
+            own_field_landed(app.config().find(&b).expect("in memory")),
+            "{label}: memory mirrors the saved field"
+        );
+        assert_eq!(
+            toast_bodies_of(&app, super::ToastKind::Danger),
+            Vec::<String>::new(),
+            "{label}: no failure"
+        );
+    }
+}
+
+/// Every per-profile TUI writer leaves an account a peer deleted after the
+/// app's read deleted: no directory, no `config.toml`.
+#[test]
+fn every_tui_profile_writer_leaves_an_account_a_peer_deleted_deleted() {
+    for (label, run, _) in chain_writers() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = chain_writer_fixture();
+        crate::lock::with_state_lock(|held| {
+            let mut state = crate::profile::load_fresh_state(held)?;
+            state.remove(&b, held);
+            crate::profile::save_app_state(&state)
+        })
+        .expect("peer roster delete");
+        let dir = crate::profile::profile_dir(&b).expect("dir");
+        std::fs::remove_dir_all(&dir).expect("peer dir delete");
+        run(&mut app, &b);
+        assert!(!dir.exists(), "{label}: no directory comes back");
+    }
+}
+
+/// A chain add seeds the default threshold onto the profile re-read off disk:
+/// a peer's edit to another field survives the seed, and an account a peer
+/// deleted gets no directory back (its config, key included, stays gone).
+#[test]
+fn a_chain_add_seeds_its_threshold_onto_a_fresh_read_only() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    for peer_deletes in [false, true] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let a = ProfileName::from("a");
+        let b = ProfileName::from("b");
+        let mut b_p = crate::testutil::blank_profile(&b);
+        b_p.base_url = Some("https://api.deepseek.com/anthropic".into());
+        b_p.api_key = Some("sk-fake-old".into());
+        save_profile(&crate::testutil::blank_profile(&a)).expect("save a");
+        save_profile(&b_p).expect("save b");
+        save_app_state(&AppState {
+            profiles: vec![a.clone(), b.clone()],
+            active_profile: Some(a.clone()),
+            fallback_chain: vec![a.clone()],
+            ..AppState::default()
+        })
+        .expect("state");
+        let mut app = super::App::new(crate::profile::load_config().expect("the app's read"));
+        let dir = crate::profile::profile_dir(&b).expect("dir");
+        if peer_deletes {
+            crate::lock::with_state_lock(|held| {
+                let mut f = crate::profile::load_fresh_state(held)?;
+                f.remove(&b, held);
+                save_app_state(&f)
+            })
+            .expect("peer roster delete");
+            std::fs::remove_dir_all(&dir).expect("peer dir delete");
+        } else {
+            let mut peer = crate::profile::load_profile(&b).expect("peer read");
+            peer.api_key = Some("sk-fake-new".into());
+            crate::profile::save_profile_config(&peer).expect("peer key edit");
+        }
+        let added = super::add_chain_candidate(&mut app, &b);
+        assert_eq!(
+            added, !peer_deletes,
+            "an add fails only on a deleted account"
+        );
+        if peer_deletes {
+            assert!(!dir.exists(), "the deleted account's dir stays gone");
+        } else {
+            let on_disk = crate::profile::load_profile(&b).expect("reload");
+            assert_eq!(on_disk.fallback_threshold, Some(super::DEFAULT_THRESHOLD));
+            assert_eq!(
+                on_disk.api_key.as_deref(),
+                Some("sk-fake-new"),
+                "the peer's key edit survives the seed"
+            );
+            assert_eq!(
+                app.config().find(&b).and_then(|p| p.fallback_threshold),
+                Some(super::DEFAULT_THRESHOLD),
+                "memory mirrors the seed"
+            );
+        }
+    }
+}
+
+/// Turning a chain radio on clears it on every other account as disk holds
+/// it: a mark a peer set after the app's read is cleared too, never left
+/// beside the one just chosen.
+#[test]
+fn a_radio_mark_clears_one_a_peer_set_meanwhile() {
+    type Flag = fn(&mut crate::profile::Profile) -> &mut bool;
+    type Toggle = fn(&mut App);
+    let radios: [(&str, Toggle, Flag); 2] = [
+        (
+            "last resort",
+            |app| super::toggle_last_resort(app),
+            |p| &mut p.last_resort,
+        ),
+        (
+            "preferred",
+            |app| super::toggle_preferred(app),
+            |p| &mut p.preferred,
+        ),
+    ];
+    for (label, toggle, flag) in radios {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = chain_writer_fixture();
+        let a = crate::profile::ProfileName::from("a");
+        crate::profile::update_profile_config(&a, |p| {
+            *flag(p) = true;
+            Ok(())
+        })
+        .expect("peer edit")
+        .expect("on roster");
+        assert!(
+            *flag(&mut crate::profile::load_profile(&a).expect("control read")),
+            "{label}: control: the peer's mark landed"
+        );
+        toggle(&mut app);
+        assert!(
+            *flag(&mut crate::profile::load_profile(&b).expect("reload b")),
+            "{label}: b is marked"
+        );
+        assert!(
+            !*flag(&mut crate::profile::load_profile(&a).expect("reload a")),
+            "{label}: the peer's mark on a is cleared, not left beside b's"
+        );
+    }
+}
+
+/// A session-token clear on an account the roster no longer holds stops at
+/// its fresh write: nothing is cleared and nothing reports success.
+#[test]
+fn a_session_token_clear_of_an_account_off_the_roster_clears_nothing() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let gone = ProfileName::from("gone");
+    let mut p = crate::testutil::blank_profile(&gone);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("sk-fake-key".into());
+    p.rolling_token = true;
+    save_profile(&p).expect("save gone");
+    crate::testutil::write_long_lived_sidecar(&gone);
+    save_app_state(&AppState::default()).expect("a roster without it");
+    let mut app = super::App::new(AppConfig {
+        state: AppState {
+            profiles: vec![gone.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    super::perform_clear_session_token(&mut app, &gone);
+    assert!(
+        crate::profile::profile_dir(&gone)
+            .expect("dir")
+            .join("session-token.json")
+            .exists(),
+        "the sidecar stays"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        Vec::<String>::new(),
+        "no success is reported"
+    );
+}
+
+/// `a` active and `b` an api account with one env key, both saved, plus an app
+/// read before any peer write, with `b`'s Setup draft open.
+fn config_editor_fixture() -> (App, crate::profile::ProfileName) {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let a = ProfileName::from("a");
+    let b = ProfileName::from("b");
+    let mut b_p = crate::testutil::blank_profile(&b);
+    b_p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    b_p.api_key = Some("sk-fake-old".into());
+    b_p.env = std::collections::BTreeMap::from([("K".to_string(), "old".to_string())]);
+    save_profile(&crate::testutil::blank_profile(&a)).expect("save a");
+    save_profile(&b_p).expect("save b");
+    save_app_state(&AppState {
+        profiles: vec![a.clone(), b.clone()],
+        active_profile: Some(a),
+        ..AppState::default()
+    })
+    .expect("state");
+    let mut app = super::App::new(crate::profile::load_config().expect("the app's read"));
+    app.config_draft = Some(super::build_draft_existing(&app, &b));
+    (app, b)
+}
+
+/// A peer's edit to `b`, landed after the app's read.
+fn peer_edits(b: &crate::profile::ProfileName, edit: impl FnOnce(&mut crate::profile::Profile)) {
+    crate::profile::update_profile_config(b, |p| {
+        edit(p);
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("on roster");
+}
+
+/// An endpoint commit moves only the row it commits: the other half is the one
+/// a peer set after the app's read, and the user's own new value lands.
+#[test]
+fn an_endpoint_commit_moves_only_the_row_it_commits() {
+    use super::{ConfigRow, InputState};
+    const PEER_URL: &str = "https://api.z.ai/api/anthropic";
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| p.api_key = Some("sk-fake-peer".into()));
+        if let Some(d) = app.config_draft.as_mut() {
+            d.base_url = InputState::new(PEER_URL);
+        }
+        assert!(super::commit_endpoint(&mut app, ConfigRow::BaseUrl));
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert_eq!(disk.base_url.as_deref(), Some(PEER_URL), "the url lands");
+        assert_eq!(
+            disk.api_key.as_deref(),
+            Some("sk-fake-peer"),
+            "a url commit keeps the key a peer set"
+        );
+    }
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| p.base_url = Some(PEER_URL.into()));
+        if let Some(d) = app.config_draft.as_mut() {
+            d.api_key = InputState::new("sk-fake-own");
+        }
+        assert!(super::commit_endpoint(&mut app, ConfigRow::ApiKey));
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert_eq!(
+            disk.api_key.as_deref(),
+            Some("sk-fake-own"),
+            "the key lands"
+        );
+        assert_eq!(
+            disk.base_url.as_deref(),
+            Some(PEER_URL),
+            "a key commit keeps the url a peer set"
+        );
+    }
+}
+
+/// A model commit moves only the tier it commits: a tier a peer set after the
+/// app's read survives, and the user's own new value lands.
+#[test]
+fn a_model_commit_moves_only_the_tier_it_commits() {
+    use super::{ConfigRow, InputState};
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| p.models.sonnet = Some("peer-sonnet".into()));
+        if let Some(input) = app
+            .config_draft
+            .as_mut()
+            .and_then(|d| d.field_mut(ConfigRow::OpusModel))
+        {
+            *input = InputState::new("own-opus");
+        }
+        assert!(super::commit_model_field(&mut app, ConfigRow::OpusModel));
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert_eq!(
+            disk.models.opus.as_deref(),
+            Some("own-opus"),
+            "the tier lands"
+        );
+        assert_eq!(
+            disk.models.sonnet.as_deref(),
+            Some("peer-sonnet"),
+            "a tier commit keeps the tier a peer set"
+        );
+    }
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| p.models.sonnet = Some("peer-sonnet".into()));
+        super::cycle_model(&mut app);
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert_eq!(
+            disk.models.default.as_deref(),
+            Some("fable"),
+            "the cycle's step lands"
+        );
+        assert_eq!(
+            disk.models.sonnet.as_deref(),
+            Some("peer-sonnet"),
+            "a cycle keeps the tier a peer set"
+        );
+    }
+}
+
+/// A preset apply stamps the fields the preset sets onto the account as disk
+/// holds it: a tier a peer set after the app's read, which the preset does not
+/// set, survives a keep and a clear alike, and a clear empties only the field
+/// its confirm named.
+#[test]
+fn a_preset_apply_keeps_a_tier_a_peer_set_that_the_preset_does_not_set() {
+    use crate::presets::Leftover;
+    for leftover in [Leftover::Keep, Leftover::Clear] {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::presets::save_preset(
+            "opus-only",
+            &None,
+            &crate::profile::ModelSettings {
+                opus: Some("preset-opus".into()),
+                ..crate::profile::ModelSettings::default()
+            },
+        )
+        .expect("save the preset");
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| p.models.sonnet = Some("peer-sonnet".into()));
+        super::apply_preset_to(
+            &mut app,
+            &super::PresetTarget::from("b"),
+            &crate::presets::load_preset("opus-only").expect("the saved preset"),
+            leftover,
+            &[],
+            &["base url"],
+        );
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert_eq!(
+            disk.models.opus.as_deref(),
+            Some("preset-opus"),
+            "{leftover:?}: the preset's tier lands"
+        );
+        assert_eq!(
+            disk.models.sonnet.as_deref(),
+            Some("peer-sonnet"),
+            "{leftover:?}: the tier a peer set survives"
+        );
+        assert_eq!(
+            disk.base_url.as_deref(),
+            match leftover {
+                Leftover::Keep => Some("https://api.deepseek.com/anthropic"),
+                Leftover::Clear => None,
+            },
+            "{leftover:?}: the confirmed leftover is kept or cleared"
+        );
+    }
+}
+
+/// An env commit moves only the key it commits: a key a peer added after the
+/// app's read survives a value commit, an add and a cancelled add.
+#[test]
+fn an_env_commit_moves_only_the_key_it_commits() {
+    type EnvCommit = fn(&mut App, &crate::profile::ProfileName);
+    type Landed = fn(&crate::profile::Profile) -> bool;
+    let commits: [(&str, EnvCommit, Landed); 3] = [
+        (
+            "commit_env_value",
+            |app, _| {
+                if let Some(d) = app.config_draft.as_mut() {
+                    d.env_value = super::InputState::new("new");
+                }
+                assert!(super::commit_env_value(app, 0));
+            },
+            |p| p.env.get("K").map(String::as_str) == Some("new"),
+        ),
+        (
+            "env_add_commit",
+            |app, b| assert!(super::env_add_commit(app, b, "Z")),
+            |p| p.env.get("Z").map(String::as_str) == Some(""),
+        ),
+        (
+            "cancel_just_added_env",
+            |app, b| super::cancel_just_added_env(app, b, "K"),
+            |p| !p.env.contains_key("K"),
+        ),
+    ];
+    for (label, commit, own_key_landed) in commits {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, b) = config_editor_fixture();
+        peer_edits(&b, |p| {
+            p.env.insert("Y".to_string(), "peer".to_string());
+        });
+        commit(&mut app, &b);
+        let disk = crate::profile::load_profile(&b).expect("reload");
+        assert!(own_key_landed(&disk), "{label}: its own key landed");
+        assert_eq!(
+            disk.env.get("Y").map(String::as_str),
+            Some("peer"),
+            "{label}: the key a peer added survives"
+        );
+    }
+}
+
+/// An env add of a key a peer already added keeps the peer's value, and arms
+/// no cancel that would delete it.
+#[test]
+fn an_env_add_of_a_key_a_peer_added_keeps_its_value() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, b) = config_editor_fixture();
+    peer_edits(&b, |p| {
+        p.env.insert("Z".to_string(), "peer".to_string());
+    });
+    super::env_add_commit(&mut app, &b, "Z");
+    let disk = crate::profile::load_profile(&b).expect("reload");
+    assert_eq!(disk.env.get("Z").map(String::as_str), Some("peer"));
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .and_then(|d| d.env_just_added.clone()),
+        None,
+        "no cancel is armed for the peer's key"
+    );
+}
+
+/// A preset apply re-checks its confirm against the account as the write reads
+/// it: a field the preset sets that a peer filled after the confirm opened is
+/// asked about again, never replaced unannounced.
+#[test]
+fn a_preset_apply_asks_again_over_a_field_a_peer_filled_meanwhile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::presets::save_preset(
+        "opus-only",
+        &None,
+        &crate::profile::ModelSettings {
+            opus: Some("preset-opus".into()),
+            ..crate::profile::ModelSettings::default()
+        },
+    )
+    .expect("save the preset");
+    let (mut app, b) = config_editor_fixture();
+    peer_edits(&b, |p| p.models.opus = Some("peer-opus".into()));
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("b"),
+        &crate::presets::load_preset("opus-only").expect("the saved preset"),
+        crate::presets::Leftover::Keep,
+        &[],
+        &["base url"],
+    );
+    assert_eq!(
+        crate::profile::load_profile(&b)
+            .expect("reload")
+            .models
+            .opus
+            .as_deref(),
+        Some("peer-opus"),
+        "the peer's value stays"
+    );
+    let Some(Modal::PresetApply(form)) = app.modals.last() else {
+        panic!("the confirm is offered again");
+    };
+    assert_eq!(form.replaces, vec!["opus"], "naming the field it replaces");
+}
+
+/// Clearing a chain radio elsewhere fails loudly when the roster does not
+/// read, rather than reporting a move it never made.
+#[test]
+fn a_radio_clear_that_cannot_read_the_roster_is_an_error() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, b) = config_editor_fixture();
+    let state = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    std::fs::write(&state, "this is = = not toml").expect("tear the roster");
+    let mut cfg = app.config();
+    assert!(super::clear_radio_elsewhere(&mut cfg, &b, |p| &mut p.preferred).is_err());
+}
+
+/// The divergence adoption writes the target into the live settings as disk
+/// holds it, and strips the env keys disk holds for the outgoing account: a
+/// peer's edit to either after the app's read is honoured.
+#[test]
+fn adopting_a_divergence_writes_and_strips_what_disk_holds() {
+    use super::{ConfirmAction, run_confirm_action};
+    use crate::profile::{AppState, Profile, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(creds_ra("rt-work", "at-work"));
+    let mut target = Profile::new("target".to_string(), None, None);
+    target.credentials = Some(creds_ra("rt-target", "at-target"));
+    save_profile(&work).expect("save work");
+    save_profile(&target).expect("save target");
+    save_app_state(&AppState {
+        profiles: vec!["work".into(), "target".into()],
+        active_profile: Some("work".into()),
+        ..AppState::default()
+    })
+    .expect("state");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let mut app = App::new(crate::profile::load_config().expect("the app's read"));
+    peer_edits(&ProfileName::from("target"), |p| {
+        p.env.insert("PEER_IN".to_string(), "peer-in".to_string());
+    });
+    peer_edits(&ProfileName::from("work"), |p| {
+        p.env.insert("PEER_OUT".to_string(), "peer-out".to_string());
+    });
+    crate::claude::apply_profile_to_claude_settings(
+        &crate::profile::load_profile(&ProfileName::from("work")).expect("work"),
+        &[],
+    )
+    .expect("the peer stamps work's key live");
+    let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
+    run_confirm_action(
+        &mut app,
+        ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "target".to_string(),
+            crate::testutil::profile_id("target"),
+            "work".to_string(),
+        ),
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("target"),
+        "fixture: the adopt activated the target"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        live.contains(&"PEER_IN".to_string()),
+        "the target's key a peer added is live"
+    );
+    assert!(
+        !live.contains(&"PEER_OUT".to_string()),
+        "the outgoing account's key a peer stamped is stripped"
+    );
+}
+
+/// `a` and `b` saved with their own logins, `a` active and linked live; the
+/// app reads that, then a peer switches to `b`.
+fn app_before_a_peer_switch() -> App {
+    use crate::profile::{AppState, Profile, save_app_state, save_profile};
+    for name in ["a", "b"] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&profile).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: vec!["a".into(), "b".into()],
+        active_profile: Some("a".into()),
+        ..AppState::default()
+    })
+    .expect("state");
+    crate::claude::link_profile_credentials(&ProfileName::from("a")).expect("link a");
+    let app = App::new(crate::profile::load_config().expect("the app's read"));
+    let mut peer = crate::profile::load_config().expect("peer read");
+    assert!(
+        crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("b"))
+            .expect("peer switch")
+    );
+    app
+}
+
+/// The live link and stores after a divergence answer about `a` that a
+/// peer's switch to `b` outran: nothing moved.
+fn assert_b_stays_linked() {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("linked"),
+        crate::profile::profile_dir(&ProfileName::from("b"))
+            .expect("dir")
+            .join("credentials.json"),
+        "the live link stays on the account disk names active"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("b")));
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+}
+
+/// The divergence Overwrite answered about an account a peer's switch has
+/// since made inactive captures and relinks nothing, and says so.
+#[test]
+fn an_overwrite_after_a_peer_switch_keeps_the_disk_active_link() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_before_a_peer_switch();
+    super::run_divergence_choice(
+        &mut app,
+        "a",
+        crate::profile::DivergenceChoice::Overwrite,
+        super::live_creds_fingerprint(),
+    );
+    assert_b_stays_linked();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["overwrite skipped\n'a' is no longer the active account".to_string()]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "no save is claimed"
+    );
+}
+
+/// The discard twin: the confirm's answer about `a` drops and relinks
+/// nothing once a peer's switch made `b` active.
+#[test]
+fn a_discard_after_a_peer_switch_keeps_the_disk_active_link() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_before_a_peer_switch();
+    super::run_discard_divergence(&mut app, "a", super::live_creds_fingerprint());
+    assert_b_stays_linked();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["discard skipped\n'a' is no longer the active account".to_string()]
+    );
+}
+
+/// The live slot's refresh token read through a regular file only: `None`
+/// once a relink replaced it with clauth's symlink.
+fn live_regular_refresh() -> Option<String> {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    if live.symlink_metadata().ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let creds: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(live).ok()?).ok()?;
+    creds.refresh_token().map(str::to_string)
+}
+
+/// Replace the live slot with a regular file holding `refresh`'s pair, the
+/// shape a Claude Code re-login leaves.
+fn relogin_live(refresh: &str) {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    match std::fs::remove_file(&live) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("unlink: {e}"),
+        _ => {}
+    }
+    write_live_creds(&creds_ra(refresh, &format!("at-{refresh}")));
+}
+
+/// `a`, `b` and `x` saved with their own logins (`rt-<name>`), `a` active
+/// with an unsaved re-login (`rt-fresh`) live; the app reads that, and the
+/// divergence prompt reads the live login.
+fn app_with_a_relogged() -> (App, crate::actions::CaptureSnapshot) {
+    use crate::profile::{AppState, Profile, save_app_state, save_profile};
+    for name in ["a", "b", "x"] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&profile).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: vec!["a".into(), "b".into(), "x".into()],
+        active_profile: Some("a".into()),
+        ..AppState::default()
+    })
+    .expect("state");
+    crate::claude::link_profile_credentials(&ProfileName::from("a")).expect("link a");
+    relogin_live("rt-fresh");
+    let app = App::new(crate::profile::load_config().expect("the app's read"));
+    let snapshot =
+        crate::actions::capture_live_file_snapshot().expect("the prompt reads the live login");
+    (app, snapshot)
+}
+
+/// A divergence adopt confirmed after a peer answered for `a`'s re-login,
+/// switched to `b`, and `b` re-logged stores, activates and relinks nothing:
+/// `b`'s newer login stays live, and no chain lands in two profiles.
+#[test]
+fn an_adopt_after_a_peer_switch_and_relogin_keeps_the_peers_relogin() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    crate::testutil::through_handle(crate::profile::load_config().expect("peer read"), |h| {
+        crate::actions::switch_profile_reconciled(
+            h,
+            &ProfileName::from("b"),
+            Some(&ProfileName::from("a")),
+        )
+        .expect("peer switch")
+    });
+    relogin_live("rt-b-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&ProfileName::from("b")).expect("classify"),
+        "control: b's re-login is unsaved"
+    );
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+    assert_eq!(
+        stored_refresh("a").as_deref(),
+        Some("rt-fresh"),
+        "the peer saved a's re-login"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-b-new"),
+        "b's re-login stays live"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("b")));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["save skipped\n'a' is no longer the active account".to_string()]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "no save is claimed"
+    );
+}
+
+/// A divergence adopt confirmed after the live login moved under the prompt
+/// (a refresh or another re-login), with disk still naming the prompt's
+/// account, stores nothing: the login the prompt read is not the one live.
+#[test]
+fn an_adopt_after_the_live_login_moved_stores_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    relogin_live("rt-newer");
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-newer"),
+        "the newer login stays live"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("a")));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["save skipped\nthe live login changed after the prompt opened".to_string()]
+    );
+}
+
+/// A discard confirmed after a newer login replaced the one its confirm
+/// showed drops nothing: the newer login stays live, unsaved.
+#[test]
+fn a_discard_after_the_live_login_moved_drops_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _snapshot) = app_with_a_relogged();
+    let seen = super::live_creds_fingerprint();
+    assert!(seen.is_some(), "fixture: the confirm saw a login");
+    relogin_live("rt-newer");
+    super::run_discard_divergence(&mut app, "a", seen);
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-newer"),
+        "the newer login stays live"
+    );
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(active_on_disk(), Some(ProfileName::from("a")));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["discard skipped\nthe live login changed after the prompt opened".to_string()]
+    );
+}
+
+/// The divergence's capture onto an existing account, confirmed after a
+/// peer's switch, detaches, captures and relinks nothing.
+#[test]
+fn a_divergence_overwrite_capture_after_a_peer_switch_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_before_a_peer_switch();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            held_snapshot(),
+            "a".to_string(),
+            crate::testutil::profile_id("a"),
+            Some("a".to_string()),
+        ),
+    );
+    assert_b_stays_linked();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["overwrite skipped\n'a' is no longer the active account".to_string()]
+    );
+}
+
+/// The divergence's capture into a new account, confirmed after a peer's
+/// switch, creates, detaches and relinks nothing.
+#[test]
+fn a_divergence_capture_after_a_peer_switch_creates_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_before_a_peer_switch();
+    super::commit_capture_name(
+        &mut app,
+        "fresh".to_string(),
+        held_snapshot(),
+        Some("a".to_string()),
+    );
+    assert_b_stays_linked();
+    assert!(!has_profile(&app, "fresh"), "memory never gains it");
+    assert!(
+        !crate::profile::profile_dir(&ProfileName::from("fresh"))
+            .expect("dir")
+            .exists(),
+        "no dir is made"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["capture skipped\n'a' is no longer the active account".to_string()]
+    );
+}
+
+/// An active account running on a long-lived token cannot hold an OAuth
+/// login: the divergence prompt never offers to overwrite it, and an
+/// `Overwrite` default never resolves its divergence silently.
+#[test]
+fn a_long_lived_accounts_divergence_never_offers_the_overwrite() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _snapshot) = app_with_a_relogged();
+    crate::testutil::write_long_lived_sidecar(&ProfileName::from("a"));
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&ProfileName::from("a")).expect("classify"),
+        "control: a's re-login is unsaved"
+    );
+    super::open_divergence_modal(&mut app, "a");
+    let Some(super::Modal::Divergence(form)) = app.modals.last() else {
+        panic!("the prompt opens");
+    };
+    assert_eq!(
+        form.actions(),
+        vec![
+            super::DivergenceAction::Choice(crate::profile::DivergenceChoice::NewProfile),
+            super::DivergenceAction::Choice(crate::profile::DivergenceChoice::Discard),
+        ]
+    );
+    let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let options: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            [
+                "save this login to another account…",
+                "discard this login and restore 'a'",
+                "overwrite 'a' with this login",
+            ]
+            .into_iter()
+            .find(|label| row.contains(label))
+            .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        options,
+        vec![
+            "save this login to another account…".to_string(),
+            "discard this login and restore 'a'".to_string(),
+        ],
+        "the button rows: {rows:#?}"
+    );
+
+    app.modals.clear();
+    crate::profile::update_app_state(|s, _held| {
+        s.default_divergence = Some(crate::profile::DivergenceChoice::Overwrite);
+    })
+    .expect("the default");
+    app.config().state.default_divergence = Some(crate::profile::DivergenceChoice::Overwrite);
+    assert_eq!(
+        super::startup_default(&app, "a"),
+        None,
+        "no silent overwrite"
+    );
+    assert_eq!(
+        super::startup_default(&app, "b"),
+        Some(crate::profile::DivergenceChoice::Overwrite),
+        "control: an account that can hold the login keeps its default"
+    );
+}
+
+/// The stores and live slot of [`app_with_a_relogged`] after an answer the
+/// moved live login (`rt-other`) outran: nothing captured, linked or switched.
+fn assert_nothing_moved_but_the_live_login() {
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-other"),
+        "the other account's re-login stays live, unlinked"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("a")));
+}
+
+/// Another account's re-login landing while the divergence prompt is open:
+/// its Overwrite captures and relinks nothing, and says why.
+#[test]
+fn an_overwrite_after_another_relogin_under_the_open_prompt_captures_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _snapshot) = app_with_a_relogged();
+    super::open_divergence_modal(&mut app, "a");
+    let Some(super::Modal::Divergence(form)) = app.modals.last() else {
+        panic!("the prompt opens");
+    };
+    assert_eq!(
+        form.actions().first(),
+        Some(&super::DivergenceAction::Choice(
+            crate::profile::DivergenceChoice::Overwrite
+        )),
+        "fixture: the cursor sits on overwrite"
+    );
+    relogin_live("rt-other");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_nothing_moved_but_the_live_login();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["overwrite skipped\nthe live login changed after the prompt opened".to_string()]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "no save is claimed"
+    );
+}
+
+/// The prompt's "save elsewhere" picker, answered after another re-login
+/// landed: neither an existing account nor a new one is offered the newer
+/// login.
+#[test]
+fn a_save_elsewhere_after_another_relogin_under_the_open_prompt_offers_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    for row in [0usize, 1] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, _snapshot) = app_with_a_relogged();
+        super::open_divergence_modal(&mut app, "a");
+        let seen = super::live_creds_fingerprint();
+        super::run_divergence_choice(
+            &mut app,
+            "a",
+            crate::profile::DivergenceChoice::NewProfile,
+            seen,
+        );
+        let Some(super::Modal::DivergenceTarget(form)) = app.modals.last_mut() else {
+            panic!("row {row}: the picker opens");
+        };
+        form.cursor = row;
+        relogin_live("rt-other");
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let action = if row == 0 { "capture" } else { "save" };
+        assert!(
+            !app.modals
+                .iter()
+                .any(|m| matches!(m, super::Modal::Confirm(_) | super::Modal::CaptureName(_))),
+            "row {row}: nothing asks to save the newer login"
+        );
+        assert_eq!(
+            toast_bodies_of(&app, super::ToastKind::Warning),
+            vec![format!(
+                "{action} skipped\nthe live login changed after the prompt opened"
+            )],
+            "row {row}"
+        );
+        assert_nothing_moved_but_the_live_login();
+    }
+}
+
+/// "Switch to its owner", answered after another re-login replaced the login
+/// the owner was named for: no adopt is offered.
+#[test]
+fn a_switch_to_owner_after_another_relogin_under_the_open_prompt_offers_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _snapshot) = app_with_a_relogged();
+    // The live file carries b's exact stored pair, so b owns it.
+    relogin_live("rt-unused");
+    write_live_creds(&creds_ra("rt-b", "at-b"));
+    super::open_divergence_modal(&mut app, "a");
+    let Some(super::Modal::Divergence(form)) = app.modals.last() else {
+        panic!("the prompt opens");
+    };
+    assert_eq!(
+        form.actions().first(),
+        Some(&super::DivergenceAction::SwitchToOwner("b".to_string())),
+        "fixture: b owns the live login"
+    );
+    relogin_live("rt-other");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "no adopt is offered"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["save skipped\nthe live login changed after the prompt opened".to_string()]
+    );
+    assert_nothing_moved_but_the_live_login();
+}
+
+/// A peer saves the prompt's login into `a` and relinks it while the answer
+/// waits: what the CLI's `clauth a` does on a yes. The live login read through
+/// that link is still the snapshot's, and disk still names `a`.
+fn peer_saves_the_relogin_into_a() {
+    crate::testutil::through_handle(crate::profile::load_config().expect("peer read"), |h| {
+        crate::actions::switch_profile_reconciled(
+            h,
+            &ProfileName::from("a"),
+            Some(&ProfileName::from("a")),
+        )
+        .expect("peer save")
+    });
+}
+
+/// The live slot's symlink target, `None` for a regular file or no slot.
+fn live_link_target() -> Option<std::path::PathBuf> {
+    std::fs::read_link(
+        crate::profile::claude_dir()
+            .expect("claude dir")
+            .join(".credentials.json"),
+    )
+    .ok()
+}
+
+fn store_path(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&ProfileName::from(name))
+        .expect("dir")
+        .join("credentials.json")
+}
+
+/// After [`peer_saves_the_relogin_into_a`] and an answer it outran: `a` alone
+/// stores the re-login, every other account keeps its own chain, the live
+/// slot still links `a` and disk still names it active.
+fn assert_only_a_holds_the_relogin() {
+    assert_eq!(
+        stored_refresh("a").as_deref(),
+        Some("rt-fresh"),
+        "a's store"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+    assert!(
+        !store_path("fresh").exists(),
+        "no new account stores the login"
+    );
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("state")
+            .profiles
+            .contains(&ProfileName::from("fresh")),
+        "the roster gains no account"
+    );
+    assert_eq!(
+        live_link_target(),
+        Some(store_path("a")),
+        "the live slot links a"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("a")));
+}
+
+/// A divergence adopt confirmed after a peer saved the very login into `a`
+/// stores nothing: `x` taking it would put one single-use chain in two
+/// stores, the first refresh through either killing the other.
+#[test]
+fn an_adopt_after_a_peer_saved_the_login_into_its_account_stores_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    peer_saves_the_relogin_into_a();
+    assert_eq!(
+        stored_refresh("a").as_deref(),
+        Some("rt-fresh"),
+        "fixture: the peer saved it into a"
+    );
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+    assert_only_a_holds_the_relogin();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["save skipped\nthis login is already saved in 'a'".to_string()]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "no save is claimed"
+    );
+}
+
+/// The divergence capture into a new account, confirmed after a peer saved
+/// the login into `a`, creates nothing and leaves `a` linked and active.
+#[test]
+fn a_divergence_capture_after_a_peer_saved_the_login_creates_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    peer_saves_the_relogin_into_a();
+    super::commit_capture_name(
+        &mut app,
+        "fresh".to_string(),
+        Box::new(snapshot),
+        Some("a".to_string()),
+    );
+    assert_only_a_holds_the_relogin();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["capture skipped\nthis login is already saved in 'a'".to_string()]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "no capture is claimed"
+    );
+}
+
+/// The divergence capture onto an existing account, confirmed after a peer
+/// saved the login into `a`, overwrites nothing and detaches nothing.
+#[test]
+fn a_divergence_overwrite_capture_after_a_peer_saved_the_login_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    peer_saves_the_relogin_into_a();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            Some("a".to_string()),
+        ),
+    );
+    assert_only_a_holds_the_relogin();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["overwrite skipped\nthis login is already saved in 'a'".to_string()]
+    );
+}
+
+/// A plain capture (`c`, no divergence) into a new account, confirmed after
+/// a peer saved the same login into `a`, creates nothing.
+#[test]
+fn a_capture_after_a_peer_saved_the_login_creates_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    peer_saves_the_relogin_into_a();
+    super::commit_capture_name(&mut app, "fresh".to_string(), Box::new(snapshot), None);
+    assert_only_a_holds_the_relogin();
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["capture skipped\nthis login is already saved in 'a'".to_string()]
+    );
+}
+
+/// `profiles/left/` off the roster, holding a leftover login.
+fn leftover_login_dir() -> std::path::PathBuf {
+    let dir = crate::profile::profile_dir(&ProfileName::from("left")).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("credentials.json"), b"{\"leftover\":true}").expect("leftover");
+    dir
+}
+
+/// A divergence capture into a name whose leftover dir holds a login refuses
+/// before the detach: `a` stays the active account, on disk and in memory,
+/// and the unsaved re-login stays live.
+#[test]
+fn a_divergence_capture_over_a_leftover_login_keeps_the_active_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    let dir = leftover_login_dir();
+    super::commit_capture_name(
+        &mut app,
+        "left".to_string(),
+        Box::new(snapshot),
+        Some("a".to_string()),
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![format!(
+            "capture failed\nprofile 'left' not created: {} holds a credentials.json no account \
+             owns, move or delete that directory first",
+            dir.display()
+        )]
+    );
+    assert_eq!(
+        std::fs::read(dir.join("credentials.json")).expect("read"),
+        b"{\"leftover\":true}",
+        "the leftover keeps its bytes"
+    );
+    assert_eq!(
+        active_on_disk(),
+        Some(ProfileName::from("a")),
+        "disk names a"
+    );
+    assert_eq!(
+        app.config().state.active_profile,
+        Some(ProfileName::from("a")),
+        "memory names a"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-fresh"),
+        "the re-login stays live"
+    );
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+}
+
+/// The refused capture left `a` active, so the next switch still sees the
+/// unsaved re-login and refuses to install over it: the login survives.
+#[test]
+fn a_switch_after_a_refused_divergence_capture_keeps_the_unsaved_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    leftover_login_dir();
+    super::commit_capture_name(
+        &mut app,
+        "left".to_string(),
+        Box::new(snapshot),
+        Some("a".to_string()),
+    );
+    let mut peer = crate::profile::load_config().expect("switcher read");
+    crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("b"))
+        .expect_err("the switch refuses to install over the unsaved re-login");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("rt-fresh"),
+        "the re-login stays live"
+    );
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(stored_refresh("x").as_deref(), Some("rt-x"), "x's store");
+    assert_eq!(
+        active_on_disk(),
+        Some(ProfileName::from("a")),
+        "nothing switched"
+    );
+}
+
+/// A peer's switch landing right after the adopt's hold keeps its own live
+/// settings: the adopt wrote the adopted account's settings inside its hold,
+/// so nothing writes them over the peer's.
+#[test]
+fn an_adopts_settings_write_never_lands_over_a_peer_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    for (name, key) in [("x", "X_ONLY"), ("b", "B_ONLY")] {
+        crate::profile::update_profile_config(&ProfileName::from(name), |p| {
+            p.env.insert(key.to_string(), "1".to_string());
+            Ok(())
+        })
+        .expect("env edit")
+        .expect("on the roster");
+    }
+    super::after_the_next_adopt_hold(|| {
+        let mut peer = crate::profile::load_config().expect("peer read");
+        assert!(
+            crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("b"))
+                .expect("peer switch"),
+            "fixture: the peer switched"
+        );
+    });
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec!["saved the login into 'x', now active".to_string()],
+        "fixture: the adopt landed"
+    );
+    assert_eq!(
+        active_on_disk(),
+        Some(ProfileName::from("b")),
+        "the peer's switch"
+    );
+    let keys = crate::claude::claude_settings_env_keys().expect("live settings");
+    assert!(
+        keys.contains(&"B_ONLY".to_string()),
+        "the peer's switch wrote b's env live"
+    );
+    assert!(
+        !keys.contains(&"X_ONLY".to_string()),
+        "the adopt wrote nothing over the peer's settings"
+    );
+    assert_eq!(
+        stored_refresh("x").as_deref(),
+        Some("rt-fresh"),
+        "x adopted the login"
+    );
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(
+        live_link_target(),
+        Some(store_path("b")),
+        "the live slot links b"
+    );
+}
+
+/// Committing the probe interval memory still shows, after a peer changed it
+/// on disk, writes the typed value: the commit decides off the fresh read.
+#[test]
+fn a_probe_interval_commit_writes_over_a_peers_value_memory_still_shows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = ProfileName::from("a");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&a)).expect("save a");
+    crate::testutil::register_names(&["a"]);
+    let mut app = App::new(crate::profile::load_config().expect("the app's read"));
+    let shown = app.config().find(&a).expect("a").usage_probe_interval_ms;
+    assert_eq!(
+        shown,
+        crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+        "fixture: memory shows the default"
+    );
+    app.config_draft = Some(super::build_draft_existing(&app, &a));
+    crate::profile::update_profile_config(&a, |p| {
+        p.usage_probe_interval_ms = 120_000;
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("on the roster");
+    assert!(
+        super::write_usage_probe_interval(&mut app, shown),
+        "the commit lands"
+    );
+    assert_eq!(
+        crate::profile::load_profile(&a)
+            .expect("a")
+            .usage_probe_interval_ms,
+        shown,
+        "disk holds the typed value"
+    );
+}
+
+/// The divergence Overwrite answered after a peer saved the prompt's login
+/// into `x`: that login is saved, so the answer captures nothing, relinks
+/// `a`, claims no save, and says where the login is saved.
+#[test]
+fn an_overwrite_after_a_peer_saved_the_login_elsewhere_captures_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    super::open_divergence_modal(&mut app, "a");
+    let Some(super::Modal::Divergence(form)) = app.modals.last() else {
+        panic!("the prompt opens");
+    };
+    assert_eq!(
+        form.actions().first(),
+        Some(&super::DivergenceAction::Choice(
+            crate::profile::DivergenceChoice::Overwrite
+        )),
+        "fixture: the cursor sits on overwrite"
+    );
+    crate::actions::overwrite_captured_profile(
+        &mut crate::profile::load_config().expect("peer read"),
+        &ProfileName::from("x"),
+        &crate::testutil::profile_id("x"),
+        snapshot,
+    )
+    .expect("the peer saves the login into x");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(stored_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(stored_refresh("b").as_deref(), Some("rt-b"), "b's store");
+    assert_eq!(
+        stored_refresh("x").as_deref(),
+        Some("rt-fresh"),
+        "x's store"
+    );
+    assert_eq!(
+        live_link_target(),
+        Some(store_path("a")),
+        "the live slot links a"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("a")));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec!["nothing saved\nthis login is already saved in 'x'".to_string()]
+    );
+    for kind in [super::ToastKind::Success, super::ToastKind::Danger] {
+        assert!(
+            toast_bodies_of(&app, kind).is_empty(),
+            "no {kind:?} toast: nothing was saved, nothing failed"
+        );
+    }
 }

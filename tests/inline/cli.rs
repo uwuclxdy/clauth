@@ -3553,7 +3553,7 @@ mod static_token_verdicts {
         unusable.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-dead".to_string(),
-                refresh_token: Some("rt-dead".to_string()),
+                refresh_token: Some("rt-dead-badkey".to_string()),
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
@@ -3631,7 +3631,7 @@ mod static_token_verdicts {
         profile.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-unrecorded".to_string(),
-                refresh_token: Some("rt-unrecorded".to_string()),
+                refresh_token: Some(format!("rt-unrecorded-{name}")),
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: Some(vec![
                     "user:inference".to_string(),
@@ -7195,6 +7195,33 @@ mod a_cli_login_lands_on_its_own_account {
         assert!(
             stored("work").is_some_and(|p| p.credentials.is_none()),
             "the account that took the name holds no login"
+        );
+    }
+
+    #[test]
+    fn a_new_login_over_a_leftover_login_refuses_before_the_browser_trip() {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("left");
+        let dir = profile::profile_dir(&name).expect("dir");
+        std::fs::create_dir_all(&dir).expect("leftover dir");
+        std::fs::write(dir.join("credentials.json"), b"{\"leftover\":true}").expect("leftover");
+        let err = capture_new_profile(&name, profile::ModelSettings::default(), || {
+            panic!("no browser trip runs")
+        })
+        .err()
+        .expect("the leftover login refuses the login");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "profile 'left' not created: {} holds a credentials.json no account owns, move \
+                 or delete that directory first",
+                dir.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(dir.join("credentials.json")).expect("read"),
+            b"{\"leftover\":true}",
+            "the leftover keeps its bytes"
         );
     }
 

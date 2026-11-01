@@ -4345,7 +4345,7 @@ fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
             plan: None,
         }),
         input: InputState::new("a name typed into the field"),
-        from_divergence: false,
+        from_divergence: None,
     }));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();

@@ -486,6 +486,8 @@ fn modal_cases() -> Vec<ModalCase> {
             modal: Modal::Divergence(DivergenceForm {
                 active: "x".into(),
                 sibling: None,
+                long_lived: false,
+                seen: None,
                 // `discard` sits last so ↵ only opens its confirm, never the
                 // overwrite path's credential work, inside a test.
                 cursor: 2,
@@ -503,6 +505,8 @@ fn modal_cases() -> Vec<ModalCase> {
         ModalCase {
             name: "divergence target",
             modal: Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 // A profile row, so ↵ takes the pick's toast path, never the
                 // `+ new` capture flow.
@@ -661,7 +665,7 @@ fn modal_cases() -> Vec<ModalCase> {
                     plan: None,
                 }),
                 input: InputState::new(""),
-                from_divergence: false,
+                from_divergence: None,
             }),
             row: Some("↵ save   ←→ caret   q back"),
             row_45: None,

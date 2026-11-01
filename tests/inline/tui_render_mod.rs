@@ -2136,7 +2136,7 @@ fn capture_name_caret_follows_edit_position() {
             plan: None,
         }),
         input,
-        from_divergence: false,
+        from_divergence: None,
     }));
 
     let (w, h) = (90u16, 20u16);
@@ -2177,7 +2177,7 @@ fn capture_name_app(value: &str) -> App {
             plan: None,
         }),
         input: InputState::new(value),
-        from_divergence: false,
+        from_divergence: None,
     }));
     app
 }
@@ -6417,6 +6417,8 @@ fn page_never_skips_content() {
         a.tab = Tab::Overview;
         a.modals.push(crate::tui::app::Modal::DivergenceTarget(
             crate::tui::app::DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: (0..30)
                     .map(|i| format!("a-rather-long-account-name-number-{i:02}"))
                     .collect(),

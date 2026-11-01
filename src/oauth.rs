@@ -2988,11 +2988,13 @@ pub(crate) fn try_adopt_live_rotation(
         {
             return Ok(false);
         }
-        profile.set_credentials(Some(live.clone()), held);
         // The login alone: the adopt changes nothing in `config.toml`, and a
         // whole-profile save from this long-lived config would revert another
-        // process's settings edit.
+        // process's settings edit. Memory follows only a write that landed: a
+        // refused one (another account's store holds the chain) must leave the
+        // next rotation on this profile's own refresh token.
         crate::profile::write_profile_credentials(name, Some(&live), held)?;
+        profile.set_credentials(Some(live.clone()), held);
         // The adopted pair is provably `live_id`'s account (the identity gate
         // above compared the mirror probe against it), so the anchor rides the
         // SAME hold that committed the store: a cross-process install's removal

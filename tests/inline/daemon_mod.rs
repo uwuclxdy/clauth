@@ -6062,7 +6062,7 @@ fn push_daemon(
     status: crate::usage::FetchStatus,
     shape: impl FnOnce(&mut Profile, &mut AppConfig),
 ) -> (Daemon, std::sync::mpsc::Receiver<crate::push::Trigger>) {
-    let mut profile = profile_with_creds(name, "at-push");
+    let mut profile = profile_with_creds(name, &format!("at-push-{name}"));
     profile.fallback_threshold = Some(90.0);
     let mut config = persist(vec![profile.clone()], Some(name), 60_000);
     config.state.fallback_chain = vec![name.into()];
@@ -7175,6 +7175,100 @@ fn an_adopted_background_tree_writes_session_records_to_the_global_store() {
             .join("4242.json")
             .is_file(),
         "the record is in the global store"
+    );
+}
+
+/// A peer's switch after the daemon's config read stamps the account it made
+/// active into the live settings: the background hold the daemon queues
+/// strips that account's custom env too, read off disk, so the adopted tree's
+/// settings never carry it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_hold_strips_the_env_a_peer_switch_stamped_after_the_daemons_read() {
+    let sb = HomeSandbox::new();
+    let mut peer = profile_with_creds("peer", "tok-peer");
+    peer.env
+        .insert("PEER_ONLY_KEY".to_string(), "peer-secret".to_string());
+    let config = persist(
+        vec![
+            profile_with_creds("bgp", "tok-bgp"),
+            profile_with_creds("work", "tok-work"),
+            peer,
+        ],
+        Some("work"),
+        60_000,
+    );
+    link_active_clean("work");
+    let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+
+    let mut peer_config = crate::profile::load_config().expect("peer read");
+    assert!(
+        crate::actions::switch_profile_locked(
+            &mut peer_config,
+            &crate::profile::ProfileName::from("peer")
+        )
+        .expect("peer switch"),
+        "fixture: the peer switched"
+    );
+    assert!(
+        crate::claude::claude_settings_env_keys()
+            .expect("live settings")
+            .contains(&"PEER_ONLY_KEY".to_string()),
+        "fixture: the peer's switch stamped its key live"
+    );
+
+    // The daemon's own read still names `work`: the hold is queued off it,
+    // before any tick reloads the config.
+    daemon.reconcile_background_holds();
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
+    });
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tree.join("settings.json")).expect("the tree's settings"),
+    )
+    .expect("parse settings");
+    assert!(
+        settings["env"].get("PEER_ONLY_KEY").is_none(),
+        "the peer-switched account's env must not ride into the background tree: {settings}"
+    );
+}
+
+/// The tick logs a strip-list read that fails once per kind of failure, not
+/// once per tick.
+#[test]
+fn a_failing_strip_list_read_logs_once_per_kind() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("work", "tok-work")],
+        Some("work"),
+        60_000,
+    );
+    let mut daemon = daemon_for(config);
+    let state = clauth_dir().expect("clauth dir").join("profiles.toml");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    std::fs::write(&state, "this is = = not toml").expect("tear the roster");
+    daemon.reconcile_background_holds();
+    daemon.reconcile_background_holds();
+    let torn = lines.snapshot();
+    assert_eq!(torn.len(), 1, "one line for two failing reads: {torn:?}");
+    assert!(
+        torn[0].starts_with(
+            "clauth daemon: could not re-read the active account's env keys, background \
+             sessions use the loaded copy: "
+        ),
+        "{torn:?}"
+    );
+    std::fs::remove_file(&state).expect("drop the roster");
+    std::fs::create_dir(&state).expect("a dir where the roster goes");
+    daemon.reconcile_background_holds();
+    daemon.reconcile_background_holds();
+    assert_eq!(
+        lines.snapshot().len(),
+        2,
+        "a new kind of failure logs once more"
     );
 }
 

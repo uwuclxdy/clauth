@@ -1661,12 +1661,14 @@ fn reauth_profile(
 
 /// The new-profile arm's landing: `collect` runs the browser trip, and the
 /// capture creates `target` in config read after it, refusing a name another
-/// account took meanwhile.
+/// account took meanwhile. A leftover login under the name refuses before the
+/// trip, which the create would only refuse after it.
 fn capture_new_profile(
     target: &ProfileName,
     models: profile::ModelSettings,
     collect: impl FnOnce() -> Result<actions::CaptureSnapshot>,
 ) -> Result<AppConfig> {
+    actions::refuse_leftover_login(target)?;
     let snapshot = collect()?;
     let mut config = load_config()?;
     actions::capture_into_profile(&mut config, target.to_string(), models, snapshot)?;
@@ -1956,10 +1958,9 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // Everything the ACTIONS key off is re-read under the guard; the snapshot
     // above fed the prompt's copy and nothing else. The prompt is an unbounded
     // wait, and a switch, a re-login or another config edit can all land
-    // during it — `save_profile_config` writes the WHOLE config, so writing
-    // the pre-prompt snapshot back would rewind that edit, and acting on the
-    // pre-prompt `active` relinks the wrong world in both directions.
-    let mut on_disk = profile::load_profile(target)?;
+    // during it — acting on the pre-prompt `active` relinks the wrong world
+    // in both directions.
+    let on_disk = profile::load_profile(target)?;
     // The other-login REFUSAL re-checks here too — it is the one decision in
     // this function that can strip a profile of its last credential, and the
     // prompt above is an unbounded wait a log-out can land inside: a profile
@@ -1976,8 +1977,10 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     }
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
-        on_disk.rolling_token = false;
-        profile::save_profile_config(&on_disk)?;
+        profile::update_profile_config(target, |p| {
+            p.rolling_token = false;
+            Ok(())
+        })?;
     }
     // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
     // detect, and one the operator did not name: the prompt says "the
@@ -2319,7 +2322,7 @@ fn cmd_switch(name: &str) -> Result<()> {
         outln!("{}", codex_collision_note(&canonical, "switches"));
     }
     refuse_if_disabled(&config, &canonical)?;
-    actions::switch_profile_cli(config, &canonical)
+    actions::switch_profile_cli(config, &canonical, std::io::stdin().lock())
 }
 
 /// `clauth rolling-token <profile>` — serve this profile's sessions a bearer
@@ -2439,11 +2442,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // non-zero exit from the arm leaves the flag exactly as it was found.
     // (After a SUCCESSFUL arm the set flag is the new truth — the live-install
     // step at the bottom can still exit non-zero, correctly leaving it on.)
-    if let Ok(mut cfg) = handle.lock()
+    if profile::update_profile_config(&canonical, |p| {
+        p.rolling_token = true;
+        Ok(())
+    })?
+    .is_some()
+        && let Ok(mut cfg) = handle.lock()
         && let Some(profile) = cfg.find_mut(&canonical)
     {
         profile.rolling_token = true;
-        profile::save_profile_config(profile)?;
     }
     let armed =
         oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
@@ -2457,15 +2464,21 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             report_armed_sidecar(&canonical, chain_is_broken)
         });
     if let Err(e) = armed {
-        if !was_rolling
-            && let Ok(mut cfg) = handle.lock()
-            && let Some(profile) = cfg.find_mut(&canonical)
-        {
-            profile.rolling_token = false;
+        if !was_rolling {
             // The arming error is the one the operator needs; a rollback that
             // then cannot save its own config write must not replace it.
-            if let Err(save_err) = profile::save_profile_config(profile) {
-                errln!("{}", rollback_stranded_warning(&canonical, &save_err));
+            match profile::update_profile_config(&canonical, |p| {
+                p.rolling_token = false;
+                Ok(())
+            }) {
+                Ok(_) => {
+                    if let Ok(mut cfg) = handle.lock()
+                        && let Some(profile) = cfg.find_mut(&canonical)
+                    {
+                        profile.rolling_token = false;
+                    }
+                }
+                Err(save_err) => errln!("{}", rollback_stranded_warning(&canonical, &save_err)),
             }
         }
         return Err(e);
@@ -2653,15 +2666,14 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // the rolling-bearer bail says in so many words that this command is what
     // stopped the re-stamping.
     //
-    // Written from a fresh DISK read, never the pre-acquire config snapshot:
+    // Written onto a fresh DISK read, never the pre-acquire config snapshot:
     // the blocking acquire above can WAIT out an in-flight rotation, and
-    // `save_profile_config` writes the whole config — writing the snapshot
-    // back would rewind any config edit that landed meanwhile.
-    let mut on_disk = profile::load_profile(&canonical)?;
-    if on_disk.rolling_token {
-        on_disk.rolling_token = false;
-        profile::save_profile_config(&on_disk)?;
-    }
+    // writing the snapshot back would rewind any config edit that landed
+    // meanwhile.
+    profile::update_profile_config(&canonical, |p| {
+        p.rolling_token = false;
+        Ok(())
+    })?;
     let is_active = load_config()?.is_active(&canonical);
     // The flag flip above is already durable, so a restore that ERRORS (the
     // backup unreadable, the sidecar unwritable) must own that state the same
