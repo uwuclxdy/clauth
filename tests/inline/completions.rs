@@ -2407,3 +2407,78 @@ fn a_same_length_script_reads_stale() {
         "one different byte of the same length is stale"
     );
 }
+
+/// A `$SHELL` path on Windows (Git Bash hands a native path) names the shell:
+/// the last component splits on either separator and a trailing `.exe` drops,
+/// case-insensitively.
+#[test]
+fn a_windows_bash_path_names_bash() {
+    assert_eq!(
+        detect_shell_name(r"C:\Users\u\scoop\apps\git\2.55.0.2\usr\bin\bash.exe")
+            .expect("git bash's bash.exe names bash"),
+        "bash"
+    );
+}
+
+#[test]
+fn a_windows_fish_path_names_fish_case_insensitively() {
+    assert_eq!(
+        detect_shell_name(r"C:\x\FISH.EXE").expect("FISH.EXE names fish"),
+        "fish"
+    );
+}
+
+/// A unix path keeps its behaviour: the last `/` component, no `.exe` involved.
+#[test]
+fn unix_paths_keep_their_names() {
+    for (path, shell) in [("/usr/bin/bash", "bash"), ("/usr/bin/zsh", "zsh")] {
+        assert_eq!(
+            detect_shell_name(path).expect("a supported shell"),
+            shell,
+            "{path}"
+        );
+    }
+}
+
+/// An unsupported shell is refused by its own name, a Windows path's stem
+/// included (sshd sets `$SHELL` to this path, measured 2026-11-01), pinned as
+/// the whole error text.
+#[test]
+fn an_unsupported_shell_is_refused_as_itself() {
+    let err = detect_shell_name(r"c:\windows\system32\cmd.exe").expect_err("cmd is not supported");
+    assert_eq!(
+        err.to_string(),
+        "unrecognized shell 'cmd' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+    );
+}
+
+/// A mixed-case stem is refused exactly as `$SHELL` spelled it: case folding
+/// serves the match, never the refusal echo.
+#[test]
+fn a_mixed_case_unix_stem_is_refused_as_spelled() {
+    let err = detect_shell_name("/usr/bin/Tcsh").expect_err("Tcsh is not supported");
+    assert_eq!(
+        err.to_string(),
+        "unrecognized shell 'Tcsh' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+    );
+}
+
+/// The TUI card's own reader resolves a Windows-shaped `$SHELL` to the
+/// installed script: after an install, the card names bash and reads current.
+#[test]
+fn the_completions_card_reads_the_windows_path_from_the_env() {
+    let home = HomeSandbox::new();
+    let _shell = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "SHELL",
+            Some(std::ffi::OsStr::new(
+                r"C:\Users\u\scoop\apps\git\2.55.0.2\usr\bin\bash.exe",
+            )),
+        )],
+    );
+    install(Some("bash")).expect("install");
+    let card = detected_installed_script().expect("the card resolves the windows path");
+    assert_eq!(card.shell, "bash");
+    assert_eq!(card.state, ScriptState::Current);
+}

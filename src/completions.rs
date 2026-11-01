@@ -723,11 +723,29 @@ fn detect_shell() -> Result<String> {
     let path = std::env::var("SHELL").context(
         "$SHELL not set; pass the shell explicitly: clauth completions install <bash|zsh|fish>",
     )?;
-    let name = path.rsplit('/').next().unwrap_or("");
-    match name {
-        "bash" | "zsh" | "fish" => Ok(name.to_string()),
-        other => bail!(
-            "unrecognized shell '{other}' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+    detect_shell_name(&path)
+}
+
+/// The shell a `$SHELL`-style path names: its last path component, split on
+/// either separator (Git Bash on Windows hands a native `...\bash.exe`,
+/// measured 2026-11-01), with a trailing `.exe` dropped case-insensitively; the
+/// stem is matched case-insensitively and the canonical lowercase name
+/// returned, while a refusal echoes the stem exactly as `$SHELL` spelled it.
+fn detect_shell_name(path: &str) -> Result<String> {
+    let last = path.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = last
+        .len()
+        .checked_sub(4)
+        .filter(|&cut| {
+            last.get(cut..)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+        })
+        .map_or(last, |cut| &last[..cut]);
+    let folded = stem.to_ascii_lowercase();
+    match folded.as_str() {
+        name @ ("bash" | "zsh" | "fish") => Ok(name.to_string()),
+        _ => bail!(
+            "unrecognized shell '{stem}' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
         ),
     }
 }
