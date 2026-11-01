@@ -302,7 +302,7 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
     Some(home_dir().ok()?.join(".claude.json"))
 }
 
-/// Write `mcpServers.clauth` into `~/.claude.json` and every shared runtime
+/// Write `mcpServers.clauth` into `~/.claude.json` and every live shared runtime
 /// copy, preserving every other field (key order is kept via serde_json's
 /// `preserve_order`). The entry mirrors the plugin manifest so a manual wire
 /// matches a plugin install. Creates a missing home holding the entry alone.
@@ -323,7 +323,7 @@ pub(crate) fn wire_mcp_server() -> Result<()> {
     let Some(_lock) = crate::claude_json::JsonSyncLock::try_once()? else {
         anyhow::bail!("clauth is syncing Claude Code's config; try again in a moment");
     };
-    let members = crate::claude_json::known_paths()?;
+    let members = crate::claude_json::live_known_paths()?;
     let record = crate::claude_json::written_record_path();
 
     // Phase 1: read, stat and parse every member before writing any, so the

@@ -24,6 +24,50 @@ fn t(offset: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + offset)
 }
 
+fn mtime_parts(when: SystemTime) -> (i64, u32) {
+    let d = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("post-epoch");
+    (d.as_secs() as i64, d.subsec_nanos())
+}
+
+/// A live `clauth start` session's flock-held marker on the sessions dir
+/// `runtime::paired_sessions_name` pairs with `copy`'s runtime dir. Keep the
+/// returned handle alive for as long as the copy should read as live.
+fn arm_live_copy(copy: &Path) -> std::fs::File {
+    let runtime_dir = copy.parent().expect("runtime dir");
+    let name = runtime_dir
+        .file_name()
+        .expect("runtime dir name")
+        .to_string_lossy()
+        .replacen("runtime", "sessions", 1);
+    let sessions = runtime_dir.with_file_name(name);
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
+}
+
+fn arm_live_copies(copies: &[PathBuf]) -> Vec<std::fs::File> {
+    copies.iter().map(|copy| arm_live_copy(copy)).collect()
+}
+
+/// Write `path` as a copy clauth wrote: the production write-and-record path,
+/// stamped at `when`, so the merge reads it as a recorded copy carrying that
+/// write.
+fn write_recorded_json(record: &Path, path: &Path, value: &Value, when: SystemTime) {
+    let bytes = serde_json::to_vec_pretty(value).expect("serialize");
+    crate::jsonsync::write_copy_and_record(
+        Some(record),
+        path,
+        &bytes,
+        mtime_parts(when),
+        true,
+        Some(when),
+    )
+    .expect("write recorded copy");
+}
+
 #[test]
 fn shared_fields_propagate_from_newest_to_others() {
     let _home = HomeSandbox::new();
@@ -105,7 +149,13 @@ fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
         fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir runtime");
     }
     write_json(&home_file, &json!({"numStartups": 1}));
-    write_json(&winner, &json!({"numStartups": 9}));
+    // This session's copy is clauth's own, so it may decide the pass.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &winner,
+        &json!({"numStartups": 9}),
+        t(10),
+    );
     write_json(&loser, &json!({"numStartups": 2}));
     fs::set_permissions(&home_file, fs::Permissions::from_mode(0o644)).expect("chmod home");
     set_mtime(&home_file, t(5));
@@ -519,15 +569,29 @@ fn strip_home_oauth_account_skips_missing_file() {
 fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     let home = HomeSandbox::new();
     let global = home.home().join(".claude.json");
-    let profiles = home.home().join(".clauth/profiles");
-    let legacy = profiles.join("p1/runtime/.claude.json");
-    let session = profiles.join("p1/runtime-4242-0/.claude.json");
-    let sibling = profiles.join("p2/runtime-4242-1/.claude.json");
-    let isolated = profiles.join("p1/runtime-isolated-4242-2/.claude.json");
+    let profiles = home.home().join(".clauth").join("profiles");
+    let legacy = profiles.join("p1").join("runtime").join(".claude.json");
+    let session = profiles
+        .join("p1")
+        .join("runtime-4242-0")
+        .join(".claude.json");
+    let sibling = profiles
+        .join("p2")
+        .join("runtime-4242-1")
+        .join(".claude.json");
+    let isolated = profiles
+        .join("p1")
+        .join("runtime-isolated-4242-2")
+        .join(".claude.json");
     for path in [&global, &legacy, &session, &sibling, &isolated] {
         fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
         write_json(path, &json!({}));
     }
+    // Each of the three shared copies is a live session's own tree; the
+    // isolated copy has no live session armable through this walk at all.
+    let _live_legacy = arm_live_copy(&legacy);
+    let _live_session = arm_live_copy(&session);
+    let _live_sibling = arm_live_copy(&sibling);
 
     let paths = known_paths().expect("known paths");
 
@@ -714,10 +778,10 @@ fn a_torn_first_read_with_nothing_parsed_yet_is_fable_alone() {
 // processes), and the write counter pins exactly one rewrite per runtime copy.
 
 /// The three shared runtime copies one fixture cycle uses, next to the global.
-fn three_runtime_members(home: &HomeSandbox) -> (PathBuf, Vec<PathBuf>) {
+fn three_runtime_members(home: &HomeSandbox) -> (PathBuf, Vec<PathBuf>, Vec<std::fs::File>) {
     let global = home.home().join(".claude.json");
     let profiles = home.home().join(".clauth/profiles");
-    let runtimes = ["p1", "p2", "p3"]
+    let runtimes: Vec<PathBuf> = ["p1", "p2", "p3"]
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -727,13 +791,15 @@ fn three_runtime_members(home: &HomeSandbox) -> (PathBuf, Vec<PathBuf>) {
                 .join(".claude.json")
         })
         .collect();
-    (global, runtimes)
+    // Each copy belongs to a live session's own tree, so it is a sync member.
+    let live = arm_live_copies(&runtimes);
+    (global, runtimes, live)
 }
 
 #[test]
 fn n_wrappers_rewrite_each_stale_copy_once_per_claude_code_write() {
     let home = HomeSandbox::new();
-    let (global, runtimes) = three_runtime_members(&home);
+    let (global, runtimes, _live) = three_runtime_members(&home);
     let mut paths = vec![global.clone()];
     paths.extend(runtimes.iter().cloned());
 
@@ -840,7 +906,7 @@ fn n_wrappers_rewrite_each_stale_copy_once_per_claude_code_write() {
 #[test]
 fn a_converged_set_with_no_new_write_rewrites_nothing() {
     let home = HomeSandbox::new();
-    let (global, runtimes) = three_runtime_members(&home);
+    let (global, runtimes, _live) = three_runtime_members(&home);
     let mut paths = vec![global.clone()];
     paths.extend(runtimes.iter().cloned());
 
@@ -882,8 +948,8 @@ fn hold_json_sync_lock() -> fs::File {
 /// three runtime copies stale, so the next sync would rewrite each runtime once.
 fn stale_runtimes_after_a_claude_code_write(
     home: &HomeSandbox,
-) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
-    let (global, runtimes) = three_runtime_members(home);
+) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>, Vec<std::fs::File>) {
+    let (global, runtimes, live) = three_runtime_members(home);
     let mut paths = vec![global.clone()];
     paths.extend(runtimes.iter().cloned());
     for (i, path) in std::iter::once(&global).chain(runtimes.iter()).enumerate() {
@@ -905,7 +971,7 @@ fn stale_runtimes_after_a_claude_code_write(
     for (i, path) in runtimes.iter().enumerate() {
         set_mtime(path, t(5 - i as u64));
     }
-    (global, runtimes, paths)
+    (global, runtimes, paths, live)
 }
 
 #[test]
@@ -914,7 +980,7 @@ fn the_watchdog_leg_skips_a_held_sync_lock_without_writing() {
     // A wait regression would park here for the deadline rather than skip; the
     // short override turns that into a fast red instead of a 25 s stall.
     set_json_sync_lock_timeout_override(Some(Duration::from_millis(300)));
-    let (_global, _runtimes, paths) = stale_runtimes_after_a_claude_code_write(&home);
+    let (_global, _runtimes, paths, _live) = stale_runtimes_after_a_claude_code_write(&home);
 
     let holder = hold_json_sync_lock();
 
@@ -951,7 +1017,7 @@ fn the_watchdog_leg_skips_a_held_sync_lock_without_writing() {
 #[test]
 fn a_held_sync_lock_blocks_the_reconcile_until_released() {
     let home = HomeSandbox::new();
-    let (_global, runtimes, paths) = stale_runtimes_after_a_claude_code_write(&home);
+    let (_global, runtimes, paths, _live) = stale_runtimes_after_a_claude_code_write(&home);
 
     let holder = hold_json_sync_lock();
     crate::jsonsync::reset_write_counts();
@@ -1005,7 +1071,7 @@ fn a_write_landing_while_held_propagates_on_the_next_pass() {
     // A try-once regression (waiting on the held lock) fails fast instead of
     // stalling 25 s before the `.expect` below.
     set_json_sync_lock_timeout_override(Some(Duration::from_millis(300)));
-    let (global, runtimes) = three_runtime_members(&home);
+    let (global, runtimes, _live) = three_runtime_members(&home);
     let mut paths = vec![global.clone()];
     paths.extend(runtimes.iter().cloned());
     for (i, path) in std::iter::once(&global).chain(runtimes.iter()).enumerate() {
@@ -1063,7 +1129,7 @@ fn a_write_landing_while_held_propagates_on_the_next_pass() {
 fn a_held_sync_lock_times_out_without_writing_or_advancing() {
     let home = HomeSandbox::new();
     set_json_sync_lock_timeout_override(Some(Duration::from_millis(300)));
-    let (_global, _runtimes, paths) = stale_runtimes_after_a_claude_code_write(&home);
+    let (_global, _runtimes, paths, _live) = stale_runtimes_after_a_claude_code_write(&home);
 
     let holder = hold_json_sync_lock();
     crate::jsonsync::reset_write_counts();
@@ -1098,7 +1164,7 @@ fn a_held_sync_lock_times_out_without_writing_or_advancing() {
 fn the_drop_flush_waits_out_a_contended_lock_within_the_bound() {
     let home = HomeSandbox::new();
     set_json_sync_lock_timeout_override(Some(Duration::from_secs(2)));
-    let (_global, runtimes, paths) = stale_runtimes_after_a_claude_code_write(&home);
+    let (_global, runtimes, paths, _live) = stale_runtimes_after_a_claude_code_write(&home);
 
     let holder = hold_json_sync_lock();
     crate::jsonsync::reset_write_counts();
@@ -1601,12 +1667,15 @@ fn a_non_winner_rewrite_inside_the_window_is_not_clobbered() {
         &global,
         &json!({"numStartups": 2, "freshSharedKey": true, "oauthAccount": {"emailAddress": "g@x"}}),
     );
-    write_json(
+    // clauth built this session's copy, so the Claude Code write landing on it
+    // below may later win a pass.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
         &runtime,
         &json!({"numStartups": 1, "oauthAccount": {"emailAddress": "r@x"}}),
+        t(5),
     );
     set_mtime(&global, t(10));
-    set_mtime(&runtime, t(5));
 
     let paths = std::sync::Arc::new(vec![global.clone(), runtime.clone()]);
 
@@ -1762,6 +1831,7 @@ fn a_stuck_strip_stops_forcing_full_parses_after_three_failures() {
     );
     set_mtime(&global, t(10));
     set_mtime(&runtime, t(5));
+    let _live = arm_live_copy(&runtime);
 
     mark_strip_pending().expect("mark");
     HONOUR_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2685,6 +2755,78 @@ fn the_written_copy_record_is_owner_only_and_holds_no_member_bytes() {
     );
 }
 
+/// The merge re-reads the member list inside the sync lock, so a pass whose
+/// fast-path list was read before a just-started session's job named its tree
+/// still keeps that session's record entry (a start records its seed). The
+/// pre-lock hook poses the start between the fast path's list and the lock;
+/// deleting the in-lock re-read reds this by pruning the entry.
+fn a_pass_listing_members_before_a_start_keeps_its_record_entry(pass: fn() -> Result<()>) {
+    let home = HomeSandbox::new();
+    let global = home.home().join(".claude.json");
+    write_json(&global, &json!({"numStartups": 1}));
+    set_mtime(&global, t(1));
+    let p1 = home
+        .home()
+        .join(".clauth/profiles/p1/runtime-4242-0/.claude.json");
+    let _live1 = arm_live_copy(&p1);
+    write_recorded_json(
+        &written_record_path().expect("record"),
+        &p1,
+        &json!({"numStartups": 2}),
+        t(10),
+    );
+    // A session starting between the fast path's list and the lock: its copy is
+    // recorded (as a start records its seed) and a job names its tree (so the
+    // re-read inside the lock admits it without a marker).
+    let p2 = home
+        .home()
+        .join(".clauth/profiles/p2/runtime-4242-1/.claude.json");
+    let tree2 = p2.parent().expect("runtime dir").to_path_buf();
+    set_pre_lock_hook(Some(Box::new({
+        let home = home.home().to_path_buf();
+        let p2 = p2.clone();
+        move || {
+            write_recorded_json(
+                &written_record_path().expect("record"),
+                &p2,
+                &json!({"numStartups": 3}),
+                t(20),
+            );
+            crate::testutil::write_claude_job(&home, "0add99bb", &tree2);
+            crate::testutil::write_live_supervisor(&tree2);
+        }
+    })));
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            set_pre_lock_hook(None);
+        }
+    }
+    let _hook_guard = HookGuard;
+    reset_last_synced();
+
+    pass().expect("sync");
+
+    let record = written_record_path().expect("record");
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(&record).expect("read record")).expect("record parses");
+    let p2_str = p2.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p2_str)),
+        "the just-started session's record entry must survive the pass: {entries:#?}"
+    );
+}
+
+#[test]
+fn a_pass_that_listed_members_before_a_session_started_keeps_its_record_entry() {
+    a_pass_listing_members_before_a_start_keeps_its_record_entry(sync_once);
+}
+
+#[test]
+fn a_watchdog_pass_that_listed_members_before_a_session_started_keeps_its_record_entry() {
+    a_pass_listing_members_before_a_start_keeps_its_record_entry(sync_once_try);
+}
+
 /// An unparseable record reads as empty (every member then ranks as a Claude
 /// Code write by its own mtime) and a pass that still converges rewrites it
 /// parseably with the copy it wrote.
@@ -2812,6 +2954,13 @@ fn a_switch_strip_never_reverts_an_unpropagated_runtime_write() {
         &global,
         &json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
     );
+    // clauth built this session's copy, then Claude Code wrote it.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &r1,
+        &json!({"numStartups": 1, "oauthAccount": {"emailAddress": "r1@x"}}),
+        t(5),
+    );
     write_json(
         &r1,
         &json!({
@@ -2932,7 +3081,7 @@ fn a_record_write_failure_logs_once_per_reconciler() {
         write_json(&b, &json!({"v": 100 + i}));
         set_mtime(&a, t(100 + 10 * i));
         set_mtime(&b, t(1));
-        crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), |_| {
+        crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), &[], |_| {
             crate::jsonsync::KeyRule::Shared
         })
         .expect("the failing-record pass still converges");
@@ -2941,7 +3090,7 @@ fn a_record_write_failure_logs_once_per_reconciler() {
         write_json(&d, &json!({"v": 100 + i}));
         set_mtime(&c, t(100 + 10 * i));
         set_mtime(&d, t(1));
-        crate::jsonsync::sync_paths(&[c.clone(), d.clone()], None, Some(&good), |_| {
+        crate::jsonsync::sync_paths(&[c.clone(), d.clone()], None, Some(&good), &[], |_| {
             crate::jsonsync::KeyRule::Shared
         })
         .expect("the clean-record pass converges");
@@ -2980,6 +3129,13 @@ fn strip_order_fixture(home: &HomeSandbox) -> (PathBuf, PathBuf) {
     write_json(
         &global,
         &json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
+    );
+    // clauth built this session's copy, then Claude Code wrote it.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &r1,
+        &json!({"numStartups": 1, "oauthAccount": {"emailAddress": "r1@x"}}),
+        t(5),
     );
     write_json(
         &r1,
@@ -3159,6 +3315,13 @@ fn assert_homes_own_write_survives_a_strip(strip: impl FnOnce()) {
         &global,
         &json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
     );
+    // clauth built this session's copy, then Claude Code wrote it.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &r1,
+        &json!({"numStartups": 1, "oauthAccount": {"emailAddress": "r1@x"}}),
+        t(5),
+    );
     write_json(
         &r1,
         &json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
@@ -3240,10 +3403,16 @@ fn a_strip_keeps_the_record_entries_of_copies_it_did_not_write() {
         &json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
     );
     write_json(&r1, &json!({"numStartups": 1}));
-    write_json(&r2, &json!({"numStartups": 1}));
+    // r2 is clauth's own copy, so the Claude Code write the hook lands on it
+    // may win a later pass.
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &r2,
+        &json!({"numStartups": 1}),
+        t(5),
+    );
     set_mtime(&global, t(10));
     set_mtime(&r1, t(5));
-    set_mtime(&r2, t(5));
 
     // Claude Code writes r2 while the pass is writing r1: r2 is skipped as
     // moved, r1 gets a fresh copy of the older winner.
@@ -3338,7 +3507,7 @@ fn an_unrecorded_copy_from_a_moved_winner_never_outranks_its_newer_write() {
     }
     let _hook_guard = HookGuard;
 
-    crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), |_| {
+    crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), &[], |_| {
         crate::jsonsync::KeyRule::Shared
     })
     .expect("the unrecorded pass still converges");
@@ -3346,7 +3515,7 @@ fn an_unrecorded_copy_from_a_moved_winner_never_outranks_its_newer_write() {
 
     // The next pass must converge on the winner's newer write, not the stale
     // unrecorded copy.
-    crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), |_| {
+    crate::jsonsync::sync_paths(&[a.clone(), b.clone()], None, Some(&bad), &[], |_| {
         crate::jsonsync::KeyRule::Shared
     })
     .expect("second pass");
@@ -3359,5 +3528,353 @@ fn an_unrecorded_copy_from_a_moved_winner_never_outranks_its_newer_write() {
         read_json(&b),
         json!({"numStartups": 3, "ccNew": true}),
         "the unrecorded copy converges on the winner's newer write"
+    );
+}
+
+/// A `.claude.json` a stray Claude Code wrote into a runtime-named dir no live
+/// clauth session holds: one under a profile clauth never made (a stale
+/// `CLAUDE_CONFIG_DIR` naming a collected runtime), one beside a sessions dir
+/// whose marker no process holds. Both carry a first-start key set, newer than
+/// home.
+fn plant_dead_runtime_copies(home: &Path) {
+    let fresh = json!({"firstStartTime": "2026-10-31T16:24:19.029Z", "userID": "new",
+        "machineID": "m", "migrationVersion": 1, "seenNotifications": {}});
+    let ghost = home.join(".clauth/profiles/zcode9/runtime-3532172-11/.claude.json");
+    fs::create_dir_all(ghost.parent().expect("parent")).expect("mkdir");
+    write_json(&ghost, &fresh);
+    set_mtime(&ghost, t(20));
+    let stale = home.join(".clauth/profiles/cld0/runtime-4242-0/.claude.json");
+    fs::create_dir_all(stale.parent().expect("parent")).expect("mkdir");
+    fs::create_dir_all(home.join(".clauth/profiles/cld0/sessions-4242-0")).expect("mkdir");
+    write_json(&stale, &fresh);
+    set_mtime(&stale, t(21));
+}
+
+#[test]
+fn a_copy_no_live_session_holds_never_rewrites_home() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let rich = json!({"numStartups": 247, "projects": {"/a": {}, "/b": {}},
+        "hasCompletedOnboarding": true, "firstStartTime": "2026-10-28T21:34:15.486Z",
+        "userID": "old", "installMethod": "native", "autoUpdates": false});
+    write_json(&home_file, &rich);
+    set_mtime(&home_file, t(10));
+    plant_dead_runtime_copies(home.home());
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        rich,
+        "a dead runtime copy took part in the sync and rewrote ~/.claude.json"
+    );
+}
+
+// ── the reconciler's three safety guards ────────────────────────────────────
+
+/// The backups under `dir` named `<file>.<stamp>`, oldest first. An absent dir
+/// has none.
+fn backups_named(dir: &Path, file: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{file}.");
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A path as the refusal line renders it: the sandbox home shortened to `~`.
+fn tilde(home: &Path, path: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Guard 2: a live runtime copy clauth never wrote joins the pass but can never
+/// WIN it, so a stray Claude Code's first-start copy cannot delete the shared
+/// keys home holds.
+#[test]
+fn a_live_copy_clauth_never_wrote_never_wins_home() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let rich = json!({"numStartups": 247, "projects": {"/a": {}},
+        "userID": "u", "installMethod": "native"});
+    write_json(&home_file, &rich);
+    set_mtime(&home_file, t(1));
+    let stray = home
+        .home()
+        .join(".clauth/profiles/p1/runtime-4242-0/.claude.json");
+    fs::create_dir_all(stray.parent().expect("has parent")).expect("mkdir");
+    write_json(
+        &stray,
+        &json!({"firstStartTime": "2026-10-31T16:24:19.029Z"}),
+    );
+    set_mtime(&stray, t(20));
+    let _live = arm_live_copy(&stray);
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        rich,
+        "an unrecorded live copy won the pass and rewrote ~/.claude.json"
+    );
+}
+
+/// Guard 2's positive control: a copy clauth WROTE, then carrying a newer
+/// in-session edit, still propagates to home.
+#[test]
+fn a_recorded_live_copy_carrying_a_newer_edit_still_reaches_home() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let live = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-0")
+        .join(".claude.json");
+    fs::create_dir_all(live.parent().expect("has parent")).expect("mkdir");
+    write_json(&home_file, &json!({"numStartups": 1, "projects": {}}));
+    set_mtime(&home_file, t(1));
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &live,
+        &json!({"numStartups": 2, "ccLive": true}),
+        t(10),
+    );
+    let _live = arm_live_copy(&live);
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        json!({"numStartups": 2, "ccLive": true}),
+        "a recorded live copy's newer edit must still reach home"
+    );
+}
+
+/// Guard 3 for `.claude.json`: a recorded live winner lacking four of home's
+/// shared top-level keys is one over the bound, so the pass writes nothing,
+/// backs home up once, and logs the exact line.
+#[test]
+fn a_winner_lacking_four_shared_keys_writes_nothing_and_backs_home_up() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let winner = home
+        .home()
+        .join(".clauth/profiles/p1/runtime-4242-0/.claude.json");
+    fs::create_dir_all(winner.parent().expect("has parent")).expect("mkdir");
+    write_json(
+        &home_file,
+        &json!({"numStartups": 1, "projects": {}, "userID": "u",
+            "installMethod": "native"}),
+    );
+    set_mtime(&home_file, t(1));
+    let record = written_record_path().expect("record path");
+    write_recorded_json(&record, &winner, &json!({"firstStartTime": "x"}), t(10));
+    let backups_dir = home.home().join(".clauth").join("backups");
+
+    let before_home = fs::read(&home_file).expect("read home");
+    let before_winner = fs::read(&winner).expect("read winner");
+    let before_record = fs::read(&record).expect("read record");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync_paths(&[home_file.clone(), winner.clone()]).expect("reconcile");
+    }
+
+    assert_eq!(
+        fs::read(&home_file).expect("read home"),
+        before_home,
+        "a refused pass must leave home byte-identical"
+    );
+    assert_eq!(
+        fs::read(&winner).expect("read winner"),
+        before_winner,
+        "a refused pass must leave every member byte-identical"
+    );
+    assert_eq!(
+        fs::read(&record).expect("read record"),
+        before_record,
+        "a refused pass must not persist a record"
+    );
+    let backups = backups_named(&backups_dir, ".claude.json");
+    assert_eq!(backups.len(), 1, "exactly one backup: {backups:#?}");
+    assert_eq!(
+        fs::read(&backups[0]).expect("read backup"),
+        before_home,
+        "the backup holds home's own bytes"
+    );
+    let expected = format!(
+        "clauth: .claude.json sync skipped: applying {} would delete 4 keys from {}; \
+         saved a copy at {}",
+        tilde(home.home(), &winner),
+        tilde(home.home(), &home_file),
+        tilde(home.home(), &backups[0]),
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![expected],
+        "the refusal line is pinned exactly"
+    );
+
+    {
+        let _capture = lines.capture_here();
+        sync_paths(&[home_file.clone(), winner.clone()]).expect("second reconcile");
+    }
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "a second pass over the same winner must not raise a second line"
+    );
+    assert_eq!(
+        backups_named(&backups_dir, ".claude.json").len(),
+        1,
+        "a second pass over the same winner must not take a second backup"
+    );
+}
+
+/// The protected-key list belongs to the settings reconciler alone: a
+/// `.claude.json` winner that happens to lack a key named `cleanupPeriodDays`
+/// still wins, and the pass still deletes that key from home.
+#[test]
+fn a_cleanup_named_key_is_not_protected_in_the_claude_json_pass() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let live = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-0")
+        .join(".claude.json");
+    fs::create_dir_all(live.parent().expect("has parent")).expect("mkdir");
+    write_json(
+        &home_file,
+        &json!({"numStartups": 1, "cleanupPeriodDays": 3650}),
+    );
+    set_mtime(&home_file, t(1));
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &live,
+        &json!({"numStartups": 2, "ccLive": true}),
+        t(10),
+    );
+    let _live = arm_live_copy(&live);
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        json!({"numStartups": 2, "ccLive": true}),
+        "a .claude.json winner lacking cleanupPeriodDays must still run and delete it"
+    );
+}
+
+// ── the guards pinned one at a time ──────────────────────────────────────────
+
+/// Guard 1 alone for `.claude.json`: a DEAD recorded copy (so guard 2 lets it
+/// win), newest, and lacking only one shared key (so guard 3 lets the pass run)
+/// is still excluded by membership, so home keeps its keys.
+#[test]
+fn a_dead_recorded_copy_cannot_wipe_home_when_only_membership_can_stop_it() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let rich = json!({"numStartups": 247, "projects": {"/a": {}},
+        "userID": "u", "installMethod": "native"});
+    write_json(&home_file, &rich);
+    set_mtime(&home_file, t(10));
+    // A dead tree under a profile clauth never made, and one beside a sessions
+    // dir no process holds: both recorded and newest, each lacking only one
+    // shared key.
+    let ghost = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("runtime-3532172-11")
+        .join(".claude.json");
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &ghost,
+        &json!({"numStartups": 247, "projects": {"/a": {}}, "userID": "u"}),
+        t(20),
+    );
+    let stale = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("cld0")
+        .join("runtime-4242-0")
+        .join(".claude.json");
+    fs::create_dir_all(
+        home.home()
+            .join(".clauth")
+            .join("profiles")
+            .join("cld0")
+            .join("sessions-4242-0"),
+    )
+    .expect("mkdir");
+    write_recorded_json(
+        &written_record_path().expect("record path"),
+        &stale,
+        &json!({"numStartups": 247, "projects": {"/a": {}}, "userID": "u"}),
+        t(21),
+    );
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        rich,
+        "a dead recorded copy took part in the sync and rewrote ~/.claude.json"
+    );
+}
+
+/// Guard 2 alone for `.claude.json`: a LIVE unrecorded copy, newest and lacking
+/// only one shared key, is admitted (guard 1) and under the bound (guard 3) —
+/// only the winner gate keeps home intact.
+#[test]
+fn an_unrecorded_live_copy_cannot_win_when_only_the_winner_gate_can_stop_it() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let rich = json!({"numStartups": 247, "projects": {"/a": {}},
+        "userID": "u", "installMethod": "native"});
+    write_json(&home_file, &rich);
+    set_mtime(&home_file, t(1));
+    let stray = home
+        .home()
+        .join(".clauth/profiles/p1/runtime-4242-0/.claude.json");
+    fs::create_dir_all(stray.parent().expect("has parent")).expect("mkdir");
+    write_json(
+        &stray,
+        &json!({"numStartups": 247, "projects": {"/a": {}}, "userID": "u"}),
+    );
+    set_mtime(&stray, t(20));
+    let _live = arm_live_copy(&stray);
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        rich,
+        "an unrecorded live copy won the pass and rewrote ~/.claude.json"
     );
 }

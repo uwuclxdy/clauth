@@ -348,6 +348,329 @@ fn live_session_blocks_liveness_probe() {
 }
 
 #[test]
+fn a_marker_claim_rides_out_a_probe_holding_the_lock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("pid");
+    let file = open_pid_file(&pid_file).expect("open claim fd");
+
+    // A liveness probe holds the marker's flock for an instant, then drops it:
+    // the claim's first try fails, the bounded retry rides the probe out.
+    let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_path = pid_file.clone();
+    let probe_holding = std::sync::Arc::clone(&holding);
+    let probe = std::thread::spawn(move || {
+        let probe_fd = open_pid_file(&probe_path).expect("open probe fd");
+        probe_fd.lock().expect("probe holds");
+        probe_holding.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(probe_fd);
+    });
+
+    while !holding.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // Seven 50 ms pauses: a 350 ms window over the 10 ms hold, past the
+    // ~150 ms a loaded runner's sleep can overrun.
+    claim_session_marker_with(&file, &pid_file, std::time::Duration::from_millis(50))
+        .expect("the claim rides out the probe");
+    probe.join().expect("probe joins");
+}
+
+/// A holder that never releases makes the claim fail inside a bound derived
+/// from the production cap and delay: 7 sleeps of 5 ms, plus 150 ms of
+/// oversleep each on a loaded runner, stays under 1.5 s. Raising the cap to
+/// 400 turns the sleeps into ~2 s and outlasts it.
+#[test]
+fn a_marker_claim_against_a_live_holder_fails_inside_its_bound() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("pid");
+    let holder = open_pid_file(&pid_file).expect("holder fd");
+    holder.lock().expect("holder locks");
+    let claimant = open_pid_file(&pid_file).expect("claim fd");
+    let started = std::time::Instant::now();
+    let err = claim_session_marker(&claimant, &pid_file)
+        .expect_err("a live holder must refuse the claim");
+    let took = started.elapsed();
+    assert!(
+        format!("{err}").contains("Another live process holds this session id"),
+        "{err}"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "the claim is bounded: {took:?}"
+    );
+    let third = open_pid_file(&pid_file).expect("third fd");
+    assert!(
+        third.try_lock().is_err(),
+        "the holder still holds after the failed claim"
+    );
+}
+
+/// A held marker anywhere in the sessions dir keeps the tree live, even when
+/// every marker before it in the walk fails to open. Returning `None` on the
+/// first open error loses the held marker behind the unreadable ones.
+#[test]
+#[cfg(unix)]
+fn a_held_marker_beside_unreadable_ones_reads_live() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runtime = tmp.path().join("runtime-4242-0");
+    let sessions = tmp.path().join("sessions-4242-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    // Several stale markers that fail to open, planted first so the walk meets
+    // them before the held one, as a crashed session's mode-000 leftovers sit
+    // beside a live sibling's held marker.
+    for i in 0..12 {
+        let stale = sessions.join(format!("aaa-{i:02}"));
+        fs::write(&stale, b"x").expect("write stale marker");
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    }
+    let held = open_pid_file(&sessions.join("zzz-held")).expect("open held marker");
+    held.lock().expect("lock held marker");
+
+    assert_eq!(
+        runtime_marker_liveness("runtime-4242-0", &runtime),
+        Some(true),
+        "a held marker must read live even beside unreadable ones"
+    );
+}
+
+/// A FINISHED job naming a tree (`claude stop`'s `"stopped"`, or `done` /
+/// `failed`) leaves the tree out of the members even while its supervisor
+/// record reads live: only an unfinished job may keep a marker-less tree in
+/// the reconcile pass, so a stopped session's tree never joins.
+#[test]
+fn a_finished_job_naming_a_tree_does_not_join_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-0");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job_in(
+        home.home(),
+        "0add99ba",
+        &tree,
+        "stopped",
+        Some("2026-10-19T05:25:39.445Z"),
+    );
+    crate::testutil::write_live_supervisor(&tree);
+
+    assert!(
+        !live_shared_runtime_dirs().contains(&tree),
+        "a finished job must not name its tree a member: {:?}",
+        live_shared_runtime_dirs()
+    );
+}
+
+/// A FINISHED job leaves its tree out even while the global job store is
+/// caught mid-create (a `claude --bg` start elsewhere) and the tree's
+/// supervisor record reads live: the live-session count reads no session on
+/// the tree, and the walk reuses that reading, so the tree never joins.
+#[test]
+fn a_finished_job_beside_a_mid_create_store_does_not_join_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-3");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job_in(
+        home.home(),
+        "0add99be",
+        &tree,
+        "stopped",
+        Some("2026-10-19T05:25:39.445Z"),
+    );
+    crate::testutil::write_live_supervisor(&tree);
+    fs::create_dir_all(home.home().join(".claude").join("jobs").join("ffffffff"))
+        .expect("mid-create job dir");
+
+    assert!(
+        !live_shared_runtime_dirs().contains(&tree),
+        "a finished job beside a mid-create store must not name its tree a member: {:?}",
+        live_shared_runtime_dirs()
+    );
+}
+
+/// A FINISHED job leaves its tree out even while the tree's own `jobs/` store
+/// cannot be read (a plain file sits where the store dir belongs) and its
+/// supervisor record reads live: the live-session count reads no session on
+/// the tree, and the walk reuses that reading, so the tree never joins.
+#[test]
+fn a_finished_job_beside_an_unreadable_scoped_store_does_not_join_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-4");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job_in(
+        home.home(),
+        "0add99bf",
+        &tree,
+        "stopped",
+        Some("2026-10-19T05:25:39.445Z"),
+    );
+    crate::testutil::write_live_supervisor(&tree);
+    fs::write(tree.join("jobs"), b"not a dir").expect("pose an unreadable scoped store");
+
+    assert!(
+        !live_shared_runtime_dirs().contains(&tree),
+        "a finished job beside an unreadable scoped store must not name its tree a member: {:?}",
+        live_shared_runtime_dirs()
+    );
+}
+
+/// An UNFINISHED (`working`) job whose supervisor is dead (no supervisor
+/// record) leaves the tree out: the live-session count reads such a tree as
+/// holding no session, and the walk reuses that reading, so it never joins.
+#[test]
+fn a_working_job_whose_supervisor_is_dead_does_not_join_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-1");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job(home.home(), "0add99bb", &tree);
+
+    assert!(
+        !live_shared_runtime_dirs().contains(&tree),
+        "a supervisor-less working job must not name its tree a member: {:?}",
+        live_shared_runtime_dirs()
+    );
+}
+
+/// A WORKING job whose supervisor reads live keeps its tree a member while the
+/// global job store is caught mid-create: the live-session count still counts
+/// the job, so a `claude --bg` start elsewhere never drops a live tree.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_working_job_beside_a_mid_create_store_joins_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-5");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job(home.home(), "0add99c1", &tree);
+    crate::testutil::write_live_supervisor(&tree);
+    fs::create_dir_all(home.home().join(".claude").join("jobs").join("ffffffff"))
+        .expect("mid-create job dir");
+
+    assert!(
+        live_shared_runtime_dirs().contains(&tree),
+        "a working job beside a mid-create store must name its tree a member: {:?}",
+        live_shared_runtime_dirs()
+    );
+}
+
+/// An UNFINISHED (`working`) job whose supervisor reads live keeps the
+/// marker-less tree a member: the job half of membership, with the supervisor
+/// check the live-session count applies. Removing the job term reds this (the
+/// tree then reads as dead).
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_working_job_with_a_live_supervisor_joins_the_members() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-2");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_claude_job(home.home(), "0add99bc", &tree);
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    assert_eq!(
+        live_shared_runtime_dirs(),
+        vec![tree],
+        "a working job with a live supervisor must name its tree a member"
+    );
+}
+
+/// The swap/adoption claim rides a foreign holder out through the bounded
+/// retry before it refuses. A single try returns instantly; the retries spend
+/// 7 x 5 ms, which is what the elapsed-time floor below pins.
+#[test]
+fn the_swap_claim_retries_against_a_live_foreign_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions = tmp.path().join("sessions-4242-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid_file = sessions.join("4242-0");
+    let holder = open_pid_file(&pid_file).expect("holder fd");
+    holder.lock().expect("holder locks");
+
+    let paths = SessionPaths {
+        runtime: tmp.path().join("runtime-4242-0"),
+        sessions,
+        pid_file,
+    };
+    let started = std::time::Instant::now();
+    let claim = stamp_swapped_markers(&paths).expect("stamp");
+    let took = started.elapsed();
+    assert!(claim.is_none(), "a foreign holder must refuse the swap");
+    assert!(
+        took >= std::time::Duration::from_millis(20),
+        "the claim must retry against the holder: {took:?}"
+    );
+}
+
+/// A live foreign holder on the codex session's marker makes the start's claim
+/// ride the bounded retry out before it bails loudly. A single try returns
+/// instantly; the retries spend 7 x 5 ms, which is what the elapsed-time floor
+/// below pins.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_codex_claim_retries_against_a_live_foreign_holder() {
+    let home = HomeSandbox::new();
+    let profile = home.home().join(".clauth").join("profiles").join("cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    // Pin the next minted sid, then hold the markers the re-mint loop walks
+    // past (8) plus the one the claim then reaches, so the claim collides.
+    rewind_session_seq_for_test(0);
+    let pid = std::process::id();
+    let mut holders = Vec::new();
+    for seq in 0..=SID_COLLISION_REMINTS as u64 {
+        let sid = format!("{pid}-{seq}");
+        let sessions = profile.join(format!("sessions-{sid}"));
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let marker = open_pid_file(&sessions.join(&sid)).expect("open marker");
+        marker.lock().expect("lock marker");
+        holders.push(marker);
+    }
+
+    let started = std::time::Instant::now();
+    let err = CodexRuntime::acquire("cx", Isolation::Shared)
+        .err()
+        .expect("a live foreign holder must refuse the codex start");
+    let took = started.elapsed();
+    assert!(
+        format!("{err:#}").contains("Another live process holds this session id"),
+        "{err:#}"
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(20),
+        "the claim must retry against the holder: {took:?}"
+    );
+}
+
+#[test]
 fn prune_removes_dead_keeps_alive() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let alive_path = tmp.path().join("alive");
@@ -19522,13 +19845,17 @@ fn a_fresh_seed_never_outranks_a_siblings_unpropagated_write() {
         &global,
         serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
     );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    // clauth built this session's copy, then Claude Code wrote it.
+    record_seed_copy(&r1, serde_json::json!({"numStartups": 1}), t(15));
     write(
         &r1,
         serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
     );
-    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
-    set_mtime(&global, t(10));
     set_mtime(&r1, t(20));
+    let _live_r1 = arm_seed_marker(r1.parent().expect("runtime dir"));
+    let _live_r2 = arm_seed_marker(&r2dir);
 
     seed_claude_json(&r2dir, &h.join(".claude")).expect("seed");
     crate::claude_json::reset_last_synced();
@@ -19571,9 +19898,47 @@ fn seed_test_doc(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
 }
 
+/// A live session's flock-held marker on the sessions dir the module's own
+/// `runtime<rest>` ↔ `sessions<rest>` rule pairs with `runtime_dir`. Keep the
+/// returned handle alive for the copy to stay a sync member.
+fn arm_seed_marker(runtime_dir: &Path) -> std::fs::File {
+    let name = runtime_dir
+        .file_name()
+        .expect("runtime dir name")
+        .to_str()
+        .expect("utf8");
+    let sessions = runtime_dir.with_file_name(paired_sessions_name(name).expect("paired name"));
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = open_pid_file(&sessions.join("test-pid")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
+}
+
+/// Write a runtime `.claude.json` as clauth's own copy, stamped at `when`: the
+/// production write-and-record path, so a later Claude Code write to it can win
+/// a pass.
+fn record_seed_copy(path: &Path, value: serde_json::Value, when: SystemTime) {
+    let record = crate::claude_json::written_record_path().expect("record path");
+    let bytes = serde_json::to_vec_pretty(&value).expect("serialize");
+    let since = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("post-epoch");
+    crate::jsonsync::write_copy_and_record(
+        Some(&record),
+        path,
+        &bytes,
+        (since.as_secs() as i64, since.subsec_nanos()),
+        true,
+        Some(when),
+    )
+    .expect("write recorded copy");
+}
+
 /// Home made into clauth's echo of a runtime write at t10 (the first pass), and
 /// a sibling holding a newer unpropagated Claude Code write at t20. Returns
-/// `(global, r1, r2, r3dir)`; `r3dir` is the tree the seed under test fills.
+/// `(global, r1, r2, r3dir, live)`; `r3dir` is the tree the seed under test
+/// fills, and `live` holds the flock marking every planted tree a live
+/// session's.
 fn seed_from_echo_home(
     h: &std::path::Path,
 ) -> (
@@ -19581,6 +19946,7 @@ fn seed_from_echo_home(
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
+    Vec<std::fs::File>,
 ) {
     let global = h.join(".claude.json");
     let r1 = seed_test_runtime(h, "p1", "runtime-4242-0").join(".claude.json");
@@ -19595,14 +19961,22 @@ fn seed_from_echo_home(
     };
     let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
     write(&global, serde_json::json!({"numStartups": 1}));
-    write(&r1, serde_json::json!({"numStartups": 2, "ccR1": true}));
     set_mtime(&global, t(5));
+    // clauth built this session's copy, then Claude Code wrote it.
+    record_seed_copy(&r1, serde_json::json!({"numStartups": 1}), t(9));
+    write(&r1, serde_json::json!({"numStartups": 2, "ccR1": true}));
     set_mtime(&r1, t(10));
+    let live = vec![
+        arm_seed_marker(r1.parent().expect("runtime dir")),
+        arm_seed_marker(r2.parent().expect("runtime dir")),
+        arm_seed_marker(&r3dir),
+    ];
     crate::claude_json::reset_last_synced();
     crate::claude_json::sync_once().expect("first pass makes home an echo");
+    record_seed_copy(&r2, serde_json::json!({"numStartups": 1}), t(15));
     write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
     set_mtime(&r2, t(20));
-    (global, r1, r2, r3dir)
+    (global, r1, r2, r3dir, live)
 }
 
 fn assert_every_copy_keeps_the_siblings_write(copies: &[(&str, &std::path::Path)]) {
@@ -19628,7 +20002,7 @@ fn assert_every_copy_keeps_the_siblings_write(copies: &[(&str, &std::path::Path)
 fn a_seed_from_an_echo_home_never_outranks_a_siblings_newer_write() {
     let home = HomeSandbox::new();
     let h = home.home().to_path_buf();
-    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+    let (global, r1, r2, r3dir, _live) = seed_from_echo_home(&h);
 
     seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
     crate::claude_json::reset_last_synced();
@@ -19658,7 +20032,7 @@ impl Drop for SeedPreLockHookGuard {
 fn a_seed_waiting_on_a_merge_reads_home_after_it() {
     let home = HomeSandbox::new();
     let h = home.home().to_path_buf();
-    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+    let (global, r1, r2, r3dir, _live) = seed_from_echo_home(&h);
 
     crate::runtime::set_seed_pre_lock_hook(Some(Box::new(|| {
         let paths = crate::claude_json::known_paths().expect("paths");
@@ -19686,7 +20060,7 @@ fn a_seed_waiting_on_a_merge_reads_home_after_it() {
 fn a_seed_into_a_differently_spelled_path_still_matches_its_record() {
     let home = HomeSandbox::new();
     let h = home.home().to_path_buf();
-    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+    let (global, r1, r2, r3dir, _live) = seed_from_echo_home(&h);
     let sep = std::path::MAIN_SEPARATOR;
     let doubled = std::path::PathBuf::from(format!(
         "{}{sep}{sep}{}",
@@ -19716,7 +20090,7 @@ fn a_seed_into_a_differently_spelled_path_still_matches_its_record() {
 fn a_seed_records_its_copy_at_homes_carried_rank() {
     let home = HomeSandbox::new();
     let h = home.home().to_path_buf();
-    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+    let (_global, _r1, _r2, r3dir, _live) = seed_from_echo_home(&h);
     let sep = std::path::MAIN_SEPARATOR;
     let doubled = std::path::PathBuf::from(format!(
         "{}{sep}{sep}{}",
@@ -19774,7 +20148,7 @@ fn every_seed_stamps_its_copy_at_the_fat_floor() {
     let floor = SystemTime::UNIX_EPOCH + Duration::from_secs(3_653 * 86_400);
     let home = HomeSandbox::new();
     let h = home.home().to_path_buf();
-    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+    let (_global, _r1, _r2, r3dir, _live) = seed_from_echo_home(&h);
 
     seed_claude_json(&r3dir, &h.join(".claude")).expect("recorded seed");
     let recorded = fs::metadata(r3dir.join(".claude.json"))
@@ -19823,13 +20197,17 @@ fn an_unrecorded_seed_never_outranks_a_siblings_newer_write() {
         &global,
         serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
     );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    // clauth built this session's copy, then Claude Code wrote it.
+    record_seed_copy(&r1, serde_json::json!({"numStartups": 1}), t(15));
     write(
         &r1,
         serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
     );
-    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
-    set_mtime(&global, t(10));
     set_mtime(&r1, t(20));
+    let _live_r1 = arm_seed_marker(r1.parent().expect("runtime dir"));
+    let _live_r2 = arm_seed_marker(&r2dir);
     // A directory where the sync-lock file goes makes the seed's lock open fail,
     // so the seed runs unrecorded — the path the unrecorded-seed mtime covers.
     let lock = h.join(".clauth").join(".claude-json-sync.lock");
@@ -20023,12 +20401,19 @@ fn an_unrecorded_seed_during_a_merge_never_outranks_a_siblings_write() {
     let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
     write(&global, serde_json::json!({"numStartups": 1}));
     write(&r1, serde_json::json!({"numStartups": 2}));
-    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
-    write(&r4, serde_json::json!({"numStartups": 1}));
     set_mtime(&global, t(5));
     set_mtime(&r1, t(10));
+    // clauth built these two copies, then Claude Code wrote them.
+    record_seed_copy(&r2, serde_json::json!({"numStartups": 1}), t(19));
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
     set_mtime(&r2, t(20));
-    set_mtime(&r4, t(3));
+    record_seed_copy(&r4, serde_json::json!({"numStartups": 1}), t(2));
+    let _live = [
+        arm_seed_marker(r1.parent().expect("runtime dir")),
+        arm_seed_marker(r2.parent().expect("runtime dir")),
+        arm_seed_marker(r4.parent().expect("runtime dir")),
+        arm_seed_marker(&r3dir),
+    ];
     crate::claude_json::reset_last_synced();
     crate::claude_json::sync_once().expect("a merge makes home an echo of r2");
 
@@ -20096,11 +20481,19 @@ fn a_seed_whose_record_write_fails_never_outranks_a_siblings_write() {
     };
     let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
     write(&global, serde_json::json!({"numStartups": 1}));
-    write(&r1, serde_json::json!({"numStartups": 2}));
     set_mtime(&global, t(5));
+    // clauth built this session's copy, then Claude Code wrote it.
+    record_seed_copy(&r1, serde_json::json!({"numStartups": 1}), t(9));
+    write(&r1, serde_json::json!({"numStartups": 2}));
     set_mtime(&r1, t(10));
+    let _live = [
+        arm_seed_marker(r1.parent().expect("runtime dir")),
+        arm_seed_marker(r2.parent().expect("runtime dir")),
+        arm_seed_marker(&r3dir),
+    ];
     crate::claude_json::reset_last_synced();
     crate::claude_json::sync_once().expect("a pass creates the lock and the record");
+    record_seed_copy(&r2, serde_json::json!({"numStartups": 1}), t(19));
     write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
     set_mtime(&r2, t(20));
 

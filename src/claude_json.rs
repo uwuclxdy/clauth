@@ -104,10 +104,25 @@ static LAST_SYNCED: Mutex<Option<Vec<crate::jsonsync::MemberSnapshot>>> = Mutex:
 static CREDIT_BILLED_FAMILIES: LazyLock<Mutex<HashMap<PathBuf, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Every `.claude.json` clauth reconciles: the global file plus each SHARED
-/// per-session runtime copy, via [`crate::jsonsync::runtime_files_under`].
+/// Every `.claude.json` copy on this host, live or dead: the global file plus
+/// each SHARED per-session runtime copy that EXISTS, via
+/// [`crate::jsonsync::runtime_files_under`]. The NAMING walk — the reconcile
+/// passes and the wire take [`live_known_paths`], which gates this on liveness.
+#[cfg(test)]
 pub(crate) fn known_paths() -> Result<Vec<PathBuf>> {
     Ok(crate::jsonsync::runtime_files_under(
+        &home_dir()?,
+        ".claude.json",
+    ))
+}
+
+/// [`known_paths`] over the LIVE shared runtime trees only — the member set a
+/// reconcile pass may join, and the wire's enumeration. A tree no live session
+/// holds and no live Claude Code job names is left out: its copy may be a stray
+/// Claude Code's first-start file, and merging one would delete the operator's
+/// own keys.
+pub(crate) fn live_known_paths() -> Result<Vec<PathBuf>> {
+    Ok(crate::jsonsync::live_runtime_files_under(
         &home_dir()?,
         ".claude.json",
     ))
@@ -119,10 +134,16 @@ pub(crate) fn known_paths() -> Result<Vec<PathBuf>> {
 /// [`crate::runtime::ProfileRuntime`] drop's final flush, whose work has no
 /// later event to retry it.
 pub(crate) fn sync_once() -> Result<()> {
-    let paths = known_paths()?;
+    let paths = live_known_paths()?;
     bypass_fast_path_for_pending_strip();
     crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || {
+        #[cfg(test)]
+        run_pre_lock_hook();
         let _lock = JsonSyncLock::acquire()?;
+        // The member list is re-read INSIDE the lock: a pass that listed it
+        // before a just-started session's marker was held would prune that
+        // session's record entry and let its first in-session edit be reverted.
+        let paths = live_known_paths()?;
         sync_paths_locked(&paths)?;
         Ok(true)
     })
@@ -134,14 +155,20 @@ pub(crate) fn sync_once() -> Result<()> {
 /// same loop iteration. The 30 s fallback tick and the next filesystem event
 /// retry a skipped pass.
 pub(crate) fn sync_once_try() -> Result<()> {
-    let paths = known_paths()?;
+    let paths = live_known_paths()?;
     bypass_fast_path_for_pending_strip();
-    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || match JsonSyncLock::try_once()? {
-        Some(_lock) => {
-            sync_paths_locked(&paths)?;
-            Ok(true)
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || {
+        #[cfg(test)]
+        run_pre_lock_hook();
+        match JsonSyncLock::try_once()? {
+            Some(_lock) => {
+                // Re-read the member list inside the lock, like [`sync_once`].
+                let paths = live_known_paths()?;
+                sync_paths_locked(&paths)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        None => Ok(false),
     })
 }
 
@@ -162,6 +189,38 @@ fn bypass_fast_path_for_pending_strip() {
         *LAST_SYNCED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Test-only interleave point at the top of the pass body of [`sync_once`] and
+/// [`sync_once_try`], between the fast path's member list and the sync lock
+/// ([`JsonSyncLock::acquire`] / [`JsonSyncLock::try_once`]): the span a
+/// session starting between the list and the lock occupies. A test arms it to
+/// start a session there and pin that the merge re-reads the list inside the
+/// lock rather than pruning the fresh session's record entry. `None` is inert;
+/// armed and disarmed only while the
+/// arming test holds a `HomeSandbox`.
+#[cfg(test)]
+static PRE_LOCK_HOOK: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// Arm or clear the [`PRE_LOCK_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_pre_lock_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook.map(std::sync::Arc::from);
+}
+
+/// Invoke the armed [`PRE_LOCK_HOOK`], if any. Clones the `Arc` so the hook
+/// runs outside the slot lock.
+#[cfg(test)]
+fn run_pre_lock_hook() {
+    let hook = PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -197,12 +256,16 @@ fn sync_paths_locked(paths: &[PathBuf]) -> Result<()> {
 pub(crate) fn merge_paths(paths: &[PathBuf]) -> Result<()> {
     let operator_file = home_dir().ok().map(|h| h.join(".claude.json"));
     let record = written_record_path();
-    crate::jsonsync::sync_paths(paths, operator_file.as_deref(), record.as_deref(), |path| {
-        match path {
+    crate::jsonsync::sync_paths(
+        paths,
+        operator_file.as_deref(),
+        record.as_deref(),
+        &[],
+        |path| match path {
             KeyPath::Top(key) if PER_PROFILE_FIELDS.contains(&key) => KeyRule::PerProfile,
             _ => KeyRule::Shared,
-        }
-    })
+        },
+    )
 }
 
 /// The cross-process flock serializing the `.claude.json` merge, so N live

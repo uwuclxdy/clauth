@@ -189,7 +189,7 @@ const BACKGROUND_SUFFIX: &str = "-bg";
 
 /// A codex session home under `profiles/<name>/`. Deliberately OUTSIDE the
 /// `runtime*`/`sessions*` stems: the config reconcilers walk
-/// [`shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
+/// [`live_shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
 /// any dir matching those, and the GC pairing rule would collect a home it has
 /// no pairing story for. A codex home named off this stem falls through both
 /// untouched, which is the designed behavior, not an accident.
@@ -3656,13 +3656,64 @@ fn collect_orphaned_keychain_item(in_flight: namespaced_keychain_ledger::InFligh
     }
 }
 
-/// Every profile's SHARED runtime dirs: each live session's `runtime-<sid>` plus
-/// a legacy bare `runtime` an earlier release left behind. Isolated dirs are
-/// excluded — both config reconcilers walk this, and neither may reach an
-/// isolated copy (why at [`crate::jsonsync::runtime_files_under`]). Fail-soft: an
-/// unreadable root or profile contributes nothing. Runs on the ~10 Hz watchdog
-/// tick, so it allocates only the paths it returns.
+/// The NAMING walk over every SHARED runtime dir, live or dead: each
+/// `runtime-<sid>`, a legacy bare `runtime`, or the fixed `runtime-bg`.
+/// Isolated dirs are excluded. Every production call site takes
+/// [`live_shared_runtime_dirs`] instead, so this serves the fixture tests that
+/// pin the naming shape.
+#[cfg(test)]
 pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
+    shared_runtime_dirs_matching(|_, _| true)
+}
+
+/// The [`shared_runtime_dirs`] a config reconcile pass may join: only trees
+/// that are LIVE — a flock-held marker in the paired sessions dir, or an
+/// unfinished Claude Code background job NAMING the tree whose supervisor
+/// reads live (the live-session count's reading, [`live_background_jobs`]). An
+/// unknown reading, marker, job store or supervisor record, EXCLUDES the copy:
+/// including a dead one lets a stray Claude Code's first-start copy decide
+/// what the operator's own files lose, while excluding a live one drops its
+/// record entry on the next pass that writes, so every edit it makes cannot win
+/// and is overwritten until a later pass rewrites the copy — a rejoin pass that
+/// finds the copy already merged leaves it unrecorded. The job store is read
+/// only when some candidate's marker probe found nothing live. A supervisor reading that
+/// cannot verify admits such a tree — an unverifiable supervisor reads live,
+/// `Some(true)` — and the recorded-winner and delete-bound guards still bound
+/// it.
+pub(crate) fn live_shared_runtime_dirs() -> Vec<PathBuf> {
+    let mut jobs: Option<crate::claude_jobs::JobTrees> = None;
+    shared_runtime_dirs_matching(|name, path| {
+        match runtime_marker_liveness(name, path) {
+            Some(true) => true,
+            // No marker: an unfinished background job naming the tree, whose
+            // supervisor reads live, may still be reading it. `names` picks the
+            // naming half and `unfinished_jobs` — the live-session count's own
+            // reading, not the GC's fail-closed `spares` or the rotation gate's
+            // fail-closed `unfinished_names` — the unfinished half: a finished
+            // job or an unreadable store leaves the copy out, and a store caught
+            // mid-create counts only its readable records, so neither admits
+            // every dead tree. The supervisor
+            // reading is the one the live-session count uses, so a tree it
+            // reads as holding no session stays out here too.
+            Some(false) => {
+                let jobs = jobs.get_or_insert_with(crate::claude_jobs::job_trees);
+                jobs.names(path)
+                    && crate::canonical::identity(path).is_ok_and(|id| {
+                        jobs.unfinished_jobs()
+                            .is_some_and(|(running, _)| running.iter().any(|(_, tree)| *tree == id))
+                    })
+                    && supervisor_is_live(path) == Some(true)
+            }
+            None => false,
+        }
+    })
+}
+
+/// The shared runtime dirs under every profile, kept when `keep(name, path)`
+/// holds. Runs on the ~10 Hz watchdog tick through [`live_shared_runtime_dirs`]:
+/// a child's name is borrowed and a matching dir's path built once. Fail-soft:
+/// an unreadable root or profile contributes nothing.
+fn shared_runtime_dirs_matching(mut keep: impl FnMut(&str, &Path) -> bool) -> Vec<PathBuf> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();
     };
@@ -3678,16 +3729,56 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
             continue;
         };
         for child in children.flatten() {
-            if child
-                .file_name()
-                .to_str()
-                .is_some_and(is_shared_runtime_dir_name)
-            {
-                out.push(child.path());
+            let file_name = child.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if is_shared_runtime_dir_name(name) {
+                let path = child.path();
+                if keep(name, &path) {
+                    out.push(path);
+                }
             }
         }
     }
     out
+}
+
+/// A shared runtime tree's marker liveness, from the sessions dir
+/// [`paired_sessions_name`] pairs with it: `Some(true)` for a flock-held
+/// marker, `Some(false)` for none, `None` when the probe could not tell: the
+/// dir or a marker could not be read, opened or locked, and none was held.
+fn runtime_marker_liveness(runtime_name: &str, runtime: &Path) -> Option<bool> {
+    let sessions = runtime.with_file_name(paired_sessions_name(runtime_name)?);
+    let entries = match std::fs::read_dir(&sessions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    // Not `live_sessions_at`: `is_session_alive` reads an unopenable or
+    // unlockable marker as live (the GC's direction); membership reads it as
+    // unknown, unless another marker in the dir is held.
+    let mut unknown = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unknown = true;
+            continue;
+        };
+        let file = match OpenOptions::new().read(true).write(true).open(entry.path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Some(true),
+            Err(std::fs::TryLockError::Error(_)) => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 /// Every live isolated SESSION, paired with the `runtime-isolated…/projects/`
@@ -4242,6 +4333,52 @@ impl RotationGuard {
 /// through here).
 pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
     crate::profile::open_state_file(path)
+}
+
+/// How many times the marker claim retries a flock momentarily held by another
+/// process. A liveness probe outside the state flock (the reconcilers' marker
+/// walk, `has_live_session`, the TUI tally) holds this same marker's flock only
+/// for the instant between its own open and drop, so the retries below ride
+/// that out; a live session holds it for its lifetime and outlives every retry.
+const MARKER_CLAIM_ATTEMPTS: u32 = 8;
+
+/// The pause between marker-claim retries. Sized far above the probe's
+/// instantaneous hold and far below the time a live holder keeps the flock.
+const MARKER_CLAIM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Claim `file`'s flock as the session marker. `try_lock`, not `lock`: reaching
+/// the claim means the re-mint loop spent its re-mints against a holder that
+/// outlived every one of them, so a holder that outlives these retries fails
+/// loudly — a blocking `lock` would park the state flock. The retries exist
+/// only for a liveness probe that grabbed the lock in the window between the
+/// marker's create and this claim.
+fn claim_session_marker(file: &File, pid_file: &Path) -> Result<()> {
+    claim_session_marker_with(file, pid_file, MARKER_CLAIM_RETRY_DELAY)
+}
+
+/// [`claim_session_marker`] with the pause between retries injected, so a test
+/// can size the retry window far above a probe's hold.
+fn claim_session_marker_with(
+    file: &File,
+    pid_file: &Path,
+    delay: std::time::Duration,
+) -> Result<()> {
+    let mut attempt = 1;
+    let e = loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < MARKER_CLAIM_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(delay);
+            }
+            Err(e) => break e,
+        }
+    };
+    anyhow::bail!(
+        "failed to claim session marker {}: {e}. Another live process \
+         holds this session id",
+        pid_file.display()
+    )
 }
 
 /// Why this host cannot execute a per-session credential swap. The arm is
@@ -4831,9 +4968,9 @@ fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>>
         .with_context(|| format!("failed to create {}", paths.sessions.display()))?;
     let pid_lock = open_pid_file(&paths.pid_file)
         .with_context(|| format!("failed to open {}", paths.pid_file.display()))?;
-    // `try_lock`, not `lock`: this runs inside the state flock, where a blocking
-    // wait on a foreign holder would park the watchdog thread.
-    if pid_lock.try_lock().is_err() {
+    // A bounded retry, not `lock`: this runs inside the state flock, where a
+    // blocking wait on a foreign holder would park the watchdog thread.
+    if claim_session_marker(&pid_lock, &paths.pid_file).is_err() {
         return Ok(None);
     }
     Ok(Some(SwappedMarkers {
@@ -7058,17 +7195,7 @@ impl ProfileRuntime {
             )?;
             let file = open_pid_file(pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
-            // `try_lock`, not `lock`, for the reason the re-mint loop above
-            // states. Reaching here means the loop spent its re-mints against a
-            // holder that outlived every one of them, so failing loudly is the
-            // only honest end: waiting would park the state flock.
-            if let Err(e) = file.try_lock() {
-                anyhow::bail!(
-                    "failed to claim session marker {}: {e}. Another live process \
-                     holds this session id",
-                    pid_file.display()
-                );
-            }
+            claim_session_marker(&file, pid_file)?;
 
             // Register inside this same hold, once the marker is flock-held: the
             // row can then never exist without a liveness signal for GC to test
@@ -9911,14 +10038,67 @@ fn write_merged_settings(
     // operator-sensitive. The write gate also fires when only the mode is wrong
     // (a byte-identical file an older build left at the umask never self-heals
     // otherwise).
+    // The reconciler only lets a copy it recorded win a pass, so every shared
+    // copy this build produces is recorded too: a write here, and an existing
+    // byte-identical copy recorded in place. The record lands under the state
+    // flock the caller holds, the same lock `settings_sync::sync_members` holds
+    // while it persists the record. An isolated copy is never a sync member, so
+    // it needs no entry.
+    let record = match isolation {
+        Isolation::Shared => crate::settings_sync::written_record_path().ok(),
+        Isolation::Isolated => None,
+    };
+    let carried_rank = record.as_deref().map_or((i64::MIN, 0), |record| {
+        settings_carried_rank(record, base.as_deref())
+    });
     let needs_write = match std::fs::read(&settings_dst) {
         Ok(existing) => existing != merged.as_bytes() || !is_owner_only(&settings_dst),
         Err(_) => true,
     };
-    if needs_write {
-        atomic_write_600(&settings_dst, merged).context("failed to write runtime settings.json")?;
+    match record {
+        Some(record) if needs_write => crate::jsonsync::write_copy_and_record(
+            Some(&record),
+            &settings_dst,
+            merged.as_bytes(),
+            carried_rank,
+            true,
+            None,
+        )
+        .context("failed to write runtime settings.json")?,
+        Some(record) => {
+            crate::jsonsync::record_existing_copy(
+                &record,
+                &settings_dst,
+                merged.as_bytes(),
+                carried_rank,
+            );
+        }
+        None => {
+            atomic_write_600(&settings_dst, &merged)
+                .context("failed to write runtime settings.json")?;
+        }
     }
     Ok(())
+}
+
+/// The carried rank for a runtime `settings.json` this build composes: the rank
+/// of the base's Claude Code write — the base's own mtime when it is not an
+/// echo, its record entry's carried rank when it is — since that write is what
+/// the copy's shared fields carry. No base (isolated) ranks lowest.
+fn settings_carried_rank(record: &Path, base: Option<&Path>) -> (i64, u32) {
+    let Some(base) = base else {
+        return (i64::MIN, 0);
+    };
+    let Ok(meta) = std::fs::metadata(base) else {
+        return (i64::MIN, 0);
+    };
+    let Ok(mtime) = meta.modified() else {
+        return (i64::MIN, 0);
+    };
+    let Ok(bytes) = std::fs::read(base) else {
+        return (i64::MIN, 0);
+    };
+    crate::jsonsync::carried_rank_of(record, base, mtime, meta.len(), &bytes)
 }
 
 /// True when `path`'s mode is exactly 0o600 on Unix. Always true on non-Unix
@@ -12404,13 +12584,7 @@ impl CodexRuntime {
 
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
-            if let Err(e) = file.try_lock() {
-                anyhow::bail!(
-                    "failed to claim session marker {}: {e}. Another live process \
-                     holds this session id",
-                    pid_file.display()
-                );
-            }
+            claim_session_marker(&file, &pid_file)?;
 
             // Register inside the same hold, marker already flock-held — the
             // row never exists without a liveness signal. `launch_store` is

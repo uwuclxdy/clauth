@@ -315,18 +315,29 @@ fn stat_snapshot(paths: &[PathBuf]) -> Vec<MemberSnapshot> {
     snapshot
 }
 
-/// Every file clauth reconciles for one synced document: the operator's own
-/// copy under `base` plus each SHARED per-session runtime copy of `file`.
-/// Enumerated through [`crate::runtime::shared_runtime_dirs`] rather than a
-/// fixed `<profile>/runtime` path — every session owns its own `runtime-<sid>`,
-/// so a fixed path would reconcile nothing while every session ran. Isolated
-/// copies stay out: an isolated runtime is built from an empty base, so it must
-/// neither win (its empty copy would delete the operator's own fields) nor
-/// receive (that would defeat the isolation it exists for).
+/// The NAMING walk: the operator's own copy under `base` plus each SHARED
+/// runtime copy of `file`, live or dead. Every production call site takes
+/// [`live_runtime_files_under`] instead, so this serves the `.claude.json`
+/// fixture tests that pin the naming shape.
+#[cfg(test)]
 pub(crate) fn runtime_files_under(base: &Path, file: &str) -> Vec<PathBuf> {
     let mut paths = vec![base.join(file)];
     paths.extend(
         crate::runtime::shared_runtime_dirs()
+            .into_iter()
+            .map(|dir| dir.join(file)),
+    );
+    paths
+}
+
+/// The naming walk over the LIVE shared runtime trees only — the member
+/// set a reconcile pass may join. A tree no live session holds and no live
+/// Claude Code job names is left out: its copy may be a stray Claude Code's
+/// first-start file, and merging one would delete the operator's own keys.
+pub(crate) fn live_runtime_files_under(base: &Path, file: &str) -> Vec<PathBuf> {
+    let mut paths = vec![base.join(file)];
+    paths.extend(
+        crate::runtime::live_shared_runtime_dirs()
             .into_iter()
             .map(|dir| dir.join(file)),
     );
@@ -395,6 +406,50 @@ pub(crate) fn member_changed_since_read(path: &Path, mtime: SystemTime, size: u6
     now_mtime != mtime
 }
 
+/// A pass may delete at most this many shared top-level keys from the
+/// operator's own file before it refuses. A winner lacking more than this is
+/// almost never a preference deletion but a copy clauth never meant to take
+/// part — a stray Claude Code in a runtime-named dir — and the merge would drop
+/// those keys from the operator's file and every live sibling at once.
+const MAX_SHARED_DELETIONS: usize = 3;
+
+/// `settings.json` top-level keys a reconcile pass never deletes from the
+/// operator's file, whatever the count: each one's ABSENCE is destructive in
+/// its own right. Claude Code 2.1.314 reads `cleanupPeriodDays ?? wVt`
+/// (`wVt = 30`) at startup and unlinks every transcript and most of its config
+/// dir older than that; a runtime copy lacking the key while the operator file
+/// sets it would make the next merge delete it from the home file and every
+/// live copy, re-arming the 30-day default on shared data.
+pub(crate) const SETTINGS_PROTECTED_KEYS: &[&str] = &["cleanupPeriodDays"];
+
+/// How many backups of ONE operator file `~/.clauth/backups/` keeps.
+const BACKUPS_KEPT: usize = 10;
+
+/// The last refused pass per operator file: `(operator file, winner path,
+/// winner mtime, winner size)`. Both reconcilers share this process, so one
+/// file's refusal must not reset the other's latch. The watchdog ticks each
+/// reconciler many times a second, so a standing refusal must back the
+/// operator's file up and log it once, not once per tick.
+type RefusalKey = (PathBuf, PathBuf, SystemTime, u64);
+static LAST_REFUSAL: Mutex<Vec<RefusalKey>> = Mutex::new(Vec::new());
+
+/// Whether `key` is latched as refused.
+fn latched(key: &RefusalKey) -> bool {
+    LAST_REFUSAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key)
+}
+
+/// Latch `key`, replacing that operator file's previous entry.
+fn latch(key: RefusalKey) {
+    let mut held = LAST_REFUSAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.retain(|k| k.0 != key.0);
+    held.push(key);
+}
+
 /// Read and parse each file (skipping missing ones and partial writes), pick as
 /// winner the member whose bytes carry the newest Claude Code write (a non-echo
 /// ranks by its own mtime, an echo by the carried rank its record entry stores),
@@ -403,13 +458,25 @@ pub(crate) fn member_changed_since_read(path: &Path, mtime: SystemTime, size: u6
 /// that moves the winner aborts the pass and one that moves a target skips it;
 /// the next event or tick re-reads and converges.
 ///
+/// A runtime copy can win only while the written-copy record holds its path: a
+/// copy clauth never wrote (a stray Claude Code's first start in a dir shaped
+/// like a runtime tree) must never decide what the operator's own file loses.
+/// A pass whose winner would delete more than [`MAX_SHARED_DELETIONS`] of the
+/// operator file's shared top-level keys, or any key in `protected_keys` the
+/// operator file holds, writes nothing, backs that file up and logs the
+/// refusal once per distinct winner.
+///
 /// `operator_file` is the one member Claude Code owns (the copy under the
 /// operator's home rather than under `~/.clauth`); see [`write_member`] for why
 /// it is written differently.
+///
+/// `protected_keys` is the reconciler's own list of keys whose absence is
+/// destructive (empty for `.claude.json`); the engine only honours it.
 pub(crate) fn sync_paths(
     paths: &[PathBuf],
     operator_file: Option<&Path>,
     record: Option<&Path>,
+    protected_keys: &[&str],
     rule: impl Fn(KeyPath<'_>) -> KeyRule,
 ) -> Result<()> {
     let mut members: Vec<Member> = Vec::new();
@@ -451,12 +518,12 @@ pub(crate) fn sync_paths(
     // Every member ranks by the mtime of the Claude Code write its bytes carry:
     // a non-echo (path + mtime + size + digest does not match the record) ranks
     // by its own mtime; an echo ranks by the carried rank its entry stores. The
-    // winner is the highest rank; a rank tie goes to the non-echo, then path. An
-    // empty record (missing, unreadable or corrupt, an old-format file included)
-    // marks nothing an echo, so every member ranks by its own mtime and the
-    // plain newest-mtime order decides (fail-open). `is_echo` reversed so
-    // `false` (not an echo) sorts greater than `true`. Non-empty invariant: the
-    // `members.len() < 2` guard above.
+    // winner is the highest rank; a rank tie goes to the non-echo, then path.
+    // `is_echo` reversed so `false` (not an echo) sorts greater than `true`.
+    // A record holding no entry for a runtime copy (missing, unreadable,
+    // corrupt, or never written) bars that copy from winning in `can_win` below,
+    // so the operator file alone can win — a lost record never promotes the
+    // newest runtime copy.
     let is_echo = |m: &Member| written.iter().any(|e| e.matches(m));
     let rank = |m: &Member| -> (i64, u32) {
         written
@@ -466,19 +533,51 @@ pub(crate) fn sync_paths(
             .or_else(|| mtime_parts(m.mtime))
             .unwrap_or((i64::MIN, 0))
     };
-    #[allow(clippy::expect_used, reason = "non-empty invariant guaranteed above")]
+    // A runtime copy clauth never wrote can never win: an unrecorded copy
+    // carries no Claude Code write clauth handed it, and letting one decide a
+    // merge deletes the operator's own keys from every member. The operator
+    // file is exempt (it is not a clauth copy at all).
+    let can_win = |m: &Member| {
+        !is_runtime_copy(&m.path)
+            || written
+                .iter()
+                .any(|e| Path::new(&e.path) == m.path.as_path())
+    };
     let winner = members
         .iter()
         .enumerate()
+        .filter(|(_, m)| can_win(m))
         .max_by(|(_, a), (_, b)| {
             rank(a)
                 .cmp(&rank(b))
                 .then_with(|| is_echo(b).cmp(&is_echo(a)))
                 .then_with(|| a.path.cmp(&b.path))
         })
-        .map(|(i, _)| i)
-        .expect("members is non-empty");
+        .map(|(i, _)| i);
+    let Some(winner) = winner else {
+        return Ok(());
+    };
     let winner_rank = rank(&members[winner]);
+
+    // The delete bound: a winner that would drop more of the operator file's
+    // shared keys than [`MAX_SHARED_DELETIONS`], or any protected key it holds,
+    // is refused outright, before this pass writes anything anywhere.
+    if let Some(operator) = operator_file
+        && let Some(home_idx) = members.iter().position(|m| m.path.as_path() == operator)
+        && home_idx != winner
+        && refuse_destructive_pass(
+            &members[home_idx],
+            &members[winner],
+            operator
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default(),
+            protected_keys,
+            &rule,
+        )
+    {
+        return Ok(());
+    }
 
     // Copies written this pass, recorded as echoes. Persisted once
     // after the loop — on every exit path that wrote something — not per copy.
@@ -611,6 +710,178 @@ fn merge_member(
         merged.insert(key, Value::Object(nested));
     }
     merged
+}
+
+/// Whether `path` is a copy under a runtime-named tree (by name only, isolated
+/// and dead trees included). Wider than the live members
+/// [`crate::runtime::live_shared_runtime_dirs`] joins a pass, which is the safe
+/// direction for a winner gate. The operator's own file, and a caller's
+/// arbitrary member, are not gated on the written-copy record.
+fn is_runtime_copy(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(crate::runtime::is_clauth_runtime_path)
+}
+
+/// Refuse a pass whose winner would drop too many of `home`'s shared top-level
+/// keys, or any key in `protected` that `home` holds. The count is exactly what
+/// [`merge_member`]'s top-level `retain` would remove from the operator file; a
+/// protected key refuses at any count because its absence alone is destructive.
+/// A refusal writes nothing: the file is backed up first, and the one log line
+/// is raised once per distinct winner so the watchdog's repeated ticks do not
+/// fill the log with copies. Returns whether the pass must stop.
+fn refuse_destructive_pass(
+    home: &Member,
+    winner: &Member,
+    file: &str,
+    protected: &[&str],
+    rule: &impl Fn(KeyPath<'_>) -> KeyRule,
+) -> bool {
+    let dropped = home
+        .obj
+        .keys()
+        .filter(|k| rule(KeyPath::Top(k.as_str())) == KeyRule::Shared)
+        .filter(|k| !winner.obj.contains_key(k.as_str()))
+        .count();
+    let missing_protected = protected
+        .iter()
+        .any(|key| home.obj.contains_key(*key) && !winner.obj.contains_key(*key));
+    if dropped <= MAX_SHARED_DELETIONS && !missing_protected {
+        return false;
+    }
+    let key = (
+        home.path.clone(),
+        winner.path.clone(),
+        winner.mtime,
+        winner.size,
+    );
+    if latched(&key) {
+        return true;
+    }
+    let Some(backup) = save_home_backup(&home.path, file) else {
+        return true;
+    };
+    // Latch only once the backup landed, so a refusal whose backup failed is
+    // retried on the next pass instead of read as already refused.
+    latch(key);
+    // `<n>` is what the merge would really drop; only a protected key refuses
+    // with n = 1.
+    let noun = if dropped == 1 { "key" } else { "keys" };
+    logline!(
+        "clauth: {file} sync skipped: applying {} would delete {dropped} {noun} from {}; \
+         saved a copy at {}",
+        shorten_home(&winner.path),
+        shorten_home(&home.path),
+        shorten_home(&backup)
+    );
+    true
+}
+
+/// Copy the operator's own file, before a refused pass could have rewritten
+/// it, into `~/.clauth/backups/<file>.<utc stamp>` (dir 0700, file 0600), then
+/// keep only the newest [`BACKUPS_KEPT`] backups of that file. `None` when the
+/// file cannot be read or the copy cannot be written.
+fn save_home_backup(home: &Path, file: &str) -> Option<PathBuf> {
+    let bytes = std::fs::read(home).ok()?;
+    let dir = crate::profile::clauth_dir().ok()?.join("backups");
+    let target = free_backup_path(&dir, file);
+    crate::profile::atomic_write_600(&target, &bytes).ok()?;
+    prune_backups(&dir, file);
+    Some(target)
+}
+
+/// `<file>.<utc stamp>` under `dir`, advanced a second at a time until it names
+/// no existing file: two refusals inside one second must not overwrite each
+/// other, and name order stays recency order for [`prune_backups`].
+fn free_backup_path(dir: &Path, file: &str) -> PathBuf {
+    let mut at = chrono::Utc::now();
+    loop {
+        let candidate = dir.join(format!("{file}.{}", at.format("%Y-%m-%dT%H-%M-%SZ")));
+        if !candidate.exists() {
+            return candidate;
+        }
+        at += chrono::TimeDelta::seconds(1);
+    }
+}
+
+/// Keep the newest [`BACKUPS_KEPT`] backups of `file`, deleting the older ones
+/// by exact path. Backups of the other operator file are untouched.
+fn prune_backups(dir: &Path, file: &str) {
+    let prefix = format!("{file}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect();
+    if names.len() <= BACKUPS_KEPT {
+        return;
+    }
+    names.sort();
+    for old in &names[..names.len() - BACKUPS_KEPT] {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// `path` with the resolved home rendered as `~`, for a line the operator
+/// reads; any path outside the home renders through `Path::display`. The `~`
+/// is followed by [`std::path::MAIN_SEPARATOR`] so the line never mixes
+/// separators: the rest renders exactly as `Path::display` gives it.
+pub(crate) fn shorten_home(path: &Path) -> String {
+    let Ok(home) = crate::profile::home_dir() else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Record `path`'s on-disk bytes as clauth's own write, without touching them.
+/// A copy clauth built and left alone is byte-identical to what clauth would
+/// write, so it is clauth's own copy even though no write happened this run;
+/// without the record a user's in-session edit could never win a pass.
+pub(crate) fn record_existing_copy(
+    record_path: &Path,
+    path: &Path,
+    bytes: &[u8],
+    carried_rank: (i64, u32),
+) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let Some((mtime_secs, mtime_nanos)) = mtime_parts(mtime) else {
+        return false;
+    };
+    let entry = WrittenEntry {
+        path: path.to_string_lossy().into_owned(),
+        mtime_secs,
+        mtime_nanos,
+        size: meta.len(),
+        digest: hex::encode(Sha256::digest(bytes)),
+        rank_secs: carried_rank.0,
+        rank_nanos: carried_rank.1,
+    };
+    // A start rebuilds every session's tree, so skip the record write when the
+    // entry already says exactly this.
+    let already = read_record(record_path).iter().any(|e| {
+        Path::new(&e.path) == path
+            && e.mtime_secs == entry.mtime_secs
+            && e.mtime_nanos == entry.mtime_nanos
+            && e.size == entry.size
+            && e.digest == entry.digest
+            && e.rank_secs == entry.rank_secs
+            && e.rank_nanos == entry.rank_nanos
+    });
+    if already {
+        return false;
+    }
+    merge_record(record_path, &entry);
+    true
 }
 
 /// Write one synced member. The rename swaps the inode, so the mode is the
