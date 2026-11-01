@@ -201,25 +201,38 @@ pub(crate) fn assert_prompt_body_reads(agent: ureq::Agent) {
 /// session dirs, pid files, or rotation locks — otherwise those paths land in
 /// the real `~/.clauth`.
 pub(crate) struct HomeSandbox {
-    // Drop order: tempdir first, then the shared lock.
+    // Drop order: tempdir first, then the shared lock when this sandbox owns it.
     _tmp: tempfile::TempDir,
-    _guard: crate::lockorder::RankedGuard<'static, ()>,
+    _guard: Option<crate::lockorder::RankedGuard<'static, ()>>,
     home: PathBuf,
     prev_config_dir: Option<std::ffi::OsString>,
     prev_session_id: Option<std::ffi::OsString>,
     prev_claude_pid: Option<std::ffi::OsString>,
+    prev_codex_home: Option<std::ffi::OsString>,
+    prev_operator_codex_home: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, acquired above"
-    )]
     pub(crate) fn new() -> Self {
         // Untracked HOME_TEST_LOCK acquired first; no RankedMutex/flock is held.
         let guard = crate::profile::HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        Self::open(Some(guard))
+    }
+
+    /// The same sandbox for a caller that already holds `HOME_TEST_LOCK`: the
+    /// guard stays with that caller, so the env its test sets around the
+    /// sandbox is never visible to another test between the set and the drop.
+    fn open_under(_held: &crate::lockorder::RankedGuard<'static, ()>) -> Self {
+        Self::open(None)
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by this sandbox or its caller"
+    )]
+    fn open(guard: Option<crate::lockorder::RankedGuard<'static, ()>>) -> Self {
         // A prior test that panicked mid-override leaks it into this one: clear
         // it here (and on drop) so a parallel test never inherits a shortened
         // lock deadline it did not set. The callback/feed bounds and the
@@ -260,6 +273,19 @@ impl HomeSandbox {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CLAUDE_PID");
         }
+        // The two codex homes this process reads, cleared for the same reason:
+        // a suite run from inside a `clauth start` codex session inherits a
+        // session `CODEX_HOME` and a carried operator home, and both outrank
+        // the sandbox for `build_codex_home`, the switch and the delete. A
+        // test that WANTS one pins it with [`CodexHomeSandbox`] or [`EnvPin`],
+        // which borrow this guard and so always set it after this clear.
+        let prev_codex_home = std::env::var_os("CODEX_HOME");
+        let prev_operator_codex_home = std::env::var_os("CLAUTH_OPERATOR_CODEX_HOME");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+            std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME");
+        }
         Self {
             _tmp: tmp,
             _guard: guard,
@@ -267,6 +293,8 @@ impl HomeSandbox {
             prev_config_dir,
             prev_session_id,
             prev_claude_pid,
+            prev_codex_home,
+            prev_operator_codex_home,
         }
     }
 
@@ -336,12 +364,105 @@ impl Drop for HomeSandbox {
             Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
             None => unsafe { std::env::remove_var("CLAUDE_PID") },
         }
+        match self.prev_codex_home.take() {
+            Some(prev) => unsafe { std::env::set_var("CODEX_HOME", prev) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match self.prev_operator_codex_home.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUTH_OPERATOR_CODEX_HOME", prev) },
+            None => unsafe { std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME") },
+        }
         // A non-panicking miss ran the whole teardown above; panic LAST naming
         // the count and the bound. The unwind then drops the guard (poisoning
         // `HOME_TEST_LOCK`, which the next sandbox recovers) and the tempdir.
         if let Some(msg) = stuck {
             panic!("{msg}");
         }
+    }
+}
+
+/// The fake values the codex-key pins below use. `HomeSandbox::open` reads them
+/// and leaves neither behind for its whole life.
+const KNOWN_CODEX_KEYS: [(&str, &str); 2] = [
+    ("CODEX_HOME", "/known/codex-home"),
+    ("CLAUTH_OPERATOR_CODEX_HOME", "/known/operator-codex-home"),
+];
+
+/// Run `check` over a sandbox built under [`KNOWN_CODEX_KEYS`], with the run's
+/// own values restored before `HOME_TEST_LOCK` is released. One lock is held
+/// across the set, the sandbox and the restore, so the fake values are never
+/// live outside it — not even for an unsandboxed reader.
+#[expect(
+    unsafe_code,
+    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held here"
+)]
+fn with_known_codex_keys<T>(check: impl FnOnce(HomeSandbox) -> T) -> T {
+    let lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let originals: Vec<Option<std::ffi::OsString>> = KNOWN_CODEX_KEYS
+        .iter()
+        .map(|&(key, _)| std::env::var_os(key))
+        .collect();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored below.
+    for &(key, value) in &KNOWN_CODEX_KEYS {
+        unsafe { std::env::set_var(key, value) };
+    }
+    let seen = check(HomeSandbox::open_under(&lock));
+    // SAFETY: as above — put back the values the run itself started with.
+    for (&(key, _), prev) in KNOWN_CODEX_KEYS.iter().zip(&originals) {
+        unsafe {
+            match prev {
+                Some(prev) => std::env::set_var(key, prev),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+    drop(lock);
+    seen
+}
+
+/// Both codex keys `open` clears are absent for the sandbox's whole life: a
+/// suite run from inside a codex session must not build homes or move links
+/// under the real carried home.
+#[test]
+fn the_home_sandbox_clears_both_codex_home_keys() {
+    let inside = with_known_codex_keys(|sandbox| {
+        let inside: Vec<Option<std::ffi::OsString>> = KNOWN_CODEX_KEYS
+            .iter()
+            .map(|&(key, _)| std::env::var_os(key))
+            .collect();
+        drop(sandbox);
+        inside
+    });
+
+    for ((key, _), value) in KNOWN_CODEX_KEYS.iter().zip(&inside) {
+        assert_eq!(
+            value, &None,
+            "{key} is cleared for the sandbox's whole life"
+        );
+    }
+}
+
+/// Both codex keys come back on drop at the value the run found: a restore that
+/// dropped either leaves every later test in this process reading no operator
+/// home.
+#[test]
+fn the_home_sandbox_restores_both_codex_home_keys() {
+    let seen = with_known_codex_keys(|sandbox| {
+        drop(sandbox);
+        KNOWN_CODEX_KEYS
+            .iter()
+            .map(|&(key, _)| std::env::var_os(key))
+            .collect::<Vec<Option<std::ffi::OsString>>>()
+    });
+
+    for ((key, value), seen) in KNOWN_CODEX_KEYS.iter().zip(&seen) {
+        assert_eq!(
+            seen.as_deref(),
+            Some(std::ffi::OsStr::new(value)),
+            "{key} comes back with the value the sandbox found"
+        );
     }
 }
 

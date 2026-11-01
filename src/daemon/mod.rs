@@ -293,8 +293,9 @@ fn listener_setup(
 /// instead of each opening a window, and it leaves the caller's job object
 /// where that job allows it, so a host closing the job (sshd ending a
 /// session) does not end it either. A clauth session home the caller inherited
-/// is scrubbed ([`crate::runtime::scrub_clauth_homes`]): the daemon outlives
-/// that session and its tree.
+/// is scrubbed, with the operator's own codex home put back in a session
+/// `CODEX_HOME`'s place ([`crate::runtime::scrub_clauth_homes`]): the daemon
+/// outlives that session and its tree.
 pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Child> {
     let dir = clauth_dir()?;
     mkdir_700(&dir).context("failed to create ~/.clauth")?;

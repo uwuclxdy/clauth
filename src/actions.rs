@@ -2353,7 +2353,7 @@ pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppCon
 }
 
 /// Move the codex active slot to `name` — and, when the operator's own
-/// `~/.codex/auth.json` is a link clauth installed, move that link with it.
+/// `auth.json` slot is a link clauth installed, move that link with it.
 ///
 /// Returns the operator slot it repointed, if any.
 ///
@@ -2401,10 +2401,11 @@ pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathB
 /// a DIFFERENT clauth profile's store; `None` when there is nothing of ours to
 /// move (a regular file, no slot, a foreign link, or already pointing here).
 fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
-    // Resolved the way the capture and the delete resolve it: inside a
-    // `clauth start` session CODEX_HOME names the session home, and the
-    // operator's real slot is still the default one.
-    let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
+    // The operator home resolves through [`operator_codex_home`]: inside a
+    // `clauth start` session CODEX_HOME names the session home, and the home
+    // this operator uses is the carried one when that session's shell named an
+    // explicit home; with none named, the default home answers.
+    let operator = crate::runtime::operator_codex_home()?;
     let slot = operator.join("auth.json");
     let Ok(target) = std::fs::read_link(&slot) else {
         return Ok(None);
@@ -2439,8 +2440,9 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// installs globally is the operator's `auth.json` slot the capture linked
 /// onto this store ([`adopt_operator_auth_slot`]); the claude-only halves (the
 /// credentials link, the settings.json endpoint, the usage-TTL memo) have no
-/// counterpart here. Returns the slot it detached, so the caller can say the
-/// operator's own codex is logged out now.
+/// counterpart here. Returns the home it resolved as the operator's and the
+/// slots it detached, so the caller can say what became of the operator's own
+/// codex.
 ///
 /// The typed live-session refusal [`delete_codex_profile`] raises when the
 /// profile still runs a live session and `force` was not passed. Kept
@@ -2468,7 +2470,7 @@ pub(crate) fn delete_codex_profile(
     name: &str,
     force: bool,
     _rotation: &RotationGuard,
-) -> Result<Option<std::path::PathBuf>> {
+) -> Result<OperatorAuthDetach> {
     crate::codex_profiles::CodexState::update(|state| {
         // Membership re-made against the state loaded UNDER the lock, before
         // anything irreversible: the caller resolved this name from a
@@ -2491,52 +2493,178 @@ pub(crate) fn delete_codex_profile(
         // the operator's next `codex login` would revoke through that link
         // first (see `codex_login_capture`'s refusal) — into a store that no
         // longer exists, leaving their own codex with no login and no word why.
-        let detached = detach_operator_auth_slot(name)?;
+        let detachment = detach_operator_auth_slot(name)?;
         let dir = profile_dir(&owned)?;
         if dir.exists() {
             // The detach is irreversible and precedes this step, so a removal
-            // that fails after it must still say the operator's codex has no
-            // login now: the retry finds no link and can never say it.
-            std::fs::remove_dir_all(&dir).with_context(|| match &detached {
-                Some(slot) => format!(
-                    "failed to remove profile directory for '{name}' after {} was detached from \
-                     it, so your own codex has no login now; run `codex login` to mint a fresh \
-                     one",
-                    slot.display()
+            // that fails after it must still say what it did to the operator's
+            // codex: the retry finds no link and can never say it.
+            std::fs::remove_dir_all(&dir).with_context(|| match detachment.slots.as_slice() {
+                [] => format!("failed to remove profile directory for '{name}'"),
+                [only] if !only.under_operator_home => format!(
+                    "failed to remove profile directory for '{name}' after {} was detached \
+                     from it; your own codex reads {} and is unaffected",
+                    only.slot.display(),
+                    detachment.operator_home.display()
                 ),
-                None => format!("failed to remove profile directory for '{name}'"),
+                [only] => format!(
+                    "failed to remove profile directory for '{name}' after {} was detached \
+                     from it, so your own codex has no login now; run `codex login` to mint \
+                     a fresh one",
+                    only.slot.display()
+                ),
+                slots => {
+                    let slots = slots
+                        .iter()
+                        .map(|detached| detached.slot.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                    format!(
+                        "failed to remove profile directory for '{name}' after {slots} were \
+                         detached from it, so your own codex has no login now; run `codex login` \
+                         to mint a fresh one"
+                    )
+                }
             })?;
         }
         state.remove_profile(name);
         // The dir removal swept the shared `usage_cache.json` and the auth
         // store; only the memory entry needs noting.
         note_forget(&owned, Half::Codex);
-        Ok(detached)
+        Ok(detachment)
     })
+}
+
+/// One `auth.json` slot a codex delete removed from an operator home, and which
+/// of the two homes a delete can infer it sat under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetachedOperatorSlot {
+    pub(crate) slot: std::path::PathBuf,
+    /// True when it sat under the home
+    /// [`crate::runtime::operator_codex_home`] resolved, which is the one the
+    /// operator's own codex reads.
+    pub(crate) under_operator_home: bool,
+}
+
+/// What a codex delete removed from the operator's own codex: the home it
+/// resolved as theirs, and every slot it detached there and in the default
+/// `~/.codex` beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperatorAuthDetach {
+    pub(crate) operator_home: std::path::PathBuf,
+    /// Operator home first, the default `~/.codex` beside it when that is
+    /// another path — the order the detach visited them in.
+    pub(crate) slots: Vec<DetachedOperatorSlot>,
+}
+
+/// What one detached slot means for the operator's own codex: the one
+/// classification behind the CLI postscript and the TUI toasts, so those two
+/// surfaces cannot disagree about it. The failure texts read the recorded
+/// `under_operator_home` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexDetachNotice {
+    /// The operator home's own slot: their codex reads that home and has no
+    /// login now.
+    LoggedOut,
+    /// The default `~/.codex` slot, detached in the same delete as the operator
+    /// home's own. The `Unaffected` arm's promise that the operator's login is
+    /// intact would contradict the logout line right before it: the operator's
+    /// own login is the one this delete just detached.
+    LoggedOutToo,
+    /// The default `~/.codex` slot alone, while the operator's codex reads
+    /// another home: that login is untouched.
+    Unaffected,
+}
+
+/// One line per detached slot, in the order the detach visited them, as the
+/// copy without the CLI's `clauth: ` prefix. The CLI prints each body behind
+/// that prefix; the TUI toasts it as it stands.
+pub(crate) fn codex_detach_postscript(
+    detach: &OperatorAuthDetach,
+) -> Vec<(CodexDetachNotice, String)> {
+    let operator_detached = detach.slots.iter().any(|d| d.under_operator_home);
+    detach
+        .slots
+        .iter()
+        .map(|detached| {
+            let slot = detached.slot.display();
+            let notice = match (detached.under_operator_home, operator_detached) {
+                (true, _) => CodexDetachNotice::LoggedOut,
+                (false, true) => CodexDetachNotice::LoggedOutToo,
+                (false, false) => CodexDetachNotice::Unaffected,
+            };
+            let body = match notice {
+                CodexDetachNotice::LoggedOut => format!(
+                    "{slot} followed that profile's chain and is detached now, so your own codex \
+                     has no login; run `codex login` to mint a fresh one"
+                ),
+                CodexDetachNotice::LoggedOutToo => {
+                    format!("{slot} followed that profile's chain and is detached now too")
+                }
+                CodexDetachNotice::Unaffected => format!(
+                    "{slot} followed that profile's chain and is detached now; your own codex \
+                     reads {} and is unaffected",
+                    detach.operator_home.display()
+                ),
+            };
+            (notice, body)
+        })
+        .collect()
 }
 
 /// Remove the operator's `auth.json` when it is the link
 /// [`adopt_operator_auth_slot`] installed onto THIS profile's store — the link
-/// alone, never its target — returning the slot's path. A link naming another
-/// profile, a regular file (the operator re-logged in on their own), or an
-/// absent slot is left exactly as found. The operator home resolves as the
-/// capture resolves it; where that refuses (`CODEX_HOME` inside a clauth
-/// session home: a delete typed from a shell codex spawned by `clauth start`)
-/// the operator's real slot is still the default home's, which the capture
-/// linked exactly as it would have from any other shell, so that is the one
-/// checked — the ownership predicate is what makes the fallback safe.
-fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
-    let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
-    let slot = operator.join("auth.json");
-    let Ok(target) = std::fs::read_link(&slot) else {
-        return Ok(None);
-    };
-    if !clauth_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
-        return Ok(None);
+/// alone, never its target — returning the home it resolved as the operator's
+/// and every slot it removed, each tagged with the home it sat under. A link
+/// naming another profile, a regular file (the operator re-logged in on their
+/// own), or an absent slot is left exactly as found.
+///
+/// The two homes a delete can infer are checked: the operator home
+/// [`crate::runtime::operator_codex_home`] resolves (a non-session
+/// `CODEX_HOME`, else the carried one inside a session whose shell named an
+/// explicit home, else the default), and the default `~/.codex`
+/// itself, visited once when they are the same path. A slot linked under
+/// another custom home the operator no longer names is not visited — nothing
+/// here can infer that home — so it is left dangling into the store this delete
+/// removes. The ownership predicate is what makes visiting both safe.
+fn detach_operator_auth_slot(name: &str) -> Result<OperatorAuthDetach> {
+    let operator_home = crate::runtime::operator_codex_home()?;
+    let default_home = default_codex_operator_home()?;
+    let mut homes = vec![operator_home.clone()];
+    if default_home != operator_home {
+        homes.push(default_home);
     }
-    std::fs::remove_file(&slot)
-        .with_context(|| format!("failed to detach {} from '{name}'", slot.display()))?;
-    Ok(Some(slot))
+    let mut slots: Vec<DetachedOperatorSlot> = Vec::new();
+    for home in homes {
+        let slot = home.join("auth.json");
+        let Ok(target) = std::fs::read_link(&slot) else {
+            continue;
+        };
+        if !clauth_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        // The operator home is visited first, so a failure on the second one
+        // names the operator's own slot as already gone: their codex has no
+        // login from that moment, and a retry finds no link that could say it.
+        std::fs::remove_file(&slot).with_context(|| match slots.as_slice() {
+            [] => format!("failed to detach {} from '{name}'", slot.display()),
+            [done, ..] => format!(
+                "failed to detach {} from '{name}' after {} was detached from it, so your own \
+                 codex has no login now; run `codex login` to mint a fresh one",
+                slot.display(),
+                done.slot.display()
+            ),
+        })?;
+        slots.push(DetachedOperatorSlot {
+            slot,
+            under_operator_home: home == operator_home,
+        });
+    }
+    Ok(OperatorAuthDetach {
+        operator_home,
+        slots,
+    })
 }
 
 /// `clauth login <name> --codex` — create (or re-authenticate) a codex
@@ -2556,7 +2684,9 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// The operator home is the one the operator's codex actually uses: a set
 /// `CODEX_HOME` is honored — unless it names a home clauth built, which means
 /// this shell is INSIDE a clauth codex session and "the operator's login" is
-/// some profile's store; that refuses rather than snapshotting a sibling.
+/// some profile's store; that refuses rather than snapshotting a sibling. Past
+/// the refusal the order is `CODEX_HOME`, else the carried operator home, else
+/// `~/.codex`.
 ///
 /// Refusals, each naming its fix:
 /// - any store mode other than the file default (`keyring`, `auto`,
@@ -2763,7 +2893,7 @@ pub(crate) fn codex_login_capture_at(
 /// [`codex_login_capture_at`]'s refusals, shared with the capturable predicate
 /// so the row's visibility and the capture run on one check.
 fn codex_operator_capture_home() -> Result<std::path::PathBuf> {
-    let operator = codex_operator_home()?;
+    let operator = capture_operator_codex_home()?;
     match codex_operator_store_mode(&operator).as_deref() {
         None | Some("file") => {}
         Some(mode) => bail!(
@@ -3019,12 +3149,18 @@ pub(crate) fn codex_browser_login_with(
     Ok((canonical, outcome))
 }
 
-/// The home the OPERATOR's codex reads: an explicit non-empty `CODEX_HOME`,
-/// else `~/.codex`. A `CODEX_HOME` naming a clauth-built session home refuses
-/// — inside a `clauth start` codex session "the operator's login" resolves to
-/// some profile's store, and capturing a sibling profile's chain is never
-/// what this verb means.
-fn codex_operator_home() -> Result<std::path::PathBuf> {
+/// The home the OPERATOR's codex reads, resolved through
+/// [`crate::runtime::operator_codex_home`]: the explicit home the environment
+/// names, else `~/.codex`. A `CODEX_HOME` naming a clauth-built session home
+/// refuses — inside a `clauth start` codex session "the operator's login"
+/// resolves to some profile's store, and capturing a sibling profile's chain
+/// is never what this verb means.
+///
+/// The refusal is the capture's own: past it the non-refusal tier asks the
+/// same question the switch and the delete ask, so a shell that holds no
+/// `CODEX_HOME` while a session's carry key reaches it still captures the home
+/// that session carries.
+fn capture_operator_codex_home() -> Result<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()) {
         let dir = std::path::PathBuf::from(dir);
         if crate::runtime::is_codex_home_path(&dir) {
@@ -3034,9 +3170,8 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
                  CODEX_HOME) holds the operator's login"
             );
         }
-        return Ok(dir);
     }
-    default_codex_operator_home()
+    crate::runtime::operator_codex_home()
 }
 
 /// The home codex reads with no `CODEX_HOME` set: `~/.codex`.

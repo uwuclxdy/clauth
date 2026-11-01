@@ -2192,9 +2192,9 @@ impl std::error::Error for CodexLiveSessionTail {}
 
 /// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
 /// same confirm gate, the same rotation guard, and the codex delete. The
-/// postscript names what a codex profile installs globally — the operator's
-/// `auth.json` slot the capture linked onto it — when the delete detached it,
-/// since the operator's own codex is logged out from that moment.
+/// postscript names what a codex profile installs globally — the slot(s) clauth
+/// linked onto it — when the delete detached them, saying per slot what became
+/// of the operator's own codex.
 fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
     let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
         return Err(unknown_profile_error(config, name));
@@ -2207,7 +2207,7 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
     // is `--force`, appended only to the TYPED live-session refusal (never a
     // second `has_live_session` read, which would tag an unrelated failure with
     // a flag that cannot fix it).
-    let detached = actions::delete_codex_profile(&canonical, force, &rotation).map_err(|e| {
+    let detachment = actions::delete_codex_profile(&canonical, force, &rotation).map_err(|e| {
         match e.downcast::<actions::CodexLiveSession>() {
             // Raised only when `force` is false (`delete_codex_profile`'s
             // guard), so an `Ok` here is always the tail-bearing refusal.
@@ -2216,12 +2216,8 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
         }
     })?;
     outln!("clauth: removed codex profile '{canonical}'.");
-    if let Some(slot) = detached {
-        outln!(
-            "clauth: {} followed that profile's chain and is detached now, so your own codex \
-             has no login; run `codex login` to mint a fresh one",
-            slot.display()
-        );
+    for (_, body) in actions::codex_detach_postscript(&detachment) {
+        outln!("clauth: {body}");
     }
     Ok(())
 }

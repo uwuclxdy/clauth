@@ -9910,6 +9910,76 @@ fn scrub_profile_env_drops_managed_and_active_custom_keys() {
     );
 }
 
+/// A session started from inside a codex session (a claude session, a daemon)
+/// inherits no session `CODEX_HOME`: the operator's own home takes its place
+/// where the environment names one, so a bare `codex` there reads the same home
+/// clauth's capture, switch and delete act on. A carry that is itself a session
+/// home resolves to no operator home, and the key is removed instead.
+#[test]
+fn the_scrub_sets_the_carried_operator_home_in_place_of_a_session_home() {
+    let home = HomeSandbox::new();
+    let session = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let carried_session = home.home().join(".clauth/profiles/cy/codex-home-777-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session.as_os_str())),
+                ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+            ],
+        );
+        let mut cmd = std::process::Command::new("probe");
+        scrub_clauth_homes(&mut cmd);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the carried operator home takes the session home's place: {env:?}"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session.as_os_str())),
+                (
+                    "CLAUTH_OPERATOR_CODEX_HOME",
+                    Some(carried_session.as_os_str()),
+                ),
+            ],
+        );
+        let mut cmd = std::process::Command::new("probe");
+        scrub_clauth_homes(&mut cmd);
+        assert_eq!(
+            crate::testutil::env_overrides(&cmd).get("CODEX_HOME"),
+            Some(&None),
+            "a carry naming a session home is no operator home: the key goes"
+        );
+    }
+}
+
+/// The session-home predicate is POSITIONAL, and a bare spelling carries no
+/// position: `codex-home-1-0` is no session home by itself and is one only once
+/// anchored under `profiles/cx`. The operator tier therefore anchors before it
+/// filters, or a relative spelling typed inside a profile dir rides through as
+/// a session home. (No cwd change here: several tests read the process cwd
+/// without the home lock, so the anchored tier is pinned at the predicate.)
+#[test]
+fn a_session_home_is_only_positional_once_anchored() {
+    let raw = std::path::Path::new("codex-home-1-0");
+    assert!(
+        !is_codex_home_path(raw),
+        "a bare spelling carries no position and passes the filter"
+    );
+    let anchored = std::path::Path::new("/tmp/profiles/cx").join(raw);
+    assert!(
+        is_codex_home_path(&anchored),
+        "the anchored spelling is the session home the filter must catch"
+    );
+}
+
 #[test]
 fn cwd_is_real_home_matches_only_the_sandboxed_home() {
     let sandbox = HomeSandbox::new();
@@ -14476,6 +14546,65 @@ fn a_session_config_loses_the_keys_that_escape_the_home() {
             .and_then(toml::Value::as_bool),
         Some(true),
         "including whole tables the strip does not name"
+    );
+}
+
+/// The copied config comes from the OPERATOR's codex home, not a hardcoded
+/// `~/.codex`: the home is built from a shell whose `CODEX_HOME` names the
+/// operator's own home (inside a session that same home rides the carry key),
+/// and a session built from it carries that home's config, never the default
+/// home's.
+#[cfg(unix)]
+#[test]
+fn a_session_config_is_copied_from_the_operators_own_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let default_operator = home.home().join(".codex");
+    fs::create_dir_all(&default_operator).expect("mkdir the default operator home");
+    fs::write(
+        default_operator.join("config.toml"),
+        b"model = \"default-o3\"\n",
+    )
+    .expect("write the default home's config");
+    let custom = home.home().join("my-codex");
+    fs::create_dir_all(&custom).expect("mkdir the custom operator home");
+    fs::write(custom.join("config.toml"), b"model = \"custom-o3\"\n").expect("write custom config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom.as_os_str()))]);
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let copied = fs::read_to_string(session_home.join("config.toml")).expect("read the copy");
+    let parsed: toml::Value = toml::from_str(&copied).expect("the copy is valid TOML");
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some("custom-o3"),
+        "the operator's own home config is what is copied: {copied}"
+    );
+
+    // Inside a codex session `CODEX_HOME` names a session home, so the
+    // operator's home can only ride the carry key; the copy follows it.
+    let caller_session = profile.join("codex-home-1111-0");
+    let nested_home = profile.join("codex-home-4242-1");
+    crate::profile::mkdir_700(&nested_home).expect("mkdir home");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(caller_session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    build_codex_home(&nested_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let copied = fs::read_to_string(nested_home.join("config.toml")).expect("read the copy");
+    let parsed: toml::Value = toml::from_str(&copied).expect("the copy is valid TOML");
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some("custom-o3"),
+        "the carried operator home's config is what is copied: {copied}"
     );
 }
 

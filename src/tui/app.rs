@@ -22212,17 +22212,18 @@ fn perform_codex_delete(app: &mut App, name: &str) {
             };
             app.place_setup_selection(pos);
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
-            // The CLI's postscript: a delete that detached the operator's own
-            // `~/.codex/auth.json` slot logs their codex out from that moment.
-            if let Some(slot) = detached {
-                app.toast(
-                    ToastKind::Warning,
-                    format!(
-                        "{} followed that profile's chain and is detached now, so your own \
-                         codex has no login; run `codex login` to mint a fresh one",
-                        slot.display()
-                    ),
-                );
+            // The CLI's postscript, from the reading the two share: a delete
+            // that detached the operator's own `auth.json` slot logs their
+            // codex out from that moment, while a slot outside the home their
+            // codex reads leaves it untouched. An untouched slot is news, not
+            // a warning.
+            for (notice, body) in crate::actions::codex_detach_postscript(&detached) {
+                let kind = match notice {
+                    crate::actions::CodexDetachNotice::Unaffected => ToastKind::Info,
+                    crate::actions::CodexDetachNotice::LoggedOut
+                    | crate::actions::CodexDetachNotice::LoggedOutToo => ToastKind::Warning,
+                };
+                app.toast(kind, body);
             }
         }
         Err(e) => {

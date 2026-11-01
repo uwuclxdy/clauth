@@ -46925,6 +46925,148 @@ fn deleting_a_codex_account_detaching_the_operators_slot_toasts_the_warning() {
     );
 }
 
+/// A delete whose detach hits only the default `~/.codex` slot while the
+/// operator's own codex reads a carried custom home: the toast names the home
+/// that is unaffected instead of saying their codex has no login.
+#[cfg(unix)]
+#[test]
+fn deleting_a_codex_account_leaves_the_carried_operator_home_logged_in() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".codex")).expect("mkdir the default home");
+    let default_slot = home.home().join(".codex").join("auth.json");
+    std::fs::write(
+        &default_slot,
+        crate::testutil::codex_auth_body("acc.1", "refresh.op"),
+    )
+    .expect("write");
+    crate::actions::codex_login_capture("cdx-one").expect("capture");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let session = crate::profile::profile_dir(&crate::profile::ProfileName::from("cdx-one"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+
+    let expected = format!(
+        "{} followed that profile's chain and is detached now; your own codex reads {} and is \
+         unaffected",
+        default_slot.display(),
+        custom.display()
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == expected),
+        "the carried home's toast names it as unaffected: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body == expected && t.kind == crate::tui::app::ToastKind::Info),
+        "a slot that leaves the operator's login untouched is news, not a warning: {:?}",
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, &t.body))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A delete that detaches BOTH the operator home's slot and the default
+/// `~/.codex` one toasts the CLI's two lines: the logout, then the default
+/// slot going too — never "unaffected" right after "has no login".
+#[cfg(unix)]
+#[test]
+fn deleting_a_codex_account_toasts_the_default_home_went_too() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".codex")).expect("mkdir the default home");
+    let default_slot = home.home().join(".codex").join("auth.json");
+    std::fs::write(
+        &default_slot,
+        crate::testutil::codex_auth_body("acc.1", "refresh.op"),
+    )
+    .expect("write");
+    crate::actions::codex_login_capture("cdx-one").expect("capture");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the adopted link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cdx-one");
+    let session = crate::profile::profile_dir(&crate::profile::ProfileName::from("cdx-one"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+
+    let expected = [
+        crate::tui::render::prose::mark_commands(&format!(
+            "{} followed that profile's chain and is detached now, so your own codex has no \
+             login; run `codex login` to mint a fresh one",
+            custom_slot.display()
+        )),
+        crate::tui::render::prose::mark_commands(&format!(
+            "{} followed that profile's chain and is detached now too",
+            default_slot.display()
+        )),
+    ];
+    let bodies = app
+        .toasts
+        .iter()
+        .map(|t| t.body.as_str())
+        .collect::<Vec<_>>();
+    for body in &expected {
+        assert!(
+            bodies.contains(&body.as_str()),
+            "the two-slot postscript toasts {body:?}: {bodies:?}"
+        );
+    }
+    let after_delete = app
+        .toasts
+        .iter()
+        .skip_while(|t| t.body != "deleted 'cdx-one'")
+        .skip(1)
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_delete,
+        vec![
+            (crate::tui::app::ToastKind::Warning, expected[0].as_str()),
+            (crate::tui::app::ToastKind::Warning, expected[1].as_str()),
+        ],
+        "the logout toast, then the default slot going too, both as warnings"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains("unaffected")),
+        "the operator's own codex lost its login two lines earlier: {bodies:?}"
+    );
+}
+
 /// The focused codex action row takes the claude detail's full-width tint (F8).
 #[test]
 fn a_codex_action_row_takes_the_tint() {

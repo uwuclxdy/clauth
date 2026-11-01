@@ -1738,9 +1738,9 @@ fn delete_codex_removes_the_dir_and_every_slot() {
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     std::fs::write(dir.join("auth.json"), b"{}").expect("write auth");
 
-    assert_eq!(
-        delete_codex_profile("cx2", false, &rotation_guard("cx2")).expect("delete"),
-        None,
+    let detach = delete_codex_profile("cx2", false, &rotation_guard("cx2")).expect("delete");
+    assert!(
+        detach.slots.is_empty(),
         "no operator slot points at this store, so nothing is detached"
     );
 
@@ -7663,6 +7663,71 @@ fn codex_capture_adopts_the_operator_slot() {
     );
 }
 
+/// A shell with no `CODEX_HOME` that still carries the operator's home: the
+/// capture reads that home, the same one the switch and the delete read there;
+/// the session-home refusal stays for a shell that still holds a session
+/// `CODEX_HOME`.
+#[test]
+fn the_capture_reads_the_carried_operator_home() {
+    let home = HomeSandbox::new();
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    std::fs::write(custom.join("auth.json"), OPERATOR_AUTH).expect("operator login");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", None),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+
+    codex_login_capture("cx").expect("the carried home is the operator's");
+
+    let stored = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join("auth.json");
+    assert_eq!(
+        std::fs::read_link(custom.join("auth.json")).expect("adopted"),
+        stored,
+        "the carried home's slot is the one the capture adopted"
+    );
+    assert_eq!(
+        parsed(&stored)["tokens"]["refresh_token"],
+        "rt.x",
+        "the chain read is the carried home's"
+    );
+}
+
+/// The session-home refusal is the capture's own, not the shared resolver's
+/// silent filter: a shell that still holds the session `CODEX_HOME` with no
+/// carried home refuses by name instead of capturing whatever the resolver
+/// falls back to.
+#[test]
+fn the_capture_refuses_a_session_codex_home_with_no_carried_home() {
+    let home = HomeSandbox::new();
+    let session = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    assert!(crate::runtime::is_codex_home_path(&session));
+    std::fs::create_dir_all(&session).expect("mkdir session home");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", None),
+        ],
+    );
+
+    let err = codex_login_capture("cx").expect_err("a session home refuses the capture");
+
+    assert_eq!(
+        err.to_string(),
+        "CODEX_HOME points into a clauth codex session home. Run the capture from a shell \
+         outside `clauth start`, where ~/.codex (or your own CODEX_HOME) holds the operator's \
+         login"
+    );
+}
+
 /// A REAL re-auth: the operator logged in fresh (a regular file again), and
 /// the re-capture replaces the profile's chain in place — unless a live
 /// session still holds the old one, which refuses by name.
@@ -7911,9 +7976,13 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
     drop(pid);
 
     // The delete detaches the link and says which slot it was.
+    let detach = delete_codex_profile("cx1", false, &rotation_guard("cx1")).expect("delete");
     assert_eq!(
-        delete_codex_profile("cx1", false, &rotation_guard("cx1")).expect("delete"),
-        Some(slot.clone())
+        detach.slots,
+        vec![crate::actions::DetachedOperatorSlot {
+            slot: slot.clone(),
+            under_operator_home: true,
+        }]
     );
     assert!(
         slot.symlink_metadata().is_err(),
@@ -7940,9 +8009,12 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
     crate::codex_profiles::CodexState::update(|state| state.add_profile("cx3"))
         .expect("roster cx3");
     crate::testutil::write_codex_store("cx3", "{}");
-    assert_eq!(
-        delete_codex_profile("cx3", false, &rotation_guard("cx3")).expect("delete cx3"),
-        None
+    assert!(
+        delete_codex_profile("cx3", false, &rotation_guard("cx3"))
+            .expect("delete cx3")
+            .slots
+            .is_empty(),
+        "another profile's store is not this delete's slot"
     );
     assert_eq!(
         std::fs::read_link(&slot).expect("cx2's link survives"),
@@ -7957,9 +8029,12 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
     // A regular-file slot (the operator re-logged in on their own) survives.
     std::fs::remove_file(&slot).expect("drop link");
     std::fs::write(&slot, OPERATOR_AUTH).expect("regular file slot");
-    assert_eq!(
-        delete_codex_profile("cx2", false, &rotation_guard("cx2")).expect("delete cx2"),
-        None
+    assert!(
+        delete_codex_profile("cx2", false, &rotation_guard("cx2"))
+            .expect("delete cx2")
+            .slots
+            .is_empty(),
+        "a regular file is the operator's own login, not a link this delete made"
     );
     assert!(
         !slot
@@ -7995,9 +8070,14 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
             .expect("session link");
     }
     let _cx_session = crate::testutil::CodexHomeSandbox::new(&home, &session_home);
+    let detach = delete_codex_profile("cx4", false, &rotation_guard("cx4")).expect("delete cx4");
     assert_eq!(
-        delete_codex_profile("cx4", false, &rotation_guard("cx4")).expect("delete cx4"),
-        Some(default_slot.clone()),
+        detach
+            .slots
+            .iter()
+            .map(|detached| detached.slot.clone())
+            .collect::<Vec<_>>(),
+        vec![default_slot.clone()],
         "a session home is not the operator's slot; the default home's link is"
     );
     assert!(
@@ -8055,6 +8135,330 @@ fn a_failed_codex_dir_removal_names_the_slot_it_detached() {
             .expect("load")
             .holds("cx"),
         "a failed removal must leave the record for a retry"
+    );
+}
+
+/// The two-slot arm of that failure: a slot under `~/.codex` and one under the
+/// carried custom home both link this profile's store, and a removal that fails
+/// after detaching both names both. Unix only: `UnwritableDir`'s Windows ACE
+/// denies add-file/add-subdir, never the DELETE right `remove_dir_all` needs.
+#[cfg(unix)]
+#[test]
+fn a_failed_codex_dir_removal_names_every_slot_it_detached() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx1");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the cx1 link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let profiles_root = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("profile dir")
+        .parent()
+        .expect("profiles root")
+        .to_path_buf();
+    let _unwritable = crate::testutil::UnwritableDir::new(&profiles_root);
+    let rotation = rotation_guard("cx1");
+
+    let err = delete_codex_profile("cx1", false, &rotation).expect_err("the dir removal must fail");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to remove profile directory for 'cx1' after {} and {} were detached from \
+             it, so your own codex has no login now; run `codex login` to mint a fresh one",
+            custom_slot.display(),
+            default_slot.display()
+        )
+    );
+    assert!(custom_slot.symlink_metadata().is_err(), "the carried slot");
+    assert!(default_slot.symlink_metadata().is_err(), "the default slot");
+}
+
+/// The same failure with the operator on a CUSTOM home: the one slot detached
+/// is the default `~/.codex` one, and the operator's own codex does not read
+/// it, so the message names the home that is unaffected instead of claiming a
+/// logout.
+#[cfg(unix)]
+#[test]
+fn a_failed_codex_dir_removal_leaves_the_carried_home_logged_in() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("capture");
+    let slot = home.home().join(".codex").join("auth.json");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let profiles_root = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("profile dir")
+        .parent()
+        .expect("profiles root")
+        .to_path_buf();
+    let _unwritable = crate::testutil::UnwritableDir::new(&profiles_root);
+    let rotation = rotation_guard("cx");
+
+    let err = delete_codex_profile("cx", false, &rotation).expect_err("the dir removal must fail");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to remove profile directory for 'cx' after {} was detached from it; your own \
+             codex reads {} and is unaffected",
+            slot.display(),
+            custom.display()
+        )
+    );
+    assert!(
+        slot.symlink_metadata().is_err(),
+        "the detach happened and the message says which home it spared"
+    );
+}
+
+/// A second detach that fails after the first one already ran names the first:
+/// the operator's codex lost its login from that moment, and a retry finds no
+/// link left that could tell them.
+#[cfg(unix)]
+#[test]
+fn a_failed_second_detach_names_the_slot_already_gone() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx1");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the cx1 link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let default_home = default_slot.parent().expect("default home").to_path_buf();
+    let _unwritable = crate::testutil::UnwritableDir::new(&default_home);
+    let rotation = rotation_guard("cx1");
+
+    let err =
+        delete_codex_profile("cx1", false, &rotation).expect_err("the second detach must fail");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to detach {} from 'cx1' after {} was detached from it, so your own codex has \
+             no login now; run `codex login` to mint a fresh one",
+            default_slot.display(),
+            custom_slot.display()
+        )
+    );
+    assert!(
+        custom_slot.symlink_metadata().is_err(),
+        "the operator home's slot is the one already gone"
+    );
+}
+
+/// A delete from the operator's own shell says their codex is logged out now:
+/// the one slot detached sits under the home their codex reads.
+#[cfg(unix)]
+#[test]
+fn a_codex_delete_postscript_says_the_operators_own_home_has_no_login() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("capture");
+    let slot = home.home().join(".codex").join("auth.json");
+    let config = crate::profile::load_config().expect("config");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        crate::cmd_delete_codex(&config, "cx", true, false).expect("delete");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf8"),
+        format!(
+            "clauth: removed codex profile 'cx'.\nclauth: {} followed that profile's chain and is \
+             detached now, so your own codex has no login; run `codex login` to mint a fresh one\n",
+            slot.display()
+        )
+    );
+}
+
+/// The same delete from a session whose shell named a custom home: the slot
+/// detached is the default home's, which the operator's codex does not read, so
+/// the postscript names the home that is unaffected rather than a logout.
+#[cfg(unix)]
+#[test]
+fn a_codex_delete_postscript_says_the_carried_operator_home_is_unaffected() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("capture");
+    let slot = home.home().join(".codex").join("auth.json");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let config = crate::profile::load_config().expect("config");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        crate::cmd_delete_codex(&config, "cx", true, false).expect("delete");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf8"),
+        format!(
+            "clauth: removed codex profile 'cx'.\nclauth: {} followed that profile's chain and is \
+             detached now; your own codex reads {} and is unaffected\n",
+            slot.display(),
+            custom.display()
+        )
+    );
+}
+
+/// A delete that detaches BOTH the operator home's slot and the default
+/// `~/.codex` one says the default went too: the `Unaffected` arm's promise
+/// that the operator's login is intact would contradict the logout line just
+/// before it, and that login is the one this same delete took away.
+#[cfg(unix)]
+#[test]
+fn a_codex_delete_postscript_says_the_default_home_went_too() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx1");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the cx1 link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+    let config = crate::profile::load_config().expect("config");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        crate::cmd_delete_codex(&config, "cx1", true, false).expect("delete");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf8"),
+        format!(
+            "clauth: removed codex profile 'cx1'.\n\
+             clauth: {} followed that profile's chain and is detached now, so your own codex has \
+             no login; run `codex login` to mint a fresh one\n\
+             clauth: {} followed that profile's chain and is detached now too\n",
+            custom_slot.display(),
+            default_slot.display()
+        )
+    );
+}
+
+/// The one reading every surface prints: the operator home's own slot logs the
+/// operator out, the default `~/.codex` slot detached beside it says it went
+/// too, and the default slot alone while the operator's codex reads another
+/// home says that login is unaffected.
+#[test]
+fn the_codex_detach_postscript_names_what_each_slot_did() {
+    let operator_home = std::path::PathBuf::from("/home/op/own");
+    let default_home = std::path::PathBuf::from("/home/op/.codex");
+    let operator_slot = operator_home.join("auth.json");
+    let default_slot = default_home.join("auth.json");
+    let slot = |slot: &std::path::PathBuf, under_operator_home: bool| {
+        crate::actions::DetachedOperatorSlot {
+            slot: slot.clone(),
+            under_operator_home,
+        }
+    };
+
+    let both = crate::actions::OperatorAuthDetach {
+        operator_home: operator_home.clone(),
+        slots: vec![slot(&operator_slot, true), slot(&default_slot, false)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&both),
+        vec![
+            (
+                crate::actions::CodexDetachNotice::LoggedOut,
+                format!(
+                    "{} followed that profile's chain and is detached now, so your own codex \
+                     has no login; run `codex login` to mint a fresh one",
+                    operator_slot.display()
+                ),
+            ),
+            (
+                crate::actions::CodexDetachNotice::LoggedOutToo,
+                format!(
+                    "{} followed that profile's chain and is detached now too",
+                    default_slot.display()
+                ),
+            ),
+        ],
+        "the slot the operator's codex reads is the logout; the one beside it went too"
+    );
+
+    let default_only = crate::actions::OperatorAuthDetach {
+        operator_home: operator_home.clone(),
+        slots: vec![slot(&default_slot, false)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&default_only),
+        vec![(
+            crate::actions::CodexDetachNotice::Unaffected,
+            format!(
+                "{} followed that profile's chain and is detached now; your own codex reads \
+                 {} and is unaffected",
+                default_slot.display(),
+                operator_home.display()
+            ),
+        )],
+        "the default slot alone leaves the home the operator's codex reads untouched"
     );
 }
 
@@ -8404,6 +8808,175 @@ fn slot_points_at(slot: &std::path::Path) -> String {
         .and_then(|d| d.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .expect("a profile dir")
+}
+
+/// Inside a `clauth start` codex session `CODEX_HOME` names the session home,
+/// and the operator's own home (the custom `CODEX_HOME` the session replaced)
+/// rides `CLAUTH_OPERATOR_CODEX_HOME`. A switch there follows that home's slot
+/// and leaves `~/.codex`, a home this operator does not use, as found.
+#[cfg(unix)]
+#[test]
+fn a_switch_inside_a_codex_session_follows_the_operators_custom_home() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx1");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the cx1 link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    assert!(crate::runtime::is_codex_home_path(&session));
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+
+    let repointed = switch_codex_profile("cx2").expect("switch");
+
+    assert_eq!(repointed.as_deref(), Some(custom_slot.as_path()));
+    assert_eq!(slot_points_at(&custom_slot), "cx2");
+    assert_eq!(
+        slot_points_at(&default_slot),
+        "cx1",
+        "~/.codex is not this operator's home"
+    );
+}
+
+/// The delete's half of that carry: a session carrying the operator's custom
+/// home detaches the slot linked under THAT home, and a `~/.codex` slot
+/// holding another profile's store is left as found.
+#[cfg(unix)]
+#[test]
+fn a_delete_inside_a_codex_session_detaches_the_operators_custom_home_slot() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx2");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    let cx1_store = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    std::os::unix::fs::symlink(&cx1_store, &custom_slot).expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    assert!(crate::runtime::is_codex_home_path(&session));
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+
+    let _ = delete_codex_profile("cx1", false, &rotation_guard("cx1")).expect("delete");
+
+    assert!(
+        custom_slot.symlink_metadata().is_err(),
+        "the carried home's link is detached, not left dangling"
+    );
+    assert_eq!(
+        slot_points_at(&default_slot),
+        "cx2",
+        "~/.codex is not this operator's home"
+    );
+}
+
+/// Both homes can hold clauth's link onto one store (a capture under one, a
+/// switch under the other): the delete detaches every one of them, and reports
+/// each slot it removed.
+#[cfg(unix)]
+#[test]
+fn a_delete_detaches_every_operator_home_slot_for_the_profile() {
+    let home = HomeSandbox::new();
+    let default_slot = cx_pair_linked_onto(&home, "cx1", "cx1");
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let custom_slot = custom.join("auth.json");
+    std::os::unix::fs::symlink(
+        std::fs::read_link(&default_slot).expect("the cx1 link"),
+        &custom_slot,
+    )
+    .expect("the custom slot links cx1");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+
+    let detach = delete_codex_profile("cx1", false, &rotation_guard("cx1")).expect("delete");
+
+    assert_eq!(
+        detach,
+        crate::actions::OperatorAuthDetach {
+            operator_home: custom.clone(),
+            slots: vec![
+                crate::actions::DetachedOperatorSlot {
+                    slot: custom_slot.clone(),
+                    under_operator_home: true,
+                },
+                crate::actions::DetachedOperatorSlot {
+                    slot: default_slot.clone(),
+                    under_operator_home: false,
+                },
+            ],
+        },
+        "the carried home's slot first, then the default home's"
+    );
+    assert!(custom_slot.symlink_metadata().is_err());
+    assert!(default_slot.symlink_metadata().is_err());
+}
+
+/// A capture from a shell with no `CODEX_HOME` linked the default home's
+/// slot; the operator then starts a session whose shell names a custom home,
+/// which carries with no link in it. The delete must detach the default
+/// home's link too, or it dangles into the store the delete removes.
+#[cfg(unix)]
+#[test]
+fn a_delete_detaches_the_default_home_slot_past_a_carried_one() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("capture");
+    let default_slot = home.home().join(".codex").join("auth.json");
+    assert_eq!(
+        std::fs::read_link(&default_slot).expect("adopted"),
+        profile_dir(&crate::profile::ProfileName::from("cx"))
+            .expect("dir")
+            .join("auth.json")
+    );
+    let custom = home.home().join("my-codex");
+    std::fs::create_dir_all(&custom).expect("mkdir the custom home");
+    let session = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join(crate::runtime::CODEX_HOME_STEM);
+    assert!(crate::runtime::is_codex_home_path(&session));
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CODEX_HOME", Some(session.as_os_str())),
+            ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+        ],
+    );
+
+    let _ = delete_codex_profile("cx", false, &rotation_guard("cx")).expect("delete");
+
+    assert!(
+        default_slot.symlink_metadata().is_err(),
+        "the default home's link is detached, not left dangling behind a carried home"
+    );
 }
 
 #[cfg(unix)]

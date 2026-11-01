@@ -1362,6 +1362,21 @@ fn codex_spawn_command(
     let mut command = engine.command();
     engine.scrub_env(&mut command, active_env_keys);
     command.env(engine.home_env_key(), home);
+    // CODEX_HOME names this session home, so a reader inside the session that
+    // must reach the OPERATOR's own login (a switch or delete following the
+    // operator's auth.json slot) resolves the carried key instead. The key
+    // rides into every process started under this session tree — a nested
+    // `clauth start`, a claude session, a daemon started from inside it — and a
+    // child gets no key when no non-session home resolves, so no child inherits
+    // one session home as its operator home.
+    match crate::runtime::explicit_operator_codex_home() {
+        Some(operator_home) => {
+            command.env("CLAUTH_OPERATOR_CODEX_HOME", &operator_home);
+        }
+        None => {
+            command.env_remove("CLAUTH_OPERATOR_CODEX_HOME");
+        }
+    }
     command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
     command
         .arg("-c")

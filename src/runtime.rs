@@ -426,12 +426,54 @@ pub(crate) fn scrubbed_codex_home(value: Option<std::ffi::OsString>) -> Option<s
     value.filter(|v| !is_codex_home_path(Path::new(v)))
 }
 
+/// The codex home the environment names as the OPERATOR's own: a non-empty
+/// `CODEX_HOME` that is not a clauth session home, else a non-empty
+/// `CLAUTH_OPERATOR_CODEX_HOME` that is not one — a nested `clauth start`
+/// inherits the value its parent session carried — else `None`, for the
+/// default home. The one spelling of that order; [`operator_codex_home`]
+/// resolves the default tier from it.
+///
+/// The value returned is the DIRECTORY, not the spelling: a child runs under
+/// its own cwd, and a relative home carried verbatim would name another
+/// directory there. It is anchored BEFORE the session-home filter for the same
+/// reason — `codex-home-1-0` typed inside `profiles/<name>` is such a home only
+/// once resolved.
+pub(crate) fn explicit_operator_codex_home() -> Option<std::path::PathBuf> {
+    ["CODEX_HOME", "CLAUTH_OPERATOR_CODEX_HOME"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                // Fails only when the path cannot be made absolute (an
+                // unreadable cwd on unix, an invalid path on Windows); the raw
+                // spelling is carried then.
+                .map(|dir| std::path::absolute(&dir).unwrap_or(dir))
+                .filter(|dir| !is_codex_home_path(dir))
+        })
+}
+
+/// The home the OPERATOR's own codex reads: the explicit home the environment
+/// names, else the default one. Readers that MOVE one of clauth's own links
+/// resolve the operator here, never off `CODEX_HOME` alone — inside a session
+/// that names the session home, and a switch or delete there would otherwise
+/// reach for the default home's slot instead of the one this operator uses.
+pub(crate) fn operator_codex_home() -> Result<std::path::PathBuf> {
+    explicit_operator_codex_home().map_or_else(crate::actions::default_codex_operator_home, Ok)
+}
+
 /// Drop from `command` each session home it would inherit that names a tree
 /// clauth built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
 /// codex home. A process spawned from inside a clauth session otherwise
 /// answers as that session (`clauth which`, a `codex` run landing in another
 /// profile's home) and keeps pointing at its tree after teardown. The user's
 /// own custom dirs are theirs and stay.
+///
+/// A session `CODEX_HOME` is REPLACED by the operator home the environment
+/// names where one resolves: a claude session or a daemon started inside a
+/// codex session must keep running a bare `codex` against the home clauth's
+/// own capture, switch and delete act on. With no operator home resolving, the
+/// key goes, so no child inherits a session home as its operator home.
 pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
     if std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| is_clauth_runtime_path(Path::new(&v)))
     {
@@ -439,7 +481,14 @@ pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
     }
     let codex_home = std::env::var_os("CODEX_HOME");
     if codex_home.is_some() && scrubbed_codex_home(codex_home).is_none() {
-        command.env_remove("CODEX_HOME");
+        match explicit_operator_codex_home() {
+            Some(operator) => {
+                command.env("CODEX_HOME", operator);
+            }
+            None => {
+                command.env_remove("CODEX_HOME");
+            }
+        }
     }
 }
 
@@ -12974,7 +13023,7 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
 }
 
 /// The config keys a clauth-built codex home must not inherit, whatever the
-/// operator set for their own `~/.codex`. Each one lets a session read or write
+/// operator set in their own codex home. Each one lets a session read or write
 /// outside the boundary the home exists to draw:
 ///
 /// - `sqlite_home` moves the state DBs, so every profile's
@@ -13070,7 +13119,7 @@ const CODEX_DURABLE_ENTRIES: &[&str] = &[
 /// is that the thread is kept.
 const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
 
-/// The operator-`~/.codex` entries a SHARED codex session sees — instruction
+/// The operator codex home's entries a SHARED codex session sees — instruction
 /// and extension surfaces, same reasoning as the claude shared runtime linking
 /// the operator's `~/.claude`. `hooks.json` is deliberately absent: hooks
 /// execute code inside a home clauth built, so linking it is a per-profile
@@ -13158,7 +13207,7 @@ fn last_refresh_ms_of(path: &Path) -> Option<i64> {
 /// reader and unknown keys stay tolerated.
 #[derive(Default, serde::Deserialize)]
 struct CodexProfileOpts {
-    /// Link the operator's `~/.codex/hooks.json` into shared session homes.
+    /// Link the operator codex home's `hooks.json` into shared session homes.
     #[serde(default)]
     hooks_json: bool,
 }
@@ -13202,7 +13251,7 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   per-session `sessions/`, discarded by design. Fake: the home IS the
 ///   global store.
 fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
-    let operator = home_dir()?.join(".codex");
+    let operator = operator_codex_home()?;
     let global = codex_global_home(name)?;
     let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
 

@@ -907,6 +907,124 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     );
 }
 
+/// The spawn carries the operator's own codex home beside the session pin:
+/// inside the session `CODEX_HOME` names the session home, and the operator's
+/// explicit home rides `CLAUTH_OPERATOR_CODEX_HOME` instead. Carried only when
+/// the caller's environment names one; the session-home pin itself is never
+/// displaced.
+#[test]
+fn the_codex_spawn_carries_the_operators_explicit_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom.as_os_str()))]);
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the caller's custom CODEX_HOME is what the spawn carries"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home pin is unchanged"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[("CODEX_HOME", None), ("CLAUTH_OPERATOR_CODEX_HOME", None)],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "no explicit operator home named, nothing carried: {env:?}"
+        );
+    }
+}
+
+/// A nested `clauth start`: the caller's `CODEX_HOME` is a clauth session
+/// home, so it is no operator home and the inherited carry value wins; a
+/// carry value that is itself a session home is no operator home either, and
+/// the spawn REMOVES the key so the child cannot inherit it — its own
+/// resolution then falls to the default home.
+#[test]
+fn the_codex_spawn_carries_the_operator_home_past_a_session_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let caller_session = home.home().join(".clauth/profiles/cy/codex-home-777-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the inherited operator home is carried, not the caller's session home"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home is pinned AFTER the scrub, whatever the scrub carried"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                (
+                    "CLAUTH_OPERATOR_CODEX_HOME",
+                    Some(caller_session.as_os_str()),
+                ),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "a carried session home is dropped from the child, not inherited: {env:?}"
+        );
+    }
+}
+
+/// A relative `CODEX_HOME` is carried as the DIRECTORY it names, resolved
+/// against this shell's cwd: the child runs under its own cwd, so the
+/// spelling alone would name another directory inside the session.
+#[test]
+fn the_codex_spawn_carries_a_relative_operator_home_as_a_directory() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some("my-codex".as_ref()))]);
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let env = crate::testutil::env_overrides(&cmd);
+
+    let expected = std::env::current_dir().expect("cwd").join("my-codex");
+    assert_eq!(
+        env.get("CLAUTH_OPERATOR_CODEX_HOME")
+            .and_then(|v| v.as_deref()),
+        expected.to_str(),
+        "the carried value is the directory, not the spelling"
+    );
+}
+
 /// codex layers its managed config ABOVE the session's `-c` flags, so a key
 /// set there defeats the forced store and state-DB home the spawn pins, and
 /// nothing clauth passes can outrank it. The two keys that kill the chain
