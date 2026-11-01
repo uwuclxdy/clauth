@@ -15,7 +15,7 @@ codex login                # once, in your own shell, if you have not already
 clauth login work --codex  # adopt it as codex profile 'work'
 ```
 
-clauth reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json` when that variable is set), copies the chain into `~/.clauth/profiles/work/auth.json` with every key codex wrote and `last_refresh` set to the capture time, records the profile in `~/.clauth/codex-profiles.toml`, then replaces `~/.codex/auth.json` with a symlink onto that store. It prints:
+clauth reads your own codex's `auth.json` — the home `$CODEX_HOME` names when you set one, else the home a `clauth start` session carries, else `~/.codex` — copies the chain into `~/.clauth/profiles/work/auth.json` with every key codex wrote and `last_refresh` set to the capture time, records the profile in `~/.clauth/codex-profiles.toml`, then replaces that same `auth.json` with a symlink onto that store. From inside a `clauth start` codex session, where `CODEX_HOME` names the session's own home, the capture refuses instead ([When something is refused](Codex#when-something-is-refused)). It prints:
 
 ```
 clauth: captured the operator codex login into codex profile 'work'
@@ -65,14 +65,14 @@ The session home is `~/.clauth/profiles/work/codex-home-<sid>/`:
 | Entry | Shared (default) | `--isolated` |
 |-------|------------------|--------------|
 | `auth.json` | a link to the profile's chain | the same link |
-| `config.toml`, and every `*.config.toml` layer `codex --profile` reads | copies of your `~/.codex` ones with `sqlite_home`, `cli_auth_credentials_store` and `debug.config_lockfile` removed (codex writes its config in place, so it is never a link) | the same copies |
-| `skills`, `rules`, `agents`, `templates`, `references`, `AGENTS.md`, `plugins` | links to your `~/.codex` entries | absent |
+| `config.toml`, and every `*.config.toml` layer `codex --profile` reads | copies of the ones in the home your own codex reads with `sqlite_home`, `cli_auth_credentials_store` and `debug.config_lockfile` removed (codex writes its config in place, so it is never a link) | the same copies |
+| `skills`, `rules`, `agents`, `templates`, `references`, `AGENTS.md`, `plugins` | links to your own codex home's entries | absent |
 | `hooks.json` | linked only when the profile's `config.toml` sets `hooks_json = true` | absent |
 | `sessions/`, `archived_sessions/`, `history.jsonl`, the `*.sqlite` state stores | links into `~/.clauth/profiles/work/codex-home/`, the store every session of the profile shares | per session, discarded at exit |
 
 A thread is in the profile's store the moment codex writes it, so a later session lists it, and archiving one keeps it. The per-session home is removed when the session ends; the store never is.
 
-The environment is scrubbed before the spawn: `CODEX_HOME`, `CODEX_SQLITE_HOME`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE`, `CODEX_REVOKE_TOKEN_URL_OVERRIDE` and `CODEX_APP_SERVER_LOGIN_CLIENT_ID` are dropped, as are the active Claude Code profile's own `[env]` keys and a `CLAUDE_CONFIG_DIR` naming a clauth runtime, so the session spends the account it names and nothing inherited.
+The environment is scrubbed before the spawn: `CODEX_HOME`, `CODEX_SQLITE_HOME`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE`, `CODEX_REVOKE_TOKEN_URL_OVERRIDE` and `CODEX_APP_SERVER_LOGIN_CLIENT_ID` are dropped, as are the active Claude Code profile's own `[env]` keys and a `CLAUDE_CONFIG_DIR` naming a clauth runtime, so the session spends the account it names and nothing inherited. The session carries the home your own codex uses as `CLAUTH_OPERATOR_CODEX_HOME` — `CODEX_HOME` when you set one, else nothing — and a process clauth starts from inside the session gets that home back in place of a session `CODEX_HOME`, so a bare `codex` there reads your own login; with no home carried, the scrub drops the session `CODEX_HOME` rather than handing one on.
 
 `--with-fallback` is refused: `--with-fallback is not available on a codex profile: codex reads auth.json once at start, so a chain lands at the NEXT start, not mid-session. Start without the flag`. `--explain` prints `would start on 'work'` and exits. `--auto` walks the Claude Code chain and never lands on a codex profile. A chain clauth has declared dead is refused before anything is built ([below](Codex#when-a-chain-dies)). ``failed to launch codex. Is the `codex` CLI installed and on PATH?`` is what a missing `codex` looks like.
 
@@ -85,7 +85,7 @@ clauth work
 # clauth: switched codex to 'work'
 ```
 
-A codex switch moves the active marker in `codex-profiles.toml`. When your own `auth.json` (in `~/.codex`, or in your `CODEX_HOME` when you set one) is the link clauth installed into a profile's store, the link follows the switch (`clauth: /home/you/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link clauth did not install, is left alone. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note: 'work' also names a codex profile. This switches the CLAUDE one`.
+A codex switch moves the active marker in `codex-profiles.toml`. When your own `auth.json` — under `CODEX_HOME` when you set one, else under the home a `clauth start` session carries, else under `~/.codex` — is the link clauth installed into a profile's store, the link follows the switch (`clauth: /home/you/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link clauth did not install, is left alone, and so is a `~/.codex` link while your codex reads another home. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note: 'work' also names a codex profile. This switches the CLAUDE one`.
 
 ## Remove
 
@@ -96,11 +96,15 @@ clauth delete work
 
 The same gate as a Claude Code delete: `--yes` skips the prompt and is required on a non-TTY stdin (`refusing to delete 'work' without confirmation; pass --yes for a non-interactive delete`), `--force` is the only way past `'work' has a live session, pass --force to remove it anyway`, and anything but `y` or `yes` leaves it with `clauth: aborted. 'work' left in place.` A confirmed delete removes `~/.clauth/profiles/work/` whole, the profile's threads and state stores under `codex-home/` included, then drops the roster row, and prints `clauth: removed codex profile 'work'.` The Setup tab's `delete account` row runs the same delete behind a two-press confirm and refuses an account with a live session (there is no `--force` here).
 
-When `~/.codex/auth.json` is the link a capture installed onto this profile, the delete removes that link too and says what that means:
+When your own `auth.json` — under the home your codex reads, or under `~/.codex` — is the link a capture installed onto this profile, the delete removes that link too and says what that means:
 
 ```
-clauth: /home/you/.codex/auth.json followed that profile's chain and is detached now, so your own codex has no login; run `codex login` to mint a fresh one
+clauth: /home/you/alt-codex/auth.json followed that profile's chain and is detached now, so your own codex has no login; run `codex login` to mint a fresh one
+clauth: /home/you/.codex/auth.json followed that profile's chain and is detached now too
+clauth: /home/you/.codex/auth.json followed that profile's chain and is detached now; your own codex reads /home/you/alt-codex and is unaffected
 ```
+
+The first line is your own codex's home, logged out from that moment; the second is `~/.codex` detached in the same delete as that home; the third is `~/.codex` alone while your codex reads another home, which keeps its login.
 
 A link onto another profile, or a real file (you logged your own codex back in), is left as it is.
 
@@ -108,7 +112,7 @@ A link onto another profile, or a real file (you logged your own codex back in),
 
 The codex chain is separate from the Claude Code one and lives in `~/.clauth/codex-profiles.toml`, hand-edited: `fallback_chain` in walk order, `wrap_off`, and its own `weekly_switch_threshold` ([Configuration](Configuration#codex-profilestoml)). It is walked with the same rules ([Auto-switch](Auto-Switch#codex)): the active codex profile has to be a chain member, it has to be exhausted (5h past 95%, or the weekly window past the codex file's line) or dead, and the walk takes the next member with headroom, preferring one whose usage was read live. A dead member is one whose chain clauth has quarantined, or whose usage polls keep answering 401 past two forced refreshes.
 
-What differs is when the switch lands. codex reads `auth.json` once at start, so a switch moves the active marker and takes effect at the next `clauth start`; a running session finishes on the account it started with. codex 0.157 and later run every task inside one shared app-server daemon (`codex app-server --managed-daemon`), and `codex resume` reconnects to it, so a switch reaches those tasks only once that daemon restarts: it read the login when it started. When a switch moves clauth's `auth.json` link, clauth checks the codex home whose link it moved (your `CODEX_HOME` when you set one, else `~/.codex`) for a daemon that started at or before the move. A hand switch prints how to restart it (`codex app-server daemon restart`, which stops running tasks' current turn and leaves them resumable); an auto-switch moves off a spent or dead account, whose tasks are stalled on it anyway, so it restarts the daemon itself (`clauth: restarted codex's app-server daemon (…)`), one restart at a time. The check needs the daemon's unix control socket, so on Windows clauth neither prints the note nor restarts anything. A stale daemon never writes its old login into the new account's store: codex re-reads `auth.json` before every refresh and refuses on an account mismatch, so it errors once its token expires instead. The daemon log reads `clauth: codex auto-switched to '<name>'. Live at the next codex session`, or `. Restarting codex's app-server daemon so its tasks resume on it` when it restarts one. With `wrap_off = true` and every member spent, the active slot is cleared (`clauth: every codex account is spent. Codex active slot cleared`) and stays clear until you switch to a member by hand.
+What differs is when the switch lands. codex reads `auth.json` once at start, so a switch moves the active marker and takes effect at the next `clauth start`; a running session finishes on the account it started with. codex 0.157 and later run every task inside one shared app-server daemon (`codex app-server --managed-daemon`), and `codex resume` reconnects to it, so a switch reaches those tasks only once that daemon restarts: it read the login when it started. When a switch moves clauth's `auth.json` link, clauth checks the codex home whose link it moved (under `CODEX_HOME` when you set one, else under the home a `clauth start` session carries, else `~/.codex`) for a daemon that started at or before the move. A hand switch prints how to restart it (`codex app-server daemon restart`, which stops running tasks' current turn and leaves them resumable); an auto-switch moves off a spent or dead account, whose tasks are stalled on it anyway, so it restarts the daemon itself (`clauth: restarted codex's app-server daemon (…)`), one restart at a time. The check needs the daemon's unix control socket, so on Windows clauth neither prints the note nor restarts anything. A stale daemon never writes its old login into the new account's store: codex re-reads `auth.json` before every refresh and refuses on an account mismatch, so it errors once its token expires instead. The daemon log reads `clauth: codex auto-switched to '<name>'. Live at the next codex session`, or `. Restarting codex's app-server daemon so its tasks resume on it` when it restarts one. With `wrap_off = true` and every member spent, the active slot is cleared (`clauth: every codex account is spent. Codex active slot cleared`) and stays clear until you switch to a member by hand.
 
 ## Usage and refresh
 
@@ -218,9 +222,9 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 | `~/.clauth/profiles/<name>/codex-home/` | the durable store: `sessions/`, `archived_sessions/`, `history.jsonl`, the sqlite state stores |
 | `~/.clauth/profiles/<name>/codex-home-<sid>/`, `codex-home-isolated-<sid>/` | one live session's `CODEX_HOME`, removed at exit |
 | `~/.clauth/profiles/<name>/sessions-<sid>/`, `sessions-isolated-<sid>/` | that session's PID file, flock-held while it runs |
-| `~/.codex/auth.json` | after a capture, a symlink onto the profile's `auth.json` |
+| your own codex home's `auth.json` | after a capture, a symlink onto the profile's `auth.json` (the home `$CODEX_HOME` names when you set one, else the home a `clauth start` session carries, else `~/.codex`) |
 
-Everything under `~/.clauth` is owner-only, as on the [Security](Security#where-credentials-live) page. `~/.codex/config.toml` is copied into sessions and never written back.
+Everything under `~/.clauth` is owner-only, as on the [Security](Security#where-credentials-live) page. Your own codex home's `config.toml` is copied into sessions and never written back.
 
 ## What stays Claude Code only
 
@@ -230,4 +234,4 @@ On the Overview, codex accounts sit in selectable rows under the Claude Code row
 
 ## Windows and hosts without symlinks
 
-Where clauth cannot create symlinks (Windows without the symlink privilege, or a home on exFAT, FAT32 or SMB), a session home holds a copy of `auth.json` instead of a link, converged with the profile's store at every session start and exit, with the later `last_refresh` winning. That copy is a second carrier of a single-use chain, so on such a host clauth stands its refresh down for the whole session, refuses a shared and an isolated session of one profile at the same time, and the capture keeps your `~/.codex/auth.json` as a separate copy with a warning: run codex only through `clauth start <name>` from then on.
+Where clauth cannot create symlinks (Windows without the symlink privilege, or a home on exFAT, FAT32 or SMB), a session home holds a copy of `auth.json` instead of a link, converged with the profile's store at every session start and exit, with the later `last_refresh` winning. That copy is a second carrier of a single-use chain, so on such a host clauth stands its refresh down for the whole session, refuses a shared and an isolated session of one profile at the same time, and the capture keeps your own codex home's `auth.json` as a separate copy with a warning: run codex only through `clauth start <name>` from then on.

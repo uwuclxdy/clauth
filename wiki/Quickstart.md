@@ -181,7 +181,8 @@ clauth list           # account table with cached usage, no network
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
 | `CLAUTH_NO_API=1` | disables the daemon's REST listener whatever `--listen` says |
 | `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |
-| `CODEX_HOME` | set by `clauth start` on a codex profile to the session's own home, which is how `which` answers inside one; read by `login --codex` as the codex home to capture from, when it is not a clauth session home |
+| `CODEX_HOME` | set by `clauth start` on a codex profile to the session's own home, which is how `which` answers inside one; read by `login --codex` as the codex home to capture from, when it is not a clauth session home; when you set your own, the home a codex switch repoints the `auth.json` link under and a delete detaches it from |
+| `CLAUTH_OPERATOR_CODEX_HOME` | internal, set by `clauth start` on a codex profile to the codex home you launched it from, so a clauth command run inside the session acts on your own home and not the session's. Never set it yourself |
 | `SHELL` | how `completions install` detects your shell when you do not name one |
 | `COLORTERM` | what the TUI auto-detects its color depth from: `truecolor` or `24bit` picks `full`, anything else `compatible`. `--theme` and the `theme` key in `profiles.toml` both beat it |
 | `HERDR_CONFIG_PATH` | which config file `herdr install` writes into, matching how herdr itself reads the override |
