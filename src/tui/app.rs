@@ -7017,8 +7017,7 @@ impl App {
             h.fetch_lease,
             // The TUI's Usage tab and chain render read the third-party store,
             // so its stand-down hydration keeps the display superset.
-            // Pinned by construction, not a test: no test drives this call site
-            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            // Pinned by construction, not a test: a TUI test drives this call site but never reads the provider store this flag shapes.
             true,
             h.snapshot,
         );

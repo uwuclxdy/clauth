@@ -10418,13 +10418,18 @@ fn a_gate_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
 /// absent (the normal suite run) it passes instantly; with it present it seeds
 /// one OAuth profile whose access token is already expired, points the token
 /// endpoint at the parent's loopback stub, and runs the real [`serve`] until
-/// the signal its test sends kills the process.
+/// the signal its test sends kills the process or its parent dies.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn daemon_serve_child_for_stop_tests() {
     let Some(home) = std::env::var_os(crate::testutil::SERVE_STOP_CHILD_HOME_ENV) else {
         return;
     };
+    // A SIGKILLed fixture parent runs no `Drop`: watch the pid this child
+    // started under and exit once the reparent moves it, so no `serve` process
+    // outlives its fixture parent.
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
     let base = std::env::var(crate::testutil::SERVE_STOP_TOKEN_BASE_ENV)
         .expect("the parent stubbed the token endpoint");
     let home = std::path::PathBuf::from(home);
@@ -10471,6 +10476,51 @@ fn serve_waits_out_an_inflight_token_save_before_dying_of_sigterm() {
         std::time::Duration::ZERO,
         "the daemon still dies of the SIGTERM it got",
     );
+}
+
+/// A SIGKILLed fixture parent runs no `Drop`: the re-entered `serve` child has
+/// to notice its own reparent and exit, or it serves on forever, holding the
+/// test's loopback stub and the child home.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_serve_child_exits_when_its_parent_is_sigkilled() {
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
+    let log = scratch.path().join("daemon.log");
+    // The stub's answered marker is the child's readiness signal: the scheduler
+    // reached the token endpoint, so the child is well past its first parent
+    // read.
+    let (mut proxy, child) = crate::testutil::spawn_fixture_under_proxy(
+        "serve",
+        stub.answered(),
+        child_home.path(),
+        &stub.base,
+        Some(&log),
+    );
+    let start = crate::testutil::proc_start_of(child).expect("the serve child's start");
+    proxy.0.kill().expect("SIGKILL the fixture parent");
+    let _ = proxy.0.wait();
+    crate::testutil::assert_child_exits(child, &start, "the serve child");
+    stub.release();
+    let _ = stub.finish();
+}
+
+/// The parked pid-stop fixture is the other re-entry target: a SIGKILLed
+/// parent must not leave it sleeping out its full hour either.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_parked_fixture_child_exits_when_its_parent_is_sigkilled() {
+    let _home = HomeSandbox::new();
+    let config_home = tempfile::tempdir().expect("child config dir");
+    let ready = config_home.path().join("ready");
+    let (mut proxy, child) =
+        crate::testutil::spawn_fixture_under_proxy("park", &ready, config_home.path(), "", None);
+    let start = crate::testutil::proc_start_of(child).expect("the parked child's start");
+    proxy.0.kill().expect("SIGKILL the fixture parent");
+    let _ = proxy.0.wait();
+    crate::testutil::assert_child_exits(child, &start, "the parked fixture child");
 }
 
 // ── reload operator-log + stale-bearer pins ──────────────────────────────────

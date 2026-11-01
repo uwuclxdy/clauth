@@ -3574,10 +3574,60 @@ impl Drop for Owned {
     }
 }
 
+/// How long a re-entered fixture child sleeps between polls of its parent.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many poll intervals a parent-death test allows a fixture child before it
+/// is stuck: 200, because a loaded box can delay one poll by far more than an
+/// interval.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_EXIT_POLLS: u32 = 200;
+
+/// The wait before a parent-death test calls a fixture child stuck: 10 s, clear
+/// of a loaded box's scheduling delay and short enough that a real leak reds.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_EXIT_BOUND: std::time::Duration =
+    match PARENT_POLL_INTERVAL.checked_mul(PARENT_EXIT_POLLS) {
+        Some(bound) => bound,
+        None => panic!("PARENT_EXIT_POLLS overflows the poll interval"),
+    };
+
+/// Exit this process once its parent pid changes. A SIGKILLed parent runs no
+/// `Drop`, so a re-entered fixture child has to notice the death itself: the
+/// reparent moves `parent_id()` off the pid the child started under. Never
+/// returns.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn exit_when_reparented(parent: u32) -> ! {
+    loop {
+        std::thread::sleep(PARENT_POLL_INTERVAL);
+        if std::os::unix::process::parent_id() != parent {
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Wait out a fixture child whose parent was SIGKILLed, and kill it before
+/// reporting if it is still there: a red must leave nothing parked behind it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn assert_child_exits(pid: u32, start: &str, what: &str) {
+    let deadline = std::time::Instant::now() + PARENT_EXIT_BOUND;
+    while proc_start_of(pid).as_deref() == Some(start) {
+        if std::time::Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+            panic!("{what} outlived its SIGKILLed parent");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The libtest path [`FakeSupervisor`] and [`spawn_parked`] re-enter: a
-/// `#[test]` that parks until SIGTERM when the fixture's marker env is present
-/// and returns at once otherwise (the normal suite run). Re-entering the test
-/// binary itself — a linker-signed executable — keeps its environment readable
+/// `#[test]` that parks until SIGTERM, or exits once its parent dies, when the
+/// fixture's marker env is present and returns at once otherwise (the normal
+/// suite run). Re-entering the test binary itself — a linker-signed
+/// executable — keeps its environment readable
 /// on macOS, where an Apple platform binary like `/bin/sh` would have it
 /// withheld from the verify read.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -3590,9 +3640,11 @@ const READY_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_READY";
 const IGNORE_TERM_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_IGNORE_TERM";
 
 /// The re-entry target: with the marker env absent this passes instantly (the
-/// normal suite run); with it present the test writes the ready file, then
-/// parks until SIGTERM — installing a no-op SIGTERM handler first when told to
-/// ignore the signal.
+/// normal suite run); with it present the test installs a no-op SIGTERM handler
+/// when told to ignore the signal, captures its parent pid, writes the ready
+/// file, then exits once that parent dies. The capture precedes the ready
+/// write, so whoever kills this child's parent has seen a child already
+/// polling it.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn fake_supervisor_parks_until_sigterm() {
@@ -3606,10 +3658,11 @@ fn fake_supervisor_parks_until_sigterm() {
         let _ignored = signal_hook::flag::register(SIGTERM, Arc::new(AtomicBool::new(false)))
             .expect("register the ignore-SIGTERM handler");
     }
+    // Armed before the ready file: the fixture's owner kills this child's
+    // parent only after reading that file.
+    let parent = std::os::unix::process::parent_id();
     std::fs::write(Path::new(&ready), b"").expect("signal readiness");
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    exit_when_reparented(parent);
 }
 
 /// Spawn a re-entered copy of the test binary that runs only `test`, with
@@ -3647,7 +3700,145 @@ fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command 
     cmd
 }
 
-/// A live re-entered test binary that parks until SIGTERM, with `leading` as
+// ── fixture parent-death harness ─────────────────────────────────────────────
+//
+// A test cannot SIGKILL its own process to prove a fixture child dies with its
+// parent, so a re-entered copy of the test binary stands in as the parent: the
+// proxy spawns the fixture child, records its pid once that child is up, then
+// parks until the test kills it. The child is orphaned exactly as a SIGKILLed
+// parent leaves it.
+
+/// The env-gated re-entry target that proxies for a SIGKILLed fixture parent.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_PARENT_TEST: &str = "testutil::fixture_proxy_parent_parks";
+
+/// The fixture the proxy spawns: `serve` or `park`.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_CHILD_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_CHILD";
+
+/// The path the proxy writes its child's pid to.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_PID_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_PID";
+
+/// The file the proxy waits for before it records the pid: the child's own
+/// readiness signal, so the parent dies only after the child watches it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_READY_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_READY";
+
+/// The daemon-log file the proxy hands the `serve` child's stderr.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_LOG_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_LOG";
+
+/// Spawn a proxy parent whose own child is the named fixture (`serve` or
+/// `park`), so the caller can SIGKILL the child's parent without dying itself.
+/// `ready` is the file the child writes once it runs, and `log` the daemon log
+/// a `serve` child writes to. Returns the proxy and the child's pid; the caller
+/// kills the proxy and waits with [`assert_child_exits`].
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_fixture_under_proxy(
+    kind: &str,
+    ready: &Path,
+    child_home: &Path,
+    base: &str,
+    log: Option<&Path>,
+) -> (Owned, u32) {
+    let dir = tempfile::tempdir().expect("proxy pid dir");
+    let pid_out = dir.path().join("child.pid");
+    let mut cmd = reentry_command(PROXY_PARENT_TEST, &[]);
+    cmd.env(PROXY_CHILD_ENV, kind)
+        .env(PROXY_PID_ENV, &pid_out)
+        .env(PROXY_READY_ENV, ready)
+        .env(SERVE_STOP_CHILD_HOME_ENV, child_home)
+        .env(SERVE_STOP_TOKEN_BASE_ENV, base);
+    if let Some(log) = log {
+        cmd.env(PROXY_LOG_ENV, log);
+    }
+    let proxy = Owned(cmd.spawn().expect("spawn the fixture proxy parent"));
+    // The proxy records the pid only after the child's readiness file exists,
+    // so the caller's SIGKILL always lands on a child that is already watching
+    // its parent.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !pid_out.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture proxy never recorded its child"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pid = std::fs::read_to_string(&pid_out)
+        .expect("the proxy's pid record")
+        .trim()
+        .parse::<u32>()
+        .expect("a child pid");
+    (proxy, pid)
+}
+
+/// The env-gated target [`spawn_fixture_under_proxy`] re-enters: it spawns the
+/// named fixture child, waits for that child's readiness file, records the
+/// child's pid, then parks until the test SIGKILLs it. With the marker env
+/// absent (the normal suite run) it passes at once.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn fixture_proxy_parent_parks() {
+    let Some(kind) = std::env::var_os(PROXY_CHILD_ENV) else {
+        return;
+    };
+    // The proxy is a re-entered child of the test too: it must not outlive a
+    // SIGKILLed test process either. Its exit reparents the fixture child,
+    // whose own poll then exits it.
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || exit_when_reparented(parent));
+    let ready = std::path::PathBuf::from(
+        std::env::var_os(PROXY_READY_ENV).expect("the proxy parent named the ready path"),
+    );
+    let pid_out = std::path::PathBuf::from(
+        std::env::var_os(PROXY_PID_ENV).expect("the proxy parent named the pid-out path"),
+    );
+    let child_home = std::path::PathBuf::from(
+        std::env::var_os(SERVE_STOP_CHILD_HOME_ENV).expect("the proxy parent named the child home"),
+    );
+    let child = match kind.to_str() {
+        Some("serve") => {
+            let base = std::env::var(SERVE_STOP_TOKEN_BASE_ENV)
+                .expect("the proxy parent stubbed the token endpoint");
+            let log = std::path::PathBuf::from(
+                std::env::var_os(PROXY_LOG_ENV).expect("the proxy parent named the daemon log"),
+            );
+            let stderr = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .expect("the proxy's daemon log");
+            serve_stop_child_command(&child_home, &base, stderr).spawn()
+        }
+        Some("park") => reenter_parked(&child_home, &[], &ready).spawn(),
+        other => panic!("unknown fixture child {other:?}"),
+    }
+    .expect("spawn the fixture child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture child never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Published whole: the reader parses the pid as soon as the path exists, so
+    // a plain write's create-then-write window would let it read an empty file.
+    let staging = crate::profile::tmp_sibling(&pid_out);
+    std::fs::write(&staging, child.id().to_string()).expect("stage the fixture child's pid");
+    std::fs::rename(&staging, &pid_out).expect("record the fixture child's pid");
+    // Park without waiting on the child: only the test's SIGKILL ends this
+    // proxy, which is what orphans the child. The binding keeps clippy's
+    // `zombie_processes` lint from reading the never-waited child as a leak.
+    let _child = child;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// A live re-entered test binary that parks until SIGTERM or its parent's
+/// death, with `leading` as
 /// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
 /// while its environment (readable on macOS only for non-platform binaries)
 /// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
@@ -3680,7 +3871,7 @@ pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
 
 /// A fake supervisor for the pid-stop tests: a re-entered copy of the test
 /// binary run with argv `daemon run` under the chosen `CLAUDE_CONFIG_DIR`,
-/// parked until SIGTERM. The test writes `<tree>/daemon.lock` from the
+/// parked until SIGTERM or its parent's death. The test writes `<tree>/daemon.lock` from the
 /// recorded `pid` + `proc_start` (the live pid's real start, via
 /// [`proc_start_of`]). Killed and reaped on drop, best-effort, never asserts;
 /// the test reaps it first to read its exit status.
@@ -3826,10 +4017,10 @@ pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::Exi
 
 // ── E2E `serve` stop harness ─────────────────────────────────────────────────
 //
-// Both stop tests re-enter the test binary to run the real `daemon::serve` in a
-// separate process (`SERVE_STOP_CHILD_TEST`), and both hold that child's token
-// spend in a loopback stub until the test signals. The command builder and the
-// stub live here so the two legs share them.
+// The stop tests and the parent-death test re-enter the test binary to run the
+// real `daemon::serve` in a separate process (`SERVE_STOP_CHILD_TEST`); the stop
+// tests hold that child's token spend in a loopback stub until the test signals.
+// The command builder and the stub live here so every caller shares them.
 
 /// The env-gated re-entry target: the child test fn in `daemon_mod.rs` that
 /// runs `daemon::serve`. With the marker env absent (the normal suite run) it
