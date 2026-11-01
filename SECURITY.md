@@ -120,8 +120,8 @@ A few code paths can change account state. All are narrow and all are documented
 Background, automatic:
 
 - **Auto-start kick.** A real, billed `/v1/messages` call (`max_tokens = 1`, a fraction of a cent) under your own OAuth token, with the Claude Code client identity, to arm the 5-hour usage window.
-  - It's the same request Claude Code makes on startup. Off by default, OAuth profiles only; enable it per profile on the Setup tab or with `auto_start = true`.
-- **Usage probe.** The same `/v1/messages` call as the auto-start kick, under the `claude setup-token` token of an account that stores no OAuth pair, read for the usage its rate-limit headers report. It repeats every `usage_probe_interval_ms` (90s by default, between 60s and 450s), a manual refresh (`r`) in the clauth process that fetches usage sends one at once, and any probe may start that account's 5-hour window.
+  - It's the same request Claude Code makes on startup. Off by default, OAuth profiles only; enable it per profile on the Setup tab or with `auto_start = true`. A plan with no 5h limit gets no kick.
+- **Usage probe.** The same `/v1/messages` call as the auto-start kick, under the `claude setup-token` token of an account that stores no OAuth pair, read for the usage its rate-limit headers report. It repeats every `usage_probe_interval_ms` (90s by default, between 60s and 450s), a manual refresh (`r`) in the clauth process that fetches usage sends one at once, and any probe may start that account's 5-hour window — a plan with no 5h limit has none to start.
   - Off by default, and only offered for an account `/usage` cannot read; enable it per profile on the Setup tab or with `usage_probe = true`. A token the server refuses is not probed again until a new one is captured with `clauth login <name> --setup-token`, clauth restarts, another clauth process takes over fetching usage, or the probe is switched off and on. While it stays refused, no automatic switch or `clauth start --auto` lands on the account, an OAuth pair stored beside the token included, since a switch installs the token ahead of the pair. A refresh by hand retries it once too, but only in the clauth process that fetches usage.
 - **Auto-switch.** When the fallback chain is armed, clauth relinks the global credentials to another account on its own once the active one runs out of headroom, from the TUI or from `clauth daemon`.
   - It sends no inference itself. The chain is empty by default, and an account outside it is never switched to.
@@ -145,7 +145,7 @@ User-invoked, only when you run the command:
 
 Agent-invoked, only when the Claude Code plugin is installed:
 
-- **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account.
+- **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account (a plan with no 5h limit has none to open).
   - It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
 - **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write the bare `clauth <name>` performs. It changes which account the global session's next request runs on; it sends no inference itself.
 

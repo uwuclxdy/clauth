@@ -113,7 +113,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 | `isolated` | bool | `false` |
 | `background` | bool | `false` |
 
-**Cost.** A delegate to a subscription account opens a real 5-hour window there. To a pay-as-you-go API-key account it bills real money. To a prepaid plan account it draws down quota you already bought, so it costs nothing extra. A loopback or LAN host is free. Call `profiles` first to pick the account with headroom.
+**Cost.** A delegate to a subscription account opens a real 5-hour window there (a plan with no 5h limit has none to open). To a pay-as-you-go API-key account it bills real money. To a prepaid plan account it draws down quota you already bought, so it costs nothing extra. A loopback or LAN host is free. Call `profiles` first to pick the account with headroom.
 
 The `cost` figure in a finished delegate's reply comes from the delegated `claude` itself, which prices every run at Anthropic's rates whatever endpoint answered it. So it is the real amount only on a subscription account. On any account whose requests go somewhere else, the reply labels the figure as Anthropic-priced rather than letting it read as the bill. That covers an account with an endpoint host and an account whose endpoint is set only as an `ANTHROPIC_BASE_URL` entry in its `[env]`, which the roster's host column does not show. Where clauth cannot read an account's config at all it says the endpoint is unknown instead of guessing. It never reprices the figure, because the envelope reports the model id that was sent, never the model the endpoint actually served. The usage line beside it names the provider that answered, as `(served by DeepSeek)`, and stays bare only when Anthropic did.
 

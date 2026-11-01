@@ -26,7 +26,7 @@
 
 ## When something looks wrong
 
-**An account shows 0% but I have been using it.** The 5h window opens on a real inference call, and a usage poll does not trip it. On an account the usage probe reads, each usage read is a probe, which is inference and may open the window. Either the window genuinely has not started, or the reading is cached. The refresh countdown on the Overview tab turns yellow on last-known numbers and red when the last fetch failed.
+**An account shows 0% but I have been using it.** The 5h window opens on a real inference call, and a usage poll does not trip it. On an account the usage probe reads, each usage read is a probe, which is inference and may open the window (a plan with no 5h limit has none to open). Either the window genuinely has not started, or the reading is cached. The refresh countdown on the Overview tab turns yellow on last-known numbers and red when the last fetch failed.
 
 **Usage numbers are stuck.** Only one clauth instance fetches at a time. If a daemon holds the lease, an open TUI reads its results instead of polling itself, and picks the lease back up within a tick of the daemon exiting. `clauth daemon --status` says whether one is up.
 
