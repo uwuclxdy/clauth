@@ -8082,7 +8082,8 @@ fn a_stale_copied_bearer_is_only_an_older_rolling_copy_of_the_members_sidecar() 
 }
 
 /// Nothing is stale against a sidecar that could not replace it: one behind
-/// its chain, one past its expiry, one with no expiry and a static mint.
+/// its chain, one past its expiry, one with no expiry, one with an empty
+/// bearer and a static mint.
 #[test]
 fn nothing_is_stale_against_a_sidecar_that_cannot_replace_it() {
     let now = 1_000;
@@ -8106,6 +8107,11 @@ fn nothing_is_stale_against_a_sidecar_that_cannot_replace_it() {
         stale_copied_bearer(&item, &no_expiry, now, false, &[]),
         None,
         "no expiry"
+    );
+    assert_eq!(
+        stale_copied_bearer(&item, &sidecar_token("", now + 60_000), now, false, &[]),
+        None,
+        "an empty bearer"
     );
     let mut mint = live;
     mint.subscription_type = None;

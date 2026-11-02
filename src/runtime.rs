@@ -10909,18 +10909,14 @@ fn runtime_reads_its_file(runtime: &Path) -> bool {
 /// The current sidecar and chain bearers of every profile but `member`: what a
 /// rolling bearer in one of `member`'s sessions' items must not be before the
 /// stale-copy sweep calls it a copy of `member`'s. Unreadable stores add
-/// nothing.
+/// nothing; a profiles root that cannot be listed is `None`, so the sweep
+/// skips the candidate instead of judging it against no foreign bearer.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(dead_code, reason = "the only caller is the macOS stale-copy sweep")
 )]
-fn current_bearers_except(member: &ProfileName) -> Vec<String> {
-    let Some(entries) = profiles_root_dir()
-        .ok()
-        .and_then(|root| std::fs::read_dir(root).ok())
-    else {
-        return Vec::new();
-    };
+fn current_bearers_except(member: &ProfileName) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(profiles_root_dir().ok()?).ok()?;
     let mut out = Vec::new();
     for entry in entries.flatten() {
         if entry.file_name().to_str() == Some(member.as_str()) {
@@ -10937,7 +10933,7 @@ fn current_bearers_except(member: &ProfileName) -> Vec<String> {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// Whether `(member, revoked)` is already queued for [`repoint_copied_bearers`].
@@ -10955,10 +10951,12 @@ fn revoked_bearer_queued(member: &ProfileName, revoked: &str) -> bool {
 /// Sessions whose item the stale-copy sweep failed to read for a reason other
 /// than a locked keychain: an access dialog denied or left unanswered, a read
 /// that ran out of time, an item that does not parse. The sweep never reads
-/// them again, as the re-point drain gives such a session up, since a read of
-/// an item Claude Code created can raise a dialog on every attempt.
+/// them again while they live, as the re-point drain gives such a session up,
+/// since a read of an item Claude Code created can raise a dialog on every
+/// attempt. Keyed by session id and the row's `started_at`: an id repeats when
+/// a later start recycles its pid, and that new session inherits nothing.
 #[cfg(target_os = "macos")]
-static STALE_SWEEP_GAVE_UP: std::sync::Mutex<BTreeSet<String>> =
+static STALE_SWEEP_GAVE_UP: std::sync::Mutex<BTreeSet<(String, u64)>> =
     std::sync::Mutex::new(BTreeSet::new());
 
 /// Queue the stale copies no stamp will name for [`repoint_copied_bearers`].
@@ -10973,8 +10971,11 @@ static STALE_SWEEP_GAVE_UP: std::sync::Mutex<BTreeSet<String>> =
 /// from its member's sidecar ([`row_copies_only_member_sidecar`]), it reads the
 /// item and, when [`crate::claude::stale_copied_bearer`] names a stale bearer,
 /// queues `(member, that bearer)`. The drain then writes it with every check
-/// a stamp's pair gets. macOS only; a no-op elsewhere and under `cfg(test)`,
-/// and inside a state-flock hold or an armed subprocess budget.
+/// a stamp's pair gets. The loop is [`sweep_stale_copied_bearers_with`]; this
+/// hands it the live sessions and the Keychain read. macOS only; a no-op
+/// elsewhere and under `cfg(test)`. A same-thread caller inside a state-flock
+/// hold or an armed subprocess budget gets a no-op too, so no `security` read
+/// runs under either; the daemon's detached sweep thread holds neither.
 pub(crate) fn sweep_stale_copied_bearers() {
     #[cfg(target_os = "macos")]
     {
@@ -10984,72 +10985,106 @@ pub(crate) fn sweep_stale_copied_bearers() {
         {
             return;
         }
-        let now = crate::usage::now_ms() as i64;
-        for live in live_session_runtime_dirs() {
-            if live.background || runtime_reads_its_file(&live.runtime) {
-                continue;
-            }
-            let gave_up = STALE_SWEEP_GAVE_UP
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&live.session);
-            if gave_up {
-                continue;
-            }
-            let Some(row) = crate::live_sessions::get(&live.session) else {
-                continue;
-            };
-            let Ok(sidecar_path) =
-                crate::profile::profile_dir(&live.profile).map(|d| d.join("session-token.json"))
-            else {
-                continue;
-            };
-            if !row_copies_only_member_sidecar(&row, &live.profile, &sidecar_path) {
-                continue;
-            }
-            let Some((_, sidecar)) = crate::claude::sidecar_summary(&live.profile) else {
-                continue;
-            };
-            let behind = crate::claude::rolling_sidecar_behind_chain(&live.profile);
-            if !crate::claude::sidecar_can_replace_copy(&sidecar, now, behind) {
-                continue;
-            }
-            let item = match crate::keychain::read_config_dir_item(&live.runtime) {
-                Ok(Some(item)) => item,
-                Ok(None) => continue,
-                Err(e) => {
-                    if !crate::keychain::failed_on_locked_keychain(&e) {
-                        STALE_SWEEP_GAVE_UP
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(live.session.clone());
-                        logline!(
-                            "clauth: could not read session {}'s per-session Keychain item to \
-                             check it for a stale '{}' rolling bearer: {e:#}. Not checking it again",
-                            live.session,
-                            live.profile
-                        );
-                    }
-                    continue;
-                }
-            };
-            let foreign = current_bearers_except(&live.profile);
-            let Some(stale) =
-                crate::claude::stale_copied_bearer(&item, &sidecar, now, behind, &foreign)
-            else {
-                continue;
-            };
-            if revoked_bearer_queued(&live.profile, &stale) {
-                continue;
-            }
-            logline!(
-                "clauth: session {}'s per-session Keychain item holds an older '{}' rolling \
-                 bearer than its sidecar; queued to re-point it",
-                live.session,
-                live.profile
-            );
-            note_revoked_rolling_bearer(&live.profile, stale);
+        let mut gave_up = STALE_SWEEP_GAVE_UP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sweep_stale_copied_bearers_with(
+            &live_session_runtime_dirs(),
+            crate::usage::now_ms() as i64,
+            &mut *gave_up,
+            |live| match crate::keychain::read_config_dir_item(&live.runtime) {
+                Err(e) if crate::keychain::failed_on_locked_keychain(&e) => Ok(None),
+                read => read,
+            },
+        );
+    }
+}
+
+/// One stale-copy sweep over `sessions` at `now`. A session's item is read
+/// through `read_item` only after every cheaper gate passed, and at most once.
+/// `read_item` answers `Ok(None)` for no item and for a read the next sweep
+/// may retry (a locked keychain); an `Err` gives the session up. `gave_up`
+/// holds the `(session id, started_at)` of the sessions given up: it is
+/// pruned to the sessions in `sessions` first, and a session in it is never
+/// read.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller outside tests is the macOS stale-copy sweep"
+    )
+)]
+pub(crate) fn sweep_stale_copied_bearers_with(
+    sessions: &[LiveRuntime],
+    now: i64,
+    gave_up: &mut BTreeSet<(String, u64)>,
+    mut read_item: impl FnMut(&LiveRuntime) -> Result<Option<serde_json::Value>>,
+) {
+    gave_up.retain(|(sid, _)| sessions.iter().any(|live| &live.session == sid));
+    for live in sessions {
+        if live.background || runtime_reads_its_file(&live.runtime) {
+            continue;
         }
+        let Some(row) = crate::live_sessions::get(&live.session) else {
+            continue;
+        };
+        let key = (live.session.clone(), row.started_at);
+        if gave_up.contains(&key) {
+            continue;
+        }
+        let Ok(sidecar_path) =
+            crate::profile::profile_dir(&live.profile).map(|d| d.join("session-token.json"))
+        else {
+            continue;
+        };
+        if !row_copies_only_member_sidecar(&row, &live.profile, &sidecar_path) {
+            continue;
+        }
+        let Some((_, sidecar)) = crate::claude::sidecar_summary(&live.profile) else {
+            continue;
+        };
+        let behind = crate::claude::rolling_sidecar_behind_chain(&live.profile);
+        if !crate::claude::sidecar_can_replace_copy(&sidecar, now, behind) {
+            continue;
+        }
+        let item = match read_item(live) {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(e) => {
+                gave_up.insert(key);
+                logline!(
+                    "clauth: could not read session {}'s per-session Keychain item to \
+                     check it for a stale '{}' rolling bearer: {e:#}. Not checking it again",
+                    live.session,
+                    live.profile
+                );
+                continue;
+            }
+        };
+        let Some(foreign) = current_bearers_except(&live.profile) else {
+            continue;
+        };
+        let Some(stale) =
+            crate::claude::stale_copied_bearer(&item, &sidecar, now, behind, &foreign)
+        else {
+            continue;
+        };
+        // A stamp plus its re-point landing between the sidecar read above
+        // and the item read leave the item holding the CURRENT bearer;
+        // only a fresh sidecar read tells that from a stale copy.
+        if revoked_bearer_queued(&live.profile, &stale)
+            || crate::claude::sidecar_summary(&live.profile)
+                .is_none_or(|(_, fresh)| fresh.access_token == stale)
+        {
+            continue;
+        }
+        logline!(
+            "clauth: session {}'s per-session Keychain item holds an older '{}' rolling \
+                 bearer than its sidecar; queued to re-point it",
+            live.session,
+            live.profile
+        );
+        note_revoked_rolling_bearer(&live.profile, stale);
     }
 }
 

@@ -21252,10 +21252,304 @@ fn the_sweep_sees_a_pair_the_queue_already_holds() {
 fn a_runtime_reads_its_file_until_claude_code_removes_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     assert!(!runtime_reads_its_file(dir.path()));
-    create_symlink(
+    let linked = create_symlink(
         &dir.path().join("gone"),
         &dir.path().join(".credentials.json"),
-    )
-    .expect("link");
+    );
+    if cfg!(windows) && linked.is_err() {
+        // Windows without symlink privilege falls back to copying the missing
+        // target, so the dangling link cannot be posed there.
+        return;
+    }
+    linked.expect("link");
     assert!(runtime_reads_its_file(dir.path()), "a dangling link");
+}
+
+/// The current bearers of every OTHER profile, sidecar and chain alike; the
+/// member's own and an unparseable store add nothing.
+#[test]
+fn the_foreign_bearers_are_every_other_profiles_current_ones() {
+    let _home = HomeSandbox::new();
+    let work = crate::profile::ProfileName::from("work");
+    let dir = |name: &str| {
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir")
+    };
+    write_sweep_store(&dir("work").join("session-token.json"), "w-side");
+    write_sweep_store(&dir("work").join("credentials.json"), "w-chain");
+    write_sweep_store(&dir("home").join("session-token.json"), "h-side");
+    write_sweep_store(&dir("home").join("credentials.json"), "h-chain");
+    fs::create_dir_all(dir("torn")).expect("mkdir torn");
+    fs::write(dir("torn").join("session-token.json"), "{").expect("write torn");
+    fs::write(dir("torn").join("credentials.json"), "not json").expect("write torn");
+    assert_eq!(
+        current_bearers_except(&work),
+        Some(vec!["h-side".to_string(), "h-chain".to_string()])
+    );
+}
+
+/// A profiles root that cannot be listed names no foreign bearers at all, so
+/// the sweep skips the candidate instead of judging it against none.
+#[test]
+fn an_unlistable_profiles_root_names_no_foreign_bearers() {
+    let _home = HomeSandbox::new();
+    let work = crate::profile::ProfileName::from("work");
+    let root = crate::profile::profile_dir(&work)
+        .expect("profile_dir")
+        .parent()
+        .expect("profiles root")
+        .to_path_buf();
+    assert!(!root.exists(), "the sandbox starts with no profiles root");
+    assert_eq!(current_bearers_except(&work), None);
+}
+
+// ── the stale-copy sweep's loop, through a counting item read ───────────────
+
+const SWEEP_NOW: i64 = 1_000;
+
+/// A rolling store (no refresh token, live at [`SWEEP_NOW`]) holding `access`.
+fn write_sweep_store(path: &Path, access: &str) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let body = serde_json::json!({ "claudeAiOauth": {
+        "accessToken": access,
+        "expiresAt": SWEEP_NOW + 60_000,
+        "scopes": ["user:inference", "user:profile"],
+        "subscriptionType": "max"
+    }});
+    fs::write(path, body.to_string()).expect("write store");
+}
+
+/// A per-session item holding a refreshless copy of `access`.
+fn sweep_item(access: &str) -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": { "accessToken": access, "expiresAt": 5, "subscriptionType": "max" }
+    })
+}
+
+fn work_sidecar() -> PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+        .expect("profile_dir")
+        .join("session-token.json")
+}
+
+/// A foreground session `sid` on `work` that passes every gate once `edit`
+/// leaves its row alone: its runtime lost its `.credentials.json`, its row
+/// launched on `work`'s rolling sidecar (holding `new`) and never left. The
+/// queue starts empty.
+fn sweep_candidate(
+    home: &HomeSandbox,
+    sid: &str,
+    edit: impl FnOnce(&mut crate::live_sessions::LiveSession),
+) -> LiveRuntime {
+    let _ = take_revoked_bearers();
+    write_sweep_store(&work_sidecar(), "new");
+    let mut row = copy_row("work", work_sidecar().to_str());
+    row.session_id = sid.to_string();
+    edit(&mut row);
+    crate::live_sessions::register(&row).expect("register row");
+    let runtime = home.home().join("runtimes").join(sid);
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    LiveRuntime {
+        runtime,
+        profile: crate::profile::ProfileName::from("work"),
+        session: sid.to_string(),
+        background: row.background,
+    }
+}
+
+/// One sweep at [`SWEEP_NOW`]: the sessions whose item it read, in order, and
+/// the queue it left.
+fn sweep_counting(
+    sessions: &[LiveRuntime],
+    gave_up: &mut BTreeSet<(String, u64)>,
+    mut answer: impl FnMut(&LiveRuntime) -> Result<Option<serde_json::Value>>,
+) -> (Vec<String>, Vec<(ProfileName, String)>) {
+    let mut reads = Vec::new();
+    sweep_stale_copied_bearers_with(sessions, SWEEP_NOW, gave_up, |live| {
+        reads.push(live.session.clone());
+        answer(live)
+    });
+    (reads, take_revoked_bearers())
+}
+
+fn old_copy(_: &LiveRuntime) -> Result<Option<serde_json::Value>> {
+    Ok(Some(sweep_item("old")))
+}
+
+fn queued_old() -> Vec<(ProfileName, String)> {
+    vec![(ProfileName::from("work"), "old".to_string())]
+}
+
+#[test]
+fn the_sweep_queues_an_older_copy_of_the_members_sidecar() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    drop(capture);
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, queued_old());
+    assert_eq!(lines.snapshot().len(), 1, "one queued line");
+}
+
+/// The listing's own background flag keeps a session out before its row is
+/// read: its `runtime-bg` tree is shared by every job on the account.
+#[test]
+fn the_sweep_never_reads_a_background_sessions_item() {
+    let home = HomeSandbox::new();
+    let mut live = sweep_candidate(&home, "4242-0", |_| {});
+    live.background = true;
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    assert_eq!(reads, Vec::<String>::new());
+    assert_eq!(queued, vec![]);
+}
+
+#[test]
+fn the_sweep_never_reads_the_item_of_a_runtime_that_still_has_its_file() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    fs::write(live.runtime.join(".credentials.json"), "{}").expect("write file");
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    assert_eq!(reads, Vec::<String>::new());
+    assert_eq!(queued, vec![]);
+}
+
+#[test]
+fn the_sweep_never_reads_the_item_of_a_session_that_swapped_away() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |row| {
+        row.current_member = Some("home".to_string());
+    });
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    assert_eq!(reads, Vec::<String>::new());
+    assert_eq!(queued, vec![]);
+}
+
+#[test]
+fn the_sweep_never_reads_the_item_of_a_session_that_visited_another_member() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |row| {
+        row.visited_members = vec!["work".to_string(), "home".to_string()];
+    });
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    assert_eq!(reads, Vec::<String>::new());
+    assert_eq!(queued, vec![]);
+}
+
+/// A read that fails on anything but a locked keychain gives the session up:
+/// the next sweep never reads its item again.
+#[test]
+fn the_sweep_gives_up_a_session_whose_item_read_failed() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let mut gave_up = BTreeSet::new();
+    let (reads, queued) = sweep_counting(std::slice::from_ref(&live), &mut gave_up, |_| {
+        Err(anyhow::anyhow!("the access dialog was denied"))
+    });
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, vec![]);
+    assert_eq!(
+        gave_up,
+        BTreeSet::from([("4242-0".to_string(), 1_700_000_000_000)])
+    );
+    let (reads, queued) = sweep_counting(&[live], &mut gave_up, old_copy);
+    assert_eq!(reads, Vec::<String>::new(), "given up");
+    assert_eq!(queued, vec![]);
+}
+
+/// A later start that recycles a given-up session's pid gets the same id; its
+/// own `started_at` keeps it from inheriting the give-up.
+#[test]
+fn a_recycled_session_id_does_not_inherit_a_give_up() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |row| row.started_at = 1_800_000_000_000);
+    let mut gave_up = BTreeSet::from([("4242-0".to_string(), 1_700_000_000_000)]);
+    let (reads, queued) = sweep_counting(&[live], &mut gave_up, old_copy);
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, queued_old());
+}
+
+/// The give-up set keeps only sessions still live: one that ended drops out.
+#[test]
+fn the_sweep_prunes_give_ups_of_sessions_that_ended() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let mut gave_up = BTreeSet::from([
+        ("4242-0".to_string(), 1_700_000_000_000),
+        ("5151-0".to_string(), 1_700_000_000_000),
+    ]);
+    let (reads, _) = sweep_counting(&[live], &mut gave_up, old_copy);
+    assert_eq!(reads, Vec::<String>::new());
+    assert_eq!(
+        gave_up,
+        BTreeSet::from([("4242-0".to_string(), 1_700_000_000_000)])
+    );
+}
+
+/// A pair the queue already holds is neither queued twice nor logged again.
+#[test]
+fn the_sweep_skips_a_pair_the_queue_already_holds() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    note_revoked_rolling_bearer(&ProfileName::from("work"), "old".to_string());
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), old_copy);
+    drop(capture);
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, queued_old());
+    assert_eq!(lines.snapshot(), Vec::<String>::new(), "nothing logged");
+}
+
+/// A stamp to `newer` plus its re-point landing while the item read runs
+/// leaves the item on the CURRENT bearer: a fresh sidecar read says so.
+#[test]
+fn the_sweep_queues_nothing_when_a_stamp_lands_during_the_item_read() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), |_| {
+        write_sweep_store(&work_sidecar(), "newer");
+        Ok(Some(sweep_item("newer")))
+    });
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, vec![]);
+}
+
+/// A sidecar gone by the fresh read proves nothing about the item's bearer.
+#[test]
+fn the_sweep_queues_nothing_when_the_sidecar_is_gone_after_the_item_read() {
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let (reads, queued) = sweep_counting(&[live], &mut BTreeSet::new(), |_| {
+        fs::remove_file(work_sidecar()).expect("remove sidecar");
+        Ok(Some(sweep_item("old")))
+    });
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, vec![]);
+}
+
+/// A profiles root the sweep cannot list leaves the foreign bearers unknown,
+/// so the candidate is skipped rather than judged against none.
+#[cfg(unix)]
+#[test]
+fn the_sweep_queues_nothing_when_the_profiles_root_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    let live = sweep_candidate(&home, "4242-0", |_| {});
+    let root = work_sidecar()
+        .parent()
+        .and_then(Path::parent)
+        .expect("profiles root")
+        .to_path_buf();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o300)).expect("chmod 300");
+    let listable = fs::read_dir(&root).is_ok();
+    let swept = (!listable).then(|| sweep_counting(&[live], &mut BTreeSet::new(), old_copy));
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert!(
+        !listable,
+        "the profiles root stayed listable under 0o300 (running as root?)"
+    );
+    let (reads, queued) = swept.expect("swept");
+    assert_eq!(reads, vec!["4242-0".to_string()]);
+    assert_eq!(queued, vec![]);
 }
