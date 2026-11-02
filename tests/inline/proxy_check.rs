@@ -88,6 +88,36 @@ enum Plant {
     PasteMode,
     /// `/health` answers a body over the 1 MiB read cap.
     BigHealthBody,
+    /// A contract 1.1 proxy: the credit figure declares its `model`.
+    ContractOneOne,
+    /// A contract 1.2 proxy, a minor past every one clauth knows.
+    ContractOneTwo,
+    /// A contract 1.1 proxy declares a figure `model` that is a number.
+    ModelNotString,
+    /// A contract 1.1 proxy declares an empty figure `model`.
+    ModelEmpty,
+    /// A contract 1.1 proxy declares a `null` figure `model`.
+    ModelNull,
+    /// A contract 1.2 proxy declares an empty figure `model`.
+    ModelEmptyOnOneTwo,
+    /// A contract 1.0 proxy declares a figure `model` that is a number, a
+    /// field 1.0 does not define.
+    ModelNumberOnOneZero,
+}
+
+impl Plant {
+    /// The contract `/health` and `/info` both declare.
+    fn contract(self) -> &'static str {
+        match self {
+            Self::ContractTwo => "2.0",
+            Self::ContractPlusOne => "+1.0",
+            Self::ContractOneOne | Self::ModelNotString | Self::ModelEmpty | Self::ModelNull => {
+                "1.1"
+            }
+            Self::ContractOneTwo | Self::ModelEmptyOnOneTwo => "1.2",
+            _ => "1.0",
+        }
+    }
 }
 
 struct StubState {
@@ -178,7 +208,6 @@ fn info() -> Value {
     json!({
         "service": "stub",
         "version": "0.0.1",
-        "contract": "1.0",
         "capabilities": ["events"],
         "actions": [{"name": "claim-now", "label": "claim now", "scope": "account", "target": "offer", "confirm": false}],
         "figures": [
@@ -307,11 +336,7 @@ fn handle(
             }
             _ => {}
         }
-        let contract = match s.plant {
-            Plant::ContractTwo => "2.0",
-            Plant::ContractPlusOne => "+1.0",
-            _ => "1.0",
-        };
+        let contract = s.plant.contract();
         let status = if s.plant == Plant::EchoSecrets {
             ADMIN
         } else {
@@ -422,6 +447,17 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             let mut info = info();
             if s.plant == Plant::EchoSecrets {
                 info["version"] = json!(KEY);
+            }
+            info["contract"] = json!(s.plant.contract());
+            let model = match s.plant {
+                Plant::ContractOneOne | Plant::ContractOneTwo => Some(json!("glm-5")),
+                Plant::ModelNotString | Plant::ModelNumberOnOneZero => Some(json!(5)),
+                Plant::ModelEmpty | Plant::ModelEmptyOnOneTwo => Some(json!("")),
+                Plant::ModelNull => Some(Value::Null),
+                _ => None,
+            };
+            if let Some(model) = model {
+                info["figures"][1]["model"] = model;
             }
             let settings = info["settings"].as_array_mut().unwrap();
             match s.plant {
@@ -1008,6 +1044,115 @@ fn a_signed_contract_major_stops_the_check_at_health() {
     );
     assert_eq!(stub.state().mutations, Vec::<String>::new());
     assert_eq!(stub.state().inferences, 0);
+}
+
+#[test]
+fn a_contract_1_1_proxy_declaring_a_figure_model_is_checked_whole() {
+    let stub = Stub::start(Plant::ContractOneOne);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
+    assert_eq!(stub.state().inferences, 1);
+}
+
+#[test]
+fn a_minor_past_1_1_is_skipped_naming_the_minor_this_clauth_knows() {
+    let stub = Stub::start(Plant::ContractOneTwo);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(
+        report.skipped,
+        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+    );
+}
+
+#[test]
+fn a_figure_model_that_is_no_string_fails_naming_the_field() {
+    let stub = Stub::start(Plant::ModelNotString);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: string",
+            "number"
+        )]
+    );
+}
+
+#[test]
+fn an_empty_figure_model_fails_naming_the_field() {
+    let stub = Stub::start(Plant::ModelEmpty);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: a non-empty string",
+            "\"\""
+        )]
+    );
+}
+
+#[test]
+fn a_null_figure_model_fails_as_no_string() {
+    let stub = Stub::start(Plant::ModelNull);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: string",
+            "null"
+        )]
+    );
+}
+
+#[test]
+fn a_later_minor_is_still_held_to_the_figure_model_rule() {
+    let stub = Stub::start(Plant::ModelEmptyOnOneTwo);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: a non-empty string",
+            "\"\""
+        )]
+    );
+    assert_eq!(
+        report.skipped,
+        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+    );
+}
+
+#[test]
+fn a_contract_1_0_proxy_is_not_held_to_the_1_1_figure_model() {
+    let stub = Stub::start(Plant::ModelNumberOnOneZero);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
 }
 
 #[test]

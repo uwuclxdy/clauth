@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::proxy::{SPOKEN_MAJOR, contract_version};
+use crate::proxy::{SPOKEN_MAJOR, SPOKEN_MINOR, contract_version};
 
 const CONTROL: &str = "/clauth/v1";
 /// An account id, flow id, action name and setting key no proxy holds: the
@@ -1331,9 +1331,9 @@ impl Checker<'_> {
             return Ok(None);
         }
         let minor = version.map(|(_, minor)| minor);
-        if minor.is_some_and(|m| m > 0) {
+        if minor.is_some_and(|m| m > SPOKEN_MINOR) {
             self.skip(format!(
-                "fields contract {} adds beyond 1.0: this clauth knows 1.0",
+                "fields contract {} adds beyond {SPOKEN_MAJOR}.{SPOKEN_MINOR}: this clauth knows {SPOKEN_MAJOR}.{SPOKEN_MINOR}",
                 contract.as_str().unwrap_or_default()
             ));
         }
@@ -1493,6 +1493,13 @@ impl Checker<'_> {
                 declared.actions.push(ActionDecl { name, target });
             }
         }
+        // A field a later minor adds is unknown to a proxy declaring an
+        // earlier one, which the contract tells readers to ignore.
+        let minor_defines_model = health
+            .contract
+            .as_str()
+            .and_then(contract_version)
+            .is_some_and(|(_, minor)| minor >= 1);
         let mut ids = BTreeSet::new();
         for (at, figure) in self.items(&route, &body, "", "figures") {
             let id = self
@@ -1502,6 +1509,21 @@ impl Checker<'_> {
             let kind = self.req_one_of(&route, figure, &at, "kind", KINDS);
             self.req(&route, figure, &at, "label", Kind::Str);
             let chain = self.chain(&route, figure, &at, kind.as_deref());
+            // The contract types `model` as a string, never null, so `opt`'s
+            // null-as-absent reading does not apply.
+            if minor_defines_model
+                && figure.get("model").is_some()
+                && let Some(model) = self.req(&route, figure, &at, "model", Kind::Str)
+            {
+                self.report.checks += 1;
+                if model.as_str().is_some_and(str::is_empty) {
+                    self.violation(
+                        &route,
+                        format!("{}: a non-empty string", join(&at, "model")),
+                        repr(model),
+                    );
+                }
+            }
             if let (Some(id), Some(kind)) = (id, kind) {
                 self.unique(&route, &mut ids, &at, &id);
                 declared.figures.push((id, kind, chain));

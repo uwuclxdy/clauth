@@ -489,6 +489,12 @@ fn service_of(file_name: &str, suffixes: &[&str]) -> Option<(Service, usize)> {
 /// another is refused, since no route shape clauth knows applies to it.
 pub(crate) const SPOKEN_MAJOR: u64 = 1;
 
+/// The contract minor this clauth speaks, beside [`SPOKEN_MAJOR`]: 1.1 adds
+/// an optional `model` to a figure declaration, and nothing else. A proxy on a
+/// later minor is checked as far as this one, and the rest is reported as
+/// skipped.
+pub(crate) const SPOKEN_MINOR: u64 = 1;
+
 /// How long `<binary> manifest` may run before clauth stops it. Measured
 /// 2026-09-29 on the core's fixture proxy under bun (`bun
 /// test/fixtures/serve.ts manifest`): 28 to 39 ms over 10 runs at load
