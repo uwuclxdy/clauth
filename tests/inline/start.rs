@@ -628,6 +628,72 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     );
 }
 
+/// The subagent-shell hook is for a headless delegate alone: a `clauth start`
+/// session's settings file carries the symlink repairs and nothing else.
+/// Driven through the real `run`, read off the settings file the fake `claude`
+/// was handed.
+#[cfg(unix)]
+#[test]
+fn a_started_session_carries_no_foreground_spawn_hook() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+    crate::testutil::healthy_install(&claude);
+
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("a shared start");
+
+    let settings = fake.settings_files();
+    assert_eq!(
+        settings.len(),
+        1,
+        "the shared start's linked projects get the repair settings file"
+    );
+    let pre = settings[0]["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("a PreToolUse array");
+    assert!(
+        pre.iter().any(|entry| entry["matcher"] == "Read"),
+        "the Read exemption hook is there, so the file under test is the start's own"
+    );
+    for entry in pre {
+        let commands: Vec<&str> = entry["hooks"]
+            .as_array()
+            .map(|hooks| hooks.iter().filter_map(|h| h["command"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            commands
+                .iter()
+                .all(|c| !c.contains(crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND)),
+            "a started session runs no foreground-spawn hook: {entry}"
+        );
+        assert_eq!(
+            entry["matcher"], "Read",
+            "a started session's file holds the Read exemption alone: {entry}"
+        );
+    }
+}
+
 // ── the plugin pre-flight ─────────────────────────────────────────────────
 
 /// The migration trigger's own pin: a `clauth start` heals a broken plugin

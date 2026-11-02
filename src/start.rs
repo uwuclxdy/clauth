@@ -1219,7 +1219,10 @@ pub(crate) fn run(
             runtime.config_dir(),
             cwd,
             claude_args,
-            &crate::cc_exempt::hook_command(),
+            &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
+            // `clauth start` keeps a session's own turn lifecycle; the
+            // foreground-spawn guard is a delegate-only repair.
+            None,
             &settings_file,
         ) {
             errln!("{warning}");

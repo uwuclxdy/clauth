@@ -846,6 +846,185 @@ fn a_delegates_relative_cwd_lands_on_its_row_absolute() {
     );
 }
 
+/// Run one admitted delegate under the fake `claude` and return the settings
+/// files its `claude` was handed, parsed.
+#[cfg(unix)]
+fn delegate_spawn_settings(isolation: Isolation, extra_args: &[&str]) -> Vec<serde_json::Value> {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // A symlinked ancestor (a `TMPDIR` reached through a link, macOS's `/var`)
+    // would make even an isolated runtime's `projects` spellings disagree and
+    // send it down the symlink-repair path; the resolved home keeps the
+    // isolated case on the no-symlink branch on every host.
+    crate::profile::set_home_override(
+        crate::canonical::identity(home.home()).expect("canonical sandbox home"),
+    );
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let fake = FakeClaude::new(&home);
+    let cwd = tempfile::tempdir().expect("delegate cwd");
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let _ = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: Some(cwd.path().to_str().expect("utf-8 tempdir")),
+        env: HashMap::new(),
+        extra_args: extra_args.iter().map(|a| (*a).to_string()).collect(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation,
+        depth: 0,
+        handoff: None,
+    });
+    fake.settings_files()
+}
+
+/// The `PreToolUse` entries of `settings` that run the foreground-spawn hook.
+#[cfg(unix)]
+fn foreground_spawn_entries(settings: &serde_json::Value) -> Vec<&serde_json::Value> {
+    settings["hooks"]["PreToolUse"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["command"].as_str().is_some_and(|c| {
+                                c.ends_with(&format!(
+                                    " {} || true",
+                                    crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND
+                                ))
+                            })
+                        })
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A delegate is a `claude -p` run, which never waits on a shell a subagent
+/// backgrounds, so every delegate spawn, shared or isolated, carries the hook
+/// that refuses one, matched on the shell tool.
+#[cfg(unix)]
+#[test]
+fn every_delegate_spawn_carries_the_foreground_spawn_hook() {
+    for isolation in [Isolation::Shared, Isolation::Isolated] {
+        let settings = delegate_spawn_settings(isolation, &[]);
+        assert_eq!(
+            settings.len(),
+            1,
+            "{isolation:?}: the delegate's claude gets exactly one --settings file"
+        );
+        let entries = foreground_spawn_entries(&settings[0]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "{isolation:?}: exactly one PreToolUse entry runs the foreground-spawn hook"
+        );
+        assert_eq!(
+            entries[0]["matcher"], "Bash",
+            "{isolation:?}: the hook sees the shell tool alone"
+        );
+        assert_eq!(
+            entries[0]["hooks"][0]["type"], "command",
+            "{isolation:?}: a command hook"
+        );
+    }
+    // The isolated runtime links no `projects`, so its file comes from the
+    // foreground hook alone: no symlink repair rides in it.
+    let isolated = delegate_spawn_settings(Isolation::Isolated, &[]);
+    assert!(
+        isolated[0].get("autoMemoryDirectory").is_none(),
+        "an isolated delegate's file carries no memory dir repair"
+    );
+    assert_eq!(
+        isolated[0]["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("a PreToolUse array")
+            .len(),
+        1,
+        "an isolated delegate's file holds the foreground hook alone"
+    );
+}
+
+/// A shared delegate's runtime links `projects`, so its settings file also
+/// carries the two symlink repairs; the foreground-spawn hook rides beside
+/// them and takes neither's place.
+#[cfg(unix)]
+#[test]
+fn a_shared_delegate_keeps_the_symlink_repairs_beside_the_foreground_hook() {
+    let settings = delegate_spawn_settings(Isolation::Shared, &[]);
+    assert_eq!(settings.len(), 1, "one --settings file");
+    let read_entries: Vec<_> = settings[0]["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("a PreToolUse array")
+        .iter()
+        .filter(|entry| entry["matcher"] == "Read")
+        .collect();
+    assert_eq!(read_entries.len(), 1, "the Read exemption hook stays");
+    assert!(
+        settings[0]["autoMemoryDirectory"].is_string(),
+        "the memory dir repair stays"
+    );
+}
+
+/// A user `--settings` is the merge base for every delegate: its own keys and
+/// its own `PreToolUse` entries reach the child beside the foreground hook.
+#[cfg(unix)]
+#[test]
+fn a_users_settings_survive_beside_the_foreground_hook() {
+    let user = serde_json::json!({
+        "model": "opus",
+        "hooks": {"PreToolUse": [{
+            "matcher": "Write",
+            "hooks": [{"type": "command", "command": "true"}]
+        }]}
+    })
+    .to_string();
+    let user_dir = tempfile::tempdir().expect("user settings dir");
+    let user_file = user_dir.path().join("user-settings.json");
+    std::fs::write(&user_file, &user).expect("user settings file");
+    let user_path = user_file.to_str().expect("utf-8 tempdir").to_string();
+    for (isolation, value) in [
+        (Isolation::Shared, user.as_str()),
+        (Isolation::Isolated, user.as_str()),
+        (Isolation::Shared, user_path.as_str()),
+        (Isolation::Isolated, user_path.as_str()),
+    ] {
+        let settings = delegate_spawn_settings(isolation, &["--settings", value]);
+        assert_eq!(
+            settings.len(),
+            1,
+            "{isolation:?} {value}: the user's value is folded into clauth's one file"
+        );
+        assert_eq!(
+            settings[0]["model"], "opus",
+            "{isolation:?} {value}: the user's key survives"
+        );
+        let pre = settings[0]["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("a PreToolUse array");
+        assert_eq!(
+            pre[0],
+            serde_json::json!({
+                "matcher": "Write",
+                "hooks": [{"type": "command", "command": "true"}]
+            }),
+            "{isolation:?} {value}: the user's own entry leads, untouched"
+        );
+        assert_eq!(
+            foreground_spawn_entries(&settings[0]).len(),
+            1,
+            "{isolation:?} {value}: the foreground hook is appended"
+        );
+    }
+}
+
 // A run started as an agent (`subagent_type`, `--agent`, the settings `agent`
 // key) runs whatever model its def names, and clauth reads no def: with no
 // named model, a capped account refuses it whatever its credit gate says; a

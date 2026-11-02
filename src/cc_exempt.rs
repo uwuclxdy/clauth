@@ -1,5 +1,6 @@
 //! Claude Code's config-dir permission exemptions, restored for a SHARED
-//! runtime whose entries resolve through symlinks into `~/.claude`.
+//! runtime whose entries resolve through symlinks into `~/.claude`, and the
+//! spawn guard every delegate carries.
 //!
 //! Claude Code builds each exempt dir (auto memory, a session's tool results)
 //! from the literal `CLAUDE_CONFIG_DIR` and requires BOTH the literal and the
@@ -7,7 +8,7 @@
 //! `projects` symlink the resolved spelling never does, so every auto-memory
 //! write and every tool-result read prompts, and a headless run loses it.
 //!
-//! Two repairs ride one per-spawn `--settings` FILE (never inline, so a user's
+//! The repairs ride one per-spawn `--settings` FILE (never inline, so a user's
 //! settings — credentials included — stay off the child's argv), written into
 //! the runtime's profile dir and removed when the runtime drops unless
 //! [`crate::claude_jobs::JobTrees::spares_settings`] spares it:
@@ -16,6 +17,13 @@
 //! - a `PreToolUse` `Read` hook that allows a read whose resolved path is this
 //!   session's own tool result. A hook allow clears a read prompt but not a
 //!   write one, so writes cannot take this route.
+//!
+//! Those two repair a symlinked runtime and are skipped when the literal and
+//! resolved spellings agree. A delegate adds a third that every delegate spawn
+//! carries: a `PreToolUse` hook on `Bash` that refuses a subagent's background
+//! shell, because a headless `claude -p` run never waits on one once that
+//! subagent's turn ends, so its output would be lost (measured 2026-11-02,
+//! Claude Code 2.1.314).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +34,9 @@ use serde_json::{Map, Value, json};
 
 /// The hidden subcommand the injected `Read` hook runs.
 pub(crate) const READ_HOOK_SUBCOMMAND: &str = "hook-read-exempt";
+
+/// The hidden subcommand the injected foreground-spawn hook runs.
+pub(crate) const FOREGROUND_SPAWN_HOOK_SUBCOMMAND: &str = "hook-foreground-spawn";
 
 /// The `PreToolUse` `Read` allow, byte-for-byte.
 const READ_ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"clauth: this session's own tool result, read through the runtime's projects link"}}"#;
@@ -201,22 +212,22 @@ fn normalize(p: &Path) -> PathBuf {
 
 /// The hook command for the binary at `exe`: the installed path (a self-update
 /// leaves a long-lived server's `current_exe` reading `(deleted)`), POSIX
-/// quoted, then the subcommand and a fail-open `|| true` — a binary that
-/// cannot parse the subcommand exits 2, which would block every Read.
-pub(crate) fn hook_command_for(exe: &Path) -> String {
+/// quoted, then `subcommand` and a fail-open `|| true` — a binary that cannot
+/// parse the subcommand exits 2, which would block the call it guards.
+pub(crate) fn hook_command_for(exe: &Path, subcommand: &str) -> String {
     let installed = crate::platform::installed_exe_path(exe);
     format!(
-        "{} {READ_HOOK_SUBCOMMAND} || true",
+        "{} {subcommand} || true",
         posix_quote(&installed.to_string_lossy())
     )
 }
 
-/// The shell command the injected `Read` hook runs: this binary (its installed
-/// path), quoted, plus [`READ_HOOK_SUBCOMMAND`] and a fail-open `|| true`.
-pub(crate) fn hook_command() -> String {
+/// The shell command running `subcommand` on this binary (its installed path),
+/// quoted, plus the fail-open `|| true`.
+pub(crate) fn hook_command(subcommand: &str) -> String {
     match std::env::current_exe() {
-        Ok(exe) => hook_command_for(&exe),
-        Err(_) => hook_command_for(Path::new("clauth")),
+        Ok(exe) => hook_command_for(&exe, subcommand),
+        Err(_) => hook_command_for(Path::new("clauth"), subcommand),
     }
 }
 
@@ -239,31 +250,35 @@ fn strip_os_error(s: &str) -> String {
 /// Append the exemption `--settings` (when the runtime needs it) and then the
 /// caller's `passthrough` args to `command`.
 ///
-/// Injects when the literal `config_dir/projects` differs from its resolved
-/// spelling (a symlinked `projects`, or a symlinked ancestor). The merged
-/// settings object is written to `settings_file` (0o600, atomic) and passed as
-/// `--settings <file>` — never inline, so a folded user settings value stays
-/// off the child's argv. The user's last pre-`--` `--settings` is the merge
-/// base; `autoMemoryDirectory` is added unless a settings source or the
-/// child's env already keys it. A user `--settings` that cannot be read or
-/// parsed, or whose `hooks` shape is wrong, disables the injection and comes
-/// back as `Some(warning)`, with the passthrough appended untouched.
+/// The symlink repairs are injected when the literal `config_dir/projects`
+/// differs from its resolved spelling (a symlinked `projects`, or a symlinked
+/// ancestor). A `foreground_hook_command` is written into the same file for
+/// every caller that passes one, whether or not the runtime needs those
+/// repairs; with neither, nothing is injected. The merged settings object is
+/// written to `settings_file` (0o600, atomic) and passed as `--settings
+/// <file>` — never inline, so a folded user settings value stays off the
+/// child's argv. The user's last pre-`--` `--settings` is the merge base;
+/// `autoMemoryDirectory` is added unless a settings source or the child's env
+/// already keys it. A user `--settings` that cannot be read or parsed, or
+/// whose `hooks` shape is wrong, disables the injection and comes back as
+/// `Some(warning)`, with the passthrough appended untouched.
 pub(crate) fn apply_spawn_settings(
     command: &mut Command,
     config_dir: &Path,
     cwd: &Path,
     passthrough: &[String],
-    hook_command: &str,
+    read_hook_command: &str,
+    foreground_hook_command: Option<&str>,
     settings_file: &Path,
 ) -> Option<String> {
     let literal = config_dir.join("projects");
-    let Some(real) = resolve_projects(config_dir) else {
-        command.args(passthrough);
-        return None;
-    };
-    let needs_injection = crate::canonical::claude_code_spelling(&literal.to_string_lossy())
-        != crate::canonical::claude_code_spelling(&real.to_string_lossy());
-    if !needs_injection {
+    // `Some` only when the symlink repairs are needed, so the memory dir and
+    // the Read hook below are skipped for a runtime whose spellings agree.
+    let real = resolve_projects(config_dir).filter(|real| {
+        crate::canonical::claude_code_spelling(&literal.to_string_lossy())
+            != crate::canonical::claude_code_spelling(&real.to_string_lossy())
+    });
+    if real.is_none() && foreground_hook_command.is_none() {
         command.args(passthrough);
         return None;
     }
@@ -298,60 +313,73 @@ pub(crate) fn apply_spawn_settings(
         None => Map::new(),
     };
 
-    // `autoMemoryDirectory` is ours only when no settings source or env var
-    // already keys it. At the real `$HOME` the spawn gets `--setting-sources
-    // user`, so the `<cwd>/.claude` project tier is never read. On unix Claude
-    // Code reads the local tier at `memory_base` (a linked worktree's main
-    // checkout) unless that root is the real `$HOME`, and still reads
-    // `<cwd>/.claude/settings.local.json` beside it as legacy local settings.
-    // Claude Code also skips a root unless the root, its `.git` and its
-    // `.claude` are owned by the euid; that check is not mirrored here, so a
-    // foreign-owned root's file still suppresses ours and its memory writes
-    // prompt, where mirroring it would need the euid (`unsafe` or a new dep).
-    let at_home = crate::runtime::cwd_is_real_home(cwd);
-    let base = memory_base(cwd);
-    let mut suppressed = sets_memory(&settings);
-    if !suppressed {
-        suppressed = settings_file_sets_memory(&config_dir.join("settings.json"));
-    }
-    if !suppressed && !at_home {
-        suppressed = settings_file_sets_memory(&cwd.join(".claude").join("settings.json"))
-            || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"))
-            || (cfg!(unix)
-                && !crate::runtime::cwd_is_real_home(&base)
-                && settings_file_sets_memory(&base.join(".claude").join("settings.local.json")));
-    }
-    if !suppressed {
-        // CC tests it for truthiness (`if(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR)`),
-        // so an empty value is unset to CC.
-        suppressed = child_env_value(command, "CLAUDE_CODE_REMOTE_MEMORY_DIR")
-            .is_some_and(|v| !v.is_empty());
-    }
-    if !suppressed {
-        suppressed = child_env_value(command, "CLAUDE_CODE_PROJECT_DIR_NAME")
-            .is_some_and(|v| valid_project_dir_name(&v));
-    }
-    if !suppressed {
-        let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
-        let key = project_key(&crate::canonical::claude_code_spelling(
-            &base.to_string_lossy(),
-        ));
-        settings.insert(
-            "autoMemoryDirectory".to_string(),
-            Value::String(
-                Path::new(&store)
-                    .join(key)
-                    .join("memory")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        );
+    if let Some(real) = real.as_ref() {
+        // `autoMemoryDirectory` is ours only when no settings source or env var
+        // already keys it. At the real `$HOME` the spawn gets `--setting-sources
+        // user`, so the `<cwd>/.claude` project tier is never read. On unix Claude
+        // Code reads the local tier at `memory_base` (a linked worktree's main
+        // checkout) unless that root is the real `$HOME`, and still reads
+        // `<cwd>/.claude/settings.local.json` beside it as legacy local settings.
+        // Claude Code also skips a root unless the root, its `.git` and its
+        // `.claude` are owned by the euid; that check is not mirrored here, so a
+        // foreign-owned root's file still suppresses ours and its memory writes
+        // prompt, where mirroring it would need the euid (`unsafe` or a new dep).
+        let at_home = crate::runtime::cwd_is_real_home(cwd);
+        let base = memory_base(cwd);
+        let mut suppressed = sets_memory(&settings);
+        if !suppressed {
+            suppressed = settings_file_sets_memory(&config_dir.join("settings.json"));
+        }
+        if !suppressed && !at_home {
+            suppressed = settings_file_sets_memory(&cwd.join(".claude").join("settings.json"))
+                || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"))
+                || (cfg!(unix)
+                    && !crate::runtime::cwd_is_real_home(&base)
+                    && settings_file_sets_memory(
+                        &base.join(".claude").join("settings.local.json"),
+                    ));
+        }
+        if !suppressed {
+            // CC tests it for truthiness (`if(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR)`),
+            // so an empty value is unset to CC.
+            suppressed = child_env_value(command, "CLAUDE_CODE_REMOTE_MEMORY_DIR")
+                .is_some_and(|v| !v.is_empty());
+        }
+        if !suppressed {
+            suppressed = child_env_value(command, "CLAUDE_CODE_PROJECT_DIR_NAME")
+                .is_some_and(|v| valid_project_dir_name(&v));
+        }
+        if !suppressed {
+            let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
+            let key = project_key(&crate::canonical::claude_code_spelling(
+                &base.to_string_lossy(),
+            ));
+            settings.insert(
+                "autoMemoryDirectory".to_string(),
+                Value::String(
+                    Path::new(&store)
+                        .join(key)
+                        .join("memory")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+        }
     }
 
-    let our_hook = json!({
-        "matcher": "Read",
-        "hooks": [{"type": "command", "command": hook_command, "timeout": 10}]
-    });
+    let mut ours = Vec::with_capacity(2);
+    if real.is_some() {
+        ours.push(json!({
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": read_hook_command, "timeout": 10}]
+        }));
+    }
+    if let Some(hook) = foreground_hook_command {
+        ours.push(json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": hook, "timeout": 10}]
+        }));
+    }
     match settings
         .entry("hooks".to_string())
         .or_insert_with(|| Value::Object(Map::new()))
@@ -360,15 +388,14 @@ pub(crate) fn apply_spawn_settings(
             let pre = hooks
                 .entry("PreToolUse".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
-            if let Value::Array(arr) = pre {
-                arr.push(our_hook);
-            } else {
-                *pre = Value::Array(vec![our_hook]);
+            match pre {
+                Value::Array(arr) => arr.extend(ours),
+                other => *other = Value::Array(ours),
             }
         }
         other => {
             let mut hooks = Map::new();
-            hooks.insert("PreToolUse".to_string(), Value::Array(vec![our_hook]));
+            hooks.insert("PreToolUse".to_string(), Value::Array(ours));
             *other = Value::Object(hooks);
         }
     }
@@ -874,17 +901,72 @@ struct ReadHookToolInput {
     file_path: String,
 }
 
-/// `clauth hook-read-exempt`: read the payload on stdin, print the verdict.
-/// Always exits 0: a hook exit of 2 would block the read.
-pub(crate) fn run_read_hook() {
+/// A hook's `PreToolUse` payload, read from stdin.
+fn read_pre_tool_use_payload() -> String {
     // Bound the stdin read to 1 MiB. `read_to_end` + `from_utf8_lossy`, never
     // `read_to_string` on the truncated reader: a cut UTF-8 codepoint would
     // read as an error and the whole payload would be dropped.
     let mut bytes = Vec::new();
     let stdin = std::io::stdin().lock();
     let _ = stdin.take(1 << 20).read_to_end(&mut bytes);
-    let payload = String::from_utf8_lossy(&bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// `clauth hook-read-exempt`: read the payload on stdin, print the verdict.
+/// Always exits 0: a hook exit of 2 would block the read.
+pub(crate) fn run_read_hook() {
+    let payload = read_pre_tool_use_payload();
     if let Some(verdict) = read_hook_verdict(&payload) {
+        outln!("{verdict}");
+    }
+}
+
+/// The `hook-foreground-spawn` refusal, naming the retry that runs the shell
+/// in the foreground.
+const SUBAGENT_SHELL_REASON: &str = "refused: a subagent's background shell is never waited on in a headless delegate (claude -p), so its output would be lost: re-send this call with run_in_background: false.";
+
+/// The deny verdict Claude Code reads off a `PreToolUse` hook's stdout.
+fn deny_verdict(reason: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
+}
+
+/// The `hook-foreground-spawn` verdict for one `PreToolUse` payload:
+/// `Some(stdout)` refusing a subagent's background shell, else `None` (print
+/// nothing, so Claude Code's own decision stands). Fails open on anything it
+/// cannot read.
+pub(crate) fn foreground_spawn_verdict(payload: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    if payload.get("tool_name")?.as_str()? != "Bash" {
+        return None;
+    }
+    // A subagent's own calls carry its `agent_id`; the main thread's carry none.
+    let is_subagent = payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if !is_subagent {
+        return None;
+    }
+    let input = payload.get("tool_input")?.as_object()?;
+    if input.get("run_in_background") == Some(&Value::Bool(true)) {
+        Some(deny_verdict(SUBAGENT_SHELL_REASON))
+    } else {
+        None
+    }
+}
+
+/// `clauth hook-foreground-spawn`: read the payload on stdin, print the
+/// verdict. Always exits 0: a hook exit of 2 would block the spawn it guards.
+pub(crate) fn run_foreground_spawn_hook() {
+    let payload = read_pre_tool_use_payload();
+    if let Some(verdict) = foreground_spawn_verdict(&payload) {
         outln!("{verdict}");
     }
 }

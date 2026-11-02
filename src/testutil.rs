@@ -1342,6 +1342,15 @@ impl Drop for EnvPin<'_> {
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
 printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# The file behind every `--settings <file>` argument, one line each: the
+# runtime that wrote it removes it when it drops, before a test can read it.
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--settings" ] && [ -f "$arg" ]; then
+    { tr -d '\n' < "$arg"; printf '\n'; } >> "$CLAUDE_SHIM_LOG.settings"
+  fi
+  prev=$arg
+done
 # Opt-in: a grandchild subshell inherits this child's stderr (the pipe clauth
 # reads) and stays alive for the named seconds while the child exits at once,
 # so a test can pin that the run finalizes on the child's exit without waiting
@@ -1616,6 +1625,18 @@ impl<'a> FakeClaude<'a> {
             .lines()
             .filter_map(|line| line.split_once('\t'))
             .map(|(dir, argv)| (dir.to_string(), argv.to_string()))
+            .collect()
+    }
+
+    /// The settings file behind every `--settings <file>` argument the shim
+    /// was handed, parsed, in call order.
+    pub(crate) fn settings_files(&self) -> Vec<serde_json::Value> {
+        let mut path = self.log.clone().into_os_string();
+        path.push(".settings");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a captured settings file parses"))
             .collect()
     }
 

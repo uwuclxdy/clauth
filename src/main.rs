@@ -248,6 +248,7 @@ fn torn_store_notice_applies(command: &Command) -> bool {
             | Command::McpAwaitJob
             | Command::HookProfileChangedNote
             | Command::HookReadExempt
+            | Command::HookForegroundSpawn
             | Command::SelfHeal
             | Command::Complete { .. }
             | Command::ApiKey { .. }
@@ -353,6 +354,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::HookProfileChangedNote => hook_note::run(),
         Command::HookReadExempt => {
             cc_exempt::run_read_hook();
+            Ok(())
+        }
+        Command::HookForegroundSpawn => {
+            cc_exempt::run_foreground_spawn_hook();
             Ok(())
         }
         // The dispatch itself is one line and deliberately unpinned: a test

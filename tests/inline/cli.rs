@@ -1225,6 +1225,7 @@ fn machine_channels_never_arm_the_torn_store_notice() {
         &["mcp-await-job"],
         &["hook-profile-changed-note"],
         &["hook-read-exempt"],
+        &["hook-foreground-spawn"],
         &["self-heal"],
         &["__complete"],
         &["__api-key", "p"],
@@ -1391,6 +1392,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&[crate::cc_exempt::READ_HOOK_SUBCOMMAND]),
         Command::HookReadExempt
     ));
+    assert!(matches!(
+        command(&[crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND]),
+        Command::HookForegroundSpawn
+    ));
     match command(&["__api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
@@ -1411,6 +1416,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "hook-profile-changed-note",
         "self-heal",
         crate::cc_exempt::READ_HOOK_SUBCOMMAND,
+        crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND,
     ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),

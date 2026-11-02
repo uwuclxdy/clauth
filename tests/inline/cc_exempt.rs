@@ -389,6 +389,7 @@ fn apply_with(l: &Layout, command: &mut Command, passthrough: &[&str]) -> Applie
         &l.cwd,
         &strings(passthrough),
         HOOK,
+        None,
         &l.settings_file,
     );
     let argv = args_of(command);
@@ -468,6 +469,7 @@ fn a_fully_resolved_runtime_gets_nothing_injected() {
         &l.cwd,
         &passthrough,
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(args_of(&command), passthrough);
@@ -490,6 +492,7 @@ fn a_runtime_reached_through_a_symlinked_parent_is_injected_too() {
         &l.cwd,
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(warning, None);
@@ -527,13 +530,22 @@ fn an_isolated_runtime_without_projects_yet_is_judged_by_its_parent() {
         &l.cwd,
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(args_of(&through_link)[0], "--settings");
 
     let direct_file = l.root.join("state").join("direct.json");
     let mut direct = Command::new("claude");
-    apply_spawn_settings(&mut direct, &l.runtime, &l.cwd, &[], HOOK, &direct_file);
+    apply_spawn_settings(
+        &mut direct,
+        &l.runtime,
+        &l.cwd,
+        &[],
+        HOOK,
+        None,
+        &direct_file,
+    );
     assert!(args_of(&direct).is_empty());
     assert!(!direct_file.exists());
 }
@@ -765,6 +777,7 @@ fn a_memory_dir_in_a_worktrees_main_checkout_local_tier_suppresses_ours() {
         &l.root.join("work/wt"),
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     let settings: Value =
@@ -792,7 +805,15 @@ fn a_memory_dir_in_a_worktrees_own_root_local_tier_does_not_suppress_ours() {
     let cwd = l.root.join("work/wt/sub");
     fs::create_dir_all(&cwd).unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &cwd,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     assert_eq!(settings["autoMemoryDirectory"], json!(memory_dir(&l)));
@@ -815,7 +836,15 @@ fn a_memory_dir_in_the_home_local_tier_does_not_suppress_ours_from_a_subdir() {
     let cwd = home.join("sub");
     fs::create_dir_all(&cwd).unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &cwd,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -840,7 +869,15 @@ fn a_project_tier_claude_code_skips_at_home_does_not_suppress_ours() {
     )
     .unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &home, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &home,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -1121,6 +1158,7 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
                 &cwd,
                 &strings(&["--settings", user]),
                 HOOK,
+                None,
                 &settings_file,
             );
             tx.send((user, warning)).unwrap();
@@ -1146,7 +1184,15 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
     let (runtime, cwd, settings_file) = (l.runtime.clone(), l.cwd.clone(), l.settings_file.clone());
     std::thread::spawn(move || {
         let mut command = Command::new("claude");
-        apply_spawn_settings(&mut command, &runtime, &cwd, &[], HOOK, &settings_file);
+        apply_spawn_settings(
+            &mut command,
+            &runtime,
+            &cwd,
+            &[],
+            HOOK,
+            None,
+            &settings_file,
+        );
         tx.send(()).unwrap();
     });
     rx.recv_timeout(std::time::Duration::from_secs(5))
@@ -1415,6 +1461,23 @@ fn clauth_start_routes_its_claude_args_through_the_exemption_settings() {
     );
 }
 
+/// The subagent-shell guard is for a delegate's `claude -p` alone: an
+/// interactive `clauth start` session keeps running after a subagent's turn
+/// ends.
+#[test]
+fn only_a_delegate_names_the_foreground_spawn_hook() {
+    let start = body_of(include_str!("../../src/start.rs"), "pub(crate) fn run(");
+    let delegate = body_of(include_str!("../../src/mcp/mod.rs"), "fn run_delegate(");
+    assert!(
+        delegate.contains("FOREGROUND_SPAWN_HOOK_SUBCOMMAND"),
+        "run_delegate must hand apply_spawn_settings the foreground-spawn hook"
+    );
+    assert!(
+        !start.contains("FOREGROUND_SPAWN_HOOK_SUBCOMMAND"),
+        "clauth start must not hand its session the foreground-spawn hook"
+    );
+}
+
 #[test]
 fn a_delegate_routes_its_extra_args_through_the_exemption_settings() {
     let body = body_of(include_str!("../../src/mcp/mod.rs"), "fn run_delegate(");
@@ -1626,7 +1689,10 @@ fn hook_command_names_the_installed_binary_and_fails_open() {
     // `<path> (deleted)`; an exit 2 from a binary that lacks the subcommand
     // would block every Read, so the command can never exit non-zero.
     assert_eq!(
-        hook_command_for(Path::new("/opt/clauth bin/clauth (deleted)")),
+        hook_command_for(
+            Path::new("/opt/clauth bin/clauth (deleted)"),
+            READ_HOOK_SUBCOMMAND
+        ),
         "'/opt/clauth bin/clauth' hook-read-exempt || true"
     );
 }

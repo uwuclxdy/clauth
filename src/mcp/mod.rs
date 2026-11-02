@@ -4190,21 +4190,27 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         command.current_dir(dir);
         crate::runtime::guard_home_project_settings(&mut command, dir);
     }
-    if let Some(dir) = delegate_cwd.as_deref() {
-        let settings_file =
-            crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
-        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
-            &mut command,
-            runtime.config_dir(),
-            dir,
-            &opts.extra_args,
-            &crate::cc_exempt::hook_command(),
-            &settings_file,
-        ) {
-            logline!("{warning}");
-        }
-    } else {
-        command.args(&opts.extra_args);
+    // A delegate is a headless `claude -p` run, which never waits on a shell a
+    // subagent backgrounds, so its settings file always carries the
+    // foreground-spawn hook, symlinked `projects` or not. With no resolved cwd
+    // the child inherits this server's, the cwd `.` names.
+    let settings_cwd = delegate_cwd
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let settings_file =
+        crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
+    if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+        &mut command,
+        runtime.config_dir(),
+        &settings_cwd,
+        &opts.extra_args,
+        &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
+        Some(&crate::cc_exempt::hook_command(
+            crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND,
+        )),
+        &settings_file,
+    ) {
+        logline!("{warning}");
     }
 
     let run_start = std::time::SystemTime::now();

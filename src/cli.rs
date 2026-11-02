@@ -520,6 +520,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     HookReadExempt,
 
+    /// The `PreToolUse` `Bash` hook every `delegate` injects: read the hook
+    /// payload on stdin and refuse a subagent's background shell, which a
+    /// headless `claude -p` never waits on once that subagent's turn ends.
+    #[command(hide = true)]
+    HookForegroundSpawn,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {
