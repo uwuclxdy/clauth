@@ -371,10 +371,18 @@ pub(crate) fn install_at(paths: &Paths, yes: bool) -> Result<bool> {
     crate::profile::atomic_write(&paths.plugin.join(MARKER), marker)
         .with_context(|| format!("write {}", paths.plugin.join(MARKER).display()))?;
     if let Some(text) = wired {
-        crate::profile::atomic_write(&paths.init, text)
-            .with_context(|| format!("write {}", paths.init.display()))?;
+        write_init(&paths.init, &text)?;
     }
     Ok(true)
+}
+
+/// Writes Rex's `init.lua` in place, the way `clauth herdr install` writes
+/// herdr's `config.toml`. A temp-and-rename would replace a symlinked
+/// `init.lua` (a dotfiles checkout) with a plain file and reset its mode, so
+/// the checkout would never see the edit. The cost is the one herdr's write
+/// takes: a crash or a full disk mid-write can leave the file short.
+fn write_init(path: &Path, text: &str) -> Result<()> {
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// Takes the block out of `init.lua` and removes a managed plugin directory.
@@ -415,8 +423,7 @@ pub(crate) fn uninstall_at(paths: &Paths, yes: bool) -> Result<bool> {
     // The config goes first: a Rex that reloads between the two steps then
     // finds no require, rather than a require of a module that is gone.
     if had_block {
-        crate::profile::atomic_write(&paths.init, unwired)
-            .with_context(|| format!("write {}", paths.init.display()))?;
+        write_init(&paths.init, &unwired)?;
     }
     if managed {
         std::fs::remove_dir_all(&paths.plugin)
