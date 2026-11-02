@@ -69,29 +69,43 @@ thread_local! {
     static GHOSTTY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Detect the tier from `$COLORTERM`:
-/// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
-pub(crate) fn detect() -> Tier {
-    match std::env::var("COLORTERM")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
-        "truecolor" | "24bit" => Tier::Full,
-        _ => Tier::Compatible,
-    }
+/// The environment the production detection reads.
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
-/// Detect the terminal family Claude Code draws its other working-line set for.
-pub(crate) fn detect_ghostty() -> bool {
-    std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty")
+/// The startup detection read through `env`, the only seam it has to the
+/// process environment: the tier comes from `$COLORTERM` (`truecolor` or
+/// `24bit` → [`Tier::Full`], anything else → [`Tier::Compatible`]), the
+/// ghostty flag from `TERM == "xterm-ghostty"`. `NO_COLOR` is the terminal
+/// library's to honour: crossterm's `Colored` display path drops colour while
+/// it is set. `TERM=dumb` is no tier: crossterm 0.29 (measured 2026-10-31)
+/// reads `TERM` only in `available_color_count`, which the TUI never calls,
+/// and in its windows ANSI probe once VT processing fails to enable. The tier
+/// ignores both.
+pub(crate) fn detect_with(env: impl Fn(&str) -> Option<String>) -> (Tier, bool) {
+    let tier = match env("COLORTERM").unwrap_or_default().to_lowercase().as_str() {
+        "truecolor" | "24bit" => Tier::Full,
+        _ => Tier::Compatible,
+    };
+    let ghostty = env("TERM").is_some_and(|term| term == "xterm-ghostty");
+    (tier, ghostty)
+}
+
+/// Detect the tier from the process environment (see [`detect_with`]).
+/// Test builds read the tier through the thread-local pin only, so the
+/// fallback's caller is `cfg(not(test))` and so is this.
+#[cfg(not(test))]
+pub(crate) fn detect() -> Tier {
+    detect_with(process_env).0
 }
 
 /// Seed the process tier and terminal family at startup.
 /// Precedence (highest first): explicit override → auto-detect.
 pub(crate) fn init(override_tier: Option<Tier>) {
-    set_tier(override_tier.unwrap_or_else(detect));
-    set_ghostty(detect_ghostty());
+    let (tier, ghostty) = detect_with(process_env);
+    set_tier(override_tier.unwrap_or(tier));
+    set_ghostty(ghostty);
 }
 
 /// Whether the terminal is the family Claude Code draws its other working-line

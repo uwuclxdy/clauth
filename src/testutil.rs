@@ -3495,7 +3495,7 @@ fn fake_supervisor_parks_until_sigterm() {
 /// `leading` as the argv words before the `--exact` filter (so argv can pose a
 /// supervisor shape, a daemon shape or a foreign shape) and null stdio.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-fn reentry_command(test: &str, leading: &[&str]) -> Command {
+pub(crate) fn reentry_command(test: &str, leading: &[&str]) -> Command {
     // Linux spawns through `/proc/self/exe`, which execs the running inode even
     // after the test binary is unlinked or rebuilt mid-run (`current_exe()`
     // then reads `<path> (deleted)` and every later spawn fails ENOENT); macOS
