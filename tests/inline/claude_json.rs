@@ -3880,11 +3880,12 @@ fn an_unrecorded_live_seed_matching_the_merge_is_recorded_and_its_edit_reaches_h
     let entries: Vec<Value> = fs::read(written_record_path().expect("record path"))
         .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
         .unwrap_or_default();
-    let seed_str = seed.to_string_lossy();
+    // Compared as paths, never strings: the seed path is joined with `/` while
+    // the record holds the platform's own separator.
     assert!(
         entries
             .iter()
-            .any(|e| e["path"].as_str() == Some(&*seed_str)),
+            .any(|e| e["path"].as_str().map(Path::new) == Some(seed.as_path())),
         "the matching live seed must be recorded on first sight: {entries:#?}"
     );
 
