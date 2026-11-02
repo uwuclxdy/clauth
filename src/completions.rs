@@ -41,7 +41,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
-        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --pid" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "sessions" ]; then
         local f remaining
         remaining=()
@@ -236,7 +236,7 @@ _clauth() {
         _values 'flag' '--control[the device may switch accounts, not only read]' \
             '--sessions[the device may mint sessions through the API]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
-        _values 'flag' '--json[emit JSON instead of plain name]'
+        _values 'flag' '--json[emit JSON instead of plain name]' '--pid[resolve the account a running process spends]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == sessions ]]; then
         local -a flags
         flags=()
@@ -403,6 +403,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback 
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --explain -d "Print the account that would be launched, without launching"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --pid -d "Resolve the account a running process spends"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session

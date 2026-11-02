@@ -55,6 +55,7 @@ mod proxy;
 mod proxy_check;
 mod proxy_list;
 mod push;
+mod rex;
 mod runtime;
 mod session_record;
 mod sessions;
@@ -310,7 +311,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Enable { profile } => cmd_enable(&profile),
         Command::LimitReset { profile, list, yes } => cmd_limit_reset(&profile, list, yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
-        Command::Which { json } => which::run(json),
+        Command::Which { json, pid } => match pid {
+            Some(pid) => which::run_pid(pid, json),
+            None => which::run(json),
+        },
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Jobs { json } => jobs_cli::run(json),
         Command::Sessions { json, tokens, live } => sessions_cli::run_sessions(json, tokens, live),

@@ -1,7 +1,7 @@
 //! Services tab — the shunt gateway, the running delegates, the Claude Code
-//! plugin and herdr on one selector, each row's readout on the right. The
-//! master-detail mirrors the Status tab's two-pane machinery and counts as 2 of
-//! the 3-panel budget.
+//! plugin, herdr and Rex's experimental `rex` row on one selector, each row's
+//! readout on the right. The master-detail mirrors the Status tab's two-pane
+//! machinery and counts as 2 of the 3-panel budget.
 //!
 //! The left panel is one cursor-driven selector over the service rows. Each row
 //! is a status dot + label, the verdict in the detail pane, plus a trailing

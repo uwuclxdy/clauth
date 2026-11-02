@@ -10966,3 +10966,296 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
 fn a_sound_mark_label_in_the_typed_editor_parks_the_caret_by_drawn_cells() {
     assert_eq!(super::typed_field_label_width("ｶﾞ", 4, 20), 18);
 }
+
+// ── rex row ──────────────────────────────────────────────────────────────────
+
+fn rex(plugin: crate::rex::PluginDir, watcher_running: bool) -> Check {
+    crate::tui::app::rex_check(&crate::rex::RexStatus {
+        plugin,
+        watcher_running,
+    })
+}
+
+/// One `key value` detail row as the pane lays it out: the key column is the
+/// widest key (`experimental`, 12 cells) plus a 2-cell gap.
+fn rex_row(key: &str, value: &str) -> String {
+    format!("{key}{}{value}", " ".repeat(12 - key.chars().count() + 2))
+}
+
+const REX_EXPERIMENTAL: &str = "may change in any release";
+
+fn rex_rows(check: Check) -> Vec<String> {
+    let app = app_with(check);
+    let (rows, _) = render(&app);
+    detail_rows(&rows)
+}
+
+#[test]
+fn a_current_rex_plugin_reads_installed_with_this_version() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        },
+        true,
+    );
+    assert_eq!(check.label, "rex");
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row(
+                "plugin",
+                &format!("installed (clauth {})", env!("CARGO_PKG_VERSION"))
+            ),
+            rex_row("watcher", "running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Ok);
+}
+
+#[test]
+fn a_rex_plugin_from_another_clauth_reads_stale() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: Some("0.17.0".to_owned()),
+        },
+        true,
+    );
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row(
+                "plugin",
+                &format!(
+                    "written by clauth 0.17.0, this is {}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            ),
+            rex_row("watcher", "running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Warn);
+}
+
+#[test]
+fn a_rex_marker_with_no_version_reads_stale_with_unknown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(crate::rex::PluginDir::Managed { version: None }, false);
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row(
+                "plugin",
+                &format!(
+                    "written by clauth unknown, this is {}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            ),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Warn);
+}
+
+#[test]
+fn a_linked_rex_plugin_names_its_root() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Linked {
+            target: Some(PathBuf::from("/src/rex-plugin")),
+        },
+        false,
+    );
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "linked (local)"),
+            rex_row("root", "/src/rex-plugin"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Ok);
+}
+
+#[test]
+fn a_foreign_rex_plugin_dir_reads_not_written_by_clauth() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(crate::rex::PluginDir::Foreign, false);
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "not written by clauth"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Warn);
+}
+
+#[test]
+fn an_absent_rex_plugin_reads_not_installed_and_idle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(crate::rex::PluginDir::Absent, false);
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "not installed"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Idle);
+}
+
+#[test]
+fn a_rex_root_holding_control_bytes_renders_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Linked {
+            target: Some(PathBuf::from("/src/\u{1b}[2Jx")),
+        },
+        false,
+    );
+    assert!(
+        check.detail.iter().all(|line| !line.contains('\u{1b}')),
+        "a raw ESC reaches the detail: {:?}",
+        check.detail
+    );
+}
+
+#[test]
+fn a_rex_marker_version_holding_control_bytes_renders_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: Some("\u{1b}[2J".to_owned()),
+        },
+        false,
+    );
+    assert!(
+        check.detail.iter().all(|line| !line.contains('\u{1b}')),
+        "a raw ESC reaches the detail: {:?}",
+        check.detail
+    );
+}
+
+/// `rex` sits above `herdr`, whose row appears only once its background probe
+/// lands, so that landing never moves a selection resting on `rex`.
+#[test]
+fn the_rex_row_sits_above_the_herdr_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = app_with_checks(Vec::new());
+    app.services.herdr = Some(Some(healthy_probe()));
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    let labels: Vec<&str> = app.services.checks.iter().map(|c| c.label).collect();
+    assert_eq!(labels, vec!["shunt", "delegates", "plugin", "rex", "herdr"]);
+}
+
+/// The watcher check reads the process table (a `ps` spawn off Linux), so the
+/// 1 s tick reuses the last answer and only a full refresh (tab focus, `r`)
+/// asks again.
+#[test]
+fn the_tick_reuses_the_rex_watcher_answer_and_a_refresh_rechecks_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let watcher_line = |app: &App| -> Option<String> {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "rex")
+            .and_then(|c| {
+                c.detail
+                    .iter()
+                    .find(|l| l.starts_with("watcher: "))
+                    .cloned()
+            })
+    };
+    let mut app = app_with_checks(Vec::new());
+    // No pidfile exists, so a real check reads `not running`; the cached
+    // `running` must survive a tick.
+    app.services.rex_watcher = Some(true);
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    assert_eq!(watcher_line(&app).as_deref(), Some("watcher: running"));
+
+    crate::tui::app::recompute_services_checks(&mut app, true, crate::tui::app::ShuntRefresh::Keep);
+    assert_eq!(watcher_line(&app).as_deref(), Some("watcher: not running"));
+    assert_eq!(app.services.rex_watcher, Some(false));
+}
+
+/// The row joins the Services list only when Rex's config dir exists, read
+/// through the real recompute over a sandbox HOME.
+#[test]
+fn the_rex_row_shows_only_when_the_rex_config_dir_exists() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    let labels =
+        |app: &App| -> Vec<&'static str> { app.services.checks.iter().map(|c| c.label).collect() };
+
+    let mut app = app_with_checks(Vec::new());
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    assert!(
+        !labels(&app).contains(&"rex"),
+        "no rex row without ~/.config/rex: {:?}",
+        labels(&app)
+    );
+
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    assert!(
+        labels(&app).contains(&"rex"),
+        "a rex row once ~/.config/rex exists: {:?}",
+        labels(&app)
+    );
+}

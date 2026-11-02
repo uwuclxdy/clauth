@@ -750,6 +750,24 @@ fn read_row(path: &Path) -> Option<LiveSession> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Every parseable row under an arbitrary registry dir, each with its file's
+/// mtime. `clauth which --pid` reads a dir it is handed (a test injects one)
+/// and picks the newest row when a recycled pid matches more than one; the
+/// production readers above stay on the real registry dir.
+pub(crate) fn rows_in(dir: &Path) -> Vec<(LiveSession, Option<std::time::SystemTime>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let row = read_row(&entry.path())?;
+            let mtime = entry.metadata().and_then(|meta| meta.modified()).ok();
+            Some((row, mtime))
+        })
+        .collect()
+}
+
 /// One session's own row, or `None` when it is absent or unparseable. Read
 /// WITHOUT the state lock, which is sound because [`write_row`] renames over the
 /// path: a reader sees the whole old row or the whole new one. A caller that

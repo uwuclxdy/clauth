@@ -2598,14 +2598,12 @@ fn report_profile_run(
     write_shim(
         home.home(),
         "herdr",
-        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n",
+        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then printf '%s\\n' '{\"process_info\":{\"foreground_process_group_id\":1000}}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n",
     );
     write_shim(
         home.home(),
         "clauth",
-        &format!(
-            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo {pane_tag} ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
-        ),
+        &clauth_shim(&[(1000, "fit", "global", "claude")], pane_tag, border_label),
     );
     let mut cmd = std::process::Command::new("sh");
     cmd.arg(concat!(
@@ -2777,66 +2775,77 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
 
 // ── report-profile.sh pane resolution, driven through the real script ────────
 
+/// One scripted `clauth which --pid` answer: `(pid, profile, source,
+/// harness)`, the triple the real resolver would name for that process.
+#[cfg(unix)]
+type WhichAnswer<'a> = (u32, &'a str, &'a str, &'a str);
+
+/// The shimmed `clauth` every script test runs against: `which --pid <pid>`
+/// answers from the caller's map (JSON when `--json` is passed, the bare name
+/// otherwise, `unknown` for a pid the map misses) and the config knobs answer
+/// the caller's values. The join itself is the Rust resolver's, pinned by
+/// `which::tests`; these tests pin what the SCRIPT decides: which pid it asks
+/// for, the sweep's mcp-parent skip, the row-over-bare-login preference and
+/// the publish.
+#[cfg(unix)]
+fn clauth_shim(answers: &[WhichAnswer<'_>], pane_tag: &str, border_label: &str) -> String {
+    let mut body = String::from("if [ \"$1\" = which ]; then\n  case \"$3\" in\n");
+    for &(pid, profile, source, harness) in answers {
+        body.push_str(&format!(
+            "    {pid}) if [ \"$4\" = --json ]; then printf '%s\\n' '{{\"profile\":\"{profile}\",\"source\":\"{source}\",\"harness\":\"{harness}\"}}'; else printf '%s\\n' '{profile}'; fi ;;\n"
+        ));
+    }
+    body.push_str(
+        "    *) if [ \"$4\" = --json ]; then printf '%s\\n' '{\"profile\":null,\"source\":null,\"harness\":null}'; else printf '%s\\n' unknown; fi ;;\n  esac\n  exit 0\nfi\n",
+    );
+    body.push_str(&format!(
+        "case \"$1:$4\" in\n  herdr:pane_tag) echo {pane_tag} ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
+    ));
+    body
+}
+
+/// A `clauth` shim whose `which --pid` exits 2 — a binary that predates the
+/// flag, the skew a plugin fetched at a newer release can hit — while the knob
+/// reads still answer.
+#[cfg(unix)]
+fn clauth_which_fails_shim() -> String {
+    String::from(
+        "if [ \"$1\" = which ]; then exit 2; fi\ncase \"$1:$4\" in\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    )
+}
+
 /// Runs the real `herdr-plugin/report-profile.sh` against shimmed `herdr`,
 /// `ps` and `clauth`. The herdr shim answers `pane process-info` ONCE (its
 /// second caller is the detached watcher, which must fail it three times so it
 /// ends itself) and logs every `pane report-metadata` argv; the ps shim
 /// answers ppid/args from the caller's scripted map; the clauth shim answers
-/// `which` with `fit` and the config knobs. Rows land in the sandbox's
-/// `~/.clauth/live_sessions`; `stale_row` names one whose mtime is pushed an
-/// hour back, posing the dead-session leftover a recycled pid would leave.
-/// Returns the logged report lines.
+/// `which --pid` from `answers`. Returns the logged report lines.
 #[cfg(unix)]
 fn report_profile_resolve_run(
     info_json: &str,
     ps_body: &str,
-    rows: &[(&str, &str, u32)],
-    stale_row: Option<&str>,
+    answers: &[WhichAnswer<'_>],
 ) -> Vec<String> {
-    report_profile_resolve_run_as(
-        r#"{"agent":"claude"}"#,
-        None,
-        "off",
-        info_json,
-        ps_body,
-        rows,
-        stale_row,
-    )
-    .0
+    report_profile_resolve_run_as(r#"{"agent":"claude"}"#, "off", info_json, ps_body, answers).0
 }
 
-/// [`report_profile_resolve_run`] with the event hook's `agent` field spelled
-/// by the caller, an optional ADOPTED codex login, and the `border_label`
-/// knob: `adopted_codex = Some(name)` lays `~/.codex/auth.json` as a symlink
-/// onto `~/.clauth/profiles/<name>/auth.json` in the sandbox, the shape
-/// `clauth login <name> --codex` leaves behind. `CODEX_HOME` is scrubbed from
-/// the script's env so the sandbox's `~/.codex` is the operator home it reads.
-/// The shim's `pane get` fails, so a spawned watcher ends on its retry budget
-/// without re-reporting; the helper joins that watcher (the pidfile disappears)
-/// before the sandbox drops. Returns the report lines and whether the watcher
-/// pidfile appeared, observed before the join: it is created synchronously
-/// before the detached spawn, so it exists here exactly when the script's
-/// watcher path ran.
+/// [`report_profile_resolve_run`] with the event hook's `agent` field and the
+/// `border_label` knob spelled by the caller. The shim's `pane get` fails, so
+/// a spawned watcher ends on its retry budget without re-reporting; the helper
+/// joins that watcher (the pidfile disappears) before the sandbox drops.
+/// Returns the report lines and whether the watcher pidfile appeared, observed
+/// before the join: it is created synchronously before the detached spawn, so
+/// it exists here exactly when the script's watcher path ran.
 #[cfg(unix)]
 fn report_profile_resolve_run_as(
     agent_json: &str,
-    adopted_codex: Option<&str>,
     border_label: &str,
     info_json: &str,
     ps_body: &str,
-    rows: &[(&str, &str, u32)],
-    stale_row: Option<&str>,
+    answers: &[WhichAnswer<'_>],
 ) -> (Vec<String>, bool) {
-    let (lines, watcher, _) = report_profile_resolve_run_in(
-        agent_json,
-        adopted_codex,
-        border_label,
-        info_json,
-        ps_body,
-        None,
-        rows,
-        stale_row,
-    );
+    let (lines, watcher, _) =
+        report_profile_resolve_run_in(agent_json, border_label, info_json, ps_body, None, answers);
     (lines, watcher)
 }
 
@@ -2845,45 +2854,56 @@ fn report_profile_resolve_run_as(
 #[cfg(unix)]
 type ProcTree<'a> = &'a [(u32, u32, &'a str)];
 
-/// [`report_profile_resolve_run`] on the Linux path: the script reads the
-/// process tree from a faked `/proc` instead of asking `ps`. The `ps` shim
+/// [`report_profile_resolve_run`] on the Linux path: the script's sweep reads
+/// the process tree from a faked `/proc` instead of asking `ps`. The `ps` shim
 /// only logs its argv and fails, so a `ps` call both shows up and breaks the
-/// resolve. Returns the report lines and every logged `ps` call.
+/// sweep. Returns the report lines and every logged `ps` call.
 #[cfg(unix)]
 fn report_profile_resolve_run_proc(
     info_json: &str,
     tree: ProcTree<'_>,
-    rows: &[(&str, &str, u32)],
+    answers: &[WhichAnswer<'_>],
 ) -> (Vec<String>, Vec<String>) {
     let (lines, _, ps_calls) = report_profile_resolve_run_in(
         r#"{"agent":"claude"}"#,
-        None,
         "off",
         info_json,
         "echo \"$*\" >> \"$(dirname \"$0\")/ps.log\"\nexit 1\n",
         Some(tree),
-        rows,
-        None,
+        answers,
     );
     (lines, ps_calls)
 }
 
 /// The shared body of the resolve runs above. `proc_tree = None` points
-/// `CLAUTH_PROC_ROOT` at a directory that does not exist, so the script takes
-/// its `ps` path (the one macOS runs) and the scripted `ps` shim answers.
-/// Either way the variable is set: left unset, the script would read the
-/// HOST's `/proc`, where the fake pids these tests use may be real processes.
+/// `CLAUTH_PROC_ROOT` at a directory that does not exist, so the script's
+/// sweep takes its `ps` path (the one macOS runs) and the scripted `ps` shim
+/// answers. Either way the variable is set: left unset, the script would read
+/// the HOST's `/proc`, where the fake pids these tests use may be real
+/// processes.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 fn report_profile_resolve_run_in(
     agent_json: &str,
-    adopted_codex: Option<&str>,
     border_label: &str,
     info_json: &str,
     ps_body: &str,
     proc_tree: Option<ProcTree<'_>>,
-    rows: &[(&str, &str, u32)],
-    stale_row: Option<&str>,
+    answers: &[WhichAnswer<'_>],
+) -> (Vec<String>, bool, Vec<String>) {
+    let clauth_body = clauth_shim(answers, "on", border_label);
+    report_profile_resolve_run_with(agent_json, info_json, ps_body, proc_tree, &clauth_body)
+}
+
+/// [`report_profile_resolve_run_in`] with the `clauth` shim spelled by the
+/// caller. `CLAUTH_REPORT_PROFILE_SH` points the run at another copy of the
+/// script, so a planted mutation is measured against the same tests.
+#[cfg(unix)]
+fn report_profile_resolve_run_with(
+    agent_json: &str,
+    info_json: &str,
+    ps_body: &str,
+    proc_tree: Option<ProcTree<'_>>,
+    clauth_body: &str,
 ) -> (Vec<String>, bool, Vec<String>) {
     let home = crate::testutil::HomeSandbox::new();
     let proc_root = home.home().join("proc");
@@ -2901,30 +2921,6 @@ fn report_profile_resolve_run_in(
         cmdline.push('\0');
         std::fs::write(dir.join("cmdline"), cmdline).expect("cmdline written");
     }
-    let sessions = home.home().join(".clauth/live_sessions");
-    std::fs::create_dir_all(&sessions).expect("sessions dir");
-    if let Some(name) = adopted_codex {
-        let store = home.home().join(".clauth/profiles").join(name);
-        std::fs::create_dir_all(&store).expect("profile store");
-        std::fs::write(store.join("auth.json"), "{}").expect("chain written");
-        let codex = home.home().join(".codex");
-        std::fs::create_dir_all(&codex).expect("codex home");
-        std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
-            .expect("adopted link");
-    }
-    for (sid, start, pid) in rows {
-        let path = sessions.join(format!("{sid}.json"));
-        let body = format!(
-            r#"{{"session_id":"{sid}","start_profile":"{start}","pid":{pid},"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":null,"last_swap_at":null}}"#
-        );
-        std::fs::write(&path, body).expect("row written");
-        if stale_row == Some(sid) {
-            crate::testutil::set_mtime(
-                &path,
-                std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
-            );
-        }
-    }
     write_shim(
         home.home(),
         "herdr",
@@ -2933,34 +2929,33 @@ fn report_profile_resolve_run_in(
         ),
     );
     write_shim(home.home(), "ps", ps_body);
-    write_shim(
-        home.home(),
-        "clauth",
-        &format!(
-            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
-        ),
-    );
+    write_shim(home.home(), "clauth", clauth_body);
+    let script = std::env::var_os("CLAUTH_REPORT_PROFILE_SH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/herdr-plugin/report-profile.sh"
+            ))
+        });
     let mut cmd = std::process::Command::new("sh");
-    cmd.arg(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/herdr-plugin/report-profile.sh"
-    ))
-    .env("HERDR_BIN_PATH", home.home().join("herdr"))
-    .env("HERDR_PLUGIN_ID", "clauth")
-    .env("HERDR_PANE_ID", "p1")
-    .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
-    .env_remove("CODEX_HOME")
-    .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
-    .env("CLAUTH_PROC_ROOT", &proc_root)
-    .env("HOME", home.home())
-    .env(
-        "PATH",
-        format!(
-            "{}:{}",
-            home.home().display(),
-            std::env::var("PATH").unwrap_or_default()
-        ),
-    );
+    cmd.arg(script)
+        .env("HERDR_BIN_PATH", home.home().join("herdr"))
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PANE_ID", "p1")
+        .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
+        .env_remove("CODEX_HOME")
+        .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+        .env("CLAUTH_PROC_ROOT", &proc_root)
+        .env("HOME", home.home())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.home().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
     let out = cmd.output().expect("report-profile.sh runs");
     assert!(
         out.status.success(),
@@ -3009,10 +3004,9 @@ fn token_line(lines: &[String]) -> String {
     lines[0].clone()
 }
 
-/// The pane's own session resolves FIRST, off `foreground_process_group_id`.
-/// The sweep order puts the delegate's claude before the supervisor, and the
-/// delegate's row is keyed on the pane's `clauth mcp`, so a sweep-first
-/// resolution names the delegate's account (D3) for a pane running uwuclxdy.
+/// The pane's own session resolves FIRST, off `foreground_process_group_id`:
+/// the script asks `clauth which --pid` at the foreground pid, and the sweep
+/// (which would name the delegate's account, D3) never runs.
 #[cfg(unix)]
 #[test]
 fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
@@ -3021,8 +3015,10 @@ fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
     let lines = report_profile_resolve_run(
         info,
         ps,
-        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
-        None,
+        &[
+            (1000, "uwuclxdy", "live_session", "claude"),
+            (1002, "D3", "live_session", "claude"),
+        ],
     );
     assert!(
         token_line(&lines).contains("--token clauth=uwuclxdy"),
@@ -3033,13 +3029,20 @@ fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
 
 /// A bare `claude` pane (foreground present, no registered session) answers
 /// the global account, never the account of a delegate it happens to host:
-/// the sweep must not run when the foreground chain resolved cleanly to no row.
+/// the foreground answer stands and the sweep must not run.
 #[cfg(unix)]
 #[test]
 fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
-    let lines = report_profile_resolve_run(info, ps, &[("1003-0", "D3", 1003)], None);
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[
+            (1001, "fit", "global", "claude"),
+            (1003, "D3", "live_session", "claude"),
+        ],
+    );
     assert!(
         token_line(&lines).contains("--token clauth=fit"),
         "the bare pane answers the global account: {}",
@@ -3047,10 +3050,195 @@ fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
     );
 }
 
-/// The compat sweep (a process-info without the foreground field) skips a
-/// delegate child by its parent and refuses to match a row on an mcp hop, so
-/// it climbs through the mcp to the pane's own supervisor instead of stopping
-/// at the delegate's row.
+/// A `clauth` binary predating `--pid` answers the foreground call with exit
+/// 2. That is "could not read", not "nothing resolved": the last tag stands,
+/// so the pane gets no report and no watcher.
+#[cfg(unix)]
+#[test]
+fn a_failed_foreground_which_publishes_nothing_for_a_claude_pane() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"claude"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned, _) = report_profile_resolve_run_with(
+        r#"{"agent":"claude"}"#,
+        info,
+        ps,
+        None,
+        &clauth_which_fails_shim(),
+    );
+    assert!(
+        lines.is_empty(),
+        "a failed `which --pid` publishes nothing: {lines:?}"
+    );
+    assert!(!watcher_spawned, "and spawns no watcher");
+}
+
+/// The same skew on a codex pane: the failed call must not read as the
+/// definitive empty that publishes the token clear.
+#[cfg(unix)]
+#[test]
+fn a_failed_foreground_which_publishes_nothing_for_a_codex_pane() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"codex"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned, _) = report_profile_resolve_run_with(
+        r#"{"agent":"codex"}"#,
+        info,
+        ps,
+        None,
+        &clauth_which_fails_shim(),
+    );
+    assert!(
+        lines.is_empty(),
+        "a failed `which --pid` publishes nothing: {lines:?}"
+    );
+    assert!(!watcher_spawned, "and spawns no watcher");
+}
+
+/// A failed `pane process-info` could not read the pane: a codex pane keeps
+/// its last tag instead of taking the definitive-empty clear.
+#[cfg(unix)]
+#[test]
+fn a_failed_process_info_publishes_nothing_for_a_codex_pane() {
+    let home = crate::testutil::HomeSandbox::new();
+    write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n",
+    );
+    write_shim(
+        home.home(),
+        "clauth",
+        &clauth_shim(&[(1000, "cx", "codex_adopted", "codex")], "on", "off"),
+    );
+    let out = std::process::Command::new("sh")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/herdr-plugin/report-profile.sh"
+        ))
+        .env("HERDR_BIN_PATH", home.home().join("herdr"))
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PANE_ID", "p1")
+        .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"codex"}"#)
+        .env_remove("CODEX_HOME")
+        .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
+        .env("HOME", home.home())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.home().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("report-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the script exits 0: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = std::fs::read_to_string(home.home().join("report.log")).unwrap_or_default();
+    assert_eq!(report, "", "a failed process-info publishes nothing");
+    assert!(
+        !home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// The compat sweep skips each failing call; when every call failed it could
+/// read nothing either, so it publishes nothing instead of the codex clear.
+#[cfg(unix)]
+#[test]
+fn a_sweep_whose_every_call_failed_publishes_nothing() {
+    let info =
+        r#"{"process_info":{"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned, _) = report_profile_resolve_run_with(
+        r#"{"agent":"codex"}"#,
+        info,
+        ps,
+        None,
+        &clauth_which_fails_shim(),
+    );
+    assert!(
+        lines.is_empty(),
+        "a sweep that read nothing publishes nothing: {lines:?}"
+    );
+    assert!(!watcher_spawned, "and spawns no watcher");
+}
+
+/// A codex pane never takes a foreground answer from another harness: the
+/// Claude Code global login on a codex pane is that harness's account, and the
+/// pane stays a definitive empty instead.
+#[cfg(unix)]
+#[test]
+fn a_codex_pane_never_takes_a_claude_harness_foreground_answer() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, _watcher_spawned) = report_profile_resolve_run_as(
+        r#"{"agent":"codex"}"#,
+        "off",
+        info,
+        ps,
+        &[(1001, "fit", "global", "claude")],
+    );
+    let line = token_line(&lines);
+    assert!(
+        !line.contains("clauth=fit"),
+        "another harness's account never reaches a codex pane: {line}"
+    );
+}
+
+/// A profile literally named `unknown` is a profile: the foreground answer
+/// publishes it, where the plain-name read mistook it for unresolved.
+#[cfg(unix)]
+#[test]
+fn a_foreground_answer_naming_the_profile_unknown_is_a_profile() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, _watcher_spawned) = report_profile_resolve_run_as(
+        r#"{"agent":"claude"}"#,
+        "off",
+        info,
+        ps,
+        &[(1001, "unknown", "live_session", "claude")],
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=unknown"),
+        "a profile named unknown is published: {}",
+        lines[0]
+    );
+}
+
+/// When the foreground field names a pid at all, its answer stands: an
+/// unresolved one never falls back to the sweep, so a delegate the pane hosts
+/// cannot paint its account on the pane.
+#[cfg(unix)]
+#[test]
+fn an_unresolved_foreground_answer_never_falls_back_to_the_sweep() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"},{"pid":1002,"ppid":1,"command":"claude"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned) = report_profile_resolve_run_as(
+        r#"{"agent":"claude"}"#,
+        "off",
+        info,
+        ps,
+        &[(1002, "delegate", "live_session", "claude")],
+    );
+    assert!(
+        lines.is_empty(),
+        "the pane takes no account from a delegate when the foreground answer is unresolved: {lines:?}"
+    );
+    assert!(!watcher_spawned, "and spawns no watcher");
+}
+
+/// The compat sweep (a process-info without the foreground field) skips a pid
+/// whose parent is `clauth mcp`, so a delegate child's own row never names the
+/// pane; the mcp pid itself resolves to the pane's own session.
 #[cfg(unix)]
 #[test]
 fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
@@ -3059,73 +3247,48 @@ fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
     let lines = report_profile_resolve_run(
         info,
         ps,
-        &[("1000-0", "uwuclxdy", 1000), ("1003-0", "D3", 1003)],
-        None,
-    );
-    assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
-        "the sweep climbs past the mcp to the pane's supervisor: {}",
-        lines[0]
-    );
-}
-
-/// On Linux the walk reads `/proc` and never runs `ps`: each `ps -o … -p` scans
-/// every process on the host to answer for one, and every watcher tick of every
-/// pane makes several. This is the foreground case above, answered from a faked
-/// `/proc` whose `ps` shim fails on any call.
-#[cfg(unix)]
-#[test]
-fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
-    let (lines, ps_calls) = report_profile_resolve_run_proc(
-        info,
         &[
-            (1000, 1, "clauth start uwuclxdy"),
-            (1001, 1002, "claude"),
-            (1002, 1000, "clauth mcp"),
+            (1002, "D3", "live_session", "claude"),
+            (1003, "uwuclxdy", "live_session", "claude"),
         ],
-        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
-    );
-    assert!(
-        ps_calls.is_empty(),
-        "no ps call on the /proc path: {ps_calls:?}"
     );
     assert!(
         token_line(&lines).contains("--token clauth=uwuclxdy"),
-        "the pane's own session wins over the delegate row: {}",
+        "the sweep skips the delegate child and climbs through the mcp: {}",
         lines[0]
     );
 }
 
-/// The `/proc` ppid read decides the answer here: the foreground pid has no
-/// row of its own, so only the climb to its parent reaches one. A ppid parse
-/// that cuts `stat` at the FIRST ") " (the faked comm holds one) reads the
-/// state letter as the parent, stops the climb, and falls to `clauth which`.
+/// The sweep's mcp-parent skip also matches an mcp server launched by its
+/// full path, with or without arguments.
 #[cfg(unix)]
 #[test]
-fn the_proc_walk_climbs_to_the_parent_row() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1000,"command":"claude"}]}}"#;
-    let (lines, ps_calls) = report_profile_resolve_run_proc(
-        info,
-        &[(1000, 1, "clauth start uwuclxdy"), (1001, 1000, "claude")],
-        &[("1000-0", "uwuclxdy", 1000)],
-    );
-    assert!(
-        ps_calls.is_empty(),
-        "no ps call on the /proc path: {ps_calls:?}"
-    );
-    assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
-        "the climb reaches the parent's row, not the global account: {}",
-        lines[0]
-    );
+fn the_compat_sweep_skips_a_full_path_mcp_parent() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    for mcp in ["/usr/bin/clauth mcp", "/usr/bin/clauth mcp --stdio"] {
+        let ps = format!(
+            "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1000;; *' 1000') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo '{mcp}';; *) echo other;; esac;;\nesac\nexit 0\n"
+        );
+        let lines = report_profile_resolve_run(
+            info,
+            &ps,
+            &[
+                (1002, "D3", "live_session", "claude"),
+                (1003, "uwuclxdy", "live_session", "claude"),
+            ],
+        );
+        assert!(
+            token_line(&lines).contains("--token clauth=uwuclxdy"),
+            "the sweep skips the delegate child under {mcp:?}: {}",
+            lines[0]
+        );
+    }
 }
 
-/// The compat sweep on the `/proc` path: the parent check and the climb both
-/// read `/proc`, and an mcp carrying arguments (`clauth mcp --stdio`, the
-/// `'clauth mcp '*` arm) is still recognised and climbed through. The delegate
-/// child 1002 carries a row of its own, so the sweep's parent check is what
-/// keeps its account off the pane.
+/// The compat sweep on the `/proc` path: the mcp-parent check reads `/proc`
+/// and never runs `ps` (each `ps -o ... -p` scans every process on the host).
+/// The delegate child 1002 answers a row of its own, so the parent check is
+/// what keeps its account off the pane.
 #[cfg(unix)]
 #[test]
 fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
@@ -3139,9 +3302,8 @@ fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
             (1003, 1001, "clauth mcp --stdio"),
         ],
         &[
-            ("1000-0", "uwuclxdy", 1000),
-            ("1002-0", "D3", 1002),
-            ("1003-0", "D3", 1003),
+            (1002, "D3", "live_session", "claude"),
+            (1003, "uwuclxdy", "live_session", "claude"),
         ],
     );
     assert!(
@@ -3150,39 +3312,54 @@ fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
     );
     assert!(
         token_line(&lines).contains("--token clauth=uwuclxdy"),
-        "the sweep climbs past the mcp to the pane's supervisor: {}",
+        "the sweep skips the delegate child and climbs through the mcp: {}",
         lines[0]
     );
 }
 
-/// Two rows carrying one pid — the D2/DS4 aliasing measured live 2026-09-03,
-/// a finished delegate's stale row beside a newer one — resolve to the
-/// NEWEST, never the alphabetically-first file. The ids sort so the stale one
-/// is alphabetically first: the old `head -n 1` picks it, mtime picks the
-/// live one.
+/// The sweep keeps a bare login's answer only while no pid gives a row: a
+/// global answer earlier in the process list loses to the session's own row.
 #[cfg(unix)]
 #[test]
-fn two_rows_on_one_pid_resolve_to_the_newest() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
-    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+fn the_compat_sweep_prefers_a_row_over_a_global_answer() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"},{"pid":1002,"ppid":1,"command":"clauth"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let lines = report_profile_resolve_run(
         info,
         ps,
-        &[("1823355-1", "D2", 1000), ("1823355-3", "DS4", 1000)],
-        Some("1823355-1"),
+        &[
+            (1001, "fit", "global", "claude"),
+            (1002, "work", "live_session", "claude"),
+        ],
     );
     assert!(
-        token_line(&lines).contains("--token clauth=DS4"),
-        "the newest row wins over the stale one: {}",
+        token_line(&lines).contains("--token clauth=work"),
+        "the session row outranks the bare login: {}",
         lines[0]
     );
 }
 
-/// A codex pane running `clauth start <name>` names that profile. The registry
-/// walk is harness-blind (a codex row is keyed on its `clauth start` supervisor
-/// like a claude one), so the only thing that kept codex panes untagged was the
-/// agent gate; and a codex pane gets a watcher like a claude pane, because a
-/// codex chain rotates between sessions with no herdr event either.
+/// With no pid giving a row, the sweep takes the first bare-login answer of
+/// the pane's own harness rather than falling through to silence.
+#[cfg(unix)]
+#[test]
+fn the_compat_sweep_takes_a_global_answer_when_no_pid_gives_a_row() {
+    let info =
+        r#"{"process_info":{"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(info, ps, &[(1001, "fit", "global", "claude")]);
+    assert!(
+        token_line(&lines).contains("--token clauth=fit"),
+        "the bare login is the compat answer: {}",
+        lines[0]
+    );
+}
+
+/// A codex pane running `clauth start <name>` names that profile: the pid join
+/// is harness-blind, and a codex pane gets a watcher like a claude pane, since
+/// a codex chain rotates between sessions with no herdr event either.
 #[cfg(unix)]
 #[test]
 fn a_codex_pane_running_a_clauth_session_names_its_profile() {
@@ -3190,12 +3367,10 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (lines, watcher_spawned) = report_profile_resolve_run_as(
         r#"{"agent":"codex"}"#,
-        None,
         "off",
         info,
         ps,
-        &[("1000-0", "work", 1000)],
-        None,
+        &[(1000, "work", "live_session", "codex")],
     );
     assert!(
         token_line(&lines).contains("--token clauth=work"),
@@ -3206,10 +3381,8 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
 }
 
 /// A bare codex pane (foreground present, no registered session) answers the
-/// ADOPTED login — the profile `~/.codex/auth.json` links into — and never
-/// `clauth which`, which answers the Claude Code side (`fit` here) for a caller
-/// holding no `CODEX_HOME`: that is a different harness's account painted on
-/// a codex pane.
+/// ADOPTED login and never the Claude Code account (`fit` here): that is a
+/// different harness's account painted on a codex pane.
 #[cfg(unix)]
 #[test]
 fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
@@ -3217,12 +3390,10 @@ fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (lines, _) = report_profile_resolve_run_as(
         r#"{"agent":"codex"}"#,
-        Some("work"),
         "off",
         info,
         ps,
-        &[],
-        None,
+        &[(1001, "work", "codex_adopted", "codex")],
     );
     assert!(
         token_line(&lines).contains("--token clauth=work"),
@@ -3233,15 +3404,15 @@ fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
 
 /// A bare codex pane whose login is NOT adopted publishes the token clear
 /// instead of leaving a stale tag standing: the empty resolution flows through
-/// the off-side clear branch, and the Claude Code fallback (`clauth which` →
-/// `fit`) never leaks onto it.
+/// the off-side clear branch, and the Claude Code account (`fit`) never leaks
+/// onto it.
 #[cfg(unix)]
 #[test]
 fn an_unadopted_codex_pane_publishes_the_token_clear() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (lines, _watcher_spawned) =
-        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, "off", info, ps, &[]);
     let line = token_line(&lines);
     assert!(
         line.contains("--clear-token clauth"),
@@ -3266,7 +3437,7 @@ fn an_unadopted_codex_pane_spawns_a_watcher() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (_lines, watcher_spawned) =
-        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, "off", info, ps, &[]);
     assert!(
         watcher_spawned,
         "an unadopted codex pane still gets a watcher (the spawn gates on pane, not profile)"
@@ -3324,6 +3495,56 @@ struct ChainSetup {
     agent_file: std::path::PathBuf,
 }
 
+/// The chain tests' `clauth` shim: `which --pid` answers what the real
+/// resolver would for the pane's CURRENT live agent (the sandbox's `agent`
+/// file, which the watcher re-reads every tick), and the config knobs answer
+/// the caller's values. The chain tests pin the watcher's re-report and the
+/// clear, never the join.
+#[cfg(unix)]
+fn chain_clauth_shim(border_label: &str) -> String {
+    format!(
+        r#"if [ "$1" = which ]; then
+    agent=$(cat "$(dirname "$0")/agent" 2>/dev/null)
+    profile=""
+    source=""
+    harness=""
+    case "$agent" in
+        claude) profile=fit source=global harness=claude ;;
+        codex)
+            harness=codex
+            link=$(readlink "$HOME/.codex/auth.json" 2>/dev/null) || link=""
+            case "$link" in
+                "$HOME/.clauth/profiles/"*/auth.json)
+                    p=${{link#"$HOME/.clauth/profiles/"}}
+                    p=${{p%/auth.json}}
+                    case "$p" in '' | */*) ;; *) profile=$p source=codex_adopted ;; esac
+                    ;;
+            esac
+            ;;
+    esac
+    if [ "$4" = --json ]; then
+        if [ -n "$profile" ]; then
+            printf '{{"profile":"%s","source":"%s","harness":"%s"}}\n' "$profile" "$source" "$harness"
+        else
+            printf '{{"profile":null,"source":null,"harness":null}}\n'
+        fi
+    elif [ -n "$profile" ]; then
+        printf '%s\n' "$profile"
+    else
+        printf 'unknown\n'
+    fi
+    exit 0
+fi
+case "$1:$4" in
+  herdr:pane_tag) echo on ;;
+  herdr:border_label) echo {border_label} ;;
+  herdr:tag_watch_secs) echo 1 ;;
+esac
+exit 0
+"#
+    )
+}
+
 #[cfg(unix)]
 fn chain_setup(adopted_codex: Option<&str>, initial_agent: &str) -> ChainSetup {
     chain_setup_labeled(adopted_codex, initial_agent, "off")
@@ -3358,13 +3579,7 @@ fn chain_setup_labeled(
         "ps",
         "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n",
     );
-    write_shim(
-        home.home(),
-        "clauth",
-        &format!(
-            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
-        ),
-    );
+    write_shim(home.home(), "clauth", &chain_clauth_shim(border_label));
     std::fs::create_dir_all(home.home().join("state")).expect("state dir");
     let report = home.home().join("report.log");
     ChainSetup {
@@ -3777,7 +3992,7 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     write_shim(
         home.home(),
         "clauth",
-        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+        &clauth_shim(&[(1001, "fit", "global", "claude")], "on", "off"),
     );
     let out = std::process::Command::new("sh")
         .arg(concat!(
@@ -3828,10 +4043,10 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     );
 }
 
-/// A claude-arm failure (`clauth which` exiting non-zero) is not a definitive
-/// empty resolution: it publishes nothing and spawns no watcher, whatever the
-/// caller. `clauth which` prints `unknown` at exit 0 when nothing resolves, so
-/// an empty claude arm is always a failure.
+/// A claude-arm failure (`clauth which --pid` exiting non-zero) is not a
+/// definitive empty resolution: it publishes nothing and spawns no watcher,
+/// whatever the caller. `which --pid` prints `unknown` at exit 0 when nothing
+/// resolves, so an empty claude arm is always a failure.
 #[cfg(unix)]
 #[test]
 fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
@@ -3853,7 +4068,7 @@ fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
     write_shim(
         home.home(),
         "clauth",
-        "case \"$1:$4\" in\n  which:) exit 1 ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+        "if [ \"$1\" = which ]; then exit 1; fi\ncase \"$1:$4\" in\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
     );
     let out = std::process::Command::new("sh")
         .arg(concat!(
@@ -3908,7 +4123,7 @@ fn an_empty_codex_resolution_with_border_label_on_publishes_the_display_agent_cl
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (lines, _watcher_spawned) =
-        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "on", info, ps, &[], None);
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, "on", info, ps, &[]);
     let line = token_line(&lines);
     assert_eq!(
         line, "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent",

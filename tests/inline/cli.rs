@@ -770,11 +770,17 @@ fn enable_takes_exactly_one_name() {
 fn which_and_sessions_take_only_json() {
     assert!(matches!(
         command(&["which"]),
-        Command::Which { json: false }
+        Command::Which {
+            json: false,
+            pid: None
+        }
     ));
     assert!(matches!(
         command(&["which", "--json"]),
-        Command::Which { json: true }
+        Command::Which {
+            json: true,
+            pid: None
+        }
     ));
     assert!(matches!(
         command(&["sessions", "--json"]),
@@ -1372,7 +1378,13 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
     );
     let cli = parse(&["--theme=compatible", "which", "--json"]).expect("ahead of a subcommand");
     assert_eq!(cli.theme, Some(ThemeArg::Compatible));
-    assert!(matches!(cli.command, Some(Command::Which { json: true })));
+    assert!(matches!(
+        cli.command,
+        Some(Command::Which {
+            json: true,
+            pid: None
+        })
+    ));
 
     assert_eq!(
         parse_exit_code(&["--theme", "bogus"]),

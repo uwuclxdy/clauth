@@ -208,6 +208,16 @@ pub(crate) enum Command {
         /// Emit JSON instead of the plain name.
         #[arg(long)]
         json: bool,
+        /// Resolve the account a running process spends instead, by pid
+        ///
+        /// Walks the process's ancestors for a live `clauth start` or
+        /// `resume` session, then falls back to the global login a bare
+        /// `claude` reads, or the adopted login a bare `codex` runs on. A
+        /// codex adoption is read from THIS caller's CODEX_HOME (default
+        /// ~/.codex), never the target process's environment. Unsupported on
+        /// Windows.
+        #[arg(long, value_name = "PID")]
+        pid: Option<u32>,
     },
 
     /// List accounts as a table with each profile's usage

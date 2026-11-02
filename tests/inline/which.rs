@@ -1902,3 +1902,633 @@ fn a_credentials_file_with_a_large_mcp_oauth_block_still_resolves_its_account() 
         "a credentials file padded past the job-record cap still attributes its login"
     );
 }
+
+// ── `which --pid` ──────────────────────────────────────────────────────────────
+
+/// A fake process table: pid -> (parent, argv).
+struct FakeProcs(BTreeMap<u32, (u32, Vec<String>)>);
+
+impl FakeProcs {
+    fn new(rows: &[(u32, u32, &str)]) -> Self {
+        Self(
+            rows.iter()
+                .map(|&(pid, parent, argv)| {
+                    (pid, (parent, argv.split(' ').map(str::to_owned).collect()))
+                })
+                .collect(),
+        )
+    }
+}
+
+impl ProcTable for FakeProcs {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        self.0.get(&pid).map(|(parent, _)| *parent)
+    }
+    fn argv(&self, pid: u32) -> Option<Vec<String>> {
+        self.0.get(&pid).map(|(_, argv)| argv.clone())
+    }
+}
+
+/// A registry, profiles dir and codex home under one temp dir.
+struct PidFixture {
+    dir: tempfile::TempDir,
+}
+
+impl PidFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["live_sessions", "profiles", "codex"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        Self { dir }
+    }
+    fn registry(&self) -> PathBuf {
+        self.dir.path().join("live_sessions")
+    }
+    fn profiles(&self) -> PathBuf {
+        self.dir.path().join("profiles")
+    }
+    fn codex_home(&self) -> PathBuf {
+        self.dir.path().join("codex")
+    }
+    /// Files `row` as `<sid>.json`, compact like the registry writes it, and
+    /// returns its path.
+    fn file_row(&self, row: &crate::live_sessions::LiveSession) -> PathBuf {
+        let path = self.registry().join(format!("{}.json", row.session_id));
+        std::fs::write(&path, serde_json::to_vec(row).unwrap()).unwrap();
+        path
+    }
+    fn resolve(&self, pid: u32, procs: &FakeProcs) -> Option<PidResolution> {
+        self.resolve_with_global(pid, procs, None)
+    }
+    fn resolve_with_global(
+        &self,
+        pid: u32,
+        procs: &FakeProcs,
+        global: Option<&str>,
+    ) -> Option<PidResolution> {
+        let registry = self.registry();
+        let profiles = self.profiles();
+        let codex_home = self.codex_home();
+        let global = global.map(str::to_owned);
+        let global_fn = move || global.clone();
+        let ctx = PidContext {
+            registry: &registry,
+            profiles: &profiles,
+            codex_home: &codex_home,
+            global: &global_fn,
+        };
+        resolve_pid(pid, procs, &ctx)
+    }
+}
+
+fn row_at(sid: &str, profile: &str, pid: u32) -> crate::live_sessions::LiveSession {
+    let mut row = crate::testutil::live_row(sid, profile);
+    row.pid = pid;
+    row
+}
+
+fn from_row(profile: &str, harness: crate::harness::Harness) -> Option<PidResolution> {
+    Some(PidResolution {
+        profile: profile.to_owned(),
+        source: PidSource::LiveSession,
+        harness,
+    })
+}
+
+#[test]
+fn a_swapped_start_supervisor_names_its_current_member() {
+    let fx = PidFixture::new();
+    let mut row = row_at("s1", "alpha", 500);
+    row.current_member = Some("beta".to_owned());
+    fx.file_row(&row);
+    let procs = FakeProcs::new(&[(500, 1, "clauth start alpha --with-fallback")]);
+    assert_eq!(
+        fx.resolve(500, &procs),
+        from_row("beta", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn an_unswapped_row_names_its_start_profile() {
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "alpha", 500));
+    let procs = FakeProcs::new(&[(500, 1, "clauth start alpha")]);
+    assert_eq!(
+        fx.resolve(500, &procs),
+        from_row("alpha", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn the_claude_child_of_a_supervisor_resolves_through_its_parent() {
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "alpha", 500));
+    let procs = FakeProcs::new(&[
+        (500, 1, "clauth start alpha"),
+        (501, 500, "/home/u/.local/bin/claude --resume x"),
+    ]);
+    assert_eq!(
+        fx.resolve(501, &procs),
+        from_row("alpha", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn a_row_keyed_on_clauth_mcp_never_names_the_pane() {
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "alpha", 500));
+    // A delegate run the pane hosts, keyed on the pane's `clauth mcp`.
+    fx.file_row(&row_at("s2", "delegate-acct", 600));
+    let procs = FakeProcs::new(&[
+        (500, 1, "clauth start alpha"),
+        (501, 500, "claude"),
+        (600, 501, "clauth mcp"),
+        (650, 600, "node /some/tool.js"),
+    ]);
+    assert_eq!(
+        fx.resolve(650, &procs),
+        from_row("alpha", crate::harness::Harness::Claude),
+        "the climb passes through the mcp hop to the pane's own supervisor"
+    );
+    assert_eq!(
+        fx.resolve(500, &procs),
+        from_row("alpha", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn an_mcp_hop_spelled_with_a_full_path_is_skipped_too() {
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "alpha", 500));
+    fx.file_row(&row_at("s2", "delegate-acct", 600));
+    let procs = FakeProcs::new(&[
+        (500, 1, "clauth start alpha"),
+        (600, 500, "/home/u/.cargo/bin/clauth mcp --stdio"),
+        (650, 600, "node /some/tool.js"),
+    ]);
+    assert_eq!(
+        fx.resolve(650, &procs),
+        from_row("alpha", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn a_pid_never_matches_a_row_whose_pid_it_prefixes() {
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "alpha", 1234));
+    let procs = FakeProcs::new(&[(123, 1, "bash"), (1234, 1, "clauth start alpha")]);
+    assert_eq!(fx.resolve(123, &procs), None);
+}
+
+#[test]
+fn the_newest_row_wins_on_a_recycled_pid() {
+    // Two orders, so neither a name-order nor a reverse-name-order pick can
+    // pass both.
+    let now = std::time::SystemTime::now();
+    let earlier = now - std::time::Duration::from_secs(600);
+    let procs = FakeProcs::new(&[(500, 1, "clauth start fresh")]);
+    for (first, second) in [
+        (("s-a", "stale"), ("s-b", "fresh")),
+        (("s-a", "fresh"), ("s-b", "stale")),
+    ] {
+        let fx = PidFixture::new();
+        for (sid, profile) in [first, second] {
+            let path = fx.file_row(&row_at(sid, profile, 500));
+            crate::testutil::set_mtime(&path, if profile == "fresh" { now } else { earlier });
+        }
+        assert_eq!(
+            fx.resolve(500, &procs),
+            from_row("fresh", crate::harness::Harness::Claude),
+            "rows {first:?} {second:?}"
+        );
+    }
+}
+
+#[test]
+fn a_row_from_before_the_harness_key_reads_claude() {
+    let fx = PidFixture::new();
+    let mut value = serde_json::to_value(row_at("s1", "alpha", 500)).unwrap();
+    value.as_object_mut().unwrap().remove("harness").unwrap();
+    std::fs::write(
+        fx.registry().join("s1.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    let procs = FakeProcs::new(&[(500, 1, "clauth start alpha")]);
+    assert_eq!(
+        fx.resolve(500, &procs),
+        from_row("alpha", crate::harness::Harness::Claude)
+    );
+}
+
+#[test]
+fn a_codex_row_reads_codex() {
+    let fx = PidFixture::new();
+    let mut row = row_at("s1", "cx", 500);
+    row.harness = crate::harness::Harness::Codex;
+    fx.file_row(&row);
+    let procs = FakeProcs::new(&[(500, 1, "clauth start cx")]);
+    assert_eq!(
+        fx.resolve(500, &procs),
+        from_row("cx", crate::harness::Harness::Codex)
+    );
+}
+
+#[test]
+fn the_walk_stops_after_eight_processes() {
+    // Chain 10 -> 11 -> ... -> 20 (each pid's parent is pid + 1): a row on the
+    // eighth process climbed (pid 17) resolves, one on the ninth (pid 18) does not.
+    let chain: Vec<(u32, u32, &str)> = (10..20).map(|pid| (pid, pid + 1, "bash")).collect();
+    let procs = FakeProcs::new(&chain);
+
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "deep", 17));
+    assert_eq!(
+        fx.resolve(10, &procs),
+        from_row("deep", crate::harness::Harness::Claude)
+    );
+
+    let fx = PidFixture::new();
+    fx.file_row(&row_at("s1", "deep", 18));
+    assert_eq!(fx.resolve(10, &procs), None);
+}
+
+#[test]
+fn a_bare_claude_names_the_global_login() {
+    let fx = PidFixture::new();
+    let global = Some(PidResolution {
+        profile: "glob".to_owned(),
+        source: PidSource::Global,
+        harness: crate::harness::Harness::Claude,
+    });
+    for argv in [
+        "claude",
+        "/home/u/.local/bin/claude --continue",
+        "/home/u/.local/share/claude/versions/2.1.300 --resume x",
+        "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+    ] {
+        let procs = FakeProcs::new(&[(700, 1, argv)]);
+        assert_eq!(
+            fx.resolve_with_global(700, &procs, Some("glob")),
+            global,
+            "argv {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_claude_with_no_global_owner_is_unknown() {
+    let fx = PidFixture::new();
+    let procs = FakeProcs::new(&[(700, 1, "claude")]);
+    assert_eq!(fx.resolve_with_global(700, &procs, None), None);
+}
+
+#[test]
+fn a_process_that_is_no_agent_is_unknown() {
+    let fx = PidFixture::new();
+    for argv in [
+        "bash",
+        "vim /home/u/.codex/worktrees/x/claude",
+        "rg codex",
+        "clauth",
+        "clauth list",
+    ] {
+        let procs = FakeProcs::new(&[(700, 1, argv)]);
+        assert_eq!(
+            fx.resolve_with_global(700, &procs, Some("glob")),
+            None,
+            "argv {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn a_clauth_start_with_no_row_yet_is_unknown_never_global() {
+    let fx = PidFixture::new();
+    for argv in ["clauth start alpha", "clauth resume abc"] {
+        let procs = FakeProcs::new(&[(500, 1, argv)]);
+        assert_eq!(
+            fx.resolve_with_global(500, &procs, Some("glob")),
+            None,
+            "argv {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn a_vanished_process_is_unknown() {
+    let fx = PidFixture::new();
+    let procs = FakeProcs::new(&[]);
+    assert_eq!(fx.resolve_with_global(700, &procs, Some("glob")), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bare_codex_on_an_adopted_login_names_its_profile() {
+    let fx = PidFixture::new();
+    let target = fx.profiles().join("cx").join("auth.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"{}").unwrap();
+    std::os::unix::fs::symlink(&target, fx.codex_home().join("auth.json")).unwrap();
+    let want = Some(PidResolution {
+        profile: "cx".to_owned(),
+        source: PidSource::CodexAdopted,
+        harness: crate::harness::Harness::Codex,
+    });
+    for argv in [
+        "codex",
+        "/home/u/.local/bin/codex exec hi",
+        "node /usr/lib/node_modules/@openai/codex/bin/codex.js",
+    ] {
+        let procs = FakeProcs::new(&[(800, 1, argv)]);
+        assert_eq!(
+            fx.resolve_with_global(800, &procs, Some("glob")),
+            want,
+            "argv {argv:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_adoption_link_resolves_against_the_codex_home() {
+    let fx = PidFixture::new();
+    let target = fx.profiles().join("cx").join("auth.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"{}").unwrap();
+    std::os::unix::fs::symlink(
+        "../profiles/cx/auth.json",
+        fx.codex_home().join("auth.json"),
+    )
+    .unwrap();
+    let procs = FakeProcs::new(&[(800, 1, "codex")]);
+    assert_eq!(
+        fx.resolve(800, &procs),
+        Some(PidResolution {
+            profile: "cx".to_owned(),
+            source: PidSource::CodexAdopted,
+            harness: crate::harness::Harness::Codex,
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bare_codex_on_a_login_never_adopted_is_unknown() {
+    let procs = FakeProcs::new(&[(800, 1, "codex")]);
+
+    // A plain file, as a login clauth never adopted leaves it.
+    let fx = PidFixture::new();
+    std::fs::write(fx.codex_home().join("auth.json"), b"{}").unwrap();
+    assert_eq!(fx.resolve_with_global(800, &procs, Some("glob")), None);
+
+    // A link outside the profiles dir.
+    let fx = PidFixture::new();
+    let elsewhere = fx.dir.path().join("elsewhere.json");
+    std::fs::write(&elsewhere, b"{}").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fx.codex_home().join("auth.json")).unwrap();
+    assert_eq!(fx.resolve_with_global(800, &procs, Some("glob")), None);
+
+    // A link to a nested path under the profiles dir.
+    let fx = PidFixture::new();
+    let nested = fx.profiles().join("a").join("b").join("auth.json");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    std::fs::write(&nested, b"{}").unwrap();
+    std::os::unix::fs::symlink(&nested, fx.codex_home().join("auth.json")).unwrap();
+    assert_eq!(fx.resolve_with_global(800, &procs, Some("glob")), None);
+
+    // No auth.json at all.
+    let fx = PidFixture::new();
+    assert_eq!(fx.resolve_with_global(800, &procs, Some("glob")), None);
+}
+
+// ── `which --pid` CLI emit and the real process table ────────────────────────
+
+#[test]
+fn which_pid_parses_beside_json() {
+    use clap::Parser as _;
+    for (args, want_json, want_pid) in [
+        (&["clauth", "which", "--pid", "12"][..], false, Some(12)),
+        (
+            &["clauth", "which", "--json", "--pid", "12"][..],
+            true,
+            Some(12),
+        ),
+        (
+            &["clauth", "which", "--pid", "12", "--json"][..],
+            true,
+            Some(12),
+        ),
+    ] {
+        let cli = crate::cli::Cli::try_parse_from(args).expect("the pid form parses");
+        match cli.command {
+            Some(crate::cli::Command::Which { json, pid }) => {
+                assert_eq!((json, pid), (want_json, want_pid), "args {args:?}");
+            }
+            other => panic!("`which` expected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn pid_json_view_names_the_resolved_answer() {
+    let resolved = PidResolution {
+        profile: "alpha".to_owned(),
+        source: PidSource::CodexAdopted,
+        harness: crate::harness::Harness::Codex,
+    };
+    assert_eq!(
+        pid_json_view(Some(&resolved)),
+        serde_json::json!({
+            "profile": "alpha",
+            "source": "codex_adopted",
+            "harness": "codex",
+        })
+    );
+}
+
+#[test]
+fn pid_json_view_carries_the_three_keys_null_when_unresolved() {
+    let value = pid_json_view(None);
+    let object = value.as_object().expect("an object");
+    let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["profile", "source", "harness"]);
+    assert!(object.values().all(serde_json::Value::is_null));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_proc_stat_reader_cuts_after_the_last_close_paren() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("1000");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::write(entry.join("stat"), "1000 (a) b) S 4321 1000 1000 0 -1\n").unwrap();
+
+    assert_eq!(parent_at(dir.path(), 1000), Some(4321));
+    assert_eq!(parent_at(dir.path(), 999), None, "a vanished pid");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_proc_cmdline_reader_splits_the_nul_separated_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("700");
+    std::fs::create_dir_all(&entry).unwrap();
+
+    std::fs::write(entry.join("cmdline"), b"clauth\0mcp\0--stdio\0").unwrap();
+    assert_eq!(
+        argv_at(dir.path(), 700),
+        Some(vec![
+            "clauth".to_owned(),
+            "mcp".to_owned(),
+            "--stdio".to_owned()
+        ])
+    );
+
+    // An empty argument keeps its slot, so the mcp matcher never reads the
+    // next argument as the subcommand.
+    std::fs::write(entry.join("cmdline"), b"clauth\0\0mcp\0").unwrap();
+    assert_eq!(
+        argv_at(dir.path(), 700),
+        Some(vec!["clauth".to_owned(), String::new(), "mcp".to_owned()])
+    );
+
+    // A zombie's empty cmdline names no process at all.
+    std::fs::write(entry.join("cmdline"), b"").unwrap();
+    assert_eq!(argv_at(dir.path(), 700), None);
+    assert_eq!(argv_at(dir.path(), 999), None, "a vanished pid");
+}
+
+/// A bare `claude` spends the GLOBAL login, whoever asks: a caller inside a
+/// `clauth start` session (its own `CLAUDE_CONFIG_DIR` naming a runtime) must
+/// not claim the bare process for its own profile.
+#[test]
+fn a_bare_claude_answers_the_global_login_for_a_caller_inside_a_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = config_with(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("global")),
+            blank_profile(&crate::profile::ProfileName::from("started")),
+        ],
+        Some("global"),
+    );
+    let runtime_dir = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("started")
+        .join("runtime-4242-0");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime_dir);
+    assert_eq!(
+        resolve_active(&config).map(|(name, _)| name),
+        Some("started".to_string()),
+        "fixture control: the caller's own env names its runtime profile"
+    );
+    let procs = FakeProcs::new(&[(700, 1, "claude")]);
+    assert_eq!(
+        resolve_pid_env(700, &procs, &|| Some(config.clone())).unwrap(),
+        Some(PidResolution {
+            profile: "global".to_owned(),
+            source: PidSource::Global,
+            harness: crate::harness::Harness::Claude,
+        })
+    );
+}
+
+/// A registry row answers without the config: a `profiles.toml` that cannot
+/// load costs a bare `claude` its global answer and nothing else.
+#[test]
+fn a_registry_row_answers_without_loading_the_config() {
+    let home = crate::testutil::HomeSandbox::new();
+    let registry = home.home().join(".clauth").join("live_sessions");
+    std::fs::create_dir_all(&registry).unwrap();
+    let mut row = crate::testutil::live_row("s1", "alpha");
+    row.pid = 500;
+    std::fs::write(registry.join("s1.json"), serde_json::to_vec(&row).unwrap()).unwrap();
+    let procs = FakeProcs::new(&[(500, 1, "clauth start alpha"), (700, 1, "claude")]);
+    let loads = std::cell::Cell::new(0);
+    let unloadable = || {
+        loads.set(loads.get() + 1);
+        None
+    };
+    assert_eq!(
+        resolve_pid_env(500, &procs, &unloadable).unwrap(),
+        Some(PidResolution {
+            profile: "alpha".to_owned(),
+            source: PidSource::LiveSession,
+            harness: crate::harness::Harness::Claude,
+        })
+    );
+    assert_eq!(loads.get(), 0, "a row hit never loads the config");
+    assert_eq!(resolve_pid_env(700, &procs, &unloadable).unwrap(), None);
+}
+
+/// A bare codex's adoption is read from the caller's `CODEX_HOME`, else
+/// `~/.codex`.
+#[cfg(unix)]
+#[test]
+fn a_bare_codex_reads_the_adoption_from_the_callers_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = config_with(Vec::new(), None);
+    let adopt = |link_dir: &std::path::Path, profile: &str| {
+        let target = home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join(profile)
+            .join("auth.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::create_dir_all(link_dir).unwrap();
+        std::os::unix::fs::symlink(&target, link_dir.join("auth.json")).unwrap();
+    };
+    let default_home = home.home().join(".codex");
+    let custom_home = home.home().join("custom-codex");
+    adopt(&default_home, "dflt");
+    adopt(&custom_home, "cust");
+    let procs = FakeProcs::new(&[(800, 1, "codex")]);
+    let codex = |profile: &str| {
+        Some(PidResolution {
+            profile: profile.to_owned(),
+            source: PidSource::CodexAdopted,
+            harness: crate::harness::Harness::Codex,
+        })
+    };
+
+    {
+        let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", None)]);
+        assert_eq!(
+            resolve_pid_env(800, &procs, &|| Some(config.clone())).unwrap(),
+            codex("dflt")
+        );
+    }
+    {
+        let _env =
+            crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom_home.as_os_str()))]);
+        assert_eq!(
+            resolve_pid_env(800, &procs, &|| Some(config.clone())).unwrap(),
+            codex("cust")
+        );
+    }
+}
+
+/// The host's process table reads the real `/proc` whatever the environment
+/// says: no variable redirects what `which --pid` reports about a process.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_process_table_reads_the_real_proc_whatever_the_env_says() {
+    let home = crate::testutil::HomeSandbox::new();
+    let empty = tempfile::tempdir().unwrap();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[("CLAUTH_PROC_ROOT", Some(empty.path().as_os_str()))],
+    );
+    let me = std::process::id();
+    assert_eq!(
+        SystemProcs.parent(me),
+        Some(std::os::unix::process::parent_id())
+    );
+    let argv = SystemProcs.argv(me).expect("this test's own argv");
+    assert_eq!(argv.first(), std::env::args().next().as_ref());
+}

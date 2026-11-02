@@ -4189,6 +4189,8 @@ pub(crate) struct ServicesState {
     /// the result lands through `drain_service_probes`, and until then the cached
     /// value renders. A tab switch and the per-tick refresh reuse it.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
+    /// Cached Rex watcher liveness: `None` = never checked.
+    pub(crate) rex_watcher: Option<bool>,
     /// The worker running [`crate::herdr::probe`].
     pub(crate) herdr_probe: ProbeWorker<Option<crate::herdr::HerdrProbe>>,
     /// Cached standalone-shunt readout, for the `shunt` row while no gateway
@@ -4400,6 +4402,7 @@ impl Default for ServicesState {
             cc_version: None,
             mcp_boot: None,
             herdr: None,
+            rex_watcher: None,
             herdr_probe: ProbeWorker::new(crate::herdr::probe),
             standalone: None,
             standalone_probe: ProbeWorker::new(standalone_probe),
@@ -9931,7 +9934,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
             }
             // Recompute on focus; the cached `claude --version` is not
             // re-probed, but the shunt plan and pool read re-run so a card
-            // left stale by an action elsewhere reads fresh on re-entry.
+            // left stale by an action elsewhere reads fresh on re-entry, and
+            // the Rex watcher is asked again.
+            app.services.rex_watcher = None;
             recompute_services_checks(app, false, ShuntRefresh::Restart);
         }
     }
@@ -12903,6 +12908,75 @@ pub(crate) fn herdr_check(
     }
 }
 
+/// The Services tab's `rex` row (experimental, read-only): the clauth plugin
+/// beside Rex's config and whether a pane-label watcher runs.
+pub(crate) fn rex_check(status: &crate::rex::RexStatus) -> Check {
+    let this = env!("CARGO_PKG_VERSION");
+    let mut detail = Vec::new();
+    let health = match &status.plugin {
+        crate::rex::PluginDir::Absent => {
+            detail.push("plugin: not installed".to_string());
+            Health::Idle
+        }
+        crate::rex::PluginDir::Foreign => {
+            detail.push("plugin: not written by clauth".to_string());
+            Health::Warn
+        }
+        crate::rex::PluginDir::Linked { target } => {
+            detail.push("plugin: linked (local)".to_string());
+            if let Some(target) = target {
+                detail.push(format!(
+                    "root: {}",
+                    escape_control(&target.to_string_lossy())
+                ));
+            }
+            Health::Ok
+        }
+        crate::rex::PluginDir::Managed { version } => match version.as_deref() {
+            Some(version) if version == this => {
+                detail.push(format!(
+                    "plugin: installed (clauth {})",
+                    escape_control(version)
+                ));
+                Health::Ok
+            }
+            Some(version) => {
+                detail.push(format!(
+                    "plugin: written by clauth {}, this is {}",
+                    escape_control(version),
+                    escape_control(this)
+                ));
+                Health::Warn
+            }
+            None => {
+                detail.push(format!(
+                    "plugin: written by clauth unknown, this is {}",
+                    escape_control(this)
+                ));
+                Health::Warn
+            }
+        },
+    };
+    detail.push(format!(
+        "watcher: {}",
+        if status.watcher_running {
+            "running"
+        } else {
+            "not running"
+        }
+    ));
+    detail.push("experimental: may change in any release".to_string());
+    Check {
+        label: "rex",
+        health,
+        detail,
+        fix: None,
+        problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    }
+}
+
 /// Whether a recompute re-runs the shunt card's plan and pool workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShuntRefresh {
@@ -12927,7 +13001,9 @@ fn adopt_shunt_record(app: &mut App, record: Option<crate::gateway::GatewayRecor
 
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
 /// `delegates` (its detail is the job list), `plugin` (the four integration
-/// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
+/// readouts in one detail), `rex`, `herdr`. Every read is a local FS/`PATH`
+/// check except the Rex watcher's process-table read (a `ps` spawn off Linux),
+/// which re-runs only when `refresh_version` is set or its cache is empty;
 /// `claude --version` and the `clauth mcp` boot probe run only when
 /// `refresh_version` is set. Synchronous, except the herdr probe, which it
 /// starts on a worker when none is cached or on `r`, and the shunt plan/pool
@@ -12996,7 +13072,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         app.services.herdr_probe.start();
     }
 
-    let mut checks: Vec<Check> = Vec::with_capacity(4);
+    let mut checks: Vec<Check> = Vec::with_capacity(5);
 
     // shunt row — the gateway's control surface: the daemon's feed when one is
     // fresh, else the record-only verdict. With no gateway adopted, the
@@ -13172,6 +13248,37 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     let (plugin_check, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     let plugin_health = plugin_check.health;
     checks.push(plugin_check);
+
+    // rex row — read-only and experimental, pushed above herdr so that row's
+    // later landing never moves a selection resting here. The plugin dir is a
+    // cheap local FS read on every recompute; the watcher reads the process
+    // table (`ps` off Linux), so it is re-asked only on `r` or with no cached
+    // answer. No row without a home or Rex's config dir.
+    if let Ok(home) = crate::profile::home_dir() {
+        let paths = crate::rex::Paths::resolve(
+            std::env::var_os("REX_CONFIG"),
+            std::env::var_os("XDG_CONFIG_HOME"),
+            &home,
+        );
+        if let Some(plugin) = crate::rex::plugin_status(&paths) {
+            let watcher_running = match app.services.rex_watcher {
+                Some(running) if !refresh_version => running,
+                _ => {
+                    let state_dir =
+                        crate::rex::state_dir(std::env::var_os("XDG_STATE_HOME"), &home);
+                    let running =
+                        crate::rex::watcher_running(&state_dir, &crate::which::SystemProcs);
+                    app.services.rex_watcher = Some(running);
+                    running
+                }
+            };
+            checks.push(rex_check(&crate::rex::RexStatus {
+                plugin,
+                watcher_running,
+            }));
+        }
+    }
+
     let herdr_health = match herdr {
         Some((herdr_check, config)) => {
             let health = herdr_check.health;

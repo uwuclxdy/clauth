@@ -63281,3 +63281,36 @@ fn an_overwrite_after_a_peer_saved_the_login_elsewhere_captures_nothing() {
         );
     }
 }
+
+/// Entering the Services tab asks the Rex watcher again; only the 1 s tick
+/// reuses the cached answer.
+#[test]
+fn entering_the_services_tab_rechecks_the_rex_watcher() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    // No pidfile exists, so a real check reads `not running`.
+    app.services.rex_watcher = Some(true);
+    super::switch_tab(&mut app, super::Tab::Services);
+    let watcher = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "rex")
+        .and_then(|c| {
+            c.detail
+                .iter()
+                .find(|l| l.starts_with("watcher: "))
+                .cloned()
+        });
+    assert_eq!(watcher.as_deref(), Some("watcher: not running"));
+    assert_eq!(app.services.rex_watcher, Some(false));
+}
