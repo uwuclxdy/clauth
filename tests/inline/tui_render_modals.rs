@@ -37,6 +37,33 @@ fn acknowledge_confirm_renders_on_narrow_terminals() {
     }
 }
 
+/// A confirm sizes its box by the cells its body draws: a detail of 20
+/// lam-alef pairs (20 cells to a whole-string measure, 40 drawn, under the
+/// box cap) gets a box wide enough to hold it on one row, as the same-width
+/// ASCII detail does.
+#[test]
+fn a_lam_alef_confirm_detail_sizes_the_box_by_its_drawn_cells() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState, Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let detail = "لا".repeat(20);
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "go?".into(),
+        detail: Some(detail.clone()),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RotateAll,
+    }));
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains(&detail)),
+        "the 40-cell detail renders on one row: {rows:?}"
+    );
+}
+
 /// An overflowing confirm body scrolls one line with ↓ and one page with
 /// PageDown while the buttons stay pinned; ←/→ still pick the button and Enter
 /// on the default `cancel` closes without running the action.
@@ -4454,6 +4481,16 @@ fn chunk_line_wraps_between_words_and_splits_long_words_by_cells() {
         "a long word splits by cell and loses nothing"
     );
     assert!(rows.iter().all(|r| r.width() <= 4));
+
+    // Three lam-alef pairs: a whole-string measure folds each pair to one cell
+    // (3), the buffer draws every grapheme on its own cell (6), so at a 4-cell
+    // row the line must break after the second pair.
+    let rows = chunk_line(Line::from("لالالا"), 4);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>(),
+        ["لالا", "لا"],
+        "an unmarked lam-alef line wraps by the cells the buffer draws"
+    );
 
     let rows = chunk_line(Line::from("日本語"), 4);
     assert_eq!(rows.len(), 2, "a wide glyph is measured by its cells");

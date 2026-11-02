@@ -511,7 +511,7 @@ fn draw_modal_scrolled(
 ) -> ModalDraw {
     let content_w = lines
         .iter()
-        .map(|body| normalize_tabs(&body.line).width())
+        .map(|body| line_cells(&normalize_tabs(&body.line)))
         .max()
         .unwrap_or(0) as u16;
     let button_w = match &tail.extra {
@@ -570,7 +570,7 @@ fn draw_modal_scrolled(
                 .iter()
                 .any(|s| s.style.bg == Some(theme::bg_hover()));
             if tinted {
-                let fill = inner_w.saturating_sub(line.width());
+                let fill = inner_w.saturating_sub(line_cells(&line));
                 if fill > 0 {
                     line.push_span(Span::styled(
                         " ".repeat(fill),
@@ -757,7 +757,7 @@ type Flat = (String, usize, Style, Option<usize>);
 /// The cells a line draws, summed per grapheme: a whole-string measure folds a
 /// lam-alef cluster to one cell and the buffer draws it as two, so a line that
 /// only looks like it fits would overrun its row.
-fn line_cells(line: &Line<'_>) -> usize {
+pub(super) fn line_cells(line: &Line<'_>) -> usize {
     line.spans
         .iter()
         .map(|span| grapheme_cells(span.content.as_ref()))
@@ -780,12 +780,7 @@ fn chunk_line_units(
     units: &[std::ops::Range<usize>],
 ) -> Vec<Line<'static>> {
     let line = normalize_tabs(&line);
-    let fits = if units.is_empty() {
-        line.width() <= w
-    } else {
-        line_cells(&line) <= w
-    };
-    if fits {
+    if line_cells(&line) <= w {
         return vec![line];
     }
 
@@ -1987,7 +1982,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
 
     let content_w = lines
         .iter()
-        .map(|line| normalize_tabs(line).width())
+        .map(|line| line_cells(&normalize_tabs(line)))
         .max()
         .unwrap_or(0) as u16;
     let width = (content_w + 6)
