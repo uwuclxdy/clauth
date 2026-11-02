@@ -50,12 +50,15 @@ Pass the prompt on stdin when you use `-p`. A variadic `claude` flag would other
 ## Check what is loaded
 
 ```bash
-clauth which          # profile that owns the current session's credentials
-clauth which --json   # plus plan tier, endpoint and live token speed/rate
-clauth list           # account table with cached usage, no network
+clauth which              # profile that owns the current session's credentials
+clauth which --json       # plus plan tier, endpoint and live token speed/rate
+clauth which --pid 4242   # account the running process 4242 spends
+clauth list               # account table with cached usage, no network
 ```
 
-`clauth which --json` carries `tps`: `speed` (float or `null`) and `rate` (float) are the profile's live 10 s figures off the token-speed cache, `session` is the same pair for the current Claude Code session when `CLAUDE_CODE_SESSION_ID` names one the cache holds (else `null`), `peaks.today` is the profile's own today peaks off the cache — `speed` `{value, at, account, model}` (the fastest reply) and `rate` `{value, at}` (the busiest 10 s), each omitted when absent — and `age_secs` is the cache's age; `tps` itself is `null` with no cache or one older than 30 s ([Tokens and cost](Tokens-And-Cost#token-speed)).
+`clauth which --pid <pid>` answers for another process, such as a terminal pane's foreground job. It climbs the process and up to seven of its ancestors for a `clauth start` or `clauth resume` session, passing over a `clauth mcp` server so a delegate it hosts never names the pane, and prints the account that session runs on now, after any fallback move. With no such session, a bare `claude` answers the account owning the global credentials, and a bare `codex` the profile its login is adopted into (`$CODEX_HOME/auth.json`, default `~/.codex/auth.json`, linked onto that profile's store); the adoption is read from the `CODEX_HOME` of the process asking, not the one asked about. Anything else, and a codex login that is not adopted, prints `unknown` at exit 0. `--json` answers `{"profile": "work", "source": "live_session", "harness": "claude"}`, where `source` is `live_session`, `codex_adopted` or `global` and every field is `null` when nothing resolves. It reads `/proc` on Linux and `ps` on macOS, and Windows refuses it.
+
+Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) and `rate` (float) are the profile's live 10 s figures off the token-speed cache, `session` is the same pair for the current Claude Code session when `CLAUDE_CODE_SESSION_ID` names one the cache holds (else `null`), `peaks.today` is the profile's own today peaks off the cache — `speed` `{value, at, account, model}` (the fastest reply) and `rate` `{value, at}` (the busiest 10 s), each omitted when absent — and `age_secs` is the cache's age; `tps` itself is `null` with no cache or one older than 30 s ([Tokens and cost](Tokens-And-Cost#token-speed)).
 
 ## Commands
 
@@ -75,7 +78,7 @@ clauth list           # account table with cached usage, no network
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth limit-reset <profile>` | `--list`, `--yes` | spend one of a codex account's banked usage-limit resets; `--list` shows them and spends nothing ([Codex](Codex#use-a-usage-limit-reset)) |
 | `clauth presets rebind [account…]` | `--yes` | list the model rows a built-in preset would fill: empty, or still on an id an earlier release shipped; `--yes` moves them ([Configuration](Configuration#presets)) |
-| `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
+| `clauth which` | `--json`, `--pid` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile; `--pid <pid>` answers for another running process instead |
 | `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
 | `clauth switch <name>` / `clauth switch <sid> <profile>` | `--list`, `--json` (with `--list`) | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session (its `<sid>` from `clauth switch --list`), picked up at its next request — a session on the account's fixed background tree (`-- --bg` without `--with-fallback`) or a codex session is refused: it stays on its account (an adopted `--with-fallback` background session moves; switching a handed-off one no daemon holds yet fails until a daemon holds it) |
