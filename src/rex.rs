@@ -12,6 +12,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -109,6 +110,14 @@ impl Paths {
             &crate::profile::home_dir()?,
         ))
     }
+}
+
+/// [`state_dir`] off this process's environment.
+fn state_dir_from_env() -> Result<PathBuf> {
+    Ok(state_dir(
+        std::env::var_os("XDG_STATE_HOME"),
+        &crate::profile::home_dir()?,
+    ))
 }
 
 /// What sits at the plugin dir.
@@ -237,29 +246,114 @@ pub(crate) fn watcher_running(state_dir: &Path, procs: &dyn crate::which::ProcTa
     let Ok(entries) = std::fs::read_dir(state_dir) else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-        if !name.starts_with("watch-") || !name.ends_with(".pid") {
-            return false;
-        }
-        let Ok(Some(bytes)) = crate::runtime::read_regular_capped(&entry.path(), PIDFILE_CAP)
-        else {
-            return false;
-        };
-        let Some(pid) = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|body| body.trim().parse::<u32>().ok())
-        else {
-            return false;
-        };
-        procs
-            .argv(pid)
-            .is_some_and(|argv| argv.iter().any(|arg| arg.contains(WATCHER_SCRIPT)))
+    entries
+        .flatten()
+        .any(|entry| live_watcher(&entry.path(), procs).is_some())
+}
+
+/// A pane-label watcher start-watch.sh recorded, still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Watcher {
+    pub(crate) pidfile: PathBuf,
+    pub(crate) pid: u32,
+}
+
+/// The watchers start-watch.sh recorded under `state_dir`, one
+/// `watch-<key>.pid` per Rex server, that still run. start-watch.sh exits
+/// while its pidfile names a live watcher, so one left running would keep the
+/// old files going until its Rex server restarts.
+pub(crate) fn running_watchers(
+    state_dir: &Path,
+    procs: &dyn crate::which::ProcTable,
+) -> Vec<Watcher> {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return Vec::new();
+    };
+    let mut watchers: Vec<Watcher> = entries
+        .flatten()
+        .filter_map(|entry| live_watcher(&entry.path(), procs))
+        .collect();
+    watchers.sort_by_key(|watcher| watcher.pid);
+    watchers
+}
+
+/// The watcher a `watch-*.pid` file names, when its pid still runs the
+/// watcher script. A pid that runs anything else was reused, and is never
+/// taken for one (nor signalled).
+fn live_watcher(pidfile: &Path, procs: &dyn crate::which::ProcTable) -> Option<Watcher> {
+    let name = pidfile.file_name()?.to_str()?;
+    if !name.starts_with("watch-") || !name.ends_with(".pid") {
+        return None;
+    }
+    let bytes = crate::runtime::read_regular_capped(pidfile, PIDFILE_CAP).ok()??;
+    let pid = std::str::from_utf8(&bytes)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    runs_watcher(pid, procs).then(|| Watcher {
+        pidfile: pidfile.to_path_buf(),
+        pid,
     })
 }
+
+/// Whether `pid` runs the watcher script. A gone pid, a zombie and a failed
+/// read all read false, so a broken probe never green-lights a signal.
+fn runs_watcher(pid: u32, procs: &dyn crate::which::ProcTable) -> bool {
+    procs
+        .argv(pid)
+        .is_some_and(|argv| argv.iter().any(|arg| arg.contains(WATCHER_SCRIPT)))
+}
+
+/// How long a stopped watcher gets to exit before install reloads Rex.
+/// A `rex do` script ends at once on SIGTERM; this bounds a wedged one.
+const WATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// SIGTERMs each watcher and waits for it to go, then removes its pidfile,
+/// so the config reload that follows install starts a fresh one. Best
+/// effort: one that will not stop is reported, not fatal.
+pub(crate) fn stop_watchers(watchers: &[Watcher], procs: &dyn crate::which::ProcTable) {
+    for watcher in watchers {
+        terminate(watcher.pid);
+        let deadline = Instant::now() + WATCHER_STOP_TIMEOUT;
+        while runs_watcher(watcher.pid, procs) {
+            if Instant::now() >= deadline {
+                errln!(
+                    "clauth: the Rex pane-label watcher (pid {}) is still running; \
+                     stop it with `kill {}`",
+                    watcher.pid,
+                    watcher.pid
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_file(&watcher.pidfile);
+    }
+}
+
+/// The plan line for stopping `watchers`, or `None` when none runs.
+fn stop_line(watchers: &[Watcher]) -> Option<String> {
+    match watchers.len() {
+        0 => None,
+        1 => Some("  stop the running pane-label watcher".to_string()),
+        n => Some(format!("  stop the {n} running pane-label watchers")),
+    }
+}
+
+/// SIGTERM through `kill(1)`, as `daemon::probe::terminate_pid` does, so
+/// this spends no `unsafe`. A pid that exited meanwhile is not an error.
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-s", "TERM", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: u32) {}
 
 /// The block install appends. Its first and last lines are what uninstall
 /// matches, so they never change spelling between releases.
@@ -317,10 +411,11 @@ pub(crate) fn without_block(existing: &str) -> (String, bool) {
     (text, true)
 }
 
-/// Writes the plugin and wires `init.lua`, after the confirm. Returns false
-/// when the user declined. Split from [`install`] so tests drive it against
-/// a temp dir without a Rex to reload.
-pub(crate) fn install_at(paths: &Paths, yes: bool) -> Result<bool> {
+/// Writes the plugin and wires `init.lua`, after the confirm, then stops any
+/// watcher running the old files. Returns false when the user declined. Split
+/// from [`install`] so tests drive it against a temp dir without a Rex to
+/// reload.
+pub(crate) fn install_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<bool> {
     match plugin_at(&paths.plugin) {
         PluginDir::Linked { .. } | PluginDir::LinkedNotDir { .. } => bail!(
             "{} is a symlink, likely onto a checkout of rex-plugin/; \
@@ -335,6 +430,8 @@ pub(crate) fn install_at(paths: &Paths, yes: bool) -> Result<bool> {
     }
     let existing = read_optional(&paths.init)?;
     let wired = with_block(&existing);
+    let procs = crate::which::SystemProcs;
+    let watchers = running_watchers(state_dir, &procs);
 
     outln!("clauth: install the Rex plugin:");
     outln!(
@@ -351,6 +448,9 @@ pub(crate) fn install_at(paths: &Paths, yes: bool) -> Result<bool> {
             "  {} already loads it; leave it as is",
             paths.init.display()
         ),
+    }
+    if let Some(line) = stop_line(&watchers) {
+        outln!("{line} on the old files; the config reload starts a fresh one");
     }
     outln!("  the plugin runs a pane-label watcher (`rex do`) for each Rex server");
     if !crate::herdr::confirm("go ahead?", yes)? {
@@ -373,6 +473,7 @@ pub(crate) fn install_at(paths: &Paths, yes: bool) -> Result<bool> {
     if let Some(text) = wired {
         write_init(&paths.init, &text)?;
     }
+    stop_watchers(&watchers, &procs);
     Ok(true)
 }
 
@@ -385,9 +486,12 @@ fn write_init(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
-/// Takes the block out of `init.lua` and removes a managed plugin directory.
+/// Takes the block out of `init.lua`, removes a managed plugin directory, and
+/// stops the watcher and removes its state directory, which would otherwise
+/// keep labelling panes with no resolver beside it. A linked or foreign
+/// plugin directory keeps its watcher and state: that checkout runs them.
 /// Returns false when the user declined or there was nothing to remove.
-pub(crate) fn uninstall_at(paths: &Paths, yes: bool) -> Result<bool> {
+pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<bool> {
     let existing = read_optional(&paths.init)?;
     let (unwired, had_block) = without_block(&existing);
     let dir = plugin_at(&paths.plugin);
@@ -399,6 +503,15 @@ pub(crate) fn uninstall_at(paths: &Paths, yes: bool) -> Result<bool> {
         }
         return Ok(false);
     }
+
+    let ours = managed || dir == PluginDir::Absent;
+    let procs = crate::which::SystemProcs;
+    let watchers = if ours {
+        running_watchers(state_dir, &procs)
+    } else {
+        Vec::new()
+    };
+    let has_state = ours && state_dir.exists();
 
     outln!("clauth: uninstall the Rex plugin:");
     if had_block {
@@ -416,6 +529,12 @@ pub(crate) fn uninstall_at(paths: &Paths, yes: bool) -> Result<bool> {
         }
         PluginDir::Absent => {}
     }
+    if let Some(line) = stop_line(&watchers) {
+        outln!("{line}");
+    }
+    if has_state {
+        outln!("  remove {}", state_dir.display());
+    }
     if !crate::herdr::confirm("go ahead?", yes)? {
         return Ok(false);
     }
@@ -425,9 +544,14 @@ pub(crate) fn uninstall_at(paths: &Paths, yes: bool) -> Result<bool> {
     if had_block {
         write_init(&paths.init, &unwired)?;
     }
+    stop_watchers(&watchers, &procs);
     if managed {
         std::fs::remove_dir_all(&paths.plugin)
             .with_context(|| format!("remove {}", paths.plugin.display()))?;
+    }
+    if has_state {
+        std::fs::remove_dir_all(state_dir)
+            .with_context(|| format!("remove {}", state_dir.display()))?;
     }
     Ok(true)
 }
@@ -437,7 +561,7 @@ pub(crate) fn install(yes: bool) -> Result<()> {
         bail!("the Rex plugin runs POSIX sh scripts; it is not available on Windows");
     }
     let paths = Paths::from_env()?;
-    if install_at(&paths, yes)? {
+    if install_at(&paths, &state_dir_from_env()?, yes)? {
         outln!(
             "clauth: installed the Rex plugin in {}",
             paths.plugin.display()
@@ -449,7 +573,7 @@ pub(crate) fn install(yes: bool) -> Result<()> {
 
 pub(crate) fn uninstall(yes: bool) -> Result<()> {
     let paths = Paths::from_env()?;
-    if uninstall_at(&paths, yes)? {
+    if uninstall_at(&paths, &state_dir_from_env()?, yes)? {
         outln!("clauth: removed the Rex plugin");
         reload();
     }

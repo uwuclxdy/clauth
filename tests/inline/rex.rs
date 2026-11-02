@@ -336,6 +336,11 @@ fn paths_in(dir: &Path) -> Paths {
     )
 }
 
+/// The watcher state dir beside a [`paths_in`] config.
+fn state_in(dir: &Path) -> PathBuf {
+    dir.join("state")
+}
+
 #[test]
 fn block_appends_to_an_existing_config_and_keeps_it() {
     let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")";
@@ -386,9 +391,10 @@ fn an_unterminated_block_is_left_whole() {
 fn install_writes_the_plugin_and_wires_init_lua() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
     std::fs::write(&paths.init, "rex.bind(\"cmd+e\", \"pane.zoom\")\n").expect("seed init.lua");
 
-    assert!(install_at(&paths, true).expect("install"));
+    assert!(install_at(&paths, &state, true).expect("install"));
     for (name, contents, _) in FILES {
         let written = std::fs::read_to_string(paths.plugin.join(name)).expect("plugin file");
         assert_eq!(&written, contents, "{name}");
@@ -415,7 +421,7 @@ fn install_writes_the_plugin_and_wires_init_lua() {
     }
 
     // A second install refreshes the files and leaves init.lua as it was.
-    assert!(install_at(&paths, true).expect("reinstall"));
+    assert!(install_at(&paths, &state, true).expect("reinstall"));
     assert_eq!(
         std::fs::read_to_string(&paths.init).expect("init.lua"),
         init
@@ -426,7 +432,8 @@ fn install_writes_the_plugin_and_wires_init_lua() {
 fn install_creates_init_lua_when_there_is_none() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(&tmp.path().join("rex"));
-    assert!(install_at(&paths, true).expect("install"));
+    let state = state_in(&tmp.path().join("rex"));
+    assert!(install_at(&paths, &state, true).expect("install"));
     assert_eq!(
         std::fs::read_to_string(&paths.init).expect("init.lua"),
         block()
@@ -441,6 +448,7 @@ fn a_symlinked_init_lua_keeps_its_link_and_mode() {
     // A dotfiles checkout: init.lua is a link onto the tracked file.
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(&tmp.path().join("rex"));
+    let state = state_in(&tmp.path().join("rex"));
     let tracked = tmp.path().join("dotfiles/init.lua");
     std::fs::create_dir_all(tracked.parent().expect("parent")).expect("dotfiles dir");
     let original = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
@@ -463,13 +471,13 @@ fn a_symlinked_init_lua_keeps_its_link_and_mode() {
             & 0o777
     };
 
-    assert!(install_at(&paths, true).expect("install"));
+    assert!(install_at(&paths, &state, true).expect("install"));
     assert!(still_linked(), "install kept the link");
     assert_eq!(mode(), 0o600, "install kept the mode");
     let wired = std::fs::read_to_string(&tracked).expect("tracked file");
     assert_eq!(wired, with_block(original).expect("appended"));
 
-    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
     assert!(still_linked(), "uninstall kept the link");
     assert_eq!(mode(), 0o600, "uninstall kept the mode");
     assert_eq!(
@@ -482,10 +490,11 @@ fn a_symlinked_init_lua_keeps_its_link_and_mode() {
 fn install_refuses_a_directory_clauth_did_not_write() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
     std::fs::create_dir_all(&paths.plugin).expect("foreign dir");
     std::fs::write(paths.plugin.join("init.lua"), "-- mine\n").expect("foreign file");
 
-    let err = install_at(&paths, true).expect_err("refused");
+    let err = install_at(&paths, &state, true).expect_err("refused");
     assert!(err.to_string().contains("clauth did not write it"), "{err}");
     assert_eq!(
         std::fs::read_to_string(paths.plugin.join("init.lua")).expect("kept"),
@@ -499,11 +508,12 @@ fn install_refuses_a_directory_clauth_did_not_write() {
 fn install_refuses_a_symlinked_checkout() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
     let checkout = tmp.path().join("checkout");
     std::fs::create_dir_all(&checkout).expect("checkout");
     std::os::unix::fs::symlink(&checkout, &paths.plugin).expect("link");
 
-    let err = install_at(&paths, true).expect_err("refused");
+    let err = install_at(&paths, &state, true).expect_err("refused");
     assert!(err.to_string().contains("symlink"), "{err}");
     assert!(matches!(
         plugin_at(&paths.plugin),
@@ -515,11 +525,12 @@ fn install_refuses_a_symlinked_checkout() {
 fn uninstall_reverses_install() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
     let original = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
     std::fs::write(&paths.init, original).expect("seed init.lua");
 
-    assert!(install_at(&paths, true).expect("install"));
-    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(install_at(&paths, &state, true).expect("install"));
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
     assert_eq!(
         std::fs::read_to_string(&paths.init).expect("init.lua"),
         original
@@ -527,19 +538,145 @@ fn uninstall_reverses_install() {
     assert_eq!(plugin_at(&paths.plugin), PluginDir::Absent);
 
     // Nothing left to remove is not an error.
-    assert!(!uninstall_at(&paths, true).expect("second uninstall"));
+    assert!(!uninstall_at(&paths, &state, true).expect("second uninstall"));
 }
 
 #[test]
 fn uninstall_leaves_a_foreign_directory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
     std::fs::write(&paths.init, block()).expect("seed init.lua");
     std::fs::create_dir_all(&paths.plugin).expect("foreign dir");
 
-    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
     assert_eq!(std::fs::read_to_string(&paths.init).expect("init.lua"), "");
     assert_eq!(plugin_at(&paths.plugin), PluginDir::Foreign);
+}
+
+/// A stand-in watcher: a child whose argv names `tag-watch.lua`, the way
+/// start-watch.sh's `rex do ... tag-watch.lua` does. The loop keeps sh from
+/// exec-ing into `sleep`, which would drop the name from the argv.
+#[cfg(unix)]
+fn fake_watcher() -> std::process::Child {
+    std::process::Command::new("sh")
+        .args(["-c", "while :; do sleep 1; done", "tag-watch.lua"])
+        .spawn()
+        .expect("spawn fake watcher")
+}
+
+#[cfg(unix)]
+fn record(state: &Path, key: &str, pid: u32) -> PathBuf {
+    std::fs::create_dir_all(state).expect("state dir");
+    let pidfile = state.join(format!("watch-{key}.pid"));
+    std::fs::write(&pidfile, format!("{pid}\n")).expect("pidfile");
+    pidfile
+}
+
+/// Waits for `child` to exit, killing it if the test's own stop did not.
+#[cfg(unix)]
+fn exited(child: &mut std::process::Child) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait").is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pidfile_naming_another_program_is_not_a_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    // A reused pid: the pidfile names a live process that is not a watcher.
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    record(&state, "1", other.id());
+    std::fs::write(state.join("watch-2.pid"), "not a pid\n").expect("junk pidfile");
+    std::fs::write(state.join("watch.log"), "").expect("log");
+
+    assert_eq!(
+        running_watchers(&state, &crate::which::SystemProcs),
+        Vec::new()
+    );
+    assert!(
+        other.try_wait().expect("try_wait").is_none(),
+        "left running"
+    );
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn install_stops_the_running_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+
+    let mut watcher = fake_watcher();
+    let pidfile = record(&state, "1", watcher.id());
+    assert_eq!(
+        running_watchers(&state, &crate::which::SystemProcs),
+        vec![Watcher {
+            pidfile: pidfile.clone(),
+            pid: watcher.id()
+        }]
+    );
+
+    // A reinstall stops it, so the reload's start-watch.sh finds no live
+    // watcher and starts one on the new files.
+    assert!(install_at(&paths, &state, true).expect("reinstall"));
+    assert!(exited(&mut watcher), "the old watcher stopped");
+    assert!(!pidfile.exists(), "its pidfile is gone");
+    assert!(state.exists(), "install keeps the state directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_stops_the_watcher_and_removes_its_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+    let mut watcher = fake_watcher();
+    record(&state, "1", watcher.id());
+    std::fs::write(state.join("watch.log"), "log\n").expect("log");
+
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
+    assert!(exited(&mut watcher), "the watcher stopped");
+    assert!(!state.exists(), "the state directory is gone");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_leaves_a_linked_checkouts_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    let checkout = tmp.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    std::os::unix::fs::symlink(&checkout, &paths.plugin).expect("link");
+    std::fs::write(&paths.init, block()).expect("seed init.lua");
+    let mut watcher = fake_watcher();
+    record(&state, "1", watcher.id());
+
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
+    assert!(
+        watcher.try_wait().expect("try_wait").is_none(),
+        "the checkout's watcher keeps running"
+    );
+    assert!(state.exists(), "its state stays");
+    let _ = watcher.kill();
+    let _ = watcher.wait();
 }
 
 #[test]
