@@ -68,6 +68,7 @@ The session home is `~/.clauth/profiles/work/codex-home-<sid>/`:
 | `config.toml`, and every `*.config.toml` layer `codex --profile` reads | copies of your `~/.codex` ones with `sqlite_home`, `cli_auth_credentials_store` and `debug.config_lockfile` removed (codex writes its config in place, so it is never a link) | the same copies |
 | `skills`, `rules`, `agents`, `templates`, `references`, `AGENTS.md`, `plugins` | links to your `~/.codex` entries | absent |
 | `hooks.json` | linked only when the profile's `config.toml` sets `hooks_json = true` | absent |
+| `.credentials.json`, `mcp-oauth-locks` | only when the profile's `config.toml` sets `mcp_oauth = true`: a hard link to your `~/.codex/.credentials.json` (codex's MCP OAuth logins when no OS keyring answers) and a link to its lock dir | absent |
 | `sessions/`, `archived_sessions/`, `history.jsonl`, the `*.sqlite` state stores | links into `~/.clauth/profiles/work/codex-home/`, the store every session of the profile shares | per session, discarded at exit |
 
 A thread is in the profile's store the moment codex writes it, so a later session lists it, and archiving one keeps it. The per-session home is removed when the session ends; the store never is.
@@ -210,7 +211,7 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 |------|-------|
 | `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold`, and `[ids]` (written by clauth, one per profile; leave it as written) |
 | `~/.clauth/profiles/<name>/auth.json` | the chain, owner-only, written atomically by clauth and in place by codex through the links |
-| `~/.clauth/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` when you set it |
+| `~/.clauth/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` and `mcp_oauth` when you set them |
 | `~/.clauth/profiles/<name>/auth.lkg.json` | the last-known-good copy of the chain |
 | `~/.clauth/profiles/<name>/auth.attempt` | the no-replay memo: a fingerprint of the refresh token last sent, never the token |
 | `~/.clauth/profiles/<name>/auth.quarantine.json` | the verdict that killed the chain, its time, and the judged token's fingerprint |
