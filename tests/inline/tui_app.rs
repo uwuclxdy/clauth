@@ -50676,7 +50676,14 @@ fn deleting_an_account_under_a_mounted_new_draft_lands_the_cursor_on_the_new_row
     let mut app = app_with(vec![a, b]);
     app.tab = super::Tab::Setup;
 
+    // The worker edits the shared config, so it is parked at its first flock
+    // wait until `n` has mounted the form: a worker finishing first would
+    // already have shrunk the roster the form's row is placed after.
+    let park = crate::lock::flock_wait_park::arm();
     perform_delete(&mut app, &crate::profile::ProfileName::from("b"));
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
     assert!(
         app.deleting.is_some(),
         "precondition: the delete worker is in flight"
@@ -50696,6 +50703,7 @@ fn deleting_an_account_under_a_mounted_new_draft_lands_the_cursor_on_the_new_row
         "precondition: the mounted draft sits on the trailing row"
     );
 
+    let _ = park.release.send(());
     drain_delete(&mut app);
 
     assert_eq!(app.profile_count(), 1, "precondition: b is deleted");
