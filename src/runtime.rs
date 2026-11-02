@@ -7697,13 +7697,19 @@ impl Drop for ProfileRuntime {
 
         // Flush this session's last `.claude.json` / `settings.json` changes to
         // the global files and siblings before a possible teardown removes this
-        // runtime's copies.
-        if let Err(e) = crate::claude_json::sync_once() {
-            logline!("clauth: final .claude.json sync failed: {e}");
-        }
-        if let Err(e) = crate::settings_sync::sync_once() {
-            logline!("clauth: final settings.json sync failed: {e}");
-        }
+        // runtime's copies, then once more after the teardown has released this
+        // session's marker: a tree it spares reads dead only then, and the
+        // written-copy record entry still ranking that tree's copy must go on a
+        // pass that reads it so.
+        let flush_written_copies = || {
+            if let Err(e) = crate::claude_json::sync_once() {
+                logline!("clauth: final .claude.json sync failed: {e}");
+            }
+            if let Err(e) = crate::settings_sync::sync_once() {
+                logline!("clauth: final settings.json sync failed: {e}");
+            }
+        };
+        flush_written_copies();
 
         // One hold decides the collection AND, when the tree has no supervisor
         // to stop, removes it there too — the single-hold shape the flock-count
@@ -7816,6 +7822,7 @@ impl Drop for ProfileRuntime {
             rescue_tombstone(&tombstone);
         }
         if !stop {
+            flush_written_copies();
             return;
         }
 
@@ -7824,6 +7831,7 @@ impl Drop for ProfileRuntime {
         // `stop_tree_supervisor` logged the outcome.
         if stop_tree_supervisor(&self.swap.runtime) == SupervisorStop::Spare {
             clear_stop_in_flight(&self.swap.runtime);
+            flush_written_copies();
             return;
         }
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -7831,6 +7839,7 @@ impl Drop for ProfileRuntime {
 
         // Re-check under a fresh lock hold, then remove: markers, the job store
         // AND the lock file, all re-read fresh.
+        let mut spared = false;
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 let spares = prune_stale_sessions(&self.sessions).unwrap_or(1) != 0
@@ -7844,16 +7853,20 @@ impl Drop for ProfileRuntime {
                     // every acquire of this fixed path (the Fake shared tree,
                     // the background pair) refuses until it ages out.
                     clear_stop_in_flight(&self.swap.runtime);
-                    return;
+                    spared = true;
+                } else {
+                    retired = self.retire_own_tree(mirrored);
                 }
-                retired = self.retire_own_tree(mirrored);
             }
             Err(e) => logline!("clauth: drop cleanup failed: {e}"),
         }
-        clear_stop_in_flight(&self.swap.runtime);
+        if !spared {
+            clear_stop_in_flight(&self.swap.runtime);
+        }
         if let Some(tombstone) = retired {
             rescue_tombstone(&tombstone);
         }
+        flush_written_copies();
     }
 }
 

@@ -3387,6 +3387,171 @@ fn drop_recheck_rereads_the_job_store() {
     });
 }
 
+/// The last-teardown pass on the path where the supervisor outlives its
+/// SIGTERM: the stop spares the tree, and the pass after the teardown hold
+/// still runs.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_wedged_supervisor_spare_still_runs_the_last_teardown_pass() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            tmp.path().join(".claude.json"),
+            br#"{"theme":"dark","projects":{}}"#,
+        )
+        .expect("write ~/.claude.json");
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"theme":"dark","env":{}}"#,
+        )
+        .expect("write ~/.claude/settings.json");
+        let profile = configured_profile("drop-wedged-prune");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let tree_name = tree
+            .file_name()
+            .expect("tree dir name")
+            .to_string_lossy()
+            .into_owned();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let _deadline = SupervisorStopDeadlineGuard::set(Duration::from_millis(300));
+        let records = [
+            (
+                "settings.json",
+                crate::settings_sync::written_record_path().expect("settings record path"),
+            ),
+            (
+                ".claude.json",
+                crate::claude_json::written_record_path().expect(".claude.json record path"),
+            ),
+        ];
+        crate::settings_sync::sync_once().expect("settings pass");
+        crate::claude_json::sync_once().expect(".claude.json pass");
+        let mut recorded = Vec::new();
+        for (what, record) in &records {
+            let entries = record_entries_in_tree(record, &tree_name);
+            assert!(
+                !entries.is_empty(),
+                "control: the live tree's {what} copy must be recorded before teardown"
+            );
+            recorded.extend(entries);
+        }
+
+        drop(rt);
+
+        assert!(
+            tree.is_dir(),
+            "control: the stop must spare {}: its supervisor ignores SIGTERM",
+            tree.display()
+        );
+        for (what, record) in &records {
+            let left = record_entries_in_tree(record, &tree_name);
+            assert!(
+                left.is_empty(),
+                "the spared dead tree must lose its {what} record entry at teardown: {left:#?}"
+            );
+        }
+        for entry in &recorded {
+            let path = entry["path"].as_str().expect("record entry path");
+            assert!(
+                Path::new(path).is_file(),
+                "control: the spared tree must keep its copy {path}: the entry leaves the record, never the file"
+            );
+        }
+    });
+}
+
+/// The same last-teardown prune on the supervisor-stop path: a tree whose
+/// supervisor the teardown stops, and which a stopped job names by the removal
+/// re-check, is spared there and reads dead on the pass after every hold, so it
+/// leaves both written-copy records.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_stop_path_teardown_drops_a_spared_trees_record_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            tmp.path().join(".claude.json"),
+            br#"{"theme":"dark","projects":{}}"#,
+        )
+        .expect("write ~/.claude.json");
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"theme":"dark","env":{}}"#,
+        )
+        .expect("write ~/.claude/settings.json");
+        let profile = configured_profile("drop-stop-prune");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let tree_name = tree
+            .file_name()
+            .expect("tree dir name")
+            .to_string_lossy()
+            .into_owned();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let records = [
+            (
+                "settings.json",
+                crate::settings_sync::written_record_path().expect("settings record path"),
+            ),
+            (
+                ".claude.json",
+                crate::claude_json::written_record_path().expect(".claude.json record path"),
+            ),
+        ];
+        crate::settings_sync::sync_once().expect("settings pass");
+        crate::claude_json::sync_once().expect(".claude.json pass");
+        let mut recorded = Vec::new();
+        for (what, record) in &records {
+            let entries = record_entries_in_tree(record, &tree_name);
+            assert!(
+                !entries.is_empty(),
+                "control: the live tree's {what} copy must be recorded before teardown"
+            );
+            recorded.extend(entries);
+        }
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            let home = crate::profile::home_dir().expect("home");
+            write_claude_job_in(
+                &home,
+                "interposed",
+                runtime,
+                "stopped",
+                Some("2026-10-20T05:25:39.445Z"),
+            );
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(
+            tree.is_dir(),
+            "control: the removal re-check must spare {}: a stopped job names it",
+            tree.display()
+        );
+        for (what, record) in &records {
+            let left = record_entries_in_tree(record, &tree_name);
+            assert!(
+                left.is_empty(),
+                "the spared dead tree must lose its {what} record entry at teardown: {left:#?}"
+            );
+        }
+        for entry in &recorded {
+            let path = entry["path"].as_str().expect("record entry path");
+            assert!(
+                Path::new(path).is_file(),
+                "control: the spared tree must keep its copy {path}: the entry leaves the record, never the file"
+            );
+        }
+    });
+}
+
 /// the teardown re-check re-reads the MARKER — a flock-held
 /// marker landing between the stop and the removal hold spares the tree.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7265,6 +7430,100 @@ fn teardown_leaves_a_tree_a_claude_job_names() {
     });
 }
 
+/// The record entries of `record` whose path lies inside the runtime tree named
+/// `tree_name` (a session-unique dir name, so a substring names it alone).
+fn record_entries_in_tree(record: &Path, tree_name: &str) -> Vec<serde_json::Value> {
+    let bytes = fs::read(record).expect("record readable");
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("record parses");
+    entries
+        .into_iter()
+        .filter(|e| e["path"].as_str().is_some_and(|p| p.contains(tree_name)))
+        .collect()
+}
+
+/// The last clauth session's teardown is the last sync pass on the box until
+/// another session starts, so it runs one after its marker is gone: a tree the
+/// teardown spares (a stopped `claude --bg` job still names it) reads dead
+/// there and leaves both written-copy records. A stray edit made while the tree
+/// is dead then never wins once `claude attach` makes it live again.
+#[test]
+fn the_last_teardown_drops_a_spared_trees_record_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        fs::write(
+            tmp.path().join(".claude.json"),
+            br#"{"theme":"dark","projects":{}}"#,
+        )
+        .expect("write ~/.claude.json");
+        fs::write(
+            tmp.path().join(".claude").join("settings.json"),
+            br#"{"theme":"dark","env":{}}"#,
+        )
+        .expect("write ~/.claude/settings.json");
+        let profile = configured_profile("bgstop");
+        seed_profile_store(tmp.path(), "bgstop");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let tree_name = tree
+            .file_name()
+            .expect("tree dir name")
+            .to_string_lossy()
+            .into_owned();
+        write_claude_job_in(
+            tmp.path(),
+            "37560ded",
+            &tree,
+            "stopped",
+            Some("2026-10-20T05:25:39.445Z"),
+        );
+        let records = [
+            (
+                "settings.json",
+                crate::settings_sync::written_record_path().expect("settings record path"),
+            ),
+            (
+                ".claude.json",
+                crate::claude_json::written_record_path().expect(".claude.json record path"),
+            ),
+        ];
+        crate::settings_sync::sync_once().expect("settings pass");
+        crate::claude_json::sync_once().expect(".claude.json pass");
+        let mut recorded = Vec::new();
+        for (what, record) in &records {
+            let entries = record_entries_in_tree(record, &tree_name);
+            assert!(
+                !entries.is_empty(),
+                "control: the live tree's {what} copy must be recorded before teardown"
+            );
+            recorded.extend(entries);
+        }
+
+        drop(rt);
+
+        assert!(
+            tree.is_dir(),
+            "control: teardown must spare {}: a stopped job still names it",
+            tree.display()
+        );
+        for (what, record) in &records {
+            let left = record_entries_in_tree(record, &tree_name);
+            assert!(
+                left.is_empty(),
+                "the spared dead tree must lose its {what} record entry at teardown: {left:#?}"
+            );
+        }
+        for entry in &recorded {
+            let path = entry["path"].as_str().expect("record entry path");
+            assert!(
+                Path::new(path).is_file(),
+                "control: the spared tree must keep its copy {path}: the entry leaves the record, never the file"
+            );
+        }
+    });
+}
+
 /// Writes the canonical credentials `acquire` links for `name`.
 fn seed_profile_store(home: &Path, name: &str) {
     let canonical = home
@@ -9599,9 +9858,12 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
 /// hoisted `unregister` is one extra outermost acquisition, leaving a window
 /// where the row is gone but the marker is not. Measured 2026-08-08: a real
 /// drop takes the lock in `tick` (credential reconcile), in
-/// `settings_sync::sync_members`, and once in the teardown closure itself
-/// (`src/runtime.rs` Drop); `claude_json::sync_once`'s fast path skips it in
-/// this fixture. The load-bearing number is that the closure stays ONE hold —
+/// `settings_sync::sync_members` before the teardown closure, and once in the
+/// teardown closure itself (`src/runtime.rs` Drop); `claude_json::sync_once`'s
+/// fast path skips it in this fixture, and so does the settings pass after the
+/// closure, since the fixture holds no `~/.claude/settings.json`. With that
+/// file present the after-closure pass is a fourth hold (measured 2026-11-02).
+/// The load-bearing number is that the closure stays ONE hold —
 /// the `tick`/sync legs are named so a change to them re-derives the count
 /// rather than misattributing it to the unregister invariant.
 #[test]
