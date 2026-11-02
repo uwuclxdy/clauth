@@ -3239,7 +3239,14 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
     std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
     std::fs::create_dir(dir.join("stats-cache.json")).unwrap();
     let unreadable = crate::tokens::load_base(&dir).expect_err("a directory fails");
-    assert_eq!(unreadable.cause_line(), "read failed: is a directory");
+    // Windows refuses to read a directory as a file with an access error, so
+    // the same fault surfaces there through the permission arm.
+    let expected = if cfg!(windows) {
+        "permission denied"
+    } else {
+        "read failed: is a directory"
+    };
+    assert_eq!(unreadable.cause_line(), expected);
     std::fs::remove_dir(dir.join("stats-cache.json")).unwrap();
 
     #[cfg(unix)]
