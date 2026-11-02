@@ -128,6 +128,51 @@ fn install_creates_init_lua_when_there_is_none() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_symlinked_init_lua_keeps_its_link_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A dotfiles checkout: init.lua is a link onto the tracked file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(&tmp.path().join("rex"));
+    let tracked = tmp.path().join("dotfiles/init.lua");
+    std::fs::create_dir_all(tracked.parent().expect("parent")).expect("dotfiles dir");
+    let original = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
+    std::fs::write(&tracked, original).expect("seed tracked file");
+    std::fs::set_permissions(&tracked, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    std::fs::create_dir_all(paths.init.parent().expect("parent")).expect("rex dir");
+    std::os::unix::fs::symlink(&tracked, &paths.init).expect("link");
+
+    let still_linked = || {
+        std::fs::symlink_metadata(&paths.init)
+            .expect("meta")
+            .file_type()
+            .is_symlink()
+    };
+    let mode = || {
+        std::fs::metadata(&tracked)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    assert!(install_at(&paths, true).expect("install"));
+    assert!(still_linked(), "install kept the link");
+    assert_eq!(mode(), 0o600, "install kept the mode");
+    let wired = std::fs::read_to_string(&tracked).expect("tracked file");
+    assert_eq!(wired, with_block(original).expect("appended"));
+
+    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(still_linked(), "uninstall kept the link");
+    assert_eq!(mode(), 0o600, "uninstall kept the mode");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("tracked file"),
+        original
+    );
+}
+
 #[test]
 fn install_refuses_a_directory_clauth_did_not_write() {
     let tmp = tempfile::tempdir().expect("tempdir");
