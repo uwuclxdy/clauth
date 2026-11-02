@@ -260,8 +260,12 @@ fn draw_overview_accounts(
                 let line = Line::from(prose::spans(&format!("  {text}"), heading));
                 // A heading is prose, not a band column: take the indent only
                 // while the line still fits the panel, so an unbounded reason
-                // keeps the full inner width instead of clipping early.
-                let pad = if line.width() + band_pad <= usize::from(inner.width) {
+                // keeps the full inner width instead of clipping early. The fit
+                // is measured in the cells the buffer draws: a whole-string
+                // measure folds a lam-alef pair to one cell where the buffer
+                // draws two.
+                let pad = if super::modals::line_cells(&line) + band_pad <= usize::from(inner.width)
+                {
                     band_pad
                 } else {
                     0
@@ -1889,19 +1893,40 @@ fn fallback_flow_lines(
         Span::raw(" "),
     ];
     let chip_w: usize = chip.iter().map(|s| grapheme_cells(&s.content)).sum();
-    // The first line also carries the 2-cell lead before the chip, so the tail
-    // wraps to `width - chip - 2` — else the caption's first line overruns the
-    // pane by exactly those two cells and clips without a mark.
-    for (i, seg) in wrap_words(tail, wrap_budget(width.saturating_sub(chip_w + 2)))
-        .into_iter()
-        .enumerate()
-    {
-        let mut spans = vec![Span::raw("  ")];
-        if i == 0 {
-            spans.extend(chip.clone());
+    // Only the first line carries the 2-cell lead and the chip, so it takes the
+    // whole tail words that fit `width - chip - 2`; the rest wrap at a
+    // continuation row's own budget (`width - 2`), which is wider, so a word
+    // the first row cannot hold whole is never split for it. A pane the lead
+    // and chip alone overrun wraps both at the floor: the chip row is cut
+    // anyway, and a continuation budget under the floor would split every word.
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    let (first_budget, rest_budget) = match width.checked_sub(chip_w + 2) {
+        Some(first) => (first, width - 2),
+        None => (wrap_budget(0), wrap_budget(0)),
+    };
+    let mut head: Vec<&str> = Vec::new();
+    let mut head_w = 0usize;
+    for &word in &words {
+        let joined = head_w + usize::from(!head.is_empty()) + grapheme_cells(word);
+        if joined > first_budget {
+            break;
         }
-        spans.push(Span::styled(seg, theme::faint()));
-        lines.push(Line::from(spans));
+        head_w = joined;
+        head.push(word);
+    }
+    let mut first = vec![Span::raw("  ")];
+    first.extend(chip);
+    if !head.is_empty() {
+        first.push(Span::styled(head.join(" "), theme::faint()));
+    }
+    lines.push(Line::from(first));
+    if head.len() < words.len() {
+        for seg in wrap_words(&words[head.len()..].join(" "), rest_budget) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(seg, theme::faint()),
+            ]));
+        }
     }
 
     // A wallet-bearing active's runway: its funded balance and burn rate, and

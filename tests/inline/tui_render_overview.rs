@@ -584,10 +584,12 @@ fn the_all_spent_caption_tail_wraps_at_the_floor_when_the_chip_overruns() {
 }
 
 /// No caption row may wrap wider than the pane leaves after its lead and chip:
-/// from width 12 up the 11-cell lead + chip fits, so the tail's real budget is
+/// from width 11 up the 11-cell lead + chip fits, so the tail's real budget is
 /// the rest of the row and the wrap must use it — a floor there overdraws the
-/// pane and the `Paragraph` (no `Wrap`) cuts the tail with no mark. At width 18
-/// the budget is 7 cells, so each word takes its own row whole.
+/// pane and the `Paragraph` (no `Wrap`) cuts the tail with no mark. Only the
+/// first row carries the chip: each continuation row wraps at its own budget
+/// (the row less the 2-cell lead). Below 11 the lead and chip overrun the pane
+/// and both wrap at the floor. At every width no tail word is ever split.
 #[test]
 fn the_all_spent_caption_tail_fits_every_pane_from_the_chip_and_lead_up() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -595,7 +597,7 @@ fn the_all_spent_caption_tail_fits_every_pane_from_the_chip_and_lead_up() {
     let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    for width in 12..=24usize {
+    for width in 3..=24usize {
         let lines = fallback_flow_lines(&app, width, &readings).0;
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let at = texts
@@ -608,19 +610,44 @@ fn the_all_spent_caption_tail_fits_every_pane_from_the_chip_and_lead_up() {
             .cloned()
             .collect();
         assert!(!caption.is_empty(), "width {width}: no caption row");
-        for row in &caption {
+        for row in caption.iter().filter(|_| width >= 11) {
             assert!(
                 Span::raw(row.as_str()).width() <= width,
                 "width {width}: caption row {row:?} overruns the pane"
             );
         }
+        if width == 11 {
+            assert_eq!(
+                caption,
+                ["  [ stop ] ", "  when all", "  spent"],
+                "width 11: the lead and chip fill the first row, the tail wraps at 9"
+            );
+        }
         if width == 18 {
             assert_eq!(
                 caption,
-                ["  [ stop ] when", "  all", "  spent"],
-                "width 18 leaves a 7-cell budget: each tail word takes its own row whole"
+                ["  [ stop ] when", "  all spent"],
+                "width 18: the first row's 7-cell budget takes `when`, the continuation \
+                 row's own 16-cell budget takes `all spent`"
             );
         }
+        // Every tail word stays whole: the first row's narrow budget never
+        // splits a word that a continuation row, which carries only the
+        // 2-cell lead, has room for.
+        let words: Vec<String> = caption
+            .iter()
+            .flat_map(|row| {
+                row.replace("[ stop ]", "")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            words,
+            ["when", "all", "spent"],
+            "width {width}: a caption word was split: {caption:?}"
+        );
     }
 }
 
@@ -2927,34 +2954,29 @@ fn a_long_chain_name_renders_whole_on_desktop() {
 }
 
 /// The all-spent caption's first line carries the 2-cell lead AND the chip, so
-/// its tail must wrap to `width - chip - 2` — the round-1 budget only
-/// subtracted the chip and let the first line overrun the pane by two cells.
+/// its tail must wrap to `width - chip - 2`: a budget that subtracts only the
+/// chip lets the first line overrun the pane by two cells.
 #[test]
 fn the_stay_caption_wraps_without_overrunning_the_first_line() {
     let _home = crate::testutil::HomeSandbox::new();
     let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
-    // Every caption line, chip included, stays within the pane: the round-1
-    // budget let the first line overrun by two cells. Pinned whole-row at the
-    // six terminal widths (inner = terminal − 4 chrome cells).
+    // Every caption line, chip included, stays within the pane. Only the first line
+    // carries the chip, so each continuation line wraps at the pane less its
+    // 2-cell lead. Pinned whole-row (inner = terminal − 4 chrome cells).
     for (w, caption_lines) in [
         (
             23usize,
-            &[
-                "  [ stay ] on the",
-                "  active",
-                "  account when",
-                "  all spent",
-            ][..],
+            &["  [ stay ] on the", "  active account when", "  all spent"][..],
         ),
         (
             24usize,
-            &["  [ stay ] on the active", "  account when", "  all spent"][..],
+            &["  [ stay ] on the active", "  account when all spent"][..],
         ),
         (
             30usize,
-            &["  [ stay ] on the active", "  account when all", "  spent"][..],
+            &["  [ stay ] on the active", "  account when all spent"][..],
         ),
         (
             41usize,
@@ -5610,6 +5632,40 @@ fn pool_rows_list_under_one_heading_per_provider() {
         "the meta counts the five pool rows: {:?}",
         accounts_title_row(&app, 60)
     );
+}
+
+/// Above the band cap a section heading takes the band's indent only while it
+/// still fits, measured in the cells the buffer draws: a provider named with
+/// lam-alef pairs (each pair one cell to a whole-string measure, two drawn)
+/// whose heading fits the panel unindented renders whole, never padded into a
+/// clipped tail.
+#[test]
+fn a_lam_alef_pool_heading_that_fits_the_panel_renders_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // The band pad starts above the 122-cell cap.
+    for width in (128u16..=160).step_by(4) {
+        for pairs in 20..=78usize {
+            let name = "لا".repeat(pairs);
+            let heading = format!("shunt ({name})");
+            // `  shunt (` + the drawn name + `)` inside the list's inner width
+            // (the panel less its two border and two gutter cells).
+            if 2 + 7 + 2 * pairs + 1 > usize::from(width) - 4 {
+                continue;
+            }
+            let mut app = pool_app();
+            app.shunt_pool =
+                crate::tui::app::ShuntPool::Read(vec![crate::gateway_admin::PoolProvider {
+                    name: name.clone(),
+                    auth: crate::gateway_admin::PoolAuth::Kimi,
+                    accounts: vec![pool_account("k1")],
+                }]);
+            let lines = accounts_list_lines(&app, width, 20);
+            assert!(
+                lines.iter().any(|line| line == &heading),
+                "width {width}, {pairs} pairs: the heading is clipped: {lines:?}"
+            );
+        }
+    }
 }
 
 /// The foreground and modifiers of the first cell of the accounts-list line
