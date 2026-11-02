@@ -11058,7 +11058,7 @@ pub(crate) fn sweep_stale_copied_bearers() {
         sweep_stale_copied_bearers_with(
             &live_session_runtime_dirs(),
             crate::usage::now_ms() as i64,
-            &mut *gave_up,
+            &mut gave_up,
             |live| match crate::keychain::read_config_dir_item(&live.runtime) {
                 Err(e) if crate::keychain::failed_on_locked_keychain(&e) => Ok(None),
                 read => read,
