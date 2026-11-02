@@ -3847,6 +3847,62 @@ fn a_dead_recorded_copy_cannot_wipe_home_when_only_membership_can_stop_it() {
     );
 }
 
+/// A live session's seed that no record names (a seed that missed the sync
+/// lock, stamped at the floor) but whose bytes already equal the merge is
+/// recorded on the first pass that sees it, without a rewrite, so the
+/// session's later Claude Code edit wins and reaches home.
+#[test]
+fn an_unrecorded_live_seed_matching_the_merge_is_recorded_and_its_edit_reaches_home() {
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    write_json(&home_file, &json!({"numStartups": 2, "userID": "u"}));
+    set_mtime(&home_file, t(1));
+    let seed = home
+        .home()
+        .join(".clauth/profiles/p1/runtime-4242-0/.claude.json");
+    fs::create_dir_all(seed.parent().expect("has parent")).expect("mkdir");
+    write_json(
+        &seed,
+        &json!({"numStartups": 2, "userID": "u", "oauthAccount": {"emailAddress": "p1@x"}}),
+    );
+    set_mtime(&seed, crate::jsonsync::floor_stamp());
+    let _live = arm_live_copy(&seed);
+    crate::jsonsync::reset_write_counts();
+    reset_last_synced();
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        crate::jsonsync::write_count(&seed),
+        0,
+        "a seed already equal to the merge is recorded without a rewrite"
+    );
+    let entries: Vec<Value> = fs::read(written_record_path().expect("record path"))
+        .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
+        .unwrap_or_default();
+    let seed_str = seed.to_string_lossy();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["path"].as_str() == Some(&*seed_str)),
+        "the matching live seed must be recorded on first sight: {entries:#?}"
+    );
+
+    write_json(
+        &seed,
+        &json!({"numStartups": 5, "userID": "u", "oauthAccount": {"emailAddress": "p1@x"}}),
+    );
+    set_mtime(&seed, t(20));
+    reset_last_synced();
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&home_file),
+        json!({"numStartups": 5, "userID": "u"}),
+        "the session's edit must reach home once its seed is recorded"
+    );
+}
+
 /// Guard 2 alone for `.claude.json`: a LIVE unrecorded copy, newest and lacking
 /// only one shared key, is admitted (guard 1) and under the bound (guard 3) —
 /// only the winner gate keeps home intact.

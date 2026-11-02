@@ -3744,46 +3744,113 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 }
 
 /// The [`shared_runtime_dirs`] a config reconcile pass may join: only trees
-/// that are LIVE — a flock-held marker in the paired sessions dir, or an
-/// unfinished Claude Code background job NAMING the tree whose supervisor
-/// reads live (the live-session count's reading, [`live_background_jobs`]). An
-/// unknown reading, marker, job store or supervisor record, EXCLUDES the copy:
-/// including a dead one lets a stray Claude Code's first-start copy decide
-/// what the operator's own files lose, while excluding a live one drops its
-/// record entry on the next pass that writes, so every edit it makes cannot win
-/// and is overwritten until a later pass rewrites the copy — a rejoin pass that
-/// finds the copy already merged leaves it unrecorded. The job store is read
-/// only when some candidate's marker probe found nothing live. A supervisor reading that
-/// cannot verify admits such a tree — an unverifiable supervisor reads live,
-/// `Some(true)` — and the recorded-winner and delete-bound guards still bound
-/// it.
+/// that read [`TreeLiveness::Live`]. A dead or unknown reading EXCLUDES the
+/// copy: including a dead one lets a stray Claude Code's first-start copy
+/// decide what the operator's own files lose. An excluded tree whose liveness
+/// reads unknown keeps its written-copy record entry while its tree exists, so
+/// once it rejoins its edits can still win; a rejoin pass that finds its copy
+/// already merged records it. A dead tree loses its entry. A supervisor
+/// reading that cannot verify admits a job's tree (an unverifiable supervisor
+/// reads live, `Some(true)`), and the recorded-winner and delete-bound guards
+/// still bound it.
 pub(crate) fn live_shared_runtime_dirs() -> Vec<PathBuf> {
-    let mut jobs: Option<crate::claude_jobs::JobTrees> = None;
+    let mut reader = TreeLivenessReader::default();
     shared_runtime_dirs_matching(|name, path| {
-        match runtime_marker_liveness(name, path) {
-            Some(true) => true,
+        reader.liveness_named(name, path) == TreeLiveness::Live
+    })
+}
+
+/// A shared runtime tree's liveness, as the config reconcile passes read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeLiveness {
+    /// A flock-held marker in the paired sessions dir, or, with none held, an
+    /// unfinished Claude Code background job naming the tree whose supervisor
+    /// reads live or unverifiable (the live-session count's reading,
+    /// [`live_background_jobs`]).
+    Live,
+    /// Every marker read and none held, and the job store read with nothing
+    /// unknown for this tree: no job names it, only a finished one does, or
+    /// the supervisor of the unfinished job naming it reads gone. Also any dir
+    /// whose name is not a shared runtime tree's
+    /// ([`TreeLivenessReader::liveness`]), which is never a member.
+    Dead,
+    /// No marker held, and something could not be read: the sessions dir or a
+    /// marker (unreadable, unopenable or unlockable); the job store as a whole,
+    /// the tree's own or its profile's store (unreadable or caught mid-create),
+    /// or a global store caught mid-create ([`JobTrees::unfinished_names`]);
+    /// the tree's canonical identity, while some job or unreadable store could
+    /// name it; or the supervisor record of the unfinished job naming it.
+    Unknown,
+}
+
+/// Reads [`TreeLiveness`] tree by tree. The job store is read at most once,
+/// and only when some tree's marker probe found nothing held.
+#[derive(Debug, Default)]
+pub(crate) struct TreeLivenessReader {
+    jobs: Option<JobTrees>,
+}
+
+impl TreeLivenessReader {
+    /// `tree`'s liveness. A dir whose name is not a shared runtime tree's is
+    /// never a reconcile member, so it reads [`TreeLiveness::Dead`].
+    pub(crate) fn liveness(&mut self, tree: &Path) -> TreeLiveness {
+        match tree
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| is_shared_runtime_dir_name(name))
+        {
+            Some(name) => self.liveness_named(name, tree),
+            None => TreeLiveness::Dead,
+        }
+    }
+
+    /// [`TreeLivenessReader::liveness`] for a tree whose shared runtime dir
+    /// name the caller already holds.
+    fn liveness_named(&mut self, name: &str, tree: &Path) -> TreeLiveness {
+        match runtime_marker_liveness(name, tree) {
+            Some(true) => TreeLiveness::Live,
+            None => TreeLiveness::Unknown,
             // No marker: an unfinished background job naming the tree, whose
             // supervisor reads live, may still be reading it. `names` picks the
             // naming half and `unfinished_jobs` — the live-session count's own
-            // reading, not the GC's fail-closed `spares` or the rotation gate's
-            // fail-closed `unfinished_names` — the unfinished half: a finished
-            // job or an unreadable store leaves the copy out, and a store caught
-            // mid-create counts only its readable records, so neither admits
-            // every dead tree. The supervisor
-            // reading is the one the live-session count uses, so a tree it
-            // reads as holding no session stays out here too.
+            // reading, not the GC's fail-closed `spares` — the unfinished half,
+            // so only a job the count would read as running makes the tree
+            // live. Where neither shows such a job, the rotation gate's
+            // fail-closed `unfinished_names` tells dead from unknown: a store
+            // that could not be read (globally, or the tree's own or its
+            // profile's), a store caught mid-create, or a tree it cannot
+            // canonicalize reads unknown; a finished job or none reads dead.
+            // The supervisor reading is the one the live-session count uses, so
+            // a tree it reads as holding no session reads dead too.
             Some(false) => {
-                let jobs = jobs.get_or_insert_with(crate::claude_jobs::job_trees);
-                jobs.names(path)
-                    && crate::canonical::identity(path).is_ok_and(|id| {
-                        jobs.unfinished_jobs()
-                            .is_some_and(|(running, _)| running.iter().any(|(_, tree)| *tree == id))
-                    })
-                    && supervisor_is_live(path) == Some(true)
+                let jobs = self.jobs.get_or_insert_with(crate::claude_jobs::job_trees);
+                let not_running = |jobs: &JobTrees| {
+                    if jobs.unfinished_names(tree) {
+                        TreeLiveness::Unknown
+                    } else {
+                        TreeLiveness::Dead
+                    }
+                };
+                if !jobs.names(tree) {
+                    return not_running(jobs);
+                }
+                let Ok(id) = crate::canonical::identity(tree) else {
+                    return TreeLiveness::Unknown;
+                };
+                let Some((running, _)) = jobs.unfinished_jobs() else {
+                    return TreeLiveness::Unknown;
+                };
+                if !running.iter().any(|(_, named)| *named == id) {
+                    return not_running(jobs);
+                }
+                match supervisor_is_live(tree) {
+                    Some(true) => TreeLiveness::Live,
+                    Some(false) => TreeLiveness::Dead,
+                    None => TreeLiveness::Unknown,
+                }
             }
-            None => false,
         }
-    })
+    }
 }
 
 /// The shared runtime dirs under every profile, kept when `keep(name, path)`

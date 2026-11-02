@@ -1554,8 +1554,9 @@ fn a_winner_keeping_the_retention_key_but_lacking_four_shared_keys_refuses() {
 }
 
 /// A refusal whose backup cannot be written still refuses and writes nothing,
-/// raises no "saved a copy" line (there is none), and sets no latch — so the
-/// next pass retries the backup and only then logs the line once.
+/// says once that it could not save a copy (naming the io error), and sets no
+/// latch — so every later pass retries the backup, stays quiet while it keeps
+/// failing, and logs the "saved a copy" line once the backup lands.
 #[test]
 fn a_failed_backup_still_refuses_and_the_next_pass_retries_it() {
     let home = HomeSandbox::new();
@@ -1578,11 +1579,40 @@ fn a_failed_backup_still_refuses_and_the_next_pass_retries_it() {
 
     let before_base = fs::read(&base).expect("read base");
     let lines = crate::logline::LogLines::new();
-    {
+    let failed = {
         let _unwritable = crate::testutil::UnwritableDir::new(&backups_dir);
-        let _capture = lines.capture_here();
-        sync();
-    }
+        // The io error the backup's own file create meets, as the platform
+        // words it: taken off a create in the same refusing dir.
+        let io_error = fs::File::create(backups_dir.join("probe"))
+            .expect_err("the unwritable dir refuses a new file")
+            .to_string();
+        let failed = format!(
+            "clauth: settings.json sync skipped: applying {} would delete 4 keys from {}; \
+             could not save a copy in {}: {io_error}",
+            tilde(home.home(), &winner),
+            tilde(home.home(), &base),
+            tilde(home.home(), &backups_dir),
+        );
+        {
+            let _capture = lines.capture_here();
+            sync();
+        }
+        assert_eq!(
+            lines.snapshot(),
+            vec![failed.clone()],
+            "a refused pass whose backup failed says so once, naming the io error"
+        );
+        {
+            let _capture = lines.capture_here();
+            sync();
+        }
+        assert_eq!(
+            lines.snapshot(),
+            vec![failed.clone()],
+            "a second pass over the same refused copy whose backup still fails stays quiet"
+        );
+        failed
+    };
     assert_eq!(
         fs::read(&base).expect("read base"),
         before_base,
@@ -1592,11 +1622,6 @@ fn a_failed_backup_still_refuses_and_the_next_pass_retries_it() {
         backups_named(&backups_dir, "settings.json").is_empty(),
         "a refused pass whose backup failed must take no backup"
     );
-    assert!(
-        lines.snapshot().is_empty(),
-        "a refused pass whose backup failed must not claim it saved a copy"
-    );
-
     {
         let _capture = lines.capture_here();
         sync();
@@ -1621,8 +1646,8 @@ fn a_failed_backup_still_refuses_and_the_next_pass_retries_it() {
     );
     assert_eq!(
         lines.snapshot(),
-        vec![expected],
-        "the retried pass logs the line exactly once"
+        vec![failed, expected],
+        "the retried pass logs the saved-copy line exactly once, after the failure line"
     );
 }
 
@@ -1932,6 +1957,314 @@ fn a_pass_that_listed_members_before_a_session_started_keeps_its_record_entry() 
     assert!(
         entries.iter().any(|e| e["path"].as_str() == Some(&*p2_str)),
         "the just-started session's record entry must survive the pass: {entries:#?}"
+    );
+}
+
+/// A running session whose copy no record names (a start by an older clauth
+/// left it unrecorded) but whose bytes already equal the merge is recorded on
+/// the first pass that sees it, without a rewrite, so the session's later
+/// in-session edit can win and reach the base.
+#[test]
+fn a_live_unrecorded_copy_matching_the_merge_is_recorded_and_its_edit_reaches_the_base() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    write_json(&copy, &json!({"theme": "light", "env": {}}), t(5));
+    let _live = arm_runtime_marker(copy.parent().expect("runtime dir"));
+    crate::jsonsync::reset_write_counts();
+
+    sync();
+
+    assert_eq!(
+        crate::jsonsync::write_count(&copy),
+        0,
+        "a copy already equal to the merge is recorded without a rewrite"
+    );
+    // A pass that writes nothing leaves no record file at all on the old code:
+    // read a missing record as empty so the assertion below is what reds.
+    let entries: Vec<Value> = fs::read(settings_record(&h))
+        .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
+        .unwrap_or_default();
+    let copy_str = copy.to_string_lossy();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["path"].as_str() == Some(&*copy_str)),
+        "the matching live copy must be recorded on first sight: {entries:#?}"
+    );
+
+    write_json(&copy, &json!({"theme": "dark", "env": {}}), t(20));
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "dark", "env": {}}),
+        "the session's in-session edit must reach the base once its copy is recorded"
+    );
+}
+
+/// A live session's tree the sync leaves out for a moment because its liveness
+/// reads UNKNOWN (here: its held marker cannot be opened) keeps its record entry
+/// through a pass that writes the other members; once it rejoins, its in-session
+/// edit wins and reaches the base instead of being overwritten. Unix-only: mode
+/// 000 is the portable way to make the marker probe's open fail.
+#[cfg(unix)]
+#[test]
+fn a_live_tree_excluded_for_a_moment_keeps_its_record_entry_and_its_edit_wins() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let _live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    let marker = h
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("sessions-4242-0")
+        .join("test-pid");
+
+    // p1's marker stays held, but the probe cannot open it, so p1's liveness
+    // reads unknown and p1 is left out while p2 wins and the pass rewrites
+    // the base.
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    assert!(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .is_err(),
+        "the mode-000 marker must refuse an open (a root run would read it live)"
+    );
+    sync();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a left-out tree that still exists keeps its record entry: {entries:#?}"
+    );
+
+    // p1's marker reads again: p1 rejoins carrying the session's own newer edit.
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("blue"),
+        "the rejoined session's edit must win, not be overwritten"
+    );
+}
+
+/// The record-on-first-sight rule is for runtime copies only: a pass whose
+/// winner is a live copy and whose base already equals the merge rewrites
+/// nothing and records no entry for the base, which is not a clauth copy.
+#[test]
+fn a_base_already_equal_to_the_merge_gets_no_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "dark", "env": {}}), t(1));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    let _live = live_recorded_json(&h, &copy, &json!({"theme": "dark", "env": {}}), t(10));
+    let before = fs::read(settings_record(&h)).expect("read record");
+
+    sync();
+
+    assert_eq!(
+        fs::read(settings_record(&h)).expect("read record"),
+        before,
+        "a converged pass must leave the record as it was: no entry for the base"
+    );
+}
+
+/// A recorded copy that already equals the merge keeps its own entry, carried
+/// rank included: the first-sight rule records only a copy the record holds no
+/// entry for, so a converged pass never re-ranks an echo at the winner's rank.
+#[test]
+fn a_converged_pass_keeps_a_recorded_copys_carried_rank() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "dark", "env": {}}), t(20));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    let _live = live_recorded_json(&h, &copy, &json!({"theme": "dark", "env": {}}), t(10));
+    let before = fs::read(settings_record(&h)).expect("read record");
+
+    sync();
+
+    assert_eq!(
+        fs::read(settings_record(&h)).expect("read record"),
+        before,
+        "a converged pass must keep the recorded copy's entry and its carried rank"
+    );
+}
+
+/// A tree whose session is known DEAD (its marker readable and unheld) loses its
+/// record entry on the next pass that writes, even while its dir still exists:
+/// an edit landing in it while dead (a stray Claude Code pointed at the tree)
+/// must not win once a later session makes the tree live again.
+#[test]
+fn a_dead_tree_loses_its_record_entry_so_an_edit_made_while_dead_never_wins() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+
+    // p1's session ends: its marker stays on disk, readable and unheld.
+    drop(live1);
+    sync();
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        !entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a known-dead tree must lose its record entry: {entries:#?}"
+    );
+
+    // A stray edit lands in the dead tree, then a session makes it live again.
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    let _relive = arm_runtime_marker(p1.parent().expect("runtime dir"));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "an edit made while the tree was dead must never win"
+    );
+}
+
+/// The dead-tree prune does not wait for a pass that writes: when the only
+/// session ends, the next pass has the base alone to merge and writes nothing,
+/// yet it still drops the dead tree's entry, so a stray edit there never wins
+/// once the tree is live again.
+#[test]
+fn the_last_sessions_death_drops_its_entry_on_a_pass_that_writes_nothing() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+
+    drop(live1);
+    sync();
+    let entries: Vec<Value> = fs::read(settings_record(&h))
+        .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
+        .unwrap_or_default();
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        !entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "the last session's dead tree must lose its entry: {entries:#?}"
+    );
+
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    let _relive = arm_runtime_marker(p1.parent().expect("runtime dir"));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("light"),
+        "an edit made while the only tree was dead must never win"
+    );
+}
+
+/// Unknown liveness through a torn global job record (portable: no chmod): a
+/// tree whose marker nobody holds while the job store cannot be read keeps its
+/// record entry through a pass that writes the other members.
+#[test]
+fn a_tree_left_out_while_the_job_store_is_torn_keeps_its_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    drop(live1);
+    let job = h.join(".claude").join("jobs").join("0add99ed");
+    fs::create_dir_all(&job).expect("mkdir job dir");
+    fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a tree whose job store cannot be read reads unknown and keeps its entry: {entries:#?}"
+    );
+}
+
+/// The same through a torn job record in the tree's OWN jobs store: that
+/// store's unreadability is unknown for this tree, never dead.
+#[test]
+fn a_tree_whose_own_job_store_is_torn_keeps_its_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    drop(live1);
+    let job = p1
+        .parent()
+        .expect("runtime dir")
+        .join("jobs")
+        .join("0add99ee");
+    fs::create_dir_all(&job).expect("mkdir job dir");
+    fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a tree whose own job store cannot be read reads unknown and keeps its entry: {entries:#?}"
     );
 }
 

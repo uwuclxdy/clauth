@@ -425,25 +425,32 @@ pub(crate) const SETTINGS_PROTECTED_KEYS: &[&str] = &["cleanupPeriodDays"];
 /// How many backups of ONE operator file `~/.clauth/backups/` keeps.
 const BACKUPS_KEPT: usize = 10;
 
-/// The last refused pass per operator file: `(operator file, winner path,
-/// winner mtime, winner size)`. Both reconcilers share this process, so one
-/// file's refusal must not reset the other's latch. The watchdog ticks each
-/// reconciler many times a second, so a standing refusal must back the
-/// operator's file up and log it once, not once per tick.
+/// One refused pass: `(operator file, winner path, winner mtime, winner size)`.
 type RefusalKey = (PathBuf, PathBuf, SystemTime, u64);
+
+/// The last refused pass per operator file whose backup landed. Both
+/// reconcilers share this process, so one file's refusal must not reset the
+/// other's latch. The watchdog ticks each reconciler many times a second, so a
+/// standing refusal must back the operator's file up and log it once, not once
+/// per tick.
 static LAST_REFUSAL: Mutex<Vec<RefusalKey>> = Mutex::new(Vec::new());
 
-/// Whether `key` is latched as refused.
-fn latched(key: &RefusalKey) -> bool {
-    LAST_REFUSAL
+/// The last refused pass per operator file whose backup failed, so the failure
+/// line logs once per refused copy. Separate from [`LAST_REFUSAL`]: a failed
+/// backup must stay unlatched there, so every later pass retries it.
+static LAST_BACKUP_FAILURE: Mutex<Vec<RefusalKey>> = Mutex::new(Vec::new());
+
+/// Whether `key` is latched in `latches`.
+fn latched(latches: &Mutex<Vec<RefusalKey>>, key: &RefusalKey) -> bool {
+    latches
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(key)
 }
 
-/// Latch `key`, replacing that operator file's previous entry.
-fn latch(key: RefusalKey) {
-    let mut held = LAST_REFUSAL
+/// Latch `key` in `latches`, replacing that operator file's previous entry.
+fn latch(latches: &Mutex<Vec<RefusalKey>>, key: RefusalKey) {
+    let mut held = latches
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     held.retain(|k| k.0 != key.0);
@@ -465,6 +472,11 @@ fn latch(key: RefusalKey) {
 /// operator file's shared top-level keys, or any key in `protected_keys` the
 /// operator file holds, writes nothing, backs that file up and logs the
 /// refusal once per distinct winner.
+///
+/// A runtime copy the record holds no entry for, whose content already equals
+/// the merge, is recorded at the winner's rank without a rewrite, so its
+/// session's later in-session edit can win. That happens only after the winner
+/// is chosen, so an unrecorded copy still never wins the pass that records it.
 ///
 /// `operator_file` is the one member Claude Code owns (the copy under the
 /// operator's home rather than under `~/.clauth`); see [`write_member`] for why
@@ -502,18 +514,53 @@ pub(crate) fn sync_paths(
             digest: hex::encode(Sha256::digest(&bytes)),
         });
     }
-    if members.len() < 2 {
-        return Ok(());
-    }
-
     // Test-only interleave: after every member is read, before the first write.
     #[cfg(test)]
-    run_interleave_hook();
+    if members.len() >= 2 {
+        run_interleave_hook();
+    }
 
     // The written-copy record, read once before the winner selection (fail-open
     // to empty): a member matching clauth's own unchanged echo ranks by the
-    // carried rank its entry stores, not by its own mtime.
+    // carried rank its entry stores, not by its own mtime. Read even when there
+    // is nothing to merge, because the persist below runs on every pass.
     let written = record.map(read_record).unwrap_or_default();
+
+    // Copies written, or recorded as read, this pass, as echoes. Persisted once
+    // after the merge, on every exit path, together with the prune of entries
+    // the keep rule drops (see [`persist_record`]).
+    let mut recorded: Vec<WrittenEntry> = Vec::new();
+    let result = merge_members(
+        &members,
+        &written,
+        &mut recorded,
+        operator_file,
+        record.is_some(),
+        protected_keys,
+        &rule,
+    );
+    if let Some(record) = record {
+        persist_record(record, paths, &recorded);
+    }
+    result
+}
+
+/// [`sync_paths`]'s merge over the members it read: pick the winner, apply
+/// the delete bound, then rewrite or record each other member, pushing each
+/// recorded entry into `recorded`. `recording` is whether the pass has a
+/// record to persist into.
+fn merge_members(
+    members: &[Member],
+    written: &[WrittenEntry],
+    recorded: &mut Vec<WrittenEntry>,
+    operator_file: Option<&Path>,
+    recording: bool,
+    protected_keys: &[&str],
+    rule: &impl Fn(KeyPath<'_>) -> KeyRule,
+) -> Result<()> {
+    if members.len() < 2 {
+        return Ok(());
+    }
 
     // Every member ranks by the mtime of the Claude Code write its bytes carry:
     // a non-echo (path + mtime + size + digest does not match the record) ranks
@@ -573,84 +620,86 @@ pub(crate) fn sync_paths(
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or_default(),
             protected_keys,
-            &rule,
-        )
+            rule,
+        )?
     {
         return Ok(());
     }
 
-    // Copies written this pass, recorded as echoes. Persisted once
-    // after the loop — on every exit path that wrote something — not per copy.
-    let mut recorded: Vec<WrittenEntry> = Vec::new();
-    let write_result: Result<()> = (|| {
-        for i in 0..members.len() {
-            if i == winner {
-                continue;
-            }
-            // Test-only interleave: between target writes, so a test can land a
-            // write on the winner mid-loop deterministically.
-            #[cfg(test)]
-            run_write_loop_hook();
-            // The winner is the merge source for every write below. Re-stat it
-            // before EACH target write, not just once before the loop: a Claude
-            // Code write to the winner landing mid-loop (after an earlier target's
-            // rename, before this one's) would otherwise leave this target holding
-            // stale bytes with a newer mtime, and the next pass would pick it as
-            // winner and revert the winner's write. A moved winner aborts the rest
-            // of this pass; the next event/tick re-reads and converges.
-            if member_changed_since_read(
-                &members[winner].path,
-                members[winner].mtime,
-                members[winner].size,
-            ) {
-                return Ok(());
-            }
-            // A member CC rewrote between our read and now keeps its newer bytes:
-            // skip it this pass; the next pass re-reads and re-merges it.
-            if member_changed_since_read(&members[i].path, members[i].mtime, members[i].size) {
-                continue;
-            }
-            let merged = merge_member(&members[winner].obj, &members[i].obj, &rule);
-            if merged == members[i].obj {
-                continue;
-            }
-            let path = &members[i].path;
-            let bytes = serde_json::to_vec_pretty(&Value::Object(merged))
-                .with_context(|| format!("failed to serialize merged {}", path.display()))?;
-            // Test-only interleave: after the re-stat and serialize, before the
-            // temp write — a write on the winner landing here is what the winner
-            // re-stat inside `write_member` exists to catch.
-            #[cfg(test)]
-            run_pre_rename_hook();
-            // Write the target. The temp is written first with a fresh mtime, then
-            // the winner is re-statted on the still-open temp handle (inside
-            // `write_member`) and the temp is back-dated to the winner's read mtime
-            // only when the winner moved since this pass read it. The early re-stat
-            // above aborted a move that landed between TARGETS; the in-writer
-            // re-stat sees a move that landed between the early re-stat and the
-            // rename (the hook window) and — running after the temp write — also a
-            // move that landed between the decision and the temp write. In the
-            // common case the winner held still, so the copy keeps the rename's
-            // fresh mtime and a running Claude Code session whose cache cursor sits
-            // after the winner's write still reloads it; the back-date stamps
-            // clauth's own temp before the rename, so a Claude Code write landing on
-            // this path right after the rename keeps its own mtime.
-            if let Some(entry) =
-                write_member(path, &bytes, operator_file, &members[winner], winner_rank)
-                    .with_context(|| format!("failed to write {}", path.display()))?
+    for i in 0..members.len() {
+        if i == winner {
+            continue;
+        }
+        // Test-only interleave: between target writes, so a test can land a
+        // write on the winner mid-loop deterministically.
+        #[cfg(test)]
+        run_write_loop_hook();
+        // The winner is the merge source for every write below. Re-stat it
+        // before EACH target write, not just once before the loop: a Claude
+        // Code write to the winner landing mid-loop (after an earlier target's
+        // rename, before this one's) would otherwise leave this target holding
+        // stale bytes with a newer mtime, and the next pass would pick it as
+        // winner and revert the winner's write. A moved winner aborts the rest
+        // of this pass; the next event/tick re-reads and converges.
+        if member_changed_since_read(
+            &members[winner].path,
+            members[winner].mtime,
+            members[winner].size,
+        ) {
+            return Ok(());
+        }
+        // A member CC rewrote between our read and now keeps its newer bytes:
+        // skip it this pass; the next pass re-reads and re-merges it.
+        if member_changed_since_read(&members[i].path, members[i].mtime, members[i].size) {
+            continue;
+        }
+        let merged = merge_member(&members[winner].obj, &members[i].obj, rule);
+        if merged == members[i].obj {
+            // An unrecorded runtime copy already holding the merge carries
+            // nothing a rewrite would not: record its read bytes at the
+            // winner's rank, so its session's later edit can win. The winner
+            // is already chosen, so this pass's `can_win` gate stands.
+            let member = &members[i];
+            if recording
+                && is_runtime_copy(&member.path)
+                && !written
+                    .iter()
+                    .any(|e| Path::new(&e.path) == member.path.as_path())
+                && let Some(entry) = recorded_as_read(member, winner_rank)
             {
                 recorded.push(entry);
             }
+            continue;
         }
-        Ok(())
-    })();
-
-    if let Some(record) = record
-        && !recorded.is_empty()
-    {
-        persist_record(record, paths, &recorded);
+        let path = &members[i].path;
+        let bytes = serde_json::to_vec_pretty(&Value::Object(merged))
+            .with_context(|| format!("failed to serialize merged {}", path.display()))?;
+        // Test-only interleave: after the re-stat and serialize, before the
+        // temp write — a write on the winner landing here is what the winner
+        // re-stat inside `write_member` exists to catch.
+        #[cfg(test)]
+        run_pre_rename_hook();
+        // Write the target. The temp is written first with a fresh mtime, then
+        // the winner is re-statted on the still-open temp handle (inside
+        // `write_member`) and the temp is back-dated to the winner's read mtime
+        // only when the winner moved since this pass read it. The early re-stat
+        // above aborted a move that landed between TARGETS; the in-writer
+        // re-stat sees a move that landed between the early re-stat and the
+        // rename (the hook window) and — running after the temp write — also a
+        // move that landed between the decision and the temp write. In the
+        // common case the winner held still, so the copy keeps the rename's
+        // fresh mtime and a running Claude Code session whose cache cursor sits
+        // after the winner's write still reloads it; the back-date stamps
+        // clauth's own temp before the rename, so a Claude Code write landing on
+        // this path right after the rename keeps its own mtime.
+        if let Some(entry) =
+            write_member(path, &bytes, operator_file, &members[winner], winner_rank)
+                .with_context(|| format!("failed to write {}", path.display()))?
+        {
+            recorded.push(entry);
+        }
     }
-    write_result
+    Ok(())
 }
 
 /// Overlay the winner's shared state onto one target: start from the target so
@@ -728,14 +777,20 @@ fn is_runtime_copy(path: &Path) -> bool {
 /// protected key refuses at any count because its absence alone is destructive.
 /// A refusal writes nothing: the file is backed up first, and the one log line
 /// is raised once per distinct winner so the watchdog's repeated ticks do not
-/// fill the log with copies. Returns whether the pass must stop.
+/// fill the log with copies. A refusal whose backup write fails logs that
+/// failure, with the io error, once per distinct winner and latches nothing
+/// else, so every later pass retries the backup and logs the saved copy once it
+/// lands. A refusal that cannot re-read home for the backup refuses with no
+/// backup and no line, and the next pass retries.
+/// Returns whether the pass must stop; an unresolvable `~/.clauth` (where the
+/// backups dir lives) is an error, and the pass writes nothing either way.
 fn refuse_destructive_pass(
     home: &Member,
     winner: &Member,
     file: &str,
     protected: &[&str],
     rule: &impl Fn(KeyPath<'_>) -> KeyRule,
-) -> bool {
+) -> Result<bool> {
     let dropped = home
         .obj
         .keys()
@@ -746,7 +801,7 @@ fn refuse_destructive_pass(
         .iter()
         .any(|key| home.obj.contains_key(*key) && !winner.obj.contains_key(*key));
     if dropped <= MAX_SHARED_DELETIONS && !missing_protected {
-        return false;
+        return Ok(false);
     }
     let key = (
         home.path.clone(),
@@ -754,18 +809,36 @@ fn refuse_destructive_pass(
         winner.mtime,
         winner.size,
     );
-    if latched(&key) {
-        return true;
+    if latched(&LAST_REFUSAL, &key) {
+        return Ok(true);
     }
-    let Some(backup) = save_home_backup(&home.path, file) else {
-        return true;
+    let dir = crate::profile::clauth_dir()?.join("backups");
+    // Home moved under the pass since its read: there is nothing to back up
+    // yet and nothing was written, so refuse quietly and let the next pass,
+    // which re-reads home, decide again.
+    let Ok(bytes) = std::fs::read(&home.path) else {
+        return Ok(true);
     };
-    // Latch only once the backup landed, so a refusal whose backup failed is
-    // retried on the next pass instead of read as already refused.
-    latch(key);
     // `<n>` is what the merge would really drop; only a protected key refuses
     // with n = 1.
     let noun = if dropped == 1 { "key" } else { "keys" };
+    let backup = match save_home_backup(&bytes, &dir, file) {
+        Ok(backup) => backup,
+        Err(e) => {
+            if !latched(&LAST_BACKUP_FAILURE, &key) {
+                latch(&LAST_BACKUP_FAILURE, key);
+                logline!(
+                    "clauth: {file} sync skipped: applying {} would delete {dropped} {noun} \
+                     from {}; could not save a copy in {}: {e}",
+                    shorten_home(&winner.path),
+                    shorten_home(&home.path),
+                    shorten_home(&dir)
+                );
+            }
+            return Ok(true);
+        }
+    };
+    latch(&LAST_REFUSAL, key);
     logline!(
         "clauth: {file} sync skipped: applying {} would delete {dropped} {noun} from {}; \
          saved a copy at {}",
@@ -773,20 +846,19 @@ fn refuse_destructive_pass(
         shorten_home(&home.path),
         shorten_home(&backup)
     );
-    true
+    Ok(true)
 }
 
-/// Copy the operator's own file, before a refused pass could have rewritten
-/// it, into `~/.clauth/backups/<file>.<utc stamp>` (dir 0700, file 0600), then
-/// keep only the newest [`BACKUPS_KEPT`] backups of that file. `None` when the
-/// file cannot be read or the copy cannot be written.
-fn save_home_backup(home: &Path, file: &str) -> Option<PathBuf> {
-    let bytes = std::fs::read(home).ok()?;
-    let dir = crate::profile::clauth_dir().ok()?.join("backups");
-    let target = free_backup_path(&dir, file);
-    crate::profile::atomic_write_600(&target, &bytes).ok()?;
-    prune_backups(&dir, file);
-    Some(target)
+/// Save `bytes`, the operator file's own read before a refused pass could have
+/// rewritten it, into `<dir>/<file>.<utc stamp>` (`dir` is
+/// `~/.clauth/backups`; dir 0700, file 0600), then keep only the newest
+/// [`BACKUPS_KEPT`] backups of that file. The error is the write of the copy,
+/// for the refusal's failure line.
+fn save_home_backup(bytes: &[u8], dir: &Path, file: &str) -> std::io::Result<PathBuf> {
+    let target = free_backup_path(dir, file);
+    crate::profile::atomic_write_600(&target, bytes)?;
+    prune_backups(dir, file);
+    Ok(target)
 }
 
 /// `<file>.<utc stamp>` under `dir`, advanced a second at a time until it names
@@ -1053,6 +1125,22 @@ fn record_written(
     })
 }
 
+/// The record entry for a member left as this pass read it: its read mtime,
+/// size and digest, carrying `carried_rank`. `None` for a pre-epoch mtime
+/// (unrecordable, like [`record_written`]'s).
+fn recorded_as_read(member: &Member, carried_rank: (i64, u32)) -> Option<WrittenEntry> {
+    let (mtime_secs, mtime_nanos) = mtime_parts(member.mtime)?;
+    Some(WrittenEntry {
+        path: member.path.to_string_lossy().into_owned(),
+        mtime_secs,
+        mtime_nanos,
+        size: member.size,
+        digest: member.digest.clone(),
+        rank_secs: carried_rank.0,
+        rank_nanos: carried_rank.1,
+    })
+}
+
 /// Read the record at `path` as a list of entries; a missing, unreadable or
 /// unparseable record reads as empty (fail-open).
 fn read_record(path: &Path) -> Vec<WrittenEntry> {
@@ -1062,19 +1150,42 @@ fn read_record(path: &Path) -> Vec<WrittenEntry> {
     serde_json::from_slice::<Vec<WrittenEntry>>(&bytes).unwrap_or_default()
 }
 
-/// Persist the record for one sync pass: `written` (copies rewritten this pass)
-/// replace their old entries, entries for other members of `paths` are kept, and
-/// entries for paths no longer in `paths` are dropped (bounds the file).
+/// Persist the record for one sync pass, run on every pass that has a record,
+/// whether or not it wrote anything: `written` (copies rewritten or recorded as
+/// read this pass) replace their old entries, entries for other members of
+/// `paths` are kept, and so is the entry of a runtime copy this pass leaves out
+/// whose tree still exists and does not read
+/// [`crate::runtime::TreeLiveness::Dead`]: an unknown reading (a session the
+/// pass could not confirm live, which may still be running), or a live one (a
+/// session whose marker was claimed after this pass listed its members). Every
+/// other entry is dropped: a removed or known-dead tree's entry goes on the
+/// first pass that reads it so, which bounds the file and keeps an edit made
+/// in that tree afterwards from winning once the tree is live again. A tree
+/// that reads unknown on every pass until it is live again keeps its entry, so
+/// an edit made in it meanwhile can still win. The record is rewritten only
+/// when this changes it.
 fn persist_record(record_path: &Path, paths: &[PathBuf], written: &[WrittenEntry]) {
-    let mut entries: Vec<WrittenEntry> = read_record(record_path)
+    let mut liveness = crate::runtime::TreeLivenessReader::default();
+    let read = read_record(record_path);
+    let read_len = read.len();
+    let mut entries: Vec<WrittenEntry> = read
         .into_iter()
         .filter(|e| {
-            !written
-                .iter()
-                .any(|w| Path::new(&w.path) == Path::new(&e.path))
-                && paths.iter().any(|p| p.as_path() == Path::new(&e.path))
+            let path = Path::new(&e.path);
+            !written.iter().any(|w| Path::new(&w.path) == path)
+                && (paths.iter().any(|p| p.as_path() == path)
+                    || (is_runtime_copy(path)
+                        && path.parent().is_some_and(|tree| {
+                            tree.is_dir()
+                                && liveness.liveness(tree) != crate::runtime::TreeLiveness::Dead
+                        })))
         })
         .collect();
+    // The filter only drops, so an unchanged length with nothing written is the
+    // record as read.
+    if written.is_empty() && entries.len() == read_len {
+        return;
+    }
     entries.extend(written.iter().cloned());
     write_record_file(record_path, &entries);
 }
