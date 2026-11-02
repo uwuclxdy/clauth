@@ -1,7 +1,9 @@
 # clauth for Rex
 
-The [Rex](https://www.superlogical.com/rex) counterpart of `herdr-plugin/`. Rex is in beta, so
-its Lua API can still change under this plugin. It does three things:
+The [Rex](https://www.superlogical.com/rex) counterpart of `herdr-plugin/`. clauth's Rex support
+is experimental: nothing heals or updates the install on its own (rerun `clauth rex install`
+after upgrading clauth), the Services tab has no controls for it, and Rex is in beta, so a new
+Rex build can break it. It does three things:
 
 - **Launch Claude Code through clauth.** The `clauth_claude` action splits a pane running
   `clauth start --auto --with-fallback`, so a new session starts on the fallback-chain member
@@ -29,7 +31,9 @@ clauth rex install
 
 That writes these files, as bundled in the clauth binary, to `~/.config/rex/clauth/` (Rex's own
 rules: `REX_CONFIG`, then `$XDG_CONFIG_HOME/rex/`), appends a marked `require("clauth").setup{}`
-block to `init.lua`, and reloads Rex. `clauth rex uninstall` takes both back out. See the
+block to `init.lua`, stops the running watcher, and reloads Rex, which starts a fresh one.
+`clauth rex uninstall` takes the files and the block back out, stops the watcher and removes
+`~/.local/state/clauth-rex/`. See the
 [wiki page](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) for the details.
 
 To develop against a checkout instead, link it in place of the installed copy (install then
@@ -87,7 +91,8 @@ Both must be in the Rex server's environment.
 | `tag-watch.lua` | The `rex do` script that labels panes. |
 | `resolve-profile.sh` | Pid to account, shared logic with the herdr plugin. |
 
-State: `~/.local/state/clauth-rex/watch.log` and `watch-<server>.pid`.
+State: `~/.local/state/clauth-rex/watch.log` and `watch-<server>.pid`. `clauth rex install` and
+`uninstall` read the pidfiles to stop the watcher, so keep their names and contents as they are.
 
 ## Limits
 

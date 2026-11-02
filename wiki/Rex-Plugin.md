@@ -2,7 +2,9 @@
 
 clauth ships a plugin for [Rex](https://www.superlogical.com/rex), a terminal multiplexer for coding agents that is in beta. It does what the [herdr plugin](Herdr-Plugin) does, through Rex's own extension points: it opens Claude Code through `clauth start`, opens the clauth dashboard in a floating pane, and labels every Rex pane with the account that pane is spending.
 
-Requires Rex with Lua config (`rex config check` answers), `clauth` on `PATH`, and Linux or macOS. The watcher and resolver are POSIX shell scripts. Rex is in beta, so its Lua API can still change under the plugin; everything here was checked against Rex builds from October 2026.
+**clauth's Rex support is experimental.** Nothing heals or updates the install on its own, the way clauth heals its Claude Code and herdr plugins: rerun `clauth rex install` after upgrading clauth. The Services tab has no controls for it. And a new Rex build can break it, since Rex's Lua API can still change under the plugin; everything here was checked against Rex builds from October 2026.
+
+Requires Rex with Lua config (`rex config check` answers), `clauth` on `PATH`, and Linux or macOS. The watcher and resolver are POSIX shell scripts.
 
 ## Install
 
@@ -22,11 +24,11 @@ It shows what it will write and asks `[y/N]` first; `--yes` skips the prompt and
 
 Rex's own rules pick the files: `REX_CONFIG` names `init.lua` when set, else `$XDG_CONFIG_HOME/rex/init.lua`, else `~/.config/rex/init.lua`.
 
-Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone.
+Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone. An `init.lua` that is itself a symlink, such as one into a dotfiles checkout, is written in place, so the link and the file's mode stay.
 
 ## Updates
 
-The plugin files come from the clauth binary, so rerun `clauth rex install` after upgrading clauth to refresh them. It overwrites only the directory it wrote and adds no second block.
+The plugin files come from the clauth binary, so rerun `clauth rex install` after upgrading clauth to refresh them. It overwrites only the directory it wrote and adds no second block. It also stops each running pane-label watcher, since a live one keeps the old `tag-watch.lua` going until its Rex server restarts; the config reload that follows starts a fresh one. A second Rex server, which that reload does not reach, gets its watcher back at its own next config load.
 
 ## Uninstall
 
@@ -34,7 +36,7 @@ The plugin files come from the clauth binary, so rerun `clauth rex install` afte
 clauth rex uninstall
 ```
 
-Takes clauth's block out of `init.lua`, leaving the rest of the file as it was, and removes the `clauth/` directory when clauth wrote it. `--yes` skips the prompt.
+Takes clauth's block out of `init.lua`, leaving the rest of the file as it was, and removes the `clauth/` directory when clauth wrote it. It stops the pane-label watcher and removes its state, `~/.local/state/clauth-rex/`. A `clauth/` that is a link onto a checkout keeps its watcher and state. `--yes` skips the prompt.
 
 ## Actions and keys
 
