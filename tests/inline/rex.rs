@@ -12,6 +12,7 @@ fn paths_in(dir: &Path) -> Paths {
     Paths::resolve(
         Some(dir.join("init.lua").into_os_string()),
         None,
+        Some(dir.join("state").into_os_string()),
         Path::new("/nonexistent"),
     )
 }
@@ -21,6 +22,7 @@ fn rex_config_wins_over_xdg_and_home() {
     let paths = Paths::resolve(
         Some("/etc/rex/custom.lua".into()),
         Some("/xdg".into()),
+        None,
         Path::new("/home/u"),
     );
     assert_eq!(paths.init, PathBuf::from("/etc/rex/custom.lua"));
@@ -29,12 +31,23 @@ fn rex_config_wins_over_xdg_and_home() {
 
 #[test]
 fn xdg_config_home_then_dot_config() {
-    let xdg = Paths::resolve(None, Some("/xdg".into()), Path::new("/home/u"));
+    let xdg = Paths::resolve(None, Some("/xdg".into()), None, Path::new("/home/u"));
     assert_eq!(xdg.init, PathBuf::from("/xdg/rex/init.lua"));
     assert_eq!(xdg.plugin, PathBuf::from("/xdg/rex/clauth"));
 
-    let home = Paths::resolve(Some("".into()), Some("".into()), Path::new("/home/u"));
+    let home = Paths::resolve(Some("".into()), Some("".into()), None, Path::new("/home/u"));
     assert_eq!(home.init, PathBuf::from("/home/u/.config/rex/init.lua"));
+}
+
+#[test]
+fn state_follows_start_watch_sh() {
+    // `${XDG_STATE_HOME:-$HOME/.local/state}/clauth-rex`: empty counts as unset.
+    let xdg = Paths::resolve(None, None, Some("/state".into()), Path::new("/home/u"));
+    assert_eq!(xdg.state, PathBuf::from("/state/clauth-rex"));
+    for unset in [None, Some("".into())] {
+        let home = Paths::resolve(None, None, unset, Path::new("/home/u"));
+        assert_eq!(home.state, PathBuf::from("/home/u/.local/state/clauth-rex"));
+    }
 }
 
 #[test]
@@ -232,6 +245,125 @@ fn uninstall_leaves_a_foreign_directory() {
     assert!(uninstall_at(&paths, true).expect("uninstall"));
     assert_eq!(std::fs::read_to_string(&paths.init).expect("init.lua"), "");
     assert_eq!(plugin_dir_state(&paths.plugin), PluginDir::Foreign);
+}
+
+/// A stand-in watcher: a child whose argv names `tag-watch.lua`, the way
+/// start-watch.sh's `rex do ... tag-watch.lua` does. The loop keeps sh from
+/// exec-ing into `sleep`, which would drop the name from the argv.
+#[cfg(unix)]
+fn fake_watcher() -> std::process::Child {
+    std::process::Command::new("sh")
+        .args(["-c", "while :; do sleep 1; done", "tag-watch.lua"])
+        .spawn()
+        .expect("spawn fake watcher")
+}
+
+#[cfg(unix)]
+fn record(state: &Path, key: &str, pid: u32) -> PathBuf {
+    std::fs::create_dir_all(state).expect("state dir");
+    let pidfile = state.join(format!("watch-{key}.pid"));
+    std::fs::write(&pidfile, format!("{pid}\n")).expect("pidfile");
+    pidfile
+}
+
+/// Waits for `child` to exit, killing it if the test's own stop did not.
+#[cfg(unix)]
+fn exited(child: &mut std::process::Child) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait").is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pidfile_naming_another_program_is_not_a_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    // A reused pid: the pidfile names a live process that is not a watcher.
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    record(&state, "1", other.id());
+    std::fs::write(state.join("watch-2.pid"), "not a pid\n").expect("junk pidfile");
+    std::fs::write(state.join("watch.log"), "").expect("log");
+
+    assert_eq!(running_watchers(&state), Vec::new());
+    assert!(
+        other.try_wait().expect("try_wait").is_none(),
+        "left running"
+    );
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn install_stops_the_running_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    assert!(install_at(&paths, true).expect("install"));
+
+    let mut watcher = fake_watcher();
+    let pidfile = record(&paths.state, "1", watcher.id());
+    assert_eq!(
+        running_watchers(&paths.state),
+        vec![Watcher {
+            pidfile: pidfile.clone(),
+            pid: watcher.id()
+        }]
+    );
+
+    // A reinstall stops it, so the reload's start-watch.sh finds no live
+    // watcher and starts one on the new files.
+    assert!(install_at(&paths, true).expect("reinstall"));
+    assert!(exited(&mut watcher), "the old watcher stopped");
+    assert!(!pidfile.exists(), "its pidfile is gone");
+    assert!(paths.state.exists(), "install keeps the state directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_stops_the_watcher_and_removes_its_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    assert!(install_at(&paths, true).expect("install"));
+    let mut watcher = fake_watcher();
+    record(&paths.state, "1", watcher.id());
+    std::fs::write(paths.state.join("watch.log"), "log\n").expect("log");
+
+    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(exited(&mut watcher), "the watcher stopped");
+    assert!(!paths.state.exists(), "the state directory is gone");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_leaves_a_linked_checkouts_watcher() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let checkout = tmp.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    std::os::unix::fs::symlink(&checkout, &paths.plugin).expect("link");
+    std::fs::write(&paths.init, block()).expect("seed init.lua");
+    let mut watcher = fake_watcher();
+    record(&paths.state, "1", watcher.id());
+
+    assert!(uninstall_at(&paths, true).expect("uninstall"));
+    assert!(
+        watcher.try_wait().expect("try_wait").is_none(),
+        "the checkout's watcher keeps running"
+    );
+    assert!(paths.state.exists(), "its state stays");
+    let _ = watcher.kill();
+    let _ = watcher.wait();
 }
 
 #[test]

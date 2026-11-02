@@ -2,7 +2,9 @@
 # Runs tag-watch.lua once for the Rex server that loaded init.lua. init.lua
 # starts this on every config load and reload, so a live watcher for the same
 # server makes it a no-op. The watcher exits when its server goes away; the
-# next server's config load starts a fresh one.
+# next server's config load starts a fresh one. `clauth rex install` and
+# `clauth rex uninstall` stop it through its pidfile, so a reinstall's reload
+# starts one on the new files; keep the pidfile's name and contents as they are.
 #
 # Several Rex servers can run at once (one per installed version), so the
 # watcher is pinned to the server that started us: our parent, whose
