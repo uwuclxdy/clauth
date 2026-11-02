@@ -67,6 +67,39 @@ fn the_table_renders_every_row_field() {
     );
 }
 
+/// The version comes from the proxy binary's own manifest, so it can hold any
+/// script: a column sizes and pads by drawn cells, so a wide-script version
+/// widens its own column and every later column keeps its start.
+#[test]
+fn a_wide_script_version_keeps_the_later_columns_aligned() {
+    let rows = vec![
+        row(
+            "zcode",
+            Some("版本漢字"),
+            Some("1.0"),
+            true,
+            Some(9101),
+            "healthy",
+            None,
+        ),
+        row(
+            "qwen",
+            Some("0.9.1"),
+            Some("1.0"),
+            false,
+            Some(9102),
+            "disabled",
+            None,
+        ),
+    ];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION   CONTRACT  ENABLED  PORT  STATE   \n\
+         zcode    版本漢字  1.0       true     9101  healthy \n\
+         qwen     0.9.1     1.0       false    9102  disabled\n"
+    );
+}
+
 /// A row with no reason renders no trailing lines and no blank line: the
 /// reason lines appear only where a row has one.
 #[test]

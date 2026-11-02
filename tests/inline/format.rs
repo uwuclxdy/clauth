@@ -1261,3 +1261,55 @@ fn a_dead_usage_credential_is_named_by_its_cause() {
     ds.api_key = Some("sk-dead".to_string());
     assert_eq!(auth_expired_label(&ds), DIAG_KEY_REJECTED);
 }
+
+/// `pad_cells` pads to a width counted in drawn cells, either alignment, and
+/// leaves a value already at or past the width whole.
+#[test]
+fn pad_cells_pads_by_drawn_cells_in_either_alignment() {
+    assert_eq!(pad_cells("abc", 5, false), "abc  ");
+    assert_eq!(pad_cells("abc", 5, true), "  abc");
+    // Two glyphs drawing four cells: two blanks, not the four a char count adds.
+    assert_eq!(pad_cells("漢字", 6, false), "漢字  ");
+    assert_eq!(pad_cells("漢字", 6, true), "  漢字");
+    assert_eq!(pad_cells("abcdef", 3, false), "abcdef");
+    assert_eq!(pad_cells("abcdef", 3, true), "abcdef");
+    assert_eq!(pad_cells("漢字漢字", 6, false), "漢字漢字");
+}
+
+/// `col_width` takes the header or the widest cell, whichever draws wider, and
+/// counts a wide cell by its cells rather than its chars.
+#[test]
+fn col_width_lets_a_wide_cell_win_by_cells() {
+    assert_eq!(col_width("HEADER", ["ab", "cde"].into_iter()), 6);
+    // Four glyphs, eight cells, against a six-cell header: the cells win.
+    assert_eq!(col_width("HEADER", ["漢字漢字"].into_iter()), 8);
+    assert_eq!(col_width("", std::iter::empty::<&str>()), 0);
+}
+
+/// The `--explain` walk sizes its name column by drawn cells, never bytes: a
+/// name of four wide glyphs (twelve bytes, eight cells) lays the walk out
+/// exactly as an eight-letter ASCII name does.
+#[test]
+fn a_wide_script_name_in_the_start_walk_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let walk = |first: &str| {
+        let row = |name: &str| StartCandidate {
+            name: crate::profile::ProfileName::from(name),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
+        };
+        render_start_walk(&[row(first), row("D2")], Some(1))
+    };
+    let twin = walk(TWIN);
+    assert!(
+        twin.contains(TWIN),
+        "the twin walk renders the twin: {twin}"
+    );
+    assert_eq!(walk(WIDE), twin.replace(TWIN, WIDE));
+}

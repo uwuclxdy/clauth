@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::format::{col_width, pad_cells};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::out::{Wrote, errln, out, outln, write_chunk_result};
@@ -869,28 +870,24 @@ fn render_table(devices: &[Device], now: i64) -> String {
         .iter()
         .map(|device| paired_cell(&device.paired_at, now))
         .collect();
-    let width = |header: &str, cells: &mut dyn Iterator<Item = &str>| {
-        cells
-            .map(|cell| cell.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(header.chars().count())
-    };
-    let w_name = width("NAME", &mut devices.iter().map(|d| d.name.as_str()));
-    let w_tier = width("TIER", &mut devices.iter().map(|d| d.tier.as_str()));
-    let w_paired = width("PAIRED AT", &mut paired.iter().map(String::as_str));
-    let w_joined = width("JOINED", &mut devices.iter().map(|d| d.joined.as_str()));
+    let w_name = col_width("NAME", devices.iter().map(|d| d.name.as_str()));
+    let w_tier = col_width("TIER", devices.iter().map(|d| d.tier.as_str()));
+    let w_paired = col_width("PAIRED AT", paired.iter().map(String::as_str));
+    let w_joined = col_width("JOINED", devices.iter().map(|d| d.joined.as_str()));
     let mut out = format!(
-        "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  SESSIONS\n",
-        "NAME", "TIER", "PAIRED AT", "JOINED"
+        "{}  {}  {}  {}  SESSIONS\n",
+        pad_cells("NAME", w_name, false),
+        pad_cells("TIER", w_tier, false),
+        pad_cells("PAIRED AT", w_paired, false),
+        pad_cells("JOINED", w_joined, false),
     );
     for (device, paired) in devices.iter().zip(&paired) {
         out.push_str(&format!(
-            "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  {}\n",
-            device.name,
-            device.tier.as_str(),
-            paired,
-            device.joined.as_str(),
+            "{}  {}  {}  {}  {}\n",
+            pad_cells(&device.name, w_name, false),
+            pad_cells(device.tier.as_str(), w_tier, false),
+            pad_cells(paired, w_paired, false),
+            pad_cells(device.joined.as_str(), w_joined, false),
             if device.sessions { "yes" } else { "no" },
         ));
     }

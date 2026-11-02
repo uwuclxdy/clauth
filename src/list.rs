@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::codex_profiles::CodexState;
 use crate::daemon::{ProfileEntry, build_codex_entries, build_profile_entries};
-use crate::format::{format_pct, grapheme_cells};
+use crate::format::{col_width, format_pct, pad_cells};
 use crate::harness::Harness;
 use crate::out::out;
 use crate::profile::{AppConfig, load_config};
@@ -207,30 +207,6 @@ fn window_pct(windows: &[Window], label: &str) -> String {
         .find(|w| w.label == label)
         .map(|w| format_pct(w.utilization_pct))
         .unwrap_or_else(|| "-".to_string())
-}
-
-/// Minimum column width: the header vs every cell, counted in drawn cells, so
-/// a wide-script name widens its own column instead of shifting the ones after
-/// it.
-fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
-    cells
-        .map(grapheme_cells)
-        .chain(std::iter::once(grapheme_cells(header)))
-        .max()
-        .unwrap_or(0)
-}
-
-/// `value` plus the spaces that bring it to `width` drawn cells: trailing for
-/// a left-aligned column, leading for a right-aligned one. `format!`'s own
-/// width pads by `char` count, which leaves a wide-script cell short by the
-/// extra cells its glyphs draw.
-fn pad_cells(value: &str, width: usize, right_align: bool) -> String {
-    let fill = " ".repeat(width.saturating_sub(grapheme_cells(value)));
-    if right_align {
-        format!("{fill}{value}")
-    } else {
-        format!("{value}{fill}")
-    }
 }
 
 fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {

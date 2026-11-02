@@ -591,3 +591,34 @@ fn the_table_names_each_row_and_quotes_a_tail_on_its_own_line() {
         "the tail rides its own indented, quoted line:\n{table}"
     );
 }
+
+/// A column sizes and pads by drawn cells: a profile cell of four wide glyphs
+/// (eight cells) lays the table out exactly as an eight-letter ASCII name does,
+/// so every column after it keeps its start.
+#[test]
+fn a_wide_script_profile_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let _home = HomeSandbox::new();
+    write_running(&RunningSpec {
+        profile: WIDE.to_string(),
+        ..spec("d-wide-0", NOW - 65_000)
+    })
+    .unwrap();
+    write_running(&spec("d-narrow-0", NOW - 65_000)).unwrap();
+
+    let mut rows = rows(NOW);
+    let wide = render_table(&rows);
+    for row in &mut rows {
+        if row.profile == WIDE {
+            row.profile = TWIN.to_string();
+        }
+    }
+    let twin = render_table(&rows);
+
+    assert!(
+        twin.contains(TWIN),
+        "the twin table renders the twin: {twin}"
+    );
+    assert_eq!(wide, twin.replace(TWIN, WIDE));
+}

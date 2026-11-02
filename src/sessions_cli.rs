@@ -42,6 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
+use crate::format::{grapheme_cells, pad_cells};
 use crate::out::{out, outln};
 use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
@@ -675,7 +676,7 @@ struct LiveWidths {
 
 impl LiveWidths {
     fn fit(cells: &[LiveCells]) -> Self {
-        let width = |s: &str| s.chars().count();
+        let width = grapheme_cells;
         let mut w = Self {
             sid: 0,
             account: 0,
@@ -705,24 +706,16 @@ impl LiveWidths {
 fn live_row_line(c: &LiveCells, w: LiveWidths) -> String {
     let transcript = c.transcript.as_deref().unwrap_or("-");
     let cwd = c.cwd.as_deref().unwrap_or("-");
-    format!(
-        "{sid:<sid_w$}  {account:<account_w$}  {harness:<harness_w$}  {age:<age_w$}  \
-         {transcript:<transcript_w$}  {cwd:<cwd_w$}  {tag:<tag_w$}",
-        sid = c.sid,
-        sid_w = w.sid,
-        account = c.account,
-        account_w = w.account,
-        harness = c.harness,
-        harness_w = w.harness,
-        age = c.age,
-        age_w = w.age,
-        transcript = transcript,
-        transcript_w = w.transcript,
-        cwd = cwd,
-        cwd_w = w.cwd,
-        tag = c.tag,
-        tag_w = w.tag,
-    )
+    [
+        pad_cells(&c.sid, w.sid, false),
+        pad_cells(&c.account, w.account, false),
+        pad_cells(&c.harness, w.harness, false),
+        pad_cells(&c.age, w.age, false),
+        pad_cells(transcript, w.transcript, false),
+        pad_cells(cwd, w.cwd, false),
+        pad_cells(&c.tag, w.tag, false),
+    ]
+    .join("  ")
     .trim_end()
     .to_string()
 }
@@ -790,7 +783,7 @@ impl Columns {
     const ID_CAP: usize = 23;
 
     fn fit<'a>(sessions: impl IntoIterator<Item = &'a SessionInfo>, now: SystemTime) -> Self {
-        let width = |cell: &str| cell.chars().count();
+        let width = grapheme_cells;
         sessions.into_iter().fold(Self::FLOOR, |cols, s| Self {
             id: cols.id.max(width(short_id(&s.id)).min(Self::ID_CAP)),
             profile: cols.profile.max(width(profile_cell(s))),
@@ -814,11 +807,9 @@ impl Columns {
 fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) -> String {
     let usage = if tokens {
         format!(
-            "  {tokens:>tokens_w$}  {cost:>cost_w$}",
-            tokens = tokens_cell(s),
-            tokens_w = cols.tokens,
-            cost = cost_cell(s),
-            cost_w = cols.cost,
+            "  {}  {}",
+            pad_cells(&tokens_cell(s), cols.tokens, true),
+            pad_cells(&cost_cell(s), cols.cost, true),
         )
     } else {
         String::new()
@@ -843,15 +834,13 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) ->
         format!("{updated}{}", " ".repeat(reserve))
     } else {
         let age_cell = format!("({age})");
-        format!("{updated} {age_cell:<w$}", w = cols.age + 2)
+        format!("{updated} {}", pad_cells(&age_cell, cols.age + 2, false))
     };
     let mut row = format!(
-        "  {id:<id_w$}  {profile:<profile_w$}  {stamp_age}{usage}  {preview}",
-        id = short_id(&s.id),
-        id_w = cols.id,
-        profile = profile_cell(s),
-        profile_w = cols.profile,
-        preview = preview_pair(s),
+        "  {}  {}  {stamp_age}{usage}  {}",
+        pad_cells(short_id(&s.id), cols.id, false),
+        pad_cells(profile_cell(s), cols.profile, false),
+        preview_pair(s),
     );
     // An empty preview would leave the padding as trailing blanks.
     row.truncate(row.trim_end().len());

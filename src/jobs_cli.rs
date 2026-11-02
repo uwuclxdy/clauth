@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 
-use crate::format::{humanize_span, terminal_safe, truncate};
+use crate::format::{col_width, humanize_span, pad_cells, terminal_safe, truncate};
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::usage::now_ms;
 use crate::{out, outln};
@@ -149,8 +149,13 @@ fn render_table(rows: &[JobRow]) -> String {
 
     // KILL is the last column, so it is never padded and needs no width.
     let mut out = format!(
-        "{:<w_state$}  {:<w_id$}  {:<w_profile$}  {:>w_age$}  {:>w_elapsed$}  {:>w_output$}  KILL IN\n",
-        "STATE", "JOB ID", "PROFILE", "AGE", "ELAPSED", "LAST OUTPUT",
+        "{}  {}  {}  {}  {}  {}  KILL IN\n",
+        pad_cells("STATE", w_state, false),
+        pad_cells("JOB ID", w_id, false),
+        pad_cells("PROFILE", w_profile, false),
+        pad_cells("AGE", w_age, true),
+        pad_cells("ELAPSED", w_elapsed, true),
+        pad_cells("LAST OUTPUT", w_output, true),
     );
     for ((r, age), (elapsed, output)) in rows
         .iter()
@@ -158,13 +163,13 @@ fn render_table(rows: &[JobRow]) -> String {
         .zip(elapsed.iter().zip(outputs.iter()))
     {
         out.push_str(&format!(
-            "{:<w_state$}  {:<w_id$}  {:<w_profile$}  {:>w_age$}  {:>w_elapsed$}  {:>w_output$}  {}\n",
-            r.phase.label(),
-            r.job_id,
-            r.profile,
-            age,
-            elapsed,
-            output,
+            "{}  {}  {}  {}  {}  {}  {}\n",
+            pad_cells(r.phase.label(), w_state, false),
+            pad_cells(&r.job_id, w_id, false),
+            pad_cells(&r.profile, w_profile, false),
+            pad_cells(age, w_age, true),
+            pad_cells(elapsed, w_elapsed, true),
+            pad_cells(output, w_output, true),
             kill_cell(r),
         ));
         if !r.tail.is_empty() {
@@ -225,15 +230,6 @@ fn render_table(rows: &[JobRow]) -> String {
 /// it needs this filter too.
 fn tail_cell(tail: &str) -> String {
     truncate(&terminal_safe(tail), TAIL_W)
-}
-
-/// Width of one column: its header, or the widest cell under it.
-fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
-    cells
-        .map(|c| c.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(header.chars().count())
 }
 
 /// How long since this record last mattered. Always answerable — every record

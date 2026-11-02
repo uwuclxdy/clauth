@@ -11,6 +11,34 @@ use clap::CommandFactory as _;
 
 use crate::cli::StartArgs;
 
+/// A stored model id is free text, so the old-id column sizes and pads by
+/// drawn cells, never bytes: a four-glyph id (twelve bytes, eight cells)
+/// pushes the arrow to the same column on every row.
+#[test]
+fn a_wide_script_old_model_id_keeps_the_rebind_arrows_aligned() {
+    use crate::presets::{AccountOffers, RowMove};
+    let offers = [AccountOffers {
+        account: "D1".to_string(),
+        rows: vec![
+            RowMove {
+                row: "default",
+                old: Some("模型漢字".to_string()),
+                new: Some("deepseek-v4-pro".to_string()),
+            },
+            RowMove {
+                row: "opus",
+                old: Some("abc".to_string()),
+                new: None,
+            },
+        ],
+    }];
+    assert_eq!(
+        rebind_list_body(&offers),
+        "D1  default  模型漢字  → deepseek-v4-pro\n\
+         D1  opus     abc       → (unset)\n"
+    );
+}
+
 /// Parse an argv WITHOUT the binary name, the way `main` does (it passes
 /// `args_os()`, whose first element is the binary).
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {

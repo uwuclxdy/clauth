@@ -80,6 +80,7 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
+use crate::format::{grapheme_cells, pad_cells};
 use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, Profile, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
@@ -515,27 +516,31 @@ const REBIND_NOTHING: &str = "every account already uses the built-in preset mod
 
 /// The aligned account-row-old→new body, one line per row, no summary.
 fn rebind_list_body(selected: &[crate::presets::AccountOffers]) -> String {
-    let acc_w = selected.iter().map(|o| o.account.len()).max().unwrap_or(0);
+    let acc_w = selected
+        .iter()
+        .map(|o| grapheme_cells(&o.account))
+        .max()
+        .unwrap_or(0);
     let row_w = selected
         .iter()
         .flat_map(|o| &o.rows)
-        .map(|m| m.row.len())
+        .map(|m| grapheme_cells(m.row))
         .max()
         .unwrap_or(0);
     let old_w = selected
         .iter()
         .flat_map(|o| &o.rows)
-        .map(|m| m.old_display().len())
+        .map(|m| grapheme_cells(m.old_display()))
         .max()
         .unwrap_or(0);
     let mut out = String::new();
     for offer in selected {
         for m in &offer.rows {
             out.push_str(&format!(
-                "{:<acc_w$}  {:<row_w$}  {:<old_w$}  → {}\n",
-                offer.account,
-                m.row,
-                m.old_display(),
+                "{}  {}  {}  → {}\n",
+                pad_cells(&offer.account, acc_w, false),
+                pad_cells(m.row, row_w, false),
+                pad_cells(m.old_display(), old_w, false),
                 m.new_display(),
             ));
         }

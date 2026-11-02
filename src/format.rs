@@ -643,6 +643,30 @@ pub(crate) fn grapheme_cells(value: &str) -> usize {
         .sum()
 }
 
+/// The width of one table column: the header or the widest cell under it,
+/// counted in drawn cells, so a wide-script cell widens its own column instead
+/// of shifting the ones after it.
+pub(crate) fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
+    cells
+        .map(grapheme_cells)
+        .chain(std::iter::once(grapheme_cells(header)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// `value` plus the spaces that bring it to `width` drawn cells: trailing for a
+/// left-aligned column, leading for a right-aligned one. `format!`'s own width
+/// pads by `char` count, which leaves a wide-script cell short by the extra
+/// cells its glyphs draw.
+pub(crate) fn pad_cells(value: &str, width: usize, right_align: bool) -> String {
+    let fill = " ".repeat(width.saturating_sub(grapheme_cells(value)));
+    if right_align {
+        format!("{fill}{value}")
+    } else {
+        format!("{value}{fill}")
+    }
+}
+
 /// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1024,12 +1048,12 @@ fn start_age_cell(row: &StartCandidate) -> String {
 pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
     let name_w = rows
         .iter()
-        .map(|r| r.name.as_str().len())
+        .map(|r| grapheme_cells(r.name.as_str()))
         .max()
         .unwrap_or(0);
     let verdict_w = rows
         .iter()
-        .map(|r| start_verdict(r).len())
+        .map(|r| grapheme_cells(&start_verdict(r)))
         .max()
         .unwrap_or(0);
     rows.iter()
@@ -1037,9 +1061,9 @@ pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) ->
         .map(|(i, r)| {
             let marker = if Some(i) == pick { '*' } else { ' ' };
             format!(
-                "{marker} {:<name_w$}  {:<verdict_w$}   {}",
-                r.name.as_str(),
-                start_verdict(r),
+                "{marker} {}  {}   {}",
+                pad_cells(r.name.as_str(), name_w, false),
+                pad_cells(&start_verdict(r), verdict_w, false),
                 start_age_cell(r),
             )
         })

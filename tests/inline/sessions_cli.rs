@@ -323,6 +323,65 @@ fn the_table_columns_widen_to_their_widest_cell_in_every_row() {
     assert!(child_row.starts_with(&child_cells), "{child_row:?}");
 }
 
+/// The profile column sizes and pads by drawn cells: a profile cell of eight
+/// wide glyphs (sixteen cells) lays the table out exactly as a sixteen-letter
+/// ASCII name does. The second row's fourteen-letter profile sits between the
+/// wide cell's char count (8) and its cell count (16), so measuring by chars
+/// sizes the column to 14 and shifts the rows apart, past the floor of 12.
+#[test]
+fn a_wide_script_profile_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字漢字漢字";
+    const TWIN: &str = "abcdefghijklmnop";
+    let sb = HomeSandbox::new();
+    let wide_id = "12345678-1234-4567-890a-123456789abc";
+    let narrow_id = "87654321-1234-4567-890a-123456789abc";
+    for (id, secs, preview) in [(wide_id, 4_000, "parent"), (narrow_id, 3_000, "sibling")] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", preview)]);
+        set_mtime(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    }
+
+    let mut groups = build_listing(false);
+    let mut lines_with = |profile: &str| {
+        for session in groups.iter_mut().flat_map(|g| &mut g.sessions) {
+            let name = if session.id == wide_id {
+                profile
+            } else {
+                "abcdefghijklmn"
+            };
+            session.last_ran_profile = Some(name.to_string());
+        }
+        table_lines(&groups, false, SystemTime::UNIX_EPOCH)
+    };
+    let twin = lines_with(TWIN).join("\n");
+    let wide = lines_with(WIDE).join("\n");
+    assert!(twin.contains(TWIN), "the twin row renders the twin: {twin}");
+    assert_eq!(wide, twin.replace(TWIN, WIDE));
+}
+
+/// A `--live` cwd is any path the session ran in, so its column sizes and
+/// pads by drawn cells: the tag after a wide-script cwd starts at the same
+/// column on every row.
+#[test]
+fn a_wide_script_live_cwd_keeps_the_tag_column_aligned() {
+    let row = |sid: &str, ago_secs: u64, cwd: &str| crate::live_sessions::LiveSession {
+        cwd: Some(std::path::PathBuf::from(cwd)),
+        background: true,
+        ..live_fixture_row(sid, "cld1", ago_secs)
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines_of(
+            &[row("100-0", 60, "/w/漢字"), row("200-0", 120, "/w/abc")],
+            now
+        ),
+        [
+            "100-0  cld1  claude  1m ago  -  /w/漢字  background",
+            "200-0  cld1  claude  2m ago  -  /w/abc   background",
+        ]
+    );
+}
+
 /// A 5-char stem pads to the id floor of 8, the `-` profile to 12.
 #[test]
 fn a_table_with_no_wide_cell_keeps_the_floor_widths() {

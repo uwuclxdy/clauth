@@ -652,6 +652,28 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
     );
 }
 
+/// A column sizes and pads by drawn cells: a device name of four wide glyphs
+/// (eight cells) lays the table out exactly as an eight-letter ASCII name does.
+#[test]
+fn a_wide_script_device_name_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let table = |first: &str| {
+        let device = |name: &str| Device {
+            paired_at: "2026-01-02T03:04:05+00:00".to_string(),
+            ..Device::minted(name, Tier::View, false, TOKEN, Joined::Pair)
+        };
+        let epoch = iso_to_epoch_secs("2026-01-02T03:04:05+00:00").expect("parse");
+        render_table(&[device(first), device("tray")], epoch + 300)
+    };
+    let twin = table(TWIN);
+    assert!(
+        twin.contains(TWIN),
+        "the twin table renders the twin: {twin}"
+    );
+    assert_eq!(table(WIDE), twin.replace(TWIN, WIDE));
+}
+
 #[test]
 fn an_unparseable_stamp_renders_as_no_data() {
     assert_eq!(paired_cell("synthetic-fixture", 0), "-");
