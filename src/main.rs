@@ -289,7 +289,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             a.explain,
         ),
         Command::Login(a) => cmd_login(a),
-        Command::Capture { profile } => cmd_capture(&profile),
+        Command::Capture { profile, new } => cmd_capture(&profile, new),
         Command::Delete {
             profile,
             yes,
@@ -1596,15 +1596,20 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 }
 
 /// `clauth capture <name>`: save the login Claude Code is using now as a new
-/// profile. The refusal paths (existing name, nothing live to capture) and the
-/// capture itself live in `actions::capture_current_login`, so they are
-/// testable without argv; this wrapper only loads config and reports the
-/// outcome.
-fn cmd_capture(profile: &str) -> Result<()> {
+/// profile, or into the existing profile `name` when the login is a newer pair
+/// of its account. The refusal paths (an existing name the login does not
+/// belong to, an owned login, nothing live to capture) and the capture itself
+/// live in `actions::capture_current_login`, so they are testable without
+/// argv; this wrapper only loads config and reports the outcome, naming an
+/// existing profile as the roster spells it.
+fn cmd_capture(profile: &str, as_new: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let name = profile.trim();
-    let became_active = actions::capture_current_login(&mut config, name)?;
+    let typed = profile.trim();
+    let name = config
+        .canonical_name(typed)
+        .unwrap_or_else(|| typed.to_string());
+    let became_active = actions::capture_current_login(&mut config, &name, as_new)?;
     if became_active {
         outln!("clauth: captured into profile '{name}'. It is the active account.");
     } else {

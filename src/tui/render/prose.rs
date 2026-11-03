@@ -18,13 +18,14 @@ use super::panes;
 const KEY_OPEN: char = '\u{E000}';
 const CMD_OPEN: char = '\u{E001}';
 const CLOSE: char = '\u{E002}';
+const NAME_OPEN: char = '\u{E003}';
 
 /// Whether `ch` is one of the marker code points ([`KEY_OPEN`], [`CMD_OPEN`],
-/// [`CLOSE`]): a copy source must escape it before the string reaches any
-/// tokenizer entry in this module, so an untrusted string cannot style the
-/// cells after it or drop a character.
+/// [`NAME_OPEN`], [`CLOSE`]): a copy source must escape it before the string
+/// reaches any tokenizer entry in this module, so an untrusted string cannot
+/// style the cells after it or drop a character.
 pub(crate) fn is_marker(ch: char) -> bool {
-    matches!(ch, KEY_OPEN | CMD_OPEN | CLOSE)
+    matches!(ch, KEY_OPEN | CMD_OPEN | NAME_OPEN | CLOSE)
 }
 
 /// [`key`] for `&'static` copy built with `concat!`; spells the markers out
@@ -44,12 +45,14 @@ macro_rules! cmd_lit {
 
 pub(crate) use {cmd_lit, key_lit};
 
-/// How a visible character draws: plain prose, a key, or a command.
+/// How a visible character draws: plain prose, a key, a command, or an
+/// account name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Face {
     Prose,
     Key,
     Cmd,
+    Name,
 }
 
 /// A visible character's face and the marked run it belongs to. The run id is
@@ -81,6 +84,12 @@ pub(crate) fn key(name: &str) -> String {
 /// A command the end user types (`run {cmd("clauth login")}`).
 pub(crate) fn cmd(command: &str) -> String {
     format!("{CMD_OPEN}{command}{CLOSE}")
+}
+
+/// An account name named in running copy, colored instead of quoted
+/// (`{name("work")} holds the newer login now`).
+pub(crate) fn name(account: &str) -> String {
+    format!("{NAME_OPEN}{account}{CLOSE}")
 }
 
 /// The one fix for a setup token that is refused or expired: a new mint,
@@ -1061,12 +1070,16 @@ fn classify(text: &str) -> Vec<(char, Kind)> {
     let mut run = 0usize;
     for (i, ch) in text.char_indices() {
         match ch {
-            KEY_OPEN | CMD_OPEN => {
+            KEY_OPEN | CMD_OPEN | NAME_OPEN => {
                 let closed = text[i + ch.len_utf8()..].contains(CLOSE);
                 if closed {
                     run += 1;
                     kind = Kind {
-                        face: if ch == KEY_OPEN { Face::Key } else { Face::Cmd },
+                        face: match ch {
+                            KEY_OPEN => Face::Key,
+                            CMD_OPEN => Face::Cmd,
+                            _ => Face::Name,
+                        },
                         run,
                     };
                 }
@@ -1102,7 +1115,7 @@ fn style_for(kind: Kind, base: Style) -> Style {
     match kind.face {
         Face::Prose => base,
         Face::Key => base.fg(theme::accent_color()).add_modifier(Modifier::BOLD),
-        Face::Cmd => base
+        Face::Cmd | Face::Name => base
             .fg(theme::accent_color())
             .remove_modifier(Modifier::BOLD),
     }

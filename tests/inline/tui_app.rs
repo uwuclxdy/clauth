@@ -10756,6 +10756,564 @@ fn capture_row_over_an_owned_live_login_refuses() {
     );
 }
 
+/// `b` stores an older pair (`rt-b`) of the account `uuid-b`, the live file a
+/// newer pair no store holds (`rt-cc-newer`), and `~/.claude.json` names
+/// `uuid-b` as the account Claude Code last signed in as. `others` join the
+/// roster ahead of `b`, each holding a pair of its own; `active` is marked
+/// active. The App sits on the `+ new` form's actions.
+fn id_matched_capture_app(others: &[&str], active: Option<&str>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    // Expires after `b`'s stored pair (`far_future()` below), so the login is a
+    // newer pair of b's account.
+    let mut live = creds_ra("rt-cc-newer", "at-cc-newer");
+    live.claude_ai_oauth.as_mut().expect("a login").expires_at = Some(far_future() + 3_600_000);
+    write_live_creds(&live);
+    let names: Vec<&str> = others.iter().copied().chain(["b"]).collect();
+    let profiles: Vec<_> = names
+        .iter()
+        .map(|n| stored_oauth_profile(n, far_future()))
+        .collect();
+    crate::testutil::register_names(&names);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("b"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-b".to_string(),
+    );
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        serde_json::to_vec(&serde_json::json!({"oauthAccount": {"accountUuid": "uuid-b"}}))
+            .expect("ser"),
+    )
+    .expect("write ~/.claude.json");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names.iter().map(|n| ProfileName::from(*n)).collect(),
+            active_profile: active.map(ProfileName::from),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.profile_cursor.set(0);
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    app
+}
+
+fn stored_refresh_of(name: &str) -> Option<String> {
+    crate::profile::load_profile(&ProfileName::from(name))
+        .expect("load profile")
+        .refresh_token()
+        .map(str::to_string)
+}
+
+/// The `SAVE LOGIN` modal's interior rows on a `w`×`h` frame, trimmed.
+fn save_login_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let top = rows
+        .iter()
+        .position(|r| r.contains("─ SAVE LOGIN ─"))
+        .expect("a SAVE LOGIN modal is drawn");
+    let chars: Vec<char> = rows[top].chars().collect();
+    let left = chars.iter().position(|&c| c == '╭').expect("left corner");
+    let right = chars.iter().rposition(|&c| c == '╮').expect("right corner");
+    rows[top + 1..]
+        .iter()
+        .take_while(|r| r.chars().nth(left) != Some('╰'))
+        .map(|r| {
+            r.chars()
+                .skip(left + 1)
+                .take(right - left - 1)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The question stays open while Claude Code refreshes the live login: `save
+/// into` saves nothing, says why, and `b` keeps its own pair.
+#[test]
+fn a_save_into_answered_after_the_live_login_moved_saves_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(_))),
+        "control: the question is open: {:?}",
+        app.modals.last()
+    );
+    let mut rotated = creds_ra("rt-cc-rotated", "at-cc-rotated");
+    rotated
+        .claude_ai_oauth
+        .as_mut()
+        .expect("a login")
+        .expires_at = Some(far_future() + 7_200_000);
+    write_live_creds(&rotated);
+
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Enter),
+    );
+
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        ["save skipped\nthe live login changed after the prompt opened"]
+    );
+}
+
+/// A capture whose login matches no stored pair but whose account id is
+/// `b`'s asks instead of stashing: the question, why, and the three rows,
+/// the owner's name colored (never quoted) in each.
+#[test]
+fn the_capture_row_over_an_id_matched_login_asks_save_into_or_new() {
+    use crate::testutil::assert_prose_part;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(f)) if f.owner.as_str() == "b"),
+        "the capture asks about b: {:?}",
+        app.modals.last()
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed while the question is open"
+    );
+    let buf = prose_frame(&app, 200, 40);
+    assert_eq!(
+        save_login_rows(&buf),
+        [
+            "",
+            "this login looks like b's account",
+            "claude code last signed in as b, and this token is newer than the one b holds",
+            "",
+            "❯ save into b",
+            "capture as a new account",
+            "cancel",
+            "",
+        ],
+    );
+    assert_prose_part(
+        &buf,
+        "this login looks like b's account",
+        "b",
+        false,
+        crate::tui::theme::body(),
+    );
+    assert_prose_part(
+        &buf,
+        "claude code last signed in as b,",
+        "b",
+        false,
+        crate::tui::theme::dim(),
+    );
+    let row = crate::testutil::needle_cells(&buf, "save into b").expect("the save row");
+    let name = row.last().expect("the owner cell");
+    assert_eq!(
+        name.fg,
+        crate::tui::theme::accent_color(),
+        "the owner is colored"
+    );
+    assert!(
+        name.modifier.contains(ratatui::style::Modifier::BOLD),
+        "the selected row's owner is bold like its label"
+    );
+}
+
+/// `save into b` writes the live pair into `b` (no second profile), keeps
+/// `b`'s account-id anchor, and toasts that `b` holds the newer login, `b`
+/// colored.
+#[test]
+fn save_into_the_id_matched_owner_lands_the_newer_pair_in_it() {
+    use crate::testutil::assert_prose_part;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(f)) if f.cursor == 0),
+        "the question opens on `save into`: {:?}",
+        app.modals.last()
+    );
+
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Enter),
+    );
+
+    assert!(app.modals.is_empty(), "the answer closes the question");
+    assert!(
+        app.config_draft.is_none(),
+        "the capture is done: the `+ new` draft closes"
+    );
+    assert_eq!(app.config_focus, super::ConfigFocus::Profiles);
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-cc-newer"));
+    assert_eq!(app.config().profiles.len(), 1, "no duplicate profile");
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+            &ProfileName::from("b"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .as_deref(),
+        Some("uuid-b"),
+        "b keeps its anchor"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Success,
+            "\u{E003}b\u{E002} holds the newer login now"
+        )),
+    );
+    assert_prose_part(
+        &prose_frame(&app, 120, 30),
+        "b holds the newer login now",
+        "b",
+        false,
+        ratatui::style::Style::default()
+            .fg(crate::tui::theme::text_color())
+            .bold(),
+    );
+}
+
+/// `capture as a new account` from the `+ new` form goes on as an unowned
+/// capture does: the login stashes into the draft, `b` untouched.
+#[test]
+fn capture_as_new_from_the_capture_row_stashes_the_login() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(_))),
+        "the capture asks first: {:?}",
+        app.modals.last()
+    );
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the live login lands in the draft"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("current login captured\ncreate account saves it")
+    );
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+}
+
+/// `capture as a new account` from a name-prompted capture reaches the name
+/// form with the login, `b` untouched.
+#[test]
+fn capture_as_new_from_a_prompted_capture_opens_the_name_form() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    app.config_draft = None;
+    super::begin_capture(&mut app, None, None);
+    super::drain_capture_probe(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(_))),
+        "the prompted capture asks too: {:?}",
+        app.modals.last()
+    );
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    match app.modals.last() {
+        Some(super::Modal::CaptureName(form)) => {
+            assert_eq!(
+                form.snapshot
+                    .credentials
+                    .as_ref()
+                    .and_then(|c| c.refresh_token()),
+                Some("rt-cc-newer")
+            );
+            assert_eq!(form.from_divergence, None);
+        }
+        other => panic!("expected the CaptureName form, got {other:?}"),
+    }
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+}
+
+/// Esc on the question leaves everything as it was: no stash, no write, no
+/// toast, no second profile.
+#[test]
+fn esc_on_the_id_match_question_changes_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+    assert!(matches!(
+        app.modals.last(),
+        Some(super::Modal::CaptureOwner(_))
+    ));
+    let toasts_before = app.toasts.len();
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+
+    assert!(app.modals.is_empty(), "esc closes the question");
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed"
+    );
+    assert_eq!(app.toasts.len(), toasts_before, "nothing is toasted");
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+    assert_eq!(app.config().profiles.len(), 1);
+}
+
+/// The divergence "save elsewhere" picker preselects on a token match only: an
+/// account-id match alone leaves the cursor on `+ new`, since its commit
+/// replaces the owner's anchor and readings where the capture question keeps
+/// the anchor.
+#[test]
+fn the_divergence_picker_does_not_preselect_an_id_matched_owner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&["a", "c"], Some("a"));
+    app.config_draft = None;
+
+    super::open_divergence_target_picker(&mut app, "a", None);
+
+    match app.modals.last() {
+        Some(super::Modal::DivergenceTarget(form)) => {
+            assert_eq!(form.targets, ["c", "b"]);
+            assert_eq!(form.cursor, 0, "an id match alone preselects nothing");
+        }
+        other => panic!("expected the picker, got {other:?}"),
+    }
+}
+
+/// A probe naming another account than `b`'s anchor breaks the id match:
+/// the `+ new` row opens no question and continues as an unowned capture,
+/// `b` untouched, and the probe worker is joined (the registry is empty once
+/// the drain returns, so the test never polls a clock).
+#[test]
+fn a_probe_naming_another_account_opens_no_question_and_stashes_unowned() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-z"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+
+    assert!(
+        app.modals.is_empty(),
+        "no question: {:?}",
+        app.modals.last()
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the login lands in the draft"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("current login captured\ncreate account saves it")
+    );
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+    assert!(
+        super::TEST_WORKERS
+            .lock()
+            .map(|w| w.is_empty())
+            .unwrap_or(true),
+        "the drain joined the probe worker"
+    );
+}
+
+/// The prompted-capture spelling of the mismatch: `begin_capture`'s probe
+/// naming another account goes on as an unowned capture, which is the name
+/// form there.
+#[test]
+fn a_probe_naming_another_account_sends_a_prompted_capture_to_the_name_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-z"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    app.config_draft = None;
+
+    super::begin_capture(&mut app, None, None);
+    super::drain_capture_probe(&mut app);
+
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureName(_))),
+        "the unowned continuation is the name form: {:?}",
+        app.modals.last()
+    );
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+}
+
+/// A probe that cannot answer (a server error) leaves the account-id tier as
+/// it was: the question still opens.
+#[test]
+fn a_failed_capture_probe_still_opens_the_question() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| (500, "{}".to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    assert!(
+        super::TEST_WORKERS.lock().is_ok_and(|w| !w.is_empty()),
+        "the probe runs on a worker, off the UI thread"
+    );
+    super::drain_capture_probe(&mut app);
+
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(f)) if f.owner.as_str() == "b"),
+        "the question opens on a failed probe: {:?}",
+        app.modals.last()
+    );
+}
+
+/// Two probes in flight (a second ↵ on the capture row before the first
+/// `/profile` answer lands) open one question, never two stacked.
+#[test]
+fn two_capture_probes_in_flight_open_one_question() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let (base, _server) = crate::testutil::serve_endpoints(3, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    super::drain_capture_probe(&mut app);
+
+    let questions = app
+        .modals
+        .iter()
+        .filter(|m| matches!(m, super::Modal::CaptureOwner(_)))
+        .count();
+    assert_eq!(questions, 1, "one question however many answers queued");
+}
+
+/// A refresh-less login (a rolling bearer, a mint) over an id match is no
+/// newer pair of `b`'s: no question, the login stashes as an unowned one does.
+#[test]
+fn a_refresh_less_login_over_an_id_match_is_stashed_without_a_question() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    let mut live = creds_ra("unused", "at-rolling");
+    {
+        let login = live.claude_ai_oauth.as_mut().expect("a login");
+        login.refresh_token = None;
+        login.expires_at = Some(far_future() + 3_600_000);
+    }
+    write_live_creds(&live);
+
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+
+    assert!(
+        app.modals.is_empty(),
+        "no question: {:?}",
+        app.modals.last()
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the login lands in the draft"
+    );
+    assert_eq!(stored_refresh_of("b").as_deref(), Some("rt-b"));
+}
+
+/// A claim that fails for any reason but the owner's absence toasts and goes
+/// no further: filing the login as a new account would be the duplicate the
+/// question exists to prevent.
+#[test]
+fn a_failed_owner_claim_toasts_and_files_no_duplicate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&[], None);
+    // The claim reads the roster off the state file; an unparseable one fails it.
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+        b"profiles = [",
+    )
+    .expect("corrupt the state file");
+
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+
+    assert!(
+        app.modals.is_empty(),
+        "no question: {:?}",
+        app.modals.last()
+    );
+    let toast = app.toasts.back().expect("a toast");
+    assert_eq!(toast.kind, super::ToastKind::Danger);
+    assert!(
+        toast.body.starts_with("capture failed\n"),
+        "the claim's error is shown: {:?}",
+        toast.body
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed"
+    );
+}
+
 /// A blank name on the `+ new` form's `create account` refuses visibly: the
 /// validator's own copy through the form's usual Danger toast, no account
 /// created, the roster and the on-disk state file byte-identical, the form
@@ -59164,6 +59722,57 @@ fn an_active_capture_overwrite_is_held_as_itself() {
         super::BareItemWrite::CaptureOverwrite { ref name, from_divergence: None, .. }
             if name == "work"
     ));
+    assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
+}
+
+/// A save into the id-matched owner of the active account is held at the
+/// bare-item gate as itself: once the settle lets it go it lands with its own
+/// success copy, and a failed settle heads its toast `save failed`.
+#[test]
+fn a_held_save_into_the_owner_resumes_with_its_own_copy() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    super::run_capture_overwrite(
+        &mut app,
+        held_snapshot(),
+        "work".to_string(),
+        crate::testutil::profile_id("work"),
+        None,
+        super::OverwriteCopy::NewerLogin,
+    );
+    land_bare_item_answers(&mut app);
+
+    assert_eq!(stored_refresh("work").as_deref(), Some("held-ref"));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Success,
+            "\u{E003}work\u{E002} holds the newer login now"
+        )),
+    );
+}
+
+#[test]
+fn a_held_save_into_the_owner_whose_settle_failed_reads_save_failed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(vec![FakeSettle::Fail], crate::claude::BareItemSave::Nothing);
+    super::run_capture_overwrite(
+        &mut app,
+        held_snapshot(),
+        "work".to_string(),
+        crate::testutil::profile_id("work"),
+        None,
+        super::OverwriteCopy::NewerLogin,
+    );
+    land_bare_item_answers(&mut app);
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["save failed\nsaving the login into b: connection refused".to_string()]
+    );
     assert_eq!(stored_refresh("work").as_deref(), Some("rt-work"));
 }
 

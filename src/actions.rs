@@ -3812,14 +3812,127 @@ pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileNam
 
     // Tier 2 — account uuid: a sibling's CC re-login mints fresh tokens tier 1
     // can't recognize, so match CC's cached identity against the anchor instead.
+    account_id_owner(config).map(|matched| matched.owner)
+}
+
+/// A profile whose account-id anchor equals the account Claude Code last
+/// signed in as: [`account_id_owner`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountIdMatch {
+    pub(crate) owner: ProfileName,
+    /// The anchor the match was made on.
+    pub(crate) account: AccountId,
+}
+
+/// The account-uuid tier of [`identify_live_login_owner`]: the first profile
+/// (roster order) whose cached anchor (`profile_cache::ACCOUNT_ID_CACHE_FILE`)
+/// equals `~/.claude.json`'s `oauthAccount.accountUuid`. A missing or
+/// unparseable file, a missing block, or a blank uuid on either side matches
+/// nobody. It reads CC's last booted identity, so it can be stale: see the
+/// caveat on [`identify_live_login_owner`].
+pub(crate) fn account_id_owner(config: &AppConfig) -> Option<AccountIdMatch> {
     let live_uuid = crate::claude_json::home_oauth_account_uuid()?;
     config.profiles.iter().find_map(|p| {
         let anchor = crate::profile_cache::load_profile_cache::<AccountId>(
             &p.name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         )?;
-        (!anchor.trim().is_empty() && anchor == live_uuid).then(|| p.name.clone())
+        (!anchor.trim().is_empty() && anchor == live_uuid).then(|| AccountIdMatch {
+            owner: p.name.clone(),
+            account: anchor,
+        })
     })
+}
+
+/// Who a login about to be captured belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureOwner {
+    /// A profile stores this very login ([`find_matching_oauth_profile`]).
+    Owned(ProfileName),
+    /// No profile stores it, but Claude Code last signed in as an account
+    /// exactly one profile is anchored to ([`account_id_owner`]) and the login is a newer,
+    /// unspent rotating pair than that profile stores: most likely its own
+    /// pair rotated past the stored copy. The id can be stale,
+    /// so a capture surface asks (save into the owner, or keep it as a new
+    /// account) and never hides or refuses on it alone.
+    LooksLike(AccountIdMatch),
+    /// Neither tier names anyone.
+    Unowned,
+}
+
+/// Classify `live` for a capture: token equality first, the account-id tier
+/// only when it misses and `live` is provably a newer, unspent rotating pair of
+/// the matched owner's account ([`oauth::advancing_live_expiry`], the gates the
+/// live-rotation adopt holds). A refresh-less login (a rolling bearer, a mint),
+/// a spent pair and an older one are [`CaptureOwner::Unowned`]: saving them
+/// into the owner would replace its rotating pair with a worse one. So is a
+/// login whose account id two or more profiles are anchored to: one account
+/// can sit in several orgs, and the id cannot tell which profile it is.
+pub(crate) fn capture_owner(config: &AppConfig, live: Option<&ClaudeCredentials>) -> CaptureOwner {
+    if let Some(owner) = find_matching_oauth_profile(config, live) {
+        return CaptureOwner::Owned(owner);
+    }
+    let Some(live_oauth) = live.and_then(|c| c.claude_ai_oauth.as_ref()) else {
+        return CaptureOwner::Unowned;
+    };
+    account_id_owner(config)
+        .filter(|matched| {
+            config
+                .profiles
+                .iter()
+                .filter(|p| {
+                    crate::profile_cache::load_profile_cache::<AccountId>(
+                        &p.name,
+                        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+                    )
+                    .is_some_and(|anchor| anchor == matched.account)
+                })
+                .count()
+                == 1
+        })
+        .filter(|matched| {
+            let stored_expires = config
+                .find(&matched.owner)
+                .and_then(Profile::access_token_expires_at);
+            oauth::advancing_live_expiry(&matched.owner, live_oauth, stored_expires).is_some()
+        })
+        .map_or(CaptureOwner::Unowned, CaptureOwner::LooksLike)
+}
+
+/// Whether a live `/profile` answer about `matched` keeps the match: an
+/// answer naming the matched account keeps it, no answer (a failed probe)
+/// leaves the account-id tier exactly as it was, and only an answer naming
+/// another account breaks it — the stale `~/.claude.json` id lied, and the
+/// login is [`CaptureOwner::Unowned`].
+pub(crate) fn probe_keeps_match(matched: &AccountIdMatch, uuid: Option<&AccountId>) -> bool {
+    uuid.is_none_or(|uuid| uuid == &matched.account)
+}
+
+/// [`capture_owner`] resolved by a live `/profile` probe of the login's
+/// access token (the identity source the live-rotation adopt passes to
+/// [`oauth::try_adopt_live_rotation`]): only when the existing gates name a
+/// [`CaptureOwner::LooksLike`] match does the probe run, and its answer is
+/// refined by [`probe_keeps_match`]. The network call lives here, not in
+/// [`capture_owner`], so a UI-thread caller can run the probe on a worker
+/// and refine with [`probe_keeps_match`] itself. The CLI's one-shot paths
+/// call this one inline.
+pub(crate) fn capture_owner_checked(
+    config: &AppConfig,
+    live: Option<&ClaudeCredentials>,
+) -> CaptureOwner {
+    let matched = match capture_owner(config, live) {
+        CaptureOwner::LooksLike(matched) => matched,
+        other => return other,
+    };
+    let uuid = live
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .map(|oauth| crate::usage::fetch_account_uuid(&oauth.access_token))
+        .unwrap_or_default();
+    if probe_keeps_match(&matched, uuid.as_ref()) {
+        CaptureOwner::LooksLike(matched)
+    } else {
+        CaptureOwner::Unowned
+    }
 }
 
 /// Returns the profile `live` belongs to, over the two shapes a stored login
@@ -3862,13 +3975,22 @@ pub(crate) fn find_matching_oauth_profile(
 }
 
 /// What committing a [`CaptureSnapshot`] must do to the profile's identity
-/// anchor. Three-valued rather than an `Option`, so "leave the anchor untouched"
-/// is its own spelling and can never be mistaken for "no proven identity".
+/// anchor. Several-valued rather than an `Option`, so "leave the anchor
+/// untouched" is its own spelling and can never be mistaken for "no proven
+/// identity".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AnchorAction {
-    /// The snapshot's OAuth login provably belongs to this account uuid — an
+    /// The snapshot's OAuth login belongs to this account uuid — an
     /// interactive login's own `/profile` probe. Write it on commit.
     Proven(AccountId),
+    /// A capture the user saved into the profile its account id matched
+    /// ([`CaptureOwner::LooksLike`]): the uuid is the profile's own anchor,
+    /// Claude Code's last booted identity, so it is no proof about the login
+    /// the snapshot installs. The anchor stays on disk, and the install is
+    /// otherwise an [`AnchorAction::Unproven`] one: the profile's cached usage
+    /// and `/profile` reading are forgotten and its `/profile` clock expired,
+    /// so the next poll reads the new login.
+    Kept(AccountId),
     /// The snapshot proves no identity (an off-disk read, a failed probe):
     /// remove the anchor on commit, so the old account's cannot vouch for the
     /// login the snapshot just installed.
@@ -3964,10 +4086,20 @@ pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
 
 /// `clauth capture <name>`: save the login Claude Code is using now as a new
 /// profile. That is the way out when the live credentials file holds a login no
-/// profile owns (#72) — every other create path refuses over it. Returns
-/// whether the new profile became the active account: the first one
-/// auto-activates, any later one needs an explicit switch.
-pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Result<bool> {
+/// profile owns (#72) — every other create path refuses over it. A login whose
+/// account id matches a profile ([`CaptureOwner::LooksLike`]) is refused under
+/// a new name unless `as_new`, and saved into that profile when `name` is that
+/// profile's. Returns whether the profile is the active account afterwards:
+/// the first one auto-activates, any later one needs an explicit switch.
+pub(crate) fn capture_current_login(
+    config: &mut AppConfig,
+    name: &str,
+    as_new: bool,
+) -> Result<bool> {
+    let name = name.trim();
+    if let Some(existing) = config.canonical_name(name) {
+        return save_into_id_matched_owner(config, existing, as_new);
+    }
     let name = validate_capture_name(config, name)?;
     let snapshot = capture_snapshot()?;
     if snapshot_is_empty(&snapshot) {
@@ -3975,8 +4107,19 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     }
     // The TUI's capture asks before duplicating a login another profile already
     // owns; the CLI has no confirm flow, so it refuses with the owner named.
-    if let Some(owner) = find_matching_oauth_profile(config, snapshot.credentials.as_ref()) {
-        bail!("these credentials already belong to '{owner}'; switch to it with:  clauth {owner}");
+    match capture_owner_checked(config, snapshot.credentials.as_ref()) {
+        CaptureOwner::Owned(owner) => bail!(
+            "these credentials already belong to '{owner}'; switch to it with:  clauth {owner}"
+        ),
+        CaptureOwner::LooksLike(matched) if !as_new => {
+            let owner = matched.owner;
+            bail!(
+                "this login looks like {owner}'s account (Claude Code last signed in as {owner})\n\
+                 save it into {owner} with:  clauth capture {owner}\n\
+                 or keep it as a new account with:  clauth capture {name} --new"
+            );
+        }
+        CaptureOwner::LooksLike(_) | CaptureOwner::Unowned => {}
     }
     capture_into_profile(config, name.to_string(), Default::default(), snapshot)?;
     // `capture_into_profile` adopted the fresh saved state into `config.state`
@@ -3991,14 +4134,53 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     Ok(becomes_active)
 }
 
+/// `clauth capture <existing>`: the live login lands in `existing` only when no
+/// profile stores it, it is a newer pair of the account `existing`'s anchor
+/// names, and the live `/profile` probe does not name another account
+/// ([`CaptureOwner::LooksLike`] out of [`capture_owner_checked`]), and never
+/// under `as_new`; every other case is the existing-name refusal. A live login
+/// that cannot be read is that read's error, not the refusal. Overwrites
+/// through [`overwrite_captured_profile`] with the owner's anchor kept
+/// ([`AnchorAction::Kept`]), so the owner keeps its anchor and its quarantine
+/// lifts.
+fn save_into_id_matched_owner(
+    config: &mut AppConfig,
+    existing: String,
+    as_new: bool,
+) -> Result<bool> {
+    let existing = ProfileName::from(existing);
+    if !as_new {
+        let snapshot = capture_snapshot()?;
+        if !snapshot_is_empty(&snapshot)
+            && let CaptureOwner::LooksLike(matched) =
+                capture_owner_checked(config, snapshot.credentials.as_ref())
+            && matched.owner == existing
+        {
+            let account = crate::profile::claim_profile_id(&existing)?;
+            let snapshot = CaptureSnapshot {
+                anchor: AnchorAction::Kept(matched.account),
+                ..snapshot
+            };
+            overwrite_captured_profile(config, &existing, &account, snapshot)?;
+            return Ok(config.state.active_profile.as_ref() == Some(&existing));
+        }
+    }
+    Err(existing_capture_name_refusal(&existing))
+}
+
+/// The refusal a capture under a name a profile already holds gets.
+fn existing_capture_name_refusal(existing: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
+    )
+}
+
 /// The name a capture saves into, trimmed: refused when a profile already
 /// holds it or it is no valid profile name.
 fn validate_capture_name<'a>(config: &AppConfig, name: &'a str) -> Result<&'a str> {
     let name = name.trim();
     if let Some(existing) = config.canonical_name(name) {
-        bail!(
-            "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
-        );
+        return Err(existing_capture_name_refusal(&existing));
     }
     validate_profile_name(name, Harness::Claude, None)?;
     Ok(name)
@@ -4545,10 +4727,12 @@ pub(crate) fn overwrite_captured_profile_held(
             // OAuth identity follows the anchor action: a proven re-login
             // re-anchors the SAME uuid (so a same-account re-login forgets
             // nothing), an unproven install removes the anchor while a login
-            // stays, and an api re-key carries the anchor unchanged.
+            // stays, a kept anchor reads the same way (its uuid is no proof
+            // about the new login) though the file stays, and an api re-key
+            // carries the anchor unchanged.
             let after_anchor = match &anchor {
                 AnchorAction::Proven(uuid) => Some(uuid),
-                AnchorAction::Unproven => None,
+                AnchorAction::Unproven | AnchorAction::Kept(_) => None,
                 AnchorAction::Unchanged => before.oauth.anchor.as_ref(),
             };
             let after_token = credentials.as_ref().and_then(|c| c.access_token());
@@ -4589,10 +4773,14 @@ pub(crate) fn overwrite_captured_profile_held(
             // failure in this hold (the relink, the settings write) leaves the
             // profile unanchored, never on the account the overwrite just
             // displaced. A proven uuid re-anchors at the end of this same hold.
-            let same_account = matches!(
-                &anchor,
-                AnchorAction::Proven(uuid) if before.oauth.anchor.as_deref() == Some(uuid.as_str())
-            );
+            // A kept anchor is never re-written: it stays only while it still
+            // is the uuid the save was made on, else it goes like any other.
+            let same_account = match &anchor {
+                AnchorAction::Proven(uuid) | AnchorAction::Kept(uuid) => {
+                    before.oauth.anchor.as_deref() == Some(uuid.as_str())
+                }
+                AnchorAction::Unproven | AnchorAction::Unchanged => false,
+            };
             if installs_login && !same_account {
                 crate::profile_cache::remove_profile_cache(
                     name,

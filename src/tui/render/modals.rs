@@ -10,12 +10,12 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, BareItemChoice, BareItemForm, BareItemOwnerForm, ConfirmAction,
-    ConfirmState, DivergenceAction, DivergenceForm, DivergenceTargetForm, EnvCollisionChoice,
-    EnvCollisionForm, InputState, LoginMethod, LoginStage, LossWarningButton, LossWarningState,
-    Modal, NamePromptForm, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
-    RebindForm, ScrollStamp, StatusFocus, Tab, TokenPickerForm, TokenView, pane_state,
-    token_model_count,
+    ActionMenuState, App, BareItemChoice, BareItemForm, BareItemOwnerForm, CaptureOwnerChoice,
+    CaptureOwnerForm, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
+    LoginStage, LossWarningButton, LossWarningState, Modal, NamePromptForm, PaneState,
+    PresetApplyButton, PresetApplyForm, PresetPickerForm, RebindForm, ScrollStamp, StatusFocus,
+    Tab, TokenPickerForm, TokenView, pane_state, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -89,6 +89,7 @@ pub(super) fn draw(
         Modal::LossWarning(state) => draw_loss_warning(frame, area, state),
         Modal::BareItem(form) => draw_bare_item(frame, area, form),
         Modal::BareItemOwner(form) => draw_bare_item_owner(frame, area, form),
+        Modal::CaptureOwner(form) => draw_capture_owner(frame, area, form),
     }
 }
 
@@ -1775,6 +1776,72 @@ fn draw_bare_item_owner(frame: &mut Frame<'_>, area: Rect, form: &BareItemOwnerF
             geometry: Some(ModalGeometry {
                 base: first,
                 count: form.owners.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+/// A capture whose login looks like `owner`'s account: the question, why it
+/// is asked, then one pick row per choice. The owner's name is colored, never
+/// quoted.
+fn draw_capture_owner(frame: &mut Frame<'_>, area: Rect, form: &CaptureOwnerForm) {
+    let choices = CaptureOwnerChoice::ALL;
+    let cursor = form.cursor.min(choices.len() - 1);
+    let owner = form.owner.as_str();
+    let name = |base: Style| Span::styled(owner.to_string(), base.fg(theme::accent_color()));
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("this login looks like ", theme::body()),
+            name(theme::body()),
+            Span::styled("'s account", theme::body()),
+        ]),
+        Line::from(vec![
+            Span::styled("claude code last signed in as ", theme::dim()),
+            name(theme::dim()),
+            Span::styled(", and this token is newer than the one ", theme::dim()),
+            name(theme::dim()),
+            Span::styled(" holds", theme::dim()),
+        ]),
+        Line::from(""),
+    ];
+    let first = lines.len();
+    for (i, choice) in choices.iter().enumerate() {
+        let selected = i == cursor;
+        let mut row = option_line(
+            selected,
+            match choice {
+                CaptureOwnerChoice::SaveInto => "save into ",
+                CaptureOwnerChoice::CaptureNew => "capture as a new account",
+                CaptureOwnerChoice::Cancel => "cancel",
+            }
+            .to_string(),
+        );
+        if *choice == CaptureOwnerChoice::SaveInto {
+            row.spans.push(Span::styled(
+                owner.to_string(),
+                with_bg(
+                    bold_when(theme::body().fg(theme::accent_color()), selected),
+                    selected.then(theme::bg_hover),
+                ),
+            ));
+        }
+        lines.push(row);
+    }
+    draw_modal_focused(
+        frame,
+        area,
+        "SAVE LOGIN",
+        BodyLine::all(lines),
+        first + cursor..first + cursor + 1,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: choices.len(),
                 starts: &form.starts,
                 block_ends: &form.block_ends,
                 total: &form.total,

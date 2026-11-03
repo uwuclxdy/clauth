@@ -468,10 +468,15 @@ fn login_bare_name_is_oauth_mode() {
 
 #[test]
 fn capture_parses_with_a_profile_argument() {
-    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+    let Command::Capture { profile, new } = command(&["capture", "acme"]) else {
         panic!("capture must parse");
     };
     assert_eq!(profile, "acme");
+    assert!(!new, "a bare capture is no --new capture");
+    let Command::Capture { new, .. } = command(&["capture", "acme", "--new"]) else {
+        panic!("capture --new must parse");
+    };
+    assert!(new, "--new reaches the capture");
 }
 
 #[test]

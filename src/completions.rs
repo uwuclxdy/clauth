@@ -112,6 +112,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "static-token" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "capture" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--new" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "limit-reset" ] && [ "${cur:0:2}" = "--" ]; then
@@ -139,7 +141,7 @@ _clauth() {
         _values 'subcommand' \
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
-            'capture[save the login Claude Code is using now as a new profile]' \
+            'capture[save the login Claude Code is using now as a profile]' \
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
@@ -285,6 +287,8 @@ _clauth() {
         return ret
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == static-token ]]; then
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == capture ]]; then
+        _values 'flag' '--new[keep the login as a new account even when it looks like an existing account'"'"'s]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == limit-reset ]]; then
@@ -342,7 +346,7 @@ complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profi
 complete -c clauth -f -n '__fish_is_first_token; and set -l t (commandline -opc); and test "$t[-1]" != "--theme"' -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
-complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
+complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a profile"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
@@ -415,6 +419,7 @@ complete -c clauth -f -n '__fish_seen_subcommand_from resume; and set -l t (comm
 complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
 complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session
 __CLATHA_LOGIN_FLAGS__
+complete -c clauth -f -n "__fish_seen_subcommand_from capture" -a --new -d "Keep the login as a new account even when it looks like an existing account's"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"

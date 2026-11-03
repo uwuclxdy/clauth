@@ -1586,7 +1586,7 @@ fn existing_profile_dir(name: &ProfileName) -> Option<std::path::PathBuf> {
 /// [`SPENT_RECORD_CAP`]. Never over an unreadable record, whose older entries
 /// a rewrite would lose. Not fail-closed: the server already answered, so a
 /// failed write is logged and the rotation goes on.
-fn record_spent(name: &ProfileName, token: &str) {
+pub(crate) fn record_spent(name: &ProfileName, token: &str) {
     let Some(dir) = existing_profile_dir(name) else {
         return;
     };
@@ -2839,6 +2839,33 @@ fn adopt_refusal_should_announce(name: &ProfileName, key: &str) -> bool {
     true
 }
 
+/// The expiry of `live` when it is a rotating pair that provably advances the
+/// login `name` stores, whose access token expires at `stored_expires`: it
+/// carries a refresh token, both expiries are known and `live`'s is later, and
+/// `name`'s spent record vouches that the refresh token is unspent. `None`
+/// otherwise. The gates [`try_adopt_live_rotation`] holds before it lands a live
+/// pair, shared with the capture surfaces' "save into" offer.
+pub(crate) fn advancing_live_expiry(
+    name: &ProfileName,
+    live: &OAuthToken,
+    stored_expires: Option<i64>,
+) -> Option<i64> {
+    let live_refresh = live.refresh_token.as_ref()?;
+    let (Some(live_expires), Some(stored_expires)) = (live.expires_at, stored_expires) else {
+        return None;
+    };
+    if live_expires <= stored_expires {
+        return None;
+    }
+    // A live pair the server already consumed (or one the record cannot vouch
+    // for) is never an advance, whatever its expiry says. The predicate the
+    // watchdog's copy-back gates use.
+    if SpentRecord::read(name).spent(live_refresh) != Some(false) {
+        return None;
+    }
+    Some(live_expires)
+}
+
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -2920,19 +2947,8 @@ pub(crate) fn try_adopt_live_rotation(
         return None;
     };
     let live_oauth = live.claude_ai_oauth.as_ref()?;
-    let live_refresh = live_oauth.refresh_token.as_ref()?;
-    let (Some(live_expires), Some(stored_expires)) = (live_oauth.expires_at, stored_expires) else {
-        return None;
-    };
-    if live_expires <= stored_expires {
-        return None;
-    }
-    // A live pair the server already consumed (or one the record cannot vouch
-    // for) is never an advance, whatever its expiry says. The predicate the
-    // watchdog's copy-back gates use.
-    if SpentRecord::read(name).spent(live_refresh) != Some(false) {
-        return None;
-    }
+    let live_expires = advancing_live_expiry(name, live_oauth, stored_expires)?;
+    let stored_expires = stored_expires?;
 
     // Identity anchor: cached uuid, else the stored token's own uuid while it
     // still authenticates. No anchor → refuse (identity unprovable).

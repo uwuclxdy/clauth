@@ -88,7 +88,7 @@ pub(crate) enum Command {
     /// endpoint yet has no console to open.
     Login(LoginArgs),
 
-    /// Save the login Claude Code is using now as a new profile
+    /// Save the login Claude Code is using now as a profile
     ///
     /// Reads the live ~/.claude/.credentials.json, plus whatever endpoint and
     /// api key Claude Code is running on, and stores it under <name>, with no
@@ -96,10 +96,14 @@ pub(crate) enum Command {
     /// including the one a first account is refused over when the live file
     /// holds a login no profile owns. The first profile becomes the active
     /// account; a later one needs `clauth <name>` to switch to. An existing
-    /// name is refused. Re-authenticating one is `clauth login <name>`.
+    /// name is refused unless the login looks like that account's, which saves
+    /// it into it. Re-authenticating one is `clauth login <name>`.
     Capture {
         /// Profile to save the current login under.
         profile: String,
+        /// Keep the login as a new account even when it looks like an existing account's
+        #[arg(long)]
+        new: bool,
     },
 
     /// Remove a profile and all its credentials

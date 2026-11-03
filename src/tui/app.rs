@@ -23,15 +23,15 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 
 use crate::actions::{
-    CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
-    capture_live_file_snapshot, capture_snapshot, classify_env_key, clear_profile_api_key,
-    clear_profile_credentials, create_blank_profile, create_profile_from_login,
-    delete_profile_taking_config, duplicate_profile, edit_profile_endpoint, edit_profile_env,
-    edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
-    set_chain_order, set_member_threshold, set_wrap_off, snapshot_is_empty, switch_off,
-    switch_profile_gated, validate_foreign_harness_free, validate_name_chars,
-    validate_profile_name,
+    CaptureOwner, CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision,
+    capture_into_profile, capture_live_file_snapshot, capture_owner, capture_snapshot,
+    classify_env_key, clear_profile_api_key, clear_profile_credentials, create_blank_profile,
+    create_profile_from_login, delete_profile_taking_config, duplicate_profile,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
+    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
+    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
+    snapshot_is_empty, switch_off, switch_profile_gated, validate_foreign_harness_free,
+    validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -1833,6 +1833,7 @@ pub(crate) enum BareItemWrite {
         name: String,
         account: ProfileId,
         from_divergence: Option<String>,
+        copy: OverwriteCopy,
     },
     AdoptDivergence {
         snapshot: Box<CaptureSnapshot>,
@@ -1887,8 +1888,16 @@ impl BareItemWrite {
             Self::Rename => "rename failed",
             Self::NewAccount => "create failed",
             Self::Delete { .. } => "delete failed",
-            Self::CaptureOverwrite { .. } | Self::DivergenceOverwrite(..) => "overwrite failed",
-            Self::AdoptDivergence { .. } => "save failed",
+            Self::CaptureOverwrite {
+                copy: OverwriteCopy::Overwrote,
+                ..
+            }
+            | Self::DivergenceOverwrite(..) => "overwrite failed",
+            Self::AdoptDivergence { .. }
+            | Self::CaptureOverwrite {
+                copy: OverwriteCopy::NewerLogin,
+                ..
+            } => "save failed",
             Self::BlankCredentials(_) => "log out failed",
             Self::DiscardDivergence(..) => "discard failed",
             Self::CaptureName { .. } => "capture failed",
@@ -2006,6 +2015,101 @@ impl BareItemOwnerForm {
             starts: std::cell::RefCell::new(Vec::new()),
             block_ends: std::cell::RefCell::new(Vec::new()),
             total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// Where a capture whose login only looks like an account's
+/// ([`crate::actions::CaptureOwner::LooksLike`]) started, which decides where
+/// `capture as a new account` continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureOrigin {
+    /// The `+ new` form's `+ capture current login` row: the login stashes
+    /// into the open draft.
+    NewForm,
+    /// A capture behind a name prompt, from the divergence prompt about the
+    /// carried active account when there is one.
+    NamePrompt(Option<String>),
+}
+
+/// An answer to [`Modal::CaptureOwner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureOwnerChoice {
+    SaveInto,
+    CaptureNew,
+    Cancel,
+}
+
+impl CaptureOwnerChoice {
+    pub(crate) const ALL: [Self; 3] = [Self::SaveInto, Self::CaptureNew, Self::Cancel];
+}
+
+/// The live login matches no stored one, but Claude Code last signed in as
+/// `owner`'s account: save it into `owner`, capture it as a new account, or
+/// cancel.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureOwnerForm {
+    pub(crate) owner: ProfileName,
+    /// The account `owner` held when the question opened: `save into` lands
+    /// only while the name still holds it.
+    pub(crate) profile: ProfileId,
+    /// The anchor the match was made on, committed as the snapshot's identity
+    /// so `save into` keeps it.
+    pub(crate) account: crate::profile::AccountId,
+    pub(crate) snapshot: Box<CaptureSnapshot>,
+    pub(crate) origin: CaptureOrigin,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+impl CaptureOwnerForm {
+    pub(crate) fn new(
+        matched: crate::actions::AccountIdMatch,
+        profile: ProfileId,
+        snapshot: CaptureSnapshot,
+        origin: CaptureOrigin,
+    ) -> Self {
+        Self {
+            owner: matched.owner,
+            profile,
+            account: matched.account,
+            snapshot: Box::new(snapshot),
+            origin,
+            cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// What a capture overwrite says it did: the name prompt's overwrite of a
+/// colliding profile, or [`CaptureOwnerChoice::SaveInto`]'s newer login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverwriteCopy {
+    Overwrote,
+    NewerLogin,
+}
+
+impl OverwriteCopy {
+    /// The verb its skipped and failed toasts name.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Overwrote => "overwrite",
+            Self::NewerLogin => "save",
+        }
+    }
+
+    fn success(self, name: &ProfileName) -> String {
+        match self {
+            Self::Overwrote => format!("overwrote '{name}' with the captured login"),
+            Self::NewerLogin => format!("{} holds the newer login now", prose::name(name)),
         }
     }
 }
@@ -2491,6 +2595,9 @@ pub(crate) enum Modal {
     /// [`Modal::BareItem`]'s `save` over a login two profiles are cached with
     /// the account of: pick which one takes it.
     BareItemOwner(BareItemOwnerForm),
+    /// A capture's login matches no stored one but looks like an account's:
+    /// save it into that account, capture it as a new one, or cancel.
+    CaptureOwner(CaptureOwnerForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -5780,6 +5887,10 @@ pub(crate) struct App {
     /// ([`spawn_capture_login`]); drained in `on_tick`.
     capture_login_rx: std::sync::mpsc::Receiver<Result<CaptureSnapshot>>,
     capture_login_tx: std::sync::mpsc::Sender<Result<CaptureSnapshot>>,
+    /// The capture owner probe worker's answers ([`spawn_capture_probe`]);
+    /// drained in `on_tick`.
+    capture_probe_rx: std::sync::mpsc::Receiver<CaptureProbeAnswer>,
+    capture_probe_tx: std::sync::mpsc::Sender<CaptureProbeAnswer>,
     /// The login [`NamePromptAction::SaveBareItem`]'s prompt names a new
     /// profile for, the account its lookup proved, and the write it holds.
     pub(crate) bare_item_naming: Option<BareItemNaming>,
@@ -6100,6 +6211,7 @@ impl App {
         let (bare_item_tx, bare_item_rx) = std::sync::mpsc::channel();
         let (unsaved_login_tx, unsaved_login_rx) = std::sync::mpsc::channel();
         let (capture_login_tx, capture_login_rx) = std::sync::mpsc::channel();
+        let (capture_probe_tx, capture_probe_rx) = std::sync::mpsc::channel();
         let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
         let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
         let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
@@ -6385,6 +6497,8 @@ impl App {
             unsaved_login_generation: 0,
             capture_login_rx,
             capture_login_tx,
+            capture_probe_rx,
+            capture_probe_tx,
             bare_item_naming: None,
         };
         // A dead login survives a restart: the live mirror starts from the
@@ -18128,10 +18242,8 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
             name,
             account,
             from_divergence,
-        } => run_confirm_action(
-            app,
-            ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence),
-        ),
+            copy,
+        } => run_capture_overwrite(app, snapshot, name, account, from_divergence, copy),
         BareItemWrite::AdoptDivergence {
             snapshot,
             name,
@@ -18535,7 +18647,8 @@ fn drain_capture_login(app: &mut App) {
 }
 
 /// Stash the captured login into the open `+ new` draft, refusing a login a
-/// profile owns and confirming before it replaces a stashed mint.
+/// profile owns, asking about one that looks like an account's, and
+/// confirming before it replaces a stashed mint.
 fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
     // The row only renders on the `+ new` form, where a draft is always
     // open; the empty and owned states are what HIDE it, so hitting one
@@ -18547,23 +18660,226 @@ fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
     };
     let owner = {
         let cfg = app.config();
-        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+        capture_owner(&cfg, snapshot.credentials.as_ref())
     };
-    if let Some(owner) = owner {
-        // Refuse, not confirm: a NEW account over a login another
-        // profile owns is the duplicate `overwrite_captured_profile`
-        // exists to prevent, and this row's whole purpose is the
-        // unowned case.
-        app.toast(
-            ToastKind::Danger,
-            format!(
-                "these credentials already belong to '{owner}'\nswitch to it with:  {}",
-                prose::cmd(&format!("clauth {owner}"))
-            ),
-        );
-        app.refresh_unsaved_live_login();
+    match owner {
+        CaptureOwner::Owned(owner) => {
+            // Refuse, not confirm: a NEW account over a login another
+            // profile owns is the duplicate `overwrite_captured_profile`
+            // exists to prevent, and this row's whole purpose is the
+            // unowned case.
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "these credentials already belong to '{owner}'\nswitch to it with:  {}",
+                    prose::cmd(&format!("clauth {owner}"))
+                ),
+            );
+            app.refresh_unsaved_live_login();
+        }
+        CaptureOwner::LooksLike(matched) => {
+            spawn_capture_probe(app, matched, snapshot, CaptureOrigin::NewForm);
+        }
+        CaptureOwner::Unowned => stash_captured_login(app, snapshot),
+    }
+}
+
+/// The account the live login's access token authenticates as, probed for a
+/// capture whose account-id tier named `matched`. `/profile` is a network
+/// call, so it runs on a worker and lands through [`drain_capture_probe`].
+/// The claim is taken first, so a claim that fails (the state lock timed
+/// out, the roster did not read, the owner was deleted meanwhile) toasts and
+/// captures nothing before the probe even runs: going on as a new account
+/// would file the duplicate the question exists to prevent.
+fn spawn_capture_probe(
+    app: &mut App,
+    matched: crate::actions::AccountIdMatch,
+    snapshot: CaptureSnapshot,
+    origin: CaptureOrigin,
+) {
+    let Some(profile) = claim_or_toast(app, matched.owner.as_str(), "capture failed") else {
+        return;
+    };
+    let access_token = snapshot
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .map(|oauth| oauth.access_token.clone())
+        .unwrap_or_default();
+    let tx = app.capture_probe_tx.clone();
+    spawn_worker(move || {
+        let uuid = crate::usage::fetch_account_uuid(&access_token);
+        let _ = tx.send(CaptureProbeAnswer {
+            matched,
+            profile,
+            snapshot: Box::new(snapshot),
+            origin,
+            uuid,
+        });
+    });
+}
+
+/// Open [`Modal::CaptureOwner`] about `matched` on the account `profile` the
+/// spawn-time claim held.
+fn open_capture_owner(
+    app: &mut App,
+    matched: crate::actions::AccountIdMatch,
+    profile: ProfileId,
+    snapshot: CaptureSnapshot,
+    origin: CaptureOrigin,
+) {
+    app.open_modal(Modal::CaptureOwner(CaptureOwnerForm::new(
+        matched, profile, snapshot, origin,
+    )));
+}
+
+/// Land the capture probe worker's answers: a probe that confirms `matched`,
+/// or one that cannot answer, opens the question; an answer naming another
+/// account continues as an unowned capture, exactly as if the account-id
+/// tier had never matched. Waits while a modal is open, so the question
+/// never stacks over another; an exit wait drops them.
+pub(crate) fn drain_capture_probe(app: &mut App) {
+    if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
+    #[cfg(test)]
+    if join_test_workers_within(std::time::Duration::from_secs(60)).is_err() {
+        return;
+    }
+    loop {
+        if blocking_modal_open(app) && !app.exit_wait {
+            return;
+        }
+        let Ok(answer) = app.capture_probe_rx.try_recv() else {
+            return;
+        };
+        if !app.exit_wait {
+            land_capture_probe(app, answer);
+        }
+    }
+}
+
+fn land_capture_probe(app: &mut App, answer: CaptureProbeAnswer) {
+    if crate::actions::probe_keeps_match(&answer.matched, answer.uuid.as_ref()) {
+        open_capture_owner(
+            app,
+            answer.matched,
+            answer.profile,
+            *answer.snapshot,
+            answer.origin,
+        );
+    } else {
+        continue_capture_as_new(app, *answer.snapshot, answer.origin);
+    }
+}
+
+/// What the capture probe worker posts back: the question's context plus the
+/// `/profile` answer.
+struct CaptureProbeAnswer {
+    matched: crate::actions::AccountIdMatch,
+    profile: ProfileId,
+    snapshot: Box<CaptureSnapshot>,
+    origin: CaptureOrigin,
+    uuid: Option<crate::profile::AccountId>,
+}
+
+/// `capture as a new account`: the flow an unowned login takes from `origin`.
+fn continue_capture_as_new(app: &mut App, snapshot: CaptureSnapshot, origin: CaptureOrigin) {
+    match origin {
+        CaptureOrigin::NewForm => stash_captured_login(app, snapshot),
+        CaptureOrigin::NamePrompt(from_divergence) => {
+            open_capture_name(app, snapshot, from_divergence);
+        }
+    }
+}
+
+/// [`Modal::CaptureOwner`]: `↑`/`↓` pick, `↵` answers the picked choice,
+/// `esc`/`q` cancel.
+fn handle_capture_owner_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::CaptureOwner(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = CaptureOwnerChoice::ALL.len() - 1;
+    let choice = match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+            return;
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+            return;
+        }
+        KeyCode::Enter => CaptureOwnerChoice::ALL[form.cursor.min(last)],
+        KeyCode::Esc | KeyCode::Char('q') => CaptureOwnerChoice::Cancel,
+        _ => return,
+    };
+    let Some(Modal::CaptureOwner(form)) = app.pop_modal() else {
+        return;
+    };
+    let CaptureOwnerForm {
+        owner,
+        profile,
+        account,
+        snapshot,
+        origin,
+        ..
+    } = form;
+    match choice {
+        CaptureOwnerChoice::Cancel => {}
+        CaptureOwnerChoice::CaptureNew => continue_capture_as_new(app, *snapshot, origin),
+        CaptureOwnerChoice::SaveInto => {
+            let from_divergence = match origin {
+                CaptureOrigin::NewForm => None,
+                CaptureOrigin::NamePrompt(from_divergence) => from_divergence,
+            };
+            // The question was about the live login as it was when it opened:
+            // a slot Claude Code refreshed or re-signed since has moved past
+            // this snapshot. A divergence origin re-checks under its own hold
+            // (`while_divergence_stands`); the un-held origins re-check here,
+            // immediately before the save.
+            if from_divergence.is_none() {
+                let live = read_claude_credentials().ok().flatten();
+                if serde_json::to_value(&live).ok()
+                    != serde_json::to_value(&snapshot.credentials).ok()
+                {
+                    app.toast(
+                        ToastKind::Warning,
+                        DivergenceMoved::Login
+                            .skipped(OverwriteCopy::NewerLogin.verb(), owner.as_str()),
+                    );
+                    return;
+                }
+            }
+            // The owner's own anchor is no proof about this login, so the
+            // commit forgets what an identity change forgets but keeps the
+            // anchor, where an off-disk snapshot's `Unproven` would remove it.
+            let snapshot = CaptureSnapshot {
+                anchor: crate::actions::AnchorAction::Kept(account),
+                ..*snapshot
+            };
+            run_capture_overwrite(
+                app,
+                Box::new(snapshot),
+                owner.to_string(),
+                profile,
+                from_divergence,
+                OverwriteCopy::NewerLogin,
+            );
+        }
+    }
+}
+
+/// Stash an unowned captured login into the open `+ new` draft, confirming
+/// before it replaces a stashed mint.
+fn stash_captured_login(app: &mut App, snapshot: CaptureSnapshot) {
     let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
         d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
     });
@@ -18606,20 +18922,30 @@ fn begin_capture(app: &mut App, from_divergence: Option<String>, seen: Option<u6
         );
         return;
     }
-    let existing_match = {
+    let owner = {
         let cfg = app.config();
-        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+        capture_owner(&cfg, snapshot.credentials.as_ref())
     };
-    if let Some(existing) = existing_match {
-        app.open_modal(Modal::Confirm(ConfirmState {
+    match owner {
+        CaptureOwner::Owned(existing) => app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
             scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
-        }));
-        return;
+        })),
+        CaptureOwner::LooksLike(matched) => spawn_capture_probe(
+            app,
+            matched,
+            snapshot,
+            CaptureOrigin::NamePrompt(from_divergence),
+        ),
+        CaptureOwner::Unowned => open_capture_name(app, snapshot, from_divergence),
     }
+}
+
+/// The name prompt a capture of `snapshot` saves under.
+fn open_capture_name(app: &mut App, snapshot: CaptureSnapshot, from_divergence: Option<String>) {
     app.open_modal(Modal::CaptureName(CaptureNameForm {
         snapshot: Box::new(snapshot),
         input: InputState::new(""),
@@ -20743,6 +21069,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Rebind(_) => handle_rebind_key(app, key),
         Modal::BareItem(_) => handle_bare_item_key(app, key),
         Modal::BareItemOwner(_) => handle_bare_item_owner_key(app, key),
+        Modal::CaptureOwner(_) => handle_capture_owner_key(app, key),
     }
 }
 
@@ -27566,98 +27893,127 @@ fn activate_adopted(cfg: &mut AppConfig, name: &ProfileName, account: &ProfileId
     })
 }
 
+/// Replace `name`'s login with `snapshot` (a capture the name prompt collided
+/// on, or a `save into` its account id matched), landing only while `name`
+/// still holds `account`; from a divergence about `from_divergence`, only
+/// while that divergence stands. `copy` words the outcome's toasts.
+fn run_capture_overwrite(
+    app: &mut App,
+    snapshot: Box<CaptureSnapshot>,
+    name: String,
+    account: ProfileId,
+    from_divergence: Option<String>,
+    copy: OverwriteCopy,
+) {
+    // The overwrite relinks the live slot when the profile is or
+    // becomes the active one, a divergence's capture always (it
+    // deactivates the prior one first). Settled before that detach,
+    // so a held overwrite has changed nothing.
+    let relinks = from_divergence.is_some() || {
+        let cfg = app.config();
+        cfg.is_active(&ProfileName::from(name.as_str())) || cfg.state.active_profile.is_none()
+    };
+    let _placed = if relinks {
+        let Some(placed) = bare_item_gate(
+            app,
+            BareItemWrite::CaptureOverwrite {
+                snapshot: snapshot.clone(),
+                name: name.clone(),
+                account: account.clone(),
+                from_divergence: from_divergence.clone(),
+                copy,
+            },
+        ) else {
+            return;
+        };
+        Some(placed)
+    } else {
+        None
+    };
+    // Same deferred detach as the non-colliding path: only disown the
+    // prior active profile once the overwrite is actually confirmed,
+    // so a cancel (handled entirely by `handle_confirm_key` popping
+    // without calling this) leaves it untouched. The writer disowns it
+    // after its id check, so a refused overwrite leaves it untouched too.
+    let name = ProfileName::from(name);
+    // A save into the owner from the `+ new` form's capture row (the only save
+    // with no divergence behind it) is that form's capture: its draft closes
+    // onto the account that took the login, as a created account's does.
+    let closes_new_form = copy == OverwriteCopy::NewerLogin
+        && from_divergence.is_none()
+        && app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none());
+    let result = {
+        let mut cfg = app.config();
+        match &from_divergence {
+            Some(from) => while_divergence_stands(
+                &mut cfg,
+                &ProfileName::from(from.as_str()),
+                *snapshot,
+                |cfg, snapshot| {
+                    crate::actions::overwrite_captured_profile_held(
+                        cfg, &name, &account, snapshot, true,
+                    )
+                },
+            )
+            .map(|outcome| {
+                outcome.map(|oauth_moved| {
+                    if oauth_moved {
+                        crate::usage::expire_profile_ttl(&name);
+                    }
+                })
+            }),
+            None => crate::actions::overwrite_captured_profile_with(
+                &mut cfg, &name, &account, *snapshot, false,
+            )
+            .map(Ok),
+        }
+    };
+    match result {
+        Ok(Err(moved)) => {
+            let from = from_divergence.unwrap_or_default();
+            app.toast(ToastKind::Warning, moved.skipped(copy.verb(), &from));
+        }
+        Ok(Ok(())) => {
+            if closes_new_form {
+                finish_created_profile(app, name.as_str());
+            } else {
+                app.refresh_tokens();
+                app.apply_forgets();
+                app.refresh_unsaved_live_login();
+            }
+            app.toast(ToastKind::Success, copy.success(&name));
+        }
+        Err(e) => match chain_held_skipped(copy.verb(), &e) {
+            Some(skipped) => app.toast(ToastKind::Warning, skipped),
+            None => app.toast(
+                ToastKind::Danger,
+                format!(
+                    "{} failed\n{}",
+                    copy.verb(),
+                    escape_control(&error_toast_detail(&e))
+                ),
+            ),
+        },
+    }
+}
+
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
-            app.open_modal(Modal::CaptureName(CaptureNameForm {
-                snapshot,
-                input: InputState::new(""),
-                from_divergence,
-            }));
+            open_capture_name(app, *snapshot, from_divergence);
         }
         ConfirmAction::CaptureOverwrite(snapshot, name, account, from_divergence) => {
-            // The overwrite relinks the live slot when the profile is or
-            // becomes the active one, a divergence's capture always (it
-            // deactivates the prior one first). Settled before that detach,
-            // so a held overwrite has changed nothing.
-            let relinks = from_divergence.is_some() || {
-                let cfg = app.config();
-                cfg.is_active(&ProfileName::from(name.as_str()))
-                    || cfg.state.active_profile.is_none()
-            };
-            let _placed = if relinks {
-                let Some(placed) = bare_item_gate(
-                    app,
-                    BareItemWrite::CaptureOverwrite {
-                        snapshot: snapshot.clone(),
-                        name: name.clone(),
-                        account: account.clone(),
-                        from_divergence: from_divergence.clone(),
-                    },
-                ) else {
-                    return;
-                };
-                Some(placed)
-            } else {
-                None
-            };
-            // Same deferred detach as the non-colliding path: only disown the
-            // prior active profile once the overwrite is actually confirmed,
-            // so a cancel (handled entirely by `handle_confirm_key` popping
-            // without calling this) leaves it untouched. The writer disowns it
-            // after its id check, so a refused overwrite leaves it untouched too.
-            let name = ProfileName::from(name);
-            let result = {
-                let mut cfg = app.config();
-                match &from_divergence {
-                    Some(from) => while_divergence_stands(
-                        &mut cfg,
-                        &ProfileName::from(from.as_str()),
-                        *snapshot,
-                        |cfg, snapshot| {
-                            crate::actions::overwrite_captured_profile_held(
-                                cfg, &name, &account, snapshot, true,
-                            )
-                        },
-                    )
-                    .map(|outcome| {
-                        outcome.map(|oauth_moved| {
-                            if oauth_moved {
-                                crate::usage::expire_profile_ttl(&name);
-                            }
-                        })
-                    }),
-                    None => crate::actions::overwrite_captured_profile_with(
-                        &mut cfg, &name, &account, *snapshot, false,
-                    )
-                    .map(Ok),
-                }
-            };
-            match result {
-                Ok(Err(moved)) => {
-                    let from = from_divergence.unwrap_or_default();
-                    app.toast(ToastKind::Warning, moved.skipped("overwrite", &from));
-                }
-                Ok(Ok(())) => {
-                    app.refresh_tokens();
-                    app.apply_forgets();
-                    app.refresh_unsaved_live_login();
-                    app.toast(
-                        ToastKind::Success,
-                        format!("overwrote '{name}' with the captured login"),
-                    );
-                }
-                Err(e) => match chain_held_skipped("overwrite", &e) {
-                    Some(skipped) => app.toast(ToastKind::Warning, skipped),
-                    None => app.toast(
-                        ToastKind::Danger,
-                        format!(
-                            "overwrite failed\n{}",
-                            escape_control(&error_toast_detail(&e))
-                        ),
-                    ),
-                },
-            }
+            run_capture_overwrite(
+                app,
+                snapshot,
+                name,
+                account,
+                from_divergence,
+                OverwriteCopy::Overwrote,
+            );
         }
         ConfirmAction::AdoptDivergence(snapshot, name, account, from) => {
             // `name` is never the active profile (the picker lists only others),
@@ -29440,6 +29796,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_bare_item_answers(app);
     drain_unsaved_live_login(app);
     drain_capture_login(app);
+    drain_capture_probe(app);
 
     refresh_shunt_mark(app);
     if app.reload_if_state_changed() {

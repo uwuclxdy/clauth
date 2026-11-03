@@ -3610,7 +3610,7 @@ fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
     let live = foreign_plain_live_login();
     let mut config = empty_config();
 
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
 
     assert!(became_active, "the first profile auto-activates");
     assert_eq!(config.state.active_profile.as_deref(), Some("work"));
@@ -3633,7 +3633,7 @@ fn capture_current_login_refuses_when_nothing_is_live() {
     let _home = HomeSandbox::new();
     let mut config = empty_config();
 
-    let err = capture_current_login(&mut config, "work").expect_err("nothing to capture");
+    let err = capture_current_login(&mut config, "work", false).expect_err("nothing to capture");
 
     assert_eq!(err.to_string(), "no live login found to capture");
     assert!(
@@ -3656,7 +3656,7 @@ fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
 
     // Case-different spelling: the refusal must name the canonical existing
     // profile, not mint a second one.
-    let err = capture_current_login(&mut config, "WORK").expect_err("duplicate refused");
+    let err = capture_current_login(&mut config, "WORK", false).expect_err("duplicate refused");
 
     let msg = err.to_string();
     assert!(
@@ -3711,7 +3711,7 @@ fn capture_beside_an_active_account_leaves_the_active_alone() {
     config.state.active_profile = Some(ProfileName::from("first"));
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
 
     assert!(!became_active, "a later profile needs an explicit switch");
     assert_eq!(config.state.active_profile.as_deref(), Some("first"));
@@ -3744,7 +3744,7 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
     config.add(owner);
     config.state.active_profile = Some(ProfileName::from("first"));
 
-    let err = capture_current_login(&mut config, "work").expect_err("owned login refused");
+    let err = capture_current_login(&mut config, "work", false).expect_err("owned login refused");
 
     let msg = err.to_string();
     assert!(
@@ -3757,6 +3757,550 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
             .is_ok_and(|m| !m.file_type().is_symlink()),
         "the live file is untouched"
     );
+}
+
+/// Profile `b` holding an older pair of the account `uuid-b`, the live login
+/// a newer pair no stored token matches (a bare `claude` refreshed it), and
+/// `~/.claude.json` naming `uuid-b` as the account Claude Code last signed in
+/// as. Returns the config and the live credentials path.
+fn id_matched_live_login(home_uuid: Option<&str>) -> (AppConfig, std::path::PathBuf) {
+    let live = foreign_plain_live_login();
+    let mut owner = Profile::new("b".to_string(), None, None);
+    owner.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "b-old-access".to_string(),
+            refresh_token: Some("b-old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&owner).expect("save b");
+    let mut config = empty_config();
+    config.add(owner);
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["b"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("b"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-b".to_string(),
+    );
+    let mut identity = serde_json::json!({"numStartups": 1});
+    if let Some(uuid) = home_uuid {
+        identity["oauthAccount"] = serde_json::json!({"accountUuid": uuid});
+    }
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        serde_json::to_vec_pretty(&identity).expect("ser"),
+    )
+    .expect("write ~/.claude.json");
+    (config, live)
+}
+
+fn stored_refresh(name: &str) -> Option<String> {
+    crate::profile::load_profile(&ProfileName::from(name))
+        .expect("load profile")
+        .refresh_token()
+        .map(str::to_string)
+}
+
+/// A capture under a new name over a login whose account an existing profile
+/// holds (matched by account id, not by token) refuses, names the owner, and
+/// offers both ways on.
+#[test]
+fn capture_refuses_a_login_whose_account_an_existing_profile_holds() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let err = capture_current_login(&mut config, "c", false).expect_err("id-matched refused");
+
+    assert_eq!(
+        err.to_string(),
+        "this login looks like b's account (Claude Code last signed in as b)\n\
+         save it into b with:  clauth capture b\n\
+         or keep it as a new account with:  clauth capture c --new"
+    );
+    assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
+/// Two profiles anchored to the login's account id: neither is named as the
+/// owner, so no capture saves into one of them (the account may be another
+/// org's); the capture falls back to the token tier alone.
+#[test]
+fn a_login_two_profiles_are_anchored_to_names_neither_as_its_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert!(
+        matches!(live_capture_owner(&config), CaptureOwner::LooksLike(_)),
+        "control: with b alone anchored, b is offered"
+    );
+    let mut twin = Profile::new("a".to_string(), None, None);
+    twin.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "a-old-access".to_string(),
+            refresh_token: Some("a-old-refresh".to_string()),
+            expires_at: Some(STORED_EXPIRES),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&twin).expect("save a");
+    config.add(twin);
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["b", "a"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-b".to_string(),
+    );
+
+    assert_eq!(live_capture_owner(&config), CaptureOwner::Unowned);
+    let err = capture_current_login(&mut config, "b", false)
+        .expect_err("an existing name with two claimants is refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert_eq!(stored_refresh("a").as_deref(), Some("a-old-refresh"));
+
+    capture_current_login(&mut config, "c", false).expect("captured as a new account");
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+}
+
+/// `clauth capture b` over a login whose account `b` holds saves the newer
+/// pair into `b`, so `b` no longer carries the spent copy.
+#[test]
+fn capture_into_the_owners_name_saves_the_newer_login_into_it() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    assert_eq!(config.profiles.len(), 1, "still one profile");
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+}
+
+/// `--new` keeps an id-matched login as a new account and leaves the owner's
+/// stored pair alone.
+#[test]
+fn capture_new_keeps_an_id_matched_login_as_a_new_account() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "c", true).expect("capture as new");
+
+    assert_eq!(config.profiles.len(), 2);
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// With no account id naming `b`, a capture under `b`'s name is still the
+/// existing-name refusal: the save-into arm needs the id match.
+#[test]
+fn capture_into_an_existing_name_without_an_id_match_is_still_refused() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        br#"{"numStartups":1,"oauthAccount":{"accountUuid":"uuid-other"}}"#,
+    )
+    .expect("write ~/.claude.json");
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("refused");
+
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// The save into `b` keeps `b`'s account-id anchor, where an off-disk
+/// snapshot's unproven install would remove it.
+#[test]
+fn capture_into_the_owners_name_keeps_its_anchor() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+            &ProfileName::from("b"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .as_deref(),
+        Some("uuid-b")
+    );
+}
+
+/// With `b` active and its live slot diverged onto the newer pair, the save
+/// into `b` leaves the live slot linked to `b`'s store again.
+#[test]
+fn capture_into_the_active_owner_relinks_the_live_slot() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    config.state.active_profile = Some(ProfileName::from("b"));
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("b")).expect("classify"),
+        crate::claude::LinkState::Diverged,
+        "precondition: the live slot holds a pair b does not store"
+    );
+
+    assert!(
+        capture_current_login(&mut config, "b", false).expect("save into b"),
+        "b stays the active account"
+    );
+
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("b")).expect("classify"),
+        crate::claude::LinkState::LinkedTo
+    );
+    #[cfg(unix)]
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()),
+        "the live slot is a link to b's store again"
+    );
+    #[cfg(not(unix))]
+    let _ = live;
+}
+
+/// What `b` stores expires at, in [`id_matched_login_with`]'s fixtures.
+const STORED_EXPIRES: i64 = 1_000;
+
+/// [`id_matched_live_login`] with the facts the save-into offer weighs: `b`
+/// stores a pair expiring at `stored_expires`, and the live login is the
+/// pair `cc-own-access` with `live_refresh`, expiring at `live_expires`.
+fn id_matched_login_with(
+    live_refresh: Option<&str>,
+    live_expires: Option<i64>,
+    stored_expires: Option<i64>,
+) -> (AppConfig, std::path::PathBuf) {
+    let (mut config, live) = id_matched_live_login(Some("uuid-b"));
+    let owner = config
+        .find_mut(&ProfileName::from("b"))
+        .expect("b is in the config");
+    owner
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+        .expect("b stores a pair")
+        .expires_at = stored_expires;
+    save_profile(owner).expect("save b");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "cc-own-access".to_string(),
+                refresh_token: live_refresh.map(str::to_string),
+                expires_at: live_expires,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    (config, live)
+}
+
+/// The shape the offer is for: a rotating pair that expires after `b`'s.
+fn id_matched_newer_login() -> (AppConfig, std::path::PathBuf) {
+    id_matched_login_with(
+        Some("cc-own-refresh"),
+        Some(STORED_EXPIRES + 1_000),
+        Some(STORED_EXPIRES),
+    )
+}
+
+fn live_capture_owner(config: &AppConfig) -> CaptureOwner {
+    let live = read_claude_credentials().expect("read the live login");
+    capture_owner_checked(config, live.as_ref())
+}
+
+/// A live login the save-into offer must not name `b` for: no menu or id
+/// refusal (`capture_owner` says `Unowned`), a capture under `b`'s name is
+/// the plain existing-name refusal, and a capture under a new name files the
+/// login as its own account. `b`'s stored pair is never touched.
+fn assert_not_offered_to_the_owner(config: &mut AppConfig) {
+    assert_eq!(live_capture_owner(config), CaptureOwner::Unowned);
+
+    let err = capture_current_login(config, "b", false).expect_err("existing name refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+
+    capture_current_login(config, "c", false).expect("a new name is not refused by the id arm");
+    assert_eq!(config.profiles.len(), 2);
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// A rolling bearer or a mint carries no refresh token: saving it into `b`
+/// would replace `b`'s rotating pair with a login that cannot rotate.
+#[test]
+fn a_live_login_without_a_refresh_token_is_not_offered_the_owner() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) =
+        id_matched_login_with(None, Some(STORED_EXPIRES + 1_000), Some(STORED_EXPIRES));
+
+    assert_not_offered_to_the_owner(&mut config);
+}
+
+/// The live slot lags the store: it holds a pair `b` already spent, which the
+/// server will refuse.
+#[test]
+fn a_spent_live_pair_is_not_offered_the_owner() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    crate::oauth::record_spent(&ProfileName::from("b"), "cc-own-refresh");
+
+    assert_not_offered_to_the_owner(&mut config);
+}
+
+/// A live pair that does not expire after `b`'s stored one is not a newer
+/// one; neither is a pair with no known expiry, nor one against a stored
+/// pair with none.
+#[test]
+fn a_live_pair_not_newer_than_the_owners_is_not_offered_the_owner() {
+    for (live_expires, stored_expires) in [
+        (Some(STORED_EXPIRES - 1), Some(STORED_EXPIRES)),
+        (Some(STORED_EXPIRES), Some(STORED_EXPIRES)),
+        (None, Some(STORED_EXPIRES)),
+        (Some(STORED_EXPIRES + 1_000), None),
+    ] {
+        let _home = HomeSandbox::new();
+        let (mut config, _live) =
+            id_matched_login_with(Some("cc-own-refresh"), live_expires, stored_expires);
+
+        assert_not_offered_to_the_owner(&mut config);
+    }
+}
+
+/// The control for the three refusals above: a rotating pair expiring after
+/// `b`'s, no spent record naming it, is offered `b` (`/profile` confirms the
+/// live login is `b`'s account).
+#[test]
+fn a_newer_unspent_live_pair_is_offered_the_owner() {
+    let home = HomeSandbox::new();
+    let (config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert_eq!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(AccountIdMatch {
+            owner: ProfileName::from("b"),
+            account: crate::profile::AccountId::from("uuid-b"),
+        })
+    );
+}
+
+/// `/profile` with the live access token names another account than `b`'s
+/// anchor: the login is not `b`'s, so nobody is offered it and `clauth
+/// capture b` is the plain existing-name refusal. The probe ran: one
+/// `/profile` request reached the stub.
+#[test]
+fn a_live_login_profile_names_as_another_account_is_not_offered_the_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-z"}}"#.to_string())
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert_eq!(live_capture_owner(&config), CaptureOwner::Unowned);
+    let err = capture_current_login(&mut config, "b", false).expect_err("existing name refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    drop(endpoints);
+    let paths = server.join().expect("stub");
+    assert!(
+        paths.iter().any(|p| p.contains("profile")),
+        "the account was asked for: {paths:?}"
+    );
+}
+
+/// `/profile` confirms the live login is `b`'s account: it is offered `b`,
+/// and the save into `b` lands with `b`'s anchor.
+#[test]
+fn a_live_login_profile_confirms_is_saved_into_the_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(4, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert!(matches!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(_)
+    ));
+    capture_current_login(&mut config, "b", false).expect("save into b");
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+            &ProfileName::from("b"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .as_deref(),
+        Some("uuid-b")
+    );
+}
+
+/// `/profile` cannot answer (a server error): the account-id tier stands as
+/// it would with no probe, so `b` is still offered.
+#[test]
+fn a_failed_profile_probe_still_offers_the_owner() {
+    let home = HomeSandbox::new();
+    let (config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(4, |_, _| (500, "{}".to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert!(matches!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(_)
+    ));
+}
+
+/// The save into `b` is an identity change for the caches: the old login's
+/// usage reading and `/profile` stamp go, as an unproven install drops them,
+/// while `b`'s anchor stays.
+#[test]
+fn capture_into_the_owners_name_forgets_the_old_readings_but_keeps_the_anchor() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let b = ProfileName::from("b");
+    let cache = |file: &str| crate::profile::profile_subpath(&b, file).expect("cache path");
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    ] {
+        crate::profile_cache::write_profile_cache(&b, file, &"old login".to_string());
+        assert!(cache(file).exists(), "precondition: {file} written");
+    }
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    ] {
+        assert!(!cache(file).exists(), "{file} is forgotten");
+    }
+    assert_eq!(anchor_of("b").as_deref(), Some("uuid-b"));
+}
+
+/// A live credentials file that cannot be read is that read's error: the
+/// existing-name refusal would hide why the save into `b` was not tried.
+#[test]
+fn capture_into_an_existing_name_surfaces_an_unreadable_live_login() {
+    let _home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    std::fs::write(&live, b"{ not json").expect("corrupt the live login");
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("unreadable live login");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(".credentials.json") && !msg.contains("already exists"),
+        "the read error, not the refusal: {msg}"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// `--new` reaches the capture through the dispatch seam.
+#[test]
+fn capture_new_through_dispatch_keeps_an_id_matched_login_as_a_new_account() {
+    let home = HomeSandbox::new();
+    let (_config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let cli =
+        <crate::cli::Cli as clap::Parser>::try_parse_from(["clauth", "capture", "c", "--new"])
+            .expect("parse");
+
+    crate::dispatch(cli).expect("--new captures as new through dispatch");
+
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// A name typed in another case saves into the profile and is reported by the
+/// roster's spelling.
+#[test]
+fn capture_into_the_owner_by_another_spelling_reports_its_own_name() {
+    let home = HomeSandbox::new();
+    let (_config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(["clauth", "capture", "B"])
+        .expect("parse");
+    let out = crate::out::OutCapture::new();
+    let _capture = out.capture_here();
+
+    crate::dispatch(cli).expect("save into b");
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf8"),
+        "clauth: captured into profile 'b'. It is the active account.\n"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
 }
 
 #[test]
@@ -18056,7 +18600,7 @@ fn capture_current_login_decides_activation_off_the_fresh_marker() {
     };
     crate::profile::save_app_state(&peer).expect("peer activation");
     let mut config = empty_config();
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
     assert!(
         !became_active,
         "the peer-activated account is active, not this capture"
@@ -19812,7 +20356,7 @@ fn the_cli_onto_the_active_account_over_a_login_another_account_stores_relinks_i
     relogin_live("x15");
     let mut capturing = crate::profile::load_config().expect("read");
     assert!(
-        !capture_current_login(&mut capturing, "d").expect("the capture"),
+        !capture_current_login(&mut capturing, "d", false).expect("the capture"),
         "d is captured beside the active a"
     );
     let stale = crate::profile::load_config().expect("stale read");
@@ -19861,7 +20405,7 @@ fn the_cli_save_answer_after_a_peer_saved_the_login_elsewhere_relinks_the_active
     let stdin = ScriptedStdin::new(vec![(
         Box::new(|| {
             let mut peer = crate::profile::load_config().expect("peer read");
-            capture_current_login(&mut peer, "d").expect("the peer's capture");
+            capture_current_login(&mut peer, "d", false).expect("the peer's capture");
         }),
         "y\n",
     )]);
