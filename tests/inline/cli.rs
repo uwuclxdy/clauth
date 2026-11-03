@@ -10030,3 +10030,69 @@ fn limit_reset_refuses_a_codex_run_without_yes_while_another_run_holds_the_accou
         "refusing to use a reset on 'cx' without confirmation; pass --yes"
     );
 }
+
+/// Each `--yes` help line names the streams its command's prompt gate reads: a
+/// gate on stdin AND stdout (`delete`, `disable`, `limit-reset`, `herdr install`,
+/// `herdr uninstall`) never prompts on a redirected stdout, so its help says so;
+/// `static-token --clear` gates on stdin alone and keeps saying stdin. `herdr
+/// install`'s key prompt runs on that same terminal gate and `--yes` skips it,
+/// so `--key`'s help names the default a skipped prompt takes.
+#[test]
+fn each_yes_help_names_the_streams_its_prompt_gate_reads() {
+    let mut cli = Cli::command();
+    let cases: [(&[&str], &str, &str); 7] = [
+        (
+            &["delete"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout, which gets no implicit yes for an irreversible delete",
+        ),
+        (
+            &["disable"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout",
+        ),
+        (
+            &["limit-reset"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout",
+        ),
+        (
+            &["herdr", "install"],
+            "yes",
+            "Skip every prompt: the key prompt and both confirms, herdr's install preview included. Required on a non-TTY stdin or stdout, which gets no prompt",
+        ),
+        (
+            &["herdr", "install"],
+            "key",
+            "Key that opens the dashboard, in herdr's own binding syntax (`prefix+a`, `ctrl+alt+c`). When omitted, prompted for on a terminal; `--yes` or a non-TTY stdin or stdout takes `prefix+a` instead",
+        ),
+        (
+            &["herdr", "uninstall"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout, which gets no prompt",
+        ),
+        (
+            &["static-token"],
+            "yes",
+            "Skip `--clear`'s confirm prompt. Required on a non-TTY stdin",
+        ),
+    ];
+    for (path, id, expected) in cases {
+        let mut command = &mut cli;
+        for name in path {
+            command = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("subcommand {name}"));
+        }
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == id)
+            .unwrap_or_else(|| panic!("{path:?} has --{id}"));
+        let help = arg
+            .get_long_help()
+            .or_else(|| arg.get_help())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert_eq!(help, expected, "{path:?} --{id} help");
+    }
+}

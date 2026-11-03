@@ -110,8 +110,8 @@ pub(crate) enum Command {
     Delete {
         /// Profile to delete.
         profile: String,
-        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no
-        /// implicit yes for an irreversible delete.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no implicit yes for an irreversible delete.
         #[arg(long, short = 'y')]
         yes: bool,
         /// Delete even while a live `clauth start` session holds the profile, or
@@ -128,7 +128,7 @@ pub(crate) enum Command {
     Disable {
         /// Profile to disable.
         profile: String,
-        /// Skip the confirm prompt. Required on a non-TTY stdin.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -171,10 +171,10 @@ pub(crate) enum Command {
     /// menu offers, or a claude grant Claude Code's own `/limit-reset` offers.
     /// Prompts `[y/N]` naming the reset it will use (codex: a `codex_rate_limits`
     /// reset first, then the one that expires first; claude: the grant the
-    /// server names next) unless `--yes`, which a non-TTY run must pass: a used
-    /// reset cannot be given back. `--list` shows
-    /// the account's resets and spends nothing. Uses the profile's stored login
-    /// as it stands and never refreshes it.
+    /// server names next) unless `--yes`, which a spend on a non-TTY stdin or
+    /// stdout must pass: a used reset cannot be given back. `--list` shows the
+    /// account's resets, spends nothing and never prompts. Uses the profile's
+    /// stored login as it stands and never refreshes it.
     #[command(name = "limit-reset")]
     LimitReset {
         /// Codex or Claude Code profile to reset.
@@ -182,7 +182,7 @@ pub(crate) enum Command {
         /// Show the account's resets and which one would be used; spend none.
         #[arg(long, conflicts_with = "yes")]
         list: bool,
-        /// Skip the confirm prompt. Required on a non-TTY stdin.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -758,14 +758,16 @@ pub(crate) enum HerdrCommand {
     /// refuses the install: it names the tree and the two ways out.
     Install {
         /// Key that opens the dashboard, in herdr's own binding syntax
-        /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
+        /// (`prefix+a`, `ctrl+alt+c`). When omitted, prompted for on a terminal;
+        /// `--yes` or a non-TTY stdin or stdout takes `prefix+a` instead.
         #[arg(long, value_name = "SPEC")]
         key: Option<String>,
         /// Install the plugin and leave herdr's config.toml untouched.
         #[arg(long)]
         no_config: bool,
-        /// Skip both confirm prompts, herdr's install preview included.
-        /// Required on a non-TTY stdin, which gets no prompt.
+        /// Skip every prompt: the key prompt and both confirms, herdr's install
+        /// preview included. Required on a non-TTY stdin or stdout, which gets no
+        /// prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -777,7 +779,8 @@ pub(crate) enum HerdrCommand {
         /// Uninstall the plugin and leave herdr's config.toml untouched.
         #[arg(long)]
         no_config: bool,
-        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },

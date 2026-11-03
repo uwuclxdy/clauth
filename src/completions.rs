@@ -201,9 +201,9 @@ _clauth() {
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config && "${words[4]}" == get ]]; then
         _values 'key' 'popup_width[how the entrypoint pane opens]' 'pane_tag[publish the profile tag token]' 'tag_watch_secs[per-pane tag watcher interval]' 'border_label[split-pane border account label]' 'delegate_dot[delegate pane metadata]' 'delegate_row_text[delegate text beside the sidebar row]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == install ]]; then
-        _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+        _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip every prompt]' '-y[skip every prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
-        _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+        _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
         _values 'subcommand' 'list[show every clauth proxy on PATH or registered, with its live state]' \
             'enable[record a proxy found on PATH, for the daemon to run]' \
@@ -373,9 +373,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from config" -a get -d "Print t
 complete -c clauth -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --key -d "Key that opens the dashboard"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --no-config -d "Leave herdr's config.toml alone"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip every prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
 complete -c clauth -f -n __fish_is_first_token -a presets -d "Built-in preset maintenance"
 complete -c clauth -f -n "__fish_seen_subcommand_from presets" -a rebind -d "Move accounts onto the model ids the built-in presets bind now"

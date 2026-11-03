@@ -2143,10 +2143,10 @@ fn codex_collision_note(canonical: &ProfileName, verb: &str) -> String {
 /// `clauth delete <name> [--yes] [--force]` — remove a profile and all its
 /// credentials (the whole on-disk profile dir + state + caches), OAuth or
 /// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
-/// `remove_dir_all`, so unlike a reauth a non-TTY stdin does NOT get an implicit
-/// yes: it must pass `--yes`, else the delete is refused. A profile held by a
-/// live `clauth start` session is refused unless `--force` (independent of
-/// `--yes`). If the deleted profile was active, its live
+/// `remove_dir_all`, so unlike a reauth a non-TTY stdin or stdout does NOT get
+/// an implicit yes: it must pass `--yes`, else the delete is refused. A profile
+/// held by a live `clauth start` session is refused unless `--force`
+/// (independent of `--yes`). If the deleted profile was active, its live
 /// `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
 fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
@@ -2274,9 +2274,9 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 /// scheduler, and the daemon status feed by default, while its dir and
 /// credentials stay on disk untouched. Refuses when `name` is the active
 /// profile or holds a live `clauth start` session (each names its own
-/// blocker). Prompts `[y/N]` on a TTY unless `--yes`; a non-TTY stdin must
-/// pass `--yes`, mirroring [`cmd_delete`]'s confirm policy. Already-disabled
-/// is a no-op — reported, not refused, and never prompted.
+/// blocker). Prompts `[y/N]` on a TTY unless `--yes`; a non-TTY stdin or
+/// stdout must pass `--yes`, mirroring [`cmd_delete`]'s confirm policy.
+/// Already-disabled is a no-op — reported, not refused, and never prompted.
 fn cmd_disable(name: &str, yes: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
@@ -3072,8 +3072,9 @@ mod tests;
 /// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex or
 /// claude account's banked usage-limit resets ([`usage::codex_reset`] /
 /// [`usage::claude_reset`]). The confirm policy is [`cmd_delete`]'s: the spend
-/// is irreversible, so a non-TTY run with no `--yes` is refused, and refused
-/// before any request leaves the machine.
+/// is irreversible, so a spend on a non-TTY stdin or stdout with no `--yes` is
+/// refused, and refused before any request leaves the machine; `--list` never
+/// prompts.
 fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
