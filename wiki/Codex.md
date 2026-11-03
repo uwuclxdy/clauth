@@ -172,7 +172,7 @@ Once that one is spent, the untitled reset is next; with no title to name, its q
 clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reopens the account's usage windows now and cannot be undone. [y/N]
 ```
 
-`--yes` (`-y`) skips the question and is required on a non-TTY stdin, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` leaves the resets alone: `clauth: aborted. no reset was used on 'work'.`
+`--yes` (`-y`) skips the question and is required on a non-TTY stdin, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` sends nothing: a first spend prints `clauth: aborted. no reset was used on 'work'.`, a declined re-send `clauth: aborted. the earlier reset request on 'work' was not re-sent; its outcome is still unknown.`
 
 | Outcome | What it prints | Exit |
 |---------|----------------|------|
@@ -181,9 +181,10 @@ clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reope
 | none held | `no usage-limit resets available on 'work'` (`--list` prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
 | taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth limit-reset work --list` to see what is left`` | 1 |
 | token refused | `codex rejected the stored access token for 'work'. The daemon refreshes it for a parked account and codex does for the one in use. Try again after that. No reset was used` | 1 |
-| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; a re-run before the window's end re-sends the same request`` | 1 |
+| no answer | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; a re-run before <time> re-sends the same request`` (`<time>` is 10 minutes after the spend, in local time) | 1 |
+| an answer clauth cannot read | ``codex answered the reset request for 'work' in a shape clauth does not read, so the reset may or may not have gone through; a re-run before <time> re-sends the same request`` | 1 |
 
-Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose answer never arrives leaves a record, and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
+Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose outcome stays unknown (no answer, a 5xx, or a reply clauth cannot read or that leaves the outcome open) leaves a record, `--list` names it (``clauth: a usage-limit reset sent at <time> got no answer; run `clauth limit-reset work` again before <time> to re-send it.``), and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
 
 ## Managed config
 
