@@ -851,6 +851,47 @@ pub(crate) fn reorders_display(c: char) -> bool {
     )
 }
 
+/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
+/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
+/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
+/// Asian Width calls them wide and halfwidth), so they count as blank: a text
+/// holding only them shows nothing.
+pub(crate) fn is_blank(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
+/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
+/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
+pub(crate) fn draws_nothing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
+/// soft hyphen included. Callers pass `terminal_safe` output.
+pub(crate) fn shows_nothing(text: &str) -> bool {
+    text.chars().all(|c| is_blank(c) || draws_nothing(c))
+}
+
 /// `text` with every character `keep` rejects written as its `\u{..}` escape.
 pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
     text.chars()

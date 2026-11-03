@@ -28,7 +28,10 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::fetch::iso_to_epoch_secs;
-use crate::format::{grapheme_cells, local_stamp, plural, terminal_safe, truncate};
+use crate::format::{
+    draws_nothing, grapheme_cells, is_blank, local_stamp, plural, shows_nothing, terminal_safe,
+    truncate,
+};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
 /// one a clauth-held login reaches (see `codex::CODEX_USAGE_URL`).
@@ -321,15 +324,6 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 // One spelling per outcome. A script can read the first stdout line as the
 // success summary and a failure off stderr.
 
-/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
-/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
-/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
-/// Asian Width calls them wide and halfwidth), so they count as blank: a cap
-/// cuts early rather than late, and a status holding one inside is never spent.
-fn is_blank(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
-}
-
 /// Whether a terminal draws nothing for `c` and it takes no cell either: a
 /// `Default_Ignorable_Code_Point` character that is neither a blank nor the
 /// soft hyphen `U+00AD`, which glibc's `wcwidth` gives a cell.
@@ -337,42 +331,10 @@ fn is_invisible(c: char) -> bool {
     draws_nothing(c) && !is_blank(c) && c != '\u{AD}'
 }
 
-/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
-/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
-/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
-fn draws_nothing(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'..='\u{1160}'
-            | '\u{17B4}'..='\u{17B5}'
-            | '\u{180B}'..='\u{180F}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFA0}'
-            | '\u{FFF0}'..='\u{FFF8}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
-}
-
 /// Whether `c` takes a cell in a terminal: every character but an invisible one
 /// does, blanks included.
 fn takes_a_cell(c: char) -> bool {
     !is_invisible(c)
-}
-
-/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
-/// soft hyphen included. Callers pass `terminal_safe` output.
-fn shows_nothing(text: &str) -> bool {
-    text.chars().all(|c| is_blank(c) || draws_nothing(c))
 }
 
 /// `text` without the blank and `draws_nothing` padding on either end: the slice from

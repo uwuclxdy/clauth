@@ -133,6 +133,157 @@ fn a_cjk_service_name_keeps_the_version_column_aligned() {
     );
 }
 
+/// A third-party proxy's manifest or `/health` answer, and a reason quoting
+/// one, reach the terminal: every such cell drops its control and bidi
+/// characters, and a cell with nothing left reads `-`, the missing-value cell.
+#[test]
+fn foreign_cells_drop_terminal_control_characters() {
+    let rows = vec![
+        row(
+            "zcode",
+            Some("1\u{1b}[2J"),
+            Some("\u{1b}]0;x\u{7}1.0"),
+            true,
+            Some(9101),
+            "healthy",
+            Some("bad\u{1b}[31m body"),
+        ),
+        row(
+            "qwen",
+            Some("\u{1b}\u{7}"),
+            Some("1.0"),
+            false,
+            Some(9102),
+            "disabled",
+            None,
+        ),
+    ];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION  CONTRACT  ENABLED  PORT  STATE   \n\
+         zcode    1[2J     ]0;x1.0   true     9101  healthy \n\
+         qwen     -        1.0       false    9102  disabled\n\
+         \n\
+         zcode: bad[31m body\n"
+    );
+}
+
+/// A reason with nothing a terminal can draw is no reason: the table prints
+/// neither the blank line nor a dangling `<service>: ` line for it.
+#[test]
+fn a_reason_with_nothing_drawable_prints_no_reason_line() {
+    let rows = vec![row(
+        "zcode",
+        Some("1.0"),
+        Some("1.0"),
+        true,
+        Some(9101),
+        "healthy",
+        Some("\u{1b}\u{202e}"),
+    )];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION  CONTRACT  ENABLED  PORT  STATE  \n\
+         zcode    1.0      1.0       true     9101  healthy\n"
+    );
+}
+
+/// A cell whose filtered text draws nothing (a zero-width space left behind by
+/// a dropped escape, a blank run) is missing too: the version and contract
+/// read `-`, and the reason prints no line.
+#[test]
+fn a_cell_left_showing_nothing_reads_as_missing() {
+    let rows = vec![row(
+        "zcode",
+        Some("\u{1b}\u{200b}"),
+        Some("  "),
+        true,
+        Some(9101),
+        "healthy",
+        Some("\u{1b}\u{2060}"),
+    )];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION  CONTRACT  ENABLED  PORT  STATE  \n\
+         zcode    -        -         true     9101  healthy\n"
+    );
+}
+
+/// An escape inside an emoji sequence splits it, so the raw cell and the
+/// printed one measure differently: the column sizes on the printed text.
+#[test]
+fn a_column_sizes_on_the_filtered_text() {
+    let rows = vec![row(
+        "zcode",
+        Some(&"\u{2764}\u{1b}\u{fe0f}".repeat(4)),
+        Some("1.0"),
+        true,
+        Some(9101),
+        "healthy",
+        None,
+    )];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION   CONTRACT  ENABLED  PORT  STATE  \n\
+         zcode    \u{2764}\u{fe0f}\u{2764}\u{fe0f}\u{2764}\u{fe0f}\u{2764}\u{fe0f}  1.0       true     9101  healthy\n"
+    );
+}
+
+/// The service name comes from a binary's file name on PATH, so it is foreign
+/// text too: it drops its escapes in the table and in its reason line.
+#[test]
+fn a_service_name_drops_terminal_control_characters() {
+    let rows = vec![row(
+        "zc\u{1b}[2Jode",
+        Some("1.0"),
+        Some("1.0"),
+        true,
+        Some(9101),
+        "healthy",
+        Some("r"),
+    )];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE   VERSION  CONTRACT  ENABLED  PORT  STATE  \n\
+         zc[2Jode  1.0      1.0       true     9101  healthy\n\
+         \n\
+         zc[2Jode: r\n"
+    );
+}
+
+/// A bidi override is a formatting character, not a `Control` one: the cell is
+/// filtered by `terminal_safe`, which drops both classes, and a version with
+/// nothing else left reads `-`.
+#[test]
+fn a_bidi_control_in_a_version_drops_and_leaves_dash_when_alone() {
+    let rows = vec![
+        row(
+            "zcode",
+            Some("1\u{202e}.0"),
+            Some("1.0"),
+            true,
+            Some(9101),
+            "healthy",
+            None,
+        ),
+        row(
+            "qwen",
+            Some("\u{202e}\u{2066}"),
+            Some("1.0"),
+            false,
+            Some(9102),
+            "disabled",
+            None,
+        ),
+    ];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE  VERSION  CONTRACT  ENABLED  PORT  STATE   \n\
+         zcode    1.0      1.0       true     9101  healthy \n\
+         qwen     -        1.0       false    9102  disabled\n"
+    );
+}
+
 /// A row with no reason renders no trailing lines and no blank line: the
 /// reason lines appear only where a row has one.
 #[test]
