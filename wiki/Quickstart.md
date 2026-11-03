@@ -123,7 +123,7 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
 - **A link at a runtime tree's path stops a start.** When `~/.clauth/profiles/<p>/runtime…` is a link clauth may not or cannot remove, `clauth start` refuses with `<path> is a link, not a runtime tree clauth made; remove it and start again`.
 - **A `--bg` start can meet clauth's own stop.** While clauth is stopping the background service in that account's background tree, `clauth start <p> -- --bg` refuses with `clauth is stopping Claude Code's background service in {path}; retry in a moment`, and a retry a moment later starts it. A plain start moves to a fresh tree instead, except on a Linux or macOS host where clauth copies runtime trees, where it refuses the same way.
 - **A scheduled task added inside a `clauth start` session lives in that session's runtime tree.** It is gone once clauth removes the tree; add a task you want to keep from a plain `claude` session.
-- **`delete`, `disable` and `limit-reset` want a TTY.** Each prompts `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session and unrescued-files guards, and `--yes` alone does not override them.
+- **`delete`, `disable` and `limit-reset` want a TTY.** Each prompts `[y/N]`; on a non-TTY stdin or stdout they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session and unrescued-files guards, and `--yes` alone does not override them.
 - **Bare names span both rosters.** `clauth <name>`, `delete` and `start` try the Claude Code profiles first, then the codex ones; an unknown name lists both (`available: …, codex: …`).
   - `disable`, `enable`, `rolling-token` and `static-token` refuse a codex name as one ([Codex](Codex)); `limit-reset` takes a codex or Claude Code name.
 - **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; on a terminal, a browser re-login asks first, and the confirm says whether it replaces the stored login or adds one beside what the profile keeps (a piped run proceeds without asking).
@@ -170,7 +170,7 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
 - **`sessions --tokens`** parses every transcript in full to total tokens and cost. On a large store that takes a while, which is why it is opt-in.
 - **`herdr install`** runs herdr's own installer and passes its preview and confirm straight through, then adds the two things a herdr plugin cannot declare for itself: the key that opens the clauth dashboard, and the sidebar row that renders which account each Claude Code pane burns.
   - Both land in your herdr `config.toml`, appended after a diff and a `[y/N]`, and herdr validates the result before anything is written. Run it a second time and it adds nothing.
-  - `--yes` skips both prompts, herdr's install preview included, and is required on a non-TTY stdin.
+  - `--yes` skips both prompts, herdr's install preview included, and is required on a non-TTY stdin or stdout.
   - **`herdr uninstall`** reverses both halves behind one confirm, and declining leaves both alone; it removes only the blocks clauth marked as its own.
   - For either command `--no-config` covers the plugin and leaves `config.toml` untouched.
   - After that, clauth keeps the plugin current on its own: it lands the plugin at the latest release and compares the installed checkout's commit against that release's commit, reinstalling when they differ, up to once per 30 minutes (`CLAUTH_NO_UPDATE=1` opts out).

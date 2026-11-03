@@ -301,6 +301,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   mcp_live/<pid>           # one marker per live `clauth mcp` server, so its delegate jobs read dead once it exits
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
+  limit-reset-locks/<name>.lock # one lock per account; a second spend attempt waits for the first
   keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
   keychain-item-owners.json # which per-session Keychain items clauth seeded; the census deletes nothing else
   keychain-which-cache/     # macOS: one cached Keychain read per service backing `clauth which`, ~30 s TTL (0600, swept after a day)
@@ -310,6 +311,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       credentials.json     # OAuth snapshot
       credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
       auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
+      limit_reset_pending_claude.json # a limit-reset spend whose answer was lost; a re-run within 10 minutes re-sends it (0600)
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       note.txt             # the account's free-form note, edited from the Usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
@@ -343,6 +345,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       auth.lkg.json        # last-known-good copy of auth.json
       auth.attempt         # no-replay memo: a fingerprint of the refresh token last sent
       auth.quarantine.json # the verdict that killed the chain, while its token is still in the store
+      limit_reset_pending_codex.json # the codex twin: a lost consume, re-sent with the same ids within 10 minutes (0600)
       usage_cache.json     # last usage reading and plan
       codex-home/          # the durable store: sessions/, archived_sessions/, history.jsonl, the sqlite state stores
       codex-home-<sid>/    # one live session's CODEX_HOME, removed at exit
