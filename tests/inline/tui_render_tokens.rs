@@ -3239,15 +3239,15 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
     std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
     std::fs::create_dir(dir.join("stats-cache.json")).unwrap();
     let unreadable = crate::tokens::load_base(&dir).expect_err("a directory fails");
-    // Windows refuses to read a directory as a file with an access error, so
-    // the same fault surfaces there through the permission arm.
-    let expected = if cfg!(windows) {
-        "permission denied"
-    } else {
-        "read failed: is a directory"
-    };
-    assert_eq!(unreadable.cause_line(), expected);
+    // One cause on every OS: Windows refuses a directory with an access error,
+    // and the directory still reads as a directory there.
+    assert_eq!(unreadable.cause_line(), "read failed: is a directory");
     std::fs::remove_dir(dir.join("stats-cache.json")).unwrap();
+
+    std::fs::write(dir.join("stats-cache.json"), [0xff, 0xfe, 0x00]).unwrap();
+    let not_utf8 = crate::tokens::load_base(&dir).expect_err("non-UTF-8 bytes fail");
+    assert_eq!(not_utf8.cause_line(), "read failed: invalid data");
+    std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
 
     #[cfg(unix)]
     {
@@ -3260,4 +3260,40 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
         let denied = crate::tokens::load_base(&dir).expect_err("unreadable file fails");
         assert_eq!(denied.cause_line(), "permission denied");
     }
+}
+
+/// The access error Windows returns for a directory reads as a directory on
+/// every OS, while the same error on a file stays a permission cause.
+#[test]
+fn a_permission_error_on_a_directory_names_the_directory() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".claude");
+    std::fs::create_dir_all(dir.join("stats-cache.json")).unwrap();
+    let file = dir.join("other.json");
+    std::fs::write(&file, "{}").unwrap();
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+    assert_eq!(
+        crate::tokens::read_error(&denied, &dir.join("stats-cache.json")).cause_line(),
+        "read failed: is a directory"
+    );
+    assert_eq!(
+        crate::tokens::read_error(&denied, &file).cause_line(),
+        "permission denied"
+    );
+}
+
+/// An error kind std leaves uncategorized names its raw OS code instead of a
+/// word that says nothing.
+#[test]
+fn an_uncategorized_read_error_names_its_raw_os_code() {
+    let home = crate::testutil::HomeSandbox::new();
+    let file = home.home().join("other.json");
+    std::fs::write(&file, "{}").unwrap();
+    // 999 is no errno or Win32 code std maps to a named kind.
+    let unnamed = std::io::Error::from_raw_os_error(999);
+    assert_eq!(
+        crate::tokens::read_error(&unnamed, &file).cause_line(),
+        "read failed: os error 999"
+    );
 }

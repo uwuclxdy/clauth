@@ -785,6 +785,26 @@ impl TokensLoadError {
     }
 }
 
+/// The typed cause of a failed read of the stats cache at `path`.
+pub(crate) fn read_error(e: &std::io::Error, path: &Path) -> TokensLoadError {
+    let kind = e.kind();
+    match kind {
+        std::io::ErrorKind::NotFound => TokensLoadError::Missing,
+        // Windows refuses to open a directory as a file with an access error.
+        std::io::ErrorKind::PermissionDenied if path.is_dir() => {
+            TokensLoadError::ReadFailed(std::io::ErrorKind::IsADirectory.to_string())
+        }
+        std::io::ErrorKind::PermissionDenied => TokensLoadError::PermissionDenied,
+        // `ErrorKind::Uncategorized` is unstable (`io_error_uncategorized`), so its
+        // Display text is the stable way to recognize the kind.
+        _ if kind.to_string() == "uncategorized error" => match e.raw_os_error() {
+            Some(code) => TokensLoadError::ReadFailed(format!("os error {code}")),
+            None => TokensLoadError::ReadFailed(kind.to_string()),
+        },
+        kind => TokensLoadError::ReadFailed(kind.to_string()),
+    }
+}
+
 /// Parse `stats-cache.json` into the base view-model — the fast first phase of
 /// the load. No transcript sweep, so it returns in well under a millisecond; the
 /// background loader emits this for an instant first paint, then merges the live
@@ -794,13 +814,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError
     let cache_path = claude_dir.join("stats-cache.json");
     let raw = match std::fs::read_to_string(&cache_path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TokensLoadError::Missing);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(TokensLoadError::PermissionDenied);
-        }
-        Err(e) => return Err(TokensLoadError::ReadFailed(e.kind().to_string())),
+        Err(e) => return Err(read_error(&e, &cache_path)),
     };
     let wire: StatsCacheFile = match serde_json::from_str(&raw) {
         Ok(wire) => wire,
