@@ -8482,9 +8482,11 @@ fn the_codex_detach_postscript_escapes_both_paths_it_names() {
         crate::actions::codex_detach_postscript(&logged_out),
         vec![(
             crate::actions::CodexDetachNotice::LoggedOut,
-            "/home/op/\\u{202e}own/auth.json followed that profile's chain and is detached now, \
-             so your own codex has no login; run `codex login` to mint a fresh one"
-                .to_string(),
+            format!(
+                "/home/op/\\u{{202e}}own{}auth.json followed that profile's chain and is detached \
+                 now, so your own codex has no login; run `codex login` to mint a fresh one",
+                std::path::MAIN_SEPARATOR
+            ),
         )],
         "the detached slot's path is escaped"
     );
