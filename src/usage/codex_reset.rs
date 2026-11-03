@@ -22,11 +22,13 @@
 
 use std::time::Duration;
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::fetch::iso_to_epoch_secs;
-use crate::format::{local_stamp, plural, terminal_safe, truncate};
+use crate::format::{grapheme_cells, local_stamp, plural, terminal_safe, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
 /// one a clauth-held login reaches (see `codex::CODEX_USAGE_URL`).
@@ -390,29 +392,41 @@ fn trim_padding(text: &str) -> &str {
     &text[start..after + tail]
 }
 
-/// Cap `text` at `max` characters that take a cell — drawn characters and
-/// blanks alike, never the invisible ones — appending `...` when it is over; at
-/// or under the cap the text comes back unchanged, padding and all. A cut keeps
-/// the invisible characters directly after the last character that takes a
-/// cell, so an emoji keeps its variation selector, and never counts those
-/// against the cap.
+/// Cap `text` at `max` terminal cells — the widths the drawn characters and
+/// blanks take, never the invisible ones, so a wide CJK glyph or an emoji
+/// presentation sequence spends its two — appending `...` when it is over; at
+/// or under the cap the text comes back unchanged, padding and all. A cut
+/// keeps whole graphemes, so an emoji's variation selector travels with its
+/// base and never counts against the cap. A cut drops a grapheme the
+/// remaining budget cannot hold whole. Cost is per grapheme, never below one
+/// per character the model counts as taking a cell: a filler the grapheme
+/// measure gives no cell still takes its blank one, and an emoji sequence
+/// draws both its cells, so a cap cuts early rather than late.
 fn cap_drawn(text: &str, max: usize) -> String {
-    if text.chars().filter(|&c| takes_a_cell(c)).count() <= max {
+    // The whole-string grapheme measure is not the guard: a combining mark
+    // costs its own cell here.
+    let cost = |g: &str| grapheme_cells(g).max(g.chars().filter(|&c| takes_a_cell(c)).count());
+    let cells = |t: &str| {
+        Span::raw(t)
+            .styled_graphemes(Style::default())
+            .map(|g| cost(g.symbol))
+            .sum::<usize>()
+    };
+    if cells(text) <= max {
         return text.to_string();
     }
     if max < 3 {
         return truncate(text, max);
     }
     let mut kept = String::new();
-    let mut cells = 0;
-    for c in text.chars() {
-        if takes_a_cell(c) {
-            if cells == max - 3 {
-                break;
-            }
-            cells += 1;
+    let mut spent = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
+        let c = cost(grapheme.symbol);
+        if spent + c > max - 3 {
+            break;
         }
-        kept.push(c);
+        spent += c;
+        kept.push_str(grapheme.symbol);
     }
     kept.push_str("...");
     kept
@@ -582,12 +596,26 @@ pub(crate) fn outcome_line(
             "that reset on '{name}' is no longer available (used or expired meanwhile); \
              run `clauth limit-reset {name} --list` to see what is left"
         )),
-        ConsumeOutcome::Unknown(code) => Err(format!(
-            "codex answered the reset request for '{name}' with an unrecognized code {:?}, \
-             so the outcome is unconfirmed; {}",
-            truncate(&code, 40),
-            check_list_hint(name)
-        )),
+        ConsumeOutcome::Unknown(code) => {
+            // Each character is escaped on its own before the cut, so the cut
+            // can neither drop a control character nor split an escape; inside
+            // double quotes an apostrophe needs no escape, as `{:?}` on a string
+            // prints it.
+            let shown = crate::format::truncate_escaped(
+                &code,
+                40,
+                |c| match c {
+                    '\'' => c.to_string(),
+                    _ => c.escape_debug().to_string(),
+                },
+                true,
+            );
+            Err(format!(
+                "codex answered the reset request for '{name}' with an unrecognized code \
+                 {shown}, so the outcome is unconfirmed; {}",
+                check_list_hint(name)
+            ))
+        }
     }
 }
 

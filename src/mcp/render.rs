@@ -1694,7 +1694,7 @@ fn escape_within(line: &str, max: usize) -> String {
     let mut used = 0;
     for c in line.chars() {
         let piece = crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
-            !c.is_control() && !crate::format::reorders_display(c)
+            !crate::format::unsafe_on_terminal(c)
         });
         used += piece.chars().count();
         pieces.push(piece);

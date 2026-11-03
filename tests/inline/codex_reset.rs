@@ -263,6 +263,122 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
     assert!(unknown.contains("before retrying"), "{unknown}");
 }
 
+/// The message around an unknown code, so each case below pins its own `shown`
+/// against everything else the line says.
+fn unknown_code_line(shown: &str) -> String {
+    format!(
+        "codex answered the reset request for 'work' with an unrecognized code {shown}, \
+         so the outcome is unconfirmed; check `clauth limit-reset work --list` before retrying"
+    )
+}
+
+/// An over-cap code keeps its control characters visible as their escapes: each
+/// character is escaped on its own before the cut, so the cut can neither drop
+/// one (the cell cut's grapheme walk skips control graphemes) nor split one.
+/// The `\n` and `\u{1b}` escapes take the kept body to 28 cells, nine y's fill
+/// the 37-cell content budget, and the dots sit outside the quoted part.
+#[test]
+fn limit_reset_unknown_code_keeps_its_control_characters_through_the_cut() {
+    let code = format!("{}\n\u{1b}{}", "x".repeat(20), "y".repeat(30));
+    let reply = ConsumeReply {
+        code,
+        windows_reset: 0,
+    };
+    let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+    assert_eq!(
+        unknown,
+        unknown_code_line(&format!(
+            "\"{}\\n\\u{{1b}}{}\"...",
+            "x".repeat(20),
+            "y".repeat(9)
+        )),
+        "the newline and the escape stay visible through the cut"
+    );
+}
+
+/// Each character is escaped on its own before the cut, so the cut can neither
+/// drop a control character nor split an escape, and the dots sit outside the
+/// quoted part. With k x's, the two-cell `\n` escape and twenty y's behind it,
+/// the 37-cell content budget keeps 35−k y's; at 36 x's the `\n` piece no
+/// longer fits and the cut stops at the last x.
+#[test]
+fn limit_reset_unknown_code_is_cut_before_it_is_escaped() {
+    for (k, ys) in [(30, 5), (31, 4), (32, 3), (33, 2), (34, 1), (35, 0)] {
+        let code = format!("{}\n{}", "x".repeat(k), "y".repeat(20));
+        let reply = ConsumeReply {
+            code,
+            windows_reset: 0,
+        };
+        let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+        assert_eq!(
+            unknown,
+            unknown_code_line(&format!("\"{}\\n{}\"...", "x".repeat(k), "y".repeat(ys))),
+            "{k} x's before the newline"
+        );
+    }
+    // The `\n` escape needs 2 cells of the 1 the budget has left at 36 x's, so
+    // the piece is left out whole and the cut stops at the last x.
+    let code = format!("{}\n{}", "x".repeat(36), "y".repeat(20));
+    let reply = ConsumeReply {
+        code,
+        windows_reset: 0,
+    };
+    let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+    assert_eq!(
+        unknown,
+        unknown_code_line(&format!("\"{}\"...", "x".repeat(36))),
+        "36 x's leave the newline's escape no room"
+    );
+}
+
+/// A code far past the cap costs only the cap: the line a 4 MiB code draws is
+/// the one its first 64 KiB draws, holding the 37 characters the content budget
+/// takes and the dots outside the quotes.
+#[test]
+fn limit_reset_unknown_code_cuts_a_huge_code_like_its_prefix() {
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let line = |code: String| {
+        let reply = ConsumeReply {
+            code,
+            windows_reset: 0,
+        };
+        outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails")
+    };
+    let expected = unknown_code_line(&format!("\"{}\"...", "x".repeat(37)));
+    assert_eq!(line(huge.clone()), expected);
+    assert_eq!(line(huge[..64 * 1024].to_string()), expected);
+}
+
+/// The escape is `{:?}`: a literal backslash in the code comes back doubled, so
+/// a code holding `\u{000a}` cannot read as the newline's own escape, which is
+/// the single-backslash `\n` pinned beside it.
+#[test]
+fn limit_reset_unknown_code_keeps_a_literal_backslash_apart_from_an_escape() {
+    let line = |code: String| {
+        let reply = ConsumeReply {
+            code,
+            windows_reset: 0,
+        };
+        outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails")
+    };
+
+    assert_eq!(
+        line(format!("{}\\u{{000a}}", "x".repeat(30))),
+        unknown_code_line(&format!("\"{}\\\\u{{000a}}\"", "x".repeat(30))),
+        "a literal backslash-u sequence stays doubled"
+    );
+    assert_eq!(
+        line("a\nb".to_string()),
+        unknown_code_line(r#""a\nb""#),
+        "a real newline is the one-backslash short escape"
+    );
+    assert_eq!(
+        line("it's".to_string()),
+        unknown_code_line(r#""it's""#),
+        "inside double quotes an apostrophe prints bare, as a string's Debug form prints it"
+    );
+}
+
 /// A failed list spent nothing and says so, whatever the failure; a failed
 /// consume says so only on a 401 — every other failure leaves the outcome open.
 #[test]
@@ -673,11 +789,13 @@ fn limit_reset_title_cap_counts_only_drawn_characters() {
     );
 
     let heart = "\u{2764}\u{fe0f}";
+    // The presentation sequence draws its two cells as one grapheme: 70 of
+    // them are 140 cells, and the 57-cell content budget keeps 28 whole pairs.
     assert_eq!(
         sole_prompt(&titled_credit(&heart.repeat(70))),
         format!(
             "clauth: use a usage-limit reset on 'work'? {}..., no expiry{PROMPT_TAIL}",
-            heart.repeat(57)
+            heart.repeat(28)
         )
     );
 
@@ -698,6 +816,19 @@ fn limit_reset_title_cap_counts_only_drawn_characters() {
     assert_eq!(
         sole_prompt(&titled_credit(&at_cap)),
         format!("clauth: use a usage-limit reset on 'work'? {at_cap}, no expiry{PROMPT_TAIL}")
+    );
+}
+
+/// A wide CJK glyph draws two terminal cells, so the title's 60 cap keeps 28
+/// of them (56 cells) where a one-cell count would keep 57.
+#[test]
+fn limit_reset_title_cap_counts_wide_glyphs_by_cells() {
+    assert_eq!(
+        sole_prompt(&titled_credit(&"漢".repeat(70))),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? {}..., no expiry{PROMPT_TAIL}",
+            "漢".repeat(28)
+        )
     );
 }
 

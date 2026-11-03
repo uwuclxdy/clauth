@@ -2233,3 +2233,42 @@ fn live_rows_find_a_background_rows_record_in_the_background_tree() {
         Some("cccccccc-3333-4333-8333-cccccccccccc".to_string()),
     );
 }
+
+/// The `--live` table pads its account and cwd columns by terminal cells: a CJK
+/// account and cwd keep the tag column on one screen column across rows.
+#[test]
+fn a_cjk_live_account_and_cwd_keep_the_tag_column_aligned() {
+    let _sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    // 14_000_000 s ago pins `started_at` at 1_786_000_000_000 ms, after `now`,
+    // so both rows age as `just now`.
+    let row = |sid: &str, account: &str, cwd: &str| {
+        let mut r = live_fixture_row(sid, account, 14_000_000);
+        r.cwd = Some(std::path::PathBuf::from(cwd));
+        r.is_delegate = true;
+        r
+    };
+
+    let lines = live_lines_of(
+        &[
+            row("s-cjk", "漢字", "/ws/漢字"),
+            row("s-asc", "ascii-prof", "/ws/ascii-project"),
+        ],
+        now,
+    );
+
+    // ACCOUNT 10 cells, CWD 17 cells; the age is `just now` on both rows.
+    assert_eq!(
+        lines[0],
+        format!(
+            "s-cjk  漢字{}  claude  just now  -  /ws/漢字{}  delegate",
+            " ".repeat(6),
+            " ".repeat(9)
+        ),
+        "the CJK account or cwd overruns its column"
+    );
+    assert_eq!(
+        lines[1], "s-asc  ascii-prof  claude  just now  -  /ws/ascii-project  delegate",
+        "the ASCII row pads the CJK columns' widths"
+    );
+}

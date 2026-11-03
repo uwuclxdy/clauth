@@ -6716,6 +6716,37 @@ fn a_named_rebind_list_repeats_only_the_names() {
     );
 }
 
+/// A CJK account name sizes and pads the account column by the eight terminal
+/// cells it draws, not the twelve bytes it holds, so the row column opens on
+/// the same screen column in every row.
+#[test]
+fn a_cjk_account_name_keeps_the_rebind_columns_aligned() {
+    let selected = vec![
+        crate::presets::AccountOffers {
+            account: "漢字漢字".to_string(),
+            rows: vec![crate::presets::RowMove {
+                row: "default",
+                old: None,
+                new: Some("opus".to_string()),
+            }],
+        },
+        crate::presets::AccountOffers {
+            account: "ascii-prof".to_string(),
+            rows: vec![crate::presets::RowMove {
+                row: "opus",
+                old: Some("deepseek-chat".to_string()),
+                new: Some("opus".to_string()),
+            }],
+        },
+    ];
+    assert_eq!(
+        rebind_list_body(&selected),
+        "漢字漢字    default  (unset)        → opus\n\
+         ascii-prof  opus     deepseek-chat  → opus\n",
+        "the account column sizes and pads by terminal cells",
+    );
+}
+
 /// `--yes` writes the offered rows and pins the exact success line.
 #[test]
 fn the_yes_rebind_writes_and_pins_its_stdout() {

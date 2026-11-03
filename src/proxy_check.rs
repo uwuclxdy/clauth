@@ -38,11 +38,11 @@ const BODY_LIMIT: u64 = 1 << 20;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 /// An inference answer can wait on the provider (a queued off-peak channel).
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(180);
-/// A violation line prints a quoted value in at most `REPR_MAX + 1` chars,
-/// `...` included.
+/// A violation line prints a quoted value in at most `REPR_MAX + 1` terminal
+/// cells, `...` included.
 const REPR_MAX: usize = 80;
 /// A violation line prints the route and the expectation, both built here but
-/// able to carry a proxy-supplied id, in at most `LINE_MAX + 1` chars.
+/// able to carry a proxy-supplied id, in at most `LINE_MAX + 1` terminal cells.
 const LINE_MAX: usize = 240;
 /// The draft keeps a `/health` body under this many bytes, the daemon probe's
 /// body cap.
@@ -704,12 +704,12 @@ fn repr(v: &Value) -> String {
     v.to_string()
 }
 
-/// Proxy-supplied text made safe for a terminal: every control character (C0
-/// and C1) and every bidi formatting character is written as its `\u{..}`
-/// escape, so a proxy can neither drive the terminal nor reorder a line.
-fn escape(text: &str) -> String {
-    crate::format::escape_unless(text, |c| {
-        !c.is_control() && !crate::format::reorders_display(c)
+/// One character as the report quotes it: a control (C0 and C1) or
+/// bidi-reordering character as its `\u{..}` escape, every other character as
+/// itself, so a proxy can neither drive the terminal nor reorder a line.
+fn escape_char(c: char) -> String {
+    crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+        !crate::format::unsafe_on_terminal(c)
     })
 }
 
@@ -941,7 +941,8 @@ fn check_expecting(
 
 impl Checker<'_> {
     /// Every line the report prints passes here: credentials redacted first,
-    /// then proxy-supplied text escaped, then cut.
+    /// then proxy-supplied text escaped, then cut at whole pieces, so an
+    /// escape is never split.
     fn printable(&self, text: &str, max: usize) -> String {
         let redacted = self
             .secrets
@@ -953,7 +954,7 @@ impl Checker<'_> {
                 [s.clone(), quoted[1..quoted.len() - 1].to_string()]
             })
             .fold(text.to_string(), |t, s| t.replace(&s, "<redacted>"));
-        crate::format::truncate(&escape(&redacted), max + 1)
+        crate::format::truncate_escaped(&redacted, max + 1, escape_char, false)
     }
 
     fn violation(&mut self, route: &str, expected: String, got: String) {
@@ -2512,8 +2513,13 @@ impl Checker<'_> {
                 && !allowed.contains(current.get(key).unwrap_or(&Value::Null))
             {
                 self.skip(format!(
-                    "setting {}: inactive under the account's current {key}",
-                    decl.key
+                    "setting {}: inactive under the account's current {}",
+                    decl.key,
+                    if is_id(key) {
+                        key.clone()
+                    } else {
+                        repr(&json!(key))
+                    }
                 ));
                 continue;
             }

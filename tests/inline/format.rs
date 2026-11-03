@@ -1234,6 +1234,21 @@ fn the_missing_chain_refusal_shows_an_empty_name() {
     );
 }
 
+/// A budget bounds terminal cells as well as characters: six CJK glyphs
+/// occupy twelve cells but only six characters, so the cell budget runs out
+/// first and the three ASCII dots stay inside it. ASCII output is unchanged.
+#[test]
+fn truncate_budgets_grapheme_cells_not_chars() {
+    assert_eq!(truncate("漢字漢字漢字", 8), "漢字...");
+    // `ab` takes the 2-cell content budget (`5 - 3`), so the next 2-cell glyph
+    // has none left and the cut stops before it.
+    assert_eq!(truncate("ab漢字", 5), "ab...");
+    assert_eq!(truncate("abc", 8), "abc");
+    assert_eq!(truncate("abcdefgh", 8), "abcdefgh");
+    assert_eq!(truncate("abcdefghi", 8), "abcde...");
+    assert_eq!(truncate("xyz", 2), "..");
+}
+
 /// One word per cause of a dead usage credential, shared by the Usage tab and
 /// `clauth list`: a refused setup token, a lapsed console session, a rejected
 /// api key, and an Alibaba account that never stored a session.
@@ -1312,4 +1327,171 @@ fn a_wide_script_name_in_the_start_walk_pads_like_its_ascii_twin() {
         "the twin walk renders the twin: {twin}"
     );
     assert_eq!(walk(WIDE), twin.replace(TWIN, WIDE));
+}
+
+/// A cap bounds what a zero-width grapheme can add: each one draws nothing but
+/// spends a character of the budget, so a run of them stops at the cap instead
+/// of carrying unbounded bytes through, while every string the cap already
+/// held comes back unchanged.
+#[test]
+fn truncate_bounds_a_run_of_zero_width_characters() {
+    let hidden = format!("{}hi", "\u{200b}".repeat(100_000));
+    let cut = truncate(&hidden, 200);
+    assert_eq!(
+        cut,
+        format!("{}...", "\u{200b}".repeat(197)),
+        "197 zero-width characters take the content budget, then the dots"
+    );
+    assert_eq!(cut.chars().count(), 200, "the cap bounds the count too");
+    assert_eq!(
+        truncate("a\u{200b}b", 5),
+        "a\u{200b}b",
+        "a short run stays whole"
+    );
+}
+
+/// A cap keeps the line structure of what it cuts: a control character costs
+/// its character and no cell, so an over-cap multi-line payload keeps its
+/// newlines instead of fusing into one line, and a run of them stops at the
+/// char budget the way a run of zero-width characters does.
+#[test]
+fn truncate_keeps_the_lines_of_an_over_cap_payload() {
+    let payload = "xxxx\n".repeat(500);
+    let cut = truncate(&payload, 1000);
+    assert_eq!(
+        cut,
+        format!("{}xx...", "xxxx\n".repeat(199)),
+        "199 five-character lines take 995 of the 997-character budget, two more x's take the last, then the dots"
+    );
+    assert_eq!(
+        cut.matches('\n').count(),
+        199,
+        "the cut keeps the newlines instead of fusing the lines"
+    );
+}
+
+#[test]
+fn truncate_bounds_a_run_of_control_characters() {
+    assert_eq!(
+        truncate(&"\u{1}".repeat(1000), 20),
+        format!("{}...", "\u{1}".repeat(17)),
+        "17 control characters take the content budget, then the dots"
+    );
+    assert_eq!(
+        truncate("a\nb", 5),
+        "a\nb",
+        "a short run of control characters comes back unchanged"
+    );
+}
+
+/// A cap keeps the one grapheme a control character does not break: a carriage
+/// return and the line feed right after it are one cluster, so the cut either
+/// keeps the pair whole or leaves it out whole, and never ends on a bare
+/// carriage return whose line feed is gone — the dots then print over the kept
+/// line instead of starting a new one.
+#[test]
+fn truncate_keeps_a_carriage_return_and_line_feed_together() {
+    assert_eq!(
+        truncate("abc\r\ndef", 7),
+        "abc...",
+        "the pair needs both its characters, so the 4-character budget takes `abc` and leaves the pair out whole"
+    );
+    assert_eq!(
+        truncate("abc\r\ndefgh", 8),
+        "abc\r\n...",
+        "one more character of budget keeps the pair whole"
+    );
+    assert_eq!(
+        truncate("abc\rdefg", 7),
+        "abc\r...",
+        "a carriage return with no line feed behind it is one control piece on its own"
+    );
+}
+
+/// A cap bounds the work of escaping as well as the output: the escaped body is
+/// built only up to the cap, so a body far over it never exists whole. The
+/// piece counter pins that bound, and the cut a multi-megabyte input gets is the
+/// one its first 64 KiB gets.
+#[test]
+fn truncate_escaped_builds_only_the_body_the_cap_can_keep() {
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let calls = std::cell::Cell::new(0usize);
+    let cut = crate::format::truncate_escaped(
+        &huge,
+        40,
+        |c| {
+            calls.set(calls.get() + 1);
+            c.to_string()
+        },
+        false,
+    );
+    assert!(
+        calls.get() <= 41,
+        "the cap bounds the characters escaped to 41 (the 40 the cap holds and the one that proves the cut), got {}",
+        calls.get()
+    );
+    assert_eq!(cut, format!("{}...", "x".repeat(37)));
+    assert_eq!(
+        cut,
+        crate::format::truncate_escaped(&huge[..64 * 1024], 40, |c| c.to_string(), false),
+        "the kept body lies inside the first 64 KiB, so the rest changes nothing"
+    );
+}
+
+/// The cut lands on a grapheme of the text the cap prints: a prepended
+/// character (`U+0600`) directly before an escaped control character is its own
+/// cluster in the body built so far but joins the escape's backslash in what is
+/// printed, so the body has to carry the piece that overran the cap or the cut
+/// keeps a character that then merges with the dots.
+#[test]
+fn truncate_escaped_cuts_where_the_kept_piece_joins_the_next() {
+    let escape = |c: char| {
+        crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !crate::format::unsafe_on_terminal(c)
+        })
+    };
+    assert_eq!(
+        crate::format::truncate_escaped("\u{600}\u{1b}\u{2026}", 4, escape, false),
+        "...",
+        "the number sign joins the escape's backslash, so the 1-character budget keeps no piece at all and the sign is never left alone before the dots"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("aa\u{1b}bb", 4, escape, false),
+        "a...",
+        "a cut that already lands between pieces keeps the same text"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("a\u{1b}b", 10, escape, false),
+        "a\\u{001b}b",
+        "a body inside the cap comes back whole"
+    );
+}
+
+/// A cap bounds characters as well as cells: one grapheme can carry unbounded
+/// characters (a base with ~250 KB of combining marks is a single cluster), so
+/// the char count — each char at most four bytes — stops it where the cell
+/// measure alone would pass it whole.
+#[test]
+fn truncate_bounds_a_single_oversized_grapheme() {
+    let marks = format!("a{}", "\u{301}".repeat(125_000));
+    let cut = truncate(&marks, 200);
+    assert_eq!(
+        cut, "...",
+        "one 250 KB cluster overruns the char budget whole, so only the dots survive"
+    );
+    assert_eq!(cut.len(), 3, "the cut is bounded in bytes as well as cells");
+    assert_eq!(
+        truncate(&"e\u{301}".repeat(100), 9),
+        format!("{}...", "e\u{301}".repeat(3)),
+        "a two-character grapheme spends two of the six-character budget"
+    );
+}
+
+/// A wide glyph carrying a halfwidth sound mark draws three cells on two
+/// characters, so the cut spends the cells the buffer draws, not the
+/// characters: one `漢ﾞ` fills 3 of the 5-cell content budget and a second
+/// would reach 6.
+#[test]
+fn truncate_cuts_a_wide_glyph_with_a_sound_mark_by_drawn_cells() {
+    assert_eq!(truncate(&"漢\u{ff9e}".repeat(10), 8), "漢\u{ff9e}...");
 }

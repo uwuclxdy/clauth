@@ -1785,3 +1785,39 @@ fn list_table_names_a_refused_setup_token_beside_a_stored_pair() {
         );
     }
 }
+
+/// A halfwidth katakana name with voiced sound marks sizes the PROFILE column
+/// by the eight cells the buffer draws — each U+FF9E mark renders its own
+/// halfwidth cell, which the grapheme width alone gives none — so the PLAN
+/// column opens on the same screen column in every row.
+#[test]
+fn a_halfwidth_katakana_name_keeps_the_plan_column_aligned() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("ｶﾞｶﾞｶﾞｶﾞ"), oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("ｶﾞｶﾞｶﾞｶﾞ", 42.4, 17.6);
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE   PLAN  5H USED  7D USED  ENDPOINT",
+            "  ｶﾞｶﾞｶﾞｶﾞ  Max     42.4%    17.6%  -",
+            "* work      Max     42.4%    17.6%  -",
+        ],
+        "the PROFILE column sizes and pads by the cells the buffer draws, got:\n{table}"
+    );
+}

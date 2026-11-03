@@ -1,17 +1,17 @@
 //! Profile/usage → display-string formatters (pure but for
 //! [`credit_refused_label`]'s clock read), plus the cross-surface diagnostic
 //! messages, so the TUI, the CLI subcommands (e.g. `clauth which`), and the
-//! headless daemon all share one spelling. No entry emits a `Span`/`Style`;
-//! the one ratatui dependency is [`grapheme_cells`], which counts the cells a
-//! terminal draws so a CLI table pads by the same measure.
-//!
+//! headless daemon all share one spelling. No entry emits a `Span`/`Style`; its
+//! ratatui use is measurement only — [`grapheme_cells`] sums the grapheme widths
+//! a terminal draws (via [`CellWidth`]) so a CLI table pads by the same measure.
 //! Helpers that emit `Span`/`Style` live in `tui/render/format.rs`, beside the
-//! theme they style with, so this tier never carries TUI styling;
-//! single-screen or domain-local display glue stays with its owner, since
-//! folding it in would mint one-caller abstractions. The split stands over a
-//! single grab-bag `format.rs` (surveyed 2026-07-16).
+//! theme they style with, so this tier never carries TUI styling; single-screen
+//! or domain-local display glue stays with its owner, since folding it in would
+//! mint one-caller abstractions, so the split stands over a single grab-bag
+//! `format.rs`.
 
 use chrono::{DateTime, Datelike, Local, Timelike};
+use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
 use ratatui::text::Span;
 
@@ -631,15 +631,24 @@ pub(crate) fn humanize_span(secs: u64) -> String {
     humanize_duration(secs as i64)
 }
 
-/// The rendered cell width of `value`: each grapheme's own width summed, the
-/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
-/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
-/// cell while the buffer draws it per grapheme as two, so that measure lets a
-/// value overrun its budget.
-pub(crate) fn grapheme_cells(value: &str) -> usize {
-    Span::raw(value)
+/// One grapheme's cells as the buffer lays them down
+/// ([`CellWidth::cell_width`]): `unicode-width` plus one cell per halfwidth
+/// katakana sound mark (`U+FF9E`/`U+FF9F`), a mark `Span::width` reports zero
+/// where the buffer lays one down, so `ｶﾞ` draws 2.
+pub(crate) fn grapheme_cell_width(symbol: &str) -> usize {
+    usize::from(symbol.cell_width())
+}
+
+/// The terminal cells `s` occupies: each grapheme's [`grapheme_cell_width`]
+/// summed over `styled_graphemes`, the measure the buffer draws by (control
+/// graphemes dropped). The whole-string [`Span::width`] folds an Arabic
+/// lam-alef ligature to one cell while the buffer draws it per grapheme as two,
+/// and `chars().count()` spends one cell on a two-cell CJK glyph, so a value
+/// sized by either overruns its budget.
+pub(crate) fn grapheme_cells(s: &str) -> usize {
+    Span::raw(s)
         .styled_graphemes(Style::default())
-        .map(|g| Span::raw(g.symbol).width())
+        .map(|g| grapheme_cell_width(g.symbol))
         .sum()
 }
 
@@ -667,19 +676,150 @@ pub(crate) fn pad_cells(value: &str, width: usize, right_align: bool) -> String 
     }
 }
 
-/// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
+/// Whether `s` fits a cap of `max` on both measures a cap bounds: the cells
+/// [`grapheme_cells`] draws, and the characters — a char is at most four bytes,
+/// so a character cap also bounds the bytes one grapheme can carry. The
+/// characters are counted first: a string over the cap stops there, and the
+/// cell walk then sees at most `max` characters.
+fn cap_fits(s: &str, max: usize) -> bool {
+    s.chars().nth(max).is_none() && grapheme_cells(s) <= max
+}
+
+/// The byte length of the longest prefix of `s` that fits `budget` on both
+/// measures [`cap_fits`] bounds, every grapheme kept whole. A control
+/// character is one piece that spends its character and no cell, so a caller's
+/// line structure survives the cut and a run of controls stops at the char
+/// budget; keeping control characters off a terminal stays the caller's job
+/// ([`terminal_safe`], or the preview seam's own mapping). A control character
+/// breaks a grapheme cluster wherever it sits, except that a carriage return
+/// and the line feed right behind it are one cluster (UAX #29 GB3), so the two
+/// go as one piece and no piece straddles a cluster.
+fn cap_prefix_len(s: &str, budget: usize) -> usize {
+    let (mut cells, mut chars, mut len) = (0, 0, 0);
+    let mut segments = s.split_inclusive(char::is_control).peekable();
+    while let Some(segment) = segments.next() {
+        let control = segment.chars().next_back().filter(|c| c.is_control());
+        let head = &segment[..segment.len() - control.map_or(0, char::len_utf8)];
+        let mut head_len = 0;
+        for grapheme in Span::raw(head).styled_graphemes(Style::default()) {
+            let (w, n) = (
+                grapheme_cell_width(grapheme.symbol),
+                grapheme.symbol.chars().count(),
+            );
+            if cells + w > budget || chars + n > budget {
+                return len + head_len;
+            }
+            cells += w;
+            chars += n;
+            head_len += grapheme.symbol.len();
+        }
+        len += head_len;
+        if let Some(c) = control {
+            let line_feed = c == '\r' && segments.peek().is_some_and(|next| *next == "\n");
+            let cost = if line_feed { 2 } else { 1 };
+            if chars + cost > budget {
+                return len;
+            }
+            chars += cost;
+            len += c.len_utf8();
+            if line_feed {
+                segments.next();
+                len += '\n'.len_utf8();
+            }
+        }
+    }
+    len
+}
+
+/// Trailing-ellipsis truncation to a cap of `max` on both measures a terminal
+/// lays text out by ([`cap_fits`]): the cells [`grapheme_cells`] draws, and the
+/// characters, which also bound the bytes. A grapheme the content budget
+/// (`max` less the 3-cell, 3-character `...`) cannot hold whole is left out,
+/// and the cut stops at the first grapheme either measure cannot take. Control
+/// characters are kept, spending their characters and no cell, so an over-cap
+/// multi-line input keeps its line structure and a run of controls stops at
+/// the char budget; keeping control characters off a terminal stays the
+/// caller's job. At or under the cap the whole text comes back unchanged, and
+/// a cap under 3 renders dots alone.
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cap_fits(s, max) {
         return s.to_string();
     }
-    // Three ASCII dots stand in for the ellipsis, so the content budget shrinks
-    // by three to keep the total at `max` columns.
     if max < 3 {
-        return "...".chars().take(max).collect();
+        return ".".repeat(max);
     }
-    let mut out: String = s.chars().take(max - 3).collect();
-    out.push_str("...");
-    out
+    format!("{}...", &s[..cap_prefix_len(s, max - 3)])
+}
+
+/// `text` with each character rendered by `piece`, cut at whole pieces to a cap
+/// of `max` on the escaped body. The body is measured by [`cap_fits`] — the
+/// cells a terminal draws it in and its characters — and a piece the content
+/// budget (`max` less the 3-cell `...`) cannot hold is left out, never split,
+/// so an escape never loses its tail and a control character survives the cut
+/// as its escape. The body stops being built at the first piece that would
+/// carry it past `max` characters, that piece included so the cut sees the
+/// grapheme it joins; nothing after it is built, which already proves the rest
+/// of the text over the cap, so no body far over it is ever built whole, and
+/// the fit and the cut both lie inside what was built. The kept text is
+/// wrapped in a pair of double quotes when `quoted` (the two quote cells sit
+/// outside `max`), `...` appended outside the quotes (at the end, bare) when
+/// anything was cut; at or under the cap the whole text comes back, and a bound
+/// under 3 cells renders dots alone.
+pub(crate) fn truncate_escaped(
+    text: &str,
+    max: usize,
+    piece: impl Fn(char) -> String,
+    quoted: bool,
+) -> String {
+    let mut body = String::new();
+    let mut ends = Vec::new();
+    let mut chars = 0;
+    let mut cut_short = false;
+    for c in text.chars() {
+        let escaped = piece(c);
+        let escaped_chars = escaped.chars().count();
+        if chars + escaped_chars > max {
+            cut_short = true;
+            body.push_str(&escaped);
+            ends.push(body.len());
+            break;
+        }
+        chars += escaped_chars;
+        body.push_str(&escaped);
+        ends.push(body.len());
+    }
+    let wrap = |s: &str| {
+        if quoted {
+            format!("\"{s}\"")
+        } else {
+            s.to_string()
+        }
+    };
+    if !cut_short && cap_fits(&body, max) {
+        return wrap(&body);
+    }
+    if max < 3 {
+        return ".".repeat(max);
+    }
+    // Both callers' `piece` escapes every control character, so every character
+    // of `body` reaches the grapheme walk and the cut lands on one of its
+    // boundaries; backing off to the last whole piece keeps an escape intact.
+    let fit = cap_prefix_len(&body, max - 3);
+    let cut = ends
+        .iter()
+        .copied()
+        .take_while(|&end| end <= fit)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", wrap(&body[..cut]))
+}
+
+/// Whether a character must not reach a terminal as itself: a control
+/// character or a display-reordering one. The one predicate set
+/// [`terminal_safe`] drops, the preview seam maps to a space and a delegate
+/// reply escapes, so none of them can drift apart.
+pub(crate) fn unsafe_on_terminal(c: char) -> bool {
+    c.is_control() || reorders_display(c)
 }
 
 /// Untrusted text with its control and bidi formatting characters dropped: it
@@ -687,9 +827,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// line, and a bidi override could reorder the line to read as something it is
 /// not.
 pub(crate) fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !reorders_display(*c))
-        .collect()
+    s.chars().filter(|c| !unsafe_on_terminal(*c)).collect()
 }
 
 /// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
@@ -1043,8 +1181,8 @@ fn start_age_cell(row: &StartCandidate) -> String {
 
 /// The member rows of a `--explain` start walk, one line per chain member in
 /// chain order: `*` for the pick, then the name and verdict each padded to the
-/// column's widest, then the cache-age cell. Pure, so the byte layout is pinned
-/// without capturing stdout.
+/// column's widest in terminal cells (a CJK name keeps its column), then the
+/// cache-age cell. Pure, so the byte layout is pinned without capturing stdout.
 pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
     let name_w = rows
         .iter()

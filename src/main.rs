@@ -519,7 +519,9 @@ fn cmd_run() -> Result<()> {
 /// The "nothing to move" line; exits 0.
 const REBIND_NOTHING: &str = "every account already uses the built-in preset models.";
 
-/// The aligned account-row-old→new body, one line per row, no summary.
+/// The aligned account-row-old→new body, one line per row, no summary. Column
+/// widths and cell padding are terminal cells, so a CJK account name keeps its
+/// column.
 fn rebind_list_body(selected: &[crate::presets::AccountOffers]) -> String {
     let acc_w = selected
         .iter()

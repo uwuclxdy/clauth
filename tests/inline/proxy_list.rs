@@ -100,6 +100,39 @@ fn a_wide_script_version_keeps_the_later_columns_aligned() {
     );
 }
 
+/// A CJK service name sizes the SERVICE column by the eight cells it draws,
+/// not the four chars it holds, so the VERSION column opens on the same
+/// screen column in every row. The ASCII row pads by cells, unchanged.
+#[test]
+fn a_cjk_service_name_keeps_the_version_column_aligned() {
+    let rows = vec![
+        row(
+            "漢字漢字",
+            Some("1.2.0"),
+            Some("1.0"),
+            true,
+            Some(9101),
+            "healthy",
+            None,
+        ),
+        row(
+            "zcode",
+            Some("1.2.0"),
+            Some("1.0"),
+            false,
+            Some(9102),
+            "disabled",
+            None,
+        ),
+    ];
+    assert_eq!(
+        render_table(&rows),
+        "SERVICE   VERSION  CONTRACT  ENABLED  PORT  STATE   \n\
+         漢字漢字  1.2.0    1.0       true     9101  healthy \n\
+         zcode     1.2.0    1.0       false    9102  disabled\n"
+    );
+}
+
 /// A row with no reason renders no trailing lines and no blank line: the
 /// reason lines appear only where a row has one.
 #[test]

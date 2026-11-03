@@ -88,6 +88,10 @@ enum Plant {
     PasteMode,
     /// `/health` answers a body over the 1 MiB read cap.
     BigHealthBody,
+    /// `off_peak`'s `active_when.key` is the literal text `a\u{001b}b`.
+    LiteralEscapeInActiveKey,
+    /// `off_peak`'s `active_when.key` holds a real ESC.
+    EscapeInActiveKey,
     /// A contract 1.1 proxy: the credit figure declares its `model`.
     ContractOneOne,
     /// A contract 1.2 proxy, a minor past every one clauth knows.
@@ -230,6 +234,16 @@ fn info() -> Value {
              "type": "bool", "default": false, "restart": true},
         ],
     })
+}
+
+/// The key a plant names in `off_peak`'s `active_when`: the literal escape
+/// text, or the control character it spells.
+fn active_key(plant: Plant) -> &'static str {
+    if plant == Plant::LiteralEscapeInActiveKey {
+        "a\\u{001b}b"
+    } else {
+        "a\u{1b}b"
+    }
 }
 
 fn usage_of(account: &str, plant: Plant) -> Value {
@@ -460,6 +474,15 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
                 info["figures"][1]["model"] = model;
             }
             let settings = info["settings"].as_array_mut().unwrap();
+            if matches!(
+                s.plant,
+                Plant::LiteralEscapeInActiveKey | Plant::EscapeInActiveKey
+            ) {
+                let key = json!(active_key(s.plant));
+                if let Some(off_peak) = settings.iter_mut().find(|s| s["key"] == "off_peak") {
+                    off_peak["active_when"]["key"] = key;
+                }
+            }
             match s.plant {
                 Plant::NoDefaultNull => settings.push(json!({
                     "key": "k", "scope": "proxy", "label": "k", "hint": "k", "type": "bool"
@@ -1850,10 +1873,18 @@ fn a_proxy_supplied_control_character_is_escaped_in_the_report() {
 #[test]
 fn escape_writes_every_control_and_bidi_character_as_its_code() {
     assert_eq!(
-        escape("a\u{1b}b\u{202e}c\u{85}d\u{2066}e"),
+        "a\u{1b}b\u{202e}c\u{85}d\u{2066}e"
+            .chars()
+            .map(escape_char)
+            .collect::<String>(),
         "a\\u{001b}b\\u{202e}c\\u{0085}d\\u{2066}e"
     );
-    assert_eq!(escape("plain text é"), "plain text é");
+    assert_eq!(escape_char('é'), "é");
+    assert_eq!(
+        "plain text é".chars().map(escape_char).collect::<String>(),
+        "plain text é",
+        "a space and every ASCII letter pass through unescaped"
+    );
 }
 
 #[test]
@@ -1861,6 +1892,111 @@ fn numbers_compare_by_value_and_nothing_else_does() {
     assert!(same(&json!(4.0), &json!(4)));
     assert!(!same(&json!(4.5), &json!(4)));
     assert!(!same(&json!("4"), &json!(4)));
+}
+
+/// A cut that would land inside an escape backs off to the whole piece: the 76
+/// a's leave the `\u{001b}` piece 8 cells it cannot fit in the 78 content
+/// cells, so the piece is left out whole and the dots close the line — never a
+/// half-spelling the value never had.
+#[test]
+fn printable_never_splits_an_escape_at_its_cut() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: agent(CONTROL_TIMEOUT),
+        inference: agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+    let text = format!("{}{}", "a".repeat(76), "\u{1b}bbbbbbbbbb");
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "a".repeat(76)),
+        "the escape is never cut in half"
+    );
+}
+
+/// The cap counts terminal cells, so `❤️` — a heart and its presentation
+/// selector, one grapheme the terminal draws two cells wide — spends both: 80
+/// of them overrun a `REPR_MAX` line, and the cut keeps 39 whole pairs.
+#[test]
+fn printable_measures_an_emoji_presentation_sequence_as_its_drawn_cells() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: agent(CONTROL_TIMEOUT),
+        inference: agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let text = "\u{2764}\u{fe0f}".repeat(80);
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "\u{2764}\u{fe0f}".repeat(39)),
+        "39 two-cell pairs take 78 cells and the dots close the 81-cell line"
+    );
+}
+
+/// A run of zero-width characters is bounded the way a run of drawn ones is:
+/// each still spends a character of the budget, so a pasted run can never
+/// carry unbounded bytes into a report line, while a short value stays whole.
+#[test]
+fn printable_bounds_a_run_of_zero_width_characters() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: agent(CONTROL_TIMEOUT),
+        inference: agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let text = format!("{}hi", "\u{200b}".repeat(1000));
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "\u{200b}".repeat(78)),
+        "78 zero-width characters take the content budget, then the dots"
+    );
+    assert_eq!(
+        checker.printable("a\u{200b}b", REPR_MAX),
+        "a\u{200b}b",
+        "a short run stays whole"
+    );
+}
+
+/// A cap bounds the characters an escape body carries as well as its cells:
+/// one grapheme of ~250 KB of combining marks passes any cell measure whole,
+/// so the char budget stops it and the dots close the line.
+#[test]
+fn printable_bounds_a_single_oversized_grapheme() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: agent(CONTROL_TIMEOUT),
+        inference: agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let marks = format!("a{}", "\u{301}".repeat(125_000));
+    assert_eq!(
+        checker.printable(&marks, REPR_MAX),
+        "...",
+        "one 250 KB cluster overruns the character budget whole"
+    );
 }
 
 #[test]
@@ -2283,6 +2419,28 @@ fn a_destructive_run_skips_a_setting_the_account_cannot_use_and_says_why() {
         report.skipped,
         vec![
             "setting off_peak: inactive under the account's current plan".to_string(),
+            "setting timezone: no other valid value to set".to_string(),
+        ]
+    );
+}
+
+/// A key that is not an id form is quoted, so the escape text a proxy writes
+/// out reads apart from the escape of the control character it spells.
+#[test]
+fn a_skip_line_quotes_an_active_key_that_is_not_an_id() {
+    let literal = destructive_report(Plant::LiteralEscapeInActiveKey);
+    assert_eq!(
+        literal.skipped,
+        vec![
+            "setting off_peak: inactive under the account's current \"a\\\\u{001b}b\"".to_string(),
+            "setting timezone: no other valid value to set".to_string(),
+        ]
+    );
+    let real = destructive_report(Plant::EscapeInActiveKey);
+    assert_eq!(
+        real.skipped,
+        vec![
+            "setting off_peak: inactive under the account's current \"a\\u001bb\"".to_string(),
             "setting timezone: no other valid value to set".to_string(),
         ]
     );

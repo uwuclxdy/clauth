@@ -71,9 +71,9 @@ const TAIL_MAX: u64 = 1024 * 1024;
 /// empty page takes that one record whatever its size, so no record is ever
 /// truncated or unreachable.
 pub(crate) const PAGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
-/// Preview length cap, in characters (not bytes — truncation lands on a char
-/// boundary so non-ASCII never panics).
-const PREVIEW_MAX_CHARS: usize = 200;
+/// Preview length cap, in terminal cells and characters (not bytes — the cut lands between
+/// graphemes, so a two-cell glyph is never split).
+const PREVIEW_MAX_CELLS: usize = 200;
 /// Recursion cap for the `*.jsonl` walk. Subagent/workflow transcripts nest a
 /// few levels under `projects/<slug>/<session>/`, so a shallow walk would miss
 /// them; the cap bounds the descent and (with symlink dirs treated as files)
@@ -308,16 +308,31 @@ fn user_text(line: &TranscriptLine) -> Option<String> {
     preview_of(&raw)
 }
 
-/// Redact then truncate to a bounded, char-boundary-safe preview. Redaction runs
-/// on the full text first so a secret can never survive by straddling the
-/// truncation point.
+/// Redact then truncate to a bounded preview measured in terminal cells and
+/// characters.
+/// Redaction runs on the full text first so a secret can never survive by
+/// straddling the truncation point. Each character `terminal_safe`'s predicate
+/// set drops — a control character or a display-reordering one — becomes one
+/// space before the cut, so a line boundary mid-text stays visible; the
+/// trailing `trim` drops such a space at either end, and neither an escape
+/// sequence nor a bidi override reaches the terminal.
 fn preview_of(raw: &str) -> Option<String> {
     let redacted = redact_secrets(raw.trim());
-    let trimmed = redacted.trim();
+    let sanitized = redacted
+        .chars()
+        .map(|c| {
+            if crate::format::unsafe_on_terminal(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(crate::format::truncate(trimmed, PREVIEW_MAX_CHARS))
+    Some(crate::format::truncate(trimmed, PREVIEW_MAX_CELLS))
 }
 
 /// Head metadata recovered from a transcript's first lines. The session id is

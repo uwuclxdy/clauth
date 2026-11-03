@@ -305,6 +305,101 @@ fn build_index_redacts_preview_without_touching_source() {
     );
 }
 
+/// A preview renders every character the cell measure skips — control and
+/// display-reordering alike — as one space, truncated or not: an escape byte
+/// never reaches the terminal and a bidi override never reorders its line.
+#[test]
+fn a_preview_maps_control_and_reordering_characters_to_spaces() {
+    let sb = HomeSandbox::new();
+    let esc = sb.home().join(".claude/projects/-w-esc/esc.jsonl");
+    write_jsonl(
+        &esc,
+        &[user_line(
+            "esc",
+            "/w/esc",
+            "before \u{1b}[31mred\u{1b}[0m after",
+        )],
+    );
+    let groups = build_index();
+    let info = find(&groups, "esc").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview, "before  [31mred [0m after",
+        "short preview: {preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{1b}'),
+        "no escape byte survives: {preview:?}"
+    );
+
+    let bidi = sb.home().join(".claude/projects/-w-bidi/bidi.jsonl");
+    write_jsonl(&bidi, &[user_line("bidi", "/w/bidi", "ab\u{202E}cdef ghi")]);
+    let groups = build_index();
+    let info = find(&groups, "bidi").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview, "ab cdef ghi",
+        "no reordering character survives: {preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{202E}'),
+        "no bidi override survives: {preview:?}"
+    );
+}
+
+/// A pasted run of zero-width characters cannot carry unbounded bytes into
+/// the row, the JSON or the daemon's API: each one spends a character of the
+/// preview's cap, so a 70000-character run — 210000 bytes, under the head
+/// read's 256 KiB — stops at the budget.
+#[test]
+fn a_preview_of_zero_width_characters_stays_bounded() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-hidden/hidden.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "hidden",
+            "/w/hidden",
+            &format!("{}hi", "\u{200b}".repeat(70_000)),
+        )],
+    );
+    let groups = build_index();
+    let info = find(&groups, "hidden").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview,
+        format!("{}...", "\u{200b}".repeat(197)),
+        "197 zero-width characters take the content budget, then the dots"
+    );
+}
+
+/// A preview cut at the cap keeps the line boundary: each control character
+/// the cell measure skips renders as one space, so a cut never fuses two lines.
+#[test]
+fn a_preview_over_the_cap_keeps_line_boundaries_as_spaces() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-fuse/fuse.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "fuse",
+            "/w/fuse",
+            &format!("{}\n{}", "a".repeat(40), "b".repeat(200)),
+        )],
+    );
+
+    let groups = build_index();
+    let info = find(&groups, "fuse").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    // 40 a's, the newline rendered as a space at cell 41, then b's to the
+    // 197-cell content budget, then the three ASCII dots.
+    assert_eq!(
+        preview,
+        format!("{} {}...", "a".repeat(40), "b".repeat(156)),
+        "the cut keeps the line boundary as a space, not fused lines: {preview:?}"
+    );
+}
+
 #[test]
 fn session_id_comes_from_file_stem_not_first_line() {
     let sb = HomeSandbox::new();
