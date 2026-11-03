@@ -111,30 +111,67 @@ fn a_subcommand_name_shadows_a_same_named_profile() {
 
 // ── clauth switch: one verb, two forms split by arity ───────────────────────
 
+/// `--list` takes no name and `--json` only rides `--list`; without `--list` a
+/// name is required. Each refusal is a clap usage error (exit 2).
+#[test]
+fn switch_list_parses_alone_and_refuses_the_other_forms() {
+    let Command::Switch {
+        name,
+        profile,
+        list,
+        json,
+    } = command(&["switch", "--list", "--json"])
+    else {
+        panic!("`switch --list --json` must parse as the listing");
+    };
+    assert_eq!((name, profile, list, json), (None, None, true, true));
+
+    let Command::Switch {
+        name,
+        profile,
+        list,
+        json,
+    } = command(&["switch", "--list"])
+    else {
+        panic!("`switch --list` must parse as the table listing");
+    };
+    assert_eq!((name, profile, list, json), (None, None, true, false));
+
+    for argv in [
+        &["switch"][..],
+        &["switch", "--json"][..],
+        &["switch", "acme", "--json"][..],
+        &["switch", "--list", "work"][..],
+        &["switch", "--list", "4242-0", "spare"][..],
+    ] {
+        assert_eq!(parse_exit_code(argv), 2, "{argv:?} is a usage error");
+    }
+}
+
 /// One positional is the global form (the bare-word act under its own verb),
 /// two positionals the session form — arity alone decides, so a sid-shaped
 /// first value is never guessed at.
 #[test]
 fn switch_splits_the_forms_on_arity_alone() {
-    let Command::Switch { name, profile } = command(&["switch", "acme"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "acme"]) else {
         panic!("one positional must parse as the global form");
     };
-    assert_eq!(name, "acme");
+    assert_eq!(name.as_deref(), Some("acme"));
     assert_eq!(profile, None, "one positional is the global form");
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0"]) else {
         panic!("a sid-shaped single name still parses as the global form");
     };
-    assert_eq!(name, "4242-0");
+    assert_eq!(name.as_deref(), Some("4242-0"));
     assert_eq!(
         profile, None,
         "arity alone decides, never the first value's shape"
     );
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0", "spare"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0", "spare"]) else {
         panic!("two positionals must parse as the session form");
     };
-    assert_eq!(name, "4242-0");
+    assert_eq!(name.as_deref(), Some("4242-0"));
     assert_eq!(profile.as_deref(), Some("spare"));
 
     let err = parse(&["switch", "a", "b", "c"]).expect_err("three positionals is a usage error");

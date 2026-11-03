@@ -269,14 +269,20 @@ pub(crate) enum Command {
     /// next request, never before it. For a session started with
     /// --with-fallback, the chain's decider can supersede a manual intent on
     /// its next tick. The sid is the `<pid>-<seq>` of a live
-    /// `clauth start` session or delegate, as `clauth sessions --live` lists
-    /// it.
+    /// `clauth start` session or delegate, as `clauth switch --list` lists it.
     Switch {
         /// Profile to switch the global account to, or a live session id.
-        name: String,
+        #[arg(required_unless_present = "list")]
+        name: Option<String>,
         /// Profile to point the live session at. Its presence is what makes
         /// the two-name form the session form.
         profile: Option<String>,
+        /// List the live sessions `clauth switch <sid> <profile>` can move
+        #[arg(long, conflicts_with_all = ["name", "profile"])]
+        list: bool,
+        /// Print the list as a JSON array instead of the table
+        #[arg(long, requires = "list", conflicts_with_all = ["name", "profile"])]
+        json: bool,
     },
 
     /// Resume a session under a chosen profile
@@ -455,16 +461,17 @@ pub(crate) enum Command {
     },
 
     /// Print one profile name per line, for the shell completion scripts;
-    /// `--live-sessions` prints the live-session registry's id stems instead,
-    /// for `clauth switch`'s first position; `--resumable` prints `latest`
-    /// plus the global store's top-level session ids, for `resume` and `info`.
+    /// `--live-sessions` prints the ids of the running sessions `switch`
+    /// accepts instead, for `clauth switch`'s first position; `--resumable`
+    /// prints `latest` plus the global store's top-level session ids, for
+    /// `resume` and `info`.
     #[command(name = "__complete", hide = true)]
     Complete {
         /// The codex roster instead of the claude one.
         #[arg(long, conflicts_with_all = ["live_sessions", "resumable"])]
         codex: bool,
-        /// Print `~/.clauth/live_sessions/`'s file stems instead of profile
-        /// names.
+        /// Print the ids of the running sessions `switch` accepts instead of
+        /// profile names.
         #[arg(long = "live-sessions", hide = true, conflicts_with = "resumable")]
         live_sessions: bool,
         /// Print `latest` plus the global store's top-level session ids

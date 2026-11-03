@@ -317,10 +317,22 @@ fn dispatch(cli: Cli) -> Result<()> {
         // One positional is the bare-word act under its own verb: the exact
         // function `Command::External`'s single-word arm calls, so the exits
         // and copy are identical.
-        Command::Switch { name, profile } => match profile {
-            None => cmd_switch(&name),
-            Some(profile) => sessions_cli::run_switch(&name, &profile),
-        },
+        Command::Switch {
+            name,
+            profile,
+            list,
+            json,
+        } => {
+            if list {
+                sessions_cli::run_switch_list(json)
+            } else {
+                match (name, profile) {
+                    (Some(name), None) => cmd_switch(&name),
+                    (Some(name), Some(profile)) => sessions_cli::run_switch(&name, &profile),
+                    (None, _) => unreachable!("clap requires a name when --list is absent"),
+                }
+            }
+        }
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }
@@ -449,7 +461,7 @@ fn cmd_complete(codex: bool, live_sessions: bool, resumable: bool) -> Result<()>
     if codex {
         completions::print_codex_profile_names();
     } else if live_sessions {
-        completions::print_session_stems();
+        completions::print_switchable_session_ids();
     } else if resumable {
         completions::print_resume_targets();
     } else {

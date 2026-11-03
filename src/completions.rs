@@ -56,6 +56,9 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         sids=$(clauth __complete --live-sessions 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
         COMPREPLY+=( $(compgen -W "${codex}" -- "${cur}") )
+        COMPREPLY+=( $(compgen -W "--list" -- "${cur}") )
+    elif [ "$prev" = "--list" ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -247,6 +250,9 @@ _clauth() {
         _describe 'profile' profiles
         _describe 'codex' codex
         _describe 'session' sids
+        _values 'flag' '--list[the live sessions switch can move]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch && "${words[3]}" == --list ]]; then
+        _values 'flag' '--json[print the list as a JSON array]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles
         profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
@@ -397,7 +403,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Em
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_codex)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3; and not contains -- --list (commandline -opc)" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a --list -d "List the live sessions `clauth switch <sid> <profile>` can move"
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and contains -- --list (commandline -opc); and not contains -- --json (commandline -opc)" -a --json -d "Print the list as a JSON array instead of the table"
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --live -d "Only the sessions running now; opens no transcript"
@@ -549,37 +557,27 @@ pub(crate) fn print_profile_names() {
     }
 }
 
-/// Live-session id stems for `clauth switch`'s first completion position: the
-/// filenames under `~/.clauth/live_sessions/` minus their `.json`, never a
-/// transcript read. The dir derives from the same [`crate::profile::clauth_dir`]
-/// base the registry writer keys its rows on, so the listing and the writer
-/// cannot drift onto different paths. Sorted so the order a shell shows is
-/// stable; a missing or unreadable dir answers empty, never an error, like
-/// [`print_profile_names`].
-fn live_session_stems() -> Vec<String> {
-    let Ok(dir) = crate::profile::clauth_dir().map(|home| home.join("live_sessions")) else {
+/// Session ids for `clauth switch`'s first completion position: the running
+/// sessions `switch` accepts, through the same gate `clauth switch --list`
+/// filters on ([`crate::sessions_cli::switch_list_rows`]), so tab never offers
+/// a dead, codex or background id `switch` would refuse. Sorted so the order a
+/// shell shows is stable; an unlistable registry answers empty, never an
+/// error, like [`print_profile_names`].
+fn switchable_session_ids() -> Vec<String> {
+    let Some(rows) = crate::live_sessions::live_rows() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut stems: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
-                .map(str::to_string)
-        })
+    let mut ids: Vec<String> = crate::sessions_cli::switch_list_rows(rows)
+        .into_iter()
+        .map(|row| row.session_id)
         .collect();
-    stems.sort();
-    stems
+    ids.sort();
+    ids
 }
 
-pub(crate) fn print_session_stems() {
-    for stem in live_session_stems() {
-        outln!("{stem}");
+pub(crate) fn print_switchable_session_ids() {
+    for sid in switchable_session_ids() {
+        outln!("{sid}");
     }
 }
 

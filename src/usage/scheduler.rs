@@ -5362,11 +5362,6 @@ fn row_member_at(row: &crate::live_sessions::LiveSession, ts: u64) -> Option<Pro
     (ts > swap_grace_end(row) && reads_member_store(row, &member)).then_some(member)
 }
 
-/// How far up a claimant's parents [`CreditAttribution`] looks for a row: a
-/// `clauth start` child or a delegate's child sits one level below its row's
-/// process, and a shell or a nested `claude` between them adds a level each.
-const CREDIT_ANCESTOR_DEPTH: usize = 4;
-
 /// The member a drained credit event on a conversation landed on: the account
 /// that answered a spend-cap 429, or served a successful turn, at `ts`. Read
 /// off the conversation's one live claimant, so two live processes on it leave
@@ -5542,20 +5537,10 @@ pub(crate) fn note_isolated_credit_refusal(iso_root: &std::path::Path) {
 /// Whether one of the claimant `pid`'s first ancestors is Claude Code's
 /// background service: the process a `claude --bg` job runs under.
 fn descends_from_claude_service(pid: u32) -> bool {
-    let mut pid = pid;
-    for _ in 0..CREDIT_ANCESTOR_DEPTH {
-        let Some(parent) = crate::session_record::parent_pid(pid) else {
-            return false;
-        };
-        if parent <= 1 {
-            return false;
-        }
-        if crate::runtime::process_is_claude_service(parent) {
-            return true;
-        }
-        pid = parent;
-    }
-    false
+    crate::session_record::first_ancestor(pid, |parent| {
+        crate::runtime::process_is_claude_service(parent).then_some(())
+    })
+    .is_some()
 }
 
 /// The live rows holding one pid: none, one, or more than one, as two
@@ -5657,22 +5642,11 @@ impl<'a> CreditAttribution<'a> {
     /// The rows holding the nearest of the claimant's first ancestors that any
     /// row holds.
     fn ancestor_row(&mut self, pid: u32) -> Holding {
-        let mut pid = pid;
-        for _ in 0..CREDIT_ANCESTOR_DEPTH {
-            let Some(parent) = crate::session_record::parent_pid(pid) else {
-                return Holding::None;
-            };
-            pid = parent;
-            // The init process and the kernel adopt orphans: no row is theirs.
-            if pid <= 1 {
-                return Holding::None;
-            }
-            match self.row_holding(pid) {
-                Holding::None => {}
-                held => return held,
-            }
-        }
-        Holding::None
+        crate::session_record::first_ancestor(pid, |ancestor| match self.row_holding(ancestor) {
+            Holding::None => None,
+            held => Some(held),
+        })
+        .unwrap_or(Holding::None)
     }
 
     fn session_tree(&mut self, conv: &str) -> crate::claude_jobs::SessionTree {

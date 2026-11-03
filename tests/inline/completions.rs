@@ -132,7 +132,7 @@ fn no_shell_completes_a_profile_after_start_auto() {
     );
 }
 
-/// `clauth switch` completes profile names ∪ live-sid stems at its first
+/// `clauth switch` completes profile names ∪ switchable sids at its first
 /// position and profile names at the second (after a sid), so each shell must
 /// offer both shapes in the right slot. The grammar walk above collects
 /// subcommand names and long flags only, so it is blind to this positional
@@ -145,7 +145,7 @@ fn no_shell_completes_a_profile_after_start_auto() {
 /// profile half.
 #[test]
 fn every_shell_completes_switchs_both_positions() {
-    // Position 1 (word 2): the union of profiles and live-sid stems, the sids
+    // Position 1 (word 2): the union of profiles and switchable sids, the sids
     // via the `__complete --live-sessions` shellout.
     let bash_pos1 = guarded_arms(&BASH, |guard| {
         guard.contains(r#"[ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]"#)
@@ -195,7 +195,7 @@ fn every_shell_completes_switchs_both_positions() {
     // that ties them together is the whole line.
     let profiles_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile"#;
     let sids_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session"#;
-    let profiles_pos2 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile"#;
+    let profiles_pos2 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3; and not contains -- --list (commandline -opc)" -a "(__clauth_profiles)" -d Profile"#;
     assert!(
         FISH.contains(profiles_pos1) && FISH.contains(sids_pos1),
         "fish must offer profiles ∪ live sids at switch's first position \
@@ -219,23 +219,50 @@ fn every_shell_completes_switchs_both_positions() {
     );
 }
 
-/// `__complete --live-sessions` is what offers switch's first position the
-/// live sids: the `.json` stems of the live-session registry dir, sorted, and
-/// nothing else — a foreign file is skipped, and no transcript is ever read.
-/// Rows are filed through the production [`crate::live_sessions::register`]
-/// writer, so the fixture and the listing cannot drift onto different paths.
+/// After `clauth switch --list` fish offers neither a profile (the CLI refuses
+/// `switch --list <profile>`) nor a second `--json`.
 #[test]
-fn session_stem_completion_lists_registry_stems_only() {
+fn fish_switch_list_offers_no_profile_and_no_second_json() {
+    let profiles_after_list = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3; and not contains -- --list (commandline -opc)" -a "(__clauth_profiles)" -d Profile"#;
+    let json_once = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and contains -- --list (commandline -opc); and not contains -- --json (commandline -opc)" -a --json -d"#;
+    assert!(
+        FISH.contains(profiles_after_list),
+        "fish must stop offering profiles once --list is on the line",
+    );
+    assert!(
+        FISH.contains(json_once),
+        "fish must stop offering --json once it is on the line",
+    );
+}
+
+/// `__complete --live-sessions` is what offers switch's first position the
+/// sids `switch` takes: the running rows that pass `switch`'s own gate, sorted
+/// — a dead row (no held marker), a codex row, a background row and a foreign
+/// file are never offered, and no transcript is ever read. Rows are filed
+/// through the production [`crate::live_sessions::register`] writer, so the
+/// fixture and the listing cannot drift onto different paths.
+#[test]
+fn session_id_completion_offers_only_the_sids_switch_takes() {
     let sb = HomeSandbox::new();
-    for sid in ["7777-1", "4242-0"] {
+    let mut held = Vec::new();
+    // (sid, harness, background, running)
+    for (sid, harness, background, running) in [
+        ("7777-1", crate::harness::Harness::Claude, false, true),
+        ("4242-0", crate::harness::Harness::Claude, false, true),
+        ("5555-0", crate::harness::Harness::Claude, false, false),
+        ("6666-1", crate::harness::Harness::Codex, false, true),
+        ("8888-0", crate::harness::Harness::Claude, true, true),
+    ] {
         let row = crate::live_sessions::LiveSession {
             session_id: sid.to_string(),
             start_profile: "work".to_string(),
-            harness: crate::harness::Harness::Claude,
+            harness,
             pid: 4242,
             claude_pid: None,
             launch_families: None,
-            started_at: 0,
+            // Newest first is what the listing yields, so only the completion's
+            // own sort puts 4242-0 ahead of 7777-1.
+            started_at: if sid == "7777-1" { 2_000 } else { 1_000 },
             cwd: None,
             isolated: false,
             follows_chain: false,
@@ -248,25 +275,35 @@ fn session_stem_completion_lists_registry_stems_only() {
             launch_store: None,
             boot_transport: None,
             is_delegate: false,
-            background: false,
+            background,
             background_hold: false,
             visited_members: vec![],
         };
         crate::live_sessions::register(&row).expect("register row");
+        if running {
+            held.push(
+                crate::runtime::hold_session_row_marker(
+                    &crate::profile::ProfileName::from("work"),
+                    false,
+                    sid,
+                )
+                .expect("hold the session's marker"),
+            );
+        }
     }
     // A foreign file in the registry dir is skipped.
     let dir = sb.home().join(".clauth").join("live_sessions");
     std::fs::write(dir.join("notes.txt"), b"{}").expect("seed a foreign file");
 
     assert_eq!(
-        live_session_stems(),
+        switchable_session_ids(),
         vec!["4242-0".to_string(), "7777-1".to_string()],
-        "the .json stems, sorted, and nothing else"
+        "only the running, claude, non-background sids, sorted"
     );
 
     // A registry dir that does not exist yet answers empty, never an error.
     std::fs::remove_dir_all(&dir).expect("remove the registry dir");
-    assert!(live_session_stems().is_empty());
+    assert!(switchable_session_ids().is_empty());
 }
 
 /// `__complete --resumable` feeds `clauth resume` / `clauth info`: the word
@@ -755,6 +792,70 @@ _describe() { print -r -- "describe $1: ${(P)2}" }
             && !offered.contains("--tokens[")
             && !offered.contains("--live["),
         "nothing is owed once every flag is typed: {offered:?}"
+    );
+}
+
+/// After `switch --list` the only word owed is `--json`: bash sourced for real
+/// and zsh driven with stubbed `_values`/`_describe`, `clauth` printing one
+/// profile name so the generic `switch <sid> <profile>` arm, which sits just
+/// beside these, offering it shows. The `--list` arms must be tried first.
+#[cfg(unix)]
+#[test]
+fn bash_and_zsh_offer_only_json_after_switch_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let driver = format!(
+        r#"clauth() {{ case "$*" in "__complete") printf '%s\n' STUB_PROFILE ;; esac; }}
+source "{script}"
+COMP_WORDS=(clauth switch --list "")
+COMP_CWORD=3
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+        script = script.display(),
+    );
+    let out = std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-c", &driver])
+        .output()
+        .expect("run bash");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>(),
+        ["--json"],
+        "bash offers --json, never a profile, after `switch --list`"
+    );
+
+    if !shell_runs("zsh") {
+        return;
+    }
+    let driver = format!(
+        r#"clauth() {{ case "$*" in "__complete") print STUB_PROFILE ;; esac }}
+_values() {{ print -r -- "values: $*" }}
+_describe() {{ print -r -- "describe $1: ${{(P)2}}" }}
+source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1
+{}
+CLAUTH_ZSH_EOF
+words=(clauth switch --list ""); CURRENT=4; _clauth"#,
+        ZSH.as_str(),
+    );
+    let out = std::process::Command::new("zsh")
+        .args(["-f", "-c", &driver])
+        .output()
+        .expect("run zsh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["values: flag --json[print the list as a JSON array]"],
+        "zsh offers --json, never a profile, after `switch --list`"
     );
 }
 

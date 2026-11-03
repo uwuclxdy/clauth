@@ -275,6 +275,14 @@ impl ErrCapture {
         Self::default()
     }
 
+    /// A stderr capture writing into `out`'s own buffer, so one snapshot holds
+    /// both streams in the order the run wrote them. Separate buffers cannot
+    /// say whether a stderr line came before or after a stdout row.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn interleaved_with(out: &OutCapture) -> Self {
+        Self(out.0.clone())
+    }
+
     /// Take every stderr byte the CALLING thread writes until the returned
     /// guard drops. Panics when one is already installed, like
     /// [`OutCapture::capture_here`].
