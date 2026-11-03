@@ -314,6 +314,12 @@ pub(crate) mod rank {
         /// acquisition is one bookkeeping step, and the warning line it decides
         /// on is written after the guard drops.
         TerminalHolders = 1902;
+        /// The per-account `limit-reset` spend flock
+        /// (`usage::limit_reset_pending::LimitResetLock`,
+        /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend
+        /// holds it across its reads, writes, prompts and HTTP round trip with
+        /// no ranked lock acquired underneath, so nothing ever nests inside it.
+        LimitResetSpend = 1950;
     }
 }
 
@@ -324,8 +330,9 @@ thread_local! {
 }
 
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
-/// the two file-lock guards ([`crate::lock`]'s state flock and
-/// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
+/// the file-lock guards ([`crate::lock`]'s state flock,
+/// [`crate::runtime::RotationGuard`], the limit-reset spend lock and the other
+/// flock guards) — not [`Mutex`]es but still in the order.
 #[must_use]
 pub(crate) struct RankGuard {
     #[cfg(debug_assertions)]

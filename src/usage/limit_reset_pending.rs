@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +160,60 @@ pub(crate) fn clear(path: &Path) -> anyhow::Result<()> {
             "could not remove the pending reset record {}: {e}",
             path.display()
         ),
+    }
+}
+
+// ── the spend lock ──────────────────────────────────────────────────────────
+
+/// The per-account advisory flock serializing `limit-reset` spends: a run
+/// holds it from before its first request through the settle, so a second run
+/// on the same account waits and then re-decides on what the first left behind
+/// (its pending record, or nothing). One lock per name, shared by the claude
+/// and codex arms; `--list` never takes it. The lock file is never deleted
+/// (the rotation-locks precedent).
+#[must_use]
+pub(crate) struct LimitResetLock {
+    // Drops before `_rank` (declaration order): the flock releases, then the
+    // LIMIT_RESET_SPEND rank pops — never the reverse.
+    _file: std::fs::File,
+    _rank: crate::lockorder::RankGuard,
+}
+
+impl LimitResetLock {
+    /// The lock file: `~/.clauth/limit-reset-locks/<name>.lock`.
+    fn path(name: &ProfileName) -> anyhow::Result<PathBuf> {
+        Ok(crate::profile::clauth_dir()?
+            .join("limit-reset-locks")
+            .join(format!("{name}.lock")))
+    }
+
+    /// Acquire the per-account spend lock, blocking until any in-flight spend
+    /// on the same account releases it. Creates the `limit-reset-locks`
+    /// directory if missing. A held lock prints one stderr line, then waits;
+    /// any other lock failure refuses the spend naming the lock file.
+    pub(crate) fn acquire(name: &ProfileName) -> anyhow::Result<Self> {
+        let path = Self::path(name)?;
+        if let Some(parent) = path.parent() {
+            crate::profile::mkdir_700(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file = crate::profile::open_state_file(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                crate::out::errln!(
+                    "clauth: another limit-reset on '{name}' is running; waiting for it."
+                );
+                file.lock()
+                    .with_context(|| format!("failed to lock {}", path.display()))?;
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::LimitResetSpend>();
+        Ok(Self { _file: file, _rank })
     }
 }
 

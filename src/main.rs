@@ -3153,10 +3153,18 @@ fn limit_reset_codex(
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
+    let profile = ProfileName::from(canonical);
+    // The spend path serializes on the account's limit-reset lock before the
+    // first request, so a second run waits and re-decides on what this one
+    // leaves behind; `--list` spends nothing and never takes it.
+    let _spend_lock = if list {
+        None
+    } else {
+        Some(pending::LimitResetLock::acquire(&profile)?)
+    };
 
     let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
         .map_err(|e| anyhow::anyhow!(reset::list_failure(canonical, &e)))?;
-    let profile = ProfileName::from(canonical);
     let pending_path = pending::path::<pending::CodexPending>(&profile)?;
     if list {
         for line in reset::describe_reset_credits(canonical, &credits) {
@@ -3256,6 +3264,14 @@ fn limit_reset_claude(
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
+    // The spend path serializes on the account's limit-reset lock before the
+    // first request, so a second run waits and re-decides on what this one
+    // leaves behind; `--list` spends nothing and never takes it.
+    let _spend_lock = if list {
+        None
+    } else {
+        Some(pending::LimitResetLock::acquire(canonical)?)
+    };
 
     let status = reset::read_status_at(&reset::read_url(&urls.claude_origin), access_token)
         .map_err(|e| anyhow::anyhow!(reset::read_failure(canonical, &e)))?;

@@ -8028,6 +8028,135 @@ fn limit_reset_drops_a_future_stamped_claude_record() {
     );
 }
 
+/// Holds `name`'s limit-reset spend lock from a second handle, standing in
+/// for another `clauth limit-reset` run mid-spend on the same account.
+fn hold_limit_reset_lock(name: &str) -> std::fs::File {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("limit-reset-locks")
+        .join(format!("{name}.lock"));
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the limit-reset lock");
+    holder
+}
+
+/// How long a test holds the lock before letting the waiting run go: long
+/// enough that an unserialized run's first request lands inside it.
+const LIMIT_RESET_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Two spends on one claude account serialize: a run that finds another run
+/// holding the account's limit-reset lock sends nothing, the status read
+/// included, until that run lets go, then spends once.
+#[test]
+fn limit_reset_waits_for_another_claude_run_on_the_same_account() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (urls, handle) = claude_spend_stub(
+        4,
+        {
+            let released = Arc::clone(&released);
+            let early = Arc::clone(&early);
+            move |_| {
+                if !released.load(Ordering::SeqCst) {
+                    early.store(true, Ordering::SeqCst);
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let run = std::thread::spawn(move || {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+    });
+    std::thread::sleep(LIMIT_RESET_HOLD);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run read the account while another run held its lock"
+    );
+    outcome.expect("the waiting run spends once the lock is free");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+    );
+}
+
+/// The codex arm serializes the same way: no listing and no consume while
+/// another run holds the account's lock.
+#[test]
+fn limit_reset_waits_for_another_codex_run_on_the_same_account() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, {
+        let released = Arc::clone(&released);
+        let early = Arc::clone(&early);
+        move |path, _| {
+            if !released.load(Ordering::SeqCst) {
+                early.store(true, Ordering::SeqCst);
+            }
+            if path.ends_with("/consume") {
+                (200, CODEX_CONSUMED.to_string())
+            } else {
+                (200, CODEX_TWO_AVAILABLE.to_string())
+            }
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let holder = hold_limit_reset_lock("cx");
+    let run = std::thread::spawn(move || {
+        limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+    });
+    std::thread::sleep(LIMIT_RESET_HOLD);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run listed the account while another run held its lock"
+    );
+    outcome.expect("the waiting run consumes once the lock is free");
+    assert_eq!(request_lines(&seen), [CODEX_LIST, CODEX_CONSUME]);
+}
+
+/// `--list` spends nothing, so it never waits on a running spend.
+#[test]
+fn limit_reset_lists_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        2,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let _holder = hold_limit_reset_lock("cl2");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            limit_reset_with("cl2", true, false, false, &urls, no_prompt)
+                .map_err(|e| e.to_string()),
+        );
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("--list returned while the lock was held")
+        .expect("--list lists");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ]);
+}
+
 /// A claude record whose grant id is off the sendable pattern reads
 /// unreadable: it is removed and the fresh spend runs.
 #[test]
@@ -9707,4 +9836,197 @@ mod a_cli_login_lands_on_its_own_account {
             "the re-key keeps the claimed account's own endpoint"
         );
     }
+}
+
+/// While another run holds the account's limit-reset lock, a waiting run
+/// prints exactly one stderr line saying it is waiting, then spends once the
+/// lock is free.
+#[test]
+fn limit_reset_prints_one_waiting_line_while_the_lock_is_held() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (urls, handle) = claude_spend_stub(
+        3,
+        {
+            let released = Arc::clone(&released);
+            let early = Arc::clone(&early);
+            move |_| {
+                if !released.load(Ordering::SeqCst) {
+                    early.store(true, Ordering::SeqCst);
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run read the account while another run held its lock"
+    );
+    outcome.expect("the waiting run spends once the lock is free");
+    let stderr = String::from_utf8(err_cap.snapshot()).expect("utf-8 stderr");
+    assert_eq!(
+        stderr, "clauth: another limit-reset on 'cl2' is running; waiting for it.\n",
+        "the run printed exactly the one waiting line"
+    );
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+    );
+}
+
+/// Waits (bounded) until the run capturing into `err_cap` has printed its
+/// waiting line, i.e. it found the lock held and is blocked on it.
+fn await_waiting_line(err_cap: &crate::out::ErrCapture) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !String::from_utf8_lossy(&err_cap.snapshot()).contains("is running; waiting for it.") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never waited on the held lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A claude run that waited on another run's lock re-sends the record that
+/// run left behind, never a fresh grant: the record is read under the lock.
+#[test]
+fn limit_reset_resends_the_claude_record_another_run_left_while_it_waited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    drop(holder);
+    run.join().expect("join run").expect("the re-send settles");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, RESET_SPEND),
+        [
+            serde_json::json!({"program": "cedar_ember", "grant_id": "g-old", "request_id": "seeded-id"})
+        ]
+    );
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// The codex arm reads its record under the lock too: a waiter re-sends the
+/// credit and redeem id the other run left, never the next credit.
+#[test]
+fn limit_reset_resends_the_codex_record_another_run_left_while_it_waited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let holder = hold_limit_reset_lock("cx");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    drop(holder);
+    run.join().expect("join run").expect("the re-send settles");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, CODEX_CONSUME),
+        [serde_json::json!({"redeem_request_id": "seeded-key", "credit_id": "later"})]
+    );
+    assert!(!pending_path("cx", CODEX_PENDING).exists());
+}
+
+/// Runs `name`'s spend with no `--yes` on a non-TTY stdin while another run
+/// holds its lock, and returns the refusal, failing if it waited on the lock.
+fn refusal_while_locked(name: &'static str) -> String {
+    let _holder = hold_limit_reset_lock(name);
+    let (_listener, urls) = untouched_reset_urls();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            limit_reset_with(name, false, false, false, &urls, no_prompt)
+                .map_err(|e| e.to_string()),
+        );
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the refusal returned while the lock was held")
+        .expect_err("refused")
+}
+
+/// A claude refusal never waits on another run's spend: it lands before the
+/// lock.
+#[test]
+fn limit_reset_refuses_a_claude_run_without_yes_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    assert_eq!(
+        refusal_while_locked("cl2"),
+        "refusing to use a reset on 'cl2' without confirmation; pass --yes"
+    );
+}
+
+/// The codex arm's refusal lands before the lock too.
+#[test]
+fn limit_reset_refuses_a_codex_run_without_yes_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    assert_eq!(
+        refusal_while_locked("cx"),
+        "refusing to use a reset on 'cx' without confirmation; pass --yes"
+    );
 }
