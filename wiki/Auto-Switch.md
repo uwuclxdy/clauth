@@ -84,7 +84,7 @@ Which account is home can also depend on the day. A `preferred_days` list in a p
 With no `last resort` member, the chain-global `quota spent` setting decides:
 
 - `stay on active` (default) keeps you on the last account, so Claude Code shows its own limit message.
-- `switch off all` clears the live credentials and unsets the active account. It re-arms automatically onto the first member that recovers.
+- `switch off all` clears the live credentials, unsets the active account and ends its `[env]` cover as a switch away does ([`config.toml`](Configuration#configtoml)). When `base-env.json` or `settings.json` cannot be read or written, it still switches off and logs that your values were not put back; the next switch that lands puts them back. It re-arms onto the first member that recovers.
 
 ## Burn-aware switching
 

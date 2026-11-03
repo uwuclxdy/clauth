@@ -225,7 +225,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
-| `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
+| `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active; when one replaces a value your own `settings.json` held, clauth saves that value, and a switch to an account without the key puts it back unless you changed or deleted it meanwhile (never for a key clauth sets from an endpoint or model field; a value an older clauth replaced before an update was never saved, so that key is removed instead, and while an older clauth still runs and switches, a value you deleted can come back) |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent`, `advisor` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
@@ -290,6 +290,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   .claude-json-sync-written.json # the `.claude.json` copies clauth wrote: path, mtime, size, a SHA-256 of the bytes and the rank of the Claude Code write they came from; tells clauth's own unchanged copies apart from Claude Code's writes, no config content (0600)
   .settings-sync-written.json # the same record for `settings.json` (0600)
   backups/<file>.<utc stamp> # a byte copy of `~/.claude.json` or `~/.claude/settings.json`, saved after a sync pass refused to delete more than 3 of its shared top-level keys (or `cleanupPeriodDays` from `settings.json`); the file itself is left alone and each clauth process logs one line naming its copy (several running `clauth start` sessions can each save one), and the newest 10 per file are kept, each 0600 in a 0700 dir
+  base-env.json            # the values your own settings.json held under custom env keys a profile replaced (0600; a value clauth records writing only as a SHA-256 digest)
   .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
   jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
