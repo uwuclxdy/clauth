@@ -181,9 +181,9 @@ clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reope
 | none held | `no usage-limit resets available on 'work'` (`--list` prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
 | taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth limit-reset work --list` to see what is left`` | 1 |
 | token refused | `codex rejected the stored access token for 'work'. The daemon refreshes it for a parked account and codex does for the one in use. Try again after that. No reset was used` | 1 |
-| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; check `clauth limit-reset work --list` before retrying`` | 1 |
+| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; a re-run before the window's end re-sends the same request`` | 1 |
 
-Nothing is retried on its own, since a lost answer may still have spent the reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
+Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose answer never arrives leaves a record, and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
 
 ## Managed config
 
@@ -204,7 +204,6 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 | `'<name>' has a live codex session. Close it before re-authenticating` | the browser form's spelling of the same |
 | ``'<name>': codex chain is broken (<kind> since <time>), run `clauth login <name> --codex --browser` `` | the browser login |
 | `'<name>' is a codex profile; <verb> is claude-only` | `disable`, `enable`, `rolling-token` and `static-token` take Claude Code profiles alone |
-| `'<name>' is a claude profile; limit-reset is codex-only` | the reverse: `limit-reset` takes codex profiles alone |
 | ``'<name>' has no stored codex login to use a reset with; run `clauth login <name> --codex --browser` `` | the profile's `auth.json` is missing, unreadable, or holds no access token |
 | `clauth: could not repoint <path> (no symlink support?). It is now a SEPARATE copy of a single-use rotating chain` | a host without symlinks: run codex only through `clauth start <name>` from then on, or `codex login` again for your own use |
 
