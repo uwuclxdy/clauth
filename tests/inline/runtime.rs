@@ -2479,6 +2479,17 @@ fn build_runtime_dir_strips_active_env_from_another_profile() {
             br#"{"env":{"FOO":"active","KEEP":"mine"}}"#,
         )
         .expect("write settings");
+        // The active profile on disk, as production always has it: the strip
+        // tells its `FOO` from the operator's by the value it carries.
+        let mut active = make_profile("active");
+        active.env.insert("FOO".to_string(), "active".to_string());
+        crate::profile::save_profile(&active).expect("save the active profile");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..crate::profile::AppState::default()
+        })
+        .expect("save state");
         let runtime = tmp.path().join("runtime");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
         let target = make_profile("target");

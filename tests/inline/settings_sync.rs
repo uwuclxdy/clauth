@@ -194,6 +194,96 @@ fn per_profile_env_never_leaves_its_own_runtime() {
     );
 }
 
+/// A key the active account covers stays per-profile while its cover is live,
+/// even after a hand edit drops it from that account's `config.toml` before any
+/// apply: `~/.clauth/base-env.json` still records the cover, so the account's
+/// live value never reaches a sibling runtime.
+#[test]
+fn a_covered_key_dropped_from_its_config_by_hand_never_leaves_the_live_file() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p2 = runtime_path(home.home(), "p2");
+    write_config(home.home(), "p1", "[env]\nOTHER = \"x\"\n");
+    write_config(home.home(), "p2", "");
+    let record = home.home().join(".clauth").join("base-env.json");
+    fs::write(
+        &record,
+        r#"{"v":1,"keys":{"K":{"base":"user","wrote":"a913e7808d8b9993a294b7cec166ea558c8faaf8e32163ed36f83753330c4e0b"}}}"#,
+    )
+    .expect("write record");
+    write_json(
+        &base,
+        &json!({"theme": "dark", "env": {"K": "p1-value", "OTHER": "x"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    let env = read_json(&p2)["env"].clone();
+    assert!(
+        env.get("K").is_none(),
+        "p2 received the active account's covered value: {env}"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "control: the merge ran and carried a shared key"
+    );
+    assert_eq!(
+        read_json(&base)["env"]["K"],
+        json!("p1-value"),
+        "the live file keeps its cover"
+    );
+}
+
+/// A `~/.clauth/base-env.json` that does not parse pauses the merge like an
+/// unparseable `config.toml`: the keys it covers are unknown, so nothing is
+/// synced, and the one line it logs names the record, never what it holds.
+#[test]
+fn a_torn_base_env_record_pauses_the_merge_without_quoting_it() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p2 = runtime_path(home.home(), "p2");
+    write_config(home.home(), "p1", "");
+    write_config(home.home(), "p2", "");
+    fs::write(
+        home.home().join(".clauth").join("base-env.json"),
+        r#"{"v":1,"keys":{"K":{"base":"sk-torn-secret""#,
+    )
+    .expect("write torn record");
+    write_json(
+        &base,
+        &json!({"theme": "dark", "env": {"K": "p1-value"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let merged = sync_members().expect("sync");
+    drop(capture);
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+
+    assert!(!merged, "the tick reports the pause");
+    let synced = read_json(&p2);
+    assert!(
+        synced.get("theme").is_none() && synced["env"].get("K").is_none(),
+        "the merge paused: {synced}"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(logged.len(), 1, "one pause line: {logged:?}");
+    assert!(
+        logged[0].contains("settings.json sync paused") && logged[0].contains("base-env.json"),
+        "the line names the record: {logged:?}"
+    );
+    assert!(
+        !logged[0].contains("sk-torn-secret"),
+        "the line never quotes the record"
+    );
+}
+
 /// The protective direction: a target must KEEP the per-profile keys the winner
 /// does not have. Every other fixture here gives both sides the same keys, which
 /// leaves the two `retain`s in `jsonsync::merge_member` unreached — so this one

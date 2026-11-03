@@ -353,7 +353,9 @@ pub(crate) struct Profile {
     /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
     /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
     pub(crate) usage_probe_interval_ms: u64,
-    /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
+    /// Extra env vars merged into `settings.json`'s `env` block while active.
+    /// A switch away removes each one, or puts back the value the user's
+    /// `~/.claude/settings.json` held under that key before it.
     pub(crate) env: BTreeMap<String, String>,
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
@@ -1158,6 +1160,12 @@ pub(crate) struct AppState {
     /// offer list re-offers. The CLI never reads or writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) preset_binds_offered: Option<String>,
+    /// [`AppState::set_active`] ran on this copy, so [`save_app_state`]
+    /// moves `~/.clauth/base-env.json`'s recorded account with the marker it
+    /// saves: a marker move by this clauth never reads as one by an older
+    /// clauth that predates the record. Never serialized.
+    #[serde(skip)]
+    pub(crate) active_moved: bool,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1183,6 +1191,7 @@ impl AppState {
     /// lose a concurrent switch.
     pub(crate) fn set_active(&mut self, active: Option<ProfileName>, _held: &StateLockHeld) {
         self.active_profile.set(active, _held);
+        self.active_moved = true;
     }
 
     /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
@@ -1449,6 +1458,7 @@ impl Default for AppState {
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
             preset_binds_offered: None,
+            active_moved: false,
         }
     }
 }
@@ -3136,7 +3146,17 @@ pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
         ));
     }
     let state = state.app_state();
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
+        // The record first: a failed record write leaves the marker as it
+        // was, and only a crash between the two writes leaves them apart.
+        if state.active_moved {
+            let replaced = load_app_state()?.active_profile.as_ref().cloned();
+            crate::claude::note_active_marker(
+                state.active_profile.as_ref(),
+                replaced.as_ref(),
+                held,
+            )?;
+        }
         mkdir_700(&clauth_dir()?)?;
         let path = app_state_path()?;
         let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
@@ -5598,7 +5618,8 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push('\n');
 
     out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
-    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
+    out.push_str("# this profile is active. A switch to another profile removes each one,\n");
+    out.push_str("# or puts back the value ~/.claude/settings.json held before it.\n");
     if profile.env.is_empty() {
         out.push_str("# [env]\n");
         out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");

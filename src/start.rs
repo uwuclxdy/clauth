@@ -1140,7 +1140,8 @@ pub(crate) fn run(
     // `clauth start <other>` session doesn't inherit it. The live
     // `settings.json` is owned by whoever is active; starting that same profile
     // passes its own keys, which the merge re-inserts (no-op). With no active
-    // marker to read (`switch_off` clears it without touching the file) the
+    // marker to read (a `switch_off` by a clauth that predates
+    // `~/.clauth/base-env.json` cleared it without touching the file) the
     // helper answers every configured profile's keys, so a departed account's
     // entries are stripped too rather than landing in front of the started
     // account's endpoint. The outgoing account is read off disk too: a peer's

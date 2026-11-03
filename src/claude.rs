@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -10,8 +10,8 @@ use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
-    profile_dir, read_json_file, read_json_file_capped, update_profile_login,
+    AppConfig, AppState, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600,
+    claude_dir, profile_dir, read_json_file, read_json_file_capped, update_profile_login,
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
@@ -5393,9 +5393,19 @@ pub(crate) fn runtime_model_sources(
     profile: &Profile,
     stale_env_keys: &[String],
 ) -> RuntimeModelSources {
+    // One line per process: a demand walk builds this per chain member, every
+    // scheduler tick, and the cause (a torn record or settings file) holds
+    // until the user repairs it.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let empty = RuntimeModelSources::default();
-    let Ok(json) = build_claude_settings_json(base, profile, stale_env_keys) else {
-        return empty;
+    let json = match build_claude_settings_json(base, profile, stale_env_keys) {
+        Ok(json) => json,
+        Err(e) => {
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                logline!("clauth: {e:#}");
+            }
+            return empty;
+        }
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&json) else {
         return empty;
@@ -5405,16 +5415,64 @@ pub(crate) fn runtime_model_sources(
 
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
 /// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
+/// A key the profile starts covering keeps the user's own value in
+/// `~/.clauth/base-env.json`, and a key it stops covering gets it back.
 pub(crate) fn apply_profile_to_claude_settings(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<()> {
-    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
+    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys, &[]))
+}
+
+/// [`apply_profile_to_claude_settings`] after an `[env]` edit of the active
+/// profile: `before` holds each copy of its env from before the edit. Disk
+/// already holds the edited map, so only these copies still name the values
+/// the live file may carry for a key the edit dropped or changed.
+pub(crate) fn apply_env_edit_to_claude_settings(
+    profile: &Profile,
+    before: &[&BTreeMap<String, String>],
+) -> Result<()> {
+    let prev_env_keys: Vec<String> = before.iter().flat_map(|env| env.keys().cloned()).collect();
+    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, &prev_env_keys, before))
+}
+
+/// Carry the record's account from the marker a save replaces (`replaced`)
+/// to the one it lands (`active`); [`crate::profile::save_app_state`] calls
+/// it, under the same hold, for a state whose marker [`AppState::set_active`]
+/// moved, so a marker move by this clauth never reads as an older clauth's.
+/// Only while the record agrees with `replaced`: a record naming another
+/// account is the evidence that an older clauth moved the marker, which only
+/// a live apply may consume, by judging the live file and then recording the
+/// marker it saw (the one its own following save replaces). Never stamps a
+/// record that does not exist yet (the first live apply's migration does),
+/// and leaves a torn one alone for the next apply that needs it to refuse.
+pub(crate) fn note_active_marker(
+    active: Option<&ProfileName>,
+    replaced: Option<&ProfileName>,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    if let Ok(Some(mut saved)) = read_saved_base_env()
+        && saved.active.as_ref() == replaced
+        && saved.active.as_ref() != active
+    {
+        saved.active = active.cloned();
+        write_saved_base_env(&saved)?;
+    }
+    Ok(())
+}
+
+/// The active marker as `profiles.toml` holds it now.
+fn active_marker() -> Result<Option<ProfileName>> {
+    Ok(crate::profile::load_app_state()?
+        .active_profile
+        .as_ref()
+        .cloned())
 }
 
 fn apply_profile_to_claude_settings_inner(
     profile: &Profile,
     prev_env_keys: &[String],
+    before: &[&BTreeMap<String, String>],
 ) -> Result<()> {
     let path = claude_settings_path()?;
 
@@ -5424,14 +5482,714 @@ fn apply_profile_to_claude_settings_inner(
         || !profile.models.is_empty()
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
+        // No live file: nothing an earlier clauth wrote can sit in it, so only
+        // the stamp lands, naming the marker this apply saw.
+        if !saved_base_env_path()?.exists() {
+            let stamp = SavedBaseEnv {
+                active: active_marker()?,
+                ..SavedBaseEnv::default()
+            };
+            write_saved_base_env(&stamp)?;
+        }
         return Ok(());
     }
 
-    let content = build_claude_settings_json(Some(&path), profile, prev_env_keys)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let build = build_settings(Some(&path), profile, prev_env_keys, Some(before))?;
+    land_live_settings(&path, Some(build.content), &build.record)
+}
+
+/// Switch-off's half of a switch away, run after the credentials and the active
+/// marker are cleared: each custom key `prev_env_keys` (the
+/// departing activation's) or the record names goes back to the user's saved
+/// value, or leaves when the user had none, and a listed key a profile field
+/// sets leaves, exactly as a switch onto an account without them would. The
+/// keys the departing account's profile fields wrote (endpoint, models,
+/// `apiKeyHelper`) stay as it wrote them.
+///
+/// Errors when `settings.json` or the record cannot be read or written,
+/// leaving the live file as it was. The caller treats that as a failed
+/// put-back, never as a reason to keep the account active: the covers stay
+/// live and the next apply that lands settles them. The marker is already
+/// cleared, so the record's `active` lands as none, the marker the switch-off
+/// leaves.
+pub(crate) fn release_saved_base_env(
+    prev_env_keys: &[String],
+    _held: &StateLockHeld,
+) -> Result<()> {
+    let path = claude_settings_path()?;
+    let mut settings: serde_json::Value = if path.exists() {
+        read_json_file(&path)?
+    } else {
+        serde_json::json!({})
+    };
+    let mut env = match settings.get("env") {
+        Some(env) => env
+            .as_object()
+            .context("settings.json `env` is not an object")?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
+    let unchanged = env.clone();
+    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]))?;
+    let content = if env == unchanged {
+        None
+    } else {
+        settings
+            .as_object_mut()
+            .context("settings.json is not an object")?
+            .insert("env".into(), env.into());
+        Some(serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")?)
+    };
+    land_live_settings(&path, content, &record)
+}
+
+/// Write a live build and its record. The stamp and every new or changed
+/// entry land before the live write (the migration's pre-write keeps it
+/// open); retirements, the active marker the apply judged and the closed
+/// migration land after it. A crash between the two leaves an entry naming
+/// the incoming account's value over a live file that still holds the
+/// outgoing account's own, which the next apply reads as clauth's and so
+/// keeps the entry's `base`. An entry written after the live write would
+/// leave a live value its entry does not name, which reads as the user's and
+/// keeps the account's value as theirs. The marker written before it would
+/// end an older clauth's evidence over a live file this apply never wrote.
+fn land_live_settings(path: &Path, content: Option<String>, record: &RecordPlan) -> Result<()> {
+    let saves_first = match &record.found {
+        Found::Absent => true,
+        Found::Read(saved) => record.captured != *saved,
+        Found::Unread => false,
+    };
+    if saves_first {
+        write_saved_base_env(&record.captured)?;
     }
-    atomic_write(&path, content).context("failed to write settings.json")
+    if let Some(content) = content {
+        #[cfg(test)]
+        if FAIL_LIVE_SETTINGS_WRITE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow::anyhow!(
+                "failed to write settings.json: Permission denied (os error 13)"
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write(path, content).context("failed to write settings.json")?;
+    }
+    if !matches!(record.found, Found::Unread)
+        && record.landed != record.captured
+        && let Err(e) = write_landed_base_env(&record.landed)
+    {
+        // Best-effort: the live write already landed.
+        logline!("clauth: {e:#}");
+    }
+    Ok(())
+}
+
+/// What clauth knows about one custom env key a profile's `[env]` covers in
+/// `~/.claude/settings.json`: the user's own value from before the first cover
+/// (`base`, `None` when the key was absent) and the SHA-256 hex digest of the
+/// JSON value clauth last wrote over it (`wrote`), compared for equality
+/// only, so a covering account's value (which can be a secret) never lands
+/// here. A live value other than `wrote` is the user's (or Claude Code's),
+/// whatever the record says.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct BaseEnvEntry {
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    base: Option<serde_json::Value>,
+    wrote: String,
+    /// The digest clauth's value in the live file still has while a pre-write
+    /// has already moved `wrote` on (a takeover, or an edit of the covering
+    /// account's own value): the live write that lands the new value, or its
+    /// failure, must not turn the old value into the user's. Dropped by the
+    /// update after a landed live write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<String>,
+}
+
+impl BaseEnvEntry {
+    /// Whether `live` is a value clauth wrote under this entry.
+    fn wrote_live(&self, live: &serde_json::Value) -> bool {
+        let digest = wrote_digest(live);
+        digest == self.wrote || self.pending.as_ref() == Some(&digest)
+    }
+}
+
+fn wrote_digest(value: &serde_json::Value) -> String {
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// A present `base` field, a JSON `null` included, is the user's value; only a
+/// missing one reads as `None`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Every [`BaseEnvEntry`], keyed by env key, under a version stamp. Lives in
+/// `~/.clauth/base-env.json` (0o600, read and written under the state flock)
+/// and is never deleted once written: the stamp says every cover since was
+/// landed by a clauth that records it. `active` is the account the last live
+/// apply left active (absent: none): an active marker that differs from it
+/// proves a clauth that predates the record (a daemon or TUI left running
+/// across an update) switched since, and only then are live values judged
+/// against the accounts' own. The values can be secrets, so neither type has
+/// `Debug` and nothing but the settings builds below reads it.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedBaseEnv {
+    v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<ProfileName>,
+    /// The migration's first live apply pre-wrote this record (its entries
+    /// are the crash guard) and its live write has not landed yet: the next
+    /// apply runs the migration again instead of trusting the stamp.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    migrating: bool,
+    keys: BTreeMap<String, BaseEnvEntry>,
+}
+
+const SAVED_BASE_ENV_VERSION: u32 = 1;
+
+impl Default for SavedBaseEnv {
+    fn default() -> Self {
+        Self {
+            v: SAVED_BASE_ENV_VERSION,
+            active: None,
+            migrating: false,
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) fn saved_base_env_path() -> Result<PathBuf> {
+    Ok(crate::profile::clauth_dir()?.join("base-env.json"))
+}
+
+/// The env keys the record holds an entry for: each is covered in the live
+/// file until its entry retires, whatever the accounts' `config.toml` now
+/// says. Keys only; no saved value leaves this module. An absent record holds
+/// none; one that does not parse is an error, never an empty set.
+pub(crate) fn saved_base_env_keys() -> Result<BTreeSet<String>> {
+    Ok(read_saved_base_env()?
+        .map(|saved| saved.keys.into_keys().collect())
+        .unwrap_or_default())
+}
+
+/// The saved values, or `None` before the first stamp. A record that does
+/// not parse, or names another version, fails the caller instead of reading
+/// as empty: an empty read would delete the user's values it holds.
+fn read_saved_base_env() -> Result<Option<SavedBaseEnv>> {
+    let path = saved_base_env_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let context = || {
+        format!(
+            "{} holds the ~/.claude/settings.json env values your profiles' [env] keys cover; repair it (removing it gives those values up)",
+            path.display()
+        )
+    };
+    let saved: SavedBaseEnv = read_json_file(&path).with_context(context)?;
+    if saved.v != SAVED_BASE_ENV_VERSION {
+        return Err(crate::format::parse_error(path.display(), None)).with_context(context);
+    }
+    Ok(Some(saved))
+}
+
+fn write_saved_base_env(saved: &SavedBaseEnv) -> Result<()> {
+    let path = saved_base_env_path()?;
+    #[cfg(test)]
+    if FAIL_BASE_ENV_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write {}: Permission denied (os error 13)",
+            path.display()
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(saved).context("failed to serialize base env")?;
+    atomic_write_600(&path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Test seam: [`write_saved_base_env`] fails the way a read-only `~/.clauth`
+/// would while armed through [`FailBaseEnvSave`].
+#[cfg(test)]
+static FAIL_BASE_ENV_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`write_saved_base_env`] failure for the guard's
+/// lifetime, borrowing the home sandbox as
+/// [`FailAppStateSave`](crate::profile::FailAppStateSave) does.
+#[cfg(test)]
+pub(crate) struct FailBaseEnvSave<'a>(std::marker::PhantomData<&'a crate::testutil::HomeSandbox>);
+
+#[cfg(test)]
+impl<'a> FailBaseEnvSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_BASE_ENV_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailBaseEnvSave<'_> {
+    fn drop(&mut self) {
+        FAIL_BASE_ENV_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test seam: a settings apply's live `~/.claude/settings.json` write fails,
+/// after its record pre-write, while armed through [`FailLiveSettingsWrite`].
+#[cfg(test)]
+static FAIL_LIVE_SETTINGS_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the live-write failure for the guard's lifetime,
+/// borrowing the home sandbox as [`FailBaseEnvSave`] does.
+#[cfg(test)]
+pub(crate) struct FailLiveSettingsWrite<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailLiveSettingsWrite<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_LIVE_SETTINGS_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailLiveSettingsWrite<'_> {
+    fn drop(&mut self) {
+        FAIL_LIVE_SETTINGS_WRITE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The record update after a live write.
+fn write_landed_base_env(saved: &SavedBaseEnv) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_BASE_ENV_LANDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write {}: Permission denied (os error 13)",
+            saved_base_env_path()?.display()
+        ));
+    }
+    write_saved_base_env(saved)
+}
+
+/// Test seam: [`write_landed_base_env`] alone fails while armed through
+/// [`FailBaseEnvLanding`], as a crash right after the live write would leave
+/// it unwritten.
+#[cfg(test)]
+static FAIL_BASE_ENV_LANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`write_landed_base_env`] failure for the guard's
+/// lifetime, borrowing the home sandbox as [`FailBaseEnvSave`] does.
+#[cfg(test)]
+pub(crate) struct FailBaseEnvLanding<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailBaseEnvLanding<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_BASE_ENV_LANDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailBaseEnvLanding<'_> {
+    fn drop(&mut self) {
+        FAIL_BASE_ENV_LANDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a covered key's base value is saved and restored: every custom key
+/// but the ones the build sets or clears from a profile field, whose live
+/// value is never the user's to put back.
+fn keeps_base_value(key: &str) -> bool {
+    managed_env_key_label(key).is_none()
+}
+
+/// Whose a live env value is, decided by the key's record entry and, with no
+/// entry, by whether the record is stamped.
+enum LiveOwner<'a> {
+    /// clauth wrote it: an uncover puts the user's value back, or removes the
+    /// key when the user had none.
+    Clauth(Option<&'a serde_json::Value>),
+    /// The user's (or Claude Code's) own value: an uncover keeps it.
+    User,
+    /// The live file lacks the key, and no unseen switch away explains it
+    /// ([`live_owner`]): the deletion is the user's, and it stands.
+    Missing,
+}
+
+/// The values the accounts carry, which name clauth's own writes where the
+/// record cannot: a cover landed before the stamp, and every write a clauth
+/// that predates the record made since the last recorded apply. Read off disk
+/// only when a decision needs it.
+struct OutgoingValues<'a> {
+    before: &'a [&'a BTreeMap<String, String>],
+    /// The keys the caller lists as the outgoing activation's.
+    listed: &'a [String],
+    disk: Option<OutgoingDisk>,
+    roster: Option<OutgoingDisk>,
+}
+
+/// Accounts' env maps as disk holds them. `unreadable`: some account no
+/// longer reads, so its values are unknown.
+struct OutgoingDisk {
+    envs: Vec<BTreeMap<String, String>>,
+    unreadable: bool,
+}
+
+impl OutgoingDisk {
+    fn read(profiles: impl Iterator<Item = Result<Profile>>) -> Self {
+        let mut disk = Self {
+            envs: Vec::new(),
+            unreadable: false,
+        };
+        for profile in profiles {
+            match profile {
+                Ok(profile) => disk.envs.push(profile.env),
+                Err(_) => disk.unreadable = true,
+            }
+        }
+        disk
+    }
+
+    fn knows(&self, key: &str) -> bool {
+        self.envs.iter().any(|env| env.contains_key(key))
+    }
+}
+
+impl<'a> OutgoingValues<'a> {
+    /// An edit's pre-edit maps are its whole outgoing account, and disk
+    /// already holds the edit (the incoming value), so disk is never read
+    /// then.
+    fn new(before: &'a [&'a BTreeMap<String, String>], listed: &'a [String]) -> Self {
+        let disk = (!before.is_empty()).then(|| OutgoingDisk {
+            envs: Vec::new(),
+            unreadable: false,
+        });
+        Self {
+            before,
+            listed,
+            disk,
+            roster: None,
+        }
+    }
+
+    fn disk(&mut self) -> Result<&OutgoingDisk> {
+        let disk = match self.disk.take() {
+            Some(disk) => disk,
+            None => {
+                OutgoingDisk::read(outgoing_profiles_on_disk(&crate::profile::load_app_state()?))
+            }
+        };
+        Ok(self.disk.insert(disk))
+    }
+
+    /// Every account on the roster, as disk holds it.
+    fn roster(&mut self) -> Result<&OutgoingDisk> {
+        let roster = match self.roster.take() {
+            Some(roster) => roster,
+            None => {
+                let state = crate::profile::load_app_state()?;
+                OutgoingDisk::read(state.profiles.iter().map(crate::profile::read_profile))
+            }
+        };
+        Ok(self.roster.insert(roster))
+    }
+
+    /// Whether any account's own value under `key` (an edit's pre-edit maps,
+    /// or any account on the roster) passes `matches`: an older clauth may
+    /// have switched any number of times since the last recorded apply.
+    fn any_account_value(&mut self, key: &str, matches: impl Fn(&str) -> bool) -> Result<bool> {
+        let holds = |env: &BTreeMap<String, String>| env.get(key).is_some_and(|v| matches(v));
+        if self.before.iter().any(|env| holds(env)) {
+            return Ok(true);
+        }
+        Ok(self.roster()?.envs.iter().any(holds))
+    }
+
+    /// Whether some outgoing account's own value under `key` is `live`.
+    fn names(&mut self, key: &str, live: &serde_json::Value) -> Result<bool> {
+        // clauth writes custom env values as strings only.
+        let Some(live) = live.as_str() else {
+            return Ok(false);
+        };
+        let names = |env: &BTreeMap<String, String>| env.get(key).is_some_and(|v| v == live);
+        if self.before.iter().any(|env| names(env)) {
+            return Ok(true);
+        }
+        Ok(self.disk()?.envs.iter().any(names))
+    }
+
+    /// Before the stamp only: whether a live value with no entry is clauth's.
+    /// An account that names the key decides by its own value. A key the
+    /// caller lists that no outgoing account names came off a wider strip list
+    /// than the active marker now gives (taken with no account active, as a
+    /// first activation's is), so every account on the roster is asked. Only
+    /// when no readable account names it at all may an unreadable one have
+    /// written it, and it is stripped; one torn profile never refuses a build.
+    fn carry(&mut self, key: &str, live: &serde_json::Value) -> Result<bool> {
+        let Some(text) = live.as_str() else {
+            return Ok(false);
+        };
+        let known_before = self.before.iter().any(|env| env.contains_key(key));
+        if known_before || self.disk()?.knows(key) {
+            return self.names(key, live);
+        }
+        if !self.listed.iter().any(|listed| listed == key) {
+            return Ok(false);
+        }
+        let roster = self.roster()?;
+        if roster.knows(key) {
+            return Ok(roster
+                .envs
+                .iter()
+                .any(|env| env.get(key).is_some_and(|value| value == text)));
+        }
+        let roster_unreadable = roster.unreadable;
+        Ok(roster_unreadable || self.disk()?.unreadable)
+    }
+}
+
+/// The accounts an outgoing activation names on disk: the active one, or with
+/// no active marker every account on the roster, since a switch-off by a
+/// clauth that predates the record left the live file as the departed account
+/// wrote it. An account that no longer reads yields its error.
+pub(crate) fn outgoing_profiles_on_disk(
+    state: &AppState,
+) -> impl Iterator<Item = Result<Profile>> + '_ {
+    let names = match state.active_profile.as_ref() {
+        Some(active) => std::slice::from_ref(active),
+        None => state.profiles.as_slice(),
+    };
+    names
+        .iter()
+        .filter(|name| state.profiles.contains(name))
+        .map(crate::profile::read_profile)
+}
+
+/// How an apply judges the live values the record does not name.
+#[derive(Clone, Copy, PartialEq)]
+enum Judge {
+    /// No stamp yet: the one-time migration judges entry-less covers by the
+    /// outgoing accounts' values ([`OutgoingValues::carry`]).
+    Migrating,
+    /// The active marker is the account the last recorded apply left active:
+    /// only a clauth that records its covers wrote since, so an entry-less
+    /// value is the user's, a missing key is the user's deletion, and no live
+    /// value is compared with any account's.
+    Recorded,
+    /// The marker differs, so a clauth that predates the record (a daemon or
+    /// TUI left running across an update) switched since, any number of
+    /// times: it moves the marker, deletes a covered key on its way out and
+    /// writes the incoming account's value with no entry. A live value equal
+    /// to any account's own is then clauth's, and a covered key it deleted
+    /// gets `base` back.
+    Unseen,
+}
+
+fn live_owner<'a>(
+    entry: Option<&'a BaseEnvEntry>,
+    judge: Judge,
+    key: &str,
+    live: Option<&serde_json::Value>,
+    outgoing: &mut OutgoingValues<'_>,
+) -> Result<LiveOwner<'a>> {
+    let Some(live) = live else {
+        return Ok(match entry {
+            Some(entry) if judge == Judge::Unseen => LiveOwner::Clauth(entry.base.as_ref()),
+            Some(_) | None => LiveOwner::Missing,
+        });
+    };
+    let held_by_an_account = |outgoing: &mut OutgoingValues<'_>| {
+        outgoing.any_account_value(key, |own| live.as_str() == Some(own))
+    };
+    Ok(match entry {
+        Some(entry) if entry.wrote_live(live) => LiveOwner::Clauth(entry.base.as_ref()),
+        Some(entry) if judge == Judge::Unseen && held_by_an_account(outgoing)? => {
+            LiveOwner::Clauth(entry.base.as_ref())
+        }
+        Some(_) => LiveOwner::User,
+        None if judge == Judge::Migrating && outgoing.carry(key, live)? => LiveOwner::Clauth(None),
+        None if judge == Judge::Unseen && held_by_an_account(outgoing)? => LiveOwner::Clauth(None),
+        None => LiveOwner::User,
+    })
+}
+
+/// How a build found `~/.clauth/base-env.json`.
+enum Found {
+    /// Not yet stamped: a live apply judges entry-less covers by the outgoing
+    /// accounts' values, once, then stamps it.
+    Absent,
+    Read(SavedBaseEnv),
+    /// Not read (an isolated build), or torn while no decision needed it: a
+    /// live apply leaves its bytes alone.
+    Unread,
+}
+
+/// The record a live apply lands around its write: `captured` with each new
+/// or re-based entry, `landed` with every change.
+struct RecordPlan {
+    found: Found,
+    captured: SavedBaseEnv,
+    landed: SavedBaseEnv,
+}
+
+/// A settings build, plus its record plan.
+struct SettingsBuild {
+    content: String,
+    record: RecordPlan,
+}
+
+/// Settle the custom keys of `env` (a settings `env` object) for an account
+/// whose `[env]` is `profile_env`. A key it lacks that `prev_env_keys` or the
+/// record names goes back to the user's saved value, or leaves when the user
+/// had none, where clauth wrote its live value; a value clauth did not write
+/// stays. `live` is `Some` when `env` lands in `~/.claude/settings.json`
+/// itself: each covered key's base value is then captured too, with `live`'s
+/// maps (an edited profile's pre-edit env) counted as the outgoing account,
+/// and the record keeps the active marker the apply saw. Live values are
+/// judged per [`Judge`]: by the record alone while the active marker is the
+/// recorded account.
+/// A live apply reads the record whenever it exists, to stamp it; a sibling's
+/// build only when `env` holds a key the account lacks, the only kind an
+/// entry can change. One that does not parse refuses the build only when a
+/// covered key, or a leaving key `prev_env_keys` lists and `env` holds, needs
+/// a decision.
+fn settle_custom_env(
+    env: &mut serde_json::Map<String, serde_json::Value>,
+    profile_env: &BTreeMap<String, String>,
+    prev_env_keys: &[String],
+    live: Option<&[&BTreeMap<String, String>]>,
+) -> Result<RecordPlan> {
+    let covering: Vec<(&String, &String)> = match live {
+        Some(_) => profile_env
+            .iter()
+            .filter(|(key, _)| keeps_base_value(key))
+            .collect(),
+        None => Vec::new(),
+    };
+    let leaving = |key: &str| !profile_env.contains_key(key) && keeps_base_value(key);
+    let needed = !covering.is_empty()
+        || prev_env_keys
+            .iter()
+            .any(|key| leaving(key) && env.contains_key(key));
+    let found = if live.is_some() || env.keys().any(|key| leaving(key)) {
+        match read_saved_base_env() {
+            Ok(Some(saved)) => Found::Read(saved),
+            Ok(None) => Found::Absent,
+            Err(e) if needed => return Err(e),
+            Err(_) => Found::Unread,
+        }
+    } else {
+        Found::Unread
+    };
+    let saved = match &found {
+        Found::Read(saved) => saved.clone(),
+        Found::Absent | Found::Unread => SavedBaseEnv::default(),
+    };
+    // The marker this apply saw. The record keeps it: the marker's own saves
+    // keep it from then on (`note_active_marker`), so a later apply finding a
+    // different one proves an older clauth moved it.
+    let seen = match &found {
+        Found::Absent | Found::Read(_) => Some(active_marker()?),
+        Found::Unread => None,
+    };
+    let judge = match &found {
+        Found::Absent => Judge::Migrating,
+        Found::Unread => Judge::Recorded,
+        Found::Read(saved) if saved.migrating => Judge::Migrating,
+        Found::Read(saved) if Some(&saved.active) == seen.as_ref() => Judge::Recorded,
+        Found::Read(_) => Judge::Unseen,
+    };
+    let mut outgoing = OutgoingValues::new(live.unwrap_or_default(), prev_env_keys);
+    let mut captured = saved.clone();
+    let mut landed = saved.clone();
+    // Evidence a later judgment consumes (the open migration, the marker)
+    // moves only with the update after a live write that landed: a live
+    // write that fails leaves it as found, so the retry judges again instead
+    // of trusting a file this apply never wrote. The entries' crash guard
+    // stays in the pre-write.
+    if live.is_some() {
+        if judge == Judge::Migrating {
+            captured.migrating = true;
+        }
+        landed.migrating = false;
+        if let Some(seen) = seen {
+            landed.active = seen;
+        }
+    }
+
+    for (key, value) in covering {
+        let entry = saved.keys.get(key);
+        let live_value = env.get(key);
+        let owner = live_owner(entry, judge, key, live_value, &mut outgoing)?;
+        let clauths = matches!(owner, LiveOwner::Clauth(_));
+        let base = match owner {
+            LiveOwner::Clauth(base) => base.cloned(),
+            LiveOwner::User => live_value.cloned(),
+            LiveOwner::Missing => None,
+        };
+        let landed_entry = BaseEnvEntry {
+            base,
+            wrote: wrote_digest(&value.as_str().into()),
+            pending: None,
+        };
+        // The pre-write keeps the digest of the clauth value still live
+        // until the live write lands; the update after it drops it.
+        let live_digest = live_value
+            .filter(|_| clauths)
+            .map(wrote_digest)
+            .filter(|digest| *digest != landed_entry.wrote);
+        let next = BaseEnvEntry {
+            pending: live_digest,
+            ..landed_entry.clone()
+        };
+        if entry != Some(&next) {
+            captured.keys.insert(key.clone(), next);
+        }
+        landed.keys.insert(key.clone(), landed_entry);
+    }
+
+    let uncovering: BTreeSet<&String> = prev_env_keys
+        .iter()
+        .chain(saved.keys.keys())
+        .filter(|key| leaving(key))
+        .collect();
+    for key in uncovering {
+        match live_owner(saved.keys.get(key), judge, key, env.get(key), &mut outgoing)? {
+            LiveOwner::Clauth(Some(base)) => {
+                env.insert(key.clone(), base.clone());
+            }
+            LiveOwner::Clauth(None) => {
+                env.remove(key);
+            }
+            LiveOwner::User | LiveOwner::Missing => {}
+        }
+        landed.keys.remove(key);
+    }
+    // The build sets or clears these from a profile field, so a live value is
+    // never the user's: a leaving one goes.
+    for key in prev_env_keys {
+        if !profile_env.contains_key(key) && !keeps_base_value(key) {
+            env.remove(key);
+        }
+    }
+    Ok(RecordPlan {
+        found,
+        captured,
+        landed,
+    })
 }
 
 /// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
@@ -5590,8 +6348,11 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
         && has_inference_auth(profile)
 }
 
-/// Build the merged settings.json content. `prev_env_keys` are stripped before
-/// the new profile's env is applied; pass `&[]` on start to leave existing keys.
+/// Build the merged settings.json content. A custom key `profile` lacks that
+/// `prev_env_keys` or `~/.clauth/base-env.json` names is stripped before the
+/// new profile's env is applied when clauth wrote its value: back to the
+/// user's saved value, or removed when the user had none. A value clauth did
+/// not write stays. A sibling's build reads the record, never retires it.
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
@@ -5605,9 +6366,22 @@ pub(crate) fn build_claude_settings_json(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<String> {
-    let mut settings: serde_json::Value = match base {
-        Some(p) if p.exists() => read_json_file(p)?,
-        _ => serde_json::json!({}),
+    Ok(build_settings(base, profile, prev_env_keys, None)?.content)
+}
+
+/// [`build_claude_settings_json`]'s body. `live` is `Some` when the build lands
+/// in `~/.claude/settings.json` itself ([`settle_custom_env`]).
+fn build_settings(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+    live: Option<&[&BTreeMap<String, String>]>,
+) -> Result<SettingsBuild> {
+    let base_exists = matches!(base, Some(p) if p.exists());
+    let mut settings: serde_json::Value = if base_exists && let Some(p) = base {
+        read_json_file(p)?
+    } else {
+        serde_json::json!({})
     };
 
     if settings.get("env").is_none() {
@@ -5618,11 +6392,7 @@ pub(crate) fn build_claude_settings_json(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
-    for key in prev_env_keys {
-        if !profile.env.contains_key(key) {
-            env.remove(key);
-        }
-    }
+    let record = settle_custom_env(env, &profile.env, prev_env_keys, live)?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -5712,7 +6482,11 @@ pub(crate) fn build_claude_settings_json(
         obj.remove("apiKeyHelper");
     }
 
-    serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")
+    Ok(SettingsBuild {
+        content: serde_json::to_string_pretty(&settings)
+            .context("failed to serialize settings.json")?,
+        record,
+    })
 }
 
 /// Whether the outgoing snapshot would read the active profile's own unreadable

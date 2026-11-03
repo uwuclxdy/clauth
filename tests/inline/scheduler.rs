@@ -9715,13 +9715,18 @@ fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() 
     let mut x = Profile::new("x".to_string(), None, None);
     x.env
         .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+    // `x` and the state on disk, as production always has them: the strip
+    // tells x's `ANTHROPIC_MODEL` from the operator's by the value x carries.
+    crate::profile::save_profile(&x).expect("save x");
+    let state = AppState {
+        active_profile: Some("x".into()),
+        profiles: vec!["a".into(), "b".into(), "x".into()],
+        fallback_chain: vec!["a".into(), "b".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: Some("x".into()),
-            profiles: vec!["a".into(), "b".into(), "x".into()],
-            fallback_chain: vec!["a".into(), "b".into()],
-            ..AppState::default()
-        },
+        state,
         profiles: vec![mk("a"), mk("b"), x],
     }));
     // Control: the real launch strips x's keys, so its demand is opus alone.

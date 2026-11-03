@@ -558,7 +558,8 @@ pub(crate) enum ConfigRow {
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
     /// unset, never a blank string — so the entry drops from `settings.json`
-    /// on the next settings apply (`commit_env_value`).
+    /// on the next settings apply, or returns to the value the user's own
+    /// settings held (`commit_env_value`).
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
@@ -971,6 +972,11 @@ pub(crate) struct ConfigDraft {
     /// semantics) instead of keeping the empty placeholder; any value commit
     /// on the key clears it.
     pub(crate) env_just_added: Option<String>,
+    /// Key an Overwrite of a `~/.claude/settings.json` collision opened for a
+    /// value, written nowhere yet: while set, the `+ add env` row's editor
+    /// types into [`ConfigDraft::env_value`], a non-empty commit is the key's
+    /// first write, and an empty commit or ⎋ writes nothing.
+    pub(crate) env_pending: Option<String>,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
     /// The value the open field's buffer held when it opened — the seed the
@@ -1059,7 +1065,13 @@ impl ConfigDraft {
             ConfigRow::BellThreshold => &self.bell_threshold,
             ConfigRow::UsageProbeInterval => &self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
-            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
+            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => {
+                if self.env_pending.is_some() {
+                    &self.env_value
+                } else {
+                    &self.env_new_key
+                }
+            }
             ConfigRow::AutoStart
             | ConfigRow::UsageProbe
             | ConfigRow::Type
@@ -1092,7 +1104,13 @@ impl ConfigDraft {
             ConfigRow::BellThreshold => &mut self.bell_threshold,
             ConfigRow::UsageProbeInterval => &mut self.usage_probe_interval,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
-            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
+            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => {
+                if self.env_pending.is_some() {
+                    &mut self.env_value
+                } else {
+                    &mut self.env_new_key
+                }
+            }
             ConfigRow::AutoStart
             | ConfigRow::UsageProbe
             | ConfigRow::Type
@@ -22861,6 +22879,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
+        env_pending: None,
         active: None,
         field_seed: None,
         armed_action: None,
@@ -22905,6 +22924,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
+        env_pending: None,
         active: None,
         field_seed: None,
         armed_action: None,
@@ -23777,7 +23797,17 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
 ///
 /// Escape on a just-added env entry removes the row instead: the add only
 /// persisted an empty placeholder, so backing out restores the pre-add state.
+/// Escape on a pending key's value editor drops the key, never written.
 fn cancel_config_edit(app: &mut App, field: ConfigRow) {
+    if field == ConfigRow::EnvAdd
+        && let Some(d) = app.config_draft.as_mut()
+        && d.env_pending.take().is_some()
+    {
+        // The pending key was never written, so backing out writes nothing.
+        d.env_value = InputState::new("");
+        d.active = None;
+        return;
+    }
     let editing_name = app
         .config_draft
         .as_ref()
@@ -23944,6 +23974,14 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         | ConfigRow::SubagentModel
         | ConfigRow::AdvisorModel => CommitResult::from(commit_model_field(app, field)),
         ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
+        ConfigRow::EnvAdd
+            if app
+                .config_draft
+                .as_ref()
+                .is_some_and(|d| d.env_pending.is_some()) =>
+        {
+            CommitResult::from(commit_env_pending(app))
+        }
         ConfigRow::EnvAdd => commit_env_new_key(app),
         ConfigRow::BellThreshold => CommitResult::from(commit_bell_threshold(app)),
         ConfigRow::UsageProbeInterval => CommitResult::from(commit_usage_probe_interval(app)),
@@ -24565,6 +24603,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
 fn enter_env_add_edit(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_new_key = InputState::new("");
+        d.env_pending = None;
         d.active = Some(ConfigRow::EnvAdd);
         d.field_seed = Some(d.env_new_key.value.clone());
     }
@@ -24608,7 +24647,8 @@ fn commit_env_value(app: &mut App, i: usize) -> bool {
             if let Some(key) = &key {
                 if value.is_empty() {
                     // Unset, not blank: `edit_profile_env` strips the dropped
-                    // key from the live settings on its own (prev-key removal).
+                    // key from the live settings on its own (prev-key removal),
+                    // back to the user's own value where one was saved.
                     env.remove(key);
                 } else {
                     env.insert(key.clone(), value.clone());
@@ -24767,6 +24807,63 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
     true
 }
 
+/// Open the `+ add env` row's value editor on `key`, written nowhere until
+/// [`commit_env_pending`] lands a non-empty value.
+fn open_env_pending_edit(app: &mut App, key: &str) {
+    if let Some(row_pos) = config_row_index(app, ConfigRow::EnvAdd) {
+        app.config_action_cursor = row_pos;
+    }
+    if let Some(d) = app.config_draft.as_mut() {
+        d.env_pending = Some(key.to_string());
+        d.env_value = InputState::new("");
+        d.active = Some(ConfigRow::EnvAdd);
+        d.field_seed = Some(String::new());
+    }
+}
+
+/// ⏎ in the pending key's value editor: a non-empty value is the key's first
+/// write, through [`edit_profile_env`]; an empty one closes the editor having
+/// written nothing. A failed persist keeps the editor open for a retry.
+fn commit_env_pending(app: &mut App) -> bool {
+    let Some((name, key, value)) = app.config_draft.as_ref().and_then(|d| {
+        Some((
+            ProfileName::from(d.editing_name.clone()?),
+            d.env_pending.clone()?,
+            d.env_value.trimmed().to_string(),
+        ))
+    }) else {
+        return false;
+    };
+    if !value.is_empty() {
+        let result = {
+            let mut cfg = app.config();
+            // A key a peer added while the editor was open keeps its value,
+            // as `env_add_commit` keeps one.
+            edit_profile_env(&mut cfg, &name, |env| {
+                if !env.contains_key(&key) {
+                    env.insert(key.clone(), value.clone());
+                }
+            })
+        };
+        if let Err(e) = result {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "env update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return false;
+        }
+    }
+    if let Some(d) = app.config_draft.as_mut() {
+        d.env_pending = None;
+        d.env_value = InputState::new("");
+        d.active = None;
+    }
+    true
+}
+
 /// Position of `row` in the current detail-row list, if present.
 fn config_row_index(app: &App, row: ConfigRow) -> Option<usize> {
     config_rows(app).iter().position(|r| *r == row)
@@ -24918,7 +25015,20 @@ fn run_env_collision_choice(
 ) {
     match choice {
         EnvCollisionChoice::Overwrite => {
-            let _ = env_add_commit(app, name, key);
+            // `classify_env_key` checks the managed and own-field sources
+            // first, so a key that is neither collided with the user's
+            // `~/.claude/settings.json`: its value there stays until a value
+            // commits over it.
+            let inherited = crate::claude::managed_env_key_label(key).is_none()
+                && app
+                    .config()
+                    .find(name)
+                    .is_some_and(|p| !p.env.contains_key(key));
+            if inherited {
+                open_env_pending_edit(app, key);
+            } else {
+                let _ = env_add_commit(app, name, key);
+            }
         }
         EnvCollisionChoice::KeepExisting => {
             // For an own-field clash, jump to the existing entry; else just dismiss.
@@ -26919,6 +27029,8 @@ fn setup_field_valid(app: &App) -> bool {
                 true
             }
         }
+        // A pending key's value editor accepts any value: empty writes nothing.
+        ConfigRow::EnvAdd if d.env_pending.is_some() => true,
         ConfigRow::EnvAdd => {
             let key = d.env_new_key.trimmed();
             // An empty key closes the editor (a no-op commit), never refuses.
@@ -26933,7 +27045,7 @@ fn setup_field_opens_dialog(app: &App) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
         return false;
     };
-    if d.active != Some(ConfigRow::EnvAdd) {
+    if d.active != Some(ConfigRow::EnvAdd) || d.env_pending.is_some() {
         return false;
     }
     let Some(name) = d.editing_name.clone() else {
@@ -27540,8 +27652,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         // Captured before the activation replaces the marker,
                         // through the one helper that also answers for a
                         // CLEARED marker — this arm can run after a
-                        // `switch_off` left the departed account's `[env]` in
-                        // the live file — plus the keys disk holds for the
+                        // `switch_off` by a clauth that predates
+                        // `~/.clauth/base-env.json` left the departed
+                        // account's `[env]` in the live file — plus the keys
+                        // disk holds for the
                         // account it names active.
                         let keys = crate::actions::outgoing_env_keys_now(cfg)?;
                         let oauth_moved = crate::actions::overwrite_captured_profile_held(

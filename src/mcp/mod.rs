@@ -4026,7 +4026,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     );
     // Strip the outgoing profile's custom env so a delegate for `<target>` does
     // not inherit whoever was globally active — or, with no marker to read
-    // (`switch_off` clears it without touching the file), the departed
+    // (a `switch_off` by a clauth that predates `~/.clauth/base-env.json`
+    // cleared it without touching the file), the departed
     // account whose entries are still in the live settings (mirrors
     // `clauth start`). Read once here: the pre-flight's demand and the
     // runtime acquire below both consume it, with the outgoing account's keys

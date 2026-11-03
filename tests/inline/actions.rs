@@ -15045,6 +15045,1600 @@ fn live_settings() -> serde_json::Value {
         .expect("parse settings")
 }
 
+/// The live `settings.json` env `ENDPOINT`, or `None` when absent.
+fn live_endpoint() -> Option<String> {
+    live_settings()["env"]["ENDPOINT"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Seed the user's own `ENDPOINT = "user"` into the live `settings.json`.
+fn seed_user_endpoint() {
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = if path.exists() {
+        live_settings()
+    } else {
+        serde_json::json!({})
+    };
+    live["env"]["ENDPOINT"] = serde_json::json!("user");
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("seed user endpoint");
+    assert_eq!(live_endpoint().as_deref(), Some("user"), "control: seeded");
+}
+
+/// A switch onto an account covering the user's key, made while no account is
+/// active (after a switch-off), then a switch away, puts the user's value back.
+#[test]
+fn a_cover_landed_from_switched_off_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "an inactive edit writes nothing live"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "b covers");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// The same flow with a stays active throughout: the control for the test above.
+#[test]
+fn a_cover_landed_from_an_active_account_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "b covers");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// A covering account switched off, then deleted while inactive: the next
+/// switch reads the user's value, never the deleted account's.
+#[test]
+fn deleting_a_switched_off_coverer_gives_the_user_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    delete_profile(&mut config, &a, false, &rotation).expect("delete a");
+    drop(rotation);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// Deleting the ACTIVE covering account gives the user's value back.
+#[test]
+fn deleting_the_active_coverer_gives_the_user_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    delete_profile(&mut config, &a, false, &rotation).expect("delete a");
+    drop(rotation);
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// A covering key the active account's `config.toml` gained outside the TUI
+/// (a hand edit), landed by any later settings apply, comes back on switch away.
+#[test]
+fn a_hand_added_cover_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "mine".to_string());
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an unrelated env edit applies the account");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// No cover ever lands: an inactive account names the user's key, the state is
+/// switched off, and a switch onto an account lacking it keeps the user's value.
+#[test]
+fn a_switch_from_off_keeps_a_user_key_no_account_ever_applied() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value stays"
+    );
+}
+
+/// Hand-edit the live `settings.json` env: `key` set to `value`, or removed at
+/// `None`, the way the user or a pre-record clauth would.
+fn set_live_env(key: &str, value: Option<&str>) {
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = if path.exists() {
+        live_settings()
+    } else {
+        serde_json::json!({ "env": {} })
+    };
+    let env = live["env"].as_object_mut().expect("env object");
+    match value {
+        Some(value) => env.insert(key.to_string(), serde_json::json!(value)),
+        None => env.remove(key),
+    };
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("hand-edit live settings");
+}
+
+fn base_env_path() -> std::path::PathBuf {
+    crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("base-env.json")
+}
+
+/// The parsed `~/.clauth/base-env.json`.
+fn base_env_record() -> serde_json::Value {
+    crate::profile::read_json_file::<serde_json::Value>(&base_env_path()).expect("parse record")
+}
+
+/// Whether `~/.clauth/base-env.json` holds an entry for `key`.
+fn base_env_record_names(key: &str) -> bool {
+    base_env_path().exists() && base_env_record()["keys"].get(key).is_some()
+}
+
+/// Remove `~/.clauth/base-env.json`, stamp included: the state a clauth that
+/// predates the record leaves behind.
+fn forget_base_env_record() {
+    match std::fs::remove_file(base_env_path()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("remove record: {e}"),
+        _ => {}
+    }
+}
+
+fn seed_third_captured() -> crate::profile::ProfileName {
+    let mut config = crate::profile::load_config().expect("read");
+    capture_into_profile(
+        &mut config,
+        "c".to_string(),
+        Default::default(),
+        login_snapshot("c", None),
+    )
+    .expect("seed capture");
+    crate::profile::ProfileName::from("c")
+}
+
+/// A value the user sets while an account covers the key is the user's newest:
+/// the uncover keeps it instead of reverting to the value saved at cover start.
+#[test]
+fn a_user_edit_made_while_covered_survives_the_uncover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    set_live_env("ENDPOINT", Some("user-later"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user-later"));
+}
+
+/// A cover a clauth without the record landed (the live value is the
+/// outgoing account's own, no entry) is still stripped: from a sibling's
+/// settings built off the live file, and from the live file on switch away.
+#[test]
+fn a_cover_from_before_the_record_is_stripped_from_a_sibling_and_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    assert!(!base_env_record_names("ENDPOINT"), "control: no entry");
+
+    let strip = outgoing_env_keys_now(&config).expect("strip list");
+    let sibling = config.find(&b).cloned().expect("b");
+    let copy: serde_json::Value = serde_json::from_str(
+        &crate::claude::build_claude_settings_json(
+            Some(&crate::claude::claude_settings_path().expect("settings path")),
+            &sibling,
+            &strip,
+        )
+        .expect("build b's copy"),
+    )
+    .expect("copy parses");
+    assert_eq!(
+        copy["env"].get("ENDPOINT"),
+        None,
+        "the sibling never sees a's value"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the switch away strips a's value");
+}
+
+/// The first apply after an upgrade that keeps a pre-record cover in place
+/// never saves the account's own value as the user's: the switch away still
+/// strips it instead of writing it back.
+#[test]
+fn a_cover_from_before_the_record_is_never_saved_as_the_users_value() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an unrelated env edit re-applies a");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-secret"),
+        "a still covers"
+    );
+    assert_eq!(
+        base_env_record()["v"],
+        serde_json::json!(1),
+        "the first apply after the upgrade stamps the record"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a's value never comes back as the user's"
+    );
+}
+
+/// An account whose own value equals the user's covers and uncovers it, and
+/// the user's value stays.
+#[test]
+fn an_account_value_equal_to_the_users_stays_after_the_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// Two accounts cover one key in turn, the first from a switched-off state;
+/// the unset that ends the second account's cover gives the user's value back.
+#[test]
+fn two_accounts_covering_one_key_in_turn_give_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    for (name, value) in [(&a, "a-value"), (&b, "b-value")] {
+        edit_profile_env(&mut config, name, |e| {
+            e.insert("ENDPOINT".to_string(), value.to_string());
+        })
+        .expect("edit inactive account");
+    }
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("a-value"), "a covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    edit_profile_env(&mut config, &b, |e| {
+        e.remove("ENDPOINT");
+    })
+    .expect("unset on active b");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A managed key no profile field sets (`ANTHROPIC_CUSTOM_HEADERS`) holding the
+/// user's own value is saved when an account's `[env]` covers it and comes
+/// back when the cover ends, like any custom key.
+#[test]
+fn a_users_own_unlabelled_managed_key_comes_back_after_a_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    set_live_env("ANTHROPIC_CUSTOM_HEADERS", Some("x-user: 1"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ANTHROPIC_CUSTOM_HEADERS".to_string(), "x-a: 1".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_CUSTOM_HEADERS"].as_str(),
+        Some("x-a: 1"),
+        "a covers"
+    );
+    assert!(
+        base_env_record_names("ANTHROPIC_CUSTOM_HEADERS"),
+        "the user's value is saved"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_CUSTOM_HEADERS"].as_str(),
+        Some("x-user: 1")
+    );
+}
+
+/// A covered key the user deletes from the live file during the cover stays
+/// deleted when the cover ends: after the stamp only a current clauth writes,
+/// and it never deletes a covered key, so a missing key is the user's call.
+#[test]
+fn a_key_the_user_deleted_during_a_cover_stays_deleted() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    set_live_env("ENDPOINT", None);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the deletion stands");
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch back to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers again");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b again"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a later cover's end never brings the deleted value back"
+    );
+}
+
+/// An outgoing account whose `config.toml` no longer reads cannot say which
+/// value it wrote, so a key it is listed for with no record entry counts as
+/// clauth's: dropped from a sibling's copy and on switch away, never kept as
+/// the user's.
+#[test]
+fn an_unreadable_outgoing_account_still_has_its_key_stripped() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    std::fs::write(
+        crate::profile::profile_subpath(&a, "config.toml").expect("a's config path"),
+        "not = [toml",
+    )
+    .expect("corrupt a's config");
+    assert!(
+        crate::profile::read_profile(&a).is_err(),
+        "control: a no longer reads"
+    );
+    assert!(!base_env_record_names("ENDPOINT"), "control: no entry");
+
+    let strip = outgoing_env_keys_now(&config).expect("strip list");
+    assert!(strip.iter().any(|k| k == "ENDPOINT"), "control: listed");
+    let sibling = config.find(&b).cloned().expect("b");
+    let copy: serde_json::Value = serde_json::from_str(
+        &crate::claude::build_claude_settings_json(
+            Some(&crate::claude::claude_settings_path().expect("settings path")),
+            &sibling,
+            &strip,
+        )
+        .expect("an unreadable account never blocks the build"),
+    )
+    .expect("copy parses");
+    assert_eq!(
+        copy["env"].get("ENDPOINT"),
+        None,
+        "the sibling never sees a's value"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the switch away strips a's value");
+}
+
+/// The first live settings apply stamps `~/.clauth/base-env.json` with the
+/// record's version, and the stamp stays once no entry is left.
+#[test]
+fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    assert_eq!(
+        base_env_record(),
+        serde_json::json!({ "v": 1, "active": "a", "keys": {} }),
+        "stamped at the first apply, naming the account it saw active"
+    );
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert!(
+        base_env_record_names("ENDPOINT"),
+        "control: the cover saved"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        base_env_record(),
+        serde_json::json!({ "v": 1, "active": "b", "keys": {} }),
+        "the last entry retired, the stamp stays"
+    );
+}
+
+/// From a switched-off state, a `config.toml` that no longer reads on an
+/// account unrelated to the key never makes the user's value clauth's.
+#[test]
+fn an_unrelated_unreadable_account_never_takes_the_users_key_from_off() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    std::fs::write(
+        crate::profile::profile_subpath(&c, "config.toml").expect("c's config path"),
+        "not = [toml",
+    )
+    .expect("corrupt c's config");
+    assert!(
+        crate::profile::read_profile(&c).is_err(),
+        "control: c no longer reads"
+    );
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value stays"
+    );
+}
+
+/// Committing, on the active account, the very value the user's key already
+/// holds keeps it as the user's: the switch away leaves it in place.
+#[test]
+fn pinning_the_users_own_value_on_the_active_account_keeps_it_after_the_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit active a");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// From a switched-off state, a switch onto an account whose own value equals
+/// the user's, then away, keeps the user's value.
+#[test]
+fn a_switch_from_off_onto_an_account_holding_the_users_value_keeps_it() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// b takes over a's cover, and the record update that follows b's live write
+/// is lost (an io failure or a kill between the two writes): b's unset still
+/// gives the user's value back and leaves nothing of b's live.
+#[test]
+fn a_takeover_whose_record_update_was_lost_still_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let before_takeover = std::fs::read(base_env_path()).expect("read record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    std::fs::write(base_env_path(), &before_takeover).expect("lose the update");
+    edit_profile_env(&mut config, &b, |e| {
+        e.remove("ENDPOINT");
+    })
+    .expect("unset on active b");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// "switch off all" ends a cover like a switch away: the user's value comes
+/// back at once and the entry retires.
+#[test]
+fn switching_off_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+}
+
+/// The record keeps the user's own value (it is what comes back) but never a
+/// covering account's raw value, which can be a secret.
+#[test]
+fn the_record_never_holds_an_accounts_own_value() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-secret-value".to_string());
+    })
+    .expect("edit active a");
+    let raw = std::fs::read_to_string(base_env_path()).expect("read record");
+    assert!(
+        base_env_record_names("ENDPOINT"),
+        "control: the cover saved"
+    );
+    assert!(
+        !raw.contains("a-secret-value"),
+        "the account's value is not in the record"
+    );
+    assert!(raw.contains("\"user\""), "the user's value is");
+}
+
+/// A record that does not parse never blocks a switch whose two accounts
+/// cover no key, and the switch leaves the torn bytes for the user to repair.
+#[test]
+fn a_torn_record_never_blocks_a_switch_that_touches_no_covered_key() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// The record save that precedes a first cover's live write is its crash
+/// guard: when that save fails, the live file keeps the user's value.
+#[test]
+fn a_failed_record_save_leaves_the_live_file_untouched() {
+    let home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    let fail = crate::claude::FailBaseEnvSave::new(&home);
+    let edit = edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    });
+    drop(fail);
+    assert!(edit.is_err(), "the failed save fails the edit");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A value the user sets during a cover, then commits on the covering account
+/// itself, stays the user's: the edit's new value on disk never reads as
+/// clauth's earlier write, so the switch away keeps it.
+#[test]
+fn committing_the_users_newer_value_on_the_covering_account_keeps_it() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    set_live_env("ENDPOINT", Some("user-later"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "user-later".to_string());
+    })
+    .expect("commit the user's newer value on a");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user-later"));
+}
+
+/// A switch-off drops an `[env]` key a profile field also sets, as a switch
+/// away does: a `claude` started while off never runs on the departed
+/// account's token.
+#[test]
+fn switching_off_drops_an_env_key_a_profile_field_sets() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "a-token".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_AUTH_TOKEN"].as_str(),
+        Some("a-token"),
+        "control: a's token is live"
+    );
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert_eq!(live_settings()["env"].get("ANTHROPIC_AUTH_TOKEN"), None);
+}
+
+/// A record that does not parse refuses a switch onto an account covering the
+/// user's key: the user's value would otherwise be covered with nothing
+/// saved. The live file and the torn bytes stay as they were.
+#[test]
+fn a_torn_record_refuses_a_switch_onto_a_covering_account() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(
+        switch_profile_locked(&mut config, &b).is_err(),
+        "the switch refuses"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// Asserts the switch-off took effect: no account is active on disk and the
+/// live credential slot is gone.
+fn assert_switched_off() {
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        None,
+        "no account stays active"
+    );
+    assert!(
+        std::fs::symlink_metadata(live_credentials_path()).is_err(),
+        "the live credentials are cleared"
+    );
+}
+
+/// A switch-off over a record that does not parse, while the active account
+/// covers the user's key, still switches off: the credentials and the active
+/// marker clear, so an account never keeps spending over a damaged record.
+/// The cover stays live (nothing saved says what to put back) and the torn
+/// bytes stay for the user to repair.
+#[test]
+fn a_torn_record_never_keeps_an_account_active_through_a_switch_off() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert!(
+        std::fs::symlink_metadata(live_credentials_path()).is_ok(),
+        "control: a is linked"
+    );
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// A switch-off over a `settings.json` that does not parse still switches
+/// off, and leaves the unparsable bytes as they were.
+#[test]
+fn a_malformed_settings_file_never_keeps_an_account_active_through_a_switch_off() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    std::fs::write(&path, "{ \"env\": { \"ENDPOINT\": \"mine\", } }").expect("break settings");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read settings"),
+        "{ \"env\": { \"ENDPOINT\": \"mine\", } }",
+        "the unparsable bytes stay"
+    );
+}
+
+/// The switch-off that could not put the user's values back says so once:
+/// the line names the departed account and the read failure's chain, which
+/// carries the file's path and the parse position but none of its contents.
+#[test]
+fn a_switch_off_that_cannot_put_back_the_values_logs_one_line() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    std::fs::write(&path, "{ \"env\": { \"ENDPOINT\": \"mine\", } }").expect("break settings");
+    // The failure text comes off the same read the put-back makes, so the
+    // platform's path spelling is not restated here.
+    let read_error = crate::profile::read_json_file::<serde_json::Value>(&path)
+        .expect_err("control: the broken settings do not parse");
+    assert_eq!(
+        format!("{read_error:#}"),
+        format!("failed to parse {} at line 1, column 32", path.display()),
+        "the chain carries the path and the position, no contents"
+    );
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: switched off, but could not put back the settings.json values a's \
+             [env] keys covered: {read_error:#}; the next switch that lands puts them back"
+        )],
+        "one line, naming the account and the read failure"
+    );
+}
+
+/// A switch-off that could not put the user's value back (its `settings.json`
+/// did not parse) leaves it to the next switch that lands: once the user
+/// repairs the file, a switch onto an account covering nothing gives the
+/// user's value back and retires the entry.
+#[test]
+fn the_next_switch_puts_back_what_a_failed_switch_off_could_not() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let good = std::fs::read(&path).expect("read settings");
+    std::fs::write(&path, "{ broken").expect("break settings");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    std::fs::write(&path, &good).expect("the user repairs settings");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("mine"),
+        "control: a's cover is still live"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+}
+
+/// A switch-off whose marker save fails puts nothing back: the values go back
+/// only after the credentials and the active marker are cleared.
+#[test]
+fn a_switch_off_whose_marker_save_fails_puts_nothing_back() {
+    let home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    assert!(
+        switch_off_locked(&mut config).is_err(),
+        "the marker save fails"
+    );
+    assert!(
+        crate::claude::claude_credentials_path()
+            .expect("link path")
+            .symlink_metadata()
+            .is_err(),
+        "the credentials were cleared before the marker save failed"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+}
+
+/// A switch-off whose credential clear fails puts nothing back: the values go
+/// back only after the live login is gone.
+#[test]
+fn a_switch_off_whose_credential_clear_fails_puts_nothing_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let link = crate::claude::claude_credentials_path().expect("link path");
+    std::fs::remove_file(&link).expect("remove the live link");
+    std::fs::create_dir_all(link.join("x")).expect("a directory the clear cannot remove");
+    assert!(
+        switch_off_locked(&mut config).is_err(),
+        "the credential clear fails"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+}
+
+/// b takes over a's cover by a switch and the record update after b's live
+/// write is lost; the switch away from b still gives the user's value back,
+/// recognising b's value as b's own off disk.
+#[test]
+fn a_switch_away_after_a_takeover_whose_record_update_was_lost_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let before_takeover = std::fs::read(base_env_path()).expect("read record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    std::fs::write(base_env_path(), &before_takeover).expect("lose the update");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// What a switch by a clauth that predates the record does: name `to` active
+/// and set the live `ENDPOINT` to `live`, writing no record entry. A daemon or
+/// TUI left running across an update is such a writer.
+fn old_clauth_switches(
+    config: &mut AppConfig,
+    to: &crate::profile::ProfileName,
+    live: Option<&str>,
+) {
+    set_live_env("ENDPOINT", live);
+    let mut state = crate::profile::load_app_state().expect("read state");
+    state.active_profile = Some(to.clone());
+    crate::profile::save_app_state(&state).expect("save state");
+    *config = crate::profile::load_config().expect("re-read");
+}
+
+/// What a "switch off all" by a clauth that predates the record does: clear
+/// the active marker and leave the live file as it was.
+fn old_clauth_switches_off(config: &mut AppConfig) {
+    let mut state = crate::profile::load_app_state().expect("read state");
+    state.active_profile = None;
+    crate::profile::save_app_state(&state).expect("save state");
+    *config = crate::profile::load_config().expect("re-read");
+}
+
+/// Renaming the active account moves the marker under this clauth's own hand,
+/// never an older clauth's: a value of the user's that equals another
+/// account's own value stays the user's across the next covers.
+#[test]
+fn renaming_the_active_account_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    let renamed = crate::profile::ProfileName::from("a2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    rename_profile(&mut config, &a, &renamed, &rotation).expect("rename active a");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &renamed).expect("switch to a2"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// Logging the active account out clears the marker through this clauth's
+/// own save, so the next switch never judges the live file as an older
+/// clauth's: the user's value equal to b's own stays the user's.
+#[test]
+fn logging_out_the_active_account_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    clear_profile_credentials(&mut config, &a).expect("log out active a");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        None,
+        "control: no account active"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The detaching capture clears the marker through this clauth's own save
+/// before its re-activation writes the live file, so that write never judges
+/// the live file as an older clauth's and keeps the user's value.
+#[test]
+fn the_detaching_capture_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    overwrite_captured_profile_with(
+        &mut config,
+        &a,
+        &crate::testutil::profile_id("a"),
+        login_snapshot("a-again", None),
+        true,
+    )
+    .expect("detaching capture of a");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The record's account lands before the marker a switch saves: a failed
+/// record write leaves the marker where it was, so the two never part.
+#[test]
+fn a_failed_record_update_leaves_the_marker_where_it_was() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert_eq!(
+        base_env_record()["active"],
+        serde_json::json!("a"),
+        "control"
+    );
+    let fail = crate::claude::FailBaseEnvSave::new(&home);
+    let switched = switch_profile_locked(&mut config, &b);
+    drop(fail);
+    assert!(
+        switched.is_err(),
+        "the failed record write fails the switch"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "the marker stays on a"
+    );
+    assert_eq!(base_env_record()["active"], serde_json::json!("a"));
+}
+
+/// An older clauth's switch onto `b`, which covers `ENDPOINT` with `b-value`,
+/// after the user seeded `ENDPOINT = "user"` with `a` active.
+fn older_clauth_covers_with_b(
+    config: &mut AppConfig,
+    a: &crate::profile::ProfileName,
+    b: &crate::profile::ProfileName,
+) {
+    assert!(switch_profile_locked(config, a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(config, b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    old_clauth_switches(config, b, Some("b-value"));
+}
+
+/// A log out of the account an older clauth switched onto keeps the evidence
+/// of that unseen switch: the next apply still strips its value.
+#[test]
+fn a_log_out_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    clear_profile_credentials(&mut config, &b).expect("log out active b");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A rename of the account an older clauth switched onto keeps the evidence of
+/// that unseen switch.
+#[test]
+fn a_rename_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    let renamed = crate::profile::ProfileName::from("b2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&b).expect("rotation guard");
+    rename_profile(&mut config, &b, &renamed, &rotation).expect("rename active b");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A first-account create after an older clauth's cover and switch-off keeps
+/// the evidence of those unseen writes.
+#[test]
+fn a_first_account_create_after_an_older_clauths_cover_never_keeps_its_value() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    old_clauth_switches_off(&mut config);
+    create_profile_from_login(
+        &mut config,
+        "c".to_string(),
+        Default::default(),
+        oauth_pair("c-login"),
+        None,
+        None,
+    )
+    .expect("create c");
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A rename after an older clauth's switch away from a cover keeps the
+/// evidence too: the user's value still comes back.
+#[test]
+fn a_rename_after_an_older_clauths_switch_away_still_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    old_clauth_switches(&mut config, &b, None);
+    let renamed = crate::profile::ProfileName::from("b2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&b).expect("rotation guard");
+    rename_profile(&mut config, &b, &renamed, &rotation).expect("rename active b");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert!(switch_profile_locked(&mut config, &renamed).expect("switch to b2"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An apply that finds an older clauth's unseen switch and then fails to write
+/// the live file keeps that evidence: the retry still strips the older
+/// clauth's value instead of keeping it as the user's.
+#[test]
+fn a_failed_live_write_keeps_the_evidence_of_an_older_clauths_switch() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &a);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("retry the switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// The first apply after an upgrade that fails its live write leaves the
+/// migration to its retry: with no account active, an older clauth's leftover
+/// cover still reads as clauth's there, so the retry strips it and no later
+/// cover saves it as the user's.
+#[test]
+fn a_failed_first_apply_after_the_upgrade_leaves_the_migration_to_its_retry() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-value".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    old_clauth_switches(&mut config, &a, Some("a-value"));
+    old_clauth_switches_off(&mut config);
+    forget_base_env_record();
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("retry the switch to b"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a's leftover never stays as the user's"
+    );
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch back to b"));
+    assert_eq!(live_endpoint(), None, "nor comes back after a later cover");
+}
+
+/// A takeover (b covers a key a covered) whose live write fails leaves a's
+/// value live: it is still clauth's, so the next switch to an account without
+/// the key gives the user's value back instead of keeping a's.
+#[test]
+fn a_takeover_whose_live_write_fails_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-value"),
+        "control: a's cover stays"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An edit of the covering account's own value whose live write fails leaves
+/// the old value live: it is still clauth's, so the next switch away gives
+/// the user's value back instead of keeping the old account value.
+#[test]
+fn an_edit_of_the_covering_value_whose_live_write_fails_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-newer".to_string());
+    });
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-value"),
+        "control: the old cover stays"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The next live apply that lands after a failed takeover drops the old
+/// account's digest it kept, so that digest can never later read a value the
+/// user sets as clauth's.
+#[test]
+fn a_landed_apply_after_a_failed_takeover_drops_the_old_digest() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert!(
+        base_env_record()["keys"]["ENDPOINT"]
+            .get("pending")
+            .is_some(),
+        "control: the failed takeover kept the old digest"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("retry the switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("b-value"), "b covers");
+    assert_eq!(
+        base_env_record()["keys"]["ENDPOINT"].get("pending"),
+        None,
+        "the landed apply dropped the old digest"
+    );
+}
+
+/// Once a live apply has dealt with an older clauth's unseen switch, later
+/// applies trust the record again: a value of the user's equal to another
+/// account's own value stays the user's across that account's cover.
+#[test]
+fn a_handled_older_clauth_switch_leaves_later_applies_trusting_the_record() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "control: the unseen switch was handled"
+    );
+    set_live_env("ENDPOINT", Some("user"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("b's value now equals the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch back to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The detaching capture of the account an older clauth switched onto keeps
+/// the evidence of that unseen switch for the re-activation that follows it,
+/// so b's value is still clauth's and the switch away removes it.
+#[test]
+fn a_detaching_capture_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    overwrite_captured_profile_with(
+        &mut config,
+        &b,
+        &crate::testutil::profile_id("b"),
+        login_snapshot("b-again", None),
+        true,
+    )
+    .expect("detaching capture of b");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A live apply that handles an older clauth's unseen switch records the
+/// marker it judged, so the switch onto a third account leaves the record
+/// agreeing with the marker: later applies trust it, and the user's value
+/// equal to b's own stays the user's across b's cover.
+#[test]
+fn handling_an_older_clauths_switch_onto_a_third_account_leaves_the_record_trusted() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "control: the unseen switch was handled"
+    );
+    set_live_env("ENDPOINT", Some("user"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("b's value now equals the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &c).expect("switch back to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An older clauth covers a key and then switches off, so no account is
+/// active: the covering account's value is still clauth's, never the user's.
+/// The next switch removes it, and no later cover saves it as the user's.
+#[test]
+fn an_older_clauths_cover_then_switch_off_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    old_clauth_switches(&mut config, &b, Some("b-value"));
+    old_clauth_switches_off(&mut config);
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a again"));
+    assert_eq!(live_endpoint(), None, "nor comes back after a later cover");
+}
+
+/// With no older clauth in play, a value the user hand-adds to the active
+/// account's `config.toml` that equals the live value is still the user's:
+/// a re-apply saves it, and the switch away keeps it.
+#[test]
+fn a_hand_added_value_equal_to_the_users_stays_the_users_after_a_reapply() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "user".to_string());
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    switch_profile_locked(&mut config, &a).expect("re-apply the active account");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// After the stamp, an older clauth's switch away from a covering account
+/// (it deletes the covered key) is an unseen switch, not the user's deletion:
+/// the next apply puts the user's value back.
+#[test]
+fn an_older_clauths_switch_away_from_a_cover_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    old_clauth_switches(&mut config, &b, None);
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an edit on active b re-applies it");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// After the stamp, an older clauth's switch onto a covering account leaves
+/// that account's value live with no entry: it is clauth's, so the next switch
+/// away removes it instead of keeping it as the user's.
+#[test]
+fn an_older_clauths_switch_onto_a_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    set_live_env("EDITOR", Some("vim"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    assert_eq!(live_endpoint(), None, "control: no cover yet");
+    old_clauth_switches(&mut config, &b, Some("b-value"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// b takes over a's cover by a switch that dies right after its live write:
+/// neither the record update after it nor the active marker lands. The next
+/// switch away still gives the user's value back, never b's as the user's.
+#[test]
+fn a_takeover_that_dies_after_its_live_write_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let state_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    let state_before = std::fs::read(&state_path).expect("read state");
+    let fail = crate::claude::FailBaseEnvLanding::new(&home);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    drop(fail);
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b's live write landed"
+    );
+    std::fs::write(&state_path, &state_before).expect("lose the marker save");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A cover only the record still names (a hand edit dropped the key from the
+/// active account's `config.toml`) is given back on switch away.
+#[test]
+fn a_cover_only_the_record_names_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.remove("ENDPOINT");
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a still covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
 /// A switch refuses a target a peer disabled after the caller's read, and
 /// links nothing.
 #[test]
@@ -16922,7 +18516,8 @@ fn a_discard_onto_the_disk_active_account_keeps_its_live_login() {
 }
 
 /// `b` carries `[env] B_KEY`; a peer switches to it (stamping the key live)
-/// then switches off, after `stale` was read naming `a` active.
+/// then switches off, after `stale` was read naming `a` active, leaving the
+/// key live with no record the way a clauth that predates the record does.
 fn departed_account_keys_fixture() -> AppConfig {
     let (_a, b) = seed_two_captured();
     let stale = crate::profile::load_config().expect("stale read");
@@ -16935,6 +18530,9 @@ fn departed_account_keys_fixture() -> AppConfig {
     peer_switches_to(&b);
     let mut peer = crate::profile::load_config().expect("peer read");
     assert!(switch_off_locked(&mut peer).expect("peer switch-off"));
+    // The switch-off of a clauth that predates the record left b's key live.
+    forget_base_env_record();
+    set_live_env("B_KEY", Some("b-secret"));
     assert_eq!(
         live_settings()["env"]["B_KEY"],
         serde_json::json!("b-secret"),

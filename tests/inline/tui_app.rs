@@ -14456,18 +14456,368 @@ mod env_editor {
             app.modals.is_empty(),
             "explicit affirmative closes the prompt"
         );
-        assert_eq!(
-            app.config()
-                .find(&name)
-                .and_then(|p| p.env.get(key))
-                .map(String::as_str),
-            Some("")
-        );
-        assert_ne!(std::fs::read(&profile_path).expect("read profile"), before);
+        // The Overwrite itself persists nothing; only a committed non-empty value reaches either file.
+        assert_eq!(app.config().find(&name).and_then(|p| p.env.get(key)), None);
+        assert_eq!(std::fs::read(&profile_path).expect("read profile"), before);
         assert_eq!(
             std::fs::read(&settings_path).expect("read settings"),
             b"{\"env\":{\"ENDPOINT\":\"inherited\"}}"
         );
+    }
+
+    /// The live `settings.json` env value of `key`, or `None` when absent.
+    fn settings_env(path: &std::path::Path, key: &str) -> Option<String> {
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read settings.json"))
+                .expect("settings.json parses");
+        settings["env"][key].as_str().map(str::to_string)
+    }
+
+    /// An `acct` profile (active on disk when `active`) beside a
+    /// `~/.claude/settings.json` whose env holds `ENDPOINT = "inherited"`,
+    /// driven through the custom-key add and the collision prompt's
+    /// confirmed Overwrite. Returns the app, the settings path, the
+    /// profile's `config.toml` path and that file's bytes before the add.
+    fn overwrite_inherited_endpoint(
+        active: bool,
+    ) -> (App, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let name = crate::profile::ProfileName::from("acct");
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_profile(&profile).expect("seed account");
+        crate::testutil::register_names(&["acct"]);
+        let state = AppState {
+            active_profile: active.then(|| name.clone()),
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        };
+        crate::profile::save_app_state(&state).expect("persist state");
+        let settings_path = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        crate::profile::atomic_write(&settings_path, "{\"env\":{\"ENDPOINT\":\"inherited\"}}")
+            .expect("seed inherited env");
+        let profile_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("profile path");
+        let before = std::fs::read(&profile_path).expect("read seeded profile");
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(draft) = app.config_draft.as_mut() {
+            draft.env_new_key = InputState::new("ENDPOINT");
+            draft.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::EnvCollision(form)) if form.reason == "your ~/.claude/settings.json")
+        );
+        super::super::handle_modal_key(&mut app, crate::testutil::key(KeyCode::Up));
+        super::super::handle_modal_key(&mut app, crate::testutil::key(KeyCode::Up));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 14)).expect("backend");
+        terminal
+            .draw(|frame| crate::tui::render::draw(frame, &app))
+            .expect("render choice");
+        super::super::handle_modal_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::super::handle_modal_key(&mut app, crate::testutil::key(KeyCode::Right));
+        super::super::handle_modal_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.modals.is_empty(),
+            "the confirmed Overwrite closes the prompt"
+        );
+        (app, settings_path, profile_path, before)
+    }
+
+    /// Types `value` into the open value editor and commits it.
+    fn type_and_commit(app: &mut App, value: &str) {
+        for c in value.chars() {
+            super::super::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+        }
+        super::super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    }
+
+    fn env_pending(app: &App) -> Option<String> {
+        app.config_draft
+            .as_ref()
+            .and_then(|d| d.env_pending.clone())
+    }
+
+    /// A committed value ends the pending Overwrite: the next `+ add env`
+    /// opens the key editor again, not the old key's value editor.
+    #[test]
+    fn a_committed_overwrite_leaves_no_pending_key() {
+        let _home = HomeSandbox::new();
+        let (mut app, ..) = overwrite_inherited_endpoint(true);
+        assert_eq!(
+            env_pending(&app).as_deref(),
+            Some("ENDPOINT"),
+            "control: the Overwrite holds the key pending"
+        );
+        type_and_commit(&mut app, "mine");
+        assert_eq!(env_pending(&app), None);
+    }
+
+    /// A key a peer added while the pending editor was open keeps the peer's
+    /// value, as a plain add keeps one.
+    #[test]
+    fn a_pending_commit_never_overwrites_a_key_a_peer_added_meanwhile() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let (mut app, ..) = overwrite_inherited_endpoint(true);
+        crate::profile::update_profile_config(&name, |p| {
+            p.env.insert("ENDPOINT".to_string(), "peer".to_string());
+            Ok(())
+        })
+        .expect("peer edit")
+        .expect("on roster");
+        type_and_commit(&mut app, "mine");
+        assert_eq!(
+            crate::profile::read_profile(&name)
+                .expect("read acct")
+                .env
+                .get("ENDPOINT")
+                .map(String::as_str),
+            Some("peer")
+        );
+    }
+
+    /// Escape ends the pending Overwrite the same way.
+    #[test]
+    fn an_escaped_overwrite_leaves_no_pending_key() {
+        let _home = HomeSandbox::new();
+        let (mut app, ..) = overwrite_inherited_endpoint(true);
+        assert_eq!(
+            env_pending(&app).as_deref(),
+            Some("ENDPOINT"),
+            "control: the Overwrite holds the key pending"
+        );
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+        assert_eq!(env_pending(&app), None);
+    }
+
+    /// On the ACTIVE profile an Overwrite
+    /// of a key `~/.claude/settings.json` holds writes nothing, and Escape in
+    /// the value editor leaves both files as they were.
+    #[test]
+    fn escaping_an_overwrite_of_an_inherited_key_leaves_both_files_untouched() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let (mut app, settings_path, profile_path, before) = overwrite_inherited_endpoint(true);
+        assert!(
+            app.config_draft.as_ref().and_then(|d| d.active).is_some(),
+            "the Overwrite opens the value editor"
+        );
+        assert_eq!(
+            std::fs::read(&settings_path).expect("read settings"),
+            b"{\"env\":{\"ENDPOINT\":\"inherited\"}}",
+            "the Overwrite writes nothing over the inherited value"
+        );
+        assert_eq!(std::fs::read(&profile_path).expect("read profile"), before);
+
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            None,
+            "Escape closes the editor"
+        );
+        assert_eq!(
+            app.config().find(&name).and_then(|p| p.env.get("ENDPOINT")),
+            None
+        );
+        assert_eq!(std::fs::read(&profile_path).expect("read profile"), before);
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("inherited"),
+            "Escape keeps the inherited value"
+        );
+    }
+
+    /// A value committed over an inherited key reaches
+    /// both files, and unsetting it later puts the inherited value back
+    /// instead of deleting the key.
+    #[test]
+    fn unsetting_an_overwritten_inherited_key_restores_its_value() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let (mut app, settings_path, _, _) = overwrite_inherited_endpoint(true);
+        type_and_commit(&mut app, "mine");
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("ENDPOINT"))
+                .map(String::as_str),
+            Some("mine")
+        );
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("mine")
+        );
+
+        let idx = app
+            .config()
+            .find(&name)
+            .and_then(|p| p.env.keys().position(|k| k == "ENDPOINT"))
+            .expect("the committed key's row");
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_value = InputState::new("");
+            d.active = Some(ConfigRow::EnvEntry(idx));
+        }
+        super::super::commit_env_value(&mut app, idx);
+        assert_eq!(
+            app.config().find(&name).and_then(|p| p.env.get("ENDPOINT")),
+            None
+        );
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("inherited"),
+            "the unset restores the inherited value"
+        );
+    }
+
+    /// Once the active profile covers an inherited key, a
+    /// sibling's settings built off the live file and a switch to that
+    /// sibling both read the inherited value, never a deleted key.
+    #[test]
+    fn a_sibling_and_a_switch_away_read_an_overwritten_inherited_value() {
+        let _home = HomeSandbox::new();
+        let (mut app, settings_path, _, _) = overwrite_inherited_endpoint(true);
+        type_and_commit(&mut app, "mine");
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("mine")
+        );
+
+        let other = Profile::new("other".to_string(), None, None);
+        let strip = ["ENDPOINT".to_string()];
+        let sibling: serde_json::Value = serde_json::from_str(
+            &crate::claude::build_claude_settings_json(Some(&settings_path), &other, &strip)
+                .expect("build the sibling's settings"),
+        )
+        .expect("sibling settings parse");
+        assert_eq!(
+            sibling["env"]["ENDPOINT"].as_str(),
+            Some("inherited"),
+            "a sibling's copy reads the inherited value"
+        );
+
+        crate::claude::apply_profile_to_claude_settings(&other, &strip)
+            .expect("switch the live settings to the sibling");
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("inherited"),
+            "a switch away restores the inherited value"
+        );
+    }
+
+    /// On a profile that was NOT active at the Overwrite: the
+    /// inherited value is first covered when a switch applies the profile,
+    /// and a switch away puts it back.
+    #[test]
+    fn an_inherited_value_covered_by_a_later_switch_comes_back_on_switch_away() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let (mut app, settings_path, _, _) = overwrite_inherited_endpoint(false);
+        type_and_commit(&mut app, "mine");
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("inherited"),
+            "an inactive profile's commit leaves the live settings alone"
+        );
+        let acct = app.config().find(&name).cloned().expect("acct");
+        crate::claude::apply_profile_to_claude_settings(&acct, &[])
+            .expect("switch the live settings to acct");
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("mine")
+        );
+
+        let other = Profile::new("other".to_string(), None, None);
+        crate::claude::apply_profile_to_claude_settings(&other, &["ENDPOINT".to_string()])
+            .expect("switch the live settings to the sibling");
+        assert_eq!(
+            settings_env(&settings_path, "ENDPOINT").as_deref(),
+            Some("inherited"),
+            "a switch away restores the inherited value"
+        );
+    }
+
+    #[test]
+    fn an_empty_commit_over_an_inherited_key_writes_nothing() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let (mut app, settings_path, profile_path, before) = overwrite_inherited_endpoint(true);
+        type_and_commit(&mut app, "");
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            None,
+            "the empty commit closes the editor"
+        );
+        assert_eq!(
+            app.config().find(&name).and_then(|p| p.env.get("ENDPOINT")),
+            None
+        );
+        assert_eq!(std::fs::read(&profile_path).expect("read profile"), before);
+        assert_eq!(
+            std::fs::read(&settings_path).expect("read settings"),
+            b"{\"env\":{\"ENDPOINT\":\"inherited\"}}",
+            "the empty commit leaves the inherited value as it was"
+        );
+    }
+
+    /// The words of the rendered row the edit glyph marks, up to the pane's
+    /// right border.
+    fn edited_row_words(app: &App) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).expect("backend");
+        terminal
+            .draw(|frame| crate::tui::render::draw(frame, app))
+            .expect("render the editor");
+        let glyph = crate::tui::theme::edit_glyph();
+        let rows = crate::testutil::buffer_rows(terminal.backend().buffer());
+        let edited: Vec<&String> = rows.iter().filter(|r| r.contains(glyph)).collect();
+        assert_eq!(edited.len(), 1, "one row is being edited");
+        let after = edited[0].split_once(glyph).map_or("", |(_, rest)| rest);
+        after
+            .split('│')
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_pending_editor_is_labelled_by_its_key() {
+        let _home = HomeSandbox::new();
+        let (mut app, _, _, _) = overwrite_inherited_endpoint(true);
+        for c in "mine".chars() {
+            super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+        }
+        assert_eq!(edited_row_words(&app), ["ENDPOINT", "mine"]);
+    }
+
+    #[test]
+    fn a_pending_secret_key_renders_as_its_saved_entry_row_would() {
+        let _home = HomeSandbox::new();
+        let mut pending = app_with_env(BTreeMap::new());
+        enter_detail(&mut pending);
+        if let Some(d) = pending.config_draft.as_mut() {
+            d.env_pending = Some("API_TOKEN".to_string());
+            d.env_value = InputState::new("s3cr3t");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        let mut env = BTreeMap::new();
+        env.insert("API_TOKEN".to_string(), "s3cr3t".to_string());
+        let mut saved = app_with_env(env);
+        enter_detail(&mut saved);
+        if let Some(d) = saved.config_draft.as_mut() {
+            d.env_value = InputState::new("s3cr3t");
+            d.active = Some(ConfigRow::EnvEntry(0));
+        }
+        let pending_words = edited_row_words(&pending);
+        assert_eq!(pending_words[0], "API_TOKEN");
+        assert_eq!(pending_words, edited_row_words(&saved));
     }
 
     #[test]

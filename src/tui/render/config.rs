@@ -227,6 +227,9 @@ struct Snap {
     advisor: String,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
+    /// The key an Overwrite left pending (`ConfigDraft::env_pending`) on this
+    /// account: the `+ add env` row's editor types its value.
+    env_pending: Option<String>,
     auto_start: bool,
     usage_probe: bool,
     /// [`ReadingsSnapshot::no_five_hour_limit`] for this account: rewords the
@@ -372,6 +375,7 @@ impl Snap {
             subagent: String::new(),
             advisor: String::new(),
             env: Vec::new(),
+            env_pending: None,
             auto_start: false,
             usage_probe: false,
             no_five_hour_limit: false,
@@ -486,6 +490,11 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                env_pending: app
+                    .config_draft
+                    .as_ref()
+                    .filter(|d| d.editing_name.as_deref() == Some(p.name.as_str()))
+                    .and_then(|d| d.env_pending.clone()),
                 auto_start: p.auto_start,
                 usage_probe: p.usage_probe,
                 no_five_hour_limit: readings.no_five_hour_limit(p.name.as_str()),
@@ -1585,6 +1594,11 @@ fn detail_row(
             let key = snap.env.get(i).map(|(k, _)| k.clone()).unwrap_or_default();
             let mask = env_key_is_secret(&key);
             return kv_field(arrow, &key, input, editing, selected, mask, false, width);
+        }
+        // A pending key's value editor reads as that key's own entry row.
+        ConfigRow::EnvAdd if editing && let Some(key) = snap.env_pending.as_deref() => {
+            let mask = env_key_is_secret(key);
+            return kv_field(arrow, key, input, editing, selected, mask, false, width);
         }
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => {

@@ -1397,12 +1397,17 @@ pub(crate) fn switch_profile_noninteractive(
     Ok((outgoing.map(|p| p.to_string()), target.to_string(), notice))
 }
 
-/// Snapshot active creds then clear them so Claude Code can't spend any account.
-/// Used by wrap-off mode when the whole chain is exhausted. No-op when no profile
-/// is active. A diverged live file is cleared WITHOUT being snapshotted
-/// (`snapshot_active_credentials` skips it, keeping the stored identity), so a
-/// fresh `/login` is dropped: the TUI gates that on the divergence prompt, while
-/// the automatic wrap-off leg accepts the drop, unattended by design.
+/// Snapshot active creds then clear them so Claude Code can't spend any account,
+/// clear the active marker, and then put the `[env]` values the account covered
+/// back the way a switch away does. Used by wrap-off mode when the whole chain
+/// is exhausted. No-op when no profile is active. The put-back is best-effort
+/// and last: a `settings.json` or saved-values record that cannot be read or
+/// written logs one line and leaves the covers live until the next apply that
+/// lands, but never keeps the account active. A diverged live file is cleared
+/// WITHOUT being snapshotted (`snapshot_active_credentials` skips it, keeping
+/// the stored identity), so a fresh `/login` is dropped: the TUI gates that on
+/// the divergence prompt, while the automatic wrap-off leg accepts the drop,
+/// unattended by design.
 pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
     #[allow(
         clippy::expect_used,
@@ -1425,11 +1430,15 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
     with_state_lock(|held| {
         // Off already in the caller's copy AND on disk: memory alone misses a
         // peer's switch onto an account, and the snapshot below captures into
-        // the account disk names.
-        let fresh = mirror_active_on_disk(config, held)?;
-        if config.state.active_profile.is_none() && fresh.is_none() {
+        // the account disk names. The mirror makes memory equal disk, so one
+        // `None` answers both.
+        let Some(departed) = mirror_active_on_disk(config, held)? else {
             return Ok(false);
-        }
+        };
+        // The outgoing account's covered keys are read while the marker still
+        // names it; the put-back itself runs last (below).
+        let state = load_fresh_state(held)?;
+        let prev_env_keys = outgoing_env_keys_with_disk(config, &state);
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
         // No active account left to show; issue #17 applies here too — the
@@ -1442,6 +1451,19 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
         let mut state = load_fresh_state(held)?;
         state.set_active(None, held);
         save_app_state(&state)?;
+        // Ends every cover the way a switch away does, but only now: an
+        // account must never stay active (spending) because `settings.json`
+        // or the saved-values record cannot be read. A put-back that fails
+        // leaves the covers live; the next apply that lands judges them again
+        // and puts the user's values back. Run after the marker clear: a
+        // switch-off that fails before it leaves the account active, and its
+        // covers with it.
+        if let Err(e) = crate::claude::release_saved_base_env(&prev_env_keys, held) {
+            crate::logline::logline!(
+                "clauth: switched off, but could not put back the settings.json values \
+                 {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
+            );
+        }
         Ok(true)
     })
 }
@@ -1451,10 +1473,11 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
 /// marker to read — every configured profile's.
 ///
 /// The fallback is the point. A cleared `active_profile` is clauth's record,
-/// never a statement about `settings.json`: `switch_off` clears the marker
-/// without touching the file, so a departed account's `[env]` entries are
-/// still sitting there while the next activation repoints `ANTHROPIC_BASE_URL`
-/// and `apiKeyHelper` at a different account. Stripping nothing pairs that
+/// never a statement about `settings.json`: a `switch_off` by a clauth that
+/// predates `~/.clauth/base-env.json` cleared the marker without touching the
+/// file, so a departed account's `[env]` entries can still sit there while
+/// the next activation repoints `ANTHROPIC_BASE_URL` and `apiKeyHelper` at a different
+/// account. Stripping nothing pairs that
 /// stale key with a new host. The incoming profile's own keys are re-applied
 /// immediately after every call, so the wider strip costs nothing.
 ///
@@ -1488,16 +1511,8 @@ pub(crate) fn outgoing_env_keys(config: &AppConfig) -> Vec<String> {
 /// live link may already have moved.
 fn outgoing_env_keys_with_disk(config: &AppConfig, state: &AppState) -> Vec<String> {
     let mut keys = outgoing_env_keys(config);
-    let outgoing = match state.active_profile.as_ref() {
-        Some(active) => std::slice::from_ref(active),
-        None => state.profiles.as_slice(),
-    };
-    for name in outgoing {
-        if state.profiles.contains(name)
-            && let Ok(disk) = crate::profile::read_profile(name)
-        {
-            keys.extend(disk.env.into_keys());
-        }
+    for disk in crate::claude::outgoing_profiles_on_disk(state).flatten() {
+        keys.extend(disk.env.into_keys());
     }
     keys
 }
@@ -1923,11 +1938,12 @@ pub(crate) fn edit_profile_env(
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
         let before = read_before_identities(name);
-        let (fresh, (plan, old_env_keys)) = update_profile_config(name, |fresh| {
+        let (fresh, (plan, disk_before)) = update_profile_config(name, |fresh| {
             // Snapshot before overwrite — a removed key is only stripped from
-            // live settings when it appears in `prev` but not in the new
-            // `profile.env`.
-            let old_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
+            // live settings when it appears in the pre-edit map but not in the
+            // new `profile.env`, and its old value tells clauth's write from
+            // the user's.
+            let disk_before = fresh.env.clone();
             edit(&mut fresh.env);
             let after_throughput = throughput_for_endpoint(
                 &before.oauth,
@@ -1941,20 +1957,22 @@ pub(crate) fn edit_profile_env(
                 ..ForgetPlan::default()
             };
             forget_disk_plan(name, plan);
-            Ok((plan, old_env_keys))
+            Ok((plan, disk_before))
         })?
         .with_context(|| format!("profile '{name}' not found"))?;
         note_forget_plan(name, plan);
         // The live file may carry a key from either copy: the one disk held,
         // or the one this process last stamped.
-        let mut old_env_keys = old_env_keys;
-        if let Some(profile) = config.find_mut(name) {
-            old_env_keys.extend(profile.env.keys().cloned());
-            profile.env = fresh.env.clone();
-        }
+        let memory_before = config
+            .find_mut(name)
+            .map(|profile| std::mem::replace(&mut profile.env, fresh.env.clone()))
+            .unwrap_or_default();
 
         if active {
-            apply_profile_to_claude_settings(&fresh, &old_env_keys)?;
+            crate::claude::apply_env_edit_to_claude_settings(
+                &fresh,
+                &[&disk_before, &memory_before],
+            )?;
         }
         Ok(())
     })
@@ -4211,8 +4229,8 @@ fn activate_first_account(
 /// the state disk now holds, then a first account's live settings are
 /// written — the reauth auto-activate arm's write, for the same reason: this
 /// profile IS the active one now, and the live settings may still carry the
-/// departed account's entries (`switch_off` clears the marker without touching
-/// the file), which the strip list removes.
+/// departed account's entries (a `switch_off` by a clauth that predates
+/// `~/.clauth/base-env.json` left them), which the strip list removes.
 fn land_registered_create(
     config: &mut AppConfig,
     state: crate::profile::FreshState<'_>,

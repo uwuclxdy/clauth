@@ -113,7 +113,8 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 ///   `advisorModel` are routing.
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
-///   every key any profile declares in its own `config.toml` `[env]`.
+///   every key any profile declares in its own `config.toml` `[env]` and every
+///   key `~/.clauth/base-env.json` records as covered.
 ///
 /// `custom_env` is the union across ALL profiles, not just the member's own
 /// owner, and that is REQUIRED — not merely the conservative choice.
@@ -160,11 +161,14 @@ struct EnvOnlyConfig {
     env: BTreeMap<String, String>,
 }
 
-/// Union of every profile's custom `[env]` keys. A missing `config.toml` is a
-/// profile with no overrides and contributes nothing.
+/// Union of every profile's custom `[env]` keys and every key
+/// `~/.clauth/base-env.json` records as covered: a hand edit can drop a key
+/// from the active account's `config.toml` while its value is still live. A
+/// missing `config.toml` is a profile with no overrides and contributes
+/// nothing.
 ///
-/// `None` when a `config.toml` cannot be read or parsed: the affected
-/// profiles' env sets are then unknown, and [`sync_members`] skips the merge
+/// `None` when a `config.toml` or the record cannot be read or parsed: the
+/// affected env sets are then unknown, and [`sync_members`] skips the merge
 /// rather than treat their keys as shared and leak them into a sibling.
 /// Fail-closed, and self-healing — a file caught mid-edit reads cleanly on the
 /// next tick. Because that pauses settings sync entirely, the first failure is
@@ -231,10 +235,8 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         .map(|n| n.to_string())
         .collect();
     let profiles = clauth_dir().ok()?.join("profiles");
-    let Ok(entries) = std::fs::read_dir(&profiles) else {
-        return Some(keys);
-    };
-    for entry in entries.flatten() {
+    // No profiles dir is no profile overrides; the record below still counts.
+    for entry in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
@@ -267,6 +269,15 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
                 .to_string();
                 return warn_paused(&path, &reason);
             }
+        }
+    }
+    // A key the active account covers stays per-profile while its record
+    // entry lives, though a hand edit dropped it from that `config.toml`.
+    match crate::claude::saved_base_env_keys() {
+        Ok(covered) => keys.extend(covered),
+        Err(_) => {
+            let path = crate::claude::saved_base_env_path().ok()?;
+            return warn_paused(&path, "does not parse");
         }
     }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);

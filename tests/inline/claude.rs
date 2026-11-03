@@ -538,6 +538,9 @@ fn a_tier_override_alone_is_enough_to_write_settings() {
 // from the base settings.json, so a switch never inherits stale model routing.
 #[test]
 fn build_settings_clears_stale_model_knobs() {
+    // `KEEP` is a custom key the profile lacks, so the build consults the
+    // saved base values under `~/.clauth`.
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(
@@ -8177,5 +8180,130 @@ fn nothing_is_stale_against_a_sidecar_that_cannot_replace_it() {
         stale_copied_bearer(&item, &mint, now, false, &[]),
         None,
         "a static mint"
+    );
+}
+
+/// A profile carrying `ENDPOINT = value` and nothing else.
+fn endpoint_profile(name: &str, value: &str) -> Profile {
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile
+        .env
+        .insert("ENDPOINT".to_string(), value.to_string());
+    profile
+}
+
+/// The live `~/.claude/settings.json` env value of `ENDPOINT`.
+fn live_endpoint() -> Option<String> {
+    let settings: serde_json::Value =
+        read_json_file(&claude_settings_path().expect("settings path")).expect("live settings");
+    settings["env"]["ENDPOINT"].as_str().map(str::to_string)
+}
+
+fn seed_live_endpoint(value: &str) {
+    atomic_write(
+        &claude_settings_path().expect("settings path"),
+        format!("{{\"env\":{{\"ENDPOINT\":\"{value}\"}}}}"),
+    )
+    .expect("seed live settings");
+}
+
+fn saved_base_env_record() -> std::path::PathBuf {
+    crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("base-env.json")
+}
+
+#[test]
+fn a_cover_handed_between_profiles_restores_the_users_value_not_the_first_profiles() {
+    let _home = HomeSandbox::new();
+    seed_live_endpoint("user");
+    let strip = ["ENDPOINT".to_string()];
+    apply_profile_to_claude_settings(&endpoint_profile("p", "p-value"), &[]).expect("cover");
+    apply_profile_to_claude_settings(&endpoint_profile("q", "q-value"), &strip)
+        .expect("hand the cover to q");
+    assert_eq!(live_endpoint().as_deref(), Some("q-value"));
+    apply_profile_to_claude_settings(&Profile::new("r".to_string(), None, None), &strip)
+        .expect("end the cover");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the value p held over the user's is p's own, never saved as the user's"
+    );
+}
+
+#[test]
+fn the_saved_value_is_owner_only_while_covered_and_goes_when_the_live_cover_ends() {
+    let _home = HomeSandbox::new();
+    seed_live_endpoint("user");
+    apply_profile_to_claude_settings(&endpoint_profile("p", "p-value"), &[]).expect("cover");
+    assert!(
+        saved_base_env_record().exists(),
+        "the cover saves the user's value"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(saved_base_env_record())
+            .expect("record metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the saved value is owner-only");
+    }
+    apply_profile_to_claude_settings(
+        &Profile::new("r".to_string(), None, None),
+        &["ENDPOINT".to_string()],
+    )
+    .expect("end the cover");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    let record: serde_json::Value =
+        read_json_file(&saved_base_env_record()).expect("the stamped record stays");
+    assert_eq!(
+        record["keys"].get("ENDPOINT"),
+        None,
+        "the cover ending in the live file retires the saved value"
+    );
+}
+
+#[test]
+fn an_entry_a_crash_left_behind_never_outranks_the_users_later_value() {
+    let _home = HomeSandbox::new();
+    seed_live_endpoint("user-later");
+    // A crash between a restore's live write and its retire leaves the entry
+    // naming the value the user has since changed.
+    atomic_write_600(
+        &saved_base_env_record(),
+        r#"{"v":1,"keys":{"ENDPOINT":{"base":"user-earlier","wrote":"f7f649ef12157671b2a5e395acfdeb457567b106fa30069f0536687e935e1f5f"}}}"#,
+    )
+    .expect("seed the left-behind entry");
+    apply_profile_to_claude_settings(&endpoint_profile("p", "p-value"), &[]).expect("cover");
+    apply_profile_to_claude_settings(
+        &Profile::new("r".to_string(), None, None),
+        &["ENDPOINT".to_string()],
+    )
+    .expect("end the cover");
+    assert_eq!(live_endpoint().as_deref(), Some("user-later"));
+}
+
+#[test]
+fn an_unparseable_saved_record_refuses_the_uncover_without_quoting_it() {
+    let _home = HomeSandbox::new();
+    seed_live_endpoint("p-value");
+    atomic_write_600(&saved_base_env_record(), r#"{"ENDPOINT":"sk-saved-secret""#)
+        .expect("seed a torn record");
+    let error = apply_profile_to_claude_settings(
+        &Profile::new("r".to_string(), None, None),
+        &["ENDPOINT".to_string()],
+    )
+    .expect_err("an unreadable saved value refuses the write that would lose it");
+    let text = format!("{error:#}");
+    assert!(text.contains("base-env.json"), "names the record: {text}");
+    assert!(
+        !text.contains("sk-saved-secret"),
+        "the error never quotes a saved value"
+    );
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("p-value"),
+        "the refused write leaves the live file as it was"
     );
 }
