@@ -705,7 +705,9 @@ impl Profile {
     /// as on disk, and an inference token beside it makes it live again.
     pub(crate) fn rederive_base_url(&mut self) {
         self.fold_base_url_edit();
-        let base_url = self.derived_base_url(self.credentials.is_some());
+        // A torn store counts as a login, as the load counts it.
+        let has_login = self.credentials.is_some() || self.unreadable_credentials_store.is_some();
+        let base_url = self.derived_base_url(has_login);
         if base_url != self.base_url {
             self.provider = base_url.as_deref().and_then(Provider::from_base_url);
         }
@@ -4119,7 +4121,7 @@ pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
             return Ok(id);
         }
         let id = ProfileId::mint()?;
-        write_config_render(&read_profile(name)?, Some(&id))?;
+        write_config_render(&read_profile(name)?, Some(&id), false)?;
         Ok(id)
     })
 }
@@ -4745,26 +4747,38 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     }
     let name = profile.name.clone();
     let _ = with_state_lock(|_held| {
-        // Re-read and re-parse under the flock, then re-derive the canonical
-        // diff against the fresh bytes and write only if STILL different.
-        let Ok(source) = read_profile_source(&name) else {
-            return Ok(());
+        // Re-read under the hold: a peer's write landed between the read and
+        // this hold is kept, never rewound.
+        let now = match std::fs::read_to_string(config_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Ok(()),
         };
-        let (fresh_profile, _, fresh_raw) = build_profile(&name, source);
-        if on_disk_profile_config(&fresh_raw)
-            .is_ok_and(|on_disk| on_disk == canonical_profile_config(&fresh_profile))
-        {
+        if now != raw_config {
+            // A peer wrote: normalize its fresh bytes from a profile rebuilt
+            // from them, never from the pre-flock copy.
+            let Ok(source) = read_profile_source(&name) else {
+                return Ok(());
+            };
+            let (fresh_profile, _, fresh_raw) = build_profile(&name, source);
+            if on_disk_profile_config(&fresh_raw)
+                .is_ok_and(|on_disk| on_disk == canonical_profile_config(&fresh_profile))
+            {
+                return Ok(());
+            }
+            let _ = edit_existing_config_toml(
+                config_path,
+                &fresh_raw,
+                &fresh_profile,
+                ConfigEditMode::Load,
+                None,
+            );
             return Ok(());
         }
         // An edit the writer refuses (a non-plain or unreadable shape) is a
         // no-op for the load: the value is already normalized in memory.
-        let _ = edit_existing_config_toml(
-            config_path,
-            &fresh_raw,
-            &fresh_profile,
-            ConfigEditMode::Load,
-            None,
-        );
+        let _ =
+            edit_existing_config_toml(config_path, raw_config, profile, ConfigEditMode::Load, None);
         Ok(())
     });
 }
@@ -5006,7 +5020,7 @@ fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<(
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
         match fresh {
-            Some(id) => write_config_render(profile, Some(&id)),
+            Some(id) => write_config_render(profile, Some(&id), true),
             None => write_profile_config(profile),
         }
     })
@@ -5139,7 +5153,7 @@ impl std::error::Error for ConfigParseRefusal {}
 /// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
     let id = profile_id_at(&profile_config_path(&profile.name)?);
-    write_config_render(profile, id.as_ref())
+    write_config_render(profile, id.as_ref(), false)
 }
 
 /// The `id` key of the `config.toml` at `config_path`, read on its own so a
@@ -5151,13 +5165,21 @@ fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
 }
 
 /// `config.toml` from `profile` plus `id`, carrying every unmodelled key the
-/// file already holds. The caller holds the state flock.
-fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> {
+/// file already holds. The caller holds the state flock. `replace_unreadable`
+/// is true only for a create claiming a fresh directory: a leftover config the
+/// writer cannot read belongs to no account, so it is replaced instead of
+/// refusing, and the create's undo still names it if the roster write then
+/// fails.
+fn write_config_render(
+    profile: &Profile,
+    id: Option<&ProfileId>,
+    replace_unreadable: bool,
+) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
     let rendered = with_profile_id(render_config_toml(profile), id);
     let raw = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || replace_unreadable => {
             return atomic_write_600(&config_path, rendered).context("failed to write config.toml");
         }
         Err(e) => {
@@ -5594,10 +5616,12 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
 /// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
 /// added to the model without a doc block and example fails a test.
 #[cfg(test)]
-const MODELLED_SCALARS: [&str; 15] = [
+const MODELLED_SCALARS: [&str; 17] = [
     "base_url",
     "api_key",
     "auto_start",
+    "usage_probe",
+    "usage_probe_interval_ms",
     "fallback_threshold",
     "weekly_threshold",
     "last_resort",
@@ -5622,7 +5646,7 @@ fn push_scalar_doc(out: &mut String, key: &str) {
     match key {
         "base_url" => {
             out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
-            out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
+            out.push_str("# (Pro / Max / Ultra / Team / Enterprise) profile.\n");
         }
         "api_key" => {
             out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
@@ -5631,7 +5655,21 @@ fn push_scalar_doc(out: &mut String, key: &str) {
             out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
             out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
             out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+            out.push_str("# A plan with no 5-hour limit gets no ping.\n");
             out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+        }
+        "usage_probe" => {
+            out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
+            out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
+            out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
+            out.push_str("# window. A plan with no 5-hour limit has none to start. Inert while an\n");
+            out.push_str("# OAuth pair is stored. OAuth profiles only.\n");
+        }
+        "usage_probe_interval_ms" => {
+            out.push_str(&format!(
+                "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
+                 # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
+            ));
         }
         "fallback_threshold" => {
             out.push_str(
@@ -5753,23 +5791,27 @@ fn push_scalar_doc(out: &mut String, key: &str) {
     }
 }
 
-fn scalar_example(key: &str) -> &'static str {
+fn scalar_example(key: &str) -> String {
     match key {
-        "base_url" => "# base_url = \"https://api.anthropic.com\"\n",
-        "api_key" => "# api_key = \"sk-ant-...\"\n",
-        "auto_start" => "# auto_start = true\n",
-        "fallback_threshold" => "# fallback_threshold = 95.0\n",
-        "weekly_threshold" => "# weekly_threshold = 98.0\n",
-        "last_resort" => "# last_resort = true\n",
-        "preferred" => "# preferred = true\n",
-        "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n",
-        "rolling_token" => "# rolling_token = true\n",
-        "max_auto_spend" => "# max_auto_spend = 5.0\n",
-        "check_weekly" => "# check_weekly = false\n",
-        "check_scoped" => "# check_scoped = false\n",
-        "check_credit_cap" => "# check_credit_cap = false\n",
-        "bell_threshold" => "# bell_threshold = 95.0\n",
-        "disabled" => "# disabled = true\n",
+        "base_url" => "# base_url = \"https://api.anthropic.com\"\n".to_string(),
+        "api_key" => "# api_key = \"sk-ant-...\"\n".to_string(),
+        "auto_start" => "# auto_start = true\n".to_string(),
+        "usage_probe" => "# usage_probe = true\n".to_string(),
+        "usage_probe_interval_ms" => {
+            format!("# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n")
+        }
+        "fallback_threshold" => "# fallback_threshold = 95.0\n".to_string(),
+        "weekly_threshold" => "# weekly_threshold = 98.0\n".to_string(),
+        "last_resort" => "# last_resort = true\n".to_string(),
+        "preferred" => "# preferred = true\n".to_string(),
+        "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n".to_string(),
+        "rolling_token" => "# rolling_token = true\n".to_string(),
+        "max_auto_spend" => "# max_auto_spend = 5.0\n".to_string(),
+        "check_weekly" => "# check_weekly = false\n".to_string(),
+        "check_scoped" => "# check_scoped = false\n".to_string(),
+        "check_credit_cap" => "# check_credit_cap = false\n".to_string(),
+        "bell_threshold" => "# bell_threshold = 95.0\n".to_string(),
+        "disabled" => "# disabled = true\n".to_string(),
         _ => unreachable!("no example for modelled scalar {key}"),
     }
 }
@@ -5843,14 +5885,14 @@ fn render_config_toml(profile: &Profile) -> String {
     push_scalar_doc(&mut out, "base_url");
     match profile.saved_base_url().as_deref() {
         Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
-        None => out.push_str(scalar_example("base_url")),
+        None => out.push_str(&scalar_example("base_url")),
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "api_key");
     match profile.api_key.as_deref() {
         Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
-        None => out.push_str(scalar_example("api_key")),
+        None => out.push_str(&scalar_example("api_key")),
     }
     out.push('\n');
 
@@ -5858,30 +5900,21 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.auto_start {
         out.push_str("auto_start = true\n");
     } else {
-        out.push_str(scalar_example("auto_start"));
+        out.push_str(&scalar_example("auto_start"));
     }
     out.push('\n');
 
-    out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
-    out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
-    out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
-    out.push_str("# window. A plan with no 5-hour limit has none to start. Inert while an\n");
-    out.push_str("# OAuth pair is stored. OAuth profiles only.\n");
+    push_scalar_doc(&mut out, "usage_probe");
     if profile.usage_probe {
         out.push_str("usage_probe = true\n");
     } else {
-        out.push_str("# usage_probe = true\n");
+        out.push_str(&scalar_example("usage_probe"));
     }
     out.push('\n');
 
-    out.push_str(&format!(
-        "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
-         # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
-    ));
+    push_scalar_doc(&mut out, "usage_probe_interval_ms");
     if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
-        out.push_str(&format!(
-            "# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n"
-        ));
+        out.push_str(&scalar_example("usage_probe_interval_ms"));
     } else {
         out.push_str(&format!(
             "usage_probe_interval_ms = {}\n",
@@ -5893,14 +5926,14 @@ fn render_config_toml(profile: &Profile) -> String {
     push_scalar_doc(&mut out, "fallback_threshold");
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
-        None => out.push_str(scalar_example("fallback_threshold")),
+        None => out.push_str(&scalar_example("fallback_threshold")),
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "weekly_threshold");
     match profile.weekly_threshold {
         Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
-        None => out.push_str(scalar_example("weekly_threshold")),
+        None => out.push_str(&scalar_example("weekly_threshold")),
     }
     out.push('\n');
 
@@ -5908,7 +5941,7 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.last_resort {
         out.push_str("last_resort = true\n");
     } else {
-        out.push_str(scalar_example("last_resort"));
+        out.push_str(&scalar_example("last_resort"));
     }
     out.push('\n');
 
@@ -5916,13 +5949,13 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.preferred {
         out.push_str("preferred = true\n");
     } else {
-        out.push_str(scalar_example("preferred"));
+        out.push_str(&scalar_example("preferred"));
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "preferred_days");
     if profile.preferred_days.is_empty() {
-        out.push_str(scalar_example("preferred_days"));
+        out.push_str(&scalar_example("preferred_days"));
     } else {
         out.push_str("preferred_days = [");
         for (i, day) in render_preferred_days(&profile.preferred_days)
@@ -5944,20 +5977,20 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.rolling_token {
         out.push_str("rolling_token = true\n");
     } else {
-        out.push_str(scalar_example("rolling_token"));
+        out.push_str(&scalar_example("rolling_token"));
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "max_auto_spend");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
-        None => out.push_str(scalar_example("max_auto_spend")),
+        None => out.push_str(&scalar_example("max_auto_spend")),
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "check_weekly");
     if profile.check_weekly {
-        out.push_str(scalar_example("check_weekly"));
+        out.push_str(&scalar_example("check_weekly"));
     } else {
         out.push_str("check_weekly = false\n");
     }
@@ -5965,7 +5998,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     push_scalar_doc(&mut out, "check_scoped");
     if profile.check_scoped {
-        out.push_str(scalar_example("check_scoped"));
+        out.push_str(&scalar_example("check_scoped"));
     } else {
         out.push_str("check_scoped = false\n");
     }
@@ -5973,7 +6006,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     push_scalar_doc(&mut out, "check_credit_cap");
     if profile.check_credit_cap {
-        out.push_str(scalar_example("check_credit_cap"));
+        out.push_str(&scalar_example("check_credit_cap"));
     } else {
         out.push_str("check_credit_cap = false\n");
     }
@@ -5982,7 +6015,7 @@ fn render_config_toml(profile: &Profile) -> String {
     push_scalar_doc(&mut out, "bell_threshold");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
-        None => out.push_str(scalar_example("bell_threshold")),
+        None => out.push_str(&scalar_example("bell_threshold")),
     }
     out.push('\n');
 
@@ -5990,7 +6023,7 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.disabled {
         out.push_str("disabled = true\n");
     } else {
-        out.push_str(scalar_example("disabled"));
+        out.push_str(&scalar_example("disabled"));
     }
     out.push('\n');
 
@@ -6102,6 +6135,10 @@ fn ends_with_any_doc_block(text: &str, doc_blocks: &[String]) -> bool {
 /// ASCII while the generated comment keeps the typographic dash.
 const EM_DASH: char = '\u{2014}';
 
+/// The cent sign the `auto_start` doc uses, spelled like [`EM_DASH`] so the
+/// older doc block in `known_doc_blocks` stays ASCII too.
+const CENT: char = '\u{a2}';
+
 /// Every `config.toml` doc block clauth has written for `key`, current first.
 /// A file last saved before a doc rewording carries the older block; it is
 /// still the key's own, so its example toggles in place. Set and unset both
@@ -6109,6 +6146,19 @@ const EM_DASH: char = '\u{2014}';
 fn known_doc_blocks(key: &str) -> Vec<String> {
     let mut docs = vec![doc_block_for(key)];
     match key {
+        // The v0.18.0 form, before the Ultra tier.
+        "base_url" => docs.push(
+            "# Base URL for an API-endpoint profile. Leave commented for an OAuth\n\
+             # (Pro / Max / Team / Enterprise) profile.\n"
+                .to_string(),
+        ),
+        // The v0.18.0 form, before the no-5-hour-limit line.
+        "auto_start" => docs.push(format!(
+            "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+             # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+             # no running window. ~0.001{CENT} per ping. OAuth profiles only.\n\
+             # Old name `kick_timer = true` is still accepted.\n"
+        )),
         // ce69b154 reworded the alert copy (90205d2d wrote the older block).
         "bell_threshold" => docs.push(
             "# 5-hour utilization percentage at/above which clauth fires a bell\n\
@@ -6707,7 +6757,7 @@ fn set_scalar(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Val
         return;
     }
     let example = scalar_example(key);
-    replace_example_with_value(doc, key, value, example);
+    replace_example_with_value(doc, key, value, &example);
 }
 
 fn unset_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
@@ -6715,7 +6765,7 @@ fn unset_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
         return;
     }
     let example = scalar_example(key);
-    remove_key_keeping_comments(doc, key, &known_doc_blocks(key), example);
+    remove_key_keeping_comments(doc, key, &known_doc_blocks(key), &example);
 }
 
 fn set_table(
@@ -6804,6 +6854,18 @@ fn edit_f64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<f64>, ca: Option
     }
     match ca {
         Some(v) => set_scalar(doc, key, toml_edit::Value::from(v)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_u64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<u64>, ca: Option<u64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        // TOML integers are i64; the load clamps the interval into
+        // MIN..=MAX_USAGE_PROBE_INTERVAL_MS, so the cast is lossless.
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v as i64)),
         None => unset_scalar(doc, key),
     }
 }
@@ -6942,6 +7004,7 @@ enum KeyShape {
 enum ScalarKind {
     Str,
     F64,
+    U64,
     Bool,
     OptBool,
     StrArray,
@@ -6958,6 +7021,8 @@ fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
         "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
         "bell_threshold" => (ScalarKind::F64, "bell_threshold"),
         "auto_start" => (ScalarKind::Bool, "auto_start"),
+        "usage_probe" => (ScalarKind::Bool, "usage_probe"),
+        "usage_probe_interval_ms" => (ScalarKind::U64, "usage_probe_interval_ms"),
         "kick_timer" => (ScalarKind::Bool, "kick_timer"),
         "last_resort" => (ScalarKind::Bool, "last_resort"),
         "preferred" => (ScalarKind::Bool, "preferred"),
@@ -7002,6 +7067,13 @@ fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
         }
         ScalarKind::F64 => {
             if v.is_integer() || v.is_float() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::U64 => {
+            if v.as_integer().is_some_and(|i| i >= 0) {
                 KeyShape::Plain
             } else {
                 KeyShape::Unreadable
@@ -7100,6 +7172,10 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
         "base_url" => on_disk.base_url != canonical.base_url,
         "api_key" => on_disk.api_key != canonical.api_key,
         "auto_start" => on_disk.auto_start != canonical.auto_start,
+        "usage_probe" => on_disk.usage_probe != canonical.usage_probe,
+        "usage_probe_interval_ms" => {
+            on_disk.usage_probe_interval_ms != canonical.usage_probe_interval_ms
+        }
         "fallback_threshold" => on_disk.fallback_threshold != canonical.fallback_threshold,
         "weekly_threshold" => on_disk.weekly_threshold != canonical.weekly_threshold,
         "last_resort" => on_disk.last_resort != canonical.last_resort,
@@ -7182,6 +7258,13 @@ fn apply_config_edits(
             unset_scalar(doc, "auto_start");
         }
     }
+    edit_bool_scalar(doc, od.usage_probe, canonical.usage_probe, "usage_probe");
+    edit_u64_scalar(
+        doc,
+        od.usage_probe_interval_ms,
+        canonical.usage_probe_interval_ms,
+        "usage_probe_interval_ms",
+    );
     match mode {
         ConfigEditMode::Save => {
             edit_f64_scalar(

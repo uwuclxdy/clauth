@@ -7185,6 +7185,41 @@ fn an_example_under_an_earlier_clauth_doc_toggles_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file v0.18.0 wrote, before the no-5-hour-limit line, still toggles
+/// `auto_start` in place under its own older doc block, and unsetting gives the
+/// file back byte for byte.
+#[test]
+fn the_v0_18_0_auto_start_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldauto".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldauto")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = format!(
+        "{}{}",
+        scalar_doc("auto_start"),
+        scalar_example("auto_start")
+    );
+    assert_eq!(template.matches(&current).count(), 1);
+    let older = "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+                 # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+                 # no running window. ~0.001¢ per ping. OAuth profiles only.\n\
+                 # Old name `kick_timer = true` is still accepted.\n\
+                 # auto_start = true\n";
+    let original = template.replace(&current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldauto")).unwrap();
+    profile.auto_start = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("# auto_start = true\n", "auto_start = true\n")
+    );
+    profile.auto_start = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
 /// The current doc block of every modelled key is in that key's list of doc
 /// blocks clauth has written, so a reworded doc can never drop its own.
 #[test]
@@ -8223,7 +8258,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
     let pinned: BTreeMap<&str, &str> = [
         (
             "base_url",
-            "4f7d51d85ca5c284c6f4c6ece92ae9fbe4f1605fcec0287c3fb42f276f0cce0f",
+            "95d4a572b6789c4aba79697e57461e564b11df50e8be7cb7fb2a4f3afca85a22",
         ),
         (
             "api_key",
@@ -8231,7 +8266,15 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "auto_start",
-            "084d495e4f87c5c5fd5cd7a2cfe3b25de4952706ced338e60708f5465de62266",
+            "5a5fc00860ba38dbd36ed3958c1c4816ddc4f3a25c06cd2157bfce1c6108cbfb",
+        ),
+        (
+            "usage_probe",
+            "a898cf7d8afd331066cc2c206ca1cba8faad6675795a0de79303638f706a355e",
+        ),
+        (
+            "usage_probe_interval_ms",
+            "a6156cdb012c9f83e80563b0631987388fd32c7665538888c5016443055745f0",
         ),
         (
             "fallback_threshold",
@@ -9204,25 +9247,17 @@ fn a_preset_clear_after_a_repoint_never_restores_a_hidden_base_url() {
     crate::testutil::register_names(&["pr"]);
     let name = ProfileName::from("pr");
     let mut config = load_config().unwrap();
-    crate::actions::edit_profile_preset(
-        &mut config,
-        &name,
-        |url, models| {
-            *url = Some("https://y.example".to_owned());
-            *models = ModelSettings::default();
-            Ok(())
-        },
-    )
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models| {
+        *url = Some("https://y.example".to_owned());
+        *models = ModelSettings::default();
+        Ok(())
+    })
     .unwrap();
-    crate::actions::edit_profile_preset(
-        &mut config,
-        &name,
-        |url, models| {
-            *url = None;
-            *models = ModelSettings::default();
-            Ok(())
-        },
-    )
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models| {
+        *url = None;
+        *models = ModelSettings::default();
+        Ok(())
+    })
     .unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -9334,4 +9369,95 @@ fn a_load_over_an_ignored_endpoint_key_takes_no_flock() {
     let before = flocks();
     load_profile(&ProfileName::from("noflock")).unwrap();
     assert_eq!(flocks() - before, 0, "the load took the state flock");
+}
+
+/// A torn `credentials.json` counts as a login for the load's endpoint
+/// compare, as it does for the loaded profile: an ignored `base_url` beside it
+/// is no drift, so the load takes no flock and writes nothing.
+#[test]
+fn a_load_over_an_ignored_endpoint_key_beside_a_torn_store_takes_no_flock() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nlast_resort = true\n";
+    let path = raw_config("tornflock", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{").unwrap();
+    let flocks = || crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get);
+    let before = flocks();
+    let profile = load_profile(&ProfileName::from("tornflock")).unwrap();
+    assert!(profile.unreadable_credentials_store.is_some());
+    assert_eq!(profile.base_url, None);
+    assert_eq!(flocks() - before, 0, "the load took the state flock");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A negative probe interval is a value clauth cannot read: a save names the
+/// key and writes nothing.
+#[test]
+fn a_negative_probe_interval_refuses_a_save_by_name() {
+    let _home = HomeSandbox::new();
+    let body = "usage_probe_interval_ms = -5\n";
+    let path = raw_config("neg", body);
+    let mut profile = Profile::new("neg".to_string(), None, None);
+    profile.auto_start = true;
+    let err = save_profile_config(&profile).expect_err("the save refuses");
+    assert_eq!(
+        format!("{err:#}"),
+        "neg: config.toml has `usage_probe_interval_ms` in a shape clauth cannot read; fix or remove that line, then try again"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// An out-of-band probe interval is written clamped in place, keeping the
+/// comment above it and the one trailing it, at both ends of the band.
+#[test]
+fn a_load_writes_a_clamped_probe_interval_in_place_and_settles() {
+    let _home = HomeSandbox::new();
+    for (name, typed, clamped) in [
+        ("probelow", "5000", 60_000),
+        ("probehigh", "999999", 450_000),
+    ] {
+        let path = raw_config(
+            name,
+            &format!("# mine\nusage_probe_interval_ms = {typed}  # cadence\nusage_probe = true\n"),
+        );
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(profile.usage_probe_interval_ms, clamped, "{name}");
+        let expected =
+            format!("# mine\nusage_probe_interval_ms = {clamped}  # cadence\nusage_probe = true\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+        assert_next_load_writes_nothing(name, &path, &expected);
+    }
+}
+
+/// The probe switch and interval toggle their template example lines in
+/// place, and unsetting both gives the template back byte for byte.
+#[test]
+fn the_probe_keys_toggle_their_template_examples_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("probetoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("probetoggle")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(template.matches("# usage_probe = true\n").count(), 1);
+    assert_eq!(
+        template
+            .matches("# usage_probe_interval_ms = 90000\n")
+            .count(),
+        1
+    );
+
+    let mut profile = load_profile(&ProfileName::from("probetoggle")).unwrap();
+    profile.usage_probe = true;
+    profile.usage_probe_interval_ms = 120_000;
+    save_profile_config(&profile).unwrap();
+    let expected = template
+        .replace("# usage_probe = true\n", "usage_probe = true\n")
+        .replace(
+            "# usage_probe_interval_ms = 90000\n",
+            "usage_probe_interval_ms = 120000\n",
+        );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+    profile.usage_probe = false;
+    profile.usage_probe_interval_ms = 90_000;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), template);
 }

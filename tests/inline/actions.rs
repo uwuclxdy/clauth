@@ -8094,16 +8094,13 @@ fn a_url_preset_on_an_oauth_account_stays_out_of_memory_and_settings() {
     crate::testutil::register_names(&["acct"]);
     let mut config = inactive_config(profile);
     config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
 
-    edit_profile_preset(
-        &mut config,
-        &name,
-        |url, models| {
-            *url = Some("https://y.example".to_string());
-            *models = ModelSettings::default();
-            Ok(())
-        },
-    )
+    edit_profile_preset(&mut config, &name, |url, models| {
+        *url = Some("https://y.example".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
     .expect("the preset apply saves");
 
     let loaded = crate::profile::load_profile(&name).expect("load the profile");
@@ -8143,15 +8140,11 @@ fn a_preset_off_alibaba_drops_the_console_session() {
     crate::testutil::register_names(&["qwen"]);
     let mut config = inactive_config(p);
 
-    edit_profile_preset(
-        &mut config,
-        &name,
-        |url, models| {
-            *url = Some("https://api.deepseek.com/anthropic".to_string());
-            *models = ModelSettings::default();
-            Ok(())
-        },
-    )
+    edit_profile_preset(&mut config, &name, |url, models| {
+        *url = Some("https://api.deepseek.com/anthropic".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
     .expect("the preset apply saves");
 
     assert!(
@@ -8213,6 +8206,7 @@ fn a_keyless_url_on_an_oauth_account_stays_out_of_memory_and_settings() {
     crate::testutil::register_names(&["acct"]);
     let mut config = inactive_config(profile);
     config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
 
     edit_profile_endpoint(&mut config, &name, |url, key| {
         *url = Some("https://y.example".to_string());
@@ -8360,15 +8354,11 @@ fn a_failed_preset_save_restores_the_in_memory_profile() {
     let before = config.find(&name).expect("acct in the roster").clone();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
         .expect("chmod the profile dir read-only");
-    let err = edit_profile_preset(
-        &mut config,
-        &name,
-        |url, models| {
-            *url = Some("https://api.example.com".to_string());
-            *models = ModelSettings::default();
-            Ok(())
-        },
-    )
+    let err = edit_profile_preset(&mut config, &name, |url, models| {
+        *url = Some("https://api.example.com".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
     .expect_err("the save must fail");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .expect("restore the profile dir");
@@ -8381,6 +8371,136 @@ fn a_failed_preset_save_restores_the_in_memory_profile() {
         format!("{before:?}"),
         "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
     );
+}
+
+/// A torn store counts as a login for an env edit's re-derive, as at load: a
+/// keyless saved URL stays out of memory and the live settings.
+#[test]
+fn an_env_edit_beside_a_torn_store_keeps_a_keyless_url_hidden() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("torn");
+    save_profile(&Profile::new(
+        "torn".to_string(),
+        Some("https://y.example".to_string()),
+        None,
+    ))
+    .expect("save");
+    crate::testutil::register_names(&["torn"]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(store, "{").expect("tear the store");
+    let mut config = crate::profile::load_config().expect("load");
+    config.state.active_profile = Some("torn".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+    assert_eq!(config.find(&name).expect("torn").base_url, None);
+    edit_profile_env(&mut config, &name, |env| {
+        env.insert("FOO".to_string(), "bar".to_string());
+    })
+    .expect("the env edit saves");
+    assert_eq!(config.find(&name).expect("torn").base_url, None);
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the torn store: {live:?}"
+    );
+}
+
+/// An edit that moves only the key hands the closure the URL saved on disk,
+/// never the in-memory one: a key typed beside an OAuth login's unused saved
+/// URL keeps that URL and makes it live.
+#[test]
+fn a_key_only_edit_beside_an_unused_saved_url_keeps_it_and_goes_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+
+    let mut seen = None;
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        seen = url.clone();
+        *key = Some("sk-1".to_string());
+    })
+    .expect("the key-only edit saves");
+
+    assert_eq!(seen.as_deref(), Some("https://y.example"), "the saved URL");
+    let after = load_profile(&name).expect("reload");
+    assert_eq!(after.saved_base_url().as_deref(), Some("https://y.example"));
+    assert_eq!(after.api_key.as_deref(), Some("sk-1"));
+    assert_eq!(after.base_url.as_deref(), Some("https://y.example"));
+}
+
+/// A preset that carries no base URL, applied with "keep", keeps the account's
+/// unused saved URL.
+#[test]
+fn a_models_only_preset_keeps_an_unused_saved_url() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("mp");
+    let mut p = Profile::new("mp".to_string(), None, None);
+    p.credentials = Some(oauth_pair("ref"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    assert_eq!(p.base_url, None, "the url hides behind the login");
+    save_profile(&p).expect("save the account");
+    crate::testutil::register_names(&["mp"]);
+    let mut config = crate::profile::load_config().expect("load");
+    let preset = crate::presets::Preset {
+        name: "models-only".to_string(),
+        base_url: None,
+        models: crate::profile::ModelSettings {
+            default: Some("m1".to_string()),
+            ..Default::default()
+        },
+        builtin: false,
+    };
+    edit_profile_preset(&mut config, &name, |url, models| {
+        (*url, *models) = preset.applied_clearing(url, models, &[]);
+        Ok(())
+    })
+    .expect("the preset apply saves");
+    let disk = load_profile(&name).expect("reload");
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some("https://y.example"),
+        "keep keeps the saved url"
+    );
+    assert_eq!(disk.models.default.as_deref(), Some("m1"));
+}
+
+/// An api-key log-out keeps a base URL a peer saved after the caller's read.
+#[test]
+fn an_api_key_log_out_keeps_a_peer_base_url_edit() {
+    let _home = HomeSandbox::new();
+    let acct = ProfileName::from("acct");
+    save_profile(&Profile::new(
+        "acct".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fake-key".to_string()),
+    ))
+    .expect("save acct");
+    crate::testutil::register_names(&["acct"]);
+    let mut stale = crate::profile::load_config().expect("stale read");
+    let mut peer = crate::profile::load_config().expect("peer read");
+    edit_profile_endpoint(&mut peer, &acct, |url, _key| {
+        *url = Some("https://api.example.com".to_string());
+    })
+    .expect("peer edit");
+    clear_profile_api_key(&mut stale, &acct).expect("log out");
+    let after = load_profile(&acct).expect("reload");
+    assert_eq!(
+        after.saved_base_url().as_deref(),
+        Some("https://api.example.com"),
+        "the peer's base-url edit is kept, not rewound"
+    );
+    assert_eq!(after.api_key, None);
 }
 
 /// Adding a key beside a previously unused URL makes memory live and the
@@ -8396,6 +8516,7 @@ fn adding_a_key_beside_an_unused_url_goes_live() {
     crate::testutil::register_names(&["acct"]);
     let mut config = inactive_config(profile);
     config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
 
     edit_profile_endpoint(&mut config, &name, |url, key| {
         *url = Some("https://y.example".to_string());

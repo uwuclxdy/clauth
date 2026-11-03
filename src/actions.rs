@@ -1614,12 +1614,14 @@ pub(crate) fn edit_profile_endpoint(
         // copy moves only once the save landed, so a failed save leaves memory
         // matching disk.
         let (fresh, plan) = update_profile_config(name, |fresh| {
-            edit(&mut fresh.base_url, &mut fresh.api_key);
+            // The edit starts from the URL saved on disk, never the derived
+            // one: a key-only edit beside an unused saved URL keeps it.
+            let mut base_url = fresh.saved_base_url();
+            edit(&mut base_url, &mut fresh.api_key);
             // `replace_base_url`, not `set_base_url`: the row now shows the
             // saved URL, so its commit states that value outright even where it
             // equals the derived one — clearing a saved-but-unused URL has to
             // drop it on disk, not leave the typed value in place.
-            let base_url = fresh.base_url.clone();
             fresh.replace_base_url(base_url);
             // Every endpoint edit re-derives the in-memory URL the way the next
             // load does, key moved or not: a keyless URL hides in memory as on
@@ -1848,8 +1850,10 @@ pub(crate) fn edit_profile_preset(
         let active = active_on_disk(name, held)?;
         let before = read_before_identities(name);
         let (fresh, plan) = update_profile_config(name, |fresh| {
-            apply(&mut fresh.base_url, &mut fresh.models)?;
-            let base_url = fresh.base_url.clone();
+            // From the saved URL, as `edit_profile_endpoint` does: a "keep"
+            // over an unused saved URL keeps it.
+            let mut base_url = fresh.saved_base_url();
+            apply(&mut base_url, &mut fresh.models)?;
             fresh.replace_base_url(base_url);
             // Every endpoint edit re-derives the in-memory URL the way the next
             // load does: a keyless URL on an OAuth account hides in memory as
@@ -1885,6 +1889,7 @@ pub(crate) fn edit_profile_preset(
             profile.base_url = fresh.base_url.clone();
             profile.models = fresh.models.clone();
             profile.provider = fresh.provider;
+            profile.console = fresh.console.clone();
             profile.typed_endpoint = fresh.typed_endpoint.clone();
         }
 
@@ -5036,11 +5041,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 /// its base url is still wired, only the key is gone.
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|held| {
-        let saved_base_url = config.find(name).and_then(|p| p.saved_base_url());
-        edit_profile_endpoint(config, name, |url, api_key| {
-            *url = saved_base_url;
-            *api_key = None;
-        })?;
+        edit_profile_endpoint(config, name, |_, api_key| *api_key = None)?;
         // The torn store is re-read under this hold too: a login a peer landed
         // since the caller's read repaired it, and that store is not this
         // log-out's to delete.

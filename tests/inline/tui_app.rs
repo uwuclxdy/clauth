@@ -3494,6 +3494,39 @@ fn unused_url_oauth(name: &str) -> crate::profile::Profile {
     p
 }
 
+/// A key committed on an OAuth account's unused saved URL keeps the key and
+/// the saved URL, and makes the URL live.
+#[test]
+fn a_key_commit_beside_an_unused_saved_url_keeps_both() {
+    use super::{ConfigRow, InputState, commit_endpoint};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("u");
+    crate::profile::save_profile(&unused_url_oauth("u")).expect("save the account");
+    crate::testutil::register_names(&["u"]);
+    let mut app = super::App::new(crate::profile::load_config().expect("load"));
+    app.config_draft = Some(super::build_draft_existing(&app, &name));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.api_key = InputState::new("sk-own");
+    }
+    assert!(commit_endpoint(&mut app, ConfigRow::ApiKey));
+    let disk = crate::profile::load_profile(&name).expect("reload");
+    assert_eq!(
+        disk.api_key.as_deref(),
+        Some("sk-own"),
+        "the typed key lands"
+    );
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some("https://y.example"),
+        "the saved url survives the key commit"
+    );
+    assert_eq!(
+        disk.base_url.as_deref(),
+        Some("https://y.example"),
+        "the key makes the saved url live"
+    );
+}
+
 /// The base-url draft buffer seeds from the saved URL, not the derived one: a
 /// keyless URL hidden behind the login still fills the editor (and the focused
 /// row's value) instead of opening empty.
