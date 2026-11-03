@@ -5848,7 +5848,8 @@ fn push_models_doc(out: &mut String) {
     out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
     out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
     out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
-    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n");
+    out.push_str("# server-side advisor model (the `advisorModel` setting).\n");
 }
 
 fn models_doc() -> String {
@@ -6167,14 +6168,25 @@ fn known_doc_blocks(key: &str) -> Vec<String> {
         ),
         // d5ea42d5 added the fable tier to the alias list (5ab01076 wrote the
         // three-model form).
-        "models" => docs.push(
-            "# Per-account Claude Code model configuration, written into this profile's\n\
-             # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
-             # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n\
-             # those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n\
-             # subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
-                .to_string(),
-        ),
+        "models" => {
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n\
+                 # those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n\
+                 # subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+            // The v0.18.1 form, before the advisor row.
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n\
+                 # pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n\
+                 # forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+        }
         // 027afde6 renamed the wrap-off flag; 3076ec9b made the spend line a
         // stop-using cap; 5f840f3c wrote the original stop-at-90% text.
         "max_auto_spend" => {
@@ -6810,9 +6822,11 @@ fn preferred_days_value(days: &[String]) -> toml_edit::Value {
     toml_edit::Value::from(arr)
 }
 
-const MODELS_FIELDS: [&str; 6] = ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+const MODELS_FIELDS: [&str; 7] = [
+    "default", "opus", "sonnet", "haiku", "fable", "subagent", "advisor",
+];
 
-fn models_fields(m: &ModelSettings) -> [(&'static str, Option<&String>); 6] {
+fn models_fields(m: &ModelSettings) -> [(&'static str, Option<&String>); 7] {
     MODELS_FIELDS.map(|k| (k, m.field(k)))
 }
 

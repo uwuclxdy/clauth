@@ -7220,6 +7220,93 @@ fn the_v0_18_0_auto_start_doc_toggles_its_example_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file v0.18.1 wrote, before the `advisor` row, still toggles `[models]` in
+/// place under its own older doc block, and unsetting gives the file back byte
+/// for byte.
+#[test]
+fn the_v0_18_1_models_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldmodels".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldmodels")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n\
+                   # server-side advisor model (the `advisorModel` setting).\n\
+                   # [models]\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n# [models]\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldmodels")).unwrap();
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [models]\n# default = \"opusplan\"\n",
+            "[models]\ndefault = \"opusplan\"\n",
+            1
+        )
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// The `advisor` row saves into `[models]` in place beside the other rows and
+/// loads back, and clearing it deletes its line alone.
+#[test]
+fn a_save_writes_and_clears_the_advisor_row_in_place() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("madvisor", "[models]\ndefault = \"x\"  # keep\n");
+    profile.models.advisor = Some("opus".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\ndefault = \"x\"  # keep\nadvisor = \"opus\"\n"
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("madvisor"))
+            .unwrap()
+            .models
+            .advisor
+            .as_deref(),
+        Some("opus")
+    );
+    profile.models.advisor = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\ndefault = \"x\"  # keep\n"
+    );
+}
+
+/// Every `ModelSettings` field is a `[models]` row the in-place writer edits.
+/// The literal names every field, so a new one stops this test compiling until
+/// it is listed here and in the writer's rows.
+#[test]
+fn the_models_rows_cover_every_model_setting() {
+    let every = ModelSettings {
+        default: Some("a".to_string()),
+        opus: Some("a".to_string()),
+        sonnet: Some("a".to_string()),
+        haiku: Some("a".to_string()),
+        fable: Some("a".to_string()),
+        subagent: Some("a".to_string()),
+        advisor: Some("a".to_string()),
+    };
+    let serialized = serde_json::to_value(&every).unwrap();
+    let keys: std::collections::BTreeSet<&str> = serialized
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let rows: std::collections::BTreeSet<&str> = MODELS_FIELDS.iter().copied().collect();
+    assert_eq!(keys, rows);
+}
+
 /// The current doc block of every modelled key is in that key's list of doc
 /// blocks clauth has written, so a reworded doc can never drop its own.
 #[test]
@@ -8013,6 +8100,7 @@ fn every_profile_config_table_is_modelled() {
             haiku: Some("h".to_string()),
             fable: Some("f".to_string()),
             subagent: Some("g".to_string()),
+            advisor: Some("v".to_string()),
         },
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
@@ -8073,6 +8161,7 @@ fn a_save_writes_every_modelled_field_from_an_empty_file() {
         haiku: Some("h".to_string()),
         fable: Some("f".to_string()),
         subagent: Some("g".to_string()),
+        advisor: Some("v".to_string()),
     };
     profile.fallback_threshold = Some(50.0);
     profile.weekly_threshold = Some(70.0);
@@ -8330,7 +8419,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "models",
-            "e78621e5af6280a96a02d27a4c6e7e36065aea5c534c0263c73dfb7bdf670267",
+            "4a6551ff138bda9ba881637c888522937789bff1b50abb8af89719aa883393d8",
         ),
         (
             "env",
