@@ -17,6 +17,20 @@ const PIDFILE_CAP: u64 = 64;
 /// The script whose argv marks a live pane-label watcher.
 const WATCHER_SCRIPT: &str = "tag-watch.lua";
 
+#[cfg(test)]
+thread_local! {
+    /// How many Rex reads ran on this thread, so a test can assert the TUI's
+    /// thread runs none, whatever path would call them.
+    static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many Rex reads (`plugin_status`, `watcher_running`) ran on the calling
+/// thread.
+#[cfg(test)]
+pub(crate) fn reads_on_this_thread() -> usize {
+    READS.with(std::cell::Cell::get)
+}
+
 /// Where Rex reads its config and where the clauth plugin goes beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Paths {
@@ -55,11 +69,20 @@ impl Paths {
 pub(crate) enum PluginDir {
     /// Nothing there.
     Absent,
-    /// A dir clauth wrote: its marker's version, `None` when unreadable.
-    Managed { version: Option<String> },
-    /// A symlink, such as one onto a checkout of the plugin source.
-    Linked { target: Option<PathBuf> },
-    /// A dir clauth did not write.
+    /// A dir clauth wrote: the version its marker names.
+    Managed { version: String },
+    /// A symlink, such as one onto a checkout of the plugin source, and
+    /// whether following it reaches nothing (a missing target, a link loop, an
+    /// unreadable parent alike).
+    Linked {
+        target: Option<PathBuf>,
+        missing: bool,
+    },
+    /// A symlink whose target resolves to something other than a folder (a
+    /// regular file, a FIFO): Rex loads a folder, so this loads no plugin.
+    LinkedNotDir { target: Option<PathBuf> },
+    /// Something there that nothing proves clauth wrote: no dir, no readable
+    /// marker, or a marker naming no version.
     Foreign,
 }
 
@@ -80,17 +103,19 @@ pub(crate) fn state_dir(xdg_state_home: Option<OsString>, home: &Path) -> PathBu
 }
 
 /// The plugin dir's state, `None` when Rex's config dir does not exist (the
-/// row then does not render). A cheap local FS read, safe on every recompute.
+/// row then does not render). Follows a symlink, so it can hang on a stalled
+/// mount: the TUI runs it on a worker, never on the recompute.
 pub(crate) fn plugin_status(paths: &Paths) -> Option<PluginDir> {
+    #[cfg(test)]
+    READS.with(|reads| reads.set(reads.get() + 1));
     if !paths.init.parent().is_some_and(Path::is_dir) {
         return None;
     }
     Some(plugin_at(&paths.plugin))
 }
 
-/// The combined readout a test drives. Production reads the plugin on every
-/// recompute and the watcher only when it re-asks, so only a test pays for both
-/// in one call.
+/// The combined readout a test drives. Production runs each reading on its
+/// own worker, so only a test pays for both in one call.
 #[cfg(test)]
 pub(crate) fn status_at(
     paths: &Paths,
@@ -112,8 +137,19 @@ fn plugin_at(plugin: &Path) -> PluginDir {
         Err(_) => return PluginDir::Foreign,
     };
     if meta.file_type().is_symlink() {
-        return PluginDir::Linked {
-            target: std::fs::read_link(plugin).ok(),
+        let target = std::fs::read_link(plugin).ok();
+        return match std::fs::metadata(plugin) {
+            Ok(target_meta) if target_meta.is_dir() => PluginDir::Linked {
+                target,
+                missing: false,
+            },
+            // The target resolves, but not to a folder: Rex loads a folder,
+            // so this loads no plugin.
+            Ok(_) => PluginDir::LinkedNotDir { target },
+            Err(_) => PluginDir::Linked {
+                target,
+                missing: true,
+            },
         };
     }
     if !meta.is_dir() {
@@ -126,15 +162,17 @@ fn plugin_at(plugin: &Path) -> PluginDir {
         return PluginDir::Foreign;
     }
     match crate::runtime::read_regular_capped(&marker, MARKER_CAP) {
-        Ok(Some(bytes)) => PluginDir::Managed {
-            version: marker_version(&bytes),
+        Ok(Some(bytes)) => match marker_version(&bytes) {
+            Some(version) => PluginDir::Managed { version },
+            // A marker naming no version proves nothing about which clauth
+            // wrote the dir.
+            None => PluginDir::Foreign,
         },
         // The marker left between the stat and the open: nothing proves clauth
         // wrote the dir.
         Ok(None) => PluginDir::Foreign,
-        // A regular marker this user cannot read: clauth's dir, its version
-        // unknown.
-        Err(()) => PluginDir::Managed { version: None },
+        // A regular marker this user cannot read proves nothing either.
+        Err(()) => PluginDir::Foreign,
     }
 }
 
@@ -147,6 +185,8 @@ fn marker_version(bytes: &[u8]) -> Option<String> {
 /// Whether a pidfile under `state_dir` names a live pane-label watcher. Reads
 /// the process table, which spawns `ps` off Linux, so callers cache it.
 pub(crate) fn watcher_running(state_dir: &Path, procs: &dyn crate::which::ProcTable) -> bool {
+    #[cfg(test)]
+    READS.with(|reads| reads.set(reads.get() + 1));
     let Ok(entries) = std::fs::read_dir(state_dir) else {
         return false;
     };

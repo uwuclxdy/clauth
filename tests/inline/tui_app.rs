@@ -8172,9 +8172,11 @@ fn drain_shunt_action(app: &mut App) {
 /// `running(app)` still holds, join every registered worker bounded at `bound`.
 /// A flag still set with no registered worker panics naming it (the worker was
 /// never in the registry, so the join keeps finding nothing and would spin
-/// forever); a join that misses at `bound` panics naming how many workers are
-/// still running, their handles already handed back to the registry for the
-/// next join.
+/// forever); a drain that restarts its own worker never settles the flag, so
+/// the whole wait is bounded from the call and panics at `bound` naming it; a
+/// join that misses at `bound` panics naming how many workers are still
+/// running, their handles already handed back to the registry for the next
+/// join.
 fn drain_workers(
     app: &mut App,
     bound: std::time::Duration,
@@ -8182,10 +8184,19 @@ fn drain_workers(
     running: fn(&App) -> bool,
     drain: fn(&mut App),
 ) {
+    let started = std::time::Instant::now();
+    let mut first_pass = true;
     loop {
         drain(app);
         if !running(app) {
             return;
+        }
+        // A drain whose recompute restarts the worker never leaves `running`
+        // false: bound the whole wait, not only each join, so that regression
+        // fails here instead of hanging the test process. The first pass has
+        // joined nothing yet, so it never reads as a restart.
+        if !std::mem::take(&mut first_pass) && started.elapsed() >= bound {
+            panic!("{what} kept restarting past {bound:?}");
         }
         let registered = super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0);
         if registered == 0 {
@@ -22953,7 +22964,7 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
 
 /// Drain the Services probe workers' results the way the tick does: joining
 /// every registered worker (120 s hang bound) and draining until none of the
-/// six `running` flags holds.
+/// eight `running` flags holds.
 fn await_service_probes(app: &mut App) {
     drain_workers(
         app,
@@ -22966,6 +22977,8 @@ fn await_service_probes(app: &mut App) {
                 || app.services.pool_probe.running
                 || app.services.shunt_action.running
                 || app.services.shunt_save_worker.running
+                || app.services.rex_plugin_probe.running
+                || app.services.rex_watcher_probe.running
         },
         super::drain_service_probes,
     );
@@ -63282,10 +63295,20 @@ fn an_overwrite_after_a_peer_saved_the_login_elsewhere_captures_nothing() {
     }
 }
 
+/// How many times `counting_rex_watcher_probe` ran.
+static COUNTED_REX_WATCHERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_rex_watcher_probe() -> bool {
+    COUNTED_REX_WATCHERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    false
+}
+
 /// Entering the Services tab asks the Rex watcher again; only the 1 s tick
 /// reuses the cached answer.
 #[test]
 fn entering_the_services_tab_rechecks_the_rex_watcher() {
+    use std::sync::atomic::Ordering;
     let home = crate::testutil::HomeSandbox::new();
     let _env = crate::testutil::EnvPin::new(
         &home,
@@ -63297,20 +63320,454 @@ fn entering_the_services_tab_rechecks_the_rex_watcher() {
     );
     std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
     let mut app = bare_app();
-    // No pidfile exists, so a real check reads `not running`.
-    app.services.rex_watcher = Some(true);
+    app.services.rex_watcher_probe.prober = Some(counting_rex_watcher_probe);
+    let before = COUNTED_REX_WATCHERS.load(Ordering::SeqCst);
+
     super::switch_tab(&mut app, super::Tab::Services);
-    let watcher = app
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_REX_WATCHERS.load(Ordering::SeqCst),
+        before + 1,
+        "tab entry asked the watcher once"
+    );
+
+    // The 1 s tick reuses the cached answer: no new run starts.
+    app.last_services_refresh = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(2))
+        .unwrap();
+    super::poll_services_refresh(&mut app);
+    assert_eq!(
+        COUNTED_REX_WATCHERS.load(Ordering::SeqCst),
+        before + 1,
+        "the tick reuses the cached answer"
+    );
+    assert!(
+        !app.services.rex_watcher_probe.running,
+        "the tick starts no watcher run"
+    );
+}
+
+/// How many times `counting_rex_plugin_probe` ran.
+static COUNTED_REX_PLUGINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_rex_plugin_probe() -> Option<crate::rex::PluginDir> {
+    COUNTED_REX_PLUGINS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(crate::rex::PluginDir::Absent)
+}
+
+/// Tab entry, `r` and the 1 s tick each ask the Rex plugin read once, and each
+/// landing's recompute asks no more: the read runs per trigger, never at the
+/// drain rate. None of those paths runs a Rex read on the TUI's own thread.
+#[test]
+fn the_rex_plugin_read_is_asked_once_per_entry_refresh_and_tick() {
+    use std::sync::atomic::Ordering;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    app.services.rex_plugin_probe.prober = Some(counting_rex_plugin_probe);
+    app.services.rex_watcher_probe.prober = Some(no_rex_watcher_probe);
+    let before = COUNTED_REX_PLUGINS.load(Ordering::SeqCst);
+    let reads_before = crate::rex::reads_on_this_thread();
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_REX_PLUGINS.load(Ordering::SeqCst),
+        before + 1,
+        "tab entry asked the plugin read once"
+    );
+
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
+    );
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_REX_PLUGINS.load(Ordering::SeqCst),
+        before + 2,
+        "`r` asked the plugin read once more"
+    );
+
+    app.last_services_refresh = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(2))
+        .unwrap();
+    super::poll_services_refresh(&mut app);
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_REX_PLUGINS.load(Ordering::SeqCst),
+        before + 3,
+        "the tick asked the plugin read once more, and its landing asked no more"
+    );
+    assert!(
+        !app.services.rex_plugin_probe.running,
+        "no plugin run is left in flight after the tick's landing"
+    );
+    assert_eq!(
+        crate::rex::reads_on_this_thread(),
+        reads_before,
+        "a Rex read ran on the TUI's thread"
+    );
+}
+
+/// The real plugin prober resolves Rex's config from `REX_CONFIG`: the plugin
+/// dir beside the named init.lua is read, not the `XDG_CONFIG_HOME` or home
+/// one.
+#[test]
+fn the_rex_plugin_prober_reads_rex_config() {
+    let home = crate::testutil::HomeSandbox::new();
+    let custom = home.home().join("custom");
+    std::fs::create_dir_all(custom.join("clauth")).unwrap();
+    std::fs::write(
+        custom.join("clauth").join(".clauth-managed"),
+        "written by clauth 9.9.9\n",
+    )
+    .unwrap();
+    let init = custom.join("init.lua");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", Some(init.as_os_str())),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    assert_eq!(
+        super::rex_plugin_probe(),
+        Some(crate::rex::PluginDir::Managed {
+            version: "9.9.9".to_string()
+        }),
+        "the plugin dir beside $REX_CONFIG's init.lua reads managed"
+    );
+}
+
+/// The real plugin prober reads Rex's config under `XDG_CONFIG_HOME/rex` when
+/// `REX_CONFIG` is unset.
+#[test]
+fn the_rex_plugin_prober_reads_the_xdg_config_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let xdg = home.home().join("xdg-config");
+    std::fs::create_dir_all(xdg.join("rex").join("clauth")).unwrap();
+    std::fs::write(
+        xdg.join("rex").join("clauth").join(".clauth-managed"),
+        "written by clauth 9.9.9\n",
+    )
+    .unwrap();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    assert_eq!(
+        super::rex_plugin_probe(),
+        Some(crate::rex::PluginDir::Managed {
+            version: "9.9.9".to_string()
+        }),
+        "the plugin dir under $XDG_CONFIG_HOME/rex reads managed"
+    );
+}
+
+/// The real watcher prober reads `XDG_STATE_HOME/clauth-rex`: a pidfile there
+/// naming a live `tag-watch.lua` process reads running, and with the variable
+/// unset the sandbox's default state dir (holding no pidfile) reads not
+/// running.
+#[cfg(unix)]
+#[test]
+fn the_rex_watcher_prober_reads_the_xdg_state_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = home.home().join("state");
+    let rex_state = state.join("clauth-rex");
+    std::fs::create_dir_all(&rex_state).unwrap();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", Some(state.as_os_str())),
+        ],
+    );
+    // The `read` builtin blocks on the piped stdin (nothing is ever written),
+    // and `; :` keeps sh from exec-ing its last command: the live process's
+    // own argv carries the watcher's script name and it forks nothing to leak.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "read line; :", "tag-watch.lua"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a tag-watch.lua process");
+    std::fs::write(rex_state.join("watch-1.pid"), format!("{}\n", child.id()))
+        .expect("write the pidfile");
+    let running = super::rex_watcher_probe();
+    // Read the unset leg while the watcher still lives, so only the state dir
+    // the prober resolves can make it read not running.
+    let unset_running = {
+        let _unset = crate::testutil::EnvPin::new(&home, &[("XDG_STATE_HOME", None)]);
+        super::rex_watcher_probe()
+    };
+    child.kill().expect("kill the tag-watch.lua process");
+    child.wait().expect("reap the tag-watch.lua process");
+    assert!(
+        running,
+        "a pidfile under $XDG_STATE_HOME naming a live watcher reads running"
+    );
+    assert!(
+        !unset_running,
+        "with $XDG_STATE_HOME unset the sandbox's state dir holds no pidfile"
+    );
+}
+
+/// Released by `entering_the_services_tab_rechecks_a_held_rex_watcher`; the
+/// gated prober waits on it (10 s at most).
+static REX_WATCH_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// How many times `gated_rex_watcher_probe` started.
+static GATED_REX_WATCHERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A watcher read that counts its runs and hangs until `REX_WATCH_GATE` opens.
+fn gated_rex_watcher_probe() -> bool {
+    GATED_REX_WATCHERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (lock, cvar) = &REX_WATCH_GATE;
+    let open = lock.lock().expect("gate lock");
+    let _open = cvar
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .expect("gate wait");
+    false
+}
+
+/// Tab entry re-asks the Rex watcher even with a run already in flight: the
+/// `restart()` queues one follow-up behind it, so the answer after entry
+/// postdates the entry instead of leaving the pre-entry reading until the next
+/// `r`.
+#[test]
+fn entering_the_services_tab_rechecks_a_held_rex_watcher() {
+    use std::sync::atomic::Ordering;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    app.services.rex_watcher_probe.prober = Some(gated_rex_watcher_probe);
+    let before = GATED_REX_WATCHERS.load(Ordering::SeqCst);
+    app.services.rex_watcher_probe.start();
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.rex_watcher_probe.rerun,
+        "tab entry queued its re-ask behind the run in flight"
+    );
+
+    {
+        let (lock, cvar) = &REX_WATCH_GATE;
+        *lock.lock().expect("gate lock") = true;
+        cvar.notify_all();
+    }
+    await_service_probes(&mut app);
+    super::join_test_workers();
+    assert_eq!(
+        GATED_REX_WATCHERS.load(Ordering::SeqCst),
+        before + 2,
+        "the held run and its queued follow-up both ran"
+    );
+}
+
+/// Released by `a_hung_rex_plugin_read_leaves_the_first_paint_unblocked` once
+/// its first paint is done; the gated prober waits on it (10 s at most).
+static REX_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// A plugin-dir read that hangs (a link into a stalled network mount) until
+/// `REX_GATE` opens, then reads the plugin as not installed.
+fn gated_rex_plugin_probe() -> Option<crate::rex::PluginDir> {
+    let (lock, cvar) = &REX_GATE;
+    let open = lock.lock().expect("gate lock");
+    let _open = cvar
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .expect("gate wait");
+    Some(crate::rex::PluginDir::Absent)
+}
+
+fn no_rex_watcher_probe() -> bool {
+    false
+}
+
+/// Reading Rex's plugin dir follows a link the user chose, so a stalled
+/// target must never hold a frame: entering the tab and drawing return while
+/// the read is held, with no rex row yet, and the row appears once it lands.
+#[test]
+fn a_hung_rex_plugin_read_leaves_the_first_paint_unblocked() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    app.services.rex_plugin_probe.prober = Some(gated_rex_plugin_probe);
+    app.services.rex_watcher_probe.prober = Some(no_rex_watcher_probe);
+
+    let started = std::time::Instant::now();
+    super::switch_tab(&mut app, super::Tab::Services);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("first paint");
+    let elapsed = started.elapsed();
+    super::drain_service_probes(&mut app);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the tab entry and first paint waited on the held plugin read: {elapsed:?}"
+    );
+    assert!(
+        app.services.rex_plugin_probe.running,
+        "the plugin read is still held after the first paint"
+    );
+    assert!(
+        !app.services.checks.iter().any(|c| c.label == "rex"),
+        "no rex row before the plugin read lands"
+    );
+
+    {
+        let (lock, cvar) = &REX_GATE;
+        *lock.lock().expect("gate lock") = true;
+        cvar.notify_all();
+    }
+    await_service_probes(&mut app);
+    let rex = app
         .services
         .checks
         .iter()
         .find(|c| c.label == "rex")
-        .and_then(|c| {
-            c.detail
-                .iter()
-                .find(|l| l.starts_with("watcher: "))
-                .cloned()
-        });
-    assert_eq!(watcher.as_deref(), Some("watcher: not running"));
-    assert_eq!(app.services.rex_watcher, Some(false));
+        .expect("the row appears once the plugin read lands");
+    assert_eq!(
+        rex.detail,
+        vec![
+            "plugin: not installed".to_string(),
+            "watcher: not running".to_string(),
+            "experimental: may change in any release".to_string(),
+        ]
+    );
+    super::join_test_workers();
+}
+
+/// The rex row sits above herdr, so a rex reading that lands after the
+/// herdr row must not move a selection resting on herdr onto rex.
+#[test]
+fn a_late_rex_row_keeps_the_selection_on_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let herdr = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "herdr")
+        .expect("the herdr row renders off the cached probe");
+    assert!(
+        !app.services.checks.iter().any(|c| c.label == "rex"),
+        "no rex row before its readings land"
+    );
+    app.services.cursor = herdr;
+
+    app.services
+        .rex_plugin_probe
+        .tx
+        .send(Some(crate::rex::PluginDir::Absent))
+        .expect("send the plugin reading");
+    app.services
+        .rex_watcher_probe
+        .tx
+        .send(false)
+        .expect("send the watcher reading");
+    super::drain_service_probes(&mut app);
+
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "rex"),
+        "the rex row appears once its readings land"
+    );
+    assert_eq!(
+        app.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "the selection stays on the row it rested on"
+    );
+}
+
+/// A recompute that runs because a rex reading landed rebuilds the row from
+/// the caches and starts no plugin run, or the read would loop at the drain
+/// rate instead of the 1 s tick.
+#[test]
+fn a_landed_rex_reading_recompute_starts_no_plugin_run() {
+    use std::sync::atomic::Ordering;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = bare_app();
+    app.services.rex_plugin_probe.prober = Some(counting_rex_plugin_probe);
+    app.services.rex_watcher_probe.prober = Some(no_rex_watcher_probe);
+
+    app.services
+        .rex_plugin_probe
+        .tx
+        .send(Some(crate::rex::PluginDir::Absent))
+        .expect("land the plugin reading");
+    app.services
+        .rex_watcher_probe
+        .tx
+        .send(false)
+        .expect("land the watcher reading");
+    let before = COUNTED_REX_PLUGINS.load(Ordering::SeqCst);
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "rex"),
+        "the landed readings build the row"
+    );
+    assert!(
+        !app.services.rex_plugin_probe.running,
+        "the landing recompute starts no plugin run"
+    );
+    assert_eq!(
+        COUNTED_REX_PLUGINS.load(Ordering::SeqCst),
+        before,
+        "the prober did not run again"
+    );
+    super::join_test_workers();
 }

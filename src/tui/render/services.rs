@@ -288,6 +288,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     } else {
         None
     };
+    // The rex row's health colours its `plugin` value, so the text follows the
+    // dot (an idle row keeps body text); every other row keeps `value_tone`'s lookup.
+    let rex_plugin_tone = (check.label == "rex").then(|| health_tone(check.health));
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, line) in check.detail.iter().enumerate() {
         match problem_index(check, idx) {
@@ -310,7 +313,12 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
                 .into_iter()
                 .map(Line::from),
             ),
-            None => lines.push(detail_line(line, key_w, inner.width as usize)),
+            None => lines.push(detail_line(
+                line,
+                key_w,
+                inner.width as usize,
+                rex_plugin_tone,
+            )),
         }
     }
 
@@ -436,7 +444,7 @@ fn draw_shunt_detail(
     let mut move_plan_line: Option<usize> = None;
     for (idx, text) in check.detail.iter().enumerate() {
         if idx < action_start {
-            lines.push(detail_line(text, key_w, width));
+            lines.push(detail_line(text, key_w, width, None));
             continue;
         }
         if let Some(focus) = check.shunt_focus.iter().find(|f| f.line() == Some(idx)) {
@@ -2078,7 +2086,7 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
             .unwrap_or(0)
             .min(18);
         frame.render_widget(
-            Paragraph::new(detail_line(&line, key_w, warn_area.width as usize))
+            Paragraph::new(detail_line(&line, key_w, warn_area.width as usize, None))
                 .style(theme::base()),
             warn_area,
         );
@@ -2404,7 +2412,14 @@ fn herdr_row_text_tooltip(app: &App) -> &'static str {
 /// value (colon dropped, gap-aligned to `key_w`), everything else body text.
 /// Values and prose truncate to the pane (`width` cells) instead of clipping at
 /// the border: path values keep both ends (middle ellipsis), prose trails.
-fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
+/// `plugin_value_tone`, when given, replaces [`value_tone`] for a `plugin`
+/// value: a row whose own health decides that line's colour passes it.
+fn detail_line(
+    text: &str,
+    key_w: usize,
+    width: usize,
+    plugin_value_tone: Option<Style>,
+) -> Line<'static> {
     if text.is_empty() {
         return Line::from("");
     }
@@ -2414,7 +2429,10 @@ fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
     if let Some((key, value)) = text.split_once(": ") {
         let pad = key_w.saturating_sub(key.chars().count()) + 2;
         let value_w = width.saturating_sub(key_w + 2);
-        let tone = value_tone(key, value);
+        let tone = match plugin_value_tone {
+            Some(tone) if key == "plugin" => tone,
+            _ => value_tone(key, value),
+        };
         let mut spans = vec![Span::styled(
             format!("{key}{}", " ".repeat(pad)),
             theme::label(),
@@ -2458,6 +2476,16 @@ fn problem_line(text: &str, selected: bool) -> Line<'static> {
     let mut spans = vec![lead];
     spans.extend(prose::spans(&marked, base));
     Line::from(spans)
+}
+
+/// The tone a row's health gives its `plugin` value: the dot's own colour, so
+/// text and dot cannot drift apart, except an idle row, whose text stays body
+/// beside its dim dot.
+fn health_tone(health: Health) -> Style {
+    match health {
+        Health::Idle => theme::body(),
+        Health::Ok | Health::Warn | Health::Danger => Style::default().fg(health_color(health)),
+    }
 }
 
 /// Tone the value of a `key: value` row by health-bearing (key, value-head) pairs.

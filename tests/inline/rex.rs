@@ -134,13 +134,15 @@ fn a_managed_dir_reads_its_marker_version() {
     assert_eq!(
         fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
         Some(PluginDir::Managed {
-            version: Some("0.17.0".to_owned()),
+            version: "0.17.0".to_owned(),
         })
     );
 }
 
+/// A marker whose first line names no version proves nothing about which
+/// clauth wrote the dir.
 #[test]
-fn a_marker_whose_first_line_is_not_the_version_reads_none() {
+fn a_marker_whose_first_line_is_not_the_version_reads_foreign() {
     for marker in [
         "",
         "garbage\nwritten by clauth 0.17.0\n",
@@ -150,10 +152,29 @@ fn a_marker_whose_first_line_is_not_the_version_reads_none() {
         fx.managed(marker);
         assert_eq!(
             fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
-            Some(PluginDir::Managed { version: None }),
+            Some(PluginDir::Foreign),
             "marker {marker:?}"
         );
     }
+}
+
+/// A marker this user cannot read names no version either.
+#[cfg(unix)]
+#[test]
+fn a_marker_this_user_cannot_read_reads_foreign() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = RexFixture::new();
+    fx.managed("written by clauth 0.17.0\n");
+    let marker = fx.paths().plugin.join(".clauth-managed");
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&marker).is_ok() {
+        // Root reads through any mode, so the fault cannot be posed here.
+        return;
+    }
+    assert_eq!(
+        fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
+        Some(PluginDir::Foreign)
+    );
 }
 
 #[test]
@@ -203,7 +224,40 @@ fn a_symlinked_plugin_dir_reads_linked_with_its_target() {
         fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
         Some(PluginDir::Linked {
             target: Some(checkout),
+            missing: false,
         })
+    );
+}
+
+/// A link whose target cannot be reached loads nothing: the row must say so.
+#[cfg(unix)]
+#[test]
+fn a_dangling_plugin_link_reads_linked_with_a_missing_target() {
+    let fx = RexFixture::new();
+    let gone = fx.dir.path().join("gone").join("rex-plugin");
+    std::os::unix::fs::symlink(&gone, fx.paths().plugin).unwrap();
+    assert_eq!(
+        fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
+        Some(PluginDir::Linked {
+            target: Some(gone),
+            missing: true,
+        })
+    );
+}
+
+/// A link that resolves to a regular file loads no plugin (Rex loads a
+/// folder): the read says so rather than reading as a working link.
+#[cfg(unix)]
+#[test]
+fn a_plugin_link_onto_a_regular_file_reads_not_a_dir() {
+    let fx = RexFixture::new();
+    let file = fx.dir.path().join("checkout").join("init.lua");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "-- not a plugin dir\n").unwrap();
+    std::os::unix::fs::symlink(&file, fx.paths().plugin).unwrap();
+    assert_eq!(
+        fx.status(&FakeProcs::new(&[])).map(|s| s.plugin),
+        Some(PluginDir::LinkedNotDir { target: Some(file) })
     );
 }
 
