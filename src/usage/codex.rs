@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
+use super::fetch::{FetchError, LimitResets, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
 
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
@@ -189,7 +189,11 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
             .rate_limit_reached_type
             .and_then(|r| r.kind)
             .filter(|k| !k.is_empty()),
-        codex_reset_credits: raw.rate_limit_reset_credits.map(|c| c.available_count),
+        limit_resets: raw.rate_limit_reset_credits.map(|c| LimitResets {
+            usable: u32::try_from(c.available_count.max(0)).unwrap_or(u32::MAX),
+            clears: Vec::new(),
+            ends_at: None,
+        }),
         ..UsageInfo::default()
     })
 }

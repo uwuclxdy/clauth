@@ -678,6 +678,20 @@ impl PlanInfo {
 /// `/profile` sends no such status.
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
+/// One provider-neutral banked limit-reset reading. Only a codex poll fills it
+/// today, `usable` alone (its body names no windows and no end); the claude
+/// poll does not read the reset block yet, so a claude row carries no reading
+/// until it does. `None` means the harness carried no reading, never that the
+/// count was zero.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct LimitResets {
+    pub(crate) usable: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) clears: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ends_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct UsageInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -710,12 +724,13 @@ pub(crate) struct UsageInfo {
     /// the reason, for a surface that wants to say why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_limit_reached: Option<String>,
-    /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
-    /// the account can spend to reopen a window early. Rides the same response,
-    /// so it costs no extra request. The poll only reads the count; spending one
-    /// is `clauth limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
+    /// Banked usage-limit resets the account can spend to reopen a window
+    /// early. A codex poll fills it from its reset-credits block, which rides
+    /// the same response; the claude poll does not read the claude reset block
+    /// yet. The poll only reads it; spending one is `clauth limit-reset`, run
+    /// by the operator, which reads the block directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) codex_reset_credits: Option<i64>,
+    pub(crate) limit_resets: Option<LimitResets>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
     /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
     /// `mark_window_open`): a history line carrying it is clauth's own durable
@@ -1335,11 +1350,36 @@ pub(crate) fn cli_user_agent() -> &'static str {
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
 /// with no `anthropic-beta`.
 #[derive(Clone, Copy)]
-enum AuthClient {
+pub(crate) enum AuthClient {
     /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.
     Usage,
     /// `/profile`: `axios/1.15.2` UA + `Cache-Control: no-cache`, no beta.
     Profile,
+}
+
+/// The headers the usage poll's `/usage` ([`AuthClient::Usage`]) and `/profile`
+/// ([`AuthClient::Profile`]) GETs carry, applied over a request built on
+/// [`http_agent`]: bearer, Accept, Content-Type, then the client's
+/// UA/beta/cache-control split. Shared so an operator command's reads send
+/// exactly what the poll sends, without the poll's request-slot spacing or
+/// activity marks — an operator command spaces nothing, as the codex arm does.
+pub(crate) fn apply_auth_headers<B>(
+    req: ureq::RequestBuilder<B>,
+    access_token: &str,
+    client: AuthClient,
+) -> ureq::RequestBuilder<B> {
+    let req = req
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Content-Type", "application/json");
+    match client {
+        AuthClient::Usage => req
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", USER_AGENT.as_str()),
+        AuthClient::Profile => req
+            .header("User-Agent", crate::oauth::TOKEN_USER_AGENT)
+            .header("Cache-Control", "no-cache"),
+    }
 }
 
 fn get_json(
@@ -1358,19 +1398,7 @@ fn get_json(
     }
     // Both CC clients send Accept + Content-Type (the latter even without a body);
     // the UA and the beta/cache-control headers are what split the two.
-    let req = AGENT
-        .get(url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Content-Type", "application/json");
-    let req = match client {
-        AuthClient::Usage => req
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("User-Agent", USER_AGENT.as_str()),
-        AuthClient::Profile => req
-            .header("User-Agent", crate::oauth::TOKEN_USER_AGENT)
-            .header("Cache-Control", "no-cache"),
-    };
+    let req = apply_auth_headers(AGENT.get(url), access_token, client);
     let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
     if status == 429 {
@@ -1787,7 +1815,7 @@ fn assemble_usage(
                 spend,
                 // Codex-only readings: the claude body carries neither.
                 codex_limit_reached: None,
-                codex_reset_credits: None,
+                limit_resets: None,
                 open_at: None,
                 fetched_at: None,
                 no_five_hour_limit,

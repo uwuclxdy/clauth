@@ -165,18 +165,19 @@ pub(crate) enum Command {
         profile: String,
     },
 
-    /// Spend one of a codex account's banked usage-limit resets
+    /// Spend one of a codex or Claude Code account's banked usage-limit resets
     ///
     /// Reopens that account's usage windows now, the reset codex's own `/usage`
-    /// menu offers. Codex profiles only. Prompts `[y/N]` naming the reset it
-    /// will use (a `codex_rate_limits` reset first, then the one that expires
-    /// first) unless `--yes`, which a non-TTY run must pass: a used reset
-    /// cannot be given back. `--list` shows the account's resets and spends
-    /// nothing. Uses the profile's stored login as it stands and never
-    /// refreshes it.
+    /// menu offers, or a claude grant Claude Code's own `/limit-reset` offers.
+    /// Prompts `[y/N]` naming the reset it will use (codex: a `codex_rate_limits`
+    /// reset first, then the one that expires first; claude: the grant the
+    /// server names next) unless `--yes`, which a non-TTY run must pass: a used
+    /// reset cannot be given back. `--list` shows
+    /// the account's resets and spends nothing. Uses the profile's stored login
+    /// as it stands and never refreshes it.
     #[command(name = "limit-reset")]
     LimitReset {
-        /// Codex profile to reset.
+        /// Codex or Claude Code profile to reset.
         profile: String,
         /// Show the account's resets and which one would be used; spend none.
         #[arg(long, conflicts_with = "yes")]

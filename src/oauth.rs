@@ -1110,6 +1110,29 @@ pub(crate) fn third_party_dead_chain_copy(
     None
 }
 
+/// The sentence a quarantined claude login prints wherever it is refused:
+/// the third-party splitter's copy when it has one for this chain, else the
+/// generic dead-chain line.
+fn dead_chain_sentence(profile: Option<&crate::profile::Profile>, name: &ProfileName) -> String {
+    third_party_dead_chain_copy(profile, name).unwrap_or_else(|| {
+        format!("'{name}' usage chain is dead. Run `clauth login {name}` first, then re-run")
+    })
+}
+
+/// Refuses a quarantined claude login with [`dead_chain_sentence`], for every
+/// claude surface that acts on the chain. One fn so the commands a dead chain
+/// prescribes cannot drift between them.
+pub(crate) fn refuse_if_chain_dead(
+    config: &crate::profile::AppConfig,
+    profile: Option<&crate::profile::Profile>,
+    name: &ProfileName,
+) -> Result<()> {
+    if !config.is_auth_broken(name) {
+        return Ok(());
+    }
+    anyhow::bail!("{}", dead_chain_sentence(profile, name))
+}
+
 /// The dead-chain arm's toast detail.
 fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) -> String {
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -3824,11 +3847,7 @@ pub(crate) fn arm_rolling_token(
                 )
             }
         }
-        AuthGate::Broken => {
-            anyhow::bail!(
-                "'{name}' usage chain is dead. Run `clauth login {name}` first, then re-run"
-            )
-        }
+        AuthGate::Broken => anyhow::bail!("{}", dead_chain_sentence(None, name)),
         // CLI surface: `text_with_status` is the flavor that names the HTTP
         // status, since stderr has no companion log to read it out of.
         AuthGate::Transient(e) => Err(anyhow::anyhow!("{}", e.text_with_status())),

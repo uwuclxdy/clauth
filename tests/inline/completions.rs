@@ -2129,23 +2129,26 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
 
-/// `limit-reset` takes codex names only, so every shell completes its profile from
-/// `__complete --codex` and none offers it the claude roster (whose names the
-/// verb always refuses).
+/// `limit-reset` takes a codex or a Claude Code name, so every shell completes
+/// its profile from both rosters (`__complete --codex` then `__complete`), its
+/// description names no account kind, and it stays out of the claude-roster-only
+/// group line (it has its own arm).
 #[test]
-fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
+fn every_shell_completes_limit_reset_from_both_rosters() {
     assert!(BASH.contains(
         r#"[ "$prev" = "limit-reset" ]; then
-        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
+        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -- "${cur}") )"#
     ));
     assert!(ZSH.contains(
         r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null)"})"#
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)"})"#
     ));
     assert!(FISH.contains(
-        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -d Profile"#
     ));
+    assert!(ZSH.contains("'limit-reset[spend a banked usage-limit reset]'"));
+    assert!(FISH.contains("-a limit-reset -d \"Spend a banked usage-limit reset\""));
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         // The shared claude-roster group line in each shell.
         let group = script

@@ -39,7 +39,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         [ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex=$(clauth __complete --codex 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
-        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json --pid" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "sessions" ]; then
@@ -145,7 +145,7 @@ _clauth() {
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
-            'limit-reset[spend a banked usage-limit reset on a codex account]' \
+            'limit-reset[spend a banked usage-limit reset]' \
             'rolling-token[serve a profile a rolling token from its usage chain]' \
             'static-token[restore the static setup-token mint, or --clear the long-lived token]' \
             'which[print profile owning the loaded credentials]' \
@@ -178,7 +178,7 @@ _clauth() {
             '--explain[print the account that would be launched, without launching]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} )); then
         local -a profiles codex
@@ -350,7 +350,7 @@ complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Cla
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
-complete -c clauth -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset on a codex account"
+complete -c clauth -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset"
 complete -c clauth -f -n __fish_is_first_token -a rolling-token -d "Serve a profile a rolling token from its usage chain"
 complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
@@ -397,7 +397,7 @@ complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--th
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start; and not __fish_seen_subcommand_from proxy; and __clauth_start_takes_name" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from delete; and not __fish_seen_subcommand_from proxy; and not string match -qvr -- '^(--yes|-y|--force)\$' (commandline -opc)[3..]" -a "(__clauth_codex)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"

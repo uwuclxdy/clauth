@@ -24,6 +24,18 @@ fn list_of(credits: Vec<ResetCredit>, available_count: i64) -> ResetCredits {
     }
 }
 
+/// The `--list` note's local-stamp fallback, computed in the test so the pin
+/// names the instant and not the zone's digits.
+fn local_at(sent_at_ms: u64) -> String {
+    crate::format::local_stamp((sent_at_ms / 1000) as i64).unwrap_or_else(|| sent_at_ms.to_string())
+}
+
+/// The re-send window's end, the same derivation the copy uses.
+fn resend_deadline(sent_at_ms: u64) -> String {
+    crate::format::local_stamp(((sent_at_ms.saturating_add(600_000)) / 1000) as i64)
+        .unwrap_or_else(|| sent_at_ms.to_string())
+}
+
 /// The list body codex's own contract test pins, extra fields and all: every
 /// field codex reads parses, and the ones it ignores are ignored here too.
 #[test]
@@ -223,9 +235,10 @@ fn limit_reset_consume_codes_map_to_their_outcomes() {
 
 /// What each outcome prints or fails with. A success is one `clauth: ` line
 /// (a caller shows it as it stands); only a success says the reset was
-/// used, and every uncertain failure says to look before retrying.
+/// used, and every uncertain failure names the re-run that re-sends it.
 #[test]
 fn limit_reset_outcome_lines_say_what_was_spent() {
+    let sent_at_ms = 1_700_000_000_000;
     let credits = list_of(Vec::new(), 3);
     let reply = |code: &str, windows_reset: i64| ConsumeReply {
         code: code.to_string(),
@@ -233,43 +246,62 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
     };
 
     assert_eq!(
-        outcome_line("work", &credits, &reply("reset", 2)),
+        outcome_line("work", &credits, &reply("reset", 2), sent_at_ms),
         Ok("clauth: used a usage-limit reset on 'work': 2 windows reopened, 2 left.".to_string())
     );
     assert_eq!(
         outcome_line(
             "work",
             &list_of(Vec::new(), 1),
-            &reply("already_redeemed", 1)
+            &reply("already_redeemed", 1),
+            sent_at_ms,
         ),
         Ok("clauth: used a usage-limit reset on 'work': 1 window reopened, 0 left.".to_string())
     );
     assert_eq!(
-        outcome_line("work", &credits, &reply("nothing_to_reset", 0)),
+        outcome_line("work", &credits, &reply("nothing_to_reset", 0), sent_at_ms),
         Err("there is nothing to reset on 'work' right now, so no reset was used".to_string())
     );
-    let no_credit = outcome_line("work", &credits, &reply("no_credit", 0)).expect_err("fails");
+    let no_credit =
+        outcome_line("work", &credits, &reply("no_credit", 0), sent_at_ms).expect_err("fails");
     assert!(no_credit.contains("no longer available"), "{no_credit}");
     assert!(
         no_credit.contains("clauth limit-reset work --list"),
         "{no_credit}"
     );
-    let unknown = outcome_line("work", &credits, &reply("weird\u{1b}[2J", 0)).expect_err("fails");
-    assert!(unknown.contains("unconfirmed"), "{unknown}");
-    assert!(
-        unknown.contains("\"weird\\u{1b}[2J\""),
-        "quoted and escaped: {unknown}"
+    let unknown =
+        outcome_line("work", &credits, &reply("weird\u{1b}[2J", 0), sent_at_ms).expect_err("fails");
+    assert_eq!(
+        unknown,
+        format!(
+            "codex answered the reset request for 'work' with an unrecognized code \
+             \"weird\\u{{1b}}[2J\", so the outcome is unconfirmed; a re-run before {} re-sends \
+             the same request",
+            resend_deadline(sent_at_ms)
+        )
     );
-    assert!(unknown.contains("before retrying"), "{unknown}");
 }
+
+/// The send time every unknown-code case below hands `outcome_line`.
+const UNKNOWN_SENT_AT_MS: u64 = 1_700_000_000_000;
 
 /// The message around an unknown code, so each case below pins its own `shown`
 /// against everything else the line says.
 fn unknown_code_line(shown: &str) -> String {
     format!(
         "codex answered the reset request for 'work' with an unrecognized code {shown}, \
-         so the outcome is unconfirmed; check `clauth limit-reset work --list` before retrying"
+         so the outcome is unconfirmed; a re-run before {} re-sends the same request",
+        resend_deadline(UNKNOWN_SENT_AT_MS)
     )
+}
+
+/// The unknown-code outcome for `code`, sent at [`UNKNOWN_SENT_AT_MS`].
+fn unknown_code_outcome(code: String) -> String {
+    let reply = ConsumeReply {
+        code,
+        windows_reset: 0,
+    };
+    outcome_line("work", &list_of(Vec::new(), 3), &reply, UNKNOWN_SENT_AT_MS).expect_err("fails")
 }
 
 /// An over-cap code keeps its control characters visible as their escapes: each
@@ -280,11 +312,7 @@ fn unknown_code_line(shown: &str) -> String {
 #[test]
 fn limit_reset_unknown_code_keeps_its_control_characters_through_the_cut() {
     let code = format!("{}\n\u{1b}{}", "x".repeat(20), "y".repeat(30));
-    let reply = ConsumeReply {
-        code,
-        windows_reset: 0,
-    };
-    let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+    let unknown = unknown_code_outcome(code);
     assert_eq!(
         unknown,
         unknown_code_line(&format!(
@@ -305,11 +333,7 @@ fn limit_reset_unknown_code_keeps_its_control_characters_through_the_cut() {
 fn limit_reset_unknown_code_is_cut_before_it_is_escaped() {
     for (k, ys) in [(30, 5), (31, 4), (32, 3), (33, 2), (34, 1), (35, 0)] {
         let code = format!("{}\n{}", "x".repeat(k), "y".repeat(20));
-        let reply = ConsumeReply {
-            code,
-            windows_reset: 0,
-        };
-        let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+        let unknown = unknown_code_outcome(code);
         assert_eq!(
             unknown,
             unknown_code_line(&format!("\"{}\\n{}\"...", "x".repeat(k), "y".repeat(ys))),
@@ -319,11 +343,7 @@ fn limit_reset_unknown_code_is_cut_before_it_is_escaped() {
     // The `\n` escape needs 2 cells of the 1 the budget has left at 36 x's, so
     // the piece is left out whole and the cut stops at the last x.
     let code = format!("{}\n{}", "x".repeat(36), "y".repeat(20));
-    let reply = ConsumeReply {
-        code,
-        windows_reset: 0,
-    };
-    let unknown = outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails");
+    let unknown = unknown_code_outcome(code);
     assert_eq!(
         unknown,
         unknown_code_line(&format!("\"{}\"...", "x".repeat(36))),
@@ -337,13 +357,7 @@ fn limit_reset_unknown_code_is_cut_before_it_is_escaped() {
 #[test]
 fn limit_reset_unknown_code_cuts_a_huge_code_like_its_prefix() {
     let huge = "x".repeat(4 * 1024 * 1024);
-    let line = |code: String| {
-        let reply = ConsumeReply {
-            code,
-            windows_reset: 0,
-        };
-        outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails")
-    };
+    let line = unknown_code_outcome;
     let expected = unknown_code_line(&format!("\"{}\"...", "x".repeat(37)));
     assert_eq!(line(huge.clone()), expected);
     assert_eq!(line(huge[..64 * 1024].to_string()), expected);
@@ -354,13 +368,7 @@ fn limit_reset_unknown_code_cuts_a_huge_code_like_its_prefix() {
 /// the single-backslash `\n` pinned beside it.
 #[test]
 fn limit_reset_unknown_code_keeps_a_literal_backslash_apart_from_an_escape() {
-    let line = |code: String| {
-        let reply = ConsumeReply {
-            code,
-            windows_reset: 0,
-        };
-        outcome_line("work", &list_of(Vec::new(), 3), &reply).expect_err("fails")
-    };
+    let line = unknown_code_outcome;
 
     assert_eq!(
         line(format!("{}\\u{{000a}}", "x".repeat(30))),
@@ -405,28 +413,78 @@ fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
         assert_eq!(list_failure("work", &err), want, "{err:?}");
     }
 
+    let sent_at_ms = 1_780_741_000_000u64;
+    let deadline = resend_deadline(sent_at_ms);
     assert_eq!(
-        consume_failure("work", &ResetCallError::Unauthorized),
+        consume_failure("work", &ResetCallError::Unauthorized, sent_at_ms, false),
         rejected_line
     );
-    let transport = consume_failure("work", &ResetCallError::Transport);
-    assert!(
-        transport.contains("may or may not have gone through"),
-        "{transport}"
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Transport, sent_at_ms, false),
+        format!(
+            "the reset request for 'work' got no answer, so the reset may or may not have gone \
+             through; a re-run before {deadline} re-sends the same request"
+        )
     );
-    assert!(
-        transport.contains("clauth limit-reset work --list"),
-        "{transport}"
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Status(500), sent_at_ms, false),
+        format!(
+            "codex answered the reset request for 'work' with HTTP 500; a re-run before \
+             {deadline} re-sends the same request"
+        )
     );
-    let status = consume_failure("work", &ResetCallError::Status(500));
-    assert!(
-        status.contains("HTTP 500") && status.contains("before retrying"),
-        "{status}"
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Parse, sent_at_ms, false),
+        format!(
+            "codex answered the reset request for 'work' in a shape clauth does not read, so the \
+             reset may or may not have gone through; a re-run before {deadline} re-sends the same \
+             request"
+        )
     );
-    let parse = consume_failure("work", &ResetCallError::Parse);
-    assert!(
-        parse.contains("may or may not have gone through"),
-        "{parse}"
+}
+
+/// A codex re-send's failed consume says the earlier request's outcome is still
+/// unknown, whatever refused this one, and names the window's end.
+#[test]
+fn a_codex_resend_failure_keeps_the_earlier_outcome_open() {
+    let sent_at_ms = 1_780_741_000_000u64;
+    let deadline = resend_deadline(sent_at_ms);
+    let open = "the earlier request's outcome is still unknown";
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Unauthorized, sent_at_ms, true),
+        format!(
+            "codex rejected the stored access token for 'work'. The daemon refreshes it for a \
+             parked account and codex does for the one in use. Try again after that, and {open}; \
+             a re-run before {deadline} re-sends the same request"
+        )
+    );
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Status(409), sent_at_ms, true),
+        format!(
+            "codex answered the re-sent reset request for 'work' with HTTP 409; {open}; a \
+             re-run before {deadline} re-sends the same request"
+        )
+    );
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Status(503), sent_at_ms, true),
+        format!(
+            "codex answered the re-sent reset request for 'work' with HTTP 503; {open}; a \
+             re-run before {deadline} re-sends the same request"
+        )
+    );
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Transport, sent_at_ms, true),
+        format!(
+            "the re-sent reset request for 'work' got no answer; {open}; a re-run before \
+             {deadline} re-sends the same request"
+        )
+    );
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Parse, sent_at_ms, true),
+        format!(
+            "codex answered the re-sent reset request for 'work' in a shape clauth does not \
+             read; {open}; a re-run before {deadline} re-sends the same request"
+        )
     );
 }
 
@@ -1221,5 +1279,102 @@ fn limit_reset_transport_failure_is_reported_not_retried() {
     let err = consume_reset_credit_at(&urls.consume, "at", None, false, "id", "c")
         .expect_err("no answer");
     assert_eq!(err, ResetCallError::Transport);
-    assert!(consume_failure("work", &err).contains("may or may not have gone through"));
+    assert!(
+        consume_failure("work", &err, 1_780_741_000_000, false)
+            .contains("may or may not have gone through")
+    );
+}
+
+/// A re-send prompt names the earlier request whose answer never arrived, not
+/// a credit pick.
+#[test]
+fn limit_reset_resend_prompt_names_the_earlier_request() {
+    assert_eq!(
+        re_send_prompt("work"),
+        "clauth: re-send the usage-limit reset on 'work' whose answer never arrived? It cannot \
+         be undone."
+    );
+}
+
+/// `--list`'s pending note names the window's end as a local time, pinned on
+/// a fixed stamp so the wiring (which instant reaches the copy) is the claim.
+#[test]
+fn limit_reset_list_note_points_at_the_rerun() {
+    let sent_at_ms = 1_780_741_000_000u64;
+    assert_eq!(
+        list_pending_note("work", sent_at_ms),
+        format!(
+            "clauth: a usage-limit reset sent at {} got no answer; run `clauth limit-reset work` \
+             again before {} to re-send it.",
+            local_at(sent_at_ms),
+            resend_deadline(sent_at_ms)
+        )
+    );
+}
+
+/// A consume reply settles the record exactly when its code is a defined one;
+/// an unknown code leaves the outcome open.
+#[test]
+fn limit_reset_consume_reply_is_settled_only_on_a_defined_code() {
+    let reply = |code: &str| ConsumeReply {
+        code: code.to_string(),
+        windows_reset: 0,
+    };
+    for (code, want) in [
+        ("reset", true),
+        ("already_redeemed", true),
+        ("nothing_to_reset", true),
+        ("no_credit", true),
+        ("partially_reset", false),
+        ("weird", false),
+    ] {
+        assert_eq!(consume_settled(&reply(code)), want, "{code}");
+    }
+}
+
+/// A POST's record clears on a fresh send's refusal, on a reply naming a
+/// definite outcome, and never on a re-send's failure.
+#[test]
+fn a_post_settles_only_where_its_outcome_is_known() {
+    let reply = |code: &str| ConsumeReply {
+        code: code.to_string(),
+        windows_reset: 0,
+    };
+    let definite: Result<ConsumeReply, ResetCallError> = Ok(reply("reset"));
+    let unknown: Result<ConsumeReply, ResetCallError> = Ok(reply("weird"));
+    let rejected: Result<ConsumeReply, ResetCallError> = Err(ResetCallError::Unauthorized);
+    let refused: Result<ConsumeReply, ResetCallError> = Err(ResetCallError::Status(409));
+    let busy: Result<ConsumeReply, ResetCallError> = Err(ResetCallError::Status(503));
+    let silent: Result<ConsumeReply, ResetCallError> = Err(ResetCallError::Transport);
+    let garbled: Result<ConsumeReply, ResetCallError> = Err(ResetCallError::Parse);
+    for (reply, want) in [
+        (&definite, true),
+        (&unknown, false),
+        (&rejected, true),
+        (&refused, true),
+        (&busy, false),
+        (&silent, false),
+        (&garbled, false),
+    ] {
+        assert_eq!(
+            post_settles(false, reply, consume_settled),
+            want,
+            "{reply:?}"
+        );
+    }
+    for (reply, want) in [
+        (&definite, true),
+        (&unknown, false),
+        (&rejected, false),
+        (&refused, false),
+        (&busy, false),
+        (&silent, false),
+        (&garbled, false),
+    ] {
+        assert_eq!(
+            post_settles(true, reply, consume_settled),
+            want,
+            "{reply:?}"
+        );
+    }
 }

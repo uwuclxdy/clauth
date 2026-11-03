@@ -300,7 +300,7 @@ fn oauth_profile(
         extra_usage: extra,
         spend,
         codex_limit_reached: None,
-        codex_reset_credits: None,
+        limit_resets: None,
         open_at: None,
         fetched_at: None,
         no_five_hour_limit: false,

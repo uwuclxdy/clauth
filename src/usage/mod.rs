@@ -7,8 +7,14 @@ mod codex_headers;
 // `clauth limit-reset`: the list/consume pair, its selection rule and its text.
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
+// `clauth limit-reset` on a claude account: Claude Code's own reset read and
+// spend. One caller (`main.rs`), reached by path like its codex sibling.
+pub(crate) mod claude_reset;
+// The per-profile record of a limit-reset spend whose reply was lost, shared
+// by both reset arms.
 mod fetch;
 mod forget;
+pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
@@ -40,7 +46,7 @@ pub(crate) use codex::map_usage as map_codex_usage;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, AccountEmail, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LABEL_30D,
-    LoginProfile, ORG_REFUSED_STATUS, PlanInfo, PlanTier, ProfileFetchDecision,
+    LimitResets, LoginProfile, ORG_REFUSED_STATUS, PlanInfo, PlanTier, ProfileFetchDecision,
     ProfileUnauthorized, ScopedWindow, SpendInfo, USAGE_HTTP_DEADLINES, UsageInfo, UsageWindow,
     WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch, epoch_secs_to_iso,
     expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,

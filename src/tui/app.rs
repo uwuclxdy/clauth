@@ -4996,7 +4996,8 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                 seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
                 resets: cached
                     .as_ref()
-                    .and_then(|u| u.codex_reset_credits)
+                    .and_then(|u| u.limit_resets.as_ref())
+                    .map(|r| r.usable as i64)
                     .filter(|count| *count > 0),
                 fetched_at: crate::usage::usage_cache_clock_of(name, cached.as_ref()),
             }

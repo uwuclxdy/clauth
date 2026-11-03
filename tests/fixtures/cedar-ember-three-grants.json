@@ -1,0 +1,23 @@
+{"five_hour": {"utilization": 100.0, "resets_at": null},
+  "cedar_ember": {
+    "eligible": true, "ineligible_reason": null, "at_limit": true,
+    "exhausted": ["five_hour"],
+    "grants": [
+      {"id": "g-old", "label": "Old refill", "resets_total": 1, "resets_left": 1,
+       "starts_at": null, "ends_at": null, "clears": ["five_hour"],
+       "paused": false, "usable_now": true, "use_requires_limit": true,
+       "percent_used": {"five_hour": 100}, "blocking": [], "gives_back_weekly": false,
+       "unavailable_reason": null},
+      {"id": "g-week", "label": "Weekly refill", "resets_total": 2, "resets_left": 1,
+       "starts_at": null, "ends_at": null, "clears": ["five_hour", "seven_day"],
+       "paused": false, "usable_now": true, "use_requires_limit": true,
+       "percent_used": {"five_hour": 100, "seven_day": 40}, "blocking": [],
+       "type": "full", "gives_back_weekly": false, "unavailable_reason": null},
+      {"id": "g-cool", "label": "", "resets_total": 1, "resets_left": 1,
+       "starts_at": null, "ends_at": null, "clears": ["five_hour", "seven_day_blue"],
+       "paused": false, "usable_now": false, "use_requires_limit": true,
+       "percent_used": {}, "blocking": [], "gives_back_weekly": false,
+       "unavailable_reason": "cooldown"}
+    ],
+    "next_grant_id": "g-week", "weekly_resets_at": null, "cooldown_until": null,
+    "event_props": {}}}

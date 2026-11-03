@@ -2401,21 +2401,13 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // mis-fill pre-clear would have removed the sidecar — leaving the profile
     // with nothing at all, which is worse than the disengaged mis-fill it
     // started in.
-    if config.state.auth_broken.contains(&canonical) {
-        // Through the shared splitter, so this bail, the rotate toast and the
-        // quarantine's own log line cannot prescribe different commands for
-        // one state. Both third-party legs are reachable here: the load
-        // boundary re-reads a creds-and-no-key profile as OAuth, but a key
-        // that survives its emptiness test and fails `validate_api_key` keeps
-        // the endpoint and reaches the keyless leg (pinned with `rt-badkey`).
-        if let Some(sentence) = oauth::third_party_dead_chain_copy(Some(profile), &canonical) {
-            anyhow::bail!("{sentence}");
-        }
-        anyhow::bail!(
-            "'{canonical}' usage chain is dead. Run `clauth login {canonical}` first, \
-             then re-run"
-        );
-    }
+    // Through the shared sentence, so this bail, the rotate toast and the
+    // quarantine's own log line cannot prescribe different commands for one
+    // state. Both third-party legs are reachable here: the load boundary
+    // re-reads a creds-and-no-key profile as OAuth, but a key that survives
+    // its emptiness test and fails `validate_api_key` keeps the endpoint and
+    // reaches the keyless leg (pinned with `rt-badkey`).
+    oauth::refuse_if_chain_dead(&config, Some(profile), &canonical)?;
     // A chain captured without `user:profile`/`subscriptionType` mints bearers
     // that still authenticate but may not unlock plan-gated models — warn
     // rather than refuse, since the roll is otherwise correct.
@@ -3077,10 +3069,11 @@ mod feature_coverage;
 #[path = "../tests/inline/cli.rs"]
 mod tests;
 
-/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex
-/// account's banked usage-limit resets ([`usage::codex_reset`]). The confirm
-/// policy is [`cmd_delete`]'s: the spend is irreversible, so a non-TTY run with
-/// no `--yes` is refused, and refused before any request leaves the machine.
+/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex or
+/// claude account's banked usage-limit resets ([`usage::codex_reset`] /
+/// [`usage::claude_reset`]). The confirm policy is [`cmd_delete`]'s: the spend
+/// is irreversible, so a non-TTY run with no `--yes` is refused, and refused
+/// before any request leaves the machine.
 fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -3102,8 +3095,9 @@ fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
 /// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
 /// injected, so the refusals and the wire run offline.
 ///
-/// On success stdout's FIRST line is the one-line summary, readable as it
-/// stands; every failure is the returned error. Reads the store as it stands:
+/// On success stdout's first line is the one-line summary, readable as it
+/// stands, unless a name both rosters hold prints its collision note ahead of
+/// it; every failure is the returned error. Reads the store as it stands:
 /// a stale token is reported, never refreshed from here, because the store has
 /// one writer and it is not this command.
 fn limit_reset_with(
@@ -3114,18 +3108,40 @@ fn limit_reset_with(
     urls: &usage::codex_reset::ResetUrls,
     confirm: impl FnOnce(&str) -> Result<bool>,
 ) -> Result<()> {
-    use usage::codex_reset as reset;
-    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
-        let config = load_config()?;
-        if let Some(claude) = config.canonical_name(name) {
-            return Err(usage_error(format!(
-                "'{claude}' is a claude profile; limit-reset is codex-only"
-            )));
+    // Resolution order: the claude roster first, as `delete` and `switch`
+    // resolve a name, then the codex roster; a name on neither is the shared
+    // unknown-profile error. A name both rosters hold says out loud which
+    // account the spend lands on.
+    let config = load_config()?;
+    if let Some(canonical) = config.canonical_name(name) {
+        let canonical = ProfileName::from(canonical);
+        let Some(profile) = config.find(&canonical) else {
+            return Err(unknown_profile_error(&config, name));
+        };
+        if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some())
+        {
+            outln!("{}", codex_collision_note(&canonical, "spends a reset on"));
         }
-        return Err(unknown_profile_error(&config, name));
-    };
-    codex_auth::refuse_if_quarantined(&canonical)?;
-    let auth = codex_auth::read_store_auth(&canonical);
+        return limit_reset_claude(&config, profile, list, yes, interactive, urls, confirm);
+    }
+    if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+        return limit_reset_codex(&canonical, list, yes, interactive, urls, confirm);
+    }
+    Err(unknown_profile_error(&config, name))
+}
+
+fn limit_reset_codex(
+    canonical: &str,
+    list: bool,
+    yes: bool,
+    interactive: bool,
+    urls: &usage::codex_reset::ResetUrls,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    use usage::codex_reset as reset;
+    use usage::limit_reset_pending as pending;
+    codex_auth::refuse_if_quarantined(canonical)?;
+    let auth = codex_auth::read_store_auth(canonical);
     let Some(access_token) = auth.as_ref().and_then(|a| a.access_token()) else {
         anyhow::bail!(
             "'{canonical}' has no stored codex login to use a reset with; run `clauth login \
@@ -3139,33 +3155,192 @@ fn limit_reset_with(
     }
 
     let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
-        .map_err(|e| anyhow::anyhow!(reset::list_failure(&canonical, &e)))?;
+        .map_err(|e| anyhow::anyhow!(reset::list_failure(canonical, &e)))?;
+    let profile = ProfileName::from(canonical);
+    let pending_path = pending::path::<pending::CodexPending>(&profile)?;
     if list {
-        for line in reset::describe_reset_credits(&canonical, &credits) {
+        for line in reset::describe_reset_credits(canonical, &credits) {
             outln!("{line}");
+        }
+        if let Some(sent_at_ms) = pending::fresh_stamp::<pending::CodexPending>(&pending_path) {
+            outln!("{}", reset::list_pending_note(canonical, sent_at_ms));
         }
         return Ok(());
     }
-    let Some(credit) = credits.next_to_use() else {
-        anyhow::bail!("{}", reset::no_resets_available(&canonical));
+    let recorded = pending::take_fresh::<pending::CodexPending>(&pending_path)?;
+    let re_send = recorded.is_some();
+    let (credit_id, redeem_request_id, sent_at_ms) = match recorded {
+        Some(record) => {
+            if !yes && !confirm(&reset::re_send_prompt(canonical))? {
+                outln!("{}", reset::declined_re_send_line(canonical));
+                return Ok(());
+            }
+            (
+                record.credit_id,
+                record.redeem_request_id,
+                record.sent_at_ms,
+            )
+        }
+        None => {
+            let Some(credit) = credits.next_to_use() else {
+                anyhow::bail!("{}", reset::no_resets_available(canonical));
+            };
+            if !yes && !confirm(&reset::limit_reset_prompt(canonical, &credits, credit))? {
+                outln!("clauth: aborted. no reset was used on '{canonical}'.");
+                return Ok(());
+            }
+            let redeem_request_id = reset::new_redeem_request_id()?;
+            let sent_at_ms = crate::usage::now_ms();
+            pending::write(
+                &pending_path,
+                &pending::CodexPending {
+                    credit_id: credit.id.clone(),
+                    redeem_request_id: redeem_request_id.clone(),
+                    sent_at_ms,
+                },
+            )?;
+            (credit.id.clone(), redeem_request_id, sent_at_ms)
+        }
     };
-    if !yes && !confirm(&reset::limit_reset_prompt(&canonical, &credits, credit))? {
-        outln!("clauth: aborted. no reset was used on '{canonical}'.");
-        return Ok(());
-    }
-
-    let redeem_request_id = reset::new_redeem_request_id()?;
     let reply = reset::consume_reset_credit_at(
         &urls.consume,
         access_token,
         account_id,
         fedramp,
         &redeem_request_id,
-        &credit.id,
-    )
-    .map_err(|e| anyhow::anyhow!(reset::consume_failure(&canonical, &e)))?;
-    let summary =
-        reset::outcome_line(&canonical, &credits, &reply).map_err(|e| anyhow::anyhow!(e))?;
+        &credit_id,
+    );
+    let settled = reset::post_settles(re_send, &reply, reset::consume_settled);
+    if settled && let Err(e) = pending::clear(&pending_path) {
+        errln!(
+            "clauth: could not remove {} after the reset settled: {e}",
+            pending_path.display()
+        );
+    }
+    let summary = match reply {
+        Ok(reply) => reset::outcome_line(canonical, &credits, &reply, sent_at_ms)
+            .map_err(|e| anyhow::anyhow!(e))?,
+        Err(e) => {
+            return Err(anyhow::anyhow!(reset::consume_failure(
+                canonical, &e, sent_at_ms, re_send
+            )));
+        }
+    };
+    outln!("{summary}");
+    outln!("clauth: the daemon shows the new usage at its next poll.");
+    Ok(())
+}
+
+fn limit_reset_claude(
+    config: &AppConfig,
+    profile: &Profile,
+    list: bool,
+    yes: bool,
+    interactive: bool,
+    urls: &usage::codex_reset::ResetUrls,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    use usage::claude_reset as reset;
+    use usage::limit_reset_pending as pending;
+    let canonical = &profile.name;
+    // A profile clauth holds no claude login for has nothing to spend; a
+    // quarantined chain refuses the way every other claude surface does.
+    // Both land before anything leaves the machine.
+    let Some(access_token) = profile.access_token().filter(|t| !t.is_empty()) else {
+        anyhow::bail!(
+            "'{canonical}' has no stored claude login to use a reset with; run `clauth login \
+             {canonical}`"
+        );
+    };
+    oauth::refuse_if_chain_dead(config, Some(profile), canonical)?;
+    if !list && !yes && !interactive {
+        anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
+    }
+
+    let status = reset::read_status_at(&reset::read_url(&urls.claude_origin), access_token)
+        .map_err(|e| anyhow::anyhow!(reset::read_failure(canonical, &e)))?;
+    let pending_path = pending::path::<pending::ClaudePending>(canonical)?;
+    if list {
+        for line in reset::describe_grants(canonical, &status) {
+            outln!("{line}");
+        }
+        if let Some(sent_at_ms) = pending::fresh_stamp::<pending::ClaudePending>(&pending_path) {
+            outln!("{}", reset::list_pending_note(canonical, sent_at_ms));
+        }
+        return Ok(());
+    }
+    let recorded = pending::take_fresh::<pending::ClaudePending>(&pending_path)?;
+    let re_send = recorded.is_some();
+    let (org_uuid, grant_id, request_id, sent_at_ms) = match recorded {
+        Some(record) => {
+            let org_uuid =
+                reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
+                    .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;
+            if !yes && !confirm(&reset::re_send_prompt(canonical))? {
+                outln!("{}", reset::declined_re_send_line(canonical));
+                return Ok(());
+            }
+            (
+                org_uuid,
+                record.grant_id,
+                record.request_id,
+                record.sent_at_ms,
+            )
+        }
+        None => {
+            let Some(grant) = status.next_grant() else {
+                anyhow::bail!("{}", reset::no_resets_available(canonical, &status));
+            };
+            // The server refuses any grant but its next one, and Claude Code
+            // refuses to send an id off the pattern before it spends.
+            if !grant.is_usable_now() {
+                anyhow::bail!("{}", reset::unusable_next_line(canonical, grant));
+            }
+            if !reset::grant_id_is_sendable(&grant.id) {
+                anyhow::bail!("{}", reset::unsendable_grant_line(canonical));
+            }
+            let org_uuid =
+                reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
+                    .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;
+            if !yes && !confirm(&reset::spend_prompt(canonical, &status, grant))? {
+                outln!("clauth: aborted. no reset was used on '{canonical}'.");
+                return Ok(());
+            }
+            let request_id = reset::new_request_id()?;
+            let sent_at_ms = crate::usage::now_ms();
+            pending::write(
+                &pending_path,
+                &pending::ClaudePending {
+                    grant_id: grant.id.clone(),
+                    request_id: request_id.clone(),
+                    sent_at_ms,
+                },
+            )?;
+            (org_uuid, grant.id.clone(), request_id, sent_at_ms)
+        }
+    };
+    let reply = reset::spend_reset_at(
+        &reset::spend_url(&urls.claude_origin, &org_uuid),
+        access_token,
+        &grant_id,
+        &request_id,
+    );
+    let settled = reset::post_settles(re_send, &reply, reset::spend_settled);
+    if settled && let Err(e) = pending::clear(&pending_path) {
+        errln!(
+            "clauth: could not remove {} after the reset settled: {e}",
+            pending_path.display()
+        );
+    }
+    let summary = match reply {
+        Ok(reply) => reset::spend_outcome_line(canonical, &reply, sent_at_ms)
+            .map_err(|e| anyhow::anyhow!(e))?,
+        Err(e) => {
+            return Err(anyhow::anyhow!(reset::spend_failure(
+                canonical, &e, sent_at_ms, re_send
+            )));
+        }
+    };
     outln!("{summary}");
     outln!("clauth: the daemon shows the new usage at its next poll.");
     Ok(())
