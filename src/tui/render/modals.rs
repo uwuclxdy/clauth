@@ -19,15 +19,15 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::chain::reason_marker;
-use super::format::{grapheme_cells, spinner_frame, truncate};
+use super::format::{grapheme_cell_width, spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_CREDIT_CAP_LEGEND, DIAG_DISABLED,
     DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT, DIAG_NO_USAGE, DIAG_ORG_REFUSED,
     DIAG_SCOPED_SPENT_LEGEND, DIAG_STALE, DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
     META_RULE_MIN, bold_when, draw_scrollbar, draw_scrolled_lines, field_window,
-    follow_scroll_offset, follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret,
-    right_meta_fits, title_label, with_bg,
+    follow_scroll_offset, follow_scroll_offset_tail, head_cols, key_cell, line_cells, meta_line,
+    meta_placeable, place_caret, right_meta_fits, title_label, with_bg,
 };
 use super::prose::{self, key_lit};
 use crate::fallback::BlockedReason;
@@ -754,16 +754,6 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 /// unit it belongs to.
 type Flat = (String, usize, Style, Option<usize>);
 
-/// The cells a line draws, summed per grapheme: a whole-string measure folds a
-/// lam-alef cluster to one cell and the buffer draws it as two, so a line that
-/// only looks like it fits would overrun its row.
-pub(super) fn line_cells(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|span| grapheme_cells(span.content.as_ref()))
-        .sum()
-}
-
 /// [`chunk_line`] over a line carrying marked units ([`prose::marked`]): a
 /// grapheme inside a unit range only breaks where the unit does, so a key or
 /// command that fits a row stays on one, and units joined by punctuation wrap
@@ -801,7 +791,7 @@ fn chunk_line_units(
                 .map(|_| unit);
             flat.push((
                 grapheme.symbol.to_string(),
-                Span::raw(grapheme.symbol).width(),
+                grapheme_cell_width(grapheme.symbol),
                 span.style,
                 held,
             ));
@@ -1275,7 +1265,7 @@ fn modal_block(title: &str, width: u16) -> Block<'static> {
 /// The narrowest modal that draws `title` whole: the corners, the
 /// corner-adjacent dash and the ` TITLE ` break.
 fn modal_title_w(title: &str) -> u16 {
-    Line::from(title_label(title, true, u16::MAX)).width() as u16 + 3
+    line_cells(&Line::from(title_label(title, true, u16::MAX))) as u16 + 3
 }
 
 /// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
@@ -1980,6 +1970,8 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         ]));
     }
 
+    // Drawn cells: `lines[0]` carries the user-typed key, so a fold-class
+    // key sizes the modal by what it draws.
     let content_w = lines
         .iter()
         .map(|line| line_cells(&normalize_tabs(line)))
@@ -2759,9 +2751,15 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
     // Grow to fit both border breaks, ` ACTIONS ` and ` <account> ─` with the
-    // meta rule between them; a terminal too narrow for that drops the name.
+    // meta rule between them; a terminal too narrow for that drops the name,
+    // and a name ratatui cannot place reserves nothing.
     let meta_w = state.context.as_ref().map_or(0, |c| {
-        META_RULE_MIN + meta_line(c, Style::default()).width()
+        let slot = meta_line(c, Style::default());
+        if meta_placeable(&slot) {
+            META_RULE_MIN + line_cells(&slot)
+        } else {
+            0
+        }
     });
     let w = (content_w + 6)
         .max(modal_title_w(title) + meta_w as u16)

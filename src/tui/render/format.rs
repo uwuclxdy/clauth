@@ -6,8 +6,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-pub(super) use crate::format::grapheme_cells;
 use crate::format::{account_tier, format_pct};
+pub(super) use crate::format::{grapheme_cell_width, grapheme_cells};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -25,7 +25,7 @@ pub(super) fn prefix_in_cells(value: &str, budget: usize) -> (String, usize) {
     let mut out = String::new();
     let mut used = 0usize;
     for grapheme in Span::raw(value).styled_graphemes(Style::default()) {
-        let w = Span::raw(grapheme.symbol).width();
+        let w = grapheme_cell_width(grapheme.symbol);
         if used + w > budget {
             break;
         }

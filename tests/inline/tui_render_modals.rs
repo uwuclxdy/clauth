@@ -3038,6 +3038,151 @@ fn the_action_menu_drops_a_name_that_leaves_no_rule() {
     }
 }
 
+/// The action menu reserves width for its scope name (`meta_w`) and re-checks
+/// it through [`right_meta_fits`], and both measure by drawn cells: a lam-alef
+/// name (`لالالا`, three pairs) folds to half its cells a whole-string
+/// `Line::width` reads, so a modal sized on that measure left the name clipped
+/// into the corner behind a too-narrow rule.
+///
+/// Hand derivation of the three pins. One blank profile named `لالالا` (each
+/// letter its own one-cell grapheme, so the name draws 6 cells where a
+/// whole-string width reads 3) carries scoped items plus
+/// `refresh all accounts` (the widest label, 20 cells), so
+/// `content_w + 6 = (2 + 20 + 3 + 1) + 6 = 32`. The width terms: ` ACTIONS `
+/// = 9, `modal_title_w` = 12; `meta_line` = ` لالالا ` (8 drawn) + one border
+/// dash = 9, so `meta_w = META_RULE_MIN + 9 = 12`; `right_meta_fits` insets =
+/// 3 + 9 + 0 + 9 = 21 and the name is kept iff `modal − 21 >= 3`, i.e. modal
+/// >= 24. The modal spans `min(max(32, 12 + 12), terminal − 4)` below 80:
+/// - 27 cols → modal 23 → `23 − 21 = 2 < 3` → the name drops whole and the
+///   rule runs `23 − 1 − 10 − 1 = 11` dashes;
+/// - 28 cols → modal 24 → `24 − 21 = 3` → kept on a 3-dash rule,
+///   `1 + 1 + 9 + 3 + 8 + 1 + 1 = 24`;
+/// - 80 cols → cap 48 → modal 32 (content-bound) → `32 − 21 = 11` dashes
+///   between title and name.
+#[test]
+fn the_action_menu_sizes_a_lam_alef_name_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("لالالا"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ─── لالالا ─╮"),
+        (80, "╭─ ACTIONS ─────────── لالالا ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// `ｶﾞｶﾞ` draws 4 cells (two clusters, `CellWidth::cell_width` 2 each: one
+/// per halfwidth sound mark) where a per-grapheme `Span::width` sum reads 2,
+/// so the modal body path must measure and split by `cell_width` like the
+/// buffer: two rows of one cluster each at a 3-cell budget, nothing lost.
+#[test]
+fn chunk_line_wraps_a_katakana_body_line_by_drawn_cells() {
+    use ratatui::text::Line;
+    let rows = chunk_line(Line::from("ｶﾞｶﾞ"), 3);
+    // Hand-derived from the buffer's rule (each cluster draws 2): a 3-cell
+    // fill holds one cluster per row.
+    let texts: Vec<String> = rows.iter().map(line_text).collect();
+    assert_eq!(texts, ["ｶﾞ", "ｶﾞ"], "the exact split");
+    for r in &rows {
+        let drawn: usize = r
+            .spans
+            .iter()
+            .map(|span| super::super::format::grapheme_cells(span.content.as_ref()))
+            .sum();
+        assert!(
+            drawn <= 3,
+            "a row draws {drawn} cells at a 3-cell budget: {rows:?}"
+        );
+    }
+}
+
+/// A scope name carrying halfwidth katakana sound marks (`ｶﾞｶﾞ`, two clusters
+/// drawing 2 cells each) cannot sit in a right-aligned title slot: ratatui
+/// places by the whole-string `Line::width`, and any span holding a mark reads
+/// one cell short per mark — no span layout compensates (the mark's
+/// whole-string width is 0), so the drawn name would clip at the corner and
+/// lose the slot's closing `─`. The meta gives way whole instead, at every
+/// width, leaving the border run whole.
+#[test]
+fn the_action_menu_sizes_a_katakana_name_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("ｶﾞｶﾞ"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ────────────╮"),
+        (80, "╭─ ACTIONS ────────────────────╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// A name ratatui cannot place (`ｶﾞ` x12, halfwidth sound marks) reserves no
+/// width: `meta_w` budgets only a placeable meta, so the menu opens at its
+/// content width (2 + the widest label 20 + 3 + the hotkey 1 + 6 = 32) and the
+/// dropped name leaves no blank border run. Budgeting the unplaceable meta's
+/// full drawn width would open the menu 42 wide.
+#[test]
+fn the_action_menu_loses_no_width_to_an_unplaceable_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = "ｶﾞ".repeat(12);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from(name.as_str()),
+        )],
+    );
+    let (rows, left, right) = render_action_menu(&app, 80, 20);
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the action menu's top border");
+    let title: String = rows[top]
+        .chars()
+        .skip(left)
+        .take(right - left + 1)
+        .collect();
+    assert_eq!(
+        title, "╭─ ACTIONS ────────────────────╮",
+        "the menu opens at its content width, not the dropped name's"
+    );
+}
+
 fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
     let buf = term.backend().buffer();
     let area = *buf.area();
@@ -3160,6 +3305,80 @@ fn the_check_output_modal_ascii_body_renders_unchanged() {
         let got = check_output_body_rows(&term);
         assert_eq!(got, *expected, "check output ascii body at {w} cols");
     }
+}
+
+/// The check-output modal sizes to the cells its body draws: `لالالا` is three
+/// lam-alef pairs drawing two cells each, so the body line draws 20 cells where
+/// a whole-string width sums 11. Measured drawn, the modal is 26 wide (20 + 6
+/// of border and padding) and the line sits on one row; a whole-string measure
+/// sizes it at the 17-cell title and cuts the line into three rows inside a
+/// 17-cell border.
+#[test]
+fn the_check_output_modal_sizes_a_lam_alef_body_by_drawn_cells() {
+    use crate::tui::app::{Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Services);
+    app.open_modal(Modal::CheckOutput("لالالا لالالا لالالا".to_string()));
+    let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert_eq!(
+        modal_rows(term.backend().buffer()),
+        [
+            "╭─ CHECK OUTPUT ─────────╮",
+            "│                        │",
+            "│  لالالا لالالا لالالا  │",
+            "│                        │",
+            "╰────────────────────────╯",
+        ],
+        "the check output modal's drawn rows"
+    );
+}
+
+/// The `KEY IN USE` modal sizes the collision line by the cells it draws: the
+/// typed env key is user text, and `لالالا لالالا لالالا` draws 20 cells where a
+/// whole-string width sums 11, so the line draws 68 and the modal is 74 wide
+/// (68 + 6 of border and padding) rather than 66 under the key's whole-string
+/// width, which would wrap the collision line inside a short border.
+#[test]
+fn the_env_collision_modal_sizes_a_fold_class_key_by_drawn_cells() {
+    use crate::tui::app::{EnvCollisionForm, Modal, ScrollStamp, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::cell::Cell;
+    let _home = crate::testutil::HomeSandbox::new();
+    let key = "لالالا لالالا لالالا";
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::EnvCollision(EnvCollisionForm {
+        profile: "work".into(),
+        key: key.into(),
+        reason: "set by the base url field".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: Cell::new(0),
+        max_scroll_stamp: Cell::new(ScrollStamp::default()),
+        viewport: Cell::new(0),
+        overwrite_needs_review: Cell::new(false),
+    }));
+    let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let (_, _, left, right) = modal_bounds(buf);
+    assert_eq!(right - left + 1, 74, "the modal's drawn width");
+    let rows = crate::testutil::buffer_rows(buf);
+    assert!(
+        rows.iter().any(|row| {
+            let cut: String = row
+                .chars()
+                .skip(usize::from(left))
+                .take(usize::from(right - left + 1))
+                .collect();
+            cut.trim_end() == "│  'لالالا لالالا لالالا' is already used by set by the base url field.  │"
+        }),
+        "the collision line draws whole inside the modal"
+    );
 }
 
 /// A scrolled modal fits its title like a panel does: a short body leaves the
@@ -4534,9 +4753,22 @@ fn chunk_line_wraps_between_words_and_splits_long_words_by_cells() {
 /// duplicated), no row is empty, and no whitespace-only row follows a row that
 /// carries content. The named probes and a multi-span probe then pin the exact
 /// rows and each grapheme's span style.
+///
+/// Residual the grid cannot see: the alphabet holds no lam-alef fold and no
+/// halfwidth katakana sound mark (each added char multiplies the whole grid),
+/// so those two classes ride the fixed words swept below, and their exact
+/// splits are pinned by `chunk_line_wraps_between_words_and_splits_long_words_by_cells`
+/// and `chunk_line_wraps_a_katakana_body_line_by_drawn_cells`. Invariant (a)
+/// reads each row through ratatui's `CellWidth` trait directly — the rule the
+/// buffer draws by — not through the product's `format::grapheme_cells`, so a
+/// regression of that helper reds here. The grapheme walk runs only on a case
+/// the per-char measure cannot read exactly (`reads_per_char`), which is none
+/// of the grid's, so the grid costs what the whole-string measure costs and the
+/// fold-class words still take the walk.
 #[test]
 fn chunk_line_wraps_any_input_without_overrun_or_loss() {
     use crate::tui::theme;
+    use ratatui::buffer::CellWidth;
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
 
@@ -4557,20 +4789,72 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         }
         v
     }
-    fn check_wrap_invariants(s: &str, w: usize, rows: &[Line<'static>]) {
+    /// The row's drawn cells: each grapheme's own width through [`CellWidth`],
+    /// summed span by span.
+    fn drawn_cells(row: &Line<'static>) -> usize {
+        row.spans
+            .iter()
+            .map(|span| {
+                Span::raw(span.content.as_ref())
+                    .styled_graphemes(Style::default())
+                    .map(|g| usize::from(g.symbol.cell_width()))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+    /// Whether the per-char measure reads `text` exactly, so every row of the
+    /// case it comes from costs `Line::width` instead of [`drawn_cells`].
+    /// That holds for a text built only from standalone chars, on which no
+    /// ligature, emoji-presentation, ZWJ or halfwidth sound-mark rule fires,
+    /// as every char of the grid's alphabet is. For a text mixing such chars
+    /// one whole-text check proves nothing, since departures can cancel
+    /// (`⚠\u{fe0f}لا` sums equal and draws one cell more), so an alphabet
+    /// char that joins one of those rules needs the per-row walk.
+    fn reads_per_char(text: &str) -> bool {
+        let mut buf = [0u8; 4];
+        let mut per_char = 0usize;
+        for c in text.chars() {
+            let one: &str = c.encode_utf8(&mut buf);
+            let own = Span::raw(one).width();
+            if usize::from(one.cell_width()) != own {
+                return false;
+            }
+            per_char += own;
+        }
+        per_char == Span::raw(text).width()
+    }
+    /// Checks the wrap invariants for one case, whose rows all read through
+    /// either the per-char measure (`cheap`) or the drawn-cell walk; returns
+    /// the rows the cheap measure read, the sweep's control that the walk is
+    /// skipped on the plain rows it is meant to skip.
+    fn check_wrap_invariants(s: &str, w: usize, rows: &[Line<'static>], cheap: bool) -> usize {
+        let mut cheap_rows = 0usize;
+        // Each row's text once; every invariant below reads it.
+        let texts: Vec<String> = rows.iter().map(line_text).collect();
         // (c) no empty row unless the source is empty.
         if !s.is_empty() {
-            for (i, r) in rows.iter().enumerate() {
-                assert!(!line_text(r).is_empty(), "empty row {i} for {s:?} at w={w}");
+            for (i, text) in texts.iter().enumerate() {
+                assert!(!text.is_empty(), "empty row {i} for {s:?} at w={w}");
             }
         }
         // (a) a row may exceed `w` only as a single grapheme wider than `w`.
-        for r in rows {
-            if r.width() > w {
+        // Read through ratatui's `CellWidth` trait directly, independent of the
+        // product's measure, on the rows the per-char measure cannot read
+        // exactly; the grid's plain rows cost the whole-string `Line::width`.
+        for (i, r) in rows.iter().enumerate() {
+            let cells = if cheap {
+                cheap_rows += 1;
+                r.width()
+            } else {
+                drawn_cells(r)
+            };
+            if cells > w {
+                let graphemes = Span::raw(texts[i].as_str())
+                    .styled_graphemes(Style::default())
+                    .count();
                 assert!(
-                    line_text(r).chars().count() == 1,
-                    "{} cells in one row for {s:?} at w={w}: {r:?}",
-                    r.width()
+                    graphemes == 1,
+                    "{cells} cells in one row for {s:?} at w={w}: {r:?}"
                 );
             }
         }
@@ -4579,15 +4863,14 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         // duplicated, and no row loses or gains whitespace mid-row.
         let source: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
         let mut it = source.chars().peekable();
-        for (i, r) in rows.iter().enumerate() {
-            let row_text = line_text(r);
-            let leads_with_ws = row_text.chars().next().is_some_and(is_break_space);
+        for (i, text) in texts.iter().enumerate() {
+            let leads_with_ws = text.chars().next().is_some_and(is_break_space);
             if i > 0 && !leads_with_ws {
                 while it.peek().is_some_and(|&c| is_break_space(c)) {
                     it.next();
                 }
             }
-            for c in row_text.chars() {
+            for c in text.chars() {
                 assert_eq!(
                     it.next(),
                     Some(c),
@@ -4611,27 +4894,29 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
                 .take_while(|&c| is_break_space(c))
                 .map(cell_w)
                 .sum();
-            let first_ws_only = line_text(&rows[0]).chars().all(is_break_space);
+            let first_ws_only = texts[0].chars().all(is_break_space);
             assert!(
                 !first_ws_only || indent + cell_w(first) > w,
                 "whitespace-only first row for {s:?} at w={w}: {rows:?}"
             );
         }
         let mut seen_content = false;
-        for (i, r) in rows.iter().enumerate() {
-            let ws_only = line_text(r).chars().all(is_break_space);
+        for (i, text) in texts.iter().enumerate() {
+            let ws_only = text.chars().all(is_break_space);
             assert!(
                 !(ws_only && seen_content),
                 "whitespace-only row {i} for {s:?} at w={w}: {rows:?}"
             );
             seen_content |= !ws_only;
         }
+        cheap_rows
     }
 
     let alphabet = [
         'a', 'b', ' ', '\t', '漢', '\u{a0}', '\u{202f}', '\u{2007}', '\u{3000}',
     ];
     let mut checked = 0usize;
+    let mut cheap_rows = 0usize;
     for len in 0..=7usize {
         let total = alphabet.len().pow(len as u32);
         let mut buf = vec![' '; len];
@@ -4641,8 +4926,11 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
                 n /= alphabet.len();
             }
             let s: String = buf.iter().collect();
+            let normalized: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+            let cheap = reads_per_char(&normalized);
             for w in 1..=6usize {
-                check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w));
+                cheap_rows +=
+                    check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w), cheap);
                 checked += 1;
             }
             // (f) `w == 0` tokenizes like every other width: a grapheme wider
@@ -4705,6 +4993,44 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         }
     }
     assert!(checked > 2_000_000, "the sweep covered {checked} cases");
+    // The fold classes the Cartesian alphabet cannot hold, as fixed words over
+    // every width: lam-alef folds per letter, a halfwidth katakana sound mark
+    // draws its own cell, and one probe mixes them with a break and a wide
+    // glyph.
+    for s in ["لالالا", "ｶﾞｶﾞ", "aｶﾞ 漢"] {
+        // A fold or a halfwidth sound mark reads one cell off the per-char
+        // measure, so a row carrying both letters or the mark pays the walk.
+        let cheap = reads_per_char(s);
+        assert!(!cheap, "the per-char measure read {s:?} exactly");
+        for w in 1..=6usize {
+            cheap_rows += check_wrap_invariants(s, w, &chunk_line(Line::from(s), w), cheap);
+        }
+        let rows = chunk_line(Line::from(s), 0);
+        assert!(!rows.is_empty(), "w=0 still draws the line for {s:?}");
+        let mut before: Vec<String> = Vec::new();
+        for r in &rows {
+            let t = line_text(r);
+            let graphemes: Vec<String> = Span::raw(t.as_str())
+                .styled_graphemes(Style::default())
+                .map(|g| g.symbol.to_string())
+                .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                .collect();
+            assert!(
+                graphemes.len() <= 1,
+                "w=0 leaves two visible graphemes on one row for {s:?}: {t:?}"
+            );
+            before.extend(graphemes);
+        }
+        let after: Vec<String> = Span::raw(s)
+            .styled_graphemes(Style::default())
+            .map(|g| g.symbol.to_string())
+            .filter(|g| g.chars().any(|c| !is_break_space(c)))
+            .collect();
+        assert_eq!(
+            before, after,
+            "w=0 keeps the visible graphemes in order for {s:?}"
+        );
+    }
 
     // The named probes, pinned row for row.
     let probes: [(&str, usize, &[&str]); 18] = [
@@ -4747,6 +5073,16 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         out,
         flatten_styled(&split),
         "every grapheme keeps its span style across the split"
+    );
+
+    // Each grid source is checked at six widths and every check holds at least
+    // one row, so the 5,380,840 sources hold at least 32,285,040 grid rows:
+    // below that, grid rows took the grapheme walk the per-char measure exists
+    // to skip.
+    assert!(
+        cheap_rows > 32_000_000,
+        "the per-char measure read {cheap_rows} rows: the grid's rows must take \
+         the cheap path, not the grapheme walk"
     );
 }
 
@@ -5247,6 +5583,15 @@ fn modal_bounds(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
         }
     }
     panic!("no open modal in the frame")
+}
+
+/// The open modal's drawn rows cut to its borders: the top row through the
+/// bottom row, each spanning `left..=right`.
+fn modal_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+    let (top, bottom, left, right) = modal_bounds(buf);
+    (top..=bottom)
+        .map(|y| (left..=right).map(|x| buf[(x, y)].symbol()).collect())
+        .collect()
 }
 
 /// The open modal's row holding the `❯` caret: `(y, left border x, right

@@ -1468,7 +1468,7 @@ fn typed_field_label(label: &str, indent: usize, lead_w: usize) -> (String, usiz
             CONFIG_KEY_GUTTER
         )
     );
-    let width = Span::raw(&text).width();
+    let width = grapheme_cells(&text);
     (text, width)
 }
 

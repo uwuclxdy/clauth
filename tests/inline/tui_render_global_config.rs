@@ -82,6 +82,104 @@ fn key_cell_is_uniform_width() {
     }
 }
 
+/// `cells_window` slices by the cells the buffer draws
+/// ([`CellWidth::cell_width`]): `ｶﾞｶﾞ` is two clusters drawing 2 cells each
+/// (a halfwidth sound mark draws its own cell), so a 3-cell window holds one
+/// cluster, and a window starting at drawn cell 2 shows the second cluster —
+/// never a blank window over content, which a per-grapheme `Span::width`
+/// slice draws (a drawn start mapped onto `Span::width` coordinates).
+#[test]
+fn cells_window_slices_a_dakuten_value_by_drawn_cells() {
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 0, 3);
+    assert_eq!(window, "ｶﾞ", "the 3-cell window holds one 2-cell cluster");
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 2, 3);
+    assert_eq!(
+        window, "ｶﾞ",
+        "a window at drawn cell 2 shows the second cluster"
+    );
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 1, 3);
+    assert_eq!(
+        window, " ｶﾞ",
+        "a cluster cut by the left edge leaves its cell blank"
+    );
+}
+
+/// `key_cell` pads by the key's drawn cells: a profile name pre-cut to drawn
+/// cells (services' facts column) holding `ｶﾞｶﾞ` draws 4 where a whole-string
+/// width reads 2, so a whole-string pad overpads by 2 and the value column
+/// drifts right past the pane edge. Drawn 4 + pad 4 = the 6-cell column + gutter.
+#[test]
+fn key_cell_pads_a_dakuten_key_by_drawn_cells() {
+    assert_eq!(key_cell("ｶﾞｶﾞ", 6, 2), "ｶﾞｶﾞ    ");
+}
+
+/// A cycle row's trail measures each custom value's word by the cells the
+/// buffer draws: the Setup model field takes any typed id, and `لالالا` draws 6
+/// cells where the whole-string `Span::width` reads 3. At an 18-cell pane the
+/// value column is 7, so `sonnet` (6) opens its own line and the fold word (6
+/// drawn) cannot share it; a word measured at 3 joins that line and the run
+/// draws 20 cells in an 18-cell pane, cut at the pane edge.
+#[test]
+fn a_cycle_row_sizes_a_fold_class_custom_word_by_drawn_cells() {
+    use super::super::format::grapheme_cells;
+    use super::super::panes::cycle_row_lines;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+    const WIDTH: usize = 18;
+    let lines = cycle_row_lines(
+        vec![Span::raw("  "), Span::raw("key  ")],
+        &[("aa", false)],
+        Some(("sonnet لالالا", true)),
+        None,
+        false,
+        WIDTH,
+    );
+    // Drawn twice the pane wide, so an overrunning row draws whole here instead
+    // of being cut at a buffer edge.
+    let mut term = ratatui::Terminal::new(TestBackend::new(WIDTH as u16 * 2, 4)).unwrap();
+    term.draw(|frame| {
+        frame.render_widget(Paragraph::new(lines), frame.area());
+    })
+    .unwrap();
+    let drawn: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|row| row.trim_end().to_string())
+        .filter(|row| !row.is_empty())
+        .collect();
+    for row in &drawn {
+        assert!(
+            grapheme_cells(row) <= WIDTH,
+            "a drawn row overruns the {WIDTH}-cell pane: {row:?}"
+        );
+    }
+    assert_eq!(drawn, ["  key  aa", "       sonnet", "       لالالا"]);
+}
+
+/// The trail asks room for the whole custom value by drawn cells, and indents
+/// by its widest drawn word: `ab لالا` draws 7 (whole-string 5), so at 17 it
+/// cannot join `  key  aa` (9 + 2 + 7 = 18) and opens its own line; `لالالالا`
+/// draws 8 (whole-string 4), so at 14 the value column (7 + 8 = 15) cannot
+/// hold it and it stacks at the 2-cell indent.
+#[test]
+fn a_cycle_row_groups_and_indents_a_fold_class_custom_value_by_drawn_cells() {
+    use super::super::panes::cycle_row_lines;
+    let rows = |custom: &str, width: usize| -> Vec<String> {
+        cycle_row_lines(
+            vec![Span::raw("  "), Span::raw("key  ")],
+            &[("aa", false)],
+            Some((custom, true)),
+            None,
+            false,
+            width,
+        )
+        .iter()
+        .map(line_text)
+        .collect()
+    };
+    assert_eq!(rows("ab لالا", 17), ["  key  aa", "       ab لالا"]);
+    assert_eq!(rows("لالالالا", 14), ["  key  aa", "  لالالالا"]);
+}
+
 /// Rot-proof against a new row with a longer key: every blurred row opens its
 /// value at the shared column. Reads the real rows, so no key list to sync.
 #[test]

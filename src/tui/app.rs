@@ -17976,7 +17976,10 @@ fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> 
     match claim_profile_id(&ProfileName::from(name)) {
         Ok(account) => Some(account),
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("{failed}\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("{failed}\n{}", escape_control(&format!("{e:#}"))),
+            );
             None
         }
     }
@@ -18075,7 +18078,10 @@ fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItem
             app.open_modal(Modal::BareItem(BareItemForm::new(unplaced, write)));
         }
         BareItemOutcome::Settled(Err(e)) => {
-            app.toast(ToastKind::Danger, format!("{}\n{e:#}", write.failed()));
+            app.toast(
+                ToastKind::Danger,
+                format!("{}\n{}", write.failed(), escape_control(&format!("{e:#}"))),
+            );
         }
         BareItemOutcome::Replace(placed) => resume_bare_item_write(app, write, placed),
         BareItemOutcome::NameNeeded { login, account } => {
@@ -18475,7 +18481,10 @@ fn snapshot_or_toast(app: &mut App, snapshot: Result<CaptureSnapshot>) -> Option
     let snapshot = match snapshot {
         Ok(s) => s,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("capture failed\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("capture failed\n{}", escape_control(&format!("{e:#}"))),
+            );
             return None;
         }
     };
@@ -20776,7 +20785,10 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
                     Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
                     Err(e) => app.toast(
                         ToastKind::Danger,
-                        format!("couldn't copy the link to clipboard\n{e}"),
+                        format!(
+                            "couldn't copy the link to clipboard\n{}",
+                            escape_control(&e.to_string())
+                        ),
                     ),
                 }
             }
@@ -20823,7 +20835,10 @@ fn handle_codex_login_modal_key(app: &mut App, key: KeyEvent) {
                     Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
                     Err(e) => app.toast(
                         ToastKind::Danger,
-                        format!("couldn't copy the link to clipboard\n{e}"),
+                        format!(
+                            "couldn't copy the link to clipboard\n{}",
+                            escape_control(&e.to_string())
+                        ),
                     ),
                 }
             }
@@ -22297,7 +22312,10 @@ fn perform_codex_delete(app: &mut App, name: &str) {
         }
         Err(e) => {
             disarm_codex_2step(app);
-            app.toast(ToastKind::Danger, format!("delete failed\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("delete failed\n{}", escape_control(&format!("{e:#}"))),
+            );
         }
     }
 }
@@ -22330,7 +22348,10 @@ fn start_codex_login(app: &mut App, name: &str) {
             return;
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", escape_control(&format!("{e:#}"))),
+            );
             return;
         }
     };
@@ -22428,7 +22449,13 @@ fn drain_codex_login(app: &mut App) {
                 app.codex_rows = codex_rows();
                 app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("login for '{name}' failed\n{e}")),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!(
+                    "login for '{name}' failed\n{}",
+                    escape_control(&e.to_string())
+                ),
+            ),
         }
     }
 }
@@ -23318,7 +23345,7 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
         app.toast(
             ToastKind::Danger,
-            format!("clear failed\n{}", refused.text()),
+            format!("clear failed\n{}", escape_control(&refused.text())),
         );
         return;
     }
@@ -23528,7 +23555,7 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
         Err(e) => {
             app.toast(
                 ToastKind::Danger,
-                format!("login failed\n{}", e.user_message()),
+                format!("login failed\n{}", escape_control(&e.user_message())),
             );
             return;
         }
@@ -24462,7 +24489,10 @@ fn drain_codex_new_login(app: &mut App) {
                     ),
                 }
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", escape_control(&e.to_string())),
+            ),
         }
     }
 }
@@ -24555,7 +24585,10 @@ fn commit_codex_account(app: &mut App) {
                 app.toast(ToastKind::Warning, warning);
             }
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("create failed\n{}", escape_control(&format!("{e:#}"))),
+        ),
     }
 }
 
@@ -25401,7 +25434,10 @@ fn commit_new_account(app: &mut App) {
             // that fails names the token left stored, and any dir the undo
             // left beside it.
             match crate::gateway_tokens::remove_client_token(&mint.record, &name) {
-                Ok(_) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
+                Ok(_) => app.toast(
+                    ToastKind::Danger,
+                    format!("create failed\n{}", escape_control(&format!("{e:#}"))),
+                ),
                 Err(removal) => {
                     let left = e
                         .downcast_ref::<crate::actions::CreateUndoIncomplete>()
@@ -25410,8 +25446,9 @@ fn commit_new_account(app: &mut App) {
                     app.toast(
                         ToastKind::Danger,
                         format!(
-                            "create failed\nthe token for {} is stored but no profile was created: {removal:#}{left}",
+                            "create failed\nthe token for {} is stored but no profile was created: {}{left}",
                             escape_control(&name),
+                            escape_control(&format!("{removal:#}")),
                         ),
                     );
                 }
@@ -25904,7 +25941,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     if let Err(e) = result {
                         // The prompt stays open on its own login for another name.
                         app.bare_item_naming = Some(naming);
-                        app.toast(ToastKind::Danger, format!("{e:#}"));
+                        app.toast(ToastKind::Danger, escape_control(&format!("{e:#}")));
                         return;
                     }
                     let write = naming.write;
@@ -27460,7 +27497,7 @@ fn apply_rebind(app: &mut App, form: RebindForm) {
         for (name, err) in failed {
             app.toast(
                 ToastKind::Danger,
-                format!("re-bind failed for '{name}'\n{err}"),
+                format!("re-bind failed for '{name}'\n{}", escape_control(&err)),
             );
         }
     }
@@ -27880,7 +27917,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 // toast is earned. (`Outcome` is #[non_exhaustive], so the
                 // wildcard is the contract, not a shortcut.)
                 Ok(outcome) => {
-                    app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                    app.toast(
+                        ToastKind::Success,
+                        format!("clauth plugin {}", escape_control(&outcome.to_string())),
+                    );
                     // Reflect the fresh install in the rows without a version
                     // probe.
                     recompute_services_checks(app, false, ShuntRefresh::Keep);
@@ -29113,7 +29153,11 @@ fn drain_login_events(app: &mut App) {
                 }
                 Err(e) => app.toast(
                     ToastKind::Danger,
-                    format!("login for '{}' failed\n{e}", session.name),
+                    format!(
+                        "login for '{}' failed\n{}",
+                        session.name,
+                        escape_control(&e.to_string())
+                    ),
                 ),
             }
         } else if let Some(identity) = app
@@ -29204,7 +29248,10 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             )
         });
         if let Err(e) = held_by_account {
-            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", escape_control(&format!("{e:#}"))),
+            );
             return;
         }
         // Names the endpoint only where the preserve arm will actually keep it
@@ -30292,7 +30339,8 @@ fn drain_switch_gates(app: &mut App) {
                 } else {
                     ToastKind::Danger
                 },
-                crate::format::refresh_transient(&name, &e).toast(),
+                stderr_display_lines(&crate::format::refresh_transient(&name, &e).toast())
+                    .join("\n"),
             ),
             // Unreachable: the TUI passes `None` as the spend marker.
             oauth::AuthGate::Stopping => {

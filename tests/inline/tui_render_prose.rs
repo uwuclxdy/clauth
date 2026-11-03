@@ -288,7 +288,7 @@ fn fit_cuts_visible_characters_and_keeps_a_line_that_fits_whole() {
 /// `fit` budgets display cells and never splits a wide glyph: a CJK string is
 /// two cells per char, and an emoji stays whole with `…` inside the budget.
 #[test]
-fn fit_budgets_display_cells_and_keeps_a_wide_glyph_whole() {
+fn fit_budgets_grapheme_cells_and_keeps_a_wide_glyph_whole() {
     assert_eq!(fit("日本語", 5, dim()), vec![Span::styled("日本…", dim())]);
     assert_eq!(fit("日本語", 6, dim()), vec![Span::styled("日本語", dim())]);
     assert_eq!(fit("🧭🧭", 3, dim()), vec![Span::styled("🧭…", dim())]);

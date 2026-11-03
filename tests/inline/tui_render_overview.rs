@@ -3550,7 +3550,7 @@ fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
 ///   uppercasing) and needs `rule = width - 9 - 6 >= 3` beside `1 x`, holding
 ///   at 18; counting chars either way keeps it at 17.
 #[test]
-fn every_give_way_term_measures_wide_glyphs_in_display_cells() {
+fn every_give_way_term_measures_wide_glyphs_in_grapheme_cells() {
     let row = |title: &str, left: Option<&str>, meta: &str, width: u16| {
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3)).expect("terminal");

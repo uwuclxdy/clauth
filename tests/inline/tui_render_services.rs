@@ -10957,3 +10957,12 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
         }
     }
 }
+
+/// The typed editor's caret offset measures the label by the cells the
+/// buffer draws, the way `key_cell` pads it: `ｶﾞ` is 2 drawn cells but 1 by
+/// whole-string width, so the row (2 lead pad + 14 key budget + 2 gutter = 18
+/// cells) and its caret must agree on 18.
+#[test]
+fn a_sound_mark_label_in_the_typed_editor_parks_the_caret_by_drawn_cells() {
+    assert_eq!(super::typed_field_label_width("ｶﾞ", 4, 20), 18);
+}

@@ -8459,6 +8459,51 @@ fn the_codex_detach_postscript_names_what_each_slot_did() {
     );
 }
 
+/// Both paths the postscript names come off the filesystem (`CODEX_HOME`, the
+/// home dir), so a control or bidi character in either is spelled as its
+/// escape where it enters the copy: the CLI line and the TUI toast print the
+/// body as it stands, and a raw one could reorder or restyle it.
+#[test]
+fn the_codex_detach_postscript_escapes_both_paths_it_names() {
+    let operator_home = std::path::PathBuf::from("/home/op/\u{202e}own");
+    let operator_slot = operator_home.join("auth.json");
+    let default_slot = std::path::PathBuf::from("/home/op/.co\u{1b}dex/auth.json");
+    let slot = |slot: &std::path::PathBuf, under_operator_home: bool| {
+        crate::actions::DetachedOperatorSlot {
+            slot: slot.clone(),
+            under_operator_home,
+        }
+    };
+    let logged_out = crate::actions::OperatorAuthDetach {
+        operator_home: operator_home.clone(),
+        slots: vec![slot(&operator_slot, true)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&logged_out),
+        vec![(
+            crate::actions::CodexDetachNotice::LoggedOut,
+            "/home/op/\\u{202e}own/auth.json followed that profile's chain and is detached now, \
+             so your own codex has no login; run `codex login` to mint a fresh one"
+                .to_string(),
+        )],
+        "the detached slot's path is escaped"
+    );
+    let unaffected = crate::actions::OperatorAuthDetach {
+        operator_home,
+        slots: vec![slot(&default_slot, false)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&unaffected),
+        vec![(
+            crate::actions::CodexDetachNotice::Unaffected,
+            "/home/op/.co\\u{1b}dex/auth.json followed that profile's chain and is detached now; \
+             your own codex reads /home/op/\\u{202e}own and is unaffected"
+                .to_string(),
+        )],
+        "the slot and the operator home are both escaped"
+    );
+}
+
 /// The browser login's pre-flight refuses a cross-harness clash before ever
 /// opening a browser — but an own-roster name is a RE-AUTH, so the pre-flight
 /// must NOT refuse it (the earlier `.and(Err(e))` made every re-auth

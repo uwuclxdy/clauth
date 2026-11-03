@@ -264,7 +264,7 @@ fn draw_overview_accounts(
                 // is measured in the cells the buffer draws: a whole-string
                 // measure folds a lam-alef pair to one cell where the buffer
                 // draws two.
-                let pad = if super::modals::line_cells(&line) + band_pad <= usize::from(inner.width)
+                let pad = if super::panes::line_cells(&line) + band_pad <= usize::from(inner.width)
                 {
                     band_pad
                 } else {

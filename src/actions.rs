@@ -2594,7 +2594,8 @@ pub(crate) enum CodexDetachNotice {
 
 /// One line per detached slot, in the order the detach visited them, as the
 /// copy without the CLI's `clauth: ` prefix. The CLI prints each body behind
-/// that prefix; the TUI toasts it as it stands.
+/// that prefix; the TUI toasts it as it stands, so both paths are escaped
+/// here, where they enter the copy.
 pub(crate) fn codex_detach_postscript(
     detach: &OperatorAuthDetach,
 ) -> Vec<(CodexDetachNotice, String)> {
@@ -2603,7 +2604,7 @@ pub(crate) fn codex_detach_postscript(
         .slots
         .iter()
         .map(|detached| {
-            let slot = detached.slot.display();
+            let slot = crate::tui::escape_control(&detached.slot.display().to_string());
             let notice = match (detached.under_operator_home, operator_detached) {
                 (true, _) => CodexDetachNotice::LoggedOut,
                 (false, true) => CodexDetachNotice::LoggedOutToo,
@@ -2620,7 +2621,7 @@ pub(crate) fn codex_detach_postscript(
                 CodexDetachNotice::Unaffected => format!(
                     "{slot} followed that profile's chain and is detached now; your own codex \
                      reads {} and is unaffected",
-                    detach.operator_home.display()
+                    crate::tui::escape_control(&detach.operator_home.display().to_string())
                 ),
             };
             (notice, body)

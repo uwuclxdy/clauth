@@ -29877,6 +29877,198 @@ fn the_shunt_action_toasts_follow_the_outcome() {
     );
 }
 
+/// An error's `Display` can embed a path or an upstream message, so a failure
+/// toast escapes the chain it shows.
+#[test]
+fn a_capture_failure_toast_escapes_the_error_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+
+    let captured =
+        super::snapshot_or_toast(&mut app, Err(anyhow::anyhow!("read /cfg/x\u{1b}y failed")));
+    assert!(captured.is_none(), "a failed capture yields no snapshot");
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.clone()),
+        Some("capture failed\nread /cfg/x\\u{1b}y failed".to_string()),
+        "{:?}",
+        app.toasts
+    );
+}
+
+/// A toast body that interpolates an error chain under one of the inline
+/// spellings `CHAINS` lists escapes it the way the sibling producers do
+/// (`escape_control(&format!("{e:#}"))`), so a bidi or prose-marker code point
+/// inside a path or an upstream message never restyles or reorders the toast.
+///
+/// Residual this scan cannot see: a chain passed as a positional `{}`
+/// argument, formatted with `{e:?}`, bound to a name `CHAINS` does not list, or
+/// built into a `String` before the `.toast(` call.
+///
+/// A source gate because neither arm this holds can be driven with such a
+/// chain from a test: an unmanaged value shunt cannot parse — the one place a
+/// marker reaches a `ClientTokenRefusal` — refuses the mint inside
+/// `commit_new_account` before its rollback arm runs, and that arm's kept-token
+/// sibling only fails after the profile save through `FailAppStateSave`'s fixed
+/// string. Driving either needs a fault seam of its own, so the shape is held
+/// over the call sites instead.
+///
+/// Only `src/tui/app.rs` is read: `src/tui/render/*` never builds a toast body.
+#[test]
+fn every_inline_error_chain_in_a_toast_body_is_escaped() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src").join("tui").join("app.rs")).unwrap();
+    // The controls: a stub that finds nothing would keep the real file green,
+    // and one that flags everything would red it for no reason.
+    let (flagged, offenders) =
+        unescaped_error_chains("app.toast(ToastKind::Danger, format!(\"create failed\\n{e:#}\"));");
+    assert_eq!((flagged, offenders.len()), (1, 1), "{offenders:?}");
+    let (flagged, offenders) = unescaped_error_chains(
+        "app.toast(ToastKind::Danger, format!(\"create failed\\n{}\", \
+         escape_control(&format!(\"{e:#}\"))));",
+    );
+    assert_eq!((flagged, offenders.len()), (1, 0), "{offenders:?}");
+    let (calls, offenders) = unescaped_error_chains(&source);
+    assert!(
+        calls > 100,
+        "the scan found {calls} `.toast(` calls — it is not reading src/tui/app.rs"
+    );
+    assert!(
+        offenders.is_empty(),
+        "an error chain reaches a toast body unescaped:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// [`every_inline_error_chain_in_a_toast_body_is_escaped`]'s scan over
+/// `source`: the number of `.toast(` calls it read, and one line per error-chain
+/// interpolation that no `escape_control(..)` in the same body wraps.
+///
+/// A name (`{name}`, `{profile}`) is out of scope: names are charset-validated
+/// at every creation path, so no control, bidi or marker code point reaches one.
+fn unescaped_error_chains(source: &str) -> (usize, Vec<String>) {
+    /// The interpolation names an error chain as a producer spells it.
+    const CHAINS: [&str; 11] = [
+        "{e}",
+        "{e:#}",
+        "{err}",
+        "{err:#}",
+        "{error}",
+        "{error:#}",
+        "{removal}",
+        "{removal:#}",
+        "{cause}",
+        "{cause:#}",
+        "{link_err}",
+    ];
+    /// `source` with every line comment blanked, and string literals' content
+    /// blanked too when `blank_strings` — so call and paren structure reads
+    /// without a body's copy or a doc line confusing it, and a chain search can
+    /// still see the interpolations, which live in those literals. Byte length
+    /// is preserved, so every index is shared with `source` itself.
+    fn masked(source: &str, blank_strings: bool) -> Vec<u8> {
+        let mut out = source.as_bytes().to_vec();
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut in_comment = false;
+        let mut i = 0;
+        while i < out.len() {
+            let b = out[i];
+            if in_comment {
+                if b == b'\n' {
+                    in_comment = false;
+                } else {
+                    out[i] = b' ';
+                }
+            } else if in_str {
+                let closing = !escaped && b == b'"';
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if closing {
+                    in_str = false;
+                }
+                if blank_strings && !closing {
+                    out[i] = b' ';
+                }
+            } else if b == b'"' {
+                in_str = true;
+            } else if b == b'/' && out.get(i + 1) == Some(&b'/') {
+                in_comment = true;
+            }
+            i += 1;
+        }
+        out
+    }
+    /// The first index of `needle` in `hay` at or after `from`.
+    fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        let rest = hay.get(from..)?;
+        rest.windows(needle.len())
+            .position(|w| w == needle)
+            .map(|i| from + i)
+    }
+    /// The index of the paren closing the one just before `from`, or `hay.len()`
+    /// when the call is unterminated.
+    fn close_of(hay: &[u8], from: usize) -> usize {
+        let mut depth = 1usize;
+        let mut i = from;
+        while i < hay.len() {
+            match hay[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        hay.len()
+    }
+    let code = masked(source, true);
+    let live = masked(source, false);
+    let mut calls = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    while let Some(open) = find(&code, b".toast(", at) {
+        let body_start = open + ".toast(".len();
+        let body_end = close_of(&code, body_start);
+        calls += 1;
+        // Every `escape_control(` call in this body, as its argument's span.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut from = body_start;
+        while let Some(call) = find(&code, b"escape_control(", from) {
+            if call >= body_end {
+                break;
+            }
+            let arg = call + "escape_control(".len();
+            spans.push((arg, close_of(&code, arg)));
+            from = arg;
+        }
+        for chain in CHAINS {
+            let mut hit = body_start;
+            while let Some(found) = find(&live, chain.as_bytes(), hit) {
+                if found >= body_end {
+                    break;
+                }
+                hit = found + chain.len();
+                if !spans
+                    .iter()
+                    .any(|(start, end)| found >= *start && found < *end)
+                {
+                    let line = source[..found].matches('\n').count() + 1;
+                    let text = source.lines().nth(line - 1).unwrap_or_default().trim();
+                    offenders.push(format!("{line}: {chain} in {text}"));
+                }
+            }
+        }
+        at = body_end;
+    }
+    (calls, offenders)
+}
+
 /// The admin-refusal toast carries the compact outcome-and-pointer detail, not
 /// the full-path `Display`: the outcome (`unchanged`) stays on screen at 80 and
 /// 45 columns. The body is the worker's exact `AdminFailed` error, pinned by

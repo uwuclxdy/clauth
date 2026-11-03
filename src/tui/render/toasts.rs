@@ -8,6 +8,8 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use super::super::app::{App, Toast, ToastKind};
 use super::super::theme;
+use super::format::grapheme_cells;
+use super::panes::spans_cells;
 use super::prose;
 
 /// A laid-out toast: its draw rect and its wrapped rows.
@@ -100,11 +102,13 @@ fn layout(area: Rect, app: &App) -> Vec<LaidOut> {
     let content_cap = 60_u16.min(area.width.saturating_sub(4)).saturating_sub(3);
 
     // Widest natural line across all toasts, in cells, clamped to cap: the wrap
-    // budget.
+    // budget. Each grapheme's own width, summed — the measure the buffer lays
+    // down; a whole-string width folds a lam-alef pair to one cell and
+    // force-wraps a line that fits.
     let budget = app
         .toasts
         .iter()
-        .flat_map(|t| t.body.lines().map(|l| Span::raw(prose::plain(l)).width()))
+        .flat_map(|t| t.body.lines().map(|l| grapheme_cells(&prose::plain(l))))
         .max()
         .unwrap_or(0)
         .min(usize::from(content_cap));
@@ -116,13 +120,10 @@ fn layout(area: Rect, app: &App) -> Vec<LaidOut> {
         .collect();
 
     // The column fits the widest row shown, so a line the height cap cut
-    // reserves no width.
+    // reserves no width. Drawn cells, like the budget above.
     let content_width = stack
         .iter()
-        .flat_map(|(_, rows)| {
-            rows.iter()
-                .map(|spans| spans.iter().map(Span::width).sum::<usize>())
-        })
+        .flat_map(|(_, rows)| rows.iter().map(|spans| spans_cells(spans)))
         .max()
         .unwrap_or(0)
         .min(usize::from(content_cap));
@@ -201,7 +202,10 @@ fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
 /// Marks the last kept row of a cut toast: `…` after its text, or in place of
 /// as many trailing graphemes as free a cell when the row fills `width`.
 fn end_in_ellipsis(spans: &mut Vec<Span<'static>>, base: Style, width: usize) {
-    while spans.iter().map(Span::width).sum::<usize>() >= width
+    // Drawn cells, like every measure that sizes the toast: a whole-string sum
+    // folds a lam-alef pair to one cell and pops nothing, landing the `…` a
+    // drawn cell past the budget.
+    while spans_cells(spans) >= width
         && let Some(last) = spans.pop()
     {
         let mut graphemes: Vec<&str> = last

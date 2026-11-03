@@ -63,7 +63,7 @@ fn cell_is_always_exactly_width() {
 
 /// CJK is two cells per char: a 5-cell column holds two glyphs plus `…`.
 #[test]
-fn fixed_split_budgets_display_cells_for_cjk() {
+fn fixed_split_budgets_grapheme_cells_for_cjk() {
     assert_eq!(fixed_split("日本語", 5), ("日本…".into(), "".into()));
     assert_eq!(fixed_split("日本語", 6).0, "日本語");
 }
@@ -78,7 +78,7 @@ fn fixed_split_keeps_a_wide_glyph_whole_at_an_odd_budget() {
 
 /// `truncate` shares the cell budget: the content is `fixed_split`'s.
 #[test]
-fn truncate_budgets_display_cells() {
+fn truncate_budgets_grapheme_cells() {
     assert_eq!(truncate("日本語", 5), "日本…");
     assert_eq!(truncate("日本語", 6), "日本語");
     assert_eq!(truncate("🧭🧭", 3), "🧭…");
@@ -89,7 +89,7 @@ fn truncate_budgets_display_cells() {
 /// Middle ellipsis budgets both halves by cells, so a CJK path's head and tail
 /// stay inside the column instead of the tail being silently dropped.
 #[test]
-fn middle_truncate_budgets_display_cells_for_cjk() {
+fn middle_truncate_budgets_grapheme_cells_for_cjk() {
     assert_eq!(middle_truncate("日本語/アカウント", 12), "日本語…ント");
     assert_eq!(middle_truncate("🧭🧭🧭🧭", 5), "🧭…🧭");
     // ASCII stays byte-identical to the old char budget.
@@ -140,6 +140,21 @@ fn helpers_budget_lam_alef_per_grapheme() {
     assert_eq!(middle_truncate("لالالا", 5), "لا…لا");
     assert_eq!(fixed("لا", 2), "لا");
     assert_eq!(fixed("لا", 3), "لا ");
+}
+
+/// A halfwidth katakana sound mark (U+FF9E) draws its own cell though
+/// `unicode-width` reports it zero (`Grapheme_Extend`), and the buffer
+/// advances each grapheme by `CellWidth::cell_width` — `unicode-width` plus
+/// one cell per mark. `ｶﾞｶﾞ` is two clusters drawing 2 cells each, so 4 drawn
+/// where a per-grapheme `Span::width` sum reads 2: `grapheme_cells` counts 4
+/// and `prefix_in_cells` keeps one cluster of a 3-cell budget (the next would
+/// draw 4).
+#[test]
+fn helpers_budget_katakana_sound_marks_by_cell_width() {
+    assert_eq!(grapheme_cells("ｶﾞｶﾞ"), 4);
+    assert_eq!(grapheme_cells("ｶﾞ"), 2);
+    assert_eq!(prefix_in_cells("ｶﾞｶﾞ", 3), ("ｶﾞ".into(), 2));
+    assert_eq!(prefix_in_cells("ｶﾞｶﾞ", 4), ("ｶﾞｶﾞ".into(), 4));
 }
 
 // ── fetch-state cue ──────────────────────────────────────────────────────

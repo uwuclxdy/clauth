@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 
 use super::super::app::InputState;
 use super::super::theme;
-use super::format::{fixed_split, grapheme_cells, truncate};
+use super::format::{fixed_split, grapheme_cell_width, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
 
@@ -190,7 +190,11 @@ pub(super) fn cells_window(text: &str, start: usize, width: usize) -> String {
     let mut out = String::new();
     let mut at = 0;
     for g in Span::raw(text).styled_graphemes(Style::default()) {
-        let (from, to) = (at, at + Span::raw(g.symbol).width());
+        // Drawn cells: callers measure `start` by
+        // [`grapheme_cells`] (`cell_width`), and a halfwidth katakana sound
+        // mark draws its own cell a `Span::width` per-grapheme walk reads
+        // zero — mixing the measures blanks the window over content.
+        let (from, to) = (at, at + grapheme_cell_width(g.symbol));
         at = to;
         if from < start {
             out.extend(std::iter::repeat_n(' ', to.saturating_sub(start)));
@@ -228,7 +232,11 @@ pub(super) fn with_bg(style: Style, tint: Option<Color>) -> Style {
 /// keeps the gap separate from the width so it never collides. Each pane passes
 /// its own `width` (its longest key) and the house `gutter` of 2.
 pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
-    let kw = Span::raw(key).width();
+    // Drawn cells, matching the `truncate` that pre-cuts caller keys
+    // (services passes a profile name): a whole-string width folds a lam-alef
+    // pair and reads a halfwidth katakana sound mark zero, overpadding the
+    // gap.
+    let kw = grapheme_cells(key);
     format!("{key}{}", " ".repeat(width.max(kw) - kw + gutter))
 }
 
@@ -300,10 +308,12 @@ pub(super) fn cycle_row_lines(
         })
         .collect();
     let mut trail = |text: &str, lead_gap: usize, style: Style| {
-        let whole = Span::raw(text).width();
+        // Drawn cells: the trail can carry typed user text (the custom model
+        // id), which a whole-string width under-measures for fold classes.
+        let whole = grapheme_cells(text);
         let widest_word = text
             .split_whitespace()
-            .map(|w| Span::raw(w).width())
+            .map(grapheme_cells)
             .max()
             .unwrap_or(0);
         let indent = if run_indent + widest_word > width {
@@ -313,7 +323,7 @@ pub(super) fn cycle_row_lines(
         };
         chips.extend(text.split_whitespace().enumerate().map(|(i, word)| {
             let chip = Span::styled(word.to_string(), style);
-            let fit = chip.width();
+            let fit = grapheme_cells(word);
             let (gap, ask) = if i == 0 { (lead_gap, whole) } else { (1, fit) };
             (gap, chip, fit, ask, indent)
         }));
@@ -1056,7 +1066,10 @@ pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
     let mut chunk = String::new();
     let mut chunk_w = 0;
     for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
-        let grapheme_w = Span::raw(grapheme.symbol).width();
+        // Drawn cells ([`format::grapheme_cell_width`]): a halfwidth katakana
+        // sound mark draws one cell a `Span::width` per-grapheme sum reads
+        // zero, so a chunk cut on that measure overruns.
+        let grapheme_w = grapheme_cell_width(grapheme.symbol);
         if !chunk.is_empty() && chunk_w + grapheme_w > width {
             lines.push(std::mem::take(&mut chunk));
             chunk_w = 0;
@@ -1227,18 +1240,48 @@ pub(super) fn section_box_verbatim(
 /// single dash between the two reads as part of the title's own rule run.
 pub(super) const META_RULE_MIN: usize = 3;
 
+/// The cells a line draws: each span's width summed per grapheme
+/// ([`grapheme_cells`]), the measure the buffer lays down. The whole-string
+/// [`Line::width`] folds an Arabic lam-alef ligature to one cell, so a border
+/// budgeted on it overruns.
+pub(super) fn line_cells(line: &Line<'_>) -> usize {
+    spans_cells(&line.spans)
+}
+
+/// [`line_cells`] over a row still held as spans.
+pub(super) fn spans_cells(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| grapheme_cells(span.content.as_ref()))
+        .sum()
+}
+
+/// Whether ratatui can place a title-right `meta_slot` ([`meta_line`]) whole:
+/// it right-aligns a title by the whole-string [`Line::width`] and clips the
+/// draw to it, and a span holding a halfwidth katakana sound mark reads one
+/// cell short per mark under that measure (no span layout compensates — the
+/// mark's whole-string width is 0), so such a slot would clip at the corner
+/// and lose the slot's closing dash.
+pub(super) fn meta_placeable(meta_slot: &Line<'_>) -> bool {
+    meta_slot.width() == line_cells(meta_slot)
+}
+
 /// Whether a title-right `meta` fits a `width`-cell top border beside the
 /// title (and a `left_w`-cell left slot) with [`META_RULE_MIN`] cells of rule
-/// between them; the title names the box and the meta only describes it, so
-/// the meta is what gives way.
+/// between them, and ratatui can place the drawn slot ([`meta_placeable`]);
+/// the title names the box and the meta only describes it, so the meta is what
+/// gives way.
 pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16) -> bool {
+    let meta_slot = meta_line(meta, Style::default());
     // `╭─` + ` TITLE ` + left + rule + ` meta ─` + `╮`: the corner-adjacent dash
     // is a border cell of its own.
     let insets = 3
-        + Line::from(title_label(title, true, u16::MAX)).width()
+        + line_cells(&Line::from(title_label(title, true, u16::MAX)))
         + left_w
-        + meta_line(meta, Style::default()).width();
-    !meta.is_empty() && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
+        + line_cells(&meta_slot);
+    !meta.is_empty()
+        && meta_placeable(&meta_slot)
+        && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
 }
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
@@ -1252,7 +1295,8 @@ pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16
 ///
 /// Only the right slot gives way: it renders while `width` leaves it at least
 /// [`META_RULE_MIN`] border cells of rule after the title and the left slot,
-/// since the title names the panel and the meta only describes what is in it.
+/// and ratatui can place its drawn cells, since the title names the panel and
+/// the meta only describes what is in it.
 /// The left slot never gives way to the right one, because it qualifies what
 /// the title names; only a panel too narrow for the title line itself clips
 /// that line from the right, the left slot first. An empty `meta` renders no
@@ -1395,10 +1439,21 @@ pub(super) fn title_label(title: &str, uppercase: bool, width: u16) -> String {
 /// The title-right meta slot. A right-aligned title ends flush against the
 /// top-right corner, so the slot closes with a border cell of its own:
 /// `… meta ─╮`.
+///
+/// The name renders one span per grapheme: ratatui places a right-aligned
+/// title by the whole-string [`Line::width`], which folds a lam-alef pair to
+/// one cell, while the buffer draws per grapheme — spans of one grapheme each
+/// keep the two measures equal for the lam-alef class, so the name lands
+/// inside its slot instead of clipping at the corner. The halfwidth katakana
+/// sound-mark class has no span layout that does (`Line::width` reads each
+/// mark zero and the buffer draws it one cell); the callers that can carry
+/// user text gate on [`right_meta_fits`], which drops such a meta whole. The
+/// one ungated draw, `tokens::card`, passes fixed labels and dates.
 pub(super) fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {meta} "), theme::dim()),
-        Span::styled("─", border_style),
-    ])
-    .right_aligned()
+    let mut spans: Vec<Span<'static>> = Span::raw(format!(" {meta} "))
+        .styled_graphemes(theme::dim())
+        .map(|g| Span::styled(g.symbol.to_owned(), g.style))
+        .collect();
+    spans.push(Span::styled("─", border_style));
+    Line::from(spans).right_aligned()
 }
