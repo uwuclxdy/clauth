@@ -203,7 +203,7 @@ pub(crate) enum Command {
 
     /// Print the profile owning the loaded .credentials.json
     ///
-    /// CLAUDE_CONFIG_DIR-aware; prints `unknown` when nothing matches.
+    /// CLAUDE_CONFIG_DIR-aware; prints nothing when nothing matches.
     Which {
         /// Emit JSON instead of the plain name.
         #[arg(long)]

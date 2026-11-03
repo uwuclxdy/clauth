@@ -2782,7 +2782,7 @@ type WhichAnswer<'a> = (u32, &'a str, &'a str, &'a str);
 
 /// The shimmed `clauth` every script test runs against: `which --pid <pid>`
 /// answers from the caller's map (JSON when `--json` is passed, the bare name
-/// otherwise, `unknown` for a pid the map misses) and the config knobs answer
+/// otherwise, nothing for a pid the map misses) and the config knobs answer
 /// the caller's values. The join itself is the Rust resolver's, pinned by
 /// `which::tests`; these tests pin what the SCRIPT decides: which pid it asks
 /// for, the sweep's mcp-parent skip, the row-over-bare-login preference and
@@ -2796,7 +2796,7 @@ fn clauth_shim(answers: &[WhichAnswer<'_>], pane_tag: &str, border_label: &str) 
         ));
     }
     body.push_str(
-        "    *) if [ \"$4\" = --json ]; then printf '%s\\n' '{\"profile\":null,\"source\":null,\"harness\":null}'; else printf '%s\\n' unknown; fi ;;\n  esac\n  exit 0\nfi\n",
+        "    *) if [ \"$4\" = --json ]; then printf '%s\\n' '{\"profile\":null,\"source\":null,\"harness\":null}'; else :; fi ;;\n  esac\n  exit 0\nfi\n",
     );
     body.push_str(&format!(
         "case \"$1:$4\" in\n  herdr:pane_tag) echo {pane_tag} ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
@@ -3193,7 +3193,7 @@ fn a_codex_pane_never_takes_a_claude_harness_foreground_answer() {
 }
 
 /// A profile literally named `unknown` is a profile: the foreground answer
-/// publishes it, where the plain-name read mistook it for unresolved.
+/// publishes it.
 #[cfg(unix)]
 #[test]
 fn a_foreground_answer_naming_the_profile_unknown_is_a_profile() {
@@ -3530,8 +3530,6 @@ fn chain_clauth_shim(border_label: &str) -> String {
         fi
     elif [ -n "$profile" ]; then
         printf '%s\n' "$profile"
-    else
-        printf 'unknown\n'
     fi
     exit 0
 fi
@@ -4045,8 +4043,8 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
 
 /// A claude-arm failure (`clauth which --pid` exiting non-zero) is not a
 /// definitive empty resolution: it publishes nothing and spawns no watcher,
-/// whatever the caller. `which --pid` prints `unknown` at exit 0 when nothing
-/// resolves, so an empty claude arm is always a failure.
+/// whatever the caller. A non-zero exit is the answer that could not be read,
+/// where an exit-0 JSON answer with a null profile is the definitive empty.
 #[cfg(unix)]
 #[test]
 fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {

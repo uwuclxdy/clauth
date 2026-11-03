@@ -558,8 +558,8 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
 fn session_token_install_is_attributed_to_its_profile() {
     // The regression: a switch installs `session-token.json` for a CLA-SPLIT
     // profile, and that mint carries no refresh token, so tier 1 cannot see it.
-    // Before the sidecar tier the whole resolution fell through to `unknown`
-    // and every statusline reading `clauth which` lost its account.
+    // Without the sidecar tier the whole resolution falls through unresolved
+    // and every statusline reading `clauth which` loses its account.
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_session_token("oat-work");
     assert_eq!(
@@ -2531,4 +2531,44 @@ fn the_host_process_table_reads_the_real_proc_whatever_the_env_says() {
     );
     let argv = SystemProcs.argv(me).expect("this test's own argv");
     assert_eq!(argv.first(), std::env::args().next().as_ref());
+}
+
+/// Plain `which` and `which --pid` print the profile, and nothing at all when
+/// nothing resolves, so a caller's `[ -n "$(clauth which)" ]` reads true only
+/// for a real profile.
+#[test]
+fn the_plain_answer_is_the_profile_or_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env =
+        crate::testutil::EnvPin::new(&home, &[("CLAUDE_CONFIG_DIR", None), ("CODEX_HOME", None)]);
+    let printed = |run: &dyn Fn()| -> String {
+        let out = crate::out::OutCapture::new();
+        {
+            let _capture = out.capture_here();
+            run();
+        }
+        String::from_utf8(out.snapshot()).expect("utf8")
+    };
+    assert_eq!(printed(&|| emit_plain(Some("work"))), "work\n");
+    assert_eq!(
+        printed(&|| emit_plain(Some("unknown"))),
+        "unknown\n",
+        "a profile named unknown"
+    );
+    assert_eq!(
+        printed(&|| run(false).expect("plain which")),
+        "",
+        "plain which with nothing to resolve"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        printed(&|| run_pid(999_999_999, false).expect("which --pid")),
+        "",
+        "which --pid on a pid that names nothing"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        run_pid(999_999_999, false).is_err(),
+        "Windows refuses which --pid"
+    );
 }

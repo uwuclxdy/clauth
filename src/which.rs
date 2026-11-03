@@ -75,7 +75,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
     // carries the ancestor's CODEX_HOME — but its own CLAUDE_CONFIG_DIR names
     // a clauth runtime, which is this process's identity. Only when no clauth
     // claude runtime claims the asker does a clauth-shaped CODEX_HOME answer.
-    // And a clauth-SHAPED home answers or answers unknown — never falls
+    // And a clauth-SHAPED home answers, or says nothing — never falls
     // through: the claude tiers below would attribute a codex session to
     // whatever the GLOBAL ~/.claude credentials resolve to, a different
     // harness's answer entirely. A CODEX_HOME that is not a clauth codex home
@@ -94,7 +94,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
                 // Shaped like ours, naming no stored codex profile (or the
                 // roster was unreadable): the same fail-closed answer the
                 // claude session-dir tier gives an unrecognized runtime —
-                // unknown, not somebody else's profile.
+                // no answer, not somebody else's profile.
                 if json {
                     outln!(
                         "{}",
@@ -472,8 +472,7 @@ fn resolve_profile_candidate<'a>(
     // Attribute to the active profile when it has no stored OAuth creds
     // (API-key/endpoint, or a fresh login not yet snapshotted). Not gated on
     // `creds`: switching to an API-key profile deletes the creds file, so a
-    // prior refresh-token guard here mis-attributed the active profile as
-    // `unknown`.
+    // prior refresh-token guard here left the active profile unresolved.
     config
         .state
         .active_profile
@@ -543,10 +542,10 @@ fn match_by_session_token<'a>(
     fallback
 }
 
+/// The plain answer: the profile, or nothing at all when nothing resolved.
 fn emit_plain(matched: Option<&str>) {
-    match matched {
-        Some(name) => outln!("{name}"),
-        None => outln!("unknown"),
+    if let Some(name) = matched {
+        outln!("{name}");
     }
 }
 
