@@ -7253,6 +7253,42 @@ fn the_v0_18_1_models_doc_toggles_its_example_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file written before the `[env]` doc named the put-back still toggles its
+/// `[env]` example in place under that older block, and unsetting gives the
+/// file back byte for byte.
+#[test]
+fn the_pre_put_back_env_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldenv".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldenv")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# this profile is active. A switch to another profile removes each one,\n\
+                   # or puts back the value ~/.claude/settings.json held before it.\n\
+                   # [env]\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# this profile is active. Cleared on switch to another profile.\n# [env]\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldenv")).unwrap();
+    profile.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n",
+            "[env]\nHTTP_PROXY = \"http://localhost:8080\"\n",
+            1
+        )
+    );
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
 /// The `advisor` row saves into `[models]` in place beside the other rows and
 /// loads back, and clearing it deletes its line alone.
 #[test]
@@ -8423,7 +8459,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "env",
-            "3c8dd7e97666430944d5448fc7aa02d9409393d25f9d3aeadb5b6bb4c305ced7",
+            "b1ecf434ca77d914fe3ad1493532e7c46a760ea8b3f6a1d43da92d7375921257",
         ),
     ]
     .into_iter()

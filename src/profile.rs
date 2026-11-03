@@ -6217,7 +6217,7 @@ fn known_doc_blocks(key: &str) -> Vec<String> {
              # fallback_threshold {EM_DASH} this profile still switches away at its own\n\
              # threshold whenever another chain member has headroom.\n"
         )),
-        // 09a1dd3c reworded the switch-away clause (673a9be4 wrote the older
+        // 09a1dd3c reworded the switch-away clause (f4c9ca1e wrote the older
         // block).
         "env" => docs.push(
             "# Extra env vars merged into ~/.claude/settings.json's env block while\n\
