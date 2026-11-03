@@ -18,7 +18,7 @@ Run it a second time and it adds nothing. `--key` picks the keybinding, and a re
 |------|--------|
 | `--key <spec>` | the key that opens the dashboard, in herdr's own binding syntax; default `prefix+a` |
 | `--no-config` | install the plugin, leave `config.toml` alone, and print the blocks to paste |
-| `--yes` | skip both prompts, herdr's install preview included; required on a non-TTY stdin or stdout |
+| `--yes` | skip every prompt: the key prompt (the key falls back to `prefix+a` unless `--key` names one) and both confirms, herdr's install preview included; required on a non-TTY stdin or stdout |
 
 `HERDR_CONFIG_PATH` overrides which config file gets written, matching how herdr itself reads that variable.
 
