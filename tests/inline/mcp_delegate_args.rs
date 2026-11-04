@@ -47,6 +47,7 @@ fn seed_profiles(names: &[&str], disabled: bool) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -73,6 +74,7 @@ fn seed_third_party_profiles(names: &[&str]) {
             Some("https://api.deepseek.com".to_string()),
             Some("sk-test-unfunded".to_string()),
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -1369,6 +1371,7 @@ fn seed_keyless_third_party(name: &str) {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 }
@@ -1459,6 +1462,7 @@ fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -1506,6 +1510,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("zzbg-off"))
@@ -1516,6 +1521,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -2223,6 +2229,7 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     drop(config);

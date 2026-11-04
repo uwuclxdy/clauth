@@ -799,6 +799,7 @@ fn seed_headroom(name: &str, pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1739,6 +1740,7 @@ fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -1747,6 +1749,7 @@ fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
     config.state.active_profile = Some(ProfileName::from("b"));
@@ -1808,6 +1811,7 @@ fn seed_chain_with_active_at(active_pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -1816,6 +1820,7 @@ fn seed_chain_with_active_at(active_pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
     // The decision-leg replay walks `b` as the clear target: a login-less
@@ -2192,6 +2197,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -2200,6 +2206,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
     crate::actions::create_blank_profile(
@@ -2208,6 +2215,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create c");
     config.state.active_profile = Some(ProfileName::from("b"));

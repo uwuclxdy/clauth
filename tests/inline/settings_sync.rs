@@ -414,6 +414,59 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     assert_eq!(read_json(&p2)["theme"], json!("dark"));
 }
 
+/// Effort is per account through its one carrier,
+/// `env.CLAUDE_CODE_EFFORT_LEVEL`, an empty value included: it stays with the
+/// member that holds it and never spreads to a sibling or the base.
+/// `effortLevel` is Claude Code's own key, which clauth never writes, so it
+/// syncs like any shared key.
+#[test]
+fn effort_stays_exactly_where_it_was() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    let p2 = runtime_path(home.home(), "p2");
+    write_json(
+        &base,
+        &json!({"effortLevel": "low", "env": {"CLAUDE_CODE_EFFORT_LEVEL": ""}}),
+        t(1),
+    );
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"effortLevel": "high", "theme": "dark", "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+        json!(""),
+        "the base kept its own empty override"
+    );
+    assert_eq!(
+        read_json(&p1)["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+        json!("max")
+    );
+    assert!(
+        read_json(&p2)["env"]
+            .get("CLAUDE_CODE_EFFORT_LEVEL")
+            .is_none(),
+        "p2 received a sibling's override"
+    );
+    assert_eq!(
+        read_json(&p2)["effortLevel"],
+        json!("high"),
+        "effortLevel is shared: the newest member's value reaches p2"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "precondition: this sync did rewrite p2"
+    );
+}
+
 /// `advisorModel` is a model choice written per account (`[models] advisor`), so
 /// a sibling's value must never reach another member: not the base, not a
 /// runtime copy, and not the other way round.

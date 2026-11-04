@@ -1177,6 +1177,7 @@ fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -1295,6 +1296,7 @@ fn add_keyed_profile(name: &str) {
         Some("https://api.example.internal".to_string()),
         Some("sk-test-not-a-real-key".to_string()),
         Default::default(),
+        None,
     )
     .expect("create keyed profile");
 }

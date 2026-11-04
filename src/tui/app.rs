@@ -27,11 +27,11 @@ use crate::actions::{
     capture_into_profile, capture_live_file_snapshot, capture_owner, capture_snapshot,
     classify_env_key, clear_profile_api_key, clear_profile_credentials, create_blank_profile,
     create_profile_from_login, delete_profile_taking_config, duplicate_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
-    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
-    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
-    snapshot_is_empty, switch_off, switch_profile_gated, validate_foreign_harness_free,
-    validate_name_chars, validate_profile_name,
+    edit_profile_effort, edit_profile_endpoint, edit_profile_env, edit_profile_model,
+    edit_profile_preset, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
+    reorder_profile, rotation_guard_for_mutation, set_chain_order, set_member_threshold,
+    set_wrap_off, snapshot_is_empty, switch_off, switch_profile_gated,
+    validate_foreign_harness_free, validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -539,6 +539,10 @@ pub(crate) enum ConfigRow {
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
     Model,
+    /// Per-account reasoning effort (`env.CLAUDE_CODE_EFFORT_LEVEL` in
+    /// settings.json). Hybrid like `Model`: space cycles the fixed list, ⏎
+    /// types a custom value.
+    Effort,
     /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
     FableModel,
     /// `ANTHROPIC_DEFAULT_OPUS_MODEL` — full id, free text.
@@ -596,9 +600,9 @@ pub(crate) enum ConfigRow {
 
 impl ConfigRow {
     /// Text rows capture keystrokes and commit on ⏎; the rest act on ⏎. The
-    /// `Model` row is hybrid (space cycles, ⏎ opens a custom field), and the env
-    /// rows seed their buffer before editing, so all three are driven out of band
-    /// and are deliberately not text rows here. `BellThreshold` is a text row
+    /// `Model` and `Effort` rows are hybrid (space cycles, ⏎ opens a custom
+    /// field), and the env rows seed their buffer before editing, so all of them
+    /// are driven out of band and are deliberately not text rows here. `BellThreshold` is a text row
     /// whose `+`/`-` at rest step it without opening the editor.
     pub(crate) fn is_text(self) -> bool {
         matches!(
@@ -625,6 +629,7 @@ impl ConfigRow {
             ConfigRow::Type
             | ConfigRow::Family
             | ConfigRow::Model
+            | ConfigRow::Effort
             | ConfigRow::AutoStart
             | ConfigRow::UsageProbe
             | ConfigRow::UsageProbeInterval
@@ -655,6 +660,10 @@ impl ConfigRow {
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
+
+/// The `effort` row cycle (space advances it). `None` renders as `unset` (no
+/// `effort` key); a custom value set via ⏎ is outside this list.
+pub(crate) const EFFORT_PRESETS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// The `+ new` form's account type: which harness the form creates for, picked
 /// on the `type` cycle row (`claude` / `codex` / `shunt`). `n` presets it from
@@ -952,6 +961,9 @@ pub(crate) struct ConfigDraft {
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
     pub(crate) model: InputState,
+    /// Buffer for the `effort` row: the cycle at rest, free text while the
+    /// ⏎ editor owns the keyboard. Trimmed on commit; empty = unset.
+    pub(crate) effort: InputState,
     pub(crate) opus_model: InputState,
     pub(crate) sonnet_model: InputState,
     pub(crate) haiku_model: InputState,
@@ -1056,6 +1068,7 @@ impl ConfigDraft {
             ConfigRow::BaseUrl => &self.base_url,
             ConfigRow::ApiKey => &self.api_key,
             ConfigRow::Model => &self.model,
+            ConfigRow::Effort => &self.effort,
             ConfigRow::OpusModel => &self.opus_model,
             ConfigRow::SonnetModel => &self.sonnet_model,
             ConfigRow::HaikuModel => &self.haiku_model,
@@ -1095,6 +1108,7 @@ impl ConfigDraft {
             ConfigRow::BaseUrl => &mut self.base_url,
             ConfigRow::ApiKey => &mut self.api_key,
             ConfigRow::Model => &mut self.model,
+            ConfigRow::Effort => &mut self.effort,
             ConfigRow::OpusModel => &mut self.opus_model,
             ConfigRow::SonnetModel => &mut self.sonnet_model,
             ConfigRow::HaikuModel => &mut self.haiku_model,
@@ -1162,6 +1176,7 @@ impl ConfigDraft {
             &self.base_url,
             &self.api_key,
             &self.model,
+            &self.effort,
             &self.opus_model,
             &self.sonnet_model,
             &self.haiku_model,
@@ -22538,7 +22553,8 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Enter => {
                     let row = rows[app.config_action_cursor];
                     // ⏎ mirrors space on the cycle rows: the `type` and `family`
-                    // rows advance; the `model` row keeps ⏎ for its custom field.
+                    // rows advance; the `model` and `effort` rows keep ⏎ for
+                    // their custom field.
                     match row {
                         ConfigRow::Type => cycle_account_type(app),
                         ConfigRow::Family => cycle_family(app),
@@ -22572,6 +22588,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     if row.is_state_control() {
                         match row {
                             ConfigRow::Model => cycle_model(app),
+                            ConfigRow::Effort => cycle_effort(app),
                             ConfigRow::Type => cycle_account_type(app),
                             ConfigRow::Family => cycle_family(app),
                             _ => run_config_row(app, row),
@@ -23026,6 +23043,7 @@ fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
             // Env rows stay existing-account-only.
             rows.push(ConfigRow::Model);
             push_override_rows(&mut rows, draft, None);
+            rows.push(ConfigRow::Effort);
             if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
                 rows.push(ConfigRow::Login);
             }
@@ -23107,6 +23125,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     }
     rows.push(ConfigRow::Model);
     push_override_rows(&mut rows, draft, profile);
+    rows.push(ConfigRow::Effort);
 
     // One row per custom env entry (sorted), then the `+ add env` row. Indices
     // must match the sorted env snapshot used by the renderer and the commit path.
@@ -23404,6 +23423,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         base_url: InputState::new(""),
         api_key: InputState::new(""),
         model: InputState::new(""),
+        effort: InputState::new(""),
         opus_model: InputState::new(""),
         sonnet_model: InputState::new(""),
         haiku_model: InputState::new(""),
@@ -23441,6 +23461,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
+        effort: InputState::new(profile.and_then(|p| p.effort.as_deref()).unwrap_or("")),
         opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
@@ -23538,8 +23559,9 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         _ => {}
     }
-    // Text rows plus the `model` row's custom field open an inline editor.
-    if row.is_text() || row == ConfigRow::Model {
+    // Text rows plus the `model` and `effort` rows' custom fields open an
+    // inline editor.
+    if row.is_text() || row == ConfigRow::Model || row == ConfigRow::Effort {
         // The alert buffer reseeds from the profile as it opens: a reload may
         // have moved the value since the draft was built.
         if row == ConfigRow::BellThreshold {
@@ -24436,6 +24458,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::Model => profile
             .and_then(|p| p.models.default.clone())
             .unwrap_or_default(),
+        ConfigRow::Effort => profile.and_then(|p| p.effort.clone()).unwrap_or_default(),
         ConfigRow::OpusModel => profile
             .and_then(|p| p.models.opus.clone())
             .unwrap_or_default(),
@@ -24509,6 +24532,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         | ConfigRow::FableModel
         | ConfigRow::SubagentModel
         | ConfigRow::AdvisorModel => CommitResult::from(commit_model_field(app, field)),
+        ConfigRow::Effort => CommitResult::from(commit_effort_field(app)),
         ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
         ConfigRow::EnvAdd
             if app
@@ -24580,6 +24604,53 @@ fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
                 ToastKind::Danger,
                 format!(
                     "model update failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// ⏎ on the effort field: fold the trimmed buffer into the profile's `effort`
+/// (empty = unset), persist, then reseed the buffer from the saved value.
+fn commit_effort_field(app: &mut App) -> bool {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return false;
+    };
+    let raw = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.field(ConfigRow::Effort))
+        .map(|i| i.trimmed().to_string())
+        .unwrap_or_default();
+    let effort = (!raw.is_empty()).then_some(raw);
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_effort(&mut cfg, &name, |slot| *slot = effort)
+    };
+    match result {
+        Ok(()) => {
+            let value = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, ConfigRow::Effort)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.effort = InputState::new(&value);
+                d.active = None;
+            }
+            true
+        }
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "effort update failed\n{}",
                     escape_control(&error_toast_detail(&e))
                 ),
             );
@@ -24726,6 +24797,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::UsageProbeInterval
         | ConfigRow::Type
         | ConfigRow::Family
+        | ConfigRow::Effort
         | ConfigRow::BellThreshold
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
@@ -24796,6 +24868,65 @@ fn next_model_preset(current: Option<&str>) -> Option<String> {
         None => Some(MODEL_PRESETS[0].to_string()),
         Some(cur) => match MODEL_PRESETS.iter().position(|p| *p == cur) {
             Some(i) if i + 1 < MODEL_PRESETS.len() => Some(MODEL_PRESETS[i + 1].to_string()),
+            _ => None,
+        },
+    }
+}
+
+/// Space on the `effort` row: advance the fixed cycle and persist. A custom
+/// value (set via ⏎) is outside the cycle, so the first space resets it to
+/// unset. `editing_name` is `None` on the still-unsaved `+ new` draft —
+/// there's no profile yet to persist into, so it just advances the buffer in
+/// place; the value is folded in on `commit_new_account`.
+pub(crate) fn cycle_effort(app: &mut App) {
+    let editing_name = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
+    let Some(name) = editing_name else {
+        if let Some(d) = app.config_draft.as_mut() {
+            let next = next_effort_preset(d.effort.trimmed_some().as_deref()).unwrap_or_default();
+            d.effort = InputState::new(&next);
+        }
+        return;
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_effort(&mut cfg, &name, |slot| {
+            *slot = next_effort_preset(slot.as_deref());
+        })
+    };
+    match result {
+        Ok(()) => {
+            let value = {
+                let cfg = app.config();
+                cfg.find(&name)
+                    .and_then(|p| p.effort.clone())
+                    .unwrap_or_default()
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.effort = InputState::new(&value);
+            }
+        }
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!(
+                "effort update failed\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
+        ),
+    }
+}
+
+/// Advance the `effort` cycle: unset → low → medium → high → xhigh → max →
+/// unset. A value outside [`EFFORT_PRESETS`] (a custom value) collapses to
+/// unset.
+fn next_effort_preset(current: Option<&str>) -> Option<String> {
+    match current {
+        None => Some(EFFORT_PRESETS[0].to_string()),
+        Some(cur) => match EFFORT_PRESETS.iter().position(|p| *p == cur) {
+            Some(i) if i + 1 < EFFORT_PRESETS.len() => Some(EFFORT_PRESETS[i + 1].to_string()),
             _ => None,
         },
     }
@@ -25763,6 +25894,9 @@ fn commit_new_account(app: &mut App) {
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
     let models = d.typed_models();
+    // Effort is not a model row: it folds in whatever endpoint the created
+    // profile lands on, a captured login's included.
+    let effort = d.effort.trimmed_some();
     // The `+ new profile` marker, armed only while the base url still names
     // the gateway and no live login is captured; editing the url away or
     // capturing a login disarms it, so `create account` is then an ordinary
@@ -25853,7 +25987,7 @@ fn commit_new_account(app: &mut App) {
             // Both stashes parked the login's uuid until this moment fixed the
             // name; the commit functions anchor it on the create.
             Some(DraftLogin::LiveLogin(snapshot)) => {
-                capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), models, effort, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it and seeds the probe's
@@ -25862,6 +25996,7 @@ fn commit_new_account(app: &mut App) {
                 &mut cfg,
                 name.clone(),
                 models,
+                effort,
                 login.credentials,
                 login.account_uuid,
                 login.plan,
@@ -25871,7 +26006,7 @@ fn commit_new_account(app: &mut App) {
             Some(DraftLogin::CodexMint(_) | DraftLogin::CodexCapture) => {
                 unreachable!("the captured filter drops a codex stash first")
             }
-            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
+            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models, effort),
         }
     };
     match result {
@@ -29391,7 +29526,7 @@ fn commit_capture_name(
                     cfg.state = saved;
                 }
             }
-            capture_into_profile(cfg, name.clone(), Default::default(), snapshot)
+            capture_into_profile(cfg, name.clone(), Default::default(), None, snapshot)
         })
     };
     let result = {

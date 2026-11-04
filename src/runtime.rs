@@ -4830,7 +4830,9 @@ pub(crate) enum SwapOutcome {
 /// The transport a session's Claude Code actually booted with. Compared against
 /// the INTENDED member rather than against a re-read of the current one, because
 /// this snapshot is what is live in the child's `process.env`: `settings.json`
-/// env is applied at startup only.
+/// env is applied at startup only — `CLAUDE_CODE_EFFORT_LEVEL` excepted, which
+/// a running CC 2.1.317 re-reads, and the swap executor rewrites in place
+/// rather than letting it ride `process.env`.
 ///
 /// The `[env]` map lives here only as a digest: an env VALUE may carry an
 /// inference credential, so the map itself must not travel onto the live-session
@@ -4992,6 +4994,13 @@ pub(crate) fn swap_target_precondition(
 struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
+    /// The intended member's effort as a launch on it would carry
+    /// ([`crate::claude::effective_effort`]: its `[env]` entry when present,
+    /// else the field, else `""`), carried into the swap's settings.json
+    /// rewrite. The converge branch mints `None`:
+    /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
+    /// new, so no caller reads the field there.
+    effort: Option<String>,
 }
 
 /// Move the mtime of the store the credential link is about to resolve to.
@@ -5271,6 +5280,11 @@ struct SwapItemRetry {
     member: ProfileName,
     store: PathBuf,
     previous_store: PathBuf,
+    /// The intended member's effort as a launch on it would carry
+    /// ([`crate::claude::effective_effort`]), written into the session's
+    /// settings.json once the item legs land (on macOS the handover write is
+    /// deferred to that point). `None` (the adopting read failed) writes `""`.
+    effort: Option<String>,
 }
 
 /// A [`SwapItemRetry`] in the cell, with its backoff: the attempt it next
@@ -5352,12 +5366,14 @@ fn adopted_item_retry(
     launch_store: Option<&Path>,
     canonical: &Path,
     member: &ProfileName,
+    effort: Option<String>,
 ) -> Option<SwapItemRetry> {
     let previous_store = launch_store.filter(|store| *store != canonical)?;
     Some(SwapItemRetry {
         member: member.clone(),
         store: canonical.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
+        effort,
     })
 }
 
@@ -5749,6 +5765,7 @@ impl SessionSwap {
             return Ok(SwapPlan {
                 member: intended,
                 store,
+                effort: None,
             });
         }
         let store = swap_target_precondition(&intended, &self.launch, models)?;
@@ -5757,11 +5774,12 @@ impl SessionSwap {
         // swap's mtime stamp. It runs only past a passed check, so no refusal
         // the check would give is skipped; a tear between the check's read and
         // this load can still refuse `ProfileUnreadable`.
-        crate::profile::load_profile(&intended)
+        let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
         Ok(SwapPlan {
             member: intended,
             store,
+            effort: Some(crate::claude::effective_effort(&profile)),
         })
     }
 
@@ -5847,6 +5865,16 @@ impl SessionSwap {
         // retry, and spent after it (the carry's read is a subprocess).
         #[cfg(target_os = "macos")]
         let mut previous_store: Option<std::path::PathBuf> = None;
+        // The written-copy record the settings reconciler keys echoes on: the
+        // effort rewrite records itself there, carrying the copy's pre-write
+        // rank, so the next pass reads it as clauth's own echo rather than a
+        // Claude Code write to outrank. An isolated session is never a sync
+        // member, so its rewrite needs no entry — the launch writer's exact
+        // rule.
+        let record = match self.isolation {
+            Isolation::Shared => crate::settings_sync::written_record_path().ok(),
+            Isolation::Isolated => None,
+        };
         // The drain may copy a session-side `/login` of a DIFFERENT account into
         // the store: mark that account's `/profile` reading stale (no network
         // call) inside the same hold that committed the store.
@@ -5943,6 +5971,24 @@ impl SessionSwap {
                     plan.member
                 );
             }
+            // The effort handover rides the same hold as the publish: past the
+            // link move the session IS on the new member, and this rewrite
+            // makes its runtime settings.json say so in the same locked step,
+            // so no reader taking the flock sees the new member with the old
+            // effort. It touches that one env key only — the session keeps its
+            // operator settings. Best-effort like the row write above: a
+            // failure must never undo or block the credential move, so it is
+            // logged and the swap stands. On macOS with the Keychain on, the
+            // session reads the item, which only moves AFTER this hold, so the
+            // rewrite is deferred to the landed item legs instead — a session
+            // that may still read the outgoing member's pair must not run at
+            // the incoming member's effort.
+            #[cfg(not(target_os = "macos"))]
+            self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
+            #[cfg(target_os = "macos")]
+            if !crate::keychain::enabled() {
+                self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
+            }
             Ok(SwapOutcome::Swapped)
         })?;
         // macOS: the session's Claude Code reads the NAMESPACED Keychain item
@@ -5984,6 +6030,7 @@ impl SessionSwap {
                 member: plan.member.clone(),
                 store: plan.store.clone(),
                 previous_store,
+                effort: plan.effort.clone(),
             });
             let legs = match &target {
                 Some(target) => self.run_swap_item_legs(target),
@@ -5997,8 +6044,7 @@ impl SessionSwap {
                 // layer onto: what the session reads moved, so the row's
                 // verdict follows.
                 Ok(()) => {
-                    self.repoint_row_store(&plan.member, &plan.store);
-                    self.retouch_after_item_leg(&plan.member, &plan.store);
+                    self.land_item_legs(&plan.member, &plan.store, plan.effort.as_deref());
                 }
                 Err(failure) => {
                     let (failed, rerun, retried) = failure.describe();
@@ -6025,6 +6071,63 @@ impl SessionSwap {
             }
         }
         Ok(outcome)
+    }
+
+    /// The swap's effort handover write: the member's effort (`""` when it
+    /// holds none) into `env.CLAUDE_CODE_EFFORT_LEVEL` of the session's
+    /// runtime settings.json, recorded through the same owner-only path the
+    /// launch uses. Best-effort — a failure is logged naming the session dir
+    /// and the swap stands, per the handover's contract.
+    fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
+        if let Err(e) = crate::claude::set_settings_env_key(
+            &self.runtime.join("settings.json"),
+            record,
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            effort.unwrap_or(""),
+        ) {
+            logline!(
+                "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",
+                self.session.as_str(),
+                member,
+                self.runtime.display(),
+            );
+        }
+    }
+
+    /// The landed item legs commit the swap's macOS half, shared by the swap's
+    /// own landed-legs arm and the item retry's `Landed` arm: repoint the row
+    /// at the store the item now serves, re-stamp the swap's commit, and hand
+    /// the session the member's effort. Only once the legs land has the swap
+    /// committed on macOS — the item holds the incoming member's pair (or is
+    /// gone and the file the session reads moved), so the effort handover runs
+    /// here rather than in the swap's commit hold, under its own short state
+    /// hold (a `security` leg must never span the flock) so the record merge
+    /// cannot race the settings sync's persist — the same lock the in-hold
+    /// rewrite rides on every other platform.
+    fn land_item_legs(&self, member: &ProfileName, store: &Path, effort: Option<&str>) {
+        self.repoint_row_store(member, store);
+        self.retouch_after_item_leg(member, store);
+        // The written-copy record the settings reconciler keys echoes on: the
+        // effort rewrite records itself there, carrying the copy's pre-write
+        // rank, so the next pass reads it as clauth's own echo rather than a
+        // Claude Code write to outrank. An isolated session is never a sync
+        // member, so its rewrite needs no entry — the launch writer's exact
+        // rule.
+        let record = match self.isolation {
+            Isolation::Shared => crate::settings_sync::written_record_path().ok(),
+            Isolation::Isolated => None,
+        };
+        if let Err(e) = with_state_lock(|_held| {
+            self.write_effort_env(member, effort, record.as_deref());
+            Ok(())
+        }) {
+            logline!(
+                "clauth: session {} swapped onto {} but the effort handover could not \
+                 take the state lock: {e:#}",
+                self.session.as_str(),
+                member
+            );
+        }
     }
 
     /// The same-member convergence executor, reached only for a plan
@@ -6518,8 +6621,7 @@ impl SessionSwap {
         match leg(&armed.target) {
             SwapItemLeg::Landed => {
                 let target = &armed.target;
-                self.repoint_row_store(&target.member, &target.store);
-                self.retouch_after_item_leg(&target.member, &target.store);
+                self.land_item_legs(&target.member, &target.store, target.effort.as_deref());
                 logline!(
                     "clauth: session {} finished its swap onto {}: its per-session Keychain leg \
                      landed on a swap-poll retry",
@@ -7151,7 +7253,20 @@ impl ProfileRuntime {
                     let launch_store = adopted_row
                         .launch_store
                         .map(|store| crate::canonical::identity(&store).unwrap_or(store));
-                    item_retry = adopted_item_retry(launch_store.as_deref(), &canonical, &member);
+                    // The intended member's effort, for the handover write once
+                    // the re-armed legs land: the swap that armed them is gone,
+                    // so its plan's value is unrecoverable, and the adoption
+                    // reads the member's current one instead — the value a
+                    // launch on it would carry (`effective_effort`: its `[env]`
+                    // entry or the field). The read-only form is the under-hold
+                    // one: `load_profile` may rewrite `config.toml` and adopt a
+                    // legacy `.pending` sidecar, both through the state flock
+                    // this hold already owns.
+                    let effort = crate::profile::read_profile(&member)
+                        .ok()
+                        .map(|profile| crate::claude::effective_effort(&profile));
+                    item_retry =
+                        adopted_item_retry(launch_store.as_deref(), &canonical, &member, effort);
                 }
                 Ok::<_, anyhow::Error>((
                     start_paths,
@@ -7981,6 +8096,7 @@ pub(crate) const MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
 ];
 
 /// Drop [`MANAGED_ENV_KEYS`] plus the outgoing activation's custom env keys

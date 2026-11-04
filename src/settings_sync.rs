@@ -110,7 +110,9 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// - top level ([`PER_PROFILE_TOP_FIELDS`]): `apiKeyHelper` names the profile
 ///   whose `config.toml` holds the raw key, so propagating that one string hands
 ///   one account's key to another without any `env` entry moving; `model` and
-///   `advisorModel` are routing.
+///   `advisorModel` are routing. `effortLevel` stays shared — it is Claude
+///   Code's own key; clauth's effort carrier is the managed
+///   `CLAUDE_CODE_EFFORT_LEVEL` env key below.
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
 ///   every key any profile declares in its own `config.toml` `[env]` and every

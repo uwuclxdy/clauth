@@ -2576,12 +2576,13 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     let rows = config_rows(&app);
     // Full runtime sequence for this fixture (OAuth account, no base url, no
     // overrides, no custom env, holding OAuth credentials): auto-start in the
-    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`, no
-    // env rows, then the login/delete-creds/disabled/delete action tail. A
-    // future reorder of `config_rows`' row-construction (the `rows.push(...)`
-    // builder) reds here; a match-arm reorder elsewhere is unobservable at
-    // runtime and isn't what this test guards. The per-account day list is NOT
-    // here: it lives on the Fallback tab's member card.
+    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`,
+    // the effort row right below the model block, no env rows, then the
+    // login/delete-creds/disabled/delete action tail. A future reorder of
+    // `config_rows`' row-construction (the `rows.push(...)` builder) reds
+    // here; a match-arm reorder elsewhere is unobservable at runtime and isn't
+    // what this test guards. The per-account day list is NOT here: it lives on
+    // the Fallback tab's member card.
     assert_eq!(
         rows,
         [
@@ -2591,6 +2592,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
             ConfigRow::BaseUrl,
             ConfigRow::Model,
             ConfigRow::ModelOverrideAdd,
+            ConfigRow::Effort,
             ConfigRow::EnvAdd,
             ConfigRow::Login,
             ConfigRow::DeleteCreds,
@@ -20341,6 +20343,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -25531,6 +25534,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
             ConfigRow::BaseUrl,
             ConfigRow::Model,
             ConfigRow::ModelOverrideAdd,
+            ConfigRow::Effort,
             ConfigRow::Login,
             ConfigRow::Create,
         ],
@@ -25552,6 +25556,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
             ConfigRow::HaikuModel,
             ConfigRow::SubagentModel,
             ConfigRow::AdvisorModel,
+            ConfigRow::Effort,
             ConfigRow::Login,
             ConfigRow::Create,
         ],
@@ -58406,6 +58411,7 @@ fn n24_create(app: &App, name: &str, base_url: Option<&str>) {
         base_url.map(str::to_string),
         Some("sk-n24".to_string()),
         crate::profile::ModelSettings::default(),
+        None,
     )
     .expect("create");
 }
@@ -58839,6 +58845,7 @@ fn a_refused_divergence_capture_keeps_the_active_link() {
         None,
         Some("sk-other".to_string()),
         crate::profile::ModelSettings::default(),
+        None,
     )
     .expect("create");
     handle_key(&mut app, key(KeyCode::Enter));
@@ -63770,4 +63777,283 @@ fn a_landed_rex_reading_recompute_starts_no_plugin_run() {
         "the prober did not run again"
     );
     super::join_test_workers();
+}
+
+// ── Setup tab: per-account `effort` row ────────────────────────────────────
+//
+// The row has the `model` row's shape: space cycles a fixed list
+// (unset → low → medium → high → xhigh → max → unset) and ⏎ opens a custom
+// field whose text is stored verbatim. It is visible without the
+// `+ model override` reveal, on a saved account and on the `+ new` form.
+
+mod effort_row {
+    use super::super::{
+        App, ConfigFocus, ConfigRow, InputState, KeyCode, Tab, commit_new_account, config_rows,
+        cycle_effort, enter_config_detail, handle_key,
+    };
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    use crate::testutil::{HomeSandbox, key};
+
+    const CYCLE: [&str; 6] = ["low", "medium", "high", "xhigh", "max", ""];
+
+    fn saved_account_app(effort: Option<&str>) -> App {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.effort = effort.map(str::to_string);
+        crate::testutil::persist_profiles(std::slice::from_ref(&profile));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(0);
+        enter_config_detail(&mut app);
+        assert_eq!(app.config_focus, ConfigFocus::Actions);
+        app
+    }
+
+    fn effort_on_disk() -> Option<String> {
+        crate::profile::load_config()
+            .expect("reload")
+            .profiles
+            .into_iter()
+            .find(|p| p.name == "acct")
+            .expect("the account is on disk")
+            .effort
+    }
+
+    fn put_cursor_on_effort(app: &mut App) {
+        app.config_action_cursor = config_rows(app)
+            .iter()
+            .position(|r| *r == ConfigRow::Effort)
+            .expect("the effort row is listed without any reveal");
+    }
+
+    #[test]
+    fn the_effort_row_follows_the_model_row_on_a_saved_account() {
+        let _home = HomeSandbox::new();
+        let app = saved_account_app(None);
+        let rows = config_rows(&app);
+        let pos = |row: ConfigRow| rows.iter().position(|r| *r == row);
+        let model = pos(ConfigRow::Model).expect("model row");
+        let effort = pos(ConfigRow::Effort).expect("effort row shows while unset");
+        assert!(model < effort, "effort sits below model");
+        assert!(
+            effort < pos(ConfigRow::Delete).expect("delete row"),
+            "effort is a setting, not an account action"
+        );
+    }
+
+    #[test]
+    fn space_cycles_the_effort_and_persists_each_step() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(None);
+        put_cursor_on_effort(&mut app);
+        for expected in CYCLE {
+            handle_key(&mut app, key(KeyCode::Char(' ')));
+            let want = (!expected.is_empty()).then(|| expected.to_string());
+            assert_eq!(effort_on_disk(), want, "space steps to {expected:?}");
+            assert_eq!(
+                app.config_draft.as_ref().expect("draft").effort.value,
+                expected,
+                "the row shows what was saved"
+            );
+        }
+    }
+
+    #[test]
+    fn space_on_a_custom_effort_resets_it_to_unset() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(Some("ultracode"));
+        put_cursor_on_effort(&mut app);
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            effort_on_disk(),
+            None,
+            "a custom value is outside the cycle, as the model row's custom id is"
+        );
+    }
+
+    #[test]
+    fn enter_saves_a_custom_effort_verbatim_and_clearing_it_unsets() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(None);
+        put_cursor_on_effort(&mut app);
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            Some(ConfigRow::Effort),
+            "⏎ opens the custom field"
+        );
+        for c in "ultracode".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effort_on_disk().as_deref(), Some("ultracode"));
+
+        put_cursor_on_effort(&mut app);
+        handle_key(&mut app, key(KeyCode::Enter));
+        for _ in 0.."ultracode".len() {
+            handle_key(&mut app, key(KeyCode::Backspace));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effort_on_disk(), None, "an emptied field unsets the effort");
+    }
+
+    #[test]
+    fn the_new_account_form_cycles_the_effort_and_create_persists_it() {
+        let _home = HomeSandbox::new();
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(app.profile_count());
+        enter_config_detail(&mut app);
+        assert!(
+            config_rows(&app).contains(&ConfigRow::Effort),
+            "the create form carries the effort row"
+        );
+        for expected in CYCLE {
+            cycle_effort(&mut app);
+            assert_eq!(
+                app.config_draft.as_ref().expect("draft").effort.value,
+                expected
+            );
+        }
+        cycle_effort(&mut app); // "" -> "low"
+        cycle_effort(&mut app); // "low" -> "medium"
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("fresh");
+        }
+
+        commit_new_account(&mut app);
+
+        assert_eq!(
+            app.config()
+                .find(&ProfileName::from("fresh"))
+                .and_then(|p| p.effort.clone()),
+            Some("medium".to_string()),
+            "the effort picked on the create form persists to the new profile"
+        );
+    }
+
+    #[test]
+    fn cycling_the_active_accounts_effort_rewrites_the_live_settings() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(None);
+        // The re-apply reads the active marker off disk (`active_on_disk`),
+        // never off the caller's copy, so the fixture must persist it.
+        let mut state = crate::profile::load_app_state().expect("load app state");
+        state.active_profile = Some("acct".into());
+        crate::profile::save_app_state(&state).expect("persist the active marker");
+        put_cursor_on_effort(&mut app);
+
+        let settings = || -> serde_json::Value {
+            let path = crate::claude::claude_settings_path().expect("settings path");
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read live settings"))
+                .expect("parse settings")
+        };
+
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            settings()["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+            "low",
+            "cycling a live account rewrites the settings env carrier"
+        );
+        assert!(
+            settings().get("effortLevel").is_none(),
+            "clauth never writes effortLevel"
+        );
+
+        for _ in 0..4 {
+            handle_key(&mut app, key(KeyCode::Char(' '))); // medium → high → xhigh → max
+        }
+        assert_eq!(
+            settings()["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+            "max",
+            "every step of the cycle reaches the live settings"
+        );
+        assert!(settings().get("effortLevel").is_none());
+    }
+
+    #[test]
+    fn a_login_carrying_create_persists_the_effort() {
+        use super::super::{DraftLogin, build_draft_new};
+        use crate::actions::{AnchorAction, CaptureSnapshot};
+        let _home = HomeSandbox::new();
+
+        let new_form = |name: &str, effort: &str, stash: Option<DraftLogin>| {
+            let mut app = App::new(AppConfig {
+                state: AppState::default(),
+                profiles: Vec::new(),
+            });
+            app.profile_cursor.set(0);
+            let mut draft = build_draft_new();
+            draft.name = InputState::new(name);
+            draft.effort = InputState::new(effort);
+            draft.captured_login = stash;
+            app.config_draft = Some(draft);
+            app
+        };
+
+        let mut captured = new_form(
+            "cap",
+            "low",
+            Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                anchor: AnchorAction::Unproven,
+                plan: None,
+            }))),
+        );
+        commit_new_account(&mut captured);
+        assert_eq!(
+            captured
+                .config()
+                .find(&ProfileName::from("cap"))
+                .and_then(|p| p.effort.clone()),
+            Some("low".to_string()),
+            "capture_into_profile carries the effort"
+        );
+
+        let mut minted = new_form(
+            "mint",
+            "high",
+            Some(DraftLogin::Mint(Box::new(super::login_outcome(
+                "minted",
+                Some("uuid-minted"),
+            )))),
+        );
+        commit_new_account(&mut minted);
+        assert_eq!(
+            minted
+                .config()
+                .find(&ProfileName::from("mint"))
+                .and_then(|p| p.effort.clone()),
+            Some("high".to_string()),
+            "create_profile_from_login carries the effort"
+        );
+    }
+
+    #[test]
+    fn duplicating_an_account_copies_its_effort() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(Some("max"));
+        super::super::duplicate_profile_into(
+            &mut app,
+            &ProfileName::from("acct"),
+            &ProfileName::from("copy"),
+        );
+        assert_eq!(
+            app.config()
+                .find(&ProfileName::from("copy"))
+                .expect("the duplicate exists")
+                .effort
+                .as_deref(),
+            Some("max"),
+            "duplicate_profile copies the effort"
+        );
+    }
 }

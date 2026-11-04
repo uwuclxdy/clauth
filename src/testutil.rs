@@ -1959,6 +1959,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: Default::default(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,

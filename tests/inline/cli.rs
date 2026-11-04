@@ -4419,6 +4419,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -4947,8 +4948,15 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
 }
 
 fn seed_blank_profile(config: &mut crate::profile::AppConfig, name: &str) {
-    crate::actions::create_blank_profile(config, name.to_string(), None, None, Default::default())
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        config,
+        name.to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create profile");
 }
 
 /// `--explain` runs the same background refusals a real launch runs: an
@@ -9045,6 +9053,7 @@ mod a_cli_login_lands_on_its_own_account {
             base_url.map(str::to_string),
             Some("sk-cli".to_string()),
             profile::ModelSettings::default(),
+            None,
         )
         .expect("create");
     }

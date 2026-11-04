@@ -905,7 +905,8 @@ pub(crate) fn save_bare_item_as_profile(
     let saving = || format!("saving the macOS Keychain login into {name}");
     let mut snapshot = snapshot_of_login(Some(login)).with_context(saving)?;
     snapshot.anchor = account.map_or(AnchorAction::Unproven, AnchorAction::Proven);
-    capture_into_profile(config, name.clone(), Default::default(), snapshot).with_context(saving)
+    capture_into_profile(config, name.clone(), Default::default(), None, snapshot)
+        .with_context(saving)
 }
 
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt read
@@ -1747,6 +1748,35 @@ pub(crate) fn edit_profile_model(
             // keeps every key the profile still carries). The model env keys
             // (`ANTHROPIC_DEFAULT_*`/`CLAUDE_CODE_SUBAGENT_MODEL`) are set or
             // cleared unconditionally inside `build_claude_settings_json`.
+            let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+        }
+        Ok(())
+    })
+}
+
+/// Persist a profile's effort: `edit` changes what disk holds now, so the
+/// fields the caller does not touch keep a peer's edit to them. Re-applies to
+/// the live `~/.claude/settings.json` when the profile is active, so a running
+/// `claude` picks the new effort up on its next settings read. Mirrors
+/// [`edit_profile_model`].
+pub(crate) fn edit_profile_effort(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    edit: impl FnOnce(&mut Option<String>),
+) -> Result<()> {
+    with_state_lock(|held| {
+        let active = active_on_disk(name, held)?;
+        let (fresh, ()) = update_profile_config(name, |fresh| {
+            edit(&mut fresh.effort);
+            Ok(())
+        })?
+        .with_context(|| format!("profile '{name}' not found"))?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.effort = fresh.effort.clone();
+        }
+
+        if active {
             let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
             apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
         }
@@ -3343,6 +3373,7 @@ pub(crate) fn create_blank_profile(
     base_url: Option<String>,
     api_key: Option<String>,
     models: ModelSettings,
+    effort: Option<String>,
 ) -> Result<()> {
     with_state_lock(|held| {
         validate_profile_name(&name, Harness::Claude, None)?;
@@ -3356,6 +3387,7 @@ pub(crate) fn create_blank_profile(
         // edit-after-create would leave a saved-but-model-less profile behind
         // when the second write fails, reported as a flat "create failed".
         profile.models = trimmed_models(models);
+        profile.effort = effort;
         let profile_name = profile.name.clone();
         let footprint = CreateFootprint::read(&profile_name)?;
         if let Err(e) = save_new_profile(&profile) {
@@ -3682,6 +3714,7 @@ pub(crate) fn duplicate_profile(
         profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
+        profile.effort = src.effort.clone();
         profile.fallback_threshold = src.fallback_threshold;
         profile.weekly_threshold = src.weekly_threshold;
         profile.max_auto_spend = src.max_auto_spend;
@@ -4121,7 +4154,7 @@ pub(crate) fn capture_current_login(
         }
         CaptureOwner::LooksLike(_) | CaptureOwner::Unowned => {}
     }
-    capture_into_profile(config, name.to_string(), Default::default(), snapshot)?;
+    capture_into_profile(config, name.to_string(), Default::default(), None, snapshot)?;
     // `capture_into_profile` adopted the fresh saved state into `config.state`
     // on success; decide the activation verdict off THAT, not the pre-capture
     // marker, so a peer activating an account from an empty marker meanwhile is
@@ -4255,13 +4288,14 @@ fn run_seed_order_hook(profile: &str) {
     }
 }
 
-/// `models` rides along the same way [`create_profile_from_login`]'s does: the
-/// Setup `+ new` form's model block. Every capture-from-a-name-prompt caller
-/// passes an empty one.
+/// `models` and `effort` ride along the same way [`create_profile_from_login`]'s
+/// do: the Setup `+ new` form's model block and effort row. Every
+/// capture-from-a-name-prompt caller passes them empty.
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
     models: ModelSettings,
+    effort: Option<String>,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -4332,6 +4366,7 @@ pub(crate) fn capture_into_profile(
 
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.models = trimmed_models(models);
+        profile.effort = effort;
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
         // hand-edited roster, a crash before the record landed). It goes
         // before the store write, so a later failure leaves the profile
@@ -4432,13 +4467,14 @@ fn land_registered_create(
 
 /// Create a fresh OAuth profile from an in-memory minted login — the Setup
 /// tab's capture-then-commit path (`create account` consuming the draft-held
-/// mint). One save carries credentials + models so a failed write never leaves
+/// mint). One save carries credentials, models and effort so a failed write never leaves
 /// a half-configured profile behind; the first profile links + activates
 /// exactly like [`capture_into_profile`].
 pub(crate) fn create_profile_from_login(
     config: &mut AppConfig,
     name: String,
     models: ModelSettings,
+    effort: Option<String>,
     credentials: ClaudeCredentials,
     account_uuid: Option<AccountId>,
     seed_plan: Option<PlanInfo>,
@@ -4482,6 +4518,7 @@ pub(crate) fn create_profile_from_login(
 
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models = trimmed_models(models);
+        profile.effort = effort;
         // Same orphan-dir guard as `capture_into_profile`: remove any stale
         // anchor before the store write.
         crate::profile_cache::remove_profile_cache(

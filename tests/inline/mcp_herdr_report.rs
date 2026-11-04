@@ -118,6 +118,7 @@ fn seed(names: &[&str], disabled: bool) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }

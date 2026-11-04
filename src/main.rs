@@ -1566,6 +1566,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
                 default: args.model.clone(),
                 ..Default::default()
             },
+            None,
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
@@ -1700,7 +1701,7 @@ fn capture_new_profile(
     actions::refuse_leftover_login(target)?;
     let snapshot = collect()?;
     let mut config = load_config()?;
-    actions::capture_into_profile(&mut config, target.to_string(), models, snapshot)?;
+    actions::capture_into_profile(&mut config, target.to_string(), models, None, snapshot)?;
     Ok(config)
 }
 
@@ -1823,6 +1824,7 @@ fn setup_token_into(
                 default: model.map(str::to_string),
                 ..Default::default()
             },
+            None,
         )?;
     }
     // CLA-ROLL: on a rolling-token profile the next rotation overwrites this

@@ -315,6 +315,7 @@ fn oauth_profile(
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold,
             weekly_threshold: None,
             last_resort: false,
@@ -363,6 +364,7 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -396,6 +398,7 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(90.0),
             weekly_threshold: None,
             last_resort: false,
@@ -1097,11 +1100,13 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "sk-test-key-0000");
     press(&mut app, KeyCode::Enter); // commit ApiKey
 
-    // Navigate to Create row and commit (skipping over the base model row and
-    // the collapsed overrides — left untouched, so every model stays unset).
+    // Navigate to Create row and commit (skipping over the base model row, the
+    // collapsed overrides and the effort row — left untouched, so every model
+    // and the effort stay unset).
     press(&mut app, KeyCode::Down); // ApiKey → Model
     press(&mut app, KeyCode::Down); // Model → + model override
-    press(&mut app, KeyCode::Down); // + model override → Create
+    press(&mut app, KeyCode::Down); // + model override → Effort
+    press(&mut app, KeyCode::Down); // Effort → Create
 
     assert!(
         app.config_draft

@@ -513,6 +513,95 @@ fn an_advisor_row_alone_is_enough_to_write_settings() {
     assert_eq!(v["advisorModel"], "opus");
 }
 
+fn built_with_effort(base_json: Option<&str>, effort: Option<&str>) -> serde_json::Value {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    if let Some(seed) = base_json {
+        fs::write(&base, seed).expect("seed base settings");
+    }
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.effort = effort.map(str::to_string);
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    serde_json::from_str(&json).expect("parse settings")
+}
+
+/// A running Claude Code re-reads only `env.CLAUDE_CODE_EFFORT_LEVEL` of the
+/// effort carriers, and that key outranks `effortLevel` and `modelSettings`, so
+/// every value (all five levels and a custom one, verbatim) rides it alone.
+#[test]
+fn every_effort_value_rides_the_env_override_alone() {
+    for value in ["low", "medium", "high", "xhigh", "max", "ultracode"] {
+        let v = built_with_effort(None, Some(value));
+        assert_eq!(
+            v["env"]["CLAUDE_CODE_EFFORT_LEVEL"], value,
+            "{value} → env.CLAUDE_CODE_EFFORT_LEVEL"
+        );
+        assert!(
+            v.get("effortLevel").is_none(),
+            "{value}: clauth never writes `effortLevel`"
+        );
+    }
+}
+
+/// An empty value reads as no value at startup and returns a running session to
+/// the model default, where removing the key leaves it on the old value, so an
+/// account with no effort writes `""`.
+#[test]
+fn an_unset_effort_writes_an_empty_env_override() {
+    let v = built_with_effort(None, None);
+    assert_eq!(v["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "");
+    assert!(v.get("effortLevel").is_none());
+}
+
+/// `effortLevel` is Claude Code's own key: an apply replaces only the env
+/// override a previous account left and never touches `effortLevel`.
+#[test]
+fn effort_replaces_the_env_override_and_leaves_effort_level_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stale = r#"{"effortLevel":"high","env":{"CLAUDE_CODE_EFFORT_LEVEL":"max","KEEP":"1"}}"#;
+
+    let none = built_with_effort(Some(stale), None);
+    assert_eq!(
+        none["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "",
+        "unset → empty override"
+    );
+    assert_eq!(
+        none["effortLevel"], "high",
+        "a hand-set effortLevel survives"
+    );
+    assert_eq!(none["env"]["KEEP"], "1", "unrelated env keys are preserved");
+
+    let medium = built_with_effort(Some(stale), Some("medium"));
+    assert_eq!(medium["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "medium");
+    assert_eq!(medium["effortLevel"], "high");
+}
+
+/// An effort alone makes a profile worth writing settings for: the
+/// `has_anything` gate in `apply_profile_to_claude_settings` must count it, or
+/// an account whose only knob is effort never reaches `settings.json`. An
+/// unset effort alone is no reason to create the file.
+#[test]
+fn an_effort_alone_is_enough_to_write_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+
+    let bare = crate::profile::Profile::new("p".to_string(), None, None);
+    apply_profile_to_claude_settings(&bare, &[]).expect("apply bare");
+    assert!(
+        !path.exists(),
+        "an unset effort alone writes no settings.json"
+    );
+
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.effort = Some("high".to_string());
+    apply_profile_to_claude_settings(&profile, &[]).expect("apply");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("settings written"))
+            .expect("parse settings");
+    assert_eq!(v["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "high");
+}
+
 /// `ModelSettings::is_empty` is the gate that decides whether a profile with no
 /// endpoint and no env is worth writing settings for at all, so a tier missing
 /// from it makes that tier's ONLY-set case a silent no-write.
@@ -8305,5 +8394,24 @@ fn an_unparseable_saved_record_refuses_the_uncover_without_quoting_it() {
         live_endpoint().as_deref(),
         Some("p-value"),
         "the refused write leaves the live file as it was"
+    );
+}
+
+/// The swap's one-key rewrite stats the settings file before it reads it —
+/// `write_copy_and_record`'s caller contract, and the order that keeps a
+/// Claude Code write landing between the two from pairing the older bytes
+/// with the newer mtime (the rank would then miss the record and fall back to
+/// that newer mtime, recording the stale copy at the newer rank). A missing
+/// file fails either way; which error text arrives depends on the order, so
+/// the pin reads it: the stat must come first.
+#[test]
+fn set_settings_env_key_stats_before_it_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("no-such-settings.json");
+    let err = set_settings_env_key(&missing, None, "CLAUDE_CODE_EFFORT_LEVEL", "max")
+        .expect_err("a missing settings file fails the write");
+    assert!(
+        format!("{err:#}").contains("failed to stat"),
+        "the stat must precede the read, so a missing file fails on the stat: {err:#}"
     );
 }

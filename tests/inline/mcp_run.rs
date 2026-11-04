@@ -142,6 +142,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("off"))
@@ -199,6 +200,7 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -264,6 +266,7 @@ fn seed_credit_spend_target(
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let name = crate::profile::ProfileName::from("capped");
@@ -1261,6 +1264,7 @@ fn a_quarantined_and_capped_oauth_target_refuses_with_the_login_expired_sentence
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let name = crate::profile::ProfileName::from("capped-q");
@@ -1509,6 +1513,7 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1561,6 +1566,7 @@ fn run_delegate_refuses_a_key_rejected_third_party_target_before_acquiring_a_run
         Some("https://api.deepseek.com".to_string()),
         Some("sk-dead-key".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     let name = crate::profile::ProfileName::from("ds-dead");
@@ -1618,6 +1624,7 @@ fn a_delegate_401_on_an_alibaba_key_refuses_the_next_delegate() {
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
         Some("sk-ali-dead".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     let name = crate::profile::ProfileName::from("ali-dead");
@@ -1688,6 +1695,7 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         Some("https://api.deepseek.com".to_string()),
         Some(String::new()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1740,6 +1748,7 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         Some("https://api.deepseek.com".to_string()),
         Some("   ".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1793,6 +1802,7 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test\r\nInjected: x".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1865,6 +1875,7 @@ fn run_delegate_does_not_refuse_a_keyed_third_party_target() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1893,6 +1904,7 @@ fn run_delegate_does_not_refuse_an_oauth_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1925,6 +1937,7 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1978,6 +1991,7 @@ fn run_delegate_does_not_refuse_an_env_authenticated_third_party_profile() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let profile = config
@@ -2014,6 +2028,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2022,6 +2037,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2030,6 +2046,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2038,6 +2055,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -2084,6 +2102,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2092,6 +2111,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2100,6 +2120,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         Some(String::new()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2108,6 +2129,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         Some(" \t ".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -2154,6 +2176,7 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2162,6 +2185,7 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2170,6 +2194,7 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -2220,6 +2245,7 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("both"))
@@ -2265,6 +2291,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -2318,6 +2345,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -2370,6 +2398,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         Some("http://127.0.0.1:4000".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -2407,6 +2436,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -2446,6 +2476,7 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2454,6 +2485,7 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     // A keyless Alibaba member would now refuse the fan-out; a keyed one is
@@ -2464,6 +2496,7 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -2503,6 +2536,7 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2511,6 +2545,7 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -2601,6 +2636,7 @@ fn background_fanout_refuses_a_credit_capped_member_before_writing_jobs() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2609,6 +2645,7 @@ fn background_fanout_refuses_a_credit_capped_member_before_writing_jobs() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -2715,6 +2752,7 @@ fn background_refuses_a_credit_capped_target_before_writing_job() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -2822,6 +2860,7 @@ fn fanout_refuses_a_credit_billed_model_named_in_args() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2830,6 +2869,7 @@ fn fanout_refuses_a_credit_billed_model_named_in_args() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -2935,6 +2975,7 @@ fn fanout_refuses_an_agent_run_naming_no_model() {
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -2943,6 +2984,7 @@ fn fanout_refuses_an_agent_run_naming_no_model() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -3256,6 +3298,7 @@ fn fanout_refuses_a_resumed_agent_session_naming_no_model() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped2 = crate::profile::ProfileName::from("capped2");
@@ -4034,6 +4077,7 @@ fn background_refuses_a_credit_billed_model_named_in_args() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -4141,6 +4185,7 @@ fn a_background_resume_reads_its_workspaces_project_model() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let capped_name = crate::profile::ProfileName::from("capped");
@@ -9838,6 +9883,7 @@ fn record_dead_key_on_alibaba_marks_the_key_and_leaves_the_usage_credential_live
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
         Some("sk-ali-key".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     let name = crate::profile::ProfileName::from("ali-key");
@@ -11205,6 +11251,7 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -12068,6 +12115,7 @@ fn a_run_that_refused_before_spawning_leaves_the_seam_unarmed() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let handoff = super::Handoff::blocking(mint_spec("work"));
@@ -13086,6 +13134,7 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -13303,6 +13352,7 @@ fn the_delegate_row_is_marked_from_its_first_sight() {
         Some("https://api.deepseek.com/anthropic".to_string()),
         Some("sk-test".to_string()),
         Default::default(),
+        None,
     )
     .expect("create profile");
     let dir = crate::profile::clauth_dir()

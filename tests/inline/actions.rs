@@ -153,6 +153,17 @@ fn classify_env_key_flags_managed_keys() {
     assert_eq!(classify_env_key(&p, &[], "ANTHROPIC_CUSTOM_FLAG"), None);
 }
 
+/// The effort row writes `CLAUDE_CODE_EFFORT_LEVEL`, so a custom entry with
+/// that name would silently override it: the collision prompt names the row.
+#[test]
+fn classify_env_key_names_the_effort_field() {
+    let p = Profile::new("acct".to_string(), None, None);
+    assert_eq!(
+        classify_env_key(&p, &[], "CLAUDE_CODE_EFFORT_LEVEL"),
+        Some(EnvKeyCollision::Managed("the effort field"))
+    );
+}
+
 #[test]
 fn classify_env_key_flags_own_field_by_sorted_index() {
     let mut p = Profile::new("acct".to_string(), None, None);
@@ -2064,6 +2075,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     target.env.insert("FOO".to_string(), "bar".to_string());
     target.fallback_threshold = Some(42.0);
     target.bell_threshold = Some(77.0);
+    target.effort = Some("max".to_string());
     target.models.opus = Some("claude-opus-4".to_string());
     target.credentials = Some(ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -2166,6 +2178,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         "fallback_threshold preserved"
     );
     assert_eq!(acme.bell_threshold, Some(77.0), "bell_threshold preserved");
+    assert_eq!(acme.effort.as_deref(), Some("max"), "effort preserved");
     assert_eq!(
         acme.models.opus.as_deref(),
         Some("claude-opus-4"),
@@ -2755,6 +2768,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
         &mut config,
         "incoming".to_string(),
         Default::default(),
+        None,
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -2824,6 +2838,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
         &mut config,
         "incoming".to_string(),
         Default::default(),
+        None,
         ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-incoming".to_string(),
@@ -3416,6 +3431,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -3476,6 +3492,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted-refresh", None),
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -3560,6 +3577,7 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         minted,
         None,
         None,
@@ -4369,6 +4387,7 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
         &mut config,
         "orphan".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted", None),
     )
     .expect("capture");
@@ -4376,6 +4395,7 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
         &mut config,
         "brandnew".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted2", None),
     )
     .expect("capture brand new");
@@ -5050,6 +5070,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     // create_blank_profile does not activate; mark it active and wire the live
@@ -5107,6 +5128,7 @@ fn delete_refuses_live_session_unless_forced() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5174,6 +5196,7 @@ fn a_delete_with_no_force_flag_never_names_it_on_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let sessions = home
@@ -5211,8 +5234,15 @@ fn profile_with_a_dead_copy_tree(
     config: &mut AppConfig,
     name: &str,
 ) -> std::path::PathBuf {
-    create_blank_profile(config, name.to_string(), None, None, Default::default())
-        .expect("create profile");
+    create_blank_profile(
+        config,
+        name.to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create profile");
     let claude_home = home.home().join(".claude");
     std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
     std::fs::write(claude_home.join("CLAUDE.md"), "memory").expect("global memory");
@@ -5577,6 +5607,7 @@ fn delete_refuses_a_profile_with_a_background_job_tree_unless_forced() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5644,6 +5675,7 @@ fn a_job_under_another_profile_does_not_block_delete() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -5691,6 +5723,7 @@ fn delete_refuses_while_a_job_record_cannot_be_read() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let job = home.home().join(".claude").join("jobs").join("0add99ec");
@@ -5736,6 +5769,7 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     // Active, so the delete's unwire leg is armed: an api key in the live
@@ -5839,6 +5873,7 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5916,6 +5951,7 @@ fn rename_refuses_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5977,6 +6013,7 @@ fn rename_refuses_a_profile_with_a_background_job_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -6036,6 +6073,7 @@ fn rename_refuses_a_leftover_target_directory() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -6092,6 +6130,7 @@ fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -6169,6 +6208,7 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6228,6 +6268,7 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6274,6 +6315,7 @@ fn a_case_only_rename_is_not_a_collision_with_itself() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6313,6 +6355,7 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     create_blank_profile(
@@ -6321,6 +6364,7 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6349,6 +6393,7 @@ fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6387,6 +6432,7 @@ fn disable_refuses_the_active_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     config.state.active_profile = Some("acme".into());
@@ -6419,6 +6465,7 @@ fn disable_refuses_a_profile_with_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6463,6 +6510,7 @@ fn disable_refuses_a_profile_with_a_background_job_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6510,6 +6558,7 @@ fn disable_sets_the_flag_and_a_reload_observes_it() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6546,6 +6595,7 @@ fn disable_is_idempotent_on_an_already_disabled_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
@@ -6656,6 +6706,7 @@ fn enable_is_idempotent_on_an_already_enabled_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6688,6 +6739,7 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -6736,6 +6788,7 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -9730,6 +9783,7 @@ fn blank_profiles(names: &[&str]) -> AppConfig {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -11015,6 +11069,7 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         login_snapshot("access-A-again", Some("uuid-A")),
     )
     .expect_err("an orphan login refuses the capture");
@@ -11082,6 +11137,7 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         oauth_pair("access-A-again"),
         Some(AccountId::from("uuid-A")),
         None,
@@ -12343,6 +12399,7 @@ fn a_delete_then_recreate_forgets_the_old_reading() {
         &mut config,
         "re".to_string(),
         Default::default(),
+        None,
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-B")),
             base_url: None,
@@ -13214,6 +13271,7 @@ fn capture_into_profile_seeds_the_probe_plan() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -13262,6 +13320,7 @@ fn a_failed_install_after_the_seed_leaves_no_usage_cache() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect_err("the app-state save fails after the seed");
@@ -13290,6 +13349,7 @@ fn create_profile_from_login_seeds_the_probe_plan() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13347,6 +13407,7 @@ fn a_probe_less_install_seeds_nothing() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -13370,6 +13431,7 @@ fn a_plan_for_another_account_is_not_seeded() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -13485,6 +13547,7 @@ fn the_capture_seed_lands_before_the_identity_writes() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -13507,6 +13570,7 @@ fn the_create_seed_lands_before_the_identity_writes() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13737,6 +13801,7 @@ fn a_seeded_new_account_is_due_at_once() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13783,6 +13848,7 @@ fn a_failed_create_after_the_seed_leaves_no_usage_cache() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13865,6 +13931,7 @@ fn a_same_account_capture_onto_an_orphan_dir_keeps_the_window() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect_err("the orphan's login refuses the capture");
@@ -13922,6 +13989,7 @@ fn a_same_account_create_onto_an_orphan_dir_keeps_the_window() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-A")),
         Some(plan_for("uuid-A")),
@@ -14004,6 +14072,7 @@ fn delete_profile_stops_a_tree_supervisor_first() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
         let tree = home
@@ -14060,6 +14129,7 @@ fn delete_profile_refuses_when_a_supervisor_lands_after_the_stop() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14120,6 +14190,7 @@ fn delete_profile_with_force_still_stops_a_verifiable_supervisor() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14169,6 +14240,7 @@ fn delete_profile_refuses_a_verified_supervisor_that_ignores_sigterm() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14226,6 +14298,7 @@ fn delete_profile_with_force_removes_a_verified_supervisor_that_ignores_sigterm(
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14278,6 +14351,7 @@ fn delete_profile_spares_a_tree_whose_post_signal_liveness_read_fails() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14353,6 +14427,7 @@ fn delete_wedges_when_any_wait_read_saw_the_supervisor_alive() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14429,6 +14504,7 @@ fn delete_profile_refuses_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14494,6 +14570,7 @@ fn delete_profile_removes_a_tree_with_a_symlinked_daemon_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14540,6 +14617,7 @@ fn delete_profile_with_force_removes_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14591,6 +14669,7 @@ fn rename_profile_refuses_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14656,6 +14735,7 @@ fn a_refused_delete_of_the_active_profile_leaves_it_wired() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -14735,6 +14815,7 @@ fn rename_profile_stops_a_tree_supervisor_first() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -15185,6 +15266,7 @@ fn a_capture_keeps_the_switch_and_chain_edit_made_meanwhile() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -15212,6 +15294,7 @@ fn a_capture_keeps_the_switch_and_chain_edit_made_meanwhile() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("capture over a stale config");
@@ -15271,6 +15354,7 @@ fn seed_two_captured() -> (crate::profile::ProfileName, crate::profile::ProfileN
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -15856,6 +15940,7 @@ fn seed_third_captured() -> crate::profile::ProfileName {
         &mut config,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("seed capture");
@@ -16821,6 +16906,7 @@ fn a_first_account_create_after_an_older_clauths_cover_never_keeps_its_value() {
         &mut config,
         "c".to_string(),
         Default::default(),
+        None,
         oauth_pair("c-login"),
         None,
         None,
@@ -17410,6 +17496,7 @@ fn a_failed_roster_write_keeps_a_profile_dir_that_predates_the_create() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -17436,6 +17523,7 @@ fn a_first_account_create_whose_roster_write_fails_keeps_the_login_live() {
         &mut config,
         "first".to_string(),
         Default::default(),
+        None,
         oauth_pair("first-access"),
         None,
         None,
@@ -17477,6 +17565,7 @@ fn a_capture_or_duplicate_whose_roster_write_fails_leaves_nothing() {
             &mut config,
             "c".to_string(),
             Default::default(),
+            None,
             login_snapshot("c", None),
         )
         .expect_err("the roster write fails");
@@ -17565,6 +17654,7 @@ fn a_reconciled_switch_elsewhere_after_a_peer_switch_keeps_each_accounts_own_log
         &mut seeded,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("seed c");
@@ -17795,6 +17885,7 @@ fn a_link_refusal_rollback_keeps_a_dir_that_predates_the_create() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         login_snapshot("work", None),
     )
     .expect_err("the link refuses");
@@ -17832,6 +17923,7 @@ fn a_failed_roster_write_removes_only_the_files_the_create_wrote() {
         &mut config,
         "left".to_string(),
         Default::default(),
+        None,
         oauth_pair("left"),
         None,
         None,
@@ -17867,6 +17959,7 @@ fn a_create_whose_profile_save_fails_removes_what_it_wrote() {
         &mut config,
         "late".to_string(),
         Default::default(),
+        None,
         oauth_pair("late"),
         None,
         None,
@@ -18130,6 +18223,7 @@ fn a_login_create_keeps_the_switch_and_chain_edit_made_meanwhile() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None).credentials.unwrap(),
         None,
         None,
@@ -18168,8 +18262,15 @@ fn a_blank_create_keeps_the_switch_and_chain_edit_made_meanwhile() {
     let _home = HomeSandbox::new();
     seed_two_captured();
     let (mut stale, meantime) = stale_config_and_meantime();
-    create_blank_profile(&mut stale, "c".to_string(), None, None, Default::default())
-        .expect("create");
+    create_blank_profile(
+        &mut stale,
+        "c".to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create");
     let after = crate::profile::load_app_state().expect("after");
     assert_eq!(
         after.active_profile, meantime.active_profile,
@@ -18410,6 +18511,7 @@ fn a_reorder_moves_by_name_when_the_roster_changed_meanwhile() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -18449,6 +18551,7 @@ fn a_reorder_of_an_account_a_peer_deleted_rewrites_nothing() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -18931,6 +19034,7 @@ fn a_reconciled_switch_saves_the_live_login_into_an_account_the_copy_lacks() {
         &mut peer,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("a peer creates c");
@@ -19149,6 +19253,7 @@ fn a_first_account_activation_strips_the_departed_accounts_keys() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         oauth_pair("c-login"),
         None,
         None,
@@ -19236,6 +19341,7 @@ fn a_failed_create_over_a_leftover_dir_puts_back_what_it_overwrote() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect_err("the roster write fails");
     }
@@ -19302,6 +19408,7 @@ fn a_failed_undo_over_a_leftover_dir_names_the_file() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -19331,6 +19438,7 @@ fn a_failed_undo_names_every_file_it_left() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     let denied = std::io::Error::from_raw_os_error(13);
@@ -19367,6 +19475,7 @@ fn a_failed_undo_names_a_leftover_it_could_not_read() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -19397,7 +19506,14 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
     type Create = fn(&mut AppConfig) -> Result<()>;
     let creates: [(&str, Create); 4] = [
         ("blank", |config| {
-            create_blank_profile(config, "left".to_string(), None, None, Default::default())
+            create_blank_profile(
+                config,
+                "left".to_string(),
+                None,
+                None,
+                Default::default(),
+                None,
+            )
         }),
         ("duplicate", |config| {
             duplicate_profile(config, &ProfileName::from("src"), "left".to_string())
@@ -19407,6 +19523,7 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 config,
                 "left".to_string(),
                 Default::default(),
+                None,
                 login_snapshot("minted", None),
             )
         }),
@@ -19415,6 +19532,7 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 config,
                 "left".to_string(),
                 Default::default(),
+                None,
                 oauth_pair("minted"),
                 None,
                 None,
@@ -19430,6 +19548,7 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("a source to duplicate");
         let dir = crate::profile::profile_dir(&ProfileName::from("left")).expect("dir");
@@ -19481,6 +19600,7 @@ fn a_create_over_a_leftover_config_alone_lands() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("the create lands");
     assert!(
@@ -19558,6 +19678,7 @@ fn three_accounts_a_relogged() -> (ProfileName, ProfileName, ProfileName) {
         &mut seeded,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("seed c");
@@ -19878,6 +19999,7 @@ fn a_peer_took_the_name_n() -> AppConfig {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("a source to duplicate");
     let stale = crate::profile::load_config().expect("stale read");
@@ -19887,6 +20009,7 @@ fn a_peer_took_the_name_n() -> AppConfig {
         None,
         Some("sk-peer".to_string()),
         Default::default(),
+        None,
     )
     .expect("the peer's create");
     stale
@@ -19935,6 +20058,7 @@ fn a_login_create_onto_a_name_a_peer_took_refuses() {
         &mut stale,
         "n".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         None,
         None,
@@ -19957,6 +20081,7 @@ fn a_create_of_a_login_another_account_stores_refuses() {
                 config,
                 "dup".to_string(),
                 Default::default(),
+                None,
                 login_snapshot("a", None),
             )
         }),
@@ -19969,6 +20094,7 @@ fn a_create_of_a_login_another_account_stores_refuses() {
                 config,
                 "dup".to_string(),
                 Default::default(),
+                None,
                 login,
                 None,
                 None,
@@ -20041,8 +20167,14 @@ fn a_active_with_bs_saved_login_live() {
         {
             oauth.access_token = format!("acc-{name}");
         }
-        capture_into_profile(&mut seeded, name.to_string(), Default::default(), snapshot)
-            .expect("seed capture");
+        capture_into_profile(
+            &mut seeded,
+            name.to_string(),
+            Default::default(),
+            None,
+            snapshot,
+        )
+        .expect("seed capture");
     }
     let b = ProfileName::from("b");
     let b_store = crate::profile::profile_dir(&b)
@@ -20173,6 +20305,7 @@ fn a_switch_off_an_account_without_a_login_never_adopts_a_saved_one() {
         Some("https://api.example.test".to_string()),
         Some("sk-keyed".to_string()),
         Default::default(),
+        None,
     )
     .expect("the api-key account");
     crate::profile::update_app_state(|s, held| s.set_active(Some("keyed".into()), held))

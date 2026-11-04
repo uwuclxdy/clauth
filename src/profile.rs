@@ -360,6 +360,11 @@ pub(crate) struct Profile {
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
     pub(crate) models: ModelSettings,
+    /// Per-account Claude Code reasoning effort, written as
+    /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the carrier a
+    /// running CC 2.1.317 re-reads live; clauth never writes `effortLevel`.
+    /// Unset = the key written empty.
+    pub(crate) effort: Option<String>,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     /// Per-account override of the chain-wide weekly (7d) switch line
@@ -482,6 +487,7 @@ impl Profile {
             usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -1904,6 +1910,8 @@ struct ProfileConfig {
     env: BTreeMap<String, String>,
     #[serde(default)]
     models: ModelSettings,
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
@@ -4504,6 +4512,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
+        effort: config.effort,
         fallback_threshold: finite_pct(config.fallback_threshold),
         // Reset-not-clamp, mirroring the chain-wide line this overrides
         // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
@@ -4562,6 +4571,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                     .then_some(profile.usage_probe_interval_ms),
                 env: profile.env.clone(),
                 models: profile.models.clone(),
+                effort: profile.effort.clone(),
                 fallback_threshold: profile.fallback_threshold,
                 weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
@@ -5561,6 +5571,16 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("disabled = true\n");
     } else {
         out.push_str("# disabled = true\n");
+    }
+    out.push('\n');
+
+    out.push_str(concat!(
+        "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
+        "# (`effortLevel` is Claude Code's own key).\n",
+    ));
+    match profile.effort.as_deref() {
+        Some(v) => out.push_str(&format!("effort = {}\n", toml_str(v))),
+        None => out.push_str("# effort = \"high\"\n"),
     }
     out.push('\n');
 

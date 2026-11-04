@@ -822,6 +822,7 @@ fn a_failed_probe_carries_no_plan_and_seeds_nothing() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");

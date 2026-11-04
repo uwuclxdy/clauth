@@ -1259,6 +1259,7 @@ fn seed_accounts(oauth: &[&str], api: &[&str], chain: &[&str]) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create oauth profile");
     }
@@ -1269,6 +1270,7 @@ fn seed_accounts(oauth: &[&str], api: &[&str], chain: &[&str]) {
             Some("https://api.example.test".to_string()),
             Some("fixture-key".to_string()),
             Default::default(),
+            None,
         )
         .expect("create api profile");
     }

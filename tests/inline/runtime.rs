@@ -4306,6 +4306,7 @@ fn delete_proceeds_when_the_supervisor_exits_before_the_kill() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
         let tree = tmp
@@ -11435,6 +11436,49 @@ fn a_swap_holds_the_intended_members_per_session_marker() {
     });
 }
 
+/// A swap whose incoming member's per-session marker a live foreign process
+/// holds is refused inside the commit hold, after the drain point: the session
+/// keeps its launch effort, byte for byte.
+#[test]
+fn a_swap_refused_inside_its_commit_hold_leaves_the_session_effort_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let launch = member("heldfx-a");
+        let mut intended = member("heldfx-b");
+        intended.effort = Some("low".to_string());
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        let settings = swap.runtime.join("settings.json");
+        let seeded = serde_json::json!({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}).to_string();
+        fs::write(&settings, &seeded).expect("seed session settings");
+
+        let markers = crate::profile::profile_dir(&crate::profile::ProfileName::from("heldfx-b"))
+            .expect("profile dir")
+            .join(format!("sessions-{sid}"));
+        fs::create_dir_all(&markers).expect("mkdir markers");
+        let held = open_pid_file(&markers.join(&sid)).expect("open marker");
+        held.lock().expect("lock marker");
+
+        let outcome = swap.swap_to("heldfx-b").expect("swap");
+
+        assert_eq!(
+            fs::read_to_string(&settings).expect("read settings"),
+            seeded,
+            "a swap refused inside its hold writes no effort"
+        );
+        assert_eq!(
+            outcome,
+            SwapOutcome::Refused(SwapRefused::MarkerNotLockable),
+            "precondition: the refusal came from inside the commit hold"
+        );
+    });
+}
+
 /// A member whose marker this session cannot hold is a member the rotation gate
 /// cannot see it on, so the swap refuses INSIDE the hold rather than repointing
 /// the link at a chain nothing is protecting.
@@ -11566,6 +11610,440 @@ fn a_swap_repoints_the_runtime_link_at_the_intended_store() {
             fs::read(&intended_store).expect("read store"),
         );
     });
+}
+
+/// A running Claude Code re-reads `env.CLAUDE_CODE_EFFORT_LEVEL` from its
+/// `settings.json`, so a swap rewrites that one key to the incoming member's
+/// effort (`""` when it has none) and leaves every other key as it was: the
+/// seed carries keys a rebuild from the incoming profile would drop. The file
+/// stays owner-only like every clauth-owned write under `~/.clauth`.
+#[test]
+fn a_swap_hands_the_session_the_intended_members_effort() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let mut launch = member("eff-a");
+        launch.effort = Some("max".to_string());
+        let mut low = member("eff-b");
+        low.effort = Some("low".to_string());
+        let unset = member("eff-c");
+        member_store(&launch);
+        member_store(&low);
+        member_store(&unset);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        let launched = serde_json::json!({
+            "theme": "dark",
+            "effortLevel": "high",
+            "apiKeyHelper": "clauth __api-key eff-a",
+            "env": {
+                "CLAUDE_CODE_EFFORT_LEVEL": "max",
+                "ANTHROPIC_BASE_URL": "https://old.example",
+                "KEEP": "1"
+            }
+        });
+        fs::write(&settings, launched.to_string()).expect("seed session settings");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(&settings).expect("read settings"))
+                .expect("parse settings")
+        };
+
+        assert_eq!(swap.swap_to("eff-b").expect("swap"), SwapOutcome::Swapped);
+        let mut expected = launched.clone();
+        expected["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = serde_json::json!("low");
+        assert_eq!(read(), expected, "only the effort key moves, onto eff-b's");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&settings)
+                .expect("stat settings")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the swap's write is owner-only");
+        }
+
+        assert_eq!(swap.swap_to("eff-c").expect("swap"), SwapOutcome::Swapped);
+        expected["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = serde_json::json!("");
+        assert_eq!(read(), expected, "a member with no effort hands over \"\"");
+    });
+}
+
+/// A session `settings.json` that parses but is no JSON object holds no `env`
+/// to update: the swap still moves the credentials, and the file is left as it
+/// was rather than taking the watchdog down.
+#[test]
+fn a_swap_over_a_settings_file_that_is_no_object_still_moves_the_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let launch = member("odd-a");
+        let mut intended = member("odd-b");
+        intended.effort = Some("low".to_string());
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        fs::write(&settings, "[]").expect("seed a non-object settings file");
+
+        assert_eq!(swap.swap_to("odd-b").expect("swap"), SwapOutcome::Swapped);
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            intended_store,
+            "the credential move stands"
+        );
+        assert_eq!(fs::read_to_string(&settings).expect("read settings"), "[]");
+    });
+}
+
+/// A member's own `[env]` `CLAUDE_CODE_EFFORT_LEVEL` outranks its `effort` field
+/// in the settings a launch builds, so a swap hands the session the same value a
+/// launch on that member would: the builder's.
+#[test]
+fn a_swap_hands_over_the_effort_a_launch_on_the_member_would_carry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let pinned = |name: &str, effort: &str| {
+            let mut p = member(name);
+            p.env
+                .insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "max".to_string());
+            p.effort = Some(effort.to_string());
+            p
+        };
+        let launch = pinned("envff-a", "high");
+        let intended = pinned("envff-b", "low");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}).to_string(),
+        )
+        .expect("seed session settings");
+
+        assert_eq!(swap.swap_to("envff-b").expect("swap"), SwapOutcome::Swapped);
+
+        let built: serde_json::Value = serde_json::from_str(
+            &crate::claude::build_claude_settings_json(None, &intended, &[]).expect("build"),
+        )
+        .expect("parse built");
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).expect("read settings"))
+                .expect("parse settings");
+        assert_eq!(
+            written["env"]["CLAUDE_CODE_EFFORT_LEVEL"], built["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+            "the swap writes what a launch on envff-b would"
+        );
+    });
+}
+
+/// A swap onto the member already current and a swap refused on its config move
+/// nothing, so neither may touch the session's effort: its `settings.json`
+/// keeps its bytes.
+#[test]
+fn a_no_op_or_a_refused_swap_leaves_the_session_effort_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let mut launch = member("still-a");
+        launch.effort = Some("low".to_string());
+        let mut refused = member("still-b");
+        refused.effort = Some("high".to_string());
+        refused
+            .env
+            .insert("SOMETHING_ELSE".to_string(), "1".to_string());
+        member_store(&launch);
+        member_store(&refused);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        let seeded = serde_json::json!({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}).to_string();
+        fs::write(&settings, &seeded).expect("seed session settings");
+
+        let same = swap.swap_to("still-a").expect("same-member swap");
+        assert_eq!(
+            fs::read_to_string(&settings).expect("read settings"),
+            seeded,
+            "a same-member swap writes no effort"
+        );
+        assert_eq!(
+            same,
+            SwapOutcome::Refused(SwapRefused::AlreadyCurrent),
+            "precondition: the link already resolves to still-a"
+        );
+
+        let outcome = swap.swap_to("still-b").expect("refused swap");
+        assert_eq!(
+            fs::read_to_string(&settings).expect("read settings"),
+            seeded,
+            "a refused swap writes no effort"
+        );
+        assert_eq!(
+            outcome,
+            SwapOutcome::Refused(SwapRefused::EnvDiffers),
+            "precondition: the swap was refused on its env"
+        );
+    });
+}
+
+/// A session `settings.json` whose top level IS an object but whose `env` is
+/// not (an array, a null) holds no env to update either: the swap still moves
+/// the credentials and leaves the file byte-identical. The top-level `[]` guard
+/// has its own pin; this one drives the nested guard.
+#[test]
+fn a_swap_over_a_settings_file_whose_env_is_not_an_object_still_moves_the_session() {
+    for raw in [r#"{"env": []}"#, r#"{"env": null}"#] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+                return;
+            }
+            let launch = member("odd-env-a");
+            let mut intended = member("odd-env-b");
+            intended.effort = Some("low".to_string());
+            member_store(&launch);
+            let intended_store = member_store(&intended);
+            let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+            let settings = swap.runtime.join("settings.json");
+            fs::write(&settings, raw).expect("seed a settings file whose env is no object");
+
+            assert_eq!(
+                swap.swap_to("odd-env-b").expect("swap"),
+                SwapOutcome::Swapped
+            );
+
+            assert_eq!(
+                fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+                intended_store,
+                "the credential move stands"
+            );
+            assert_eq!(
+                fs::read_to_string(&settings).expect("read settings"),
+                raw,
+                "the swap leaves the file untouched: {raw}"
+            );
+        });
+    }
+}
+
+/// A swap's settings rewrite records itself in the written-copy record (with
+/// the copy's pre-write rank), so the reconciler reads it as clauth's own echo
+/// rather than as a fresh Claude Code write: an unrecorded rewrite ranks by
+/// its new mtime — while its stale launch entry still lets it win — and
+/// outranks a NEWER edit of the same shared key the user made in the base
+/// `~/.claude/settings.json`, reverting it everywhere. Pinned end to end: a
+/// launch-recorded session copy holding a stale shared key, a newer base edit,
+/// a swap, then one reconcile pass — the base's newer value survives in the
+/// base and in the session copy.
+#[test]
+fn a_swap_does_not_let_the_session_copy_revert_a_newer_base_edit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let base = fake_claude_home(tmp.path()).join("settings.json");
+        let record = crate::settings_sync::written_record_path().expect("record path");
+        let launch = member("echo-a");
+        let intended = member("echo-b");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        // The base's original write, which the launch-built copy carries.
+        let t0 = SystemTime::now() - Duration::from_secs(120);
+        fs::write(&base, serde_json::json!({"theme": "dark"}).to_string())
+            .expect("seed the base's original write");
+        set_mtime(&base, t0);
+        // The launch-built copy, recorded exactly as `write_merged_settings`
+        // records it: carrying the base write's rank, stamped at its own write.
+        let stale = serde_json::json!({"theme": "dark", "env": {}});
+        let stale_bytes = serde_json::to_vec_pretty(&stale).expect("serialize");
+        crate::jsonsync::write_copy_and_record(
+            Some(&record),
+            &settings,
+            &stale_bytes,
+            as_rank(t0),
+            true,
+            Some(SystemTime::now() - Duration::from_secs(110)),
+        )
+        .expect("record the session copy as the launch would");
+        // The user's newer edit of the shared key.
+        fs::write(&base, serde_json::json!({"theme": "light"}).to_string())
+            .expect("seed the base's newer edit");
+        set_mtime(&base, SystemTime::now() - Duration::from_secs(60));
+
+        assert_eq!(swap.swap_to("echo-b").expect("swap"), SwapOutcome::Swapped);
+
+        crate::settings_sync::sync_once().expect("one reconcile pass");
+
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(path).expect("read settings"))
+                .expect("parse settings")
+        };
+        assert_eq!(
+            read(&base)["theme"],
+            serde_json::json!("light"),
+            "the base keeps its newer edit"
+        );
+        assert_eq!(
+            read(&settings)["theme"],
+            serde_json::json!("light"),
+            "the session copy follows the base, not its own stale key"
+        );
+    });
+}
+
+/// A swap's rewrite of an UNCHANGED launch echo carries the rank of the base
+/// write those bytes were built from, not the copy's own newer mtime: the copy
+/// can be written after a base edit landed but from an older read, and only the
+/// carried rank keeps that newer base edit winning. Reading the copy's own
+/// mtime here would let the launch's stale shared keys override the user's
+/// edit, the class the recorded write exists to stop.
+#[test]
+fn a_swap_keeps_the_echo_rank_so_a_base_edit_inside_its_write_window_wins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let base = fake_claude_home(tmp.path()).join("settings.json");
+        let record = crate::settings_sync::written_record_path().expect("record path");
+        let launch = member("rank-a");
+        let intended = member("rank-b");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        // The base's original write, which the launch-built copy carries.
+        let base_rank = SystemTime::now() - Duration::from_secs(120);
+        fs::write(&base, serde_json::json!({"theme": "dark"}).to_string())
+            .expect("seed the base's original write");
+        set_mtime(&base, base_rank);
+        // The launch-built copy: clauth's unchanged echo, recorded with the base
+        // write's rank and stamped at its own (later) write.
+        let stale = serde_json::json!({"theme": "dark", "env": {}});
+        let stale_bytes = serde_json::to_vec_pretty(&stale).expect("serialize");
+        crate::jsonsync::write_copy_and_record(
+            Some(&record),
+            &settings,
+            &stale_bytes,
+            as_rank(base_rank),
+            true,
+            Some(SystemTime::now() - Duration::from_secs(30)),
+        )
+        .expect("record the session copy as the launch would");
+        // The user's newer edit of the shared key, inside the copy's write
+        // window: newer than the rank its bytes carry, older than its mtime.
+        fs::write(&base, serde_json::json!({"theme": "light"}).to_string())
+            .expect("seed the base's newer edit");
+        set_mtime(&base, SystemTime::now() - Duration::from_secs(60));
+
+        assert_eq!(swap.swap_to("rank-b").expect("swap"), SwapOutcome::Swapped);
+
+        crate::settings_sync::sync_once().expect("one reconcile pass");
+
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(path).expect("read settings"))
+                .expect("parse settings")
+        };
+        assert_eq!(
+            read(&base)["theme"],
+            serde_json::json!("light"),
+            "the base keeps its newer edit"
+        );
+        assert_eq!(
+            read(&settings)["theme"],
+            serde_json::json!("light"),
+            "the session copy follows the base, not the echo's stale key"
+        );
+    });
+}
+
+/// A session copy Claude Code edited after the launch carries bytes the record
+/// no longer matches, so the swap ranks it by that edit's own mtime: a base
+/// edit older than the session's edit must not revert it. A floor rank (or the
+/// old entry's rank) would hand the older base the win and lose the edit.
+#[test]
+fn a_swap_ranks_a_session_edit_by_its_own_mtime_over_an_older_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let base = fake_claude_home(tmp.path()).join("settings.json");
+        let record = crate::settings_sync::written_record_path().expect("record path");
+        let launch = member("edit-a");
+        let intended = member("edit-b");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let settings = swap.runtime.join("settings.json");
+        // The base's original write, which the launch-built copy carries.
+        let base_rank = SystemTime::now() - Duration::from_secs(120);
+        fs::write(&base, serde_json::json!({"theme": "dark"}).to_string())
+            .expect("seed the base's original write");
+        set_mtime(&base, base_rank);
+        let stale = serde_json::json!({"theme": "dark", "env": {}});
+        let stale_bytes = serde_json::to_vec_pretty(&stale).expect("serialize");
+        crate::jsonsync::write_copy_and_record(
+            Some(&record),
+            &settings,
+            &stale_bytes,
+            as_rank(base_rank),
+            true,
+            Some(base_rank),
+        )
+        .expect("record the session copy as the launch would");
+        // Claude Code's own in-session edit: new bytes, new mtime, so no record
+        // entry matches and the copy ranks as itself.
+        fs::write(
+            &settings,
+            serde_json::json!({"theme": "light", "env": {}}).to_string(),
+        )
+        .expect("seed the session's own edit");
+        set_mtime(&settings, SystemTime::now() - Duration::from_secs(30));
+        // The base's own edit, older than the session's.
+        fs::write(&base, serde_json::json!({"theme": "dim"}).to_string())
+            .expect("seed the base's older edit");
+        set_mtime(&base, SystemTime::now() - Duration::from_secs(60));
+
+        assert_eq!(swap.swap_to("edit-b").expect("swap"), SwapOutcome::Swapped);
+
+        crate::settings_sync::sync_once().expect("one reconcile pass");
+
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(path).expect("read settings"))
+                .expect("parse settings")
+        };
+        assert_eq!(
+            read(&base)["theme"],
+            serde_json::json!("light"),
+            "the session's newer edit reaches the base"
+        );
+        assert_eq!(
+            read(&settings)["theme"],
+            serde_json::json!("light"),
+            "and survives in the session copy"
+        );
+    });
+}
+
+/// `SystemTime` as the record's `(secs, nanos)` rank pair.
+fn as_rank(when: SystemTime) -> (i64, u32) {
+    let d = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("post-epoch");
+    (d.as_secs() as i64, d.subsec_nanos())
 }
 
 /// §11 #1. A Claude Code re-login sitting in the runtime file belongs to the
@@ -12963,6 +13441,47 @@ fn a_pre_arming_session_converges_onto_the_armed_sidecar_on_one_poll() {
         let creds = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&sidecar)
             .expect("read sidecar");
         assert_eq!(converge_item_arm(Some(&creds)), SwapItemArm::SignOut);
+    });
+}
+
+/// A convergence that really moves the session (one poll onto the armed
+/// rolling sidecar, same member) writes nothing new, so the session's effort
+/// — whatever `env.CLAUDE_CODE_EFFORT_LEVEL` the file carries — keeps its
+/// bytes: the converge plan mints no effort, and writing one would reset the
+/// session to the model default mid-conversation.
+#[test]
+fn a_converge_leaves_the_session_effort_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("conv-effort-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        // Arm the profile under the live session, exactly as the pre-arming
+        // fixture: the poll then really converges, it is not a no-op.
+        let sidecar =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-effort-a"))
+                .expect("profile_dir")
+                .join("session-token.json");
+        write_creds(&sidecar, None);
+        let settings = swap.runtime.join("settings.json");
+        let seeded = serde_json::json!({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}).to_string();
+        fs::write(&settings, &seeded).expect("seed the session's effort");
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "precondition: the poll really converged the session onto the sidecar"
+        );
+        assert_eq!(
+            fs::read_to_string(&settings).expect("read settings"),
+            seeded,
+            "a convergence writes no effort"
+        );
     });
 }
 
@@ -19022,6 +19541,7 @@ fn item_retry_for(prefix: &str, store: &Path, previous_store: &Path) -> SwapItem
         member: crate::profile::ProfileName::from(format!("{prefix}-b").as_str()),
         store: store.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
+        effort: None,
     }
 }
 
@@ -19077,6 +19597,15 @@ fn a_landed_swap_item_retry_repoints_the_row_and_disarms() {
             &intended_store,
             &launch_store,
         ));
+        // The landed legs are where the swap's deferred effort handover lands,
+        // so the session's settings must take the intended member's effort
+        // here, exactly as the swap's own landed legs write it on macOS.
+        let settings = swap.runtime.join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({"env": {"KEEP": "1"}}).to_string(),
+        )
+        .expect("seed the session settings");
 
         swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
 
@@ -19086,6 +19615,19 @@ fn a_landed_swap_item_retry_repoints_the_row_and_disarms() {
             Some(intended_store),
             "the row names the store the session reads now"
         );
+        let read: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).expect("read settings"))
+                .expect("parse settings");
+        assert_eq!(
+            read["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+            serde_json::json!(""),
+            "the landed retry hands the session the intended member's effort"
+        );
+        assert_eq!(
+            read["env"]["KEEP"],
+            serde_json::json!("1"),
+            "the handover touches the one key"
+        );
 
         let calls = std::cell::Cell::new(0_u32);
         swap.retry_item_leg_with(|_| {
@@ -19093,6 +19635,47 @@ fn a_landed_swap_item_retry_repoints_the_row_and_disarms() {
             SwapItemLeg::Landed
         });
         assert_eq!(calls.get(), 0, "a disarmed retry runs no leg");
+    });
+}
+
+/// A retried item leg that lands hands the session the effort the swap planned
+/// for it, not the `""` a missing one writes: the retry exists on macOS with
+/// the Keychain on, where the swap's own handover is deferred to the moment a
+/// leg lands. The captured effort must ride the same landed arm.
+#[test]
+fn a_landed_swap_item_retry_hands_the_session_the_retrys_effort() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-e");
+        swap.arm_item_retry(SwapItemRetry {
+            member: crate::profile::ProfileName::from("item-retry-e-b"),
+            store: intended_store,
+            previous_store: launch_store,
+            effort: Some("high".to_string()),
+        });
+        let settings = swap.runtime.join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({"env": {"KEEP": "1"}}).to_string(),
+        )
+        .expect("seed the session settings");
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+
+        let read: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).expect("read settings"))
+                .expect("parse settings");
+        assert_eq!(
+            read["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+            serde_json::json!("high"),
+            "the landed retry hands the session the retry's effort"
+        );
+        assert_eq!(
+            read["env"]["KEEP"],
+            serde_json::json!("1"),
+            "the handover touches the one key"
+        );
     });
 }
 
@@ -19257,6 +19840,7 @@ fn a_swap_item_retry_for_another_member_runs_no_leg() {
             member: crate::profile::ProfileName::from("item-retry-m-a"),
             store: intended_store,
             previous_store: launch_store.clone(),
+            effort: None,
         });
 
         let calls = std::cell::Cell::new(0_u32);
@@ -19546,6 +20130,7 @@ fn a_convergence_waits_while_an_item_retry_is_armed() {
             member: crate::profile::ProfileName::from("conv-r"),
             store: store.clone(),
             previous_store: tmp.path().join("outgoing-store.json"),
+            effort: None,
         };
         swap.arm_item_retry(retry.clone());
 
@@ -19618,20 +20203,21 @@ fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
     let canonical = Path::new("/profiles/adopt-retry-b/credentials.json");
     let outgoing = Path::new("/profiles/adopt-retry-a/credentials.json");
     assert_eq!(
-        adopted_item_retry(Some(outgoing), canonical, &member),
+        adopted_item_retry(Some(outgoing), canonical, &member, None),
         Some(SwapItemRetry {
             member: crate::profile::ProfileName::from("adopt-retry-b"),
             store: PathBuf::from("/profiles/adopt-retry-b/credentials.json"),
             previous_store: PathBuf::from("/profiles/adopt-retry-a/credentials.json"),
+            effort: None,
         })
     );
     assert_eq!(
-        adopted_item_retry(Some(canonical), canonical, &member),
+        adopted_item_retry(Some(canonical), canonical, &member, None),
         None,
         "a landed leg moved the row onto the link's store"
     );
     assert_eq!(
-        adopted_item_retry(None, canonical, &member),
+        adopted_item_retry(None, canonical, &member, None),
         None,
         "a row that never swapped"
     );

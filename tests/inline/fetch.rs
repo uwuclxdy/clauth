@@ -3204,6 +3204,7 @@ fn the_seeded_plan_survives_a_failed_forced_profile() {
         },
         "acct".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("install the seeded login");

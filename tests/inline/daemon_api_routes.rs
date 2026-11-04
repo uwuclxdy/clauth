@@ -1964,6 +1964,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .expect("create profile");
             crate::actions::disable_profile(&mut cfg, &"off".into()).expect("disable");

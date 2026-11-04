@@ -35,6 +35,13 @@ fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'stat
     lines.remove(0)
 }
 
+/// [`effort_cycle_lines`] in a pane wide enough that the row is one line.
+fn effort_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
+    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
 // Blurred: bare labels, no brackets anywhere. Focused: the active preset wraps
 // in `[]` and that bracket pair is the only width change (the old shape padded
 // the blurred active option to ` label `, so blurred==focused in width — this
@@ -71,6 +78,62 @@ fn model_cycle_lists_fable_first_after_default() {
     assert_eq!(
         options.split_whitespace().collect::<Vec<_>>(),
         ["default", "fable", "opus", "sonnet", "haiku", "opusplan"]
+    );
+}
+
+#[test]
+fn effort_cycle_lists_the_presets_after_unset() {
+    let line = line_text(&effort_line(Span::raw("  "), "", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("effort")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        ["unset", "low", "medium", "high", "xhigh", "max"]
+    );
+}
+
+#[test]
+fn effort_cycle_brackets_the_active_preset_only_on_focus() {
+    let arrow = Span::raw("  ");
+    let blurred = line_text(&effort_line(arrow.clone(), "high", false));
+    let focused = line_text(&effort_line(arrow, "high", true));
+
+    assert!(
+        blurred.contains("high"),
+        "active preset renders when blurred: {blurred}"
+    );
+    assert!(!blurred.contains('['), "blurred stays bare: {blurred}");
+    assert!(
+        focused.contains("[high]"),
+        "focused brackets the active preset: {focused}"
+    );
+    assert_eq!(
+        focused.chars().count(),
+        blurred.chars().count() + 2,
+        "the bracket pair is the only width change on focus"
+    );
+}
+
+#[test]
+fn effort_cycle_trails_a_custom_value_outside_the_presets() {
+    let line = line_text(&effort_line(Span::raw("  "), "ultracode", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("effort")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        [
+            "unset",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultracode"
+        ]
     );
 }
 
@@ -196,13 +259,13 @@ fn setup_hints_follow_the_row_value() {
     let mut snap = Snap::blank("a");
 
     snap.auto_start = true;
-    let on = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    let on = row_hint(ConfigRow::AutoStart, &snap, "").unwrap();
     assert_eq!(
         on,
         "sends a 1-token request to Haiku at every 5h usage reset"
     );
     snap.auto_start = false;
-    let off = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    let off = row_hint(ConfigRow::AutoStart, &snap, "").unwrap();
     assert_eq!(off, "5h usage window stays closed after reset");
 
     // A plan with no 5h limit: both auto-start states say nothing is sent, and
@@ -211,7 +274,7 @@ fn setup_hints_follow_the_row_value() {
     for auto_start in [true, false] {
         snap.auto_start = auto_start;
         assert_eq!(
-            row_hint(ConfigRow::AutoStart, &snap).unwrap(),
+            row_hint(ConfigRow::AutoStart, &snap, "").unwrap(),
             "this plan has no 5h limit, so nothing is sent",
             "marked, auto-start {auto_start}"
         );
@@ -219,26 +282,26 @@ fn setup_hints_follow_the_row_value() {
     snap.auto_start = false;
     snap.usage_probe = true;
     assert_eq!(
-        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        row_hint(ConfigRow::UsageProbe, &snap, "").unwrap(),
         "a 1-token request to Haiku reads usage",
         "marked, probe on"
     );
     snap.usage_probe = false;
     assert_eq!(
-        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        row_hint(ConfigRow::UsageProbe, &snap, "").unwrap(),
         "usage goes unread; a probe is a 1-token request to Haiku",
         "marked, probe off"
     );
     snap.no_five_hour_limit = false;
 
     snap.base_url = String::new();
-    let empty = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    let empty = row_hint(ConfigRow::BaseUrl, &snap, "").unwrap();
     assert_eq!(
         empty,
         "leave empty for a Claude account, or set an API endpoint"
     );
     snap.base_url = "https://api.example.com".into();
-    let set = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    let set = row_hint(ConfigRow::BaseUrl, &snap, "").unwrap();
     assert_eq!(
         set,
         "the API endpoint this account calls instead of claude.ai"
@@ -303,28 +366,124 @@ fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
         ConfigRow::EnvEntry(0),
         ConfigRow::EnvAdd,
     ] {
-        assert_eq!(row_hint(row, &snap), None, "{row:?} carries no hint");
+        assert_eq!(row_hint(row, &snap, ""), None, "{row:?} carries no hint");
     }
     assert_eq!(
-        row_hint(ConfigRow::SubagentModel, &snap).as_deref(),
+        row_hint(ConfigRow::SubagentModel, &snap, "").as_deref(),
         Some("default subagent model in this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::AdvisorModel, &snap).as_deref(),
+        row_hint(ConfigRow::AdvisorModel, &snap, "").as_deref(),
         Some("server-side advisor model in this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::ModelOverrideAdd, &snap).as_deref(),
+        row_hint(ConfigRow::ModelOverrideAdd, &snap, "").as_deref(),
         Some("set custom model names on this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::ApiKey, &snap).as_deref(),
+        row_hint(ConfigRow::ApiKey, &snap, "").as_deref(),
         Some("provided to Claude Code via \"apiKeyHelper\" field"),
     );
     snap.console_login = true;
     assert_eq!(
-        row_hint(ConfigRow::Login, &snap).as_deref(),
+        row_hint(ConfigRow::Login, &snap, "").as_deref(),
         Some("log into alibaba console to see this account's usage"),
+    );
+}
+
+/// The effort hint says whether the account holds an effort, since a held one
+/// outranks `/effort` in the session. Byte-exact copy.
+#[test]
+fn the_effort_hint_says_whether_the_account_holds_an_effort() {
+    let mut snap = Snap::blank("a");
+    snap.effort = "max".into();
+    let set = "reasoning effort for this account; /effort can't change it while set";
+    for value in ["low", "medium", "high", "xhigh", "max", "ultracode"] {
+        assert_eq!(
+            row_hint(ConfigRow::Effort, &snap, value).as_deref(),
+            Some(set),
+            "{value:?}"
+        );
+    }
+    // The trim matches the commit's: a blank buffer commits to unset.
+    for value in ["", "  "] {
+        assert_eq!(
+            row_hint(ConfigRow::Effort, &snap, value).as_deref(),
+            Some("no effort set: /effort and Claude Code's default apply"),
+            "{value:?}"
+        );
+    }
+}
+
+/// The set-effort hint at an 80-column terminal: the detail pane is narrower
+/// than the copy, so the hint word-wraps onto a second line — every word stays
+/// whole and in order, nothing clips.
+#[test]
+fn the_effort_hint_wraps_not_clips_at_an_80_column_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut snap = Snap::blank("acct");
+    snap.effort = "max".into();
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+
+    // The pane the hint wraps to, at a full 80-column frame: the master-detail
+    // split gives the detail side 80 - selector_width(80) cells, and the
+    // section box trims its border.
+    let (_, settings) = master_detail(Rect::new(0, 0, 80, 24), app.setup_items().len() + 1);
+    let inner = section_box("acct", true, false, settings.width).inner(settings);
+    assert_eq!(
+        settings.width,
+        80 - 24,
+        "selector_width(80) = 24: the detail pane is 56 cells wide"
+    );
+    let copy = "reasoning effort for this account; /effort can't change it while set";
+    assert!(
+        copy.chars().count() > inner.width as usize,
+        "the copy is wider than the pane ({} cells), so the wrap is real",
+        inner.width
+    );
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            inner,
+            &app,
+            &[ConfigRow::Effort],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: true,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    let start = rows
+        .iter()
+        .position(|r| r.contains("reasoning effort for this account;"))
+        .expect("the effort hint renders");
+    let words = rows[start..]
+        .iter()
+        .flat_map(|r| r.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        words.contains(copy),
+        "every word of the copy renders in order — a clip would drop one: {words}"
+    );
+    assert!(
+        rows[start + 1].contains("while set"),
+        "the tail wraps whole onto the next line: {}",
+        rows[start + 1]
     );
 }
 
@@ -333,17 +492,17 @@ fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
 fn capture_and_logout_hints_state_the_act_alone() {
     let mut snap = Snap::blank("a");
     assert_eq!(
-        row_hint(ConfigRow::CaptureLogin, &snap).as_deref(),
+        row_hint(ConfigRow::CaptureLogin, &snap, "").as_deref(),
         Some("save the current global credentials into a new account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored OAuth login"),
     );
     // `api_login` flips on `!login_is_oauth`, mirroring row_hint's own guard.
     snap.login_is_oauth = false;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored API key"),
     );
 }
@@ -358,12 +517,12 @@ fn logout_hint_over_a_torn_store_names_the_file() {
     snap.has_unreadable_store = true;
     snap.has_api_key = true;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored API key and the unreadable credentials.json"),
     );
     snap.has_api_key = false;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the unreadable credentials.json"),
     );
 }
@@ -399,7 +558,8 @@ fn torn_store_logout_hint_survives_an_open_draft() {
             assert_eq!(
                 row_hint(
                     ConfigRow::DeleteCreds,
-                    &build_snap(&app, &app.readings_snapshot(), with_text)
+                    &build_snap(&app, &app.readings_snapshot(), with_text),
+                    "",
                 )
                 .as_deref(),
                 Some(want),
@@ -582,27 +742,27 @@ fn disabled_hint_follows_the_gate_then_the_value() {
     let mut snap = Snap::blank("a");
 
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("excludes this account from auto-switch, usage polling, and status until re-enabled"),
     );
 
     snap.disabled = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("excluded from auto-switch, usage polling, and status until re-enabled"),
     );
 
     snap.disabled = false;
     snap.has_live_session = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("cannot disable an account with a live session"),
     );
 
     // The active-account gate outranks the live-session gate.
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("cannot disable the global active account"),
     );
 }
@@ -1407,33 +1567,33 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     let mut snap = Snap::blank("a");
 
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 
     // An api key alone opens the gate, and there is no login behind it.
     snap.has_other_login = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("the next switch runs this account on its API key"),
     );
 
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("signs Claude Code out now · this account runs on its API key"),
     );
 
     // A stored OAuth pair is what the clear actually falls back to.
     snap.clear_falls_back_to_oauth = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow"),
     );
 
     snap.is_active = false;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("the next switch installs this account's own login again"),
     );
 
@@ -1445,12 +1605,12 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     // has its own test below.)
     snap.rolling_armed = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
     );
     snap.has_static_backup = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some(
             "relinks this account's own login now · running sessions follow · re-stamping \
              stops · the preserved mint goes too"
@@ -1463,7 +1623,7 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     snap.rolling_token = true;
     snap.has_static_backup = false;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
     );
 }
@@ -1481,7 +1641,7 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     snap.rolling_armed = true;
 
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("stops the daemon re-stamping this account · nothing else is stored"),
     );
 
@@ -1489,7 +1649,7 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     // and the hint says so instead of hiding it behind the disarm.
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some(
             "stops the daemon re-stamping this account · signs Claude Code out · nothing is \
              stored behind it"
@@ -1499,14 +1659,14 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
 
     snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 
     snap.session_token = None;
     snap.has_static_backup = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 }
@@ -1867,7 +2027,7 @@ fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
     assert_eq!(set.spans[2].content, "90%");
     assert_eq!(set.spans[2].style.fg, theme::accent().fg);
     assert_eq!(
-        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        row_hint(ConfigRow::BellThreshold, &snap, "").unwrap(),
         "alerts once when 5h usage reaches this, again after it drops below"
     );
 
@@ -1894,7 +2054,7 @@ fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
     assert_eq!(off.spans[2].content, "off");
     assert_eq!(off.spans[2].style.fg, theme::faint().fg);
     assert_eq!(
-        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        row_hint(ConfigRow::BellThreshold, &snap, "").unwrap(),
         concat!(
             "no alert when 5h usage climbs; ",
             key_lit!("↵"),

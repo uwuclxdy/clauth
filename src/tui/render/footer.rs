@@ -558,11 +558,12 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                     }
                 }
                 // Claude rows and `+ new` keep the row-aware claude arm:
-                // the `model` row cycles on space; `alert at` steps on
-                // `+`/`-`; env rows edit a value or open the add-env editor.
+                // the `model` and `effort` rows cycle on space; `alert at`
+                // steps on `+`/`-`; env rows edit a value or open the
+                // add-env editor.
                 SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
                     match config_rows(app).get(app.config_action_cursor) {
-                        Some(ConfigRow::Model) => &[
+                        Some(ConfigRow::Model | ConfigRow::Effort) => &[
                             ("↑↓", "row"),
                             ("space", "cycle"),
                             ("↵", "custom"),

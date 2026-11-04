@@ -2468,6 +2468,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -3035,6 +3036,58 @@ fn model_settings_round_trip_through_config_toml() {
             "`advisor` is the\n# server-side advisor model (the `advisorModel` setting)."
         ),
         "the generated comment block names the row"
+    );
+}
+
+/// The account's effort is its own top-level `effort` key, outside `[models]`
+/// (presets re-bind and launch demand read `[models]`), and survives a
+/// render→parse round-trip; an unset effort writes no key at all.
+#[test]
+fn effort_round_trips_as_its_own_account_key() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.effort = Some("max".to_string());
+    profile.models.default = Some("opus".to_string());
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.effort.as_deref(), Some("max"));
+    assert_eq!(
+        parsed.models, profile.models,
+        "effort never lands in [models]"
+    );
+    let doc: toml::Table = toml::from_str(&rendered).expect("parse as a table");
+    assert_eq!(
+        doc.get("effort").and_then(toml::Value::as_str),
+        Some("max"),
+        "`effort` is a top-level key: {rendered}"
+    );
+    assert!(
+        doc.get("models")
+            .and_then(toml::Value::as_table)
+            .is_none_or(|m| !m.contains_key("effort")),
+        "`effort` is not a [models] row"
+    );
+
+    let unset = render_config_toml(&Profile::new("q".to_string(), None, None));
+    let doc: toml::Table = toml::from_str(&unset).expect("parse as a table");
+    assert!(!doc.contains_key("effort"), "an unset effort writes no key");
+}
+
+/// The generated `config.toml` names the effort key and its one carrier in
+/// its comment block, so a hand-editor knows which `settings.json` key it
+/// feeds.
+#[test]
+fn the_config_comment_names_the_effort_carrier() {
+    let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        rendered.contains(concat!(
+            "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
+            "# (`effortLevel` is Claude Code's own key).\n",
+        )),
+        "the comment names the key and its one carrier: {rendered}"
+    );
+    assert!(
+        rendered.contains("# effort = \"high\"\n"),
+        "an unset effort renders as a commented example: {rendered}"
     );
 }
 
@@ -5994,6 +6047,7 @@ fn create_account(name: &str) {
         None,
         Some("sk-id".to_string()),
         ModelSettings::default(),
+        None,
     )
     .expect("create");
 }

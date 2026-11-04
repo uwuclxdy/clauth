@@ -12,9 +12,10 @@ use ratatui::text::{Line, Span};
 use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
 
 use super::super::app::{
-    App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, HarnessFilter,
-    InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow, PoolMutationKind, ReadingsSnapshot,
-    SetupSelection, config_rows, escape_control, new_form_draft, pool_auth_label,
+    App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin,
+    EFFORT_PRESETS, HarnessFilter, InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow,
+    PoolMutationKind, ReadingsSnapshot, SetupSelection, config_rows, escape_control,
+    new_form_draft, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
@@ -219,6 +220,7 @@ struct Snap {
     base_url: String,
     api_key: String,
     model: String,
+    effort: String,
     opus: String,
     sonnet: String,
     haiku: String,
@@ -368,6 +370,7 @@ impl Snap {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            effort: String::new(),
             opus: String::new(),
             sonnet: String::new(),
             haiku: String::new(),
@@ -481,6 +484,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 base_url: text(&p.base_url),
                 api_key: text(&p.api_key),
                 model: text(&p.models.default),
+                effort: text(&p.effort),
                 opus: text(&p.models.opus),
                 sonnet: text(&p.models.sonnet),
                 haiku: text(&p.models.haiku),
@@ -1178,7 +1182,7 @@ fn draw_settings_rows(
         } else if let Some(reason) = refusal {
             invalid_tooltip_lines(&reason, inner.width as usize)
         } else {
-            row_hint(*row, snap)
+            row_hint(*row, snap, &input.value)
                 .map(|text| help_tooltip_lines(&text, inner.width as usize))
                 .unwrap_or_default()
         };
@@ -1260,6 +1264,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::BaseUrl => &snap.base_url,
         ConfigRow::ApiKey => &snap.api_key,
         ConfigRow::Model => &snap.model,
+        ConfigRow::Effort => &snap.effort,
         ConfigRow::OpusModel => &snap.opus,
         ConfigRow::SonnetModel => &snap.sonnet,
         ConfigRow::HaikuModel => &snap.haiku,
@@ -1291,7 +1296,10 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
 /// on their own value, and auto-start and the usage probe also on whether the
 /// plan has a 5h limit at all.
-fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
+/// `value` is the row's own live value (the draft buffer while a draft holds
+/// the row): the effort hint names what the CURRENT value does, so it must not
+/// read the snap, whose text fields empty while a draft is open.
+fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
         ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
@@ -1302,6 +1310,10 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
         ConfigRow::AdvisorModel => "server-side advisor model in this account",
+        ConfigRow::Effort if value.trim().is_empty() => {
+            "no effort set: /effort and Claude Code's default apply"
+        }
+        ConfigRow::Effort => "reasoning effort for this account; /effort can't change it while set",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
@@ -1558,6 +1570,16 @@ fn detail_row(
         ConfigRow::Model => {
             return kv_field(
                 arrow, "model", input, editing, selected, false, false, width,
+            );
+        }
+        // The `model` row's shape: the fixed cycle at rest, a plain text field
+        // while typing a custom value.
+        ConfigRow::Effort if !editing => {
+            return effort_cycle_lines(arrow, &input.value, selected, width);
+        }
+        ConfigRow::Effort => {
+            return kv_field(
+                arrow, "effort", input, editing, selected, false, false, width,
             );
         }
         ConfigRow::OpusModel => {
@@ -1938,6 +1960,23 @@ fn model_cycle_lines(
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
     let custom =
         (!current.is_empty() && !MODEL_PRESETS.contains(&current)).then_some((current, true));
+    cycle_row_lines(lead, &options, custom, None, selected, width)
+}
+
+/// The `effort` row at rest: the same shape as the `model` row, with `unset`
+/// where the model row says `default`. A custom value (set via ⏎) matches no
+/// preset, so it trails the run rather than mis-bracketing the nearest one.
+fn effort_cycle_lines(
+    arrow: Span<'static>,
+    current: &str,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let lead = kv_lead(arrow, "effort", selected);
+    let mut options: Vec<(&str, bool)> = vec![("unset", current.is_empty())];
+    options.extend(EFFORT_PRESETS.iter().map(|p| (*p, *p == current)));
+    let custom =
+        (!current.is_empty() && !EFFORT_PRESETS.contains(&current)).then_some((current, true));
     cycle_row_lines(lead, &options, custom, None, selected, width)
 }
 

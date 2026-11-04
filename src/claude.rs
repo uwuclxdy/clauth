@@ -5265,9 +5265,9 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
 
 /// The Setup-tab field that owns a clauth-managed env key, phrased for the
 /// collision prompt (`'X' is already set by …`). These are the keys clauth
-/// derives from a profile's endpoint + model-tier fields; a custom env entry
-/// equal to one of them would override the field's value in `settings.json`.
-/// `None` when the key is not clauth-managed.
+/// derives from a profile's endpoint, model-tier and effort fields; a custom
+/// env entry equal to one of them would override the field's value in
+/// `settings.json`. `None` when the key is not clauth-managed.
 pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
     Some(match key {
         "ANTHROPIC_BASE_URL" => "the base url field",
@@ -5277,6 +5277,7 @@ pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
         "ANTHROPIC_DEFAULT_HAIKU_MODEL" => "the haiku model field",
         "ANTHROPIC_DEFAULT_FABLE_MODEL" => "the fable model field",
         "CLAUDE_CODE_SUBAGENT_MODEL" => "the subagent model field",
+        "CLAUDE_CODE_EFFORT_LEVEL" => "the effort field",
         _ => return None,
     })
 }
@@ -5480,6 +5481,7 @@ fn apply_profile_to_claude_settings_inner(
         || profile.api_key.is_some()
         || !profile.env.is_empty()
         || !profile.models.is_empty()
+        || profile.effort.is_some()
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
         // No live file: nothing an earlier clauth wrote can sit in it, so only
@@ -6348,6 +6350,20 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
         && has_inference_auth(profile)
 }
 
+/// The effort a launch on `profile` carries: the profile's own `[env]`
+/// `CLAUDE_CODE_EFFORT_LEVEL` entry when present (the builder's
+/// "profile env last" pass lets it win over the field), else the `effort`
+/// field, else `""` — the one rule shared by the settings builder and every
+/// swap-side handover, so a moved live session gets exactly what a fresh
+/// launch on the member would write.
+pub(crate) fn effective_effort(profile: &Profile) -> String {
+    profile
+        .env
+        .get("CLAUDE_CODE_EFFORT_LEVEL")
+        .cloned()
+        .unwrap_or_else(|| profile.effort.clone().unwrap_or_default())
+}
+
 /// Build the merged settings.json content. A custom key `profile` lacks that
 /// `prev_env_keys` or `~/.clauth/base-env.json` names is stripped before the
 /// new profile's env is applied when clauth wrote its value: back to the
@@ -6356,7 +6372,11 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing.
+/// previous profile's model routing. The profile's effort rides
+/// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
+/// profile's own `[env]` entry outranking the `effort` field
+/// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
+/// carrier; `effortLevel` is Claude Code's own key and is never written here.
 ///
 /// `base` is the settings file to merge onto; `None` (or a missing path) starts
 /// from an empty object — used for an isolated runtime that must carry no
@@ -6428,6 +6448,18 @@ fn build_settings(
         }
     }
 
+    // The one effort carrier: every value rides
+    // `CLAUDE_CODE_EFFORT_LEVEL`, `""` when unset — an empty value acts as no
+    // value at startup and returns a running session to the model default,
+    // where removing the key leaves it on the old value (CC 2.1.317 re-reads
+    // only this carrier). `effective_effort` folds the profile's own `[env]`
+    // entry in ahead of "profile env last", so the loop below re-asserts the
+    // same value.
+    env.insert(
+        "CLAUDE_CODE_EFFORT_LEVEL".into(),
+        effective_effort(profile).into(),
+    );
+
     // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key.
     for (k, v) in &profile.env {
         env.insert(k.clone(), v.clone().into());
@@ -6458,6 +6490,8 @@ fn build_settings(
             obj.remove("advisorModel");
         }
     }
+    // `effortLevel` is Claude Code's own key (its `/effort` command writes it
+    // under `modelSettings`): clauth never writes or removes it.
 
     // An api-key profile mints its key via CC's top-level `apiKeyHelper`
     // instead of `env.ANTHROPIC_AUTH_TOKEN` (cleared above). The key then
@@ -6487,6 +6521,75 @@ fn build_settings(
             .context("failed to serialize settings.json")?,
         record,
     })
+}
+
+/// Set ONE env key in the settings file `settings_path`, touching no other
+/// key: the swap executor's effort handover, which must not rebuild the file
+/// from the incoming profile (the session keeps its operator settings). Reads
+/// the file, sets `key = value` inside its `env` object, and writes it back
+/// through the same recorded, owner-only path the launch uses for this very
+/// file ([`crate::jsonsync::write_copy_and_record`] with `owner_only = true`):
+/// the session's settings.json lives under `~/.clauth` and can carry the
+/// api-key profile's `apiKeyHelper` command, so the write must land 0o600,
+/// and recording it keeps the settings reconciler from reading the rewrite as
+/// a Claude Code write — an unrecorded rewrite ranks by its new mtime and, its
+/// stale entry still holding the path, outranks a newer edit the user made to
+/// a shared key in the base. The carried rank is the pre-write copy's own: the
+/// record entry's rank when the copy is clauth's unchanged echo, else its
+/// mtime. The file is stat'd before it is read — `write_copy_and_record`'s
+/// caller contract — so a Claude Code write landing between the two cannot
+/// pair the older bytes with the newer mtime and record the stale copy at the
+/// newer rank. `record` is `None` for an isolated session (never a sync
+/// member, so it needs no entry). A file that parses but is no JSON object (or
+/// whose
+/// `env` is not an object) fails cleanly and is left untouched: the caller
+/// logs it, naming the session dir, and the swap stands. The caller logs any
+/// failure and continues — a failed write must never undo the credential move
+/// it follows.
+pub(crate) fn set_settings_env_key(
+    settings_path: &Path,
+    record: Option<&Path>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let meta = std::fs::metadata(settings_path)
+        .with_context(|| format!("failed to stat {}", settings_path.display()))?;
+    let mtime = meta
+        .modified()
+        .with_context(|| format!("failed to stat {}", settings_path.display()))?;
+    let bytes = std::fs::read(settings_path)
+        .with_context(|| format!("failed to read {}", settings_path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(
+            settings_path.display(),
+            crate::format::json_parse_position(&e),
+        )
+    })?;
+    let env = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?
+        .entry("env")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("settings.json `env` is not an object")?;
+    env.insert(key.into(), value.into());
+    let content =
+        serde_json::to_vec_pretty(&settings).context("failed to serialize settings.json")?;
+    let carried_rank = match record {
+        Some(record) => {
+            crate::jsonsync::carried_rank_of(record, settings_path, mtime, meta.len(), &bytes)
+        }
+        None => (i64::MIN, 0),
+    };
+    crate::jsonsync::write_copy_and_record(
+        record,
+        settings_path,
+        &content,
+        carried_rank,
+        true,
+        None,
+    )
+    .with_context(|| format!("failed to write {}", settings_path.display()))
 }
 
 /// Whether the outgoing snapshot would read the active profile's own unreadable
