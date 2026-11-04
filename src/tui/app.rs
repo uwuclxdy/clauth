@@ -26921,6 +26921,10 @@ fn apply_preset_to(
                     profile.console = moved.console;
                     profile.provider = moved.provider;
                     profile.models = moved.models;
+                    profile.provider = profile
+                        .base_url
+                        .as_deref()
+                        .and_then(crate::providers::Provider::from_base_url);
                 }
                 offer_preset_apply(app, target.clone(), &preset);
                 return;

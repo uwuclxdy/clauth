@@ -1510,7 +1510,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 #[test]
 fn disabled_row_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
-    // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
+    // The wave is a Full-tier effect: `identity_wave_spans` returns flat spans
     // below it. A test build's tier defaults to `Full`, and the sandbox pins it
     // explicitly, so the wave renders and the disabled-vs-enabled control below
     // is real.
@@ -1522,7 +1522,7 @@ fn disabled_row_type_cell_does_not_pulse() {
     b.credentials = Some(oauth_creds());
     let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
 
-    // `pulse_name_spans` keys off `App::anim_ms`, so two Apps with different
+    // `identity_wave_spans` keys off `App::anim_ms`, so two Apps with different
     // pinned phases sample different points of the wave. 450ms is the crest of
     // the 900ms sweep, where the envelope peaks: the phase furthest from the
     // flat 0ms frame, so a surviving pulse shows up at its widest rather than at
@@ -1554,9 +1554,11 @@ fn disabled_row_type_cell_does_not_pulse() {
             .map(|s| s.style.fg)
             .collect()
     };
+    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
+    // first frame, 1444ms its crest.
     assert_ne!(
-        enabled_snapshot(0),
-        enabled_snapshot(450),
+        enabled_snapshot(994),
+        enabled_snapshot(1444),
         "control: an enabled credentialed row's type cell really does animate"
     );
 }
@@ -1601,7 +1603,7 @@ fn no_tier_type_cell_does_not_pulse() {
     };
 
     // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
-    // one value a ONE-CHARACTER label cannot express. `pulse_name_spans` weights
+    // one value a ONE-CHARACTER label cannot express. `identity_wave_spans` weights
     // grapheme `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
     // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
     // grapheme sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
@@ -1615,9 +1617,11 @@ fn no_tier_type_cell_does_not_pulse() {
         snapshot(0, 135),
         "a no-tier row must render identically at two wave phases (no pulse)"
     );
+    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
+    // first frame.
     assert_ne!(
-        snapshot(1, 0),
-        snapshot(1, 135),
+        snapshot(1, 994),
+        snapshot(1, 994 + 135),
         "control: a row that HAS a tier really does animate, so the equality above is real"
     );
 }
@@ -1628,8 +1632,9 @@ fn no_tier_type_cell_does_not_pulse() {
 /// reached the un-pulsed branch.
 ///
 /// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
-/// has a genuine `API` label AND no credentials, so it lands in the same branch
-/// a no-data dash does; without the conjunct every DeepSeek / Z.ai row fades.
+/// on a generic host has a genuine `API` label and no recognized provider, so it
+/// lands in the same un-pulsed branch a no-data dash does; without the conjunct
+/// its label fades to `faint`, which reads as missing data.
 #[test]
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1681,17 +1686,28 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         "a disabled row flattens to dim, outranking no-data as it does stale"
     );
 
-    let (api, api_fg) = cell(2);
+    let api_frames = claude_kind_frames(&mut App::new(config.clone()), 2, false, &readings);
+    let api: String = api_frames[0]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect();
     assert_eq!(
         api.trim_end(),
         "API",
         "fixture control: an api-key row carries a real label, not the dash"
     );
-    assert_eq!(
-        api_fg,
-        theme::dim().fg,
-        "a real label never fades, however it reached the un-pulsed branch"
-    );
+    let deepseek = theme::crest_rgb(theme::CrestProvider::DeepSeek);
+    for hue in kind_cell_hues(&api_frames) {
+        assert_ne!(
+            Some(hue),
+            theme::faint().fg,
+            "a real label never fades, however it reached its branch"
+        );
+        assert!(
+            on_segment(hue, TEXT_DIM_RGB, deepseek),
+            "a DeepSeek label leans only toward its crest: {hue:?}"
+        );
+    }
 
     // An UNCREDENTIALED account reaches the same branch by a different route
     // (no credentials rather than no tier), and it fades too — the cell is empty
@@ -4119,7 +4135,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let wide = OverviewWidths::new(80, &app, &readings);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
-    let line = render_codex_row(&row, &wide, false);
+    let line = render_codex_row(&row, 0, &wide, false, 0);
     assert_eq!(
         five_hour_cell_text(&wide, false, &line),
         fixed("42%", wide.five_hour),
@@ -4133,7 +4149,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let narrow = OverviewWidths::new(56, &app, &readings);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
-    let line = render_codex_row(&row, &narrow, false);
+    let line = render_codex_row(&row, 0, &narrow, false, 0);
     assert_eq!(
         five_hour_cell_text(&narrow, false, &line),
         fixed("42%", narrow.five_hour)
@@ -4171,11 +4187,11 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
 
     let wide = OverviewWidths::new(80, &app, &readings);
     assert!(
-        text(render_codex_row(&row(Some(2)), &wide, false)).contains("↺ 2"),
+        text(render_codex_row(&row(Some(2)), 0, &wide, false, 0)).contains("↺ 2"),
         "two banked resets render the chip"
     );
     assert!(
-        !text(render_codex_row(&row(None), &wide, false)).contains("↺"),
+        !text(render_codex_row(&row(None), 0, &wide, false, 0)).contains("↺"),
         "no available reset (the constructor floors zero to None): no chip"
     );
 }
@@ -4219,7 +4235,7 @@ fn a_codex_reset_chip_never_sits_under_the_tps_header() {
     // t/s column on: the chip sits one gap past the blank t/s cell.
     let wide = OverviewWidths::new(200, &app, &readings);
     assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
-    let line = render_codex_row(&row, &wide, false);
+    let line = render_codex_row(&row, 0, &wide, false, 0);
     assert_eq!(
         tps_column_text(&wide, &line),
         " ".repeat(wide.tps),
@@ -4242,7 +4258,7 @@ fn a_codex_reset_chip_never_sits_under_the_tps_header() {
     // t/s column off: the chip still trails the live slot, one gap past it.
     let narrow = OverviewWidths::new(100, &app, &readings);
     assert_eq!((narrow.live, narrow.tps), (LIVE_W, 0));
-    let line = render_codex_row(&row, &narrow, false);
+    let line = render_codex_row(&row, 0, &narrow, false, 0);
     let live_col = line_text(&overview_header(&narrow, false))
         .find("live")
         .expect("the accounts table carries a `live` header");
@@ -5034,8 +5050,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(80, &app, &readings);
-    let broken = render_codex_row(&rows[0], &widths, false);
-    let live = render_codex_row(&rows[1], &widths, false);
+    let broken = render_codex_row(&rows[0], 0, &widths, false, 0);
+    let live = render_codex_row(&rows[1], 1, &widths, false, 0);
 
     // The codex row carries the list rows' slots (blank 2-cell cursor prefix,
     // marker cell, gap, name), so the glyph and the name sit in the claude
@@ -5075,8 +5091,10 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
             active: true,
             ..rows[0].clone()
         },
+        0,
         &widths,
         false,
+        0,
     );
     let text = line_text(&active_broken);
     assert!(
@@ -7121,7 +7139,7 @@ fn the_active_codex_row_carries_the_codex_mark() {
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(80, &app, &readings);
-    let line = render_codex_row(&row, &widths, false);
+    let line = render_codex_row(&row, 0, &widths, false, 0);
     let text = line_text(&line);
     let mark = line
         .spans
@@ -7134,8 +7152,10 @@ fn the_active_codex_row_carries_the_codex_mark() {
             active: false,
             ..row
         },
+        0,
         &widths,
         false,
+        0,
     );
     assert!(
         !line_text(&inactive).contains('⏣'),
@@ -7641,4 +7661,730 @@ fn the_active_shunt_mark_reads_the_client_token_store_at_startup() {
             )
         });
     assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+}
+
+/// The phases a wave test samples: two and a bit full sweeps at 20 ms, wide
+/// enough that a per-row phase offset of up to a whole cycle still shows every
+/// row's crest.
+fn wave_phases() -> impl Iterator<Item = u64> {
+    (0..=300).map(|i| i * 20)
+}
+
+const TEXT_DIM_RGB: (u8, u8, u8) = (166, 173, 200);
+
+/// The type cell of a rendered row, one `(grapheme run, fg)` per span: the
+/// spans from `KIND_SPAN` on until they fill `kind_w` cells. A claude row and a
+/// codex row both open with cursor, marker, spacer or name, name, gap.
+fn kind_cell(line: &Line<'static>, kind_w: usize) -> Vec<(String, Option<ratatui::style::Color>)> {
+    let mut out = Vec::new();
+    let mut cells = 0;
+    for span in &line.spans[KIND_SPAN..] {
+        if cells >= kind_w {
+            break;
+        }
+        cells += grapheme_cells(&span.content);
+        out.push((span.content.to_string(), span.style.fg));
+    }
+    out
+}
+
+/// Every foreground a type cell's visible graphemes take across the sampled
+/// phases.
+fn kind_cell_hues(
+    frames: &[Vec<(String, Option<ratatui::style::Color>)>],
+) -> Vec<ratatui::style::Color> {
+    let mut hues = Vec::new();
+    for frame in frames {
+        for (text, fg) in frame {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let fg = fg.unwrap_or_else(|| panic!("a type-cell grapheme `{text}` carries no fg"));
+            if !hues.contains(&fg) {
+                hues.push(fg);
+            }
+        }
+    }
+    hues
+}
+
+/// Whether `fg` is an RGB on the straight segment from `base` to `crest`
+/// (within rounding): the blend the crest's soft edges walk.
+fn on_segment(fg: ratatui::style::Color, base: (u8, u8, u8), crest: (u8, u8, u8)) -> bool {
+    let ratatui::style::Color::Rgb(r, g, b) = fg else {
+        return false;
+    };
+    let v = [f64::from(r), f64::from(g), f64::from(b)];
+    let lo = [f64::from(base.0), f64::from(base.1), f64::from(base.2)];
+    let hi = [f64::from(crest.0), f64::from(crest.1), f64::from(crest.2)];
+    let axis = (0..3)
+        .max_by(|&i, &j| (hi[i] - lo[i]).abs().total_cmp(&(hi[j] - lo[j]).abs()))
+        .unwrap_or(0);
+    let span = hi[axis] - lo[axis];
+    if span == 0.0 {
+        return v == lo;
+    }
+    let t = (v[axis] - lo[axis]) / span;
+    (-0.02..=1.02).contains(&t)
+        && (0..3).all(|i| (v[i] - (lo[i] + t * (hi[i] - lo[i]))).abs() <= 2.0)
+}
+
+/// A claude row's type-cell frames across [`wave_phases`].
+fn claude_kind_frames(
+    app: &mut App,
+    idx: usize,
+    selected: bool,
+    readings: &ReadingsSnapshot,
+) -> Vec<Vec<(String, Option<ratatui::style::Color>)>> {
+    wave_phases()
+        .map(|ms| {
+            app.anim_phase_ms = Some(ms);
+            let widths = OverviewWidths::new(110, app, readings);
+            kind_cell(
+                &render_overview_row(app, idx, &widths, selected, true, readings),
+                widths.kind,
+            )
+        })
+        .collect()
+}
+
+/// A codex row's type-cell frames across [`wave_phases`], drawn at list
+/// position `position`.
+fn codex_kind_frames(
+    row: &CodexRow,
+    position: usize,
+    app: &App,
+    readings: &ReadingsSnapshot,
+) -> Vec<Vec<(String, Option<ratatui::style::Color>)>> {
+    let widths = OverviewWidths::new(110, app, readings);
+    wave_phases()
+        .map(|ms| {
+            kind_cell(
+                &render_codex_row(row, position, &widths, false, ms),
+                widths.kind,
+            )
+        })
+        .collect()
+}
+
+/// An api-key account on `url`, typed as the provider that URL names.
+fn provider_key_profile(name: &str, url: &str) -> (Profile, ReadingsSnapshot) {
+    let mut p = Profile::new(
+        name.to_string(),
+        Some(url.to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(url);
+    assert!(
+        p.provider.is_some(),
+        "fixture control: {url} is a typed provider"
+    );
+    (p, ReadingsSnapshot::default())
+}
+
+fn codex_row(name: &str, plan: Option<&str>) -> CodexRow {
+    CodexRow {
+        name: ProfileName::from(name),
+        active: false,
+        broken: false,
+        plan: plan.map(str::to_string),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }
+}
+
+/// Each provider clauth recognizes by type crests its type cell in its own
+/// reviewed color: every hue the cell takes lies between `TEXT_DIM` and that
+/// provider's crest, and at least one leaves `TEXT_DIM`.
+#[test]
+fn each_recognized_provider_crests_its_type_cell_in_its_own_color() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("z", "https://api.z.ai/api/anthropic"),
+            provider_key_profile(
+                "al",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+            ),
+            provider_key_profile("or", "https://openrouter.ai/api"),
+            provider_key_profile("mm", "https://api.minimax.io/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let cases = [
+        (0, CrestProvider::Anthropic),
+        (1, CrestProvider::DeepSeek),
+        (2, CrestProvider::Zai),
+        (3, CrestProvider::Alibaba),
+        (4, CrestProvider::OpenRouter),
+        (5, CrestProvider::MiniMax),
+    ];
+    for (idx, provider) in cases {
+        let hues = kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings));
+        let crest = crest_rgb(provider);
+        assert!(
+            hues.iter().any(|&h| h != theme::text_dim_color()),
+            "{provider:?}'s type cell crests: {hues:?}"
+        );
+        assert!(
+            hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+            "{provider:?}'s type cell leans only toward its crest {crest:?}: {hues:?}"
+        );
+    }
+}
+
+/// The selected row's label drops its own wave, but the provider crest rides
+/// the type cell, which keeps moving.
+#[test]
+fn the_selected_rows_type_cell_keeps_its_crest() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![provider_key_profile(
+            "ds",
+            "https://api.deepseek.com/anthropic",
+        )],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let hues = kind_cell_hues(&claude_kind_frames(&mut app, 0, true, &readings));
+    let crest = crest_rgb(CrestProvider::DeepSeek);
+    assert!(
+        hues.iter().any(|&h| h != theme::text_dim_color()),
+        "the selected row's type cell still crests: {hues:?}"
+    );
+    assert!(
+        hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+        "the selected row's crest is still DeepSeek's: {hues:?}"
+    );
+}
+
+/// Rows of one provider share its color but never crest in unison: every pair
+/// of its rows differs on some frame, not only neighbours (a phase keyed on
+/// row parity keeps neighbours apart and puts rows 0 and 2 in step), and each
+/// row really moves.
+#[test]
+fn rows_of_one_provider_crest_out_of_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a1", "max"),
+            credentialed_profile("a2", "max"),
+            provider_key_profile("ds1", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("ds2", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("ds3", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let colors = |frames: &[Vec<(String, Option<ratatui::style::Color>)>]| -> Vec<Vec<Option<ratatui::style::Color>>> {
+        frames.iter().map(|f| f.iter().map(|(_, fg)| *fg).collect()).collect()
+    };
+    let rows: Vec<_> = (0..5)
+        .map(|idx| claude_kind_frames(&mut app, idx, false, &readings))
+        .collect();
+    for (idx, frames) in rows.iter().enumerate() {
+        assert!(
+            frames.iter().any(|f| f != &frames[0]),
+            "fixture control: row {idx}'s type cell moves"
+        );
+    }
+    for (first, second) in [(0, 1), (2, 3), (3, 4), (2, 4)] {
+        assert_ne!(
+            colors(&rows[first]),
+            colors(&rows[second]),
+            "rows {first} and {second} of one provider must not crest in unison"
+        );
+    }
+}
+
+/// An endpoint clauth does not recognize by type has no reviewed color, so its
+/// type cell stays flat `TEXT_DIM`; so does a disabled account of a recognized
+/// provider. A crested DeepSeek row in the same list is the control.
+#[test]
+fn an_unrecognized_or_disabled_provider_row_stays_flat() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (generic, generic_readings) = third_party_profile(40.0, 20.0);
+    let (mut disabled, disabled_readings) =
+        provider_key_profile("off", "https://api.deepseek.com/anthropic");
+    disabled.disabled = true;
+    let (config, readings) = config_with(
+        vec![
+            (generic, generic_readings),
+            (disabled, disabled_readings),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for (idx, what) in [(0, "an unrecognized endpoint"), (1, "a disabled account")] {
+        assert_eq!(
+            kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings)),
+            vec![theme::text_dim_color()],
+            "{what}'s type cell is flat TEXT_DIM"
+        );
+    }
+    assert!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 2, false, &readings))
+            .iter()
+            .any(|&h| h != theme::text_dim_color()),
+        "control: the recognized DeepSeek row in the same list crests"
+    );
+}
+
+/// A codex row's plan cell crests a neutral `TEXT` glint, staggered by its
+/// drawn list position; with no plan read it stays the faint no-data dash.
+#[test]
+fn a_codex_rows_plan_cell_crests_in_text() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let first = codex_kind_frames(&codex_row("cx1", Some("plus")), 0, &app, &readings);
+    let hues = kind_cell_hues(&first);
+    let crest = crest_rgb(CrestProvider::Codex);
+    assert!(
+        hues.iter().any(|&h| h != theme::text_dim_color()),
+        "a codex plan cell crests: {hues:?}"
+    );
+    assert!(
+        hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+        "a codex plan cell leans only toward {crest:?}: {hues:?}"
+    );
+    let second = codex_kind_frames(&codex_row("cx2", Some("plus")), 1, &app, &readings);
+    let colors = |frames: &[Vec<(String, Option<ratatui::style::Color>)>]| -> Vec<Vec<Option<ratatui::style::Color>>> {
+        frames.iter().map(|f| f.iter().map(|(_, fg)| *fg).collect()).collect()
+    };
+    assert_ne!(
+        colors(&first),
+        colors(&second),
+        "two codex rows must not crest in unison"
+    );
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx3", None),
+            2,
+            &app,
+            &readings
+        )),
+        vec![theme::faint().fg.expect("faint carries an fg")],
+        "an unread plan stays the faint dash"
+    );
+}
+
+/// The identity wave runs on the full tier only: on compatible every type
+/// cell, claude and codex, renders one flat color across every phase.
+#[test]
+fn the_compatible_tier_runs_no_identity_wave() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Compatible);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for idx in [0, 1] {
+        assert_eq!(
+            kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings)),
+            vec![theme::text_dim_color()],
+            "row {idx}'s type cell is flat on the compatible tier"
+        );
+    }
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx", Some("plus")),
+            2,
+            &app,
+            &readings
+        )),
+        vec![theme::text_dim_color()],
+        "a codex plan cell is flat on the compatible tier"
+    );
+}
+
+/// Every cresting row keeps its crest apart from every other however far down
+/// the list it sits, whichever provider it belongs to: twenty DeepSeek rows
+/// interleaved with twenty Anthropic rows, every pair of the forty starts its
+/// crest at least 32 ms apart around the 2600 ms cycle. One golden-fraction
+/// step per list row gives 34 ms at forty rows (offsets rounded to the
+/// millisecond); the floor leaves one 2 ms sample of slack. A phase keyed on
+/// the row's rank within its provider plus a per-provider seed puts a row and
+/// the row three ranks down in the previous provider 8 ms apart.
+#[test]
+fn rows_of_one_provider_keep_their_crests_apart_down_a_long_list() {
+    const STEP_MS: u64 = 2;
+    const CYCLE_SAMPLES: u64 = 6000 / STEP_MS;
+    const MIN_GAP_MS: u64 = 32;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut profiles = Vec::new();
+    for i in 0..20 {
+        profiles.push(provider_key_profile(
+            &format!("ds{i:02}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+        profiles.push(credentialed_profile(&format!("a{i:02}"), "max"));
+    }
+    let (config, readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let crested = |line: &Line<'static>| {
+        kind_cell(line, widths.kind)
+            .iter()
+            .any(|(text, fg)| !text.trim().is_empty() && *fg != Some(theme::text_dim_color()))
+    };
+    // Each row's crest start: the first sample that crests after one that does
+    // not. Every row runs the same wave shifted, so the starts carry the rows'
+    // phase differences exactly, to the sample step.
+    let starts: Vec<u64> = (0..40)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..CYCLE_SAMPLES)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    crested(&render_overview_row(
+                        &app, idx, &widths, false, true, &readings,
+                    ))
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    let mut closest = (u64::MAX, 0, 0);
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            if gap < closest.0 {
+                closest = (gap, a, b);
+            }
+        }
+    }
+    let (gap, a, b) = closest;
+    assert!(
+        gap >= MIN_GAP_MS,
+        "list rows {a} and {b} crest {gap} ms apart"
+    );
+}
+
+/// The real draw loop hands every row its drawn list position, across the
+/// claude and codex bands: four Anthropic and eight DeepSeek rows, then two
+/// codex rows, drawn whole frame by frame; every pair of the fourteen starts
+/// its crest at least 83 ms apart. One golden-fraction step per position gives
+/// 90 ms over these fourteen; the floor leaves the onset skew between crest
+/// colours plus one 2 ms sample. Residual: a key that also counts the heading
+/// and spacer rows keeps distinct golden offsets and passes here. A codex row keyed on its rank among the codex rows instead
+/// lands on an Anthropic row's offset.
+#[test]
+fn the_drawn_table_keeps_every_crest_apart_across_its_bands() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 83;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut names: Vec<String> = Vec::new();
+    let mut profiles = Vec::new();
+    for i in 0..4 {
+        names.push(format!("a{i}"));
+        profiles.push(credentialed_profile(&format!("a{i}"), "max"));
+    }
+    for i in 0..8 {
+        names.push(format!("ds{i}"));
+        profiles.push(provider_key_profile(
+            &format!("ds{i}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+    }
+    let (config, _readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![
+        codex_row("cx0", Some("plus")),
+        codex_row("cx1", Some("pro")),
+    ];
+    names.push("cx0".into());
+    names.push("cx1".into());
+
+    // One frame per sample; each row's crest start is the first sample whose
+    // type cell leaves `TEXT_DIM` after one that does not.
+    let (width, height) = (110u16, 24u16);
+    let frames: Vec<ratatui::buffer::Buffer> = (0..6000 / STEP_MS)
+        .map(|s| {
+            app.anim_phase_ms = Some(s * STEP_MS);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("terminal");
+            term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+                .expect("draw");
+            term.backend().buffer().clone()
+        })
+        .collect();
+    let rows = crate::testutil::buffer_rows(&frames[0]);
+    let type_x = rows[1]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(4)
+        .position(|w| w.iter().collect::<String>() == "type")
+        .expect("fixture control: the header names the type column") as u16;
+    let starts: Vec<u64> = names
+        .iter()
+        .map(|name| {
+            let ys: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.contains(&format!(" {name} ")))
+                .map(|(y, _)| y)
+                .collect();
+            assert_eq!(ys.len(), 1, "fixture control: `{name}` draws on one row");
+            let y = ys[0] as u16;
+            let crested: Vec<bool> = frames
+                .iter()
+                .map(|buf| {
+                    (type_x..type_x + 6).any(|x| {
+                        let cell = &buf[(x, y)];
+                        !cell.symbol().trim().is_empty() && cell.fg != theme::text_dim_color()
+                    })
+                })
+                .collect();
+            let start = (1..crested.len())
+                .find(|&s| crested[s] && !crested[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: `{name}` crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "`{}` and `{}` crest {gap} ms apart",
+                names[a],
+                names[b]
+            );
+        }
+    }
+}
+
+/// The roster this box runs (four Anthropic logins, eight DeepSeek keys, two
+/// z.ai keys, one Alibaba, one OpenRouter, listed in that order): every pair
+/// of its sixteen rows starts its crest at least 83 ms apart. One
+/// golden-fraction step per list row gives 89 ms here. The test reads the
+/// first sample whose cell leaves `TEXT_DIM`, and a crest close to that base
+/// (z.ai's dark sweep) shows a few ms later than a far one (86 ms measured);
+/// the floor leaves that skew plus one 2 ms sample of slack. A
+/// rank-within-provider phase with a per-provider seed puts four
+/// Anthropic/DeepSeek pairs 8-10 ms apart on this roster.
+#[test]
+fn the_observed_roster_keeps_every_crest_apart() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 83;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut profiles = Vec::new();
+    for i in 0..4 {
+        profiles.push(credentialed_profile(&format!("a{i}"), "max"));
+    }
+    for i in 0..8 {
+        profiles.push(provider_key_profile(
+            &format!("ds{i}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+    }
+    for i in 0..2 {
+        profiles.push(provider_key_profile(
+            &format!("z{i}"),
+            "https://api.z.ai/api/anthropic",
+        ));
+    }
+    profiles.push(provider_key_profile(
+        "al",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    ));
+    profiles.push(provider_key_profile("or", "https://openrouter.ai/api"));
+    let (config, readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let starts: Vec<u64> = (0..16)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..6000 / STEP_MS)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    kind_cell(
+                        &render_overview_row(&app, idx, &widths, false, true, &readings),
+                        widths.kind,
+                    )
+                    .iter()
+                    .any(|(text, fg)| {
+                        !text.trim().is_empty() && *fg != Some(theme::text_dim_color())
+                    })
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "list rows {a} and {b} crest {gap} ms apart"
+            );
+        }
+    }
+}
+
+/// A quarantined row's type cell holds still: motion reads as live, and a
+/// quarantined login is not. A claude row whose login is quarantined and a
+/// codex row whose chain is quarantined each render one flat `TEXT_DIM` across
+/// every phase, while a live row of the same provider beside each still
+/// crests (the fixture's control).
+#[test]
+fn a_quarantined_row_does_not_crest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            credentialed_profile("live", "max"),
+        ],
+        None,
+        vec![],
+    );
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    assert_eq!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 0, false, &readings)),
+        vec![theme::text_dim_color()],
+        "a quarantined claude row's type cell is flat"
+    );
+    assert!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 1, false, &readings)).len() > 1,
+        "fixture control: the live claude row beside it crests"
+    );
+    let mut broken = codex_row("cx", Some("plus"));
+    broken.broken = true;
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(&broken, 0, &app, &readings)),
+        vec![theme::text_dim_color()],
+        "a quarantined codex row's plan cell is flat"
+    );
+    assert!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx2", Some("plus")),
+            1,
+            &app,
+            &readings
+        ))
+        .len()
+            > 1,
+        "fixture control: a live codex row crests"
+    );
+
+    // Selection does not wake a quarantined row: the cursor on it still draws
+    // the cell flat, on both harnesses.
+    assert_eq!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 0, true, &readings)),
+        vec![theme::text_dim_color()],
+        "a selected quarantined claude row's type cell is flat"
+    );
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let selected_codex: Vec<_> = wave_phases()
+        .map(|ms| {
+            kind_cell(
+                &render_codex_row(&broken, 0, &widths, true, ms),
+                widths.kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        kind_cell_hues(&selected_codex),
+        vec![theme::text_dim_color()],
+        "a selected quarantined codex row's plan cell is flat"
+    );
+}
+
+/// Rows of different providers never pulse as one band: each provider's
+/// first row, one apiece, starts its crest at least 232 ms from every other
+/// provider's. One golden-fraction step per list row gives 234 ms across six
+/// rows; the floor leaves one 2 ms sample of slack. A phase keyed only on a
+/// row's rank within its provider gives every provider's first row the same
+/// phase.
+#[test]
+fn each_providers_first_row_crests_apart_from_the_others() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 232;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("z", "https://api.z.ai/api/anthropic"),
+            provider_key_profile(
+                "al",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+            ),
+            provider_key_profile("or", "https://openrouter.ai/api"),
+            provider_key_profile("mm", "https://api.minimax.io/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let starts: Vec<u64> = (0..6)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..6000 / STEP_MS)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    kind_cell(
+                        &render_overview_row(&app, idx, &widths, false, true, &readings),
+                        widths.kind,
+                    )
+                    .iter()
+                    .any(|(text, fg)| {
+                        !text.trim().is_empty() && *fg != Some(theme::text_dim_color())
+                    })
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "the first rows of providers {a} and {b} crest {gap} ms apart"
+            );
+        }
+    }
 }

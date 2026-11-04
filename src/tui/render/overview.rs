@@ -9,14 +9,14 @@ use ratatui::widgets::{ListItem, Paragraph};
 use super::super::app::{
     App, BandEntry, CodexRow, MainItemKind, ReadingsSnapshot, ShuntPool, escape_control,
 };
-use super::super::theme;
+use super::super::theme::{self, CrestProvider};
 use super::chain::reason_marker;
 use super::format::{
     NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, duration_label,
     fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_resume,
     spinner_frame, spinner_style, truncate, window_label, window_summary_spans_bracketed,
 };
-use super::header::pulse_name_spans;
+use super::header::identity_wave_spans;
 use super::panes::{
     bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
     select_line, wrap_words,
@@ -279,7 +279,9 @@ fn draw_overview_accounts(
                     MainItemKind::Profile(_) => {
                         render_overview_row(app, flat, &widths, flat == sel, focused, readings)
                     }
-                    MainItemKind::Codex(idx) => render_codex_row(&codex[idx], &widths, flat == sel),
+                    MainItemKind::Codex(idx) => {
+                        render_codex_row(&codex[idx], flat, &widths, flat == sel, app.anim_ms())
+                    }
                     MainItemKind::Shunt(pi, ai) => {
                         let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
                             rows.push(ListItem::new(Line::from("")));
@@ -933,7 +935,13 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 /// is drawn: the Overview cannot refresh or switch a Codex account. The
 /// marker cell carries `×` for a quarantined chain and the active account's
 /// `⏣` otherwise.
-fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> Line<'static> {
+fn render_codex_row(
+    row: &CodexRow,
+    position: usize,
+    widths: &OverviewWidths,
+    selected: bool,
+    anim_ms: u64,
+) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
     } else if selected {
@@ -961,11 +969,22 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
         Span::raw(" "),
         Span::styled(fixed(row.name.as_str(), widths.name), name_style),
         Span::raw(" ".repeat(widths.gap)),
-        match row.plan.as_deref() {
-            Some(plan) => Span::styled(fixed(plan, widths.kind), theme::dim()),
-            None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
-        },
     ];
+    // A quarantined chain holds still: motion reads as live, and it is not.
+    match row.plan.as_deref() {
+        Some(plan) if !row.broken => {
+            let (clamped, pad) = fixed_split(plan, widths.kind);
+            spans.extend(identity_wave_spans(
+                &clamped,
+                CrestProvider::Codex,
+                position,
+                anim_ms,
+            ));
+            spans.push(Span::raw(pad));
+        }
+        Some(plan) => spans.push(Span::styled(fixed(plan, widths.kind), theme::dim())),
+        None => spans.push(Span::styled(fixed(NO_DATA, widths.kind), theme::faint())),
+    }
     // The usage cells take the claude row's lead-in (narrow gap + a blank
     // timer slot) and its left alignment, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
@@ -1161,6 +1180,21 @@ fn active_mark(app: &App, profile: &Profile) -> &'static str {
     }
 }
 
+/// The provider an account's type cell crests for, read off its endpoint or
+/// stored login, never its name: a typed endpoint names its provider, a stored
+/// login with no endpoint is Anthropic's, anything else has no crest.
+fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
+    match profile.provider {
+        Some(Provider::DeepSeek) => Some(CrestProvider::DeepSeek),
+        Some(Provider::Zai) => Some(CrestProvider::Zai),
+        Some(Provider::Alibaba) => Some(CrestProvider::Alibaba),
+        Some(Provider::OpenRouter) => Some(CrestProvider::OpenRouter),
+        Some(Provider::MiniMax) => Some(CrestProvider::MiniMax),
+        None => (profile.is_oauth() && profile.credentials.is_some())
+            .then_some(CrestProvider::Anthropic),
+    }
+}
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1287,10 +1321,11 @@ fn render_overview_row(
     // the next switch, so it outranks a bell. The active mark
     // outranks the peak marker — naming which account a bare `claude`
     // authenticates as beats a schedule the Usage tab's pricing row already names.
+    let auth_broken = cfg.is_auth_broken(&profile.name);
     if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if cfg.is_auth_broken(&profile.name) {
+    } else if auth_broken {
         spans.push(Span::styled(
             theme::dead_credential_glyph(),
             hue(theme::danger()),
@@ -1337,15 +1372,17 @@ fn render_overview_row(
     // animate one. A lone glyph color-cycling beside the static faint dashes in
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
-    // The credentialed identity-wave is ambient MOTION, which reads as "this
-    // thing is live". A disabled account is not, so it renders the same flat dim
-    // cell an uncredentialed row gets — dimming the pulse's crest would still
-    // animate.
-    if profile.credentials.is_some() && !disabled && !no_tier {
+    // The identity wave is ambient MOTION, which reads as "this thing is live".
+    // A disabled or quarantined account is not, so it renders the same flat dim
+    // cell an unrecognized provider gets — dimming the crest would still animate.
+    if let Some(provider) = crest_provider(profile)
+        && !disabled
+        && !auth_broken
+        && !no_tier
+    {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let mut pulse = pulse_name_spans(&clamped, theme::dim(), app.anim_ms());
-        pulse.push(Span::raw(pad));
-        spans.extend(pulse);
+        spans.extend(identity_wave_spans(&clamped, provider, idx, app.anim_ms()));
+        spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
         // whole cell. A disabled row still flattens to dim, outranking no-data

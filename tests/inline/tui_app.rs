@@ -63213,6 +63213,73 @@ fn a_preset_apply_asks_again_over_a_field_a_peer_filled_meanwhile() {
     assert_eq!(form.replaces, vec!["opus"], "naming the field it replaces");
 }
 
+/// A preset apply that finds the block moved mirrors the endpoint the write
+/// read into the app, and the account's provider follows it: the row crests
+/// for the endpoint the account will call, not the one the app last saw.
+#[test]
+fn a_preset_apply_that_finds_the_block_moved_re_derives_the_provider() {
+    const MOVED_URL: &str = "https://coding.dashscope.aliyuncs.com/apps/anthropic";
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::presets::save_preset(
+        "zai-endpoint",
+        &Some("https://api.z.ai/api/anthropic".to_string()),
+        &crate::profile::ModelSettings {
+            opus: Some("preset-opus".into()),
+            ..crate::profile::ModelSettings::default()
+        },
+    )
+    .expect("save the preset");
+    let (mut app, b) = config_editor_fixture();
+    // The app's copy is still the DeepSeek account the confirm was opened over.
+    assert_eq!(
+        app.config().find(&b).map(|p| p.provider),
+        Some(Some(crate::providers::Provider::DeepSeek)),
+        "fixture control: the app read b before the peer's move"
+    );
+    // The disk moves to another typed provider AND takes a value the preset
+    // replaces, so the write's re-check names a field the confirm never showed.
+    peer_edits(&b, |p| {
+        p.base_url = Some(MOVED_URL.into());
+        p.models.opus = Some("peer-opus".into());
+    });
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("b"),
+        &crate::presets::load_preset("zai-endpoint").expect("the saved preset"),
+        crate::presets::Leftover::Keep,
+        &["base url"],
+        &[],
+    );
+    // The moved arm asked again over the fresh diff instead of writing.
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "the confirm is offered again over the moved block"
+    );
+    assert_eq!(
+        crate::profile::load_profile(&b)
+            .expect("reload")
+            .base_url
+            .as_deref(),
+        Some(MOVED_URL),
+        "the moved block is re-read, never written"
+    );
+    let (base_url, provider) = app
+        .config()
+        .find(&b)
+        .map(|p| (p.base_url.clone(), p.provider))
+        .expect("b");
+    assert_eq!(
+        base_url.as_deref(),
+        Some(MOVED_URL),
+        "the app mirrors the endpoint the write read"
+    );
+    assert_eq!(
+        provider,
+        Some(crate::providers::Provider::Alibaba),
+        "the provider follows the endpoint the account will call"
+    );
+}
+
 /// Clearing a chain radio elsewhere fails loudly when the roster does not
 /// read, rather than reporting a move it never made.
 #[test]

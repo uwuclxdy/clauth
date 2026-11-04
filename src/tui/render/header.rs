@@ -80,6 +80,12 @@ const GAUGE_GAP: usize = 1;
 const PULSE_SWEEP_MS: u64 = 900;
 const PULSE_REST_MS: u64 = 1700;
 const PULSE_DEPTH: f32 = 0.4;
+const PULSE_CYCLE_MS: u64 = PULSE_SWEEP_MS + PULSE_REST_MS;
+/// The identity wave's crest is the provider's own color, not a tint toward it.
+const IDENTITY_DEPTH: f32 = 1.0;
+/// A row's step into the cycle, as a fraction of it: the golden ratio, so any
+/// run of rows spreads its crests across the cycle instead of cascading.
+const PULSE_STAGGER_FRACTION: f64 = 0.6180339887498949;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GaugeFit {
@@ -209,12 +215,51 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
 }
 
 pub(super) fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'static>> {
+    crest_spans(
+        name,
+        style,
+        theme::accent_2_color(),
+        PULSE_DEPTH,
+        elapsed_ms,
+    )
+}
+
+/// The identity wave over one row's provider-owned cell: a `TEXT_DIM` base the
+/// provider's crest sweeps, started one golden-ratio step per `position` — the
+/// row's position in the list the Overview draws — so a list spreads its crests
+/// across the cycle instead of running them as one band, whichever provider
+/// each row belongs to, and a row keeps its phase when a neighbour starts or
+/// stops cresting.
+pub(super) fn identity_wave_spans(
+    label: &str,
+    provider: theme::CrestProvider,
+    position: usize,
+    elapsed_ms: u64,
+) -> Vec<Span<'static>> {
+    let fraction = (position as f64 * PULSE_STAGGER_FRACTION).fract();
+    let offset = (fraction * PULSE_CYCLE_MS as f64).round() as u64;
+    crest_spans(
+        label,
+        theme::dim(),
+        theme::crest_color(provider),
+        IDENTITY_DEPTH,
+        elapsed_ms % PULSE_CYCLE_MS + offset,
+    )
+}
+
+fn crest_spans(
+    name: &str,
+    style: Style,
+    crest_color: ratatui::style::Color,
+    depth: f32,
+    elapsed_ms: u64,
+) -> Vec<Span<'static>> {
     use std::f32::consts::{PI, TAU};
     let plain = || vec![Span::styled(name.to_string(), style)];
     if theme::tier() != theme::Tier::Full {
         return plain();
     }
-    let t = (elapsed_ms % (PULSE_SWEEP_MS + PULSE_REST_MS)) as f32;
+    let t = (elapsed_ms % PULSE_CYCLE_MS) as f32;
     let sweep = PULSE_SWEEP_MS as f32;
     if t >= sweep {
         return plain();
@@ -240,8 +285,8 @@ pub(super) fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec
         .map(|(i, symbol)| {
             let col = (i as f32 / len) * TAU;
             let crest = ((col - head).cos() * 0.5 + 0.5).powi(2);
-            let lean = f64::from(crest * envelope * PULSE_DEPTH);
-            let fg = theme::blend_over(base, theme::accent_2_color(), lean);
+            let lean = f64::from(crest * envelope * depth);
+            let fg = theme::blend_over(base, crest_color, lean);
             Span::styled((*symbol).to_string(), style.fg(fg))
         })
         .collect()

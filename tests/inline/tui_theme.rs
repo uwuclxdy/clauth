@@ -600,3 +600,70 @@ fn no_mark_glyph_is_spelled_in_a_render_file() {
         "draw marks through the theme module: {offenders:?}"
     );
 }
+
+/// The reviewed provider palette: Anthropic's crest is `ACCENT_2`, Codex's the
+/// neutral `TEXT` glint, z.ai's a dark sweep below `TEXT_DIM`, the rest each
+/// provider's own color.
+#[test]
+fn each_provider_crest_is_its_reviewed_color() {
+    use super::{CrestProvider as P, crest_rgb};
+    let expected = [
+        (P::Anthropic, (217, 119, 87)),
+        (P::DeepSeek, (0x67, 0x99, 0xFE)),
+        (P::Zai, (0x8A, 0x90, 0xA6)),
+        (P::Alibaba, (0xFF, 0x6A, 0x00)),
+        (P::OpenRouter, (0xC8, 0xFF, 0x00)),
+        (P::MiniMax, (0xFF, 0x51, 0x51)),
+        (P::Codex, (205, 214, 244)),
+    ];
+    assert_eq!(
+        expected.len(),
+        P::ALL.len(),
+        "every provider has a pinned crest"
+    );
+    for (provider, rgb) in expected {
+        assert_eq!(crest_rgb(provider), rgb, "{provider:?}'s crest");
+    }
+}
+
+/// WCAG 2.x relative luminance of an sRGB triple.
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Every crest differs from the `TEXT_DIM` base it rides and holds 4.5:1
+/// against both `BG` (30, 30, 46) and `BG_HOVER` (40, 40, 56), the backgrounds
+/// a type cell sits on.
+#[test]
+fn every_provider_crest_clears_the_contrast_floor() {
+    use super::{CrestProvider, crest_rgb};
+    assert!(
+        contrast((255, 255, 255), (0, 0, 0)) > 20.9,
+        "control: the formula gives white on black its 21:1"
+    );
+    for provider in CrestProvider::ALL {
+        let rgb = crest_rgb(provider);
+        assert_ne!(
+            rgb,
+            (166, 173, 200),
+            "{provider:?}'s crest differs from TEXT_DIM"
+        );
+        for (bg_name, bg) in [("BG", (30, 30, 46)), ("BG_HOVER", (40, 40, 56))] {
+            let ratio = contrast(rgb, bg);
+            assert!(ratio >= 4.5, "{provider:?} on {bg_name}: {ratio:.3}:1");
+        }
+    }
+}

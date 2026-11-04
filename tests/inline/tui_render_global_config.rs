@@ -1,5 +1,5 @@
 //! Config-tab row geometry. Every blurred row's value starts at the same
-//! column (the Config tab is a tight chip group); cycle options are
+//! column (the Config tab is a settings table); cycle options are
 //! bare labels on 2-space gaps with the active option bracketed only on focus;
 //! an on/off boolean renders as a toggle, not a 2-option cycle.
 

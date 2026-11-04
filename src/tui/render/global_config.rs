@@ -44,7 +44,7 @@ use super::panes::{
 /// Width of the key column: the longest keys (`allow extra usage` /
 /// `extra usage spent`, 17). Keys pad to it, then [`KEY_GUTTER`] separates them
 /// from the value — so every row's value starts at the same column (the Config
-/// tab is a tight chip group).
+/// tab is a settings table).
 const KEY_W: usize = 17;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;

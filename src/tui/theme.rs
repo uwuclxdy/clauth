@@ -241,11 +241,62 @@ pub(crate) fn text_faint_color() -> Color {
 pub(crate) fn accent_color() -> Color {
     pick(Color::Rgb(67, 171, 229), Color::Indexed(75))
 }
-/// Claude orange — the warm secondary; rule: once per screen max.
+/// Claude orange — the warm secondary, held only by a closed set of warm
+/// anchors; any other orange is a passing crest, never a held color.
 #[inline]
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
 }
+
+/// A provider the Overview's identity wave recognizes by type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrestProvider {
+    Anthropic,
+    DeepSeek,
+    Zai,
+    Alibaba,
+    OpenRouter,
+    MiniMax,
+    Codex,
+}
+
+impl CrestProvider {
+    /// Every variant, in declaration order. Test-only: the palette pins walk it
+    /// to prove each provider a variant can name has a reviewed crest.
+    #[cfg(test)]
+    pub(crate) const ALL: [CrestProvider; 7] = [
+        CrestProvider::Anthropic,
+        CrestProvider::DeepSeek,
+        CrestProvider::Zai,
+        CrestProvider::Alibaba,
+        CrestProvider::OpenRouter,
+        CrestProvider::MiniMax,
+        CrestProvider::Codex,
+    ];
+}
+
+/// The full-tier RGB of a provider's identity-wave crest. Each holds 4.5:1
+/// against `BG` and `BG_HOVER`; z.ai's sweeps dark, below `TEXT_DIM`.
+pub(crate) fn crest_rgb(provider: CrestProvider) -> (u8, u8, u8) {
+    match provider {
+        CrestProvider::Anthropic => (217, 119, 87), // 5.25:1 BG, 4.64:1 BG_HOVER
+        CrestProvider::DeepSeek => (0x67, 0x99, 0xFE), // 5.91:1 BG, 5.21:1 BG_HOVER
+        CrestProvider::Zai => (0x8A, 0x90, 0xA6),   // 5.17:1 BG, 4.56:1 BG_HOVER
+        CrestProvider::Alibaba => (0xFF, 0x6A, 0x00), // 5.71:1 BG, 5.04:1 BG_HOVER
+        CrestProvider::OpenRouter => (0xC8, 0xFF, 0x00), // 13.87:1 BG, 12.24:1 BG_HOVER
+        CrestProvider::MiniMax => (0xFF, 0x51, 0x51), // 5.11:1 BG, 4.51:1 BG_HOVER
+        CrestProvider::Codex => (205, 214, 244),    // 11.34:1 BG, 10.01:1 BG_HOVER
+    }
+}
+
+/// A provider's crest color. The wave's own tier check is the single gate that
+/// keeps the crest off the compatible tier, so this answers the full-tier RGB
+/// on every tier.
+pub(crate) fn crest_color(provider: CrestProvider) -> Color {
+    let (r, g, b) = crest_rgb(provider);
+    Color::Rgb(r, g, b)
+}
+
 /// Clawd's `clawd_background` cut-out colour: `rgb(0,0,0)` in the source's dark
 /// and light themes alike (its ansi themes use `ansi:black`). The compatible
 /// tier uses xterm-256 index 16 (the colour cube's black), never 16-colour
