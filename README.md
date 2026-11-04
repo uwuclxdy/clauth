@@ -40,7 +40,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 ## Features
 
 - 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Ultra / Team / Enterprise) or a custom API endpoint, plan tier detected for you
-- 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
+- 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed, and an Overview flag on a plan that bills or ends within the week
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts on a plan with a 5h limit queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, tells a session when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a paired phone
