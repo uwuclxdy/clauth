@@ -1687,7 +1687,7 @@ fn the_auto_help_names_the_configured_walk_order() {
     for phrase in [
         "the fallback-chain member with headroom",
         "taken in your `walk_order`",
-        "chain position by default, else the soonest weekly reset or the most weekly headroom",
+        "chain position by default, else the soonest weekly reset, the most weekly headroom or the soonest plan end",
     ] {
         assert!(
             flat.contains(phrase),

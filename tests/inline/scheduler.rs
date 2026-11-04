@@ -31727,6 +31727,8 @@ fn reset_member(name: &str) -> crate::fallback::ChainMember {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }
 }
 

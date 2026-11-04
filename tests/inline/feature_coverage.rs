@@ -100,6 +100,8 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // `build_status_auto_start_queue_` status tests, and `queue` alone
             // matches every name carrying that substring.
             "auto_start_queue_",
+            // The soonest-plan-end walk order: an ending plan spent first.
+            "walk_order_soonest_plan_end_",
         ],
     ),
     (

@@ -1076,11 +1076,14 @@ impl Default for UpdateSettings {
 /// soonest-resetting weekly window, so the member whose quota expires soonest
 /// drains first and less expires unspent; `MostWeeklyHeadroom` reorders it by
 /// the least-used week, so hops spread across the chain instead of always
-/// landing on the next slot. The pass ladder (free quota > serving sink >
-/// spend-armed > dead sink > halt) and every exclusion are untouched — the
-/// mode decides only WHERE among the members a pass already accepts to land.
+/// landing on the next slot; `SoonestPlanEnd` reorders it by when each plan
+/// ends or renews, so a plan the operator canceled is spent before it ends.
+/// The pass ladder (free quota > serving sink > spend-armed > dead sink >
+/// halt) and every exclusion are untouched — the mode decides only WHERE
+/// among the members a pass already accepts to land.
 /// Serialized as a lowercase string with explicit hyphenated spellings:
-/// `walk_order = "soonest-weekly-reset"`, `walk_order = "most-weekly-headroom"`.
+/// `walk_order = "soonest-weekly-reset"`, `walk_order = "most-weekly-headroom"`,
+/// `walk_order = "soonest-plan-end"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum WalkOrder {
@@ -1094,6 +1097,12 @@ pub(crate) enum WalkOrder {
     /// only: unlike `SoonestWeeklyReset` it never walks a healthy active.
     #[serde(rename = "most-weekly-headroom")]
     MostWeeklyHeadroom,
+    /// Order each accept pass by plan end ([`crate::usage::PlanEnd::rank_key`]):
+    /// every plan marked ending (`plan_ends`) by its day, then every renewing
+    /// plan (`plan_renews`) by its next billing day. Like `SoonestWeeklyReset`
+    /// it also walks a healthy active home to the soonest such member.
+    #[serde(rename = "soonest-plan-end")]
+    SoonestPlanEnd,
 }
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
@@ -1139,11 +1148,12 @@ pub(crate) struct AppState {
     /// (issue #86): `chain` (the default) walks by chain position exactly as
     /// it always has; `soonest-weekly-reset` lands each pass on the accepted
     /// member whose weekly window resets soonest, so less quota expires
-    /// unspent; `most-weekly-headroom` on the one whose week is least used.
-    /// `None` = the [`WalkOrder`] default, so an untouched
-    /// profiles.toml carries neither this key nor the setting and walks
-    /// byte-identically to before the key existed. Read through
-    /// [`AppState::walk_order`].
+    /// unspent; `most-weekly-headroom` on the one whose week is least used;
+    /// `soonest-plan-end` on the one whose plan ends or renews first, a
+    /// canceled plan's end before any renewal. `None` = the [`WalkOrder`]
+    /// default, so an untouched profiles.toml carries neither this key nor
+    /// the setting and walks byte-identically to before the key existed. Read
+    /// through [`AppState::walk_order`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_order: Option<WalkOrder>,
     /// The program the daemon runs when an account's 5h usage crosses its

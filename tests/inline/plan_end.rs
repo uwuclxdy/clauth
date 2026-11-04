@@ -1,5 +1,5 @@
-//! The plan end: the operator's `plan_ends` and `plan_renews` days and the
-//! monthly carry of a billing day.
+//! The plan end: the operator's `plan_ends` and `plan_renews` days, the
+//! monthly carry of a billing day, and the `soonest-plan-end` ranking key.
 
 use chrono::NaiveDate;
 
@@ -101,6 +101,20 @@ fn a_marked_end_reads_ended_once_past() {
         ends(date(2026, 11, 3)).end(today),
         Some(PlanEnd::Ended(date(2026, 11, 3)))
     );
+}
+
+/// Every ending plan ranks ahead of every renewing one, whatever the days:
+/// what an ending plan leaves unspent is lost, a renewing plan's week is not.
+#[test]
+fn an_ending_plan_ranks_ahead_of_a_sooner_renewal() {
+    let ends_late = PlanEnd::Ends(date(2027, 3, 1)).rank_key();
+    let ends_soon = PlanEnd::Ends(date(2026, 11, 20)).rank_key();
+    let renews_soon = PlanEnd::Renews(date(2026, 11, 5)).rank_key();
+    let renews_late = PlanEnd::Renews(date(2026, 11, 30)).rank_key();
+    assert!(ends_soon < ends_late);
+    assert!(ends_late < renews_soon);
+    assert!(renews_soon < renews_late);
+    assert_eq!(PlanEnd::Ended(date(2026, 11, 3)).rank_key(), None);
 }
 
 #[test]

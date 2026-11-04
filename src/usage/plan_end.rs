@@ -1,5 +1,6 @@
 //! When an account's paid plan ends or renews: the date the Usage tab,
-//! `clauth list` and the feeds show.
+//! `clauth list` and the feeds show, and the key the `soonest-plan-end` walk
+//! order ranks by.
 //!
 //! Neither OAuth endpoint clauth reads (`/api/oauth/usage`,
 //! `/api/oauth/profile`) names a billing date. `/profile`'s
@@ -53,6 +54,20 @@ pub(crate) enum PlanEnd {
 }
 
 impl PlanEnd {
+    /// The `soonest-plan-end` ranking key, smallest first: every ending plan
+    /// before every renewing one, each by day. An ending plan's unspent quota
+    /// is gone at its end, while a renewing plan's weekly quota carries on past
+    /// its billing day. An ended plan has no key: the operator's own date says
+    /// it no longer serves, so it ranks with the members nothing is known
+    /// about.
+    pub(crate) fn rank_key(self) -> Option<(u8, i64)> {
+        match self {
+            PlanEnd::Ends(day) => Some((0, i64::from(day.num_days_from_ce()))),
+            PlanEnd::Renews(day) => Some((1, i64::from(day.num_days_from_ce()))),
+            PlanEnd::Ended(_) => None,
+        }
+    }
+
     /// The day this end falls on.
     pub(crate) fn day(self) -> NaiveDate {
         match self {
