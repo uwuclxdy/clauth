@@ -118,6 +118,8 @@ fn build_status_top_level_shape_and_active() {
             "has_live_session",
             "name",
             "next_refresh_at",
+            // Additive: when the plan ends or renews, `null` when unknown.
+            "plan_end",
             "provider",
             "rolling_token",
             "spend",
@@ -2205,6 +2207,10 @@ fn status_body_matches_legacy_json_bytes() {
                     percent: Some(12.428),
                 }),
                 credit_capped: false,
+                plan_end: Some(PlanEndEntry {
+                    kind: "renews".to_string(),
+                    date: "2026-10-15".to_string(),
+                }),
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2230,6 +2236,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                plan_end: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2258,6 +2265,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                plan_end: None,
             },
         ],
     };
@@ -2276,18 +2284,20 @@ fn status_body_matches_legacy_json_bytes() {
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
-        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"#,
+        r#""plan_end":{"kind":"renews","date":"2026-10-15"}},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"#,
+        r#""plan_end":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
-        r#""extra_usage":null,"credit_capped":false}]}"#,
+        r#""extra_usage":null,"credit_capped":false,"plan_end":null}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -3868,4 +3878,58 @@ fn build_status_ages_a_probed_account_at_its_probe_interval() {
     let v = status_value(&config, 90_000, None, false);
     assert_eq!(entry(&v, "probed")["stale"], false);
     assert_eq!(entry(&v, "polled")["stale"], true);
+}
+
+/// `profiles[].plan_end`: a marked `plan_ends` wins over `plan_renews`, a
+/// past billing day carries forward a month, and a profile with neither date
+/// publishes `null`.
+#[test]
+fn build_status_publishes_the_plan_end() {
+    let _home = HomeSandbox::new();
+    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
+    let mut marked = oauth_profile("marked");
+    marked.plan_ends = Some(today + chrono::Duration::days(10));
+    marked.plan_renews = Some(today + chrono::Duration::days(4));
+    let mut renewing = oauth_profile("renewing");
+    renewing.plan_renews = Some(today - chrono::Duration::days(1));
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![marked, renewing, oauth_profile("bare")],
+    };
+    crate::testutil::register_names(&["marked", "renewing", "bare"]);
+    let body = status_value(&config, 60_000, None, false);
+    let entry = |name: &str| -> serde_json::Value {
+        body["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is published"))
+            .clone()
+    };
+    assert_eq!(
+        entry("marked")["plan_end"],
+        serde_json::json!({
+            "kind": "ends",
+            "date": crate::usage::render_plan_date(today + chrono::Duration::days(10)),
+        })
+    );
+    let next = crate::usage::PlanDates {
+        ends: None,
+        renews: Some(today - chrono::Duration::days(1)),
+    }
+    .end(today)
+    .expect("a billing day renews");
+    assert_eq!(
+        entry("renewing")["plan_end"],
+        serde_json::json!({
+            "kind": "renews",
+            "date": crate::usage::render_plan_date(next.day()),
+        })
+    );
+    assert!(
+        next.day() > today,
+        "yesterday's billing day carried forward a month"
+    );
+    assert_eq!(entry("bare")["plan_end"], serde_json::Value::Null);
 }

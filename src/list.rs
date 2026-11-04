@@ -127,14 +127,21 @@ impl Row {
                 window_pct(&entry.windows, crate::usage::LABEL_7D),
             ),
         };
+        let tier =
+            entry
+                .tier
+                .as_deref()
+                .unwrap_or(if claude { entry.provider.as_str() } else { "-" });
         Row {
             marker: if entry.active { '*' } else { ' ' },
             name: entry.name.as_str().to_string(),
-            plan: entry
-                .tier
-                .as_deref()
-                .unwrap_or(if claude { entry.provider.as_str() } else { "-" })
-                .to_string(),
+            // When the plan ends or renews rides its cell, in plain ASCII like
+            // all CLI text: `Ultra (renews 2026-12-03)`, `Ultra (ends
+            // 2026-11-20)`.
+            plan: match &entry.plan_end {
+                Some(end) => format!("{tier} ({} {})", end.kind, end.date),
+                None => tier.to_string(),
+            },
             five_h,
             seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
