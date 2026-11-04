@@ -2486,6 +2486,25 @@ fn the_save_cue_names_the_profile_a_running_delete_removes() {
     }
 }
 
+/// While the exit wait holds on a running rolling-token switch, the cue
+/// names the account being armed.
+#[test]
+fn the_save_cue_names_the_account_a_rolling_switch_arms() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for w in [80, 34] {
+        let mut app = bare_app();
+        app.tab = Tab::Setup;
+        app.rolling_switch = Some(crate::profile::ProfileName::from("arm"));
+        app.exit_wait = true;
+        let expected = format!(
+            " {SAVE_CUE_LEADER}{}",
+            prose::plain(&save_cue("arm", w - 2))
+        );
+        assert_eq!(cue_row(&app, w), expected, "whole row at {w}");
+    }
+}
+
 /// A Setup `+ new` form of `account_type` with its cursor on `+ login` and the
 /// cached shunt reason seeded — the state the footer's `+ login` hint reads.
 /// The caller holds the `HomeSandbox` across `App::new`.

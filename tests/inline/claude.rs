@@ -7006,11 +7006,8 @@ fn the_off_loop_settle_defers_to_a_detached_lookup_then_settles_off_its_answer()
     assert_eq!(
         settled,
         BareItemSettle::Settled(BareItemSettled {
-            notice: Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-                    .to_string()
-            ),
+            notice: Some("saved the Keychain login Claude Code wrote into b".to_string()),
+            saved_into: Some(ProfileName::from("b")),
             placed: None,
         })
     );
@@ -7255,11 +7252,8 @@ fn the_off_loop_settle_looks_an_uncached_holder_up_before_it_asks() {
     assert_eq!(
         settled,
         BareItemSettle::Settled(BareItemSettled {
-            notice: Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-                    .to_string()
-            ),
+            notice: Some("saved the Keychain login Claude Code wrote into b".to_string()),
+            saved_into: Some(ProfileName::from("b")),
             placed: None,
         })
     );
@@ -7458,8 +7452,8 @@ fn the_leg_over_a_torn_active_store_says_it_signed_the_keychain_out() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth: the macOS Keychain login was a's, written by a Claude Code still running \
-             on it; saved it into a and signed the Keychain out, since b has no login to put back"
+            "clauth: saved the Keychain login Claude Code wrote into a and signed the Keychain \
+             out, since b has no login to put back"
                 .to_string()
         ]
     );
@@ -7930,8 +7924,7 @@ fn an_unplaced_bare_item_is_warned_about_and_left() {
 fn the_rescue_line_names_both_accounts() {
     assert_eq!(
         foreign_item_rescued_line("cld0", "cld1"),
-        "the macOS Keychain login was cld0's, written by a Claude Code still running on it; \
-         saved it into cld0 and put cld1 back"
+        "saved the Keychain login Claude Code wrote into cld0 and put cld1 back"
     );
 }
 

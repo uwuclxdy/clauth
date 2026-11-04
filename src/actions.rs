@@ -5291,6 +5291,455 @@ pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<()> {
     })
 }
 
+/// What arming `name`'s rolling token did, read back off disk rather than
+/// assumed: the gate reports `Ready` on paths that armed NOTHING and left a
+/// static mint in place, so a flat "armed from the usage chain" outcome is a
+/// lie exactly when the operator most needs the truth. The sidecar's own
+/// classification separates them.
+#[derive(Debug)]
+pub(crate) enum RollingArmOutcome {
+    /// The sidecar holds a rolling bearer stamped from the usage chain:
+    /// its scope list, its plan stamp (absent when unstamped), and the
+    /// daemon state the re-stamp promise closes on.
+    Armed {
+        scopes: Vec<String>,
+        plan: Option<String>,
+        daemon: crate::daemon::DaemonHealth,
+    },
+    /// The gate was ready but the sidecar still holds a static mint (a chain
+    /// the gate could not read, or one too degraded to stamp from): the flag
+    /// is on, the mint stays in place, and the daemon re-stamps on its next
+    /// rotation.
+    MintKept,
+}
+
+/// A finished arm: its outcome plus the facts every surface composes its
+/// report from — whether the plan-scope warning fired, whether a mis-filled
+/// sidecar was quarantined first, and whether the account is the active one
+/// (the live install ran, or installs on the next switch).
+#[derive(Debug)]
+pub(crate) struct RollingArmReport {
+    pub(crate) outcome: RollingArmOutcome,
+    pub(crate) plan_incapable: bool,
+    pub(crate) quarantined_misfill: bool,
+    pub(crate) active: bool,
+}
+
+/// A refusal of the arm, typed so the CLI and the TUI classify by variant
+/// and compose the sentence themselves: neither matches an error message to
+/// pick an outcome.
+#[derive(Debug)]
+pub(crate) enum RollingArmRefusal {
+    /// The account is user-disabled: `'{name}': account is disabled`.
+    Disabled,
+    /// No usage chain on an api-key (third-party endpoint) account: the bail
+    /// names the why-not and prescribes nothing.
+    NoChainThirdParty,
+    /// No usage chain on an OAuth account: the bail carries the re-login fix.
+    NoChainOauth,
+    /// A standing quarantine, carrying the composed sentence (the
+    /// third-party split copy, or the generic dead-chain sentence).
+    Quarantined(String),
+    /// The arm reported success but no readable sidecar exists to verify.
+    NoReadableSidecar,
+    /// Report-time: the chain is dead, the static mint stays, the flag was
+    /// left as found.
+    DeadChainKeptMint,
+    /// Report-time: a rotating pair raced back into the sidecar mid-arm.
+    RefilledMisfill,
+    /// Arm-time: the gate was ready but nothing was armed.
+    NothingArmed,
+    /// Arm-time: the chain is terminally dead.
+    Broken,
+    /// Arm-time: a transient failure (the CLI sentence names its HTTP status
+    /// when it had one; the TUI toast drops it).
+    Transient(crate::format::Transient),
+    /// Arm-time: the daemon is stopping and refused the spend.
+    Stopping,
+    /// The account left the roster between the pre-arm read and the flag
+    /// write: the write silently wrote nothing, so the arm must not run
+    /// for it.
+    GoneFromRoster,
+    /// Anything outside the table (a load, save or install error): the CLI
+    /// prints the error as it came, the TUI toasts it as its detail.
+    Open(anyhow::Error),
+}
+
+impl RollingArmRefusal {
+    /// The sentence the CLI prints for this refusal, without any
+    /// `Error: ` prefix. The TUI's danger toast carries it too, except an
+    /// `Open` error (escaped for a toast) and a `Transient` (its `text()`,
+    /// no HTTP status).
+    pub(crate) fn sentence(&self, name: &ProfileName) -> String {
+        match self {
+            Self::Disabled => crate::disabled_account_refusal(name),
+            Self::NoChainThirdParty => {
+                format!("'{name}' has no usage OAuth chain to roll from")
+            }
+            Self::NoChainOauth => format!(
+                "'{name}' has no usage OAuth chain to roll from; run \
+                 `clauth login {name}` first"
+            ),
+            Self::Quarantined(sentence) => sentence.clone(),
+            Self::NoReadableSidecar => format!(
+                "arming reported success but '{name}' has no readable sidecar to verify, \
+                 so nothing was confirmed. Check permissions on ~/.clauth and re-run"
+            ),
+            Self::DeadChainKeptMint => format!(
+                "'{name}' usage chain is dead, so sessions stay on the static mint and \
+                 nothing would re-stamp a rolling token. Run `clauth login {name}` to \
+                 revive the chain, then re-run. The rolling-token flag was left as it was."
+            ),
+            Self::RefilledMisfill => format!(
+                "'{name}' sidecar was re-filled with a rotating pair while arming, so \
+                 the split is disengaged and nothing was armed. Re-run, and if it \
+                 repeats find what is writing session-token.json"
+            ),
+            Self::NothingArmed => format!(
+                "'{name}' could not arm the rolling sidecar (a mis-filled sidecar with no \
+                 backup?). Re-capture with `clauth login {name} --setup-token`, or clear \
+                 the sidecar, then re-run"
+            ),
+            Self::Broken => crate::oauth::dead_chain_sentence(None, name),
+            Self::Transient(t) => t.text_with_status(),
+            Self::Stopping => crate::format::DAEMON_STOPPING.to_string(),
+            // The same head the CLI's not-found wording prints; the account
+            // leaving mid-run is the same fact for the operator.
+            Self::GoneFromRoster => profile_not_found_head(name.as_str()),
+            Self::Open(e) => format!("{e:#}"),
+        }
+    }
+}
+
+/// The head both the CLI's not-found wording and the arm's off-roster refusal
+/// print for a name no roster holds, so the two cannot drift.
+pub(crate) fn profile_not_found_head(name: &str) -> String {
+    format!("profile '{name}' not found")
+}
+
+/// A failed arm: its refusal, plus the facts every surface composes its
+/// report from. `rollback_stranded` carries the rollback's own save error
+/// when the flag rollback itself could not save; each surface formats its
+/// own copy of the warning from it (the CLI the full `clauth: warning: `
+/// line, the TUI the body).
+#[derive(Debug)]
+pub(crate) struct RollingArmFailure {
+    pub(crate) refusal: RollingArmRefusal,
+    pub(crate) rollback_stranded: Option<anyhow::Error>,
+    pub(crate) plan_incapable: bool,
+    pub(crate) quarantined_misfill: bool,
+}
+
+impl RollingArmFailure {
+    pub(crate) fn new(
+        refusal: RollingArmRefusal,
+        plan_incapable: bool,
+        quarantined_misfill: bool,
+    ) -> Self {
+        Self {
+            refusal,
+            rollback_stranded: None,
+            plan_incapable,
+            quarantined_misfill,
+        }
+    }
+
+    /// A failure outside the typed table (a load, save or install error).
+    pub(crate) fn open(e: anyhow::Error, plan_incapable: bool, quarantined_misfill: bool) -> Self {
+        Self::new(
+            RollingArmRefusal::Open(e),
+            plan_incapable,
+            quarantined_misfill,
+        )
+    }
+}
+
+/// The report-time classification of the sidecar an arm left behind — the
+/// one step the CLI's printer and the TUI's toast both need, off the same
+/// disk read. `chain_is_broken` separates "the daemon will get it" (a mint
+/// kept while the chain recovers) from "nothing to retry" (a terminally dead
+/// chain).
+pub(crate) fn classify_armed_sidecar(
+    canonical: &ProfileName,
+    chain_is_broken: bool,
+) -> std::result::Result<RollingArmOutcome, RollingArmRefusal> {
+    let Some((kind, token)) = crate::claude::sidecar_summary(canonical) else {
+        return Err(RollingArmRefusal::NoReadableSidecar);
+    };
+    match kind {
+        crate::claude::SidecarKind::Mint if chain_is_broken => {
+            Err(RollingArmRefusal::DeadChainKeptMint)
+        }
+        crate::claude::SidecarKind::Mint => Ok(RollingArmOutcome::MintKept),
+        crate::claude::SidecarKind::Misfilled => Err(RollingArmRefusal::RefilledMisfill),
+        crate::claude::SidecarKind::Rolling => Ok(RollingArmOutcome::Armed {
+            scopes: token.scopes.clone().unwrap_or_default(),
+            plan: token.subscription_type.clone().filter(|p| !p.is_empty()),
+            daemon: crate::daemon::daemon_health(),
+        }),
+    }
+}
+
+/// The stranded-rollback warning body (the CLI prefixes `clauth: warning: `):
+/// a failed arm whose rollback ALSO failed to save leaves the flag durably
+/// on with nothing armed, and this line is the only thing telling the
+/// operator that state exists and how to leave it. A save the writer
+/// REFUSED over a line's shape is the file's problem, not the directory's,
+/// so it names the line instead of pointing at write permission.
+pub(crate) fn rollback_stranded_warning_body(canonical: &str, save_err: &anyhow::Error) -> String {
+    if let Some(refusal) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::profile::ConfigEditRefusal>())
+    {
+        let key = refusal.key();
+        return format!(
+            "could not roll the rolling-token flag back for \
+             '{canonical}': config.toml has `{key}` in a shape clauth cannot read. \
+             Fix or remove that line, then run `clauth static-token {canonical}` to clear it"
+        );
+    }
+    if let Some(parse) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::profile::ConfigParseRefusal>())
+        && let Some(position) = crate::format::parse_position(parse.position())
+    {
+        return format!(
+            "could not roll the rolling-token flag back for \
+             '{canonical}': config.toml does not parse ({position}). Fix that line, then run \
+             `clauth static-token {canonical}` to clear it"
+        );
+    }
+    format!(
+        "could not roll the rolling-token flag back for \
+         '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \
+         `clauth static-token {canonical}` to clear it"
+    )
+}
+
+/// The body of the CLI's mis-fill quarantine line (its `clauth: ` prefix
+/// dropped): shared with the TUI's warning, so an edit on either surface
+/// cannot drift from the other.
+pub(crate) fn misfill_quarantined_body(canonical: &ProfileName) -> String {
+    format!(
+        "'{canonical}' had a mis-filled sidecar (a rotating pair). It was quarantined \
+         under the profile's quarantine/ dir before arming."
+    )
+}
+
+/// The pre-arm half of the shared rolling-token switch: everything the base
+/// CLI did BEFORE its macOS bare-item settle — the fresh disk read, the
+/// disabled/no-chain/quarantine refusals, the plan-capability warning fact
+/// and the mis-fill quarantine. Both callers run it first, so a refused
+/// switch settles nothing; [`arm_rolling_token`] takes what it returns.
+pub(crate) struct RollingPreArm {
+    /// The chain lacks the plan scope or subscription stamp: the warning
+    /// fact every surface composes its line from.
+    pub(crate) plan_incapable: bool,
+    /// A mis-filled sidecar was quarantined as evidence before arming.
+    pub(crate) quarantined_misfill: bool,
+    /// The account is the active one: the live install follows the report.
+    pub(crate) active: bool,
+    handle: ConfigHandle,
+    was_rolling: bool,
+    name: ProfileName,
+}
+
+/// The shared arm's pre-arm half (see [`RollingPreArm`]): every refusal, the
+/// warning facts and the mis-fill quarantine, off a FRESH disk read — the
+/// TUI's render snapshot is a tick old, and a peer's edit may have landed
+/// since any caller's own read.
+pub(crate) fn precheck_rolling_token(
+    name: &ProfileName,
+) -> std::result::Result<RollingPreArm, RollingArmFailure> {
+    // `load_profile` reads the profile dir directly, so the arm judges the
+    // account that is really there, never the roster the caller resolved nor
+    // the TUI's tick-stale snapshot.
+    let state =
+        crate::profile::load_app_state().map_err(|e| RollingArmFailure::open(e, false, false))?;
+    let profile =
+        crate::profile::load_profile(name).map_err(|e| RollingArmFailure::open(e, false, false))?;
+    // Same gate `switch` and `start` take: a disabled profile is off every
+    // operational surface, the re-stamp timer included, so arming one
+    // produces a bearer that dies in hours with nothing behind it.
+    if profile.is_disabled() {
+        return Err(RollingArmFailure::new(
+            RollingArmRefusal::Disabled,
+            false,
+            false,
+        ));
+    }
+    let Some(oauth) = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+    else {
+        // Third-party names the why-not and stops; an OAuth account keeps the
+        // re-login tail, where the same login IS the recovery.
+        let refusal = if crate::claude::has_own_inference_endpoint(&profile) {
+            RollingArmRefusal::NoChainThirdParty
+        } else {
+            RollingArmRefusal::NoChainOauth
+        };
+        return Err(RollingArmFailure::new(refusal, false, false));
+    };
+    // A standing quarantine is checked BEFORE anything destructive runs: the
+    // arm below would only degrade-and-bail on a dead chain, and by then the
+    // mis-fill pre-clear would have removed the sidecar — leaving the profile
+    // with nothing at all, which is worse than the disengaged mis-fill it
+    // started in.
+    if state.is_auth_broken(name) {
+        return Err(RollingArmFailure::new(
+            RollingArmRefusal::Quarantined(crate::oauth::dead_chain_sentence(Some(&profile), name)),
+            false,
+            false,
+        ));
+    }
+    // A chain captured without `user:profile`/`subscriptionType` mints bearers
+    // that still authenticate but may not unlock plan-gated models — warn
+    // rather than refuse, since the roll is otherwise correct.
+    let plan_capable = oauth
+        .scopes
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
+        && oauth.subscription_type.is_some();
+    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
+    // operator intent — the evidence still goes to quarantine first.
+    let quarantined_misfill = crate::claude::quarantine_misfilled_sidecar(name)
+        .map_err(|e| RollingArmFailure::open(e, !plan_capable, false))?;
+    let is_active = state.active_profile.as_ref() == Some(name);
+    let was_rolling = profile.rolling_token;
+    let handle: ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    }));
+    Ok(RollingPreArm {
+        plan_incapable: !plan_capable,
+        quarantined_misfill,
+        active: is_active,
+        handle,
+        was_rolling,
+        name: name.clone(),
+    })
+}
+
+/// The arm half of the shared rolling-token switch: everything the base CLI
+/// did AFTER its macOS bare-item settle — the flag persist, the arm, the
+/// report-time classification and the rollback on failure. Takes the
+/// pre-arm half's fresh read ([`RollingPreArm`]); the caller settles the
+/// bare item BETWEEN the halves (the placement is thread-local and guards
+/// the live install's write, which each caller runs after the report).
+pub(crate) fn arm_rolling_token(
+    pre: RollingPreArm,
+    refresher: impl Fn(
+        &str,
+        Option<&str>,
+    )
+        -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError>,
+) -> std::result::Result<RollingArmReport, RollingArmFailure> {
+    let RollingPreArm {
+        plan_incapable,
+        quarantined_misfill,
+        active,
+        handle,
+        was_rolling,
+        name,
+    } = pre;
+    // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
+    // a failed report. Persist-after was wrong twice over: the gate's refresh
+    // leg stamps the sidecar through the rotation hook, and that hook is
+    // FLAG-GATED — arming with the flag still false made the very refresh the
+    // arm triggered stamp nothing — and a CLI reader walking away at the
+    // report would leave an armed rolling bearer with no flag and nothing
+    // ever re-stamping it. Rollback-on-failure keeps both invariants: the arm
+    // runs with the flag it needs, and a non-zero exit from the arm leaves
+    // the flag exactly as it was found. The in-memory mirror flips only AFTER
+    // the write lands: flipped first, a failed save leaves the handle lying
+    // until an unrelated save makes the lie durable.
+    match crate::profile::update_profile_config(&name, |p| {
+        p.rolling_token = true;
+        Ok(())
+    }) {
+        Ok(Some(_)) => {
+            if let Ok(mut cfg) = handle.lock()
+                && let Some(profile) = cfg.find_mut(&name)
+            {
+                profile.rolling_token = true;
+            }
+        }
+        // The account left the roster between the pre-arm read and the write:
+        // the flag never landed, so there is nothing for the arm to run on —
+        // a typed refusal, never a success that nothing will re-stamp.
+        Ok(None) => {
+            return Err(RollingArmFailure::new(
+                RollingArmRefusal::GoneFromRoster,
+                plan_incapable,
+                quarantined_misfill,
+            ));
+        }
+        Err(e) => {
+            return Err(RollingArmFailure::open(
+                e,
+                plan_incapable,
+                quarantined_misfill,
+            ));
+        }
+    }
+    let outcome = crate::oauth::arm_rolling_token(&handle, &name, refresher)
+        .map_err(|e| match e {
+            crate::oauth::RollingArmError::NothingArmed => RollingArmRefusal::NothingArmed,
+            crate::oauth::RollingArmError::Broken => RollingArmRefusal::Broken,
+            crate::oauth::RollingArmError::Transient(t) => RollingArmRefusal::Transient(t),
+            crate::oauth::RollingArmError::Stopping => RollingArmRefusal::Stopping,
+        })
+        .and_then(|()| {
+            // Re-read under the handle: the gate marks a terminally dead chain
+            // `auth_broken` on its way to degrading, and that is what separates
+            // "nothing to retry" from "the daemon will get it".
+            let chain_is_broken = handle
+                .lock()
+                .ok()
+                .is_some_and(|c| c.state.auth_broken.contains(&name));
+            classify_armed_sidecar(&name, chain_is_broken)
+        });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            let rollback_stranded = if !was_rolling {
+                match crate::profile::update_profile_config(&name, |p| {
+                    p.rolling_token = false;
+                    Ok(())
+                }) {
+                    // `Ok(None)`: the account left the roster, so there is
+                    // nothing left to roll back — the flag is gone with it.
+                    Ok(Some(_)) | Ok(None) => {
+                        if let Ok(mut cfg) = handle.lock()
+                            && let Some(profile) = cfg.find_mut(&name)
+                        {
+                            profile.rolling_token = false;
+                        }
+                        None
+                    }
+                    Err(save_err) => Some(save_err),
+                }
+            } else {
+                None
+            };
+            return Err(RollingArmFailure {
+                refusal,
+                rollback_stranded,
+                plan_incapable,
+                quarantined_misfill,
+            });
+        }
+    };
+    Ok(RollingArmReport {
+        outcome,
+        plan_incapable,
+        quarantined_misfill,
+        active,
+    })
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/actions.rs"]
 mod tests;

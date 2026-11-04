@@ -2578,11 +2578,11 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     // overrides, no custom env, holding OAuth credentials): auto-start in the
     // second slot, the alias overrides collapsed behind `ModelOverrideAdd`,
     // the effort row right below the model block, no env rows, then the
-    // login/delete-creds/disabled/delete action tail. A future reorder of
-    // `config_rows`' row-construction (the `rows.push(...)` builder) reds
-    // here; a match-arm reorder elsewhere is unobservable at runtime and isn't
-    // what this test guards. The per-account day list is NOT here: it lives on
-    // the Fallback tab's member card.
+    // login/delete-creds/rolling-token-switch/disabled/delete action tail. A
+    // future reorder of `config_rows`' row-construction (the `rows.push(...)`
+    // builder) reds here; a match-arm reorder elsewhere is unobservable at
+    // runtime and isn't what this test guards. The per-account day list is NOT
+    // here: it lives on the Fallback tab's member card.
     assert_eq!(
         rows,
         [
@@ -2596,6 +2596,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
             ConfigRow::EnvAdd,
             ConfigRow::Login,
             ConfigRow::DeleteCreds,
+            ConfigRow::RollingTokenSwitch,
             ConfigRow::Disabled,
             ConfigRow::Delete,
         ],
@@ -12551,20 +12552,59 @@ fn page_movers_clamp_at_the_edges() {
     use super::{page_down_cursor_by_rows, page_up_cursor_by_rows};
 
     // Empty starts: both return 0.
-    assert_eq!(page_down_cursor_by_rows(0, &[], &[], 10, 0, 0), 0);
+    assert_eq!(page_down_cursor_by_rows(0, &[], &[], &[], 10, 0, 0), 0);
     assert_eq!(page_up_cursor_by_rows(0, &[], &[], &[], 10, 0, 0), 0);
 
     // One row: page down stays at 0, page up stays at 0.
-    assert_eq!(page_down_cursor_by_rows(0, &[0], &[1], 10, 0, 1), 0);
+    assert_eq!(page_down_cursor_by_rows(0, &[0], &[1], &[0], 10, 0, 1), 0);
     assert_eq!(page_up_cursor_by_rows(0, &[0], &[1], &[0], 10, 0, 1), 0);
 
     // A cursor past the published starts behaves like the last row (no panic).
     let starts = [0usize, 4, 8];
     let ends = [4usize, 8, 12];
-    assert_eq!(page_down_cursor_by_rows(9, &starts, &ends, 4, 0, 12), 2);
+    assert_eq!(
+        page_down_cursor_by_rows(9, &starts, &ends, &[0, 0, 0], 4, 0, 12),
+        2
+    );
     assert_eq!(
         page_up_cursor_by_rows(9, &starts, &ends, &[0, 0, 0], 4, 0, 12),
         1
+    );
+}
+
+/// A page-down landing whose tooltip outgrows the departing one (the focused
+/// row's tooltip leaves with the cursor, the landing row's arrives) reads a
+/// taller layout at the draw, so its follow pushes past the line that held the
+/// old bottom content. The walk-back re-predicts against that layout and stops
+/// at the last landing that redraws the old bottom line; a list with no
+/// tooltips keeps the old behaviour.
+#[test]
+fn page_down_walks_back_onto_the_old_bottom_line() {
+    use super::page_down_cursor_by_rows;
+    // The Setup card's geometry at 60x16 with the cursor on row 5
+    // (`+ model override`, 2-line tooltip) and row 10 (`switch to a rolling
+    // token`, 4-line tooltip) one page below.
+    let starts = [2usize, 3, 4, 5, 6, 9, 12, 15, 16, 17, 18, 19, 20];
+    let ends = [3usize, 6, 7, 8, 9, 12, 17, 16, 18, 19, 23, 22, 24];
+    let tips = [0usize, 2, 2, 2, 0, 2, 2, 0, 1, 1, 4, 2, 3];
+    assert_eq!(
+        page_down_cursor_by_rows(5, &starts, &ends, &tips, 10, 4, 21),
+        9
+    );
+    assert_eq!(
+        page_down_cursor_by_rows(5, &starts, &ends, &[], 10, 4, 21),
+        10
+    );
+    // The departing tooltip lifts the landing block; unshifted, the walk-back
+    // stops a row short.
+    assert_eq!(
+        page_down_cursor_by_rows(0, &[0, 2, 3], &[2, 6, 8], &[1, 3, 4], 4, 0, 4),
+        2
+    );
+    // The departing tooltip leaves the total the follow clamps against.
+    assert_eq!(
+        page_down_cursor_by_rows(0, &[2, 5, 6], &[5, 10, 10], &[2, 4, 3], 6, 0, 7),
+        2
     );
 }
 
@@ -61302,6 +61342,12 @@ fn a_refused_divergence_capture_keeps_the_active_link() {
 enum FakeSettle {
     Settled,
     Ask(crate::claude::BareItemUnplaced),
+    /// A settle whose carry saved the item's login into an owner: the notice
+    /// a real settle shows and the owner itself.
+    Noticed {
+        notice: &'static str,
+        saved_into: crate::profile::ProfileName,
+    },
     /// A settle that fails with a two-link cause chain.
     Fail,
     /// A settle whose worker panics.
@@ -61375,6 +61421,13 @@ fn fake_settle(
             return Err(anyhow::anyhow!("connection refused").context("saving the login into b"));
         }
         Some(FakeSettle::Ask(unplaced)) => crate::claude::BareItemSettle::NeedsChoice(unplaced),
+        Some(FakeSettle::Noticed { notice, saved_into }) => {
+            crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled {
+                notice: Some(notice.to_string()),
+                saved_into: Some(saved_into),
+                placed: None,
+            })
+        }
         Some(FakeSettle::Gated(gate)) => {
             gate.hold();
             crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled::default())
@@ -66572,4 +66625,1578 @@ mod effort_row {
             "duplicate_profile copies the effort"
         );
     }
+}
+
+// ── `switch to a rolling token` row ─────────────────────────────────────────
+
+/// The five scopes a browser login stores, joined the way the token endpoint
+/// returns them.
+const C5B_SCOPES: [&str; 5] = [
+    "user:inference",
+    "user:profile",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+
+/// A plan-capable usage chain (every scope, `max` stamp, a refresh token, a
+/// day of life left).
+fn c5b_chain() -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "chain-access".to_string(),
+            refresh_token: Some("chain-refresh".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: Some(C5B_SCOPES.iter().map(|s| s.to_string()).collect()),
+            subscription_type: Some("max".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The test refresher the row's worker calls instead of the token endpoint.
+fn c5b_refresher(
+    _refresh: &str,
+    _scopes: Option<&str>,
+) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+    Ok(crate::oauth::TokenResponse {
+        access_token: "rolled-access".to_string(),
+        refresh_token: "rolled-refresh".to_string(),
+        expires_in: 28_800,
+        scope: Some(C5B_SCOPES.join(" ")),
+    })
+}
+
+/// Write a ROLLING sidecar by hand: no refresh token, a subscription stamp
+/// (`claude::sidecar_kind_of` classifies it `Rolling`).
+fn seed_rolling_sidecar(name: &str) {
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile");
+    let mut creds = c5b_chain();
+    if let Some(oauth) = creds.claude_ai_oauth.as_mut() {
+        oauth.access_token = "rolling-access".to_string();
+        oauth.refresh_token = None;
+    }
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds).expect("serialize sidecar"),
+    )
+    .expect("write sidecar");
+}
+
+fn c5b_index(rows: &[super::ConfigRow], row: super::ConfigRow) -> Option<usize> {
+    rows.iter().position(|r| *r == row)
+}
+
+/// Where the row sits and when it shows: directly above `clear long-lived
+/// token`, on any account holding a usage OAuth chain; gone once the sidecar
+/// holds a rolling token (`t` re-stamps it from then on); still there when the
+/// flag is set over a static mint or no sidecar at all (a retry); never on an
+/// account with no chain.
+#[test]
+fn config_rows_rolling_switch_sits_above_the_clear_row_and_hides_once_rolling() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = None;
+
+    // A chain, no long-lived piece: no clear row, so the switch sits where it
+    // would be, right above `disable account`.
+    let rows = config_rows(&app);
+    let at = c5b_index(&rows, ConfigRow::RollingTokenSwitch).expect("a chain shows the row");
+    assert_eq!(rows.get(at + 1), Some(&ConfigRow::Disabled), "{rows:?}");
+
+    // A static mint: the clear row appears, the switch right above it.
+    seed_session_token("acct", None);
+    let rows = config_rows(&app);
+    let at = c5b_index(&rows, ConfigRow::RollingTokenSwitch).expect("a mint keeps the row");
+    assert_eq!(
+        rows.get(at + 1),
+        Some(&ConfigRow::ClearSessionToken),
+        "{rows:?}"
+    );
+
+    // Flag set over the static mint (an arm that kept the mint): still offered.
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("acct"))
+            .expect("acct")
+            .rolling_token = true;
+    }
+    assert!(
+        config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "a flag over a static mint is a retry, so the row stays"
+    );
+
+    // The sidecar holds a rolling token: hidden, flag or no flag.
+    seed_rolling_sidecar("acct");
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "a rolling sidecar hides the row"
+    );
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("acct"))
+            .expect("acct")
+            .rolling_token = false;
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "a rolling sidecar hides the row with the flag down too"
+    );
+
+    // Flag set with no sidecar at all (an arm whose sidecar write never
+    // landed): still offered, a retry like the static-mint case.
+    let dir = crate::profile::profile_dir(&ProfileName::from("acct")).expect("profile dir");
+    std::fs::remove_file(dir.join("session-token.json")).expect("drop the sidecar");
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("acct"))
+            .expect("acct")
+            .rolling_token = true;
+    }
+    assert!(
+        config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "a flag with no sidecar is a retry, so the row stays"
+    );
+
+    // No chain at all: logged out, or an api-key account.
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("acct"))
+            .expect("acct")
+            .credentials = None;
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "no chain, nothing to roll from"
+    );
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("acct"))
+            .expect("acct")
+            .rolling_token = false;
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "no chain with the flag down, nothing to roll from"
+    );
+    {
+        let mut cfg = app.config();
+        let p = cfg.find_mut(&ProfileName::from("acct")).expect("acct");
+        p.set_base_url(Some("https://api.example.test".to_string()));
+        p.api_key = Some("sk-test".to_string());
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "an api-key account with no chain gets no row"
+    );
+}
+
+/// The first press only arms: nothing written, no worker, no toast.
+#[test]
+fn rolling_switch_first_press_only_arms() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::RollingTokenSwitch),
+        "the first press arms this row"
+    );
+    assert_eq!(app.rolling_switch, None, "arming starts no worker");
+    assert!(app.toasts.is_empty(), "arming alone must not toast");
+    let sidecar = crate::profile::profile_dir(&ProfileName::from("acct"))
+        .expect("profile dir")
+        .join("session-token.json");
+    assert!(!sidecar.exists(), "arming writes nothing");
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "arming sets no flag"
+    );
+}
+
+/// The confirmed press runs the arm off the UI thread; the drain lands the
+/// success toast (idle account, no daemon in the sandbox), the flag
+/// and a rolling sidecar on disk, and clears the arm and the in-flight mark.
+#[test]
+fn rolling_switch_second_press_arms_the_sidecar_and_toasts_the_switch() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "the confirm disarms the row"
+    );
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        app.rolling_switch, None,
+        "the drain clears the in-flight mark"
+    );
+    assert!(
+        crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "the flag is on disk"
+    );
+    let (kind, _) =
+        crate::claude::sidecar_summary(&ProfileName::from("acct")).expect("a readable sidecar");
+    assert_eq!(kind, crate::claude::SidecarKind::Rolling);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n5 scopes, plan max · installs on the next \
+             switch · no daemon runs, so nothing re-stamps it"
+                .to_string()
+        ]
+    );
+    assert!(toast_bodies_of(&app, super::ToastKind::Danger).is_empty());
+}
+
+/// A dead (quarantined) login is the dim gate: both presses are inert, as on
+/// `clear long-lived token`'s gate.
+#[test]
+fn rolling_switch_is_inert_on_a_quarantined_login() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_refresher;
+    {
+        // In memory and on disk, the way the quarantine writer leaves it.
+        let mut cfg = app.config();
+        cfg.state.auth_broken.push(ProfileName::from("acct"));
+        crate::profile::save_app_state(&cfg.state).expect("persist the quarantine");
+    }
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "a gated row must not arm"
+    );
+    assert_eq!(app.rolling_switch, None, "a gated row starts no worker");
+    assert!(app.toasts.is_empty(), "a gated row stays silent");
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token
+    );
+}
+
+/// The worker judges the account off DISK, never the render snapshot: a chain
+/// gone from disk since the last reload refuses with the CLI's own sentence,
+/// and the flag the arm set rolls back.
+#[test]
+fn rolling_switch_refuses_off_the_disk_login_and_rolls_the_flag_back() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // On disk: no login at all. In memory: a chain (a stale snapshot).
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut stale = acct.clone();
+    stale.credentials = Some(c5b_chain());
+    let mut app = app_with(vec![stale]);
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![crate::tui::render::prose::mark_commands(
+            "switch failed\n'acct' has no usage OAuth chain to roll from; run `clauth login \
+             acct` first"
+        )]
+    );
+    assert!(toast_bodies_of(&app, super::ToastKind::Success).is_empty());
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "no flag left behind"
+    );
+    assert_eq!(app.rolling_switch, None);
+}
+
+/// One switch at a time, and a quit waits for the running one.
+#[test]
+fn a_running_rolling_switch_refuses_a_second_and_holds_the_quit() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    // A switch already in flight.
+    app.rolling_switch = Some(ProfileName::from("acct"));
+    assert!(
+        super::in_flight_exit_write(&app),
+        "a running switch holds the quit"
+    );
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["a rolling-token switch is still running\nwait for it, then try again".to_string()]
+    );
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "the refused press wrote nothing"
+    );
+}
+
+// ── `switch to a rolling token` toast composition ───────────────────────────
+
+/// The mint-kept outcome's own success copy: the flag is on, the sessions
+/// stay on the setup token, and the daemon is what closes the gap.
+#[test]
+fn a_mint_kept_switch_toasts_the_flagged_rollback_free_copy() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::MintKept,
+        plan_incapable: false,
+        quarantined_misfill: false,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "rolling token set for 'acct'\nits login could not be read just now · sessions \
+             stay on the setup token until the daemon re-stamps"
+                .to_string()
+        ]
+    );
+}
+
+/// A chain without the plan scope gets the warning toast BESIDE the success
+/// toast, both pinned by equality.
+#[test]
+fn a_plan_incapable_switch_adds_the_warning_toast_beside_the_success() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec!["user:inference".to_string(), "user:profile".to_string()],
+            plan: Some("max".to_string()),
+            daemon: crate::daemon::DaemonHealth::Absent,
+        },
+        plan_incapable: true,
+        quarantined_misfill: false,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec![
+            "'acct' login lacks the plan scope\nrolling tokens may not unlock plan models · \
+             a browser re-login fixes it"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n2 scopes, plan max · installs on the next \
+             switch · no daemon runs, so nothing re-stamps it"
+                .to_string()
+        ]
+    );
+}
+
+/// A mis-filled sidecar quarantined before the arm appends its own clause to
+/// the success detail.
+#[test]
+fn a_switch_that_quarantined_a_misfill_says_so_in_the_detail() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec!["user:inference".to_string()],
+            plan: Some("pro".to_string()),
+            daemon: crate::daemon::DaemonHealth::Absent,
+        },
+        plan_incapable: false,
+        quarantined_misfill: true,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n1 scope, plan pro · installs on the next \
+             switch · no daemon runs, so nothing re-stamps it · a mis-filled token was \
+             quarantined first"
+                .to_string()
+        ]
+    );
+}
+
+/// The active account's success detail names the live install, and a fresh
+/// daemon the re-stamp promise.
+#[test]
+fn an_active_accounts_switch_names_the_live_install_and_the_fresh_daemon() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+                "user:mcp_servers".to_string(),
+            ],
+            plan: None,
+            daemon: crate::daemon::DaemonHealth::Fresh,
+        },
+        plan_incapable: false,
+        quarantined_misfill: false,
+        active: true,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n3 scopes · installed live · the daemon \
+             re-stamps it"
+                .to_string()
+        ]
+    );
+}
+
+/// A resumed (held) switch enters the user's placement: the modal's Replace
+/// answer hands the worker the placement the settle bought, the arm runs on
+/// that thread with the placement guarding its writes, and the flag lands.
+#[test]
+fn a_held_rolling_switch_resumes_into_the_placement_and_arms_once() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("acct")),
+        profiles: vec![ProfileName::from("acct")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("persist the active marker");
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some(ProfileName::from("acct"));
+    app.rolling_switch_refresher = c5b_refresher;
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    // Press twice: the worker's settle asks, the switch holds.
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::UseRollingToken(ref name) if name.as_str() == "acct"
+    ));
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "a held switch has armed nothing"
+    );
+
+    // Answer Replace: the placement the answer bought must guard the
+    // resumed worker's writes.
+    *super::BARE_ITEM_PLACEMENTS.lock().unwrap() = Some((unsaved_item(), Vec::new()));
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    super::drain_rolling_switch(&mut app);
+
+    let seen = super::BARE_ITEM_PLACEMENTS
+        .lock()
+        .unwrap()
+        .take()
+        .map(|(_, seen)| seen)
+        .unwrap_or_default();
+    assert_eq!(seen.len(), 1, "the resumed worker entered the placement");
+    assert_ne!(
+        seen[0].0,
+        std::thread::current().id(),
+        "the placement was entered on the worker thread"
+    );
+    assert!(seen[0].1, "the placement lets the guard replace the item");
+    assert_eq!(SETTLE_THREADS.lock().unwrap().len(), 1, "no second settle");
+    assert!(
+        crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "the flag landed"
+    );
+    let (kind, _) =
+        crate::claude::sidecar_summary(&ProfileName::from("acct")).expect("a readable sidecar");
+    assert_eq!(kind, crate::claude::SidecarKind::Rolling);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success).len(),
+        1,
+        "the arm ran once"
+    );
+}
+
+/// The refusal order: a no-chain account is refused BEFORE the settle runs,
+/// so a refused switch settles nothing (the fake source counts the settles).
+#[test]
+fn a_no_chain_rolling_switch_is_refused_before_the_settle_runs() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // On disk: no login at all. In memory: a chain (a stale snapshot).
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("acct")),
+        profiles: vec![ProfileName::from("acct")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("persist the active marker");
+    let mut stale = acct.clone();
+    stale.credentials = Some(c5b_chain());
+    let mut app = app_with(vec![stale]);
+    app.config().state.active_profile = Some(ProfileName::from("acct"));
+    app.rolling_switch_refresher = c5b_refresher;
+    install_fake_source(&mut app, vec![FakeSettle::Settled]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert!(
+        SETTLE_THREADS.lock().unwrap().is_empty(),
+        "a refused switch settles nothing"
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![crate::tui::render::prose::mark_commands(
+            "switch failed\n'acct' has no usage OAuth chain to roll from; run `clauth login \
+             acct` first"
+        )]
+    );
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "no flag left behind"
+    );
+}
+
+/// A disabled account's row is inert on the press path too: both presses
+/// do nothing (no arm, no worker, no toast, no flag), the same gate the
+/// renderer dims on.
+#[test]
+fn rolling_switch_is_inert_on_a_disabled_account() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_chain());
+    acct.disabled = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "a gated row must not arm"
+    );
+    assert_eq!(app.rolling_switch, None, "a gated row starts no worker");
+    assert!(app.toasts.is_empty(), "a gated row stays silent");
+    assert!(
+        !crate::profile::load_profile(&ProfileName::from("acct"))
+            .expect("load")
+            .rolling_token,
+        "no flag"
+    );
+}
+
+/// The row keys on the CHAIN whatever the base url: a hybrid (base url +
+/// api key + usage chain) still shows it.
+#[test]
+fn a_base_url_hybrid_with_a_chain_still_shows_the_rolling_switch_row() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new(
+        "acct".to_string(),
+        Some("https://proxy.example/v1".to_string()),
+        Some("sk-proxy".to_string()),
+    );
+    acct.credentials = Some(c5b_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = None;
+
+    assert!(
+        config_rows(&app).contains(&ConfigRow::RollingTokenSwitch),
+        "a chain shows the row whatever the base url"
+    );
+}
+
+/// A relink that fails after the arm lands the success toast first, then
+/// the `relink failed` danger beside it (the clear row's precedent).
+#[test]
+fn a_relink_failure_adds_the_danger_toast_beside_the_success() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let name = ProfileName::from("acct");
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec!["user:inference".to_string()],
+            plan: Some("max".to_string()),
+            daemon: crate::daemon::DaemonHealth::Fresh,
+        },
+        plan_incapable: false,
+        quarantined_misfill: false,
+        active: true,
+    };
+    let relink = Err(anyhow::anyhow!("connection refused").context("saving the login into b"));
+    app.rolling_switch_tx
+        .send(super::RollingSwitchResult::Ran(
+            name.clone(),
+            super::RollingSwitchDone {
+                saved_into: None,
+                ran: Ok(super::RollingSwitchRan::Armed {
+                    report,
+                    relink: Some(relink),
+                }),
+            },
+        ))
+        .expect("post the worker result");
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n1 scope, plan max · installed live · the \
+             daemon re-stamps it"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["relink failed\nconnection refused · saving the login into b".to_string()]
+    );
+}
+
+/// A panicked rolling worker toasts the bare `switch failed` (a panic has
+/// no CLI sentence; the delete precedent) and clears the marker.
+#[test]
+fn a_panicked_rolling_worker_toasts_the_bare_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.rolling_switch = Some(crate::profile::ProfileName::from("acct"));
+    app.rolling_switch_tx
+        .send(super::RollingSwitchResult::Panicked)
+        .expect("post the panic");
+    super::drain_rolling_switch(&mut app);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec!["switch failed".to_string()]
+    );
+    assert_eq!(app.rolling_switch, None, "the marker clears");
+}
+
+/// The stale-daemon clause: the hedge a stale feed warrants, pinned by
+/// equality.
+#[test]
+fn a_stale_daemon_switch_names_the_hedged_clause() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec!["user:inference".to_string()],
+            plan: None,
+            daemon: crate::daemon::DaemonHealth::Stale,
+        },
+        plan_incapable: false,
+        quarantined_misfill: false,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n1 scope · installs on the next switch · \
+             the daemon feed looks stale, re-stamps may not land"
+                .to_string()
+        ]
+    );
+}
+
+/// Zero scopes and an empty plan drop the head: the detail starts with the
+/// install clause, no stray separator.
+#[test]
+fn an_empty_scope_list_and_plan_drop_the_detail_head() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::Armed {
+            scopes: vec![],
+            plan: None,
+            daemon: crate::daemon::DaemonHealth::Absent,
+        },
+        plan_incapable: false,
+        quarantined_misfill: false,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\ninstalls on the next switch · no daemon \
+             runs, so nothing re-stamps it"
+                .to_string()
+        ]
+    );
+}
+
+/// A failure whose rollback save failed lands the Warning toast with the
+/// CLI's stranded-rollback body beside the danger toast.
+#[test]
+fn a_stranded_rollback_failure_toasts_the_warning_beside_the_danger() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let name = ProfileName::from("acct");
+    let failure = crate::actions::RollingArmFailure {
+        refusal: crate::actions::RollingArmRefusal::Broken,
+        rollback_stranded: Some(anyhow::anyhow!("read-only file system")),
+        plan_incapable: false,
+        quarantined_misfill: false,
+    };
+    super::land_rolling_switch_failure(&mut app, &name, &failure, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![crate::tui::render::prose::mark_commands(
+            "switch failed\n'acct' usage chain is dead. Run `clauth login acct` first, \
+             then re-run"
+        )]
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec![crate::tui::render::prose::mark_commands(
+            "could not roll the rolling-token flag back for \
+             'acct' (read-only file system). Once ~/.clauth is writable, run \
+             `clauth static-token acct` to clear it"
+        )]
+    );
+}
+
+/// `acct` on `credentials`, saved and active on disk and in the app, its Setup
+/// row ready to press: the settle gate reads the active marker off disk.
+fn c5b_active_app(credentials: crate::profile::ClaudeCredentials) -> App {
+    use super::build_draft_existing;
+    use crate::profile::{AppState, Profile, ProfileName};
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(credentials);
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("acct")),
+        profiles: vec![ProfileName::from("acct")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("persist the active marker");
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some(ProfileName::from("acct"));
+    app.rolling_switch_refresher = c5b_refresher;
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+    app
+}
+
+/// A plan-capable chain inside the gate's refresh grace, so the arm calls the
+/// refresher instead of stamping from the stored token.
+fn c5b_expiring_chain() -> crate::profile::ClaudeCredentials {
+    let mut credentials = c5b_chain();
+    if let Some(oauth) = credentials.claude_ai_oauth.as_mut() {
+        oauth.access_token = "chain-expiring".to_string();
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 60_000);
+    }
+    credentials
+}
+
+/// A refresher that fails the arm after the precheck, so the failure path
+/// carries whatever the precheck and the settle learned.
+fn c5b_failing_refresher(
+    _refresh: &str,
+    _scopes: Option<&str>,
+) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+    Err(crate::oauth::RefreshError::Transient(
+        crate::oauth::TokenFailure::Transport,
+    ))
+}
+
+/// The settle's carry notice as `bare_item_saved_line` composes it for `acct`.
+const C5B_NOTICE: &str = "saved the Keychain login Claude Code wrote into acct";
+
+/// Every toast body in the order the app holds them.
+fn all_toast_bodies(app: &App) -> Vec<String> {
+    app.toasts.iter().map(|t| t.body.clone()).collect()
+}
+
+/// Post one finished rolling worker's result straight to the drain, the way
+/// the worker's `tx.send` does.
+fn c5b_post_rolling_result(
+    app: &mut App,
+    ran: Result<super::RollingSwitchRan, crate::actions::RollingArmFailure>,
+) {
+    app.rolling_switch_tx
+        .send(super::RollingSwitchResult::Ran(
+            crate::profile::ProfileName::from("acct"),
+            super::RollingSwitchDone {
+                saved_into: Some(crate::profile::ProfileName::from("acct")),
+                ran,
+            },
+        ))
+        .expect("post the worker result");
+}
+
+/// The rolling worker's own settle hands its carry notice to the UI thread,
+/// and the drain leads the success toast's detail with it, dropping the
+/// scope/plan count and the fresh-daemon clause so the toast fits its rows.
+#[test]
+fn a_rolling_settle_notice_rides_the_success_toast() {
+    use super::{ConfigRow, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = c5b_active_app(c5b_chain());
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Noticed {
+            notice: C5B_NOTICE,
+            saved_into: crate::profile::ProfileName::from("acct"),
+        }],
+    );
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert!(
+        !all_toast_bodies(&app).iter().any(|b| b == C5B_NOTICE),
+        "the notice has no toast of its own: {:?}",
+        all_toast_bodies(&app)
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\nKeychain login saved into acct · installed \
+             live · no daemon to re-stamp it"
+                .to_string()
+        ]
+    );
+}
+
+/// A settle's carry notice survives a switch that fails after it: the failure
+/// toast's head names the saved login, the sentence stays below it.
+#[test]
+fn a_rolling_settle_notice_rides_the_failure_toast() {
+    use super::{ConfigRow, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = c5b_active_app(c5b_expiring_chain());
+    app.rolling_switch_refresher = c5b_failing_refresher;
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Noticed {
+            notice: C5B_NOTICE,
+            saved_into: crate::profile::ProfileName::from("acct"),
+        }],
+    );
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert!(
+        !all_toast_bodies(&app).iter().any(|b| b == C5B_NOTICE),
+        "the notice has no toast of its own: {:?}",
+        all_toast_bodies(&app)
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Danger),
+        vec![
+            "switch failed · Keychain login saved into acct\ncould not reach anthropic: \
+             check your connection and retry"
+                .to_string()
+        ]
+    );
+}
+
+/// Each toast's rows as the renderer lays them out at the widest content
+/// budget (57 cells).
+fn c5b_rendered_rows(app: &App) -> Vec<Vec<String>> {
+    app.toasts
+        .iter()
+        .map(|toast| {
+            crate::tui::render::toasts::toast_rows(toast, 57)
+                .iter()
+                .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+                .collect()
+        })
+        .collect()
+}
+
+/// The outcome toasts that carry a saved login draw whole at the
+/// 57-cell budget with a 12-cell account name, one warning clause included;
+/// the two-warning armed toast may cut its last clause, never the owner.
+#[test]
+fn every_rolling_outcome_with_a_saved_login_draws_uncut() {
+    const LONG: &str = "work-account";
+    let post =
+        |app: &mut App, ran: Result<super::RollingSwitchRan, crate::actions::RollingArmFailure>| {
+            app.rolling_switch_tx
+                .send(super::RollingSwitchResult::Ran(
+                    crate::profile::ProfileName::from(LONG),
+                    super::RollingSwitchDone {
+                        saved_into: Some(crate::profile::ProfileName::from(LONG)),
+                        ran,
+                    },
+                ))
+                .expect("post the worker result");
+        };
+    let armed = |outcome, active| {
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome,
+                plan_incapable: false,
+                quarantined_misfill: false,
+                active,
+            },
+            relink: None,
+        })
+    };
+    let armed_misfill = |outcome, active| {
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome,
+                plan_incapable: false,
+                quarantined_misfill: true,
+                active,
+            },
+            relink: None,
+        })
+    };
+    let five_scopes = |daemon| crate::actions::RollingArmOutcome::Armed {
+        scopes: (1..=5).map(|n| format!("scope:{n}")).collect(),
+        plan: Some("max".to_string()),
+        daemon,
+    };
+    // (worker result, whether the whole toast fits uncut)
+    let outcomes: Vec<(
+        Result<super::RollingSwitchRan, crate::actions::RollingArmFailure>,
+        bool,
+    )> = vec![
+        (
+            armed(five_scopes(crate::daemon::DaemonHealth::Fresh), true),
+            true,
+        ),
+        (
+            armed(five_scopes(crate::daemon::DaemonHealth::Fresh), false),
+            true,
+        ),
+        (
+            armed(crate::actions::RollingArmOutcome::MintKept, false),
+            true,
+        ),
+        (
+            Err(crate::actions::RollingArmFailure::open(
+                anyhow::anyhow!("could not reach anthropic: check your connection and retry"),
+                false,
+                false,
+            )),
+            true,
+        ),
+        (
+            armed(five_scopes(crate::daemon::DaemonHealth::Absent), true),
+            true,
+        ),
+        (
+            armed(five_scopes(crate::daemon::DaemonHealth::Absent), false),
+            true,
+        ),
+        (
+            armed(five_scopes(crate::daemon::DaemonHealth::Stale), false),
+            true,
+        ),
+        (
+            armed_misfill(five_scopes(crate::daemon::DaemonHealth::Fresh), true),
+            true,
+        ),
+        (
+            armed_misfill(five_scopes(crate::daemon::DaemonHealth::Fresh), false),
+            true,
+        ),
+        (
+            armed_misfill(five_scopes(crate::daemon::DaemonHealth::Stale), false),
+            false,
+        ),
+    ];
+    for (ran, uncut) in outcomes {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(vec![]);
+        post(&mut app, ran);
+        super::drain_rolling_switch(&mut app);
+        let rows = c5b_rendered_rows(&app);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let toast = &rows[0];
+        let joined = toast.join(" ");
+        if uncut {
+            assert!(!joined.contains('…'), "nothing is cut: {toast:?}");
+        }
+        assert!(
+            joined.contains(&format!("into {LONG}")),
+            "the saved login's owner shows before any cut: {toast:?}"
+        );
+    }
+}
+
+/// The account a settle saved the login into is its own fact, not the
+/// switch target: switching `b` while the login went into `a` names `a` in
+/// the notice and `b` in the head, on every outcome.
+#[test]
+fn a_saved_login_names_its_owner_not_the_switched_account() {
+    let post =
+        |app: &mut App, ran: Result<super::RollingSwitchRan, crate::actions::RollingArmFailure>| {
+            app.rolling_switch_tx
+                .send(super::RollingSwitchResult::Ran(
+                    crate::profile::ProfileName::from("b"),
+                    super::RollingSwitchDone {
+                        saved_into: Some(crate::profile::ProfileName::from("a")),
+                        ran,
+                    },
+                ))
+                .expect("post the worker result");
+        };
+    let armed = |outcome| {
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome,
+                plan_incapable: false,
+                quarantined_misfill: false,
+                active: true,
+            },
+            relink: None,
+        })
+    };
+    let cases: Vec<(
+        Result<super::RollingSwitchRan, crate::actions::RollingArmFailure>,
+        &str,
+    )> = vec![
+        (
+            armed(crate::actions::RollingArmOutcome::Armed {
+                scopes: vec!["user:inference".to_string()],
+                plan: Some("max".to_string()),
+                daemon: crate::daemon::DaemonHealth::Fresh,
+            }),
+            "switched 'b' to a rolling token\nKeychain login saved into a · installed live",
+        ),
+        (
+            armed(crate::actions::RollingArmOutcome::MintKept),
+            "rolling token set for 'b'\nits login could not be read just now · Keychain login \
+             saved into a",
+        ),
+        (
+            Err(crate::actions::RollingArmFailure::open(
+                anyhow::anyhow!("disk full"),
+                false,
+                false,
+            )),
+            "switch failed · Keychain login saved into a\ndisk full",
+        ),
+    ];
+    for (ran, want) in cases {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(vec![]);
+        post(&mut app, ran);
+        super::drain_rolling_switch(&mut app);
+        assert_eq!(all_toast_bodies(&app), vec![want.to_string()]);
+    }
+}
+
+/// The accepted bound's floor: on a 60-column terminal (a 53-cell budget) a
+/// 4-cell owner and switch name draw every single-warning saved-login toast
+/// uncut. Longer names cut a warning clause's tail by design; this pin keeps
+/// the bound from shrinking further.
+#[test]
+fn a_short_name_draws_every_single_warning_toast_uncut_at_sixty_columns() {
+    let armed = |daemon, quarantined_misfill, active| {
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome: crate::actions::RollingArmOutcome::Armed {
+                    scopes: vec!["user:inference".to_string()],
+                    plan: Some("max".to_string()),
+                    daemon,
+                },
+                plan_incapable: false,
+                quarantined_misfill,
+                active,
+            },
+            relink: None,
+        })
+    };
+    use crate::daemon::DaemonHealth::{Absent, Fresh, Stale};
+    let shapes = vec![
+        armed(Absent, false, true),
+        armed(Absent, false, false),
+        armed(Stale, false, true),
+        armed(Stale, false, false),
+        armed(Fresh, true, true),
+        armed(Fresh, true, false),
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome: crate::actions::RollingArmOutcome::MintKept,
+                plan_incapable: false,
+                quarantined_misfill: false,
+                active: false,
+            },
+            relink: None,
+        }),
+    ];
+    for ran in shapes {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(vec![]);
+        c5b_post_rolling_result(&mut app, ran);
+        super::drain_rolling_switch(&mut app);
+        let toast = app.toasts.back().expect("the outcome toast");
+        let rows: Vec<String> = crate::tui::render::toasts::toast_rows(toast, 53)
+            .iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert!(!rows.join(" ").contains('…'), "nothing is cut: {rows:?}");
+    }
+}
+
+/// A transient refusal reads in the toast as every TUI toast reads a
+/// transient, `text()` without the HTTP status; the CLI keeps the status.
+#[test]
+fn a_transient_switch_failure_toast_omits_the_http_status() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let transient = crate::oauth::TokenFailure::Status(503).as_refresh_transient();
+    let want = format!("switch failed\n{}", transient.text());
+    assert!(!want.contains("HTTP"), "{want}");
+    app.rolling_switch_tx
+        .send(super::RollingSwitchResult::Ran(
+            crate::profile::ProfileName::from("acct"),
+            super::RollingSwitchDone {
+                saved_into: None,
+                ran: Err(crate::actions::RollingArmFailure::new(
+                    crate::actions::RollingArmRefusal::Transient(transient),
+                    false,
+                    false,
+                )),
+            },
+        ))
+        .expect("post the worker result");
+    super::drain_rolling_switch(&mut app);
+    assert_eq!(all_toast_bodies(&app), vec![want]);
+}
+
+/// With a saved login, a stale daemon and a quarantined mis-fill, the
+/// armed detail reads notice, install, daemon, mis-fill, in that order.
+#[test]
+fn a_saved_login_leads_the_armed_detail_before_every_warning_clause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    c5b_post_rolling_result(
+        &mut app,
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome: crate::actions::RollingArmOutcome::Armed {
+                    scopes: vec!["user:inference".to_string(), "user:profile".to_string()],
+                    plan: Some("max".to_string()),
+                    daemon: crate::daemon::DaemonHealth::Stale,
+                },
+                plan_incapable: false,
+                quarantined_misfill: true,
+                active: false,
+            },
+            relink: None,
+        }),
+    );
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        all_toast_bodies(&app),
+        vec![
+            "switched 'acct' to a rolling token\nKeychain login saved into acct · installs on \
+             the next switch · daemon feed stale, re-stamps may not land · mis-filled token \
+             quarantined"
+                .to_string()
+        ]
+    );
+}
+
+/// The most crowded armed drain (plan warning, success, relink danger)
+/// keeps the settle's fact on screen: three toasts, the notice inside the
+/// success toast, nothing evicted by the toast cap.
+#[test]
+fn a_crowded_armed_drain_keeps_the_settle_notice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    c5b_post_rolling_result(
+        &mut app,
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome: crate::actions::RollingArmOutcome::Armed {
+                    scopes: vec!["user:inference".to_string()],
+                    plan: Some("max".to_string()),
+                    daemon: crate::daemon::DaemonHealth::Fresh,
+                },
+                plan_incapable: true,
+                quarantined_misfill: false,
+                active: true,
+            },
+            relink: Some(Err(anyhow::anyhow!("connection refused"))),
+        }),
+    );
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        all_toast_bodies(&app),
+        vec![
+            "'acct' login lacks the plan scope\nrolling tokens may not unlock plan models · \
+             a browser re-login fixes it"
+                .to_string(),
+            "switched 'acct' to a rolling token\nKeychain login saved into acct · installed live"
+                .to_string(),
+            "relink failed\nconnection refused".to_string(),
+        ]
+    );
+}
+
+/// The crowded mint-kept arm: plan warning, mis-fill warning and the kept-mint
+/// success, the notice inside the success toast.
+#[test]
+fn a_crowded_mint_kept_drain_keeps_the_settle_notice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    c5b_post_rolling_result(
+        &mut app,
+        Ok(super::RollingSwitchRan::Armed {
+            report: crate::actions::RollingArmReport {
+                outcome: crate::actions::RollingArmOutcome::MintKept,
+                plan_incapable: true,
+                quarantined_misfill: true,
+                active: false,
+            },
+            relink: None,
+        }),
+    );
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        all_toast_bodies(&app),
+        vec![
+            "'acct' login lacks the plan scope\nrolling tokens may not unlock plan models · \
+             a browser re-login fixes it"
+                .to_string(),
+            crate::actions::misfill_quarantined_body(&crate::profile::ProfileName::from("acct")),
+            "rolling token set for 'acct'\nits login could not be read just now · Keychain \
+             login saved into acct"
+                .to_string(),
+        ]
+    );
+}
+
+/// The crowded failure arm: mis-fill warning, failure and stranded-rollback
+/// warning, the notice inside the failure toast.
+#[test]
+fn a_crowded_failed_drain_keeps_the_settle_notice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    let mut failure =
+        crate::actions::RollingArmFailure::open(anyhow::anyhow!("disk full"), false, true);
+    failure.rollback_stranded = Some(anyhow::anyhow!("read-only file system"));
+    c5b_post_rolling_result(&mut app, Err(failure));
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        all_toast_bodies(&app),
+        vec![
+            crate::actions::misfill_quarantined_body(&crate::profile::ProfileName::from("acct")),
+            "switch failed · Keychain login saved into acct\ndisk full".to_string(),
+            super::prose::mark_commands(&crate::actions::rollback_stranded_warning_body(
+                "acct",
+                &anyhow::anyhow!("read-only file system")
+            )),
+        ]
+    );
+}
+
+/// A held switch's precheck quarantined a mis-filled sidecar before the
+/// settle: the resumed run folds that fact into its report, so the success
+/// toast still carries the mis-fill clause.
+#[test]
+fn a_held_switch_carries_the_misfill_quarantine_into_its_resume() {
+    use super::{BareItemWrite, ConfigRow, run_config_row};
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = c5b_active_app(c5b_chain());
+    seed_session_token("acct", Some("rotating"));
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+
+    // Press twice: the precheck quarantines the mis-fill, the settle asks,
+    // and the switch holds, having armed nothing.
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+    assert!(matches!(
+        held_write(&mut app),
+        BareItemWrite::UseRollingToken(ref name) if name.as_str() == "acct"
+    ));
+    let sidecar = crate::profile::profile_dir(&ProfileName::from("acct"))
+        .expect("profile dir")
+        .join("session-token.json");
+    assert!(!sidecar.exists(), "the mis-filled sidecar was quarantined");
+
+    // Answer Replace: the resumed run arms, and the success toast still names
+    // the quarantine the first run did.
+    super::handle_key(&mut app, key(KeyCode::Char('p')));
+    land_bare_item_answers(&mut app);
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "switched 'acct' to a rolling token\n5 scopes, plan max · installed live · \
+             no daemon runs, so nothing re-stamps it · a mis-filled token was quarantined \
+             first"
+                .to_string()
+        ]
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Warning).is_empty(),
+        "the success clause is the only report: no extra quarantine toast"
+    );
+}
+
+/// A mint-kept success has no clause to carry the fact: the quarantine still
+/// shows as the CLI's line beside the success toast.
+#[test]
+fn a_mint_kept_switch_with_a_quarantined_misfill_still_says_so() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    let report = crate::actions::RollingArmReport {
+        outcome: crate::actions::RollingArmOutcome::MintKept,
+        plan_incapable: false,
+        quarantined_misfill: true,
+        active: false,
+    };
+    super::land_rolling_switch_success(&mut app, &ProfileName::from("acct"), &report, None);
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec![
+            "'acct' had a mis-filled sidecar (a rotating pair). It was quarantined under \
+             the profile's quarantine/ dir before arming."
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Success),
+        vec![
+            "rolling token set for 'acct'\nits login could not be read just now · sessions \
+             stay on the setup token until the daemon re-stamps"
+                .to_string()
+        ]
+    );
+}
+
+/// Cancelling a held switch still reports the quarantine its precheck ran: the
+/// fact never reaches a success toast, so the CLI's mis-fill line shows as a
+/// warning.
+#[test]
+fn cancelling_a_held_switch_still_reports_the_misfill_quarantine() {
+    use super::{BareItemWrite, ConfigRow, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = c5b_active_app(c5b_chain());
+    seed_session_token("acct", Some("rotating"));
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(
+            crate::claude::BareItemUnplaced::UnknownAccount,
+        )],
+    );
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+    assert!(matches!(
+        held_write(&mut app),
+        BareItemWrite::UseRollingToken(ref name) if name.as_str() == "acct"
+    ));
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec![
+            "'acct' had a mis-filled sidecar (a rotating pair). It was quarantined under \
+             the profile's quarantine/ dir before arming."
+                .to_string()
+        ],
+        "the cancelled hold still reports the quarantine"
+    );
+    assert!(
+        toast_bodies_of(&app, super::ToastKind::Success).is_empty(),
+        "nothing armed"
+    );
+}
+
+/// A switch whose precheck quarantined a mis-fill but whose arm then fails
+/// still reports the quarantine, as the CLI's line prints before the failure.
+#[test]
+fn a_failed_switch_still_reports_the_misfill_quarantine() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_expiring_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_failing_refresher;
+    seed_session_token("acct", Some("rotating"));
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &ProfileName::from("acct")));
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        toast_bodies_of(&app, super::ToastKind::Warning),
+        vec![
+            "'acct' had a mis-filled sidecar (a rotating pair). It was quarantined under \
+             the profile's quarantine/ dir before arming."
+                .to_string()
+        ],
+        "the failed switch still reports the quarantine"
+    );
+    let danger = toast_bodies_of(&app, super::ToastKind::Danger);
+    assert_eq!(danger.len(), 1, "{danger:?}");
+    assert!(danger[0].starts_with("switch failed\n"), "{danger:?}");
 }

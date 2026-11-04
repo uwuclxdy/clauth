@@ -2022,9 +2022,7 @@ fn the_bare_item_leg_saves_a_siblings_successor_then_restores() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth: the macOS Keychain login was b's, written by a Claude Code still running \
-             on it; saved it into b and put a back"
-                .to_string()
+            "clauth: saved the Keychain login Claude Code wrote into b and put a back".to_string()
         ]
     );
 }

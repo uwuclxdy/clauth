@@ -352,6 +352,38 @@ fn the_no_five_hour_verdict_reads_the_oauth_store_not_the_picked_reading() {
     }
 }
 
+/// `build_snap` derives `auth_broken` from `AppState::auth_broken` (the
+/// renderer's dim for a quarantined login), driven through a real `App`,
+/// never a hand-set `Snap`.
+#[test]
+fn an_auth_broken_quarantine_dims_the_rolling_row_through_the_app() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let name = ProfileName::from("acct");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            auth_broken: vec![name.clone()],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&name)],
+    });
+    app.profile_cursor.set(0);
+    let snap = build_snap(&app, &app.readings_snapshot(), true);
+    assert!(snap.auth_broken, "the quarantine reached the snap");
+    assert!(
+        snap.rolling_switch_gated(),
+        "a quarantined login dims the rolling switch row"
+    );
+    assert_eq!(
+        row_hint(ConfigRow::RollingTokenSwitch, &snap, "").as_deref(),
+        Some("cannot switch: this login is dead · log in again first"),
+        "the gate line names the dead login"
+    );
+}
+
 /// A saved base URL an OAuth account does not use (no api key, no env token)
 /// shows on the row with a dim inline note, blurred and focused alike, and its
 /// help line names where requests really go. A used URL keeps the plain row.
@@ -3215,4 +3247,127 @@ fn moving_the_selector_to_another_account_clears_the_detail_tint() {
         Vec::new(),
         "the claude detail is never-entered again"
     );
+}
+
+// ── `switch to a rolling token` row ─────────────────────────────────────────
+
+/// The row's copy, arm-on-first-press like `clear long-lived token`: the
+/// unarmed label is fixed whatever the focus, the armed one swaps to the
+/// confirm, and another row's arm never bleeds into it.
+#[test]
+fn rolling_switch_button_reads_its_unarmed_and_armed_labels() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("a");
+    let input = InputState::new("");
+
+    for selected in [false, true] {
+        let arrow = if selected { "❯ " } else { "  " };
+        let unarmed = one_row(
+            ConfigRow::RollingTokenSwitch,
+            selected,
+            false,
+            None,
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&unarmed),
+            format!("{arrow}switch to a rolling token"),
+            "unarmed label (selected={selected})"
+        );
+        assert_ne!(
+            unarmed.spans[1].style.fg,
+            theme::faint().fg,
+            "an ungated row is not dim (selected={selected})"
+        );
+        let armed = one_row(
+            ConfigRow::RollingTokenSwitch,
+            selected,
+            false,
+            Some(ConfigRow::RollingTokenSwitch),
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&armed),
+            format!("{arrow}press again to switch"),
+            "arming swaps to the confirm copy (selected={selected})"
+        );
+    }
+    let cross_armed = one_row(
+        ConfigRow::RollingTokenSwitch,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&cross_armed), "❯ switch to a rolling token");
+}
+
+/// Dim + inert where `clauth rolling-token` refuses: a disabled account and a
+/// quarantined (dead) login. The arrow dims too, a stale arm shows the plain
+/// label, and the hint names the reason; an ungated row carries its
+/// disclosure.
+#[test]
+fn rolling_switch_button_dims_on_a_disabled_account_or_a_dead_login() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let input = InputState::new("");
+
+    let open = Snap::blank("a");
+    assert_eq!(
+        row_hint(ConfigRow::RollingTokenSwitch, &open, "").as_deref(),
+        Some(
+            "sessions get this login's full-scope token, re-stamped by the daemon · \
+             wider than a setup token · no refresh token"
+        ),
+    );
+    let ungated = one_row(
+        ConfigRow::RollingTokenSwitch,
+        true,
+        false,
+        None,
+        &open,
+        &input,
+    );
+
+    let mut disabled = Snap::blank("a");
+    disabled.disabled = true;
+    let mut dead = Snap::blank("a");
+    dead.auth_broken = true;
+    for (snap, hint) in [
+        (&disabled, "cannot switch a disabled account"),
+        (
+            &dead,
+            "cannot switch: this login is dead · log in again first",
+        ),
+    ] {
+        assert_eq!(
+            row_hint(ConfigRow::RollingTokenSwitch, snap, "").as_deref(),
+            Some(hint)
+        );
+        let gated = one_row(
+            ConfigRow::RollingTokenSwitch,
+            true,
+            false,
+            Some(ConfigRow::RollingTokenSwitch),
+            snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&gated),
+            "❯ switch to a rolling token",
+            "a gated row ignores a stale arm ({hint})"
+        );
+        assert_eq!(gated.spans[1].style.fg, theme::faint().fg, "{hint}");
+        assert_eq!(
+            gated.spans[0].style.fg,
+            theme::faint().fg,
+            "the arrow dims too ({hint})"
+        );
+        assert_ne!(
+            gated.spans[1].style.fg, ungated.spans[1].style.fg,
+            "gated renders distinctly from ungated ({hint})"
+        );
+    }
 }

@@ -1147,15 +1147,21 @@ pub(crate) fn third_party_dead_chain_copy(
 /// The sentence a quarantined claude login prints wherever it is refused:
 /// the third-party splitter's copy when it has one for this chain, else the
 /// generic dead-chain line.
-fn dead_chain_sentence(profile: Option<&crate::profile::Profile>, name: &ProfileName) -> String {
+pub(crate) fn dead_chain_sentence(
+    profile: Option<&crate::profile::Profile>,
+    name: &ProfileName,
+) -> String {
     third_party_dead_chain_copy(profile, name).unwrap_or_else(|| {
         format!("'{name}' usage chain is dead. Run `clauth login {name}` first, then re-run")
     })
 }
 
-/// Refuses a quarantined claude login with [`dead_chain_sentence`], for every
-/// claude surface that acts on the chain. One fn so the commands a dead chain
-/// prescribes cannot drift between them.
+/// Refuses a quarantined claude login with [`dead_chain_sentence`], for a
+/// claude surface that bails with an error; the rolling-token arm carries it
+/// as a typed refusal: `Quarantined` at its precheck (profile-aware, like
+/// here), `Broken` mid-arm (no profile, so the generic sentence even for a
+/// third-party account). One builder so the commands a dead chain prescribes
+/// come from one place.
 pub(crate) fn refuse_if_chain_dead(
     config: &crate::profile::AppConfig,
     profile: Option<&crate::profile::Profile>,
@@ -3882,6 +3888,24 @@ fn rolling_install_gate(
     }
 }
 
+/// How an arm's gate refused, typed so the shared arm action (and through it
+/// the CLI and the TUI) classifies by variant, never by matching a message:
+/// the sentences live with the surfaces that print them.
+#[derive(Debug)]
+pub(crate) enum RollingArmError {
+    /// The gate came back `Ready`/`Refreshed` but no sidecar was armed — a
+    /// mis-filled sidecar with no backup, or a raced-in vanilla `Ready`.
+    NothingArmed,
+    /// The usage chain is terminally dead; a re-login is the only fix.
+    Broken,
+    /// A transient failure (network, an unwritable rotation lock, a grant the
+    /// stamp refuses). The chain may be fine; retry.
+    Transient(crate::format::Transient),
+    /// The daemon is stopping and refused the spend. Unreachable for the CLI
+    /// and the TUI, which pass no spend marker.
+    Stopping,
+}
+
 /// CLA-ROLL: arm or re-stamp `name`'s rolling sidecar right now — the CLI-enable
 /// path. Same decision table as [`rolling_install_gate`] (the CLI pre-clears a
 /// mis-fill by quarantining it, so the vanilla fall-through leg is
@@ -3891,7 +3915,7 @@ pub(crate) fn arm_rolling_token(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
-) -> Result<()> {
+) -> std::result::Result<(), RollingArmError> {
     match rolling_install_gate(
         config,
         name,
@@ -3904,19 +3928,13 @@ pub(crate) fn arm_rolling_token(
             if crate::claude::has_session_token(name) {
                 Ok(())
             } else {
-                anyhow::bail!(
-                    "'{name}' could not arm the rolling sidecar (a mis-filled sidecar with no \
-                     backup?). Re-capture with `clauth login {name} --setup-token`, or clear \
-                     the sidecar, then re-run"
-                )
+                Err(RollingArmError::NothingArmed)
             }
         }
-        AuthGate::Broken => anyhow::bail!("{}", dead_chain_sentence(None, name)),
-        // CLI surface: `text_with_status` is the flavor that names the HTTP
-        // status, since stderr has no companion log to read it out of.
-        AuthGate::Transient(e) => Err(anyhow::anyhow!("{}", e.text_with_status())),
-        // Unreachable: the CLI passes `None` as the spend marker.
-        AuthGate::Stopping => Err(anyhow::anyhow!("{}", crate::format::DAEMON_STOPPING)),
+        AuthGate::Broken => Err(RollingArmError::Broken),
+        AuthGate::Transient(e) => Err(RollingArmError::Transient(e)),
+        // Unreachable: the CLI and the TUI pass `None` as the spend marker.
+        AuthGate::Stopping => Err(RollingArmError::Stopping),
     }
 }
 

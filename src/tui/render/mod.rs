@@ -24,7 +24,7 @@ pub(super) mod prose;
 mod services;
 mod status;
 mod tabs;
-mod toasts;
+pub(crate) mod toasts;
 mod tokens;
 mod usage;
 

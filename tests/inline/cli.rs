@@ -3795,18 +3795,23 @@ mod static_token_verdicts {
         );
     }
 
-    /// The read-back report refuses to claim success it cannot verify: no
-    /// readable sidecar is an error, and a sidecar re-filled with a rotating
-    /// pair mid-arm is an error — neither may decay into an `Ok(())` print.
+    /// The read-back classification refuses to claim success it cannot
+    /// verify: no readable sidecar is an error, and a sidecar re-filled with
+    /// a rotating pair mid-arm is an error — neither may decay into an
+    /// `Ok(())` print.
     #[test]
     fn the_arming_report_fails_on_what_it_cannot_verify() {
         let _home = HomeSandbox::new();
         seeded_profile("rt-report", true);
-        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
-            .expect_err("no readable sidecar must not report armed");
+        let err = crate::actions::classify_armed_sidecar(
+            &crate::profile::ProfileName::from("rt-report"),
+            false,
+        )
+        .expect_err("no readable sidecar must not report armed");
         assert!(
-            format!("{err:#}").contains("no readable sidecar"),
-            "{err:#}"
+            err.sentence(&crate::profile::ProfileName::from("rt-report"))
+                .contains("no readable sidecar"),
+            "{err:?}"
         );
 
         let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("rt-report"))
@@ -3826,12 +3831,178 @@ mod static_token_verdicts {
             serde_json::to_vec_pretty(&pair).expect("ser"),
         )
         .expect("write misfill");
-        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
-            .expect_err("a raced-in rotating pair must not report armed");
+        let err = crate::actions::classify_armed_sidecar(
+            &crate::profile::ProfileName::from("rt-report"),
+            false,
+        )
+        .expect_err("a raced-in rotating pair must not report armed");
         assert!(
-            format!("{err:#}").contains("rotating pair while arming"),
-            "{err:#}"
+            err.sentence(&crate::profile::ProfileName::from("rt-report"))
+                .contains("rotating pair while arming"),
+            "{err:?}"
         );
+    }
+
+    /// The production printer's report lines, pinned by equality: the armed
+    /// line, the mint-kept line, the two warning lines and the two install
+    /// lines come from the same fns `cmd_rolling_token` calls, so a word
+    /// edited in the printer reds here.
+    #[test]
+    fn the_rolling_arm_lines_match_the_base_bytes() {
+        let canonical = crate::profile::ProfileName::from("rt-lines");
+        assert_eq!(
+            rolling_token_armed_line(
+                &canonical,
+                &["user:inference".to_string(), "user:profile".to_string(),],
+                &Some("max".to_string()),
+                crate::daemon::DaemonHealth::Absent,
+            ),
+            "clauth: rolling token armed for 'rt-lines'. Sessions now hold the usage \
+             chain's access token: 2 scope(s) (user:inference, user:profile), plan \
+             max, and no refresh token. No daemon appears to be running. Nothing \
+             re-stamps it until `clauth daemon` starts."
+        );
+        assert_eq!(
+            rolling_token_mint_kept_line(&canonical),
+            "clauth: 'rt-lines' usage chain could not be read just now, so sessions \
+             stay on the static mint. The flag is set. The daemon re-stamps on its \
+             next rotation."
+        );
+        assert_eq!(
+            plan_incapable_warning(&canonical),
+            "clauth: warning: the usage chain for 'rt-lines' is missing the user:profile \
+             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
+             models. A fresh `clauth login rt-lines` browser sign-in fixes that."
+        );
+        assert_eq!(
+            misfill_quarantined_line(&canonical),
+            "clauth: 'rt-lines' had a mis-filled sidecar (a rotating pair). It was \
+             quarantined under the profile's quarantine/ dir before arming."
+        );
+        assert_eq!(
+            installed_live_line(),
+            "clauth: installed live. New sessions run on it immediately."
+        );
+        assert_eq!(
+            next_switch_install_line(&canonical),
+            "clauth: it installs on the next switch:  clauth switch rt-lines"
+        );
+    }
+
+    /// One drive of `cmd_rolling_token` through a real arm to SUCCESS: the
+    /// production printer's success path (armed line, disclosure, next-switch
+    /// line) runs and prints the base's bytes, and the flag and a rolling
+    /// sidecar land.
+    #[test]
+    fn a_successful_rolling_token_arm_prints_the_report_lines() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-ok".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-ok".to_string(),
+                refresh_token: Some("rt-ok".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let out = crate::out::OutCapture::new();
+        {
+            let _capture = out.capture_here();
+            cmd_rolling_token("rt-ok").expect("the arm succeeds");
+        }
+        assert_eq!(
+            String::from_utf8(out.snapshot()).expect("utf8"),
+            "clauth: rolling token armed for 'rt-ok'. Sessions now hold the usage \
+             chain's access token: 2 scope(s) (user:inference, user:profile), plan \
+             max, and no refresh token. No daemon appears to be running. Nothing \
+             re-stamps it until `clauth daemon` starts.\n\
+             clauth: that is wider than the setup-token mint it supersedes, which \
+             carried two. Anything that can read this profile's session credential \
+             can now use every one of those scopes. `clauth static-token rt-ok` puts \
+             the mint back.\n\
+             clauth: it installs on the next switch:  clauth switch rt-ok\n"
+        );
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rt-ok"))
+            .expect("reload");
+        assert!(p.rolling_token, "the flag is on");
+        let (kind, _) = crate::claude::sidecar_summary(&crate::profile::ProfileName::from("rt-ok"))
+            .expect("a readable sidecar");
+        assert_eq!(kind, crate::claude::SidecarKind::Rolling);
+    }
+
+    /// A failed live install still reports the arm: the armed lines print
+    /// BEFORE the relink, whose failure exits non-zero after them, and the
+    /// flag stays on — a script still sees the arm landed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_rolling_token_live_install_still_reports_the_arm() {
+        let home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-live".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-live".to_string(),
+                refresh_token: Some("rt-live".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let name = profile.name.clone();
+        let state = crate::profile::AppState {
+            profiles: vec![name.clone()],
+            active_profile: Some(name.clone()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        // The live slot's parent goes read-only: the publish fails, the only
+        // write left in the command.
+        let claude = home.home().join(".claude");
+        std::fs::create_dir_all(&claude).expect("mkdir .claude");
+        let mut perms = std::fs::metadata(&claude).expect("meta").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&claude, perms).expect("read-only .claude");
+
+        let out = crate::out::OutCapture::new();
+        let err = {
+            let _capture = out.capture_here();
+            cmd_rolling_token("rt-live").expect_err("the live install fails")
+        };
+        let printed = String::from_utf8(out.snapshot()).expect("utf8");
+        assert!(
+            printed.starts_with("clauth: rolling token armed for 'rt-live'."),
+            "the armed line prints before the failure: {printed}"
+        );
+        assert!(
+            printed.contains("clauth: that is wider than the setup-token mint"),
+            "the disclosure prints before the failure: {printed}"
+        );
+        assert!(
+            !printed.contains("installed live"),
+            "the install line never prints when the relink failed: {printed}"
+        );
+        assert!(
+            format!("{err:#}").contains("credential symlink"),
+            "the failure is the relink itself: {err:#}"
+        );
+        let p = crate::profile::load_profile(&name).expect("reload");
+        assert!(p.rolling_token, "the arm landed: the flag stays on");
     }
 
     /// "Already on its mint" is only a no-op success while the mint is ALIVE:

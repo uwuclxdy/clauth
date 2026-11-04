@@ -587,6 +587,14 @@ pub(crate) enum ConfigRow {
     /// it changes what every future switch installs and, on the active account,
     /// moves a running session's credentials.
     ClearSessionToken,
+    /// `switch to a rolling token`: one-way — it arms the account's rolling
+    /// token through the shared arm action, and turning it back off stays
+    /// `clear long-lived token`. Shown only on an account whose profile holds
+    /// a usage OAuth chain and whose sidecar does not already classify as a
+    /// rolling bearer (the `t` rotation re-stamps it from then on); dimmed and
+    /// inert on a disabled account or a quarantined login. Arms on the first
+    /// ⏎, like `ClearSessionToken`; the second runs the arm on a worker.
+    RollingTokenSwitch,
     /// User-disabled account-action row (`Profile::disabled`), same class as
     /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
@@ -650,6 +658,7 @@ impl ConfigRow {
             | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
+            | ConfigRow::RollingTokenSwitch
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => false,
@@ -1096,6 +1105,7 @@ impl ConfigDraft {
             | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
+            | ConfigRow::RollingTokenSwitch
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -1136,6 +1146,7 @@ impl ConfigDraft {
             | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
+            | ConfigRow::RollingTokenSwitch
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -1835,6 +1846,9 @@ pub(crate) enum BareItemWrite {
     Switch(ProfileName),
     SwitchOff,
     ClearSessionToken(ProfileName),
+    /// The `switch to a rolling token` row's confirmed arm on the active
+    /// account: its relink of the live slot settles the bare item first.
+    UseRollingToken(ProfileName),
     /// Renaming the active profile in the open Setup draft.
     Rename,
     /// The `+ new` form's create, whose fresh login becomes the active one.
@@ -1882,6 +1896,7 @@ impl BareItemWrite {
             }
             Self::BootRelink(_) => crate::claude::BareItemWriter::Relink,
             Self::Switch(_)
+            | Self::UseRollingToken(_)
             | Self::ClearSessionToken(_)
             | Self::Rename
             | Self::NewAccount
@@ -1898,7 +1913,7 @@ impl BareItemWrite {
     fn failed(&self) -> &'static str {
         match self {
             Self::BootRelink(_) | Self::ClearSessionToken(_) => "relink failed",
-            Self::Switch(_) => "switch failed",
+            Self::Switch(_) | Self::UseRollingToken(_) => "switch failed",
             Self::SwitchOff => "switch-off failed",
             Self::Rename => "rename failed",
             Self::NewAccount => "create failed",
@@ -5955,6 +5970,25 @@ pub(crate) struct App {
     /// the name is taken when the selection lands
     /// ([`App::note_delete_selection`]), never re-read off the index.
     delete_selected: Option<ProfileName>,
+    /// The account a rolling-token switch worker is arming; `None` while none
+    /// runs. A second confirm while one runs toasts that it is still running,
+    /// and the exit wait counts it so a quit waits for the arm to land.
+    pub(crate) rolling_switch: Option<ProfileName>,
+    /// The quarantine fact a held switch's precheck learned before the bare
+    /// item held it: the resumed run's fresh read cannot see the mis-fill
+    /// again (its sidecar is already gone), so its answer folds this into
+    /// the report, and an abandoned hold reports it here.
+    rolling_switch_misfill_carry: Option<ProfileName>,
+    /// The refresher the switch worker hands the arm — production runs the
+    /// same `oauth::refresh_result` the CLI does; tests swap it.
+    pub(crate) rolling_switch_refresher:
+        fn(
+            &str,
+            Option<&str>,
+        ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError>,
+    /// Rolling-token switch worker results; drained in `on_tick`.
+    rolling_switch_rx: std::sync::mpsc::Receiver<RollingSwitchResult>,
+    rolling_switch_tx: std::sync::mpsc::Sender<RollingSwitchResult>,
     /// Delete worker results; drained in `on_tick`.
     delete_rx: std::sync::mpsc::Receiver<DeleteResult>,
     delete_tx: std::sync::mpsc::Sender<DeleteResult>,
@@ -6305,6 +6339,7 @@ impl App {
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
         let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let (rolling_switch_tx, rolling_switch_rx) = std::sync::mpsc::channel();
         let (bare_item_tx, bare_item_rx) = std::sync::mpsc::channel();
         let (unsaved_login_tx, unsaved_login_rx) = std::sync::mpsc::channel();
         let (capture_login_tx, capture_login_rx) = std::sync::mpsc::channel();
@@ -6586,6 +6621,11 @@ impl App {
             pool_mutation_tx,
             deleting: None,
             delete_selected: None,
+            rolling_switch: None,
+            rolling_switch_misfill_carry: None,
+            rolling_switch_refresher: crate::oauth::refresh_result,
+            rolling_switch_rx,
+            rolling_switch_tx,
             delete_rx,
             delete_tx,
             bare_item_source: default_bare_item_source(),
@@ -9781,14 +9821,16 @@ fn in_flight_shunt_card_write(app: &App) -> bool {
 
 /// A running write the exit waits for, the one predicate both the quit's
 /// decision (`quit_or_wait`) and its resolution (`on_tick`) call so the two
-/// cannot drift: any shunt-card write, a profile delete's worker, or an account
-/// between a refresh token's request and its stage write. Dying inside that
-/// window loses the minted pair, and dying inside a delete can leave the record
-/// beside a half-removed profile dir, so a quit over either waits instead of
+/// cannot drift: any shunt-card write, a profile delete's worker, a
+/// rolling-token switch's worker, or an account between a refresh token's
+/// request and its stage write. Dying inside that window loses the minted
+/// pair, and dying inside a delete can leave the record beside a
+/// half-removed profile dir, so a quit over either waits instead of
 /// exiting. A usage read never holds a quit.
 fn in_flight_exit_write(app: &App) -> bool {
     in_flight_shunt_card_write(app)
         || app.deleting.is_some()
+        || app.rolling_switch.is_some()
         || token_spend_in_flight(&app.activity)
 }
 
@@ -10366,14 +10408,20 @@ pub(crate) fn page_up_scroll(scroll: usize, max: usize, viewport: usize) -> usiz
 /// lands on the last row whose start line is within one page (`viewport - 1`
 /// lines) below the current row's start, at least one row forward, stopping at
 /// the last row — walking back if the follow that landing produces would push
-/// the old bottom line off the top (a focused row's tooltip moves with the
-/// cursor). `starts[i]` is the rendered line where row `i` begins; `block_ends`
-/// is the line its block reaches when focused; `offset`/`total` are the last
-/// render's scroll and line count.
+/// the old bottom line off the top. The follow is predicted against the
+/// re-laid-out rows, not the last render's (an inline footnote's extension of
+/// the focus block is not modelled): the focused row's tooltip leaves with the
+/// cursor, pulling every line below it up by `tips[cursor]`, while the landing
+/// row's `tips[next]` lines re-extend the total, so both the focus block and
+/// the continuity bound shift by the departing tooltip.
+/// `starts[i]` is the rendered line where row `i` begins; `block_ends` is the
+/// line its block reaches when focused; `offset`/`total` are the last render's
+/// scroll and line count.
 pub(crate) fn page_down_cursor_by_rows(
     cursor: usize,
     starts: &[usize],
     block_ends: &[usize],
+    tips: &[usize],
     viewport: usize,
     offset: usize,
     total: usize,
@@ -10382,6 +10430,10 @@ pub(crate) fn page_down_cursor_by_rows(
         return 0;
     }
     let cursor = cursor.min(starts.len() - 1);
+    let departing = tips.get(cursor).copied().unwrap_or(0);
+    let bound = offset
+        .saturating_add(page_step(viewport))
+        .saturating_sub(departing);
     let mut next = page_land_down(cursor, starts, viewport);
     while next > cursor + 1 {
         let end = block_ends
@@ -10389,8 +10441,17 @@ pub(crate) fn page_down_cursor_by_rows(
             .copied()
             .unwrap_or(starts[next] + 1)
             .max(starts[next] + 1);
-        let predicted = follow_scroll_offset(total, viewport, (starts[next], end), offset);
-        if predicted <= offset + page_step(viewport) {
+        let arriving = tips.get(next).copied().unwrap_or(0);
+        let predicted = follow_scroll_offset(
+            total.saturating_add(arriving).saturating_sub(departing),
+            viewport,
+            (
+                starts[next].saturating_sub(departing),
+                end.saturating_sub(departing),
+            ),
+            offset,
+        );
+        if predicted <= bound {
             break;
         }
         next -= 1;
@@ -10446,10 +10507,12 @@ pub(crate) fn page_up_cursor_by_rows(
 fn selector_page_down(cursor: usize, list: &ListView) -> usize {
     let starts = list.starts.borrow();
     let block_ends = list.block_ends.borrow();
+    let tips = list.tips.borrow();
     page_down_cursor_by_rows(
         cursor,
         &starts,
         &block_ends,
+        &tips,
         list.viewport.get(),
         list.offset.get(),
         list.total.get(),
@@ -11051,6 +11114,7 @@ fn handle_delegates_detail_key(app: &mut App, key: KeyEvent) {
                     app.services.delegates_cursor,
                     &starts,
                     &block_ends,
+                    &[],
                     app.services.delegates_viewport.get(),
                     app.services.delegates_offset.get(),
                     app.services.delegates_total.get(),
@@ -18321,6 +18385,7 @@ where
             Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
                 crate::claude::BareItemSettled {
                     notice: None,
+                    saved_into: None,
                     placed,
                 },
             )),
@@ -18580,6 +18645,23 @@ fn drain_bare_item_answers(app: &mut App) {
     }
 }
 
+/// The quarantine fact a held rolling switch carries: when its write is
+/// abandoned (cancelled by the user, or a later settle failed), nothing
+/// armed the token, but the precheck's quarantine still happened — say so
+/// before the fact drops with the hold.
+fn abandon_bare_item_write(app: &mut App, write: &BareItemWrite) {
+    let BareItemWrite::UseRollingToken(name) = write else {
+        return;
+    };
+    if app.rolling_switch_misfill_carry.as_ref() == Some(name) {
+        app.rolling_switch_misfill_carry = None;
+        app.toast(
+            ToastKind::Warning,
+            crate::actions::misfill_quarantined_body(name),
+        );
+    }
+}
+
 /// A settle that lets the write go shows what it saved (its carry has
 /// landed) and runs the write again; one only the user can place asks; a
 /// failed one toasts the write's own failure.
@@ -18595,6 +18677,7 @@ fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItem
             app.open_modal(Modal::BareItem(BareItemForm::new(unplaced, write)));
         }
         BareItemOutcome::Settled(Err(e)) => {
+            abandon_bare_item_write(app, &write);
             app.toast(
                 ToastKind::Danger,
                 format!("{}\n{}", write.failed(), escape_control(&format!("{e:#}"))),
@@ -18635,6 +18718,7 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
         BareItemWrite::Switch(name) => spawn_switch_gate(app, name, oauth::refresh_result),
         BareItemWrite::SwitchOff => perform_switch_off(app),
         BareItemWrite::ClearSessionToken(name) => perform_clear_session_token(app, &name),
+        BareItemWrite::UseRollingToken(name) => start_rolling_switch(app, &name),
         BareItemWrite::Rename => {
             commit_rename(app);
         }
@@ -18727,6 +18811,7 @@ fn handle_bare_item_key(app: &mut App, key: KeyEvent) {
                 form.cursor,
                 &starts,
                 &block_ends,
+                &[],
                 form.viewport.get(),
                 form.scroll.get(),
                 form.total.get(),
@@ -18761,7 +18846,7 @@ fn answer_bare_item(app: &mut App, write: BareItemWrite, choice: BareItemChoice)
     let source = app.bare_item_source;
     let tx = app.bare_item_tx.clone();
     match choice {
-        BareItemChoice::Cancel => {}
+        BareItemChoice::Cancel => abandon_bare_item_write(app, &write),
         BareItemChoice::Save => {
             let check = begin_bare_item_check(app, &write);
             spawn_worker(move || {
@@ -18830,7 +18915,10 @@ fn handle_bare_item_owner_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Down => form.cursor = 1 - form.cursor.min(1),
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.pop_modal();
+            let Some(Modal::BareItemOwner(form)) = app.pop_modal() else {
+                return;
+            };
+            abandon_bare_item_write(app, &form.write);
         }
         KeyCode::Enter => {
             let Some(Modal::BareItemOwner(form)) = app.pop_modal() else {
@@ -18892,6 +18980,7 @@ fn settle_after_save(
         Some(placed) => Ok(crate::claude::BareItemSettle::Settled(
             crate::claude::BareItemSettled {
                 notice: None,
+                saved_into: None,
                 placed: Some(placed),
             },
         )),
@@ -19559,10 +19648,12 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageDown => {
             let starts = app.global_config_row_starts.borrow();
             let block_ends = app.global_config_block_ends.borrow();
+            let tips = app.global_config_tips.borrow();
             app.global_config_cursor = page_down_cursor_by_rows(
                 app.global_config_cursor,
                 &starts,
                 &block_ends,
+                &tips,
                 app.global_config_viewport.get(),
                 app.global_config_offset.get(),
                 app.global_config_total.get(),
@@ -20363,10 +20454,12 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
             app.fallback_edit = None;
             let starts = app.fallback_detail_row_starts.borrow();
             let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
             app.fallback_detail_cursor = page_down_cursor_by_rows(
                 app.fallback_detail_cursor,
                 &starts,
                 &block_ends,
+                &tips,
                 app.fallback_detail_viewport.get(),
                 app.fallback_detail_offset.get(),
                 app.fallback_detail_total.get(),
@@ -20452,10 +20545,12 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageDown => {
             let starts = app.fallback_detail_row_starts.borrow();
             let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
             app.fallback_detail_cursor = page_down_cursor_by_rows(
                 app.fallback_detail_cursor,
                 &starts,
                 &block_ends,
+                &tips,
                 app.fallback_detail_viewport.get(),
                 app.fallback_detail_offset.get(),
                 app.fallback_detail_total.get(),
@@ -22101,6 +22196,7 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                         state.cursor,
                         &starts,
                         &block_ends,
+                        &[],
                         state.viewport.get(),
                         state.scroll.get(),
                         state.total.get(),
@@ -22778,10 +22874,12 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     disarm_armed_action(app);
                     let starts = app.setup_detail_row_starts.borrow();
                     let block_ends = app.setup_detail_block_ends.borrow();
+                    let tips = app.setup_detail_tips.borrow();
                     app.config_action_cursor = page_down_cursor_by_rows(
                         app.config_action_cursor,
                         &starts,
                         &block_ends,
+                        &tips,
                         app.setup_detail_viewport.get(),
                         app.setup_detail_offset.get(),
                         app.setup_detail_total.get(),
@@ -22892,10 +22990,12 @@ fn handle_codex_detail_key(app: &mut App, key: KeyEvent) {
             disarm_codex_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
             app.config_action_cursor = page_down_cursor_by_rows(
                 app.config_action_cursor,
                 &starts,
                 &block_ends,
+                &tips,
                 app.setup_detail_viewport.get(),
                 app.setup_detail_offset.get(),
                 app.setup_detail_total.get(),
@@ -22987,10 +23087,12 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
             disarm_pool_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
             app.config_action_cursor = page_down_cursor_by_rows(
                 app.config_action_cursor,
                 &starts,
                 &block_ends,
+                &tips,
                 app.setup_detail_viewport.get(),
                 app.setup_detail_offset.get(),
                 app.setup_detail_total.get(),
@@ -23395,6 +23497,22 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let has_creds = has_creds || profile.is_some_and(|p| p.unreadable_credentials_store.is_some());
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
+    }
+    // `switch to a rolling token`, directly above the clear row (or where the
+    // clear row would sit, above `disable account` when none shows): arming
+    // rolls from the account's usage OAuth chain, so the row keys on the
+    // CHAIN whatever the base url — a hybrid can still hold one. Hidden once
+    // the sidecar already classifies as a rolling bearer (the `t` rotation
+    // re-stamps it from then on), whatever the flag; a flag over a static
+    // mint or nothing is a retry the row must still offer.
+    if profile.is_some_and(|p| {
+        crate::usage::usage_poll_pair(p).is_some()
+            && !matches!(
+                crate::claude::sidecar_summary(&p.name),
+                Some((crate::claude::SidecarKind::Rolling, _))
+            )
+    }) {
+        rows.push(ConfigRow::RollingTokenSwitch);
     }
     // CLA-SPLIT escape hatch, beside the log-out row because it drops the OTHER
     // credential a split profile holds. Gated on ANY long-lived piece existing
@@ -24042,6 +24160,31 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }
             }
         }
+        ConfigRow::RollingTokenSwitch => {
+            if let Some(name) = name {
+                // Same dim gate the renderer dims on, re-derived here (the
+                // clear row's three-surface pattern): a disabled account and
+                // a quarantined login are both inert, a stale arm included.
+                let gated = {
+                    let cfg = app.config();
+                    cfg.find(&name).is_some_and(|p| p.is_disabled())
+                        || cfg.state.auth_broken.contains(&name)
+                };
+                if gated {
+                    return;
+                }
+                let armed = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.armed_action == Some(ConfigRow::RollingTokenSwitch));
+                if armed {
+                    start_rolling_switch(app, &name);
+                    disarm_armed_action(app);
+                } else {
+                    arm_action(app, ConfigRow::RollingTokenSwitch);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -24088,9 +24231,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     // The active account's clear relinks its live slot over the bare item, so
     // it settles before anything is cleared: a held clear has changed nothing.
-    let relinks = crate::profile::load_app_state()
-        .map(|state| state.active_profile.as_ref() == Some(name))
-        .unwrap_or_else(|_| app.config().is_active(name));
+    let relinks = active_profile_on_disk(name, &app.config);
     let _placed = if relinks {
         let Some(placed) = bare_item_gate(app, BareItemWrite::ClearSessionToken(name.clone()))
         else {
@@ -24773,6 +24914,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
+        | ConfigRow::RollingTokenSwitch
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => String::new(),
@@ -25083,6 +25225,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
+        | ConfigRow::RollingTokenSwitch
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => {}
@@ -26564,6 +26707,401 @@ impl Drop for DeleteWorkerPanics {
     }
 }
 
+/// How a rolling-token switch worker ended.
+enum RollingSwitchResult {
+    /// The switch ran: its settle's carry and the outcome.
+    Ran(ProfileName, RollingSwitchDone),
+    /// The worker panicked; the in-flight marker must still clear.
+    Panicked,
+}
+
+/// What a finished switch worker hands the UI thread: the settle's carry —
+/// the owner it saved an unsaved login into, as data — and the outcome
+/// itself. The outcome toast composes its own copy from the owner.
+struct RollingSwitchDone {
+    saved_into: Option<ProfileName>,
+    ran: std::result::Result<RollingSwitchRan, crate::actions::RollingArmFailure>,
+}
+
+/// A switch that ran without failing.
+enum RollingSwitchRan {
+    Armed {
+        report: crate::actions::RollingArmReport,
+        /// The live install, run on the worker after the report; `None`
+        /// when the account is idle (the install happens on its next
+        /// switch).
+        relink: Option<std::result::Result<(), anyhow::Error>>,
+    },
+    /// The bare item holds a login only the user can place: the switch
+    /// waits on [`Modal::BareItem`], having armed nothing. A precheck that
+    /// quarantined a mis-fill before the hold carries the fact, since the
+    /// resumed run cannot re-read it.
+    Held { quarantined_misfill: bool },
+}
+
+/// Run the rolling-token arm on a worker: its gate refreshes the chain and
+/// can wait on a rotation lock, and the UI thread waits on neither. The
+/// outcome lands through [`drain_rolling_switch`]. The account the arm acts
+/// on is re-read from DISK by the shared action; only the bare-item settle
+/// gate reads the active marker early, off disk the same way.
+fn start_rolling_switch(app: &mut App, name: &ProfileName) {
+    if app.rolling_switch.is_some() {
+        app.toast(
+            ToastKind::Danger,
+            "a rolling-token switch is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    app.rolling_switch = Some(name.clone());
+    let config = Arc::clone(&app.config);
+    let tx = app.rolling_switch_tx.clone();
+    let bare_item_tx = app.bare_item_tx.clone();
+    let source = app.bare_item_source;
+    let ready = app.bare_item_ready.take();
+    // A held switch's precheck may already have quarantined a mis-fill; the
+    // sidecar is gone, so the resumed run cannot see the fact again.
+    let mut carried_misfill = false;
+    if ready.is_some() && app.rolling_switch_misfill_carry.as_ref() == Some(name) {
+        app.rolling_switch_misfill_carry = None;
+        carried_misfill = true;
+    }
+    if ready.is_none() {
+        // A fresh switch never inherits a fact from an abandoned hold.
+        app.rolling_switch_misfill_carry = None;
+    }
+    let refresher = app.rolling_switch_refresher;
+    let name = name.clone();
+    let settling = ready.is_none() && active_profile_on_disk(&name, &config);
+    let check = if settling {
+        begin_bare_item_check(app, &BareItemWrite::UseRollingToken(name.clone()))
+    } else {
+        None
+    };
+    spawn_worker(move || {
+        // A panic inside the arm still lands a result, so `rolling_switch`
+        // never sticks (the `start_pool_mutation` precedent). The settle's
+        // carry lives outside the caught closure: a run that fails after
+        // the save landed still shows it.
+        let mut settle_saved_into: Option<ProfileName> = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // The base CLI's step order: every refusal and the mis-fill
+            // quarantine run BEFORE the settle, so a refused switch settles
+            // nothing. A resumed switch folds in the fact its held precheck
+            // learned: the sidecar it quarantined is gone, so this run's
+            // fresh read cannot see it.
+            let pre = match crate::actions::precheck_rolling_token(&name) {
+                Ok(mut pre) => {
+                    pre.quarantined_misfill |= carried_misfill;
+                    pre
+                }
+                Err(mut failure) => {
+                    failure.quarantined_misfill |= carried_misfill;
+                    return Err(failure);
+                }
+            };
+            // The live install relinks the live slot over the bare item, so
+            // it settles on THIS worker (the placement is thread-local and
+            // guards this thread's writes); a login only the user can place
+            // holds the switch until they answer, and a resumed switch takes
+            // their answer instead.
+            let _placed = match ready {
+                Some(placed) => Some(enter_bare_item_placement(placed)),
+                None if settling => {
+                    // A panicking settle fails as a settle, so the toast
+                    // says what every other bare-item worker's does.
+                    let settle = catch_unwind(AssertUnwindSafe(|| {
+                        settle_bare_keychain_item(source, crate::claude::BareItemWriter::Switch)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                    // The check ends with the settle, not with the arm's
+                    // own writes after it.
+                    drop(check);
+                    match settle.map_err(|e| anyhow::anyhow!("{e:#}")) {
+                        Ok(crate::claude::BareItemSettle::Settled(settled)) => {
+                            settle_saved_into = settled.saved_into;
+                            Some(enter_bare_item_placement(settled.placed))
+                        }
+                        Ok(held @ crate::claude::BareItemSettle::NeedsChoice(_)) => {
+                            let _ = bare_item_tx.send(BareItemAnswer {
+                                write: BareItemWrite::UseRollingToken(name.clone()),
+                                outcome: BareItemOutcome::Settled(Ok(held)),
+                            });
+                            return Ok(RollingSwitchRan::Held {
+                                quarantined_misfill: pre.quarantined_misfill,
+                            });
+                        }
+                        Err(e) => {
+                            return Err(crate::actions::RollingArmFailure::open(
+                                e,
+                                pre.plan_incapable,
+                                pre.quarantined_misfill,
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            };
+            let report = crate::actions::arm_rolling_token(pre, refresher)?;
+            // The live install follows the report on THIS worker (the
+            // placement guards this thread's writes); the drain toasts its
+            // failure beside the success toast.
+            let relink = if report.active {
+                Some(crate::claude::force_link_profile_credentials(&name))
+            } else {
+                None
+            };
+            Ok(RollingSwitchRan::Armed { report, relink })
+        }));
+        let _ = tx.send(match result {
+            Ok(ran) => RollingSwitchResult::Ran(
+                name,
+                RollingSwitchDone {
+                    saved_into: settle_saved_into,
+                    ran,
+                },
+            ),
+            Err(_) => RollingSwitchResult::Panicked,
+        });
+    });
+}
+
+/// Whether `name` is the active profile, read off DISK (the settle gate must
+/// judge the store the caller's relink will act on, not a tick-stale snapshot);
+/// a config that will not parse keeps the in-memory read rather than
+/// inventing a verdict.
+fn active_profile_on_disk(name: &ProfileName, config: &ConfigHandle) -> bool {
+    crate::profile::load_app_state()
+        .map(|state| state.active_profile.as_ref() == Some(name))
+        .unwrap_or_else(|_| App::lock_config(config).is_active(name))
+}
+
+/// The short wording for a saved Keychain login: the armed detail, the
+/// mint-kept detail and the failure head all compose it here, so the three
+/// cannot drift apart.
+fn saved_login_notice(owner: &ProfileName) -> String {
+    format!("Keychain login saved into {owner}")
+}
+
+/// Compose the success toasts for a finished arm: the switch toast, beside
+/// the plan-scope warning when the chain lacks the plan stamp. The detail
+/// drops an empty plan stamp or scope list rather than printing `plan ` or
+/// `0 scopes`. A saved login (`saved_into`) leads the detail, so a crowded
+/// drain's toast cap cannot evict the fact. The renderer's three-row cap
+/// still bounds it: a long account name or a narrow terminal can cut a
+/// warning clause's tail, and a long switch name can push the owner
+/// itself out. Without one, the detail keeps the scope/plan count and
+/// every daemon clause.
+fn land_rolling_switch_success(
+    app: &mut App,
+    name: &ProfileName,
+    report: &crate::actions::RollingArmReport,
+    saved_into: Option<&ProfileName>,
+) {
+    if report.plan_incapable {
+        app.toast(
+            ToastKind::Warning,
+            format!(
+                "'{name}' login lacks the plan scope\nrolling tokens may not unlock plan \
+                 models · a browser re-login fixes it"
+            ),
+        );
+    }
+    // The armed toast carries the quarantine clause itself; the mint-kept
+    // success has no room for it, so its fact still shows as the CLI's line.
+    if report.quarantined_misfill
+        && matches!(&report.outcome, crate::actions::RollingArmOutcome::MintKept)
+    {
+        app.toast(
+            ToastKind::Warning,
+            crate::actions::misfill_quarantined_body(name),
+        );
+    }
+    match &report.outcome {
+        crate::actions::RollingArmOutcome::Armed {
+            scopes,
+            plan,
+            daemon,
+        } => {
+            let mut detail = String::new();
+            match saved_into {
+                // A saved login leads the detail; the scope/plan count and
+                // the fresh-daemon clause step aside and the warning clauses
+                // take their short wording.
+                Some(owner) => {
+                    detail.push_str(&saved_login_notice(owner));
+                    detail.push_str(if report.active {
+                        " · installed live"
+                    } else {
+                        " · installs on the next switch"
+                    });
+                    match daemon {
+                        crate::daemon::DaemonHealth::Fresh => {}
+                        crate::daemon::DaemonHealth::Absent => {
+                            detail.push_str(" · no daemon to re-stamp it");
+                        }
+                        crate::daemon::DaemonHealth::Stale => {
+                            detail.push_str(" · daemon feed stale, re-stamps may not land");
+                        }
+                    }
+                    if report.quarantined_misfill {
+                        detail.push_str(" · mis-filled token quarantined");
+                    }
+                }
+                None => {
+                    if !scopes.is_empty() {
+                        detail.push_str(&format!(
+                            "{} scope{}",
+                            scopes.len(),
+                            if scopes.len() == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if let Some(plan) = plan {
+                        if !detail.is_empty() {
+                            detail.push_str(", ");
+                        }
+                        detail.push_str(&format!("plan {plan}"));
+                    }
+                    let mut clause = |suffix: &str| {
+                        if !detail.is_empty() {
+                            detail.push_str(" · ");
+                        }
+                        detail.push_str(suffix);
+                    };
+                    if report.active {
+                        clause("installed live");
+                    } else {
+                        clause("installs on the next switch");
+                    }
+                    clause(match daemon {
+                        crate::daemon::DaemonHealth::Fresh => "the daemon re-stamps it",
+                        crate::daemon::DaemonHealth::Absent => {
+                            "no daemon runs, so nothing re-stamps it"
+                        }
+                        crate::daemon::DaemonHealth::Stale => {
+                            "the daemon feed looks stale, re-stamps may not land"
+                        }
+                    });
+                    if report.quarantined_misfill {
+                        clause("a mis-filled token was quarantined first");
+                    }
+                }
+            }
+            app.toast(
+                ToastKind::Success,
+                format!("switched '{name}' to a rolling token\n{detail}"),
+            );
+        }
+        crate::actions::RollingArmOutcome::MintKept => {
+            let body = match saved_into {
+                // The saved login rides right after the kept-mint clause;
+                // the setup-token clause steps aside.
+                Some(owner) => format!(
+                    "rolling token set for '{name}'\nits login could not be read just now · {}",
+                    saved_login_notice(owner)
+                ),
+                None => format!(
+                    "rolling token set for '{name}'\nits login could not be read just now · \
+                     sessions stay on the setup token until the daemon re-stamps"
+                ),
+            };
+            app.toast(ToastKind::Success, body);
+        }
+    }
+}
+
+/// Compose the failure toasts for a finished arm: the danger toast carries
+/// the refusal's sentence (the typed sentences are canned copy plus a
+/// validated profile name, so they print verbatim, backticks included), with
+/// a saved login (`saved_into`) named in its head, and a stranded rollback
+/// adds the warning toast beside it. A transient reads without the HTTP
+/// status, as every TUI toast reads one; the CLI's sentence keeps it.
+fn land_rolling_switch_failure(
+    app: &mut App,
+    name: &ProfileName,
+    failure: &crate::actions::RollingArmFailure,
+    saved_into: Option<&ProfileName>,
+) {
+    // A precheck that quarantined a mis-fill before this failure still says
+    // so: the CLI prints its line on every path, and the evidence is out of
+    // the sidecar by now.
+    if failure.quarantined_misfill {
+        app.toast(
+            ToastKind::Warning,
+            crate::actions::misfill_quarantined_body(name),
+        );
+    }
+    let sentence = match &failure.refusal {
+        crate::actions::RollingArmRefusal::Transient(t) => t.text(),
+        crate::actions::RollingArmRefusal::Open(e) => escape_control(&error_toast_detail(e)),
+        refusal => refusal.sentence(name),
+    };
+    let body = match saved_into {
+        Some(owner) => format!("switch failed · {}\n{sentence}", saved_login_notice(owner)),
+        None => format!("switch failed\n{sentence}"),
+    };
+    app.toast(ToastKind::Danger, body);
+    if let Some(save_err) = &failure.rollback_stranded {
+        app.toast(
+            ToastKind::Warning,
+            crate::actions::rollback_stranded_warning_body(name.as_str(), save_err),
+        );
+    }
+}
+
+/// Land a finished rolling-token switch: the flag and the sidecar landed on
+/// disk, the outcome is toasted as it reads, and the in-flight marker clears
+/// whatever the worker reports (a panicked worker included) — the marker is
+/// what the footer's `saving` cue and the quit's exit wait both key on.
+pub(crate) fn drain_rolling_switch(app: &mut App) {
+    while let Ok(result) = app.rolling_switch_rx.try_recv() {
+        app.rolling_switch = None;
+        match result {
+            RollingSwitchResult::Ran(name, RollingSwitchDone { saved_into, ran }) => {
+                // The settle's carry never gets a toast of its own: the toast
+                // cap evicts the oldest first, so the fact rides the outcome
+                // toast instead (the success detail or the failure head).
+                match ran {
+                    Ok(RollingSwitchRan::Held {
+                        quarantined_misfill,
+                    }) => {
+                        // The precheck quarantined a mis-fill before the item
+                        // held the switch; the resumed run cannot see it, so
+                        // carry the fact to its answer (or report it if the
+                        // hold is abandoned).
+                        if quarantined_misfill {
+                            app.rolling_switch_misfill_carry = Some(name);
+                        }
+                    }
+                    Ok(RollingSwitchRan::Armed { report, relink }) => {
+                        app.refresh_tokens();
+                        app.refresh_unsaved_live_login();
+                        land_rolling_switch_success(app, &name, &report, saved_into.as_ref());
+                        // The arm landed: the success toast stays, and the
+                        // relink's own failure is a second, danger toast
+                        // beside it (the clear row's `relink failed`
+                        // precedent).
+                        if let Some(Err(e)) = relink {
+                            app.toast(
+                                ToastKind::Danger,
+                                format!(
+                                    "relink failed\n{}",
+                                    escape_control(&error_toast_detail(&e))
+                                ),
+                            );
+                        }
+                    }
+                    Err(failure) => {
+                        land_rolling_switch_failure(app, &name, &failure, saved_into.as_ref());
+                    }
+                }
+            }
+            RollingSwitchResult::Panicked => {
+                app.toast(ToastKind::Danger, "switch failed");
+            }
+        }
+    }
+}
+
 /// Land a finished delete: the stores forget the account and its open draft
 /// closes, or the refusal or failure is toasted as it reads.
 pub(crate) fn drain_profile_delete(app: &mut App) {
@@ -26812,7 +27350,20 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
         // input editor. (The other modals' `q` shortcut doesn't apply to a
         // text field.)
         KeyCode::Esc => {
+            let held = match app.modals.last() {
+                Some(Modal::NamePrompt(form))
+                    if matches!(&form.action, NamePromptAction::SaveBareItem) =>
+                {
+                    app.bare_item_naming
+                        .as_ref()
+                        .map(|naming| naming.write.clone())
+                }
+                _ => None,
+            };
             app.pop_modal();
+            if let Some(write) = held {
+                abandon_bare_item_write(app, &write);
+            }
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
@@ -26943,6 +27494,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 state.cursor,
                 &starts,
                 &block_ends,
+                &[],
                 state.viewport.get(),
                 state.scroll.get(),
                 state.total.get(),
@@ -28338,6 +28890,7 @@ fn handle_rebind_key(app: &mut App, key: KeyEvent) {
                     form.cursor,
                     &starts,
                     &block_ends,
+                    &[],
                     form.viewport.get(),
                     form.scroll.get(),
                     form.total.get(),
@@ -29188,6 +29741,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                 state.cursor,
                 &starts,
                 &block_ends,
+                &[],
                 state.viewport.get(),
                 state.scroll.get(),
                 state.total.get(),
@@ -29583,6 +30137,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 form.cursor,
                 &starts,
                 &block_ends,
+                &[],
                 form.viewport.get(),
                 form.scroll.get(),
                 form.total.get(),
@@ -29693,6 +30248,7 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
                 form.cursor,
                 &starts,
                 &block_ends,
+                &[],
                 form.viewport.get(),
                 form.scroll.get(),
                 form.total.get(),
@@ -30419,6 +30975,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_codex_login(app);
     drain_codex_new_login(app);
     drain_profile_delete(app);
+    drain_rolling_switch(app);
     // After the delete drain: a delete the bare item held has cleared its
     // in-flight mark before its question can be answered.
     drain_bare_item_answers(app);

@@ -21994,3 +21994,170 @@ fn the_cli_keeps_the_exemption_with_no_peer_write() {
     );
     crate::testutil::switch_race_seam::assert_empty();
 }
+
+// ── the shared rolling-token arm ────────────────────────────────────────────
+
+/// The shared arm action rolls the flag back on a failed arm WITHOUT
+/// rewinding a concurrent edit to another `config.toml` key made between the
+/// flag write and the failure: the rollback re-reads the profile fresh, so
+/// the peer's edit survives it.
+#[test]
+fn a_failed_arm_rolls_the_flag_back_without_rewinding_a_mid_arm_edit() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-midarm");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-expiring".to_string(),
+            refresh_token: Some("rt-expiring".to_string()),
+            // Within the gate's refresh grace, so the arm calls the refresher
+            // instead of stamping from the stored chain.
+            expires_at: Some(crate::usage::now_ms() as i64 + 60_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let edited = name.clone();
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, move |_rt: &str, _scopes: Option<&str>| {
+        // A peer's edit landing between the flag write and the arm's failure:
+        // the refresher edits another config key through the same fresh-disk
+        // writer the rollback uses, then fails the refresh.
+        crate::profile::update_profile_config(&edited, |p| {
+            p.models.default = Some("claude-sonnet-4-5".to_string());
+            Ok(())
+        })
+        .expect("the mid-arm edit lands");
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    })
+    .expect_err("the failed refresh fails the arm");
+
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "the failed arm rolls the flag back");
+    assert_eq!(
+        after.models.default.as_deref(),
+        Some("claude-sonnet-4-5"),
+        "the mid-arm edit survives the rollback"
+    );
+}
+
+/// A pre-armed profile keeps its flag on a failed arm: the rollback restores
+/// the PRIOR value, never a hardcoded off. The unrecorded grant refuses the
+/// stamp without touching the network, so the panic refresher proves the
+/// refresh never ran.
+#[test]
+fn a_pre_armed_profile_keeps_its_flag_on_a_failed_arm() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-prearmed");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-unrecorded".to_string(),
+            refresh_token: Some("rt-unrecorded".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("an unrecorded grant refuses before any refresh")
+    })
+    .expect_err("the unrecorded grant refuses the arm");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(
+        after.rolling_token,
+        "a flag that was already on is left on — the rollback restores the PRIOR value"
+    );
+}
+
+/// An account that left the roster between the pre-arm read and the flag
+/// write refuses the arm as a typed refusal: the write silently wrote
+/// nothing, so the arm must not run for it (and report a success nothing
+/// will re-stamp).
+#[test]
+fn an_account_that_left_the_roster_refuses_the_arm_typed() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-gone");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-gone".to_string(),
+            refresh_token: Some("rt-gone".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes on the roster");
+    // The account leaves the roster after the pre-arm read, before the flag
+    // write.
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![],
+        ..AppState::default()
+    })
+    .expect("the account leaves the roster");
+
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("the arm must not run for an account that left the roster")
+    })
+    .expect_err("the flag write refused");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::GoneFromRoster),
+        "{:?}",
+        failure.refusal
+    );
+    assert_eq!(
+        failure.refusal.sentence(&name),
+        "profile 'roll-gone' not found",
+        "the off-roster sentence is the CLI's own not-found head"
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "no flag was ever written");
+}

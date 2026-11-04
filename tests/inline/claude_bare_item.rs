@@ -293,7 +293,12 @@ fn every_settle_runs_above_its_gate_and_no_drain_blocks_on_a_probe() {
             actions,
             "ensure_installable(",
         ),
+        // The rolling arm lives in the shared arm half; both of its callers
+        // settle the bare item above the arm-half call, which keeps the
+        // settle above the arm on every path (the CLI's and the TUI
+        // worker's).
         ("fn cmd_rolling_token(", main, "arm_rolling_token("),
+        ("fn start_rolling_switch(", app, "arm_rolling_token("),
         ("fn spawn_switch_gate<", app, "ensure_installable("),
     ] {
         let body = item_body(text, entry, "\n}\n");
@@ -302,6 +307,23 @@ fn every_settle_runs_above_its_gate_and_no_drain_blocks_on_a_probe() {
             "{entry} settles the bare item above its {gate}"
         );
     }
+    // The pre-arm half runs before the settle in both rolling callers, so a
+    // refused switch settles nothing.
+    for (entry, text) in [
+        ("fn cmd_rolling_token(", main),
+        ("fn start_rolling_switch(", app),
+    ] {
+        let body = item_body(text, entry, "\n}\n");
+        assert!(
+            at(body, "precheck_rolling_token(", entry) < at(body, SETTLE, entry),
+            "{entry} refuses the switch before it settles"
+        );
+    }
+    assert!(
+        item_body(actions, "pub(crate) fn arm_rolling_token(", "\n}\n")
+            .contains("crate::oauth::arm_rolling_token("),
+        "the shared arm half owns the rolling arm"
+    );
     for entry in [
         "pub(super) fn drain_pending_switch(&mut self)",
         "pub(super) fn drain_pending_switch_off(&mut self)",
@@ -453,9 +475,14 @@ fn settle(
     })
 }
 
-fn settled(notice: Option<&str>, placed: Option<[u8; 32]>) -> BareItemSettle {
+fn settled(
+    notice: Option<&str>,
+    saved_into: Option<&str>,
+    placed: Option<[u8; 32]>,
+) -> BareItemSettle {
     BareItemSettle::Settled(BareItemSettled {
         notice: notice.map(str::to_string),
+        saved_into: saved_into.map(ProfileName::from),
         placed,
     })
 }
@@ -472,10 +499,8 @@ fn a_switch_saves_a_siblings_unsaved_login_before_it_writes() {
     assert_eq!(
         settled,
         self::settled(
-            Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-            ),
+            Some("saved the Keychain login Claude Code wrote into b"),
+            Some("b"),
             None
         )
     );
@@ -492,7 +517,7 @@ fn a_switch_over_a_saved_login_settles_without_a_probe() {
         |_| panic!("a saved login needs no probe"),
     )
     .expect("settle");
-    assert_eq!(settled, self::settled(None, None));
+    assert_eq!(settled, self::settled(None, None, None));
 }
 
 #[test]
@@ -586,10 +611,8 @@ fn a_switch_looks_an_uncached_profiles_account_up_and_saves_into_it() {
     assert_eq!(
         settled,
         self::settled(
-            Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-            ),
+            Some("saved the Keychain login Claude Code wrote into b"),
+            Some("b"),
             None
         )
     );
@@ -650,7 +673,7 @@ fn an_expired_login_that_strands_nothing_settles_as_before() {
         assert_eq!(
             settle_bare_item_before_write(&item, BareItemWriter::Switch, |_| panic!("no probe"))
                 .expect("settle"),
-            settled(None, None)
+            settled(None, None, None)
         );
     }
 }
@@ -769,7 +792,10 @@ fn a_switch_over_a_login_its_owner_outlived_hands_the_guard_its_key() {
         Ok("uuid-b"),
     )
     .expect("settle");
-    assert_eq!(settled, self::settled(None, Some(sha256("older-acc"))));
+    assert_eq!(
+        settled,
+        self::settled(None, None, Some(sha256("older-acc")))
+    );
     assert_eq!(fs::read(store("b")).expect("read"), before);
 }
 
@@ -788,10 +814,7 @@ fn the_leg_saves_a_siblings_successor_then_puts_the_active_login_back() {
     assert_eq!(leg.restores, vec![None]);
     assert_eq!(
         leg.lines,
-        line(
-            "the macOS Keychain login was b's, written by a Claude Code still running on it; \
-             saved it into b and put a back"
-        )
+        line("saved the Keychain login Claude Code wrote into b and put a back")
     );
 }
 
@@ -810,8 +833,8 @@ fn the_leg_saves_into_the_owner_whatever_the_active_profile_holds() {
     assert_eq!(
         keyless.lines,
         line(
-            "the macOS Keychain login was a's, written by a Claude Code still running on it; \
-             saved it into a and signed the Keychain out, since key has no login to put back"
+            "saved the Keychain login Claude Code wrote into a and signed the Keychain out, \
+             since key has no login to put back"
         )
     );
 
@@ -822,8 +845,8 @@ fn the_leg_saves_into_the_owner_whatever_the_active_profile_holds() {
     assert_eq!(
         none.lines,
         line(
-            "the macOS Keychain login was a's, written by a Claude Code still running on it; \
-             saved it into a and signed the Keychain out, since no clauth account is active"
+            "saved the Keychain login Claude Code wrote into a and signed the Keychain out, \
+             since no clauth account is active"
         )
     );
 }

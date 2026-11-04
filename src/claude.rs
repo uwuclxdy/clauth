@@ -2131,10 +2131,7 @@ pub(crate) fn bare_item_correction<'a>(
 /// The line after a writer saved the bare item's login into `owner`, which
 /// had not saved it.
 fn bare_item_saved_line(owner: &str) -> String {
-    format!(
-        "the macOS Keychain login was {owner}'s, written by a Claude Code still running on it; \
-         saved it into {owner}"
-    )
+    format!("saved the Keychain login Claude Code wrote into {owner}")
 }
 
 /// The daemon leg's line after it saved another account's login out of the
@@ -2581,7 +2578,9 @@ impl BareItemWriter {
 }
 
 /// What [`settle_bare_item_before_write`] leaves the writer: a line to show
-/// the user, and the key of an item it may replace though no store holds it
+/// the user, the owner it saved the login into (`saved_into`, the `notice`'s
+/// own data, so a consumer composes its copy instead of re-parsing the
+/// line), and the key of an item it may replace though no store holds it
 /// ([`bare_item_may_be_replaced`]'s `placed`).
 #[cfg_attr(
     not(target_os = "macos"),
@@ -2593,6 +2592,7 @@ impl BareItemWriter {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BareItemSettled {
     pub(crate) notice: Option<String>,
+    pub(crate) saved_into: Option<ProfileName>,
     pub(crate) placed: Option<[u8; 32]>,
 }
 
@@ -2835,10 +2835,12 @@ pub(crate) fn settle_bare_item_before_write(
     match carried {
         BareItemCarry::Saved => settled(BareItemSettled {
             notice: Some(bare_item_saved_line(owner.as_str())),
+            saved_into: Some(owner.clone()),
             placed: None,
         }),
         BareItemCarry::Kept => settled(BareItemSettled {
             notice: None,
+            saved_into: None,
             placed: Some(key),
         }),
         BareItemCarry::Refused => Err(bare_item_owner_refusal(owner, writer)),

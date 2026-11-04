@@ -119,7 +119,8 @@ fn claude_roster_part(config: &AppConfig) -> Vec<String> {
 
 fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
     usage_error(format!(
-        "profile '{name}' not found\navailable: {}",
+        "{}\navailable: {}",
+        actions::profile_not_found_head(name),
         parts.join(", ")
     ))
 }
@@ -2441,78 +2442,44 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     let canonical = resolve_or_bail(&config, name, "rolling-token")?;
     // Same gate `start` and `switch` take. A disabled profile is off every
     // operational surface, the re-stamp timer included, so arming one produces
-    // a bearer that dies in hours with nothing behind it.
+    // a bearer that dies in hours with nothing behind it. The shared pre-arm
+    // half re-checks this off its own fresh read; this early check answers
+    // before the settle below runs.
     refuse_if_disabled(&config, &canonical)?;
-    // Unreachable by contract — `resolve_or_bail` just proved membership — so
-    // this arm is a defensive seam, not a user-facing path (the user-facing
-    // not-found already exited 2 above).
-    let Some(profile) = config.find(&canonical) else {
-        anyhow::bail!("profile '{canonical}' vanished between resolve and read");
-    };
-
-    let Some(oauth) = profile
-        .credentials
-        .as_ref()
-        .and_then(|c| c.claude_ai_oauth.as_ref())
-    else {
-        // Third-party names the why-not and stops. A bare login WOULD mint a
-        // chain here (the browser flow; Alibaba diverts to its console), but
-        // that adds an Anthropic login to an api-key account rather than
-        // answering the request, so this arm states the missing chain and
-        // prescribes nothing. The OAuth arm keeps the tail, where the same
-        // login IS the recovery.
-        if claude::has_own_inference_endpoint(profile) {
-            anyhow::bail!("'{canonical}' has no usage OAuth chain to roll from");
+    // The pre-arm half: every refusal, the plan warning fact and the
+    // mis-fill quarantine run BEFORE the settle below, so a refused switch
+    // settles nothing, and the two warning lines describe facts that were
+    // true before the arm — they print first on an arm failure too.
+    let pre = match actions::precheck_rolling_token(&canonical) {
+        Ok(pre) => {
+            if pre.plan_incapable {
+                outln!("{}", plan_incapable_warning(&canonical));
+            }
+            if pre.quarantined_misfill {
+                outln!("{}", misfill_quarantined_line(&canonical));
+            }
+            pre
         }
-        anyhow::bail!(
-            "'{canonical}' has no usage OAuth chain to roll from; run \
-             `clauth login {canonical}` first"
-        );
+        Err(failure) => {
+            if failure.plan_incapable {
+                outln!("{}", plan_incapable_warning(&canonical));
+            }
+            if failure.quarantined_misfill {
+                outln!("{}", misfill_quarantined_line(&canonical));
+            }
+            match failure.refusal {
+                actions::RollingArmRefusal::Open(e) => return Err(e),
+                refusal => return Err(anyhow::anyhow!("{}", refusal.sentence(&canonical))),
+            }
+        }
     };
-    // A standing quarantine is checked BEFORE anything destructive runs: the
-    // arm below would only degrade-and-bail on a dead chain, and by then the
-    // mis-fill pre-clear would have removed the sidecar — leaving the profile
-    // with nothing at all, which is worse than the disengaged mis-fill it
-    // started in.
-    // Through the shared sentence, so this bail, the rotate toast and the
-    // quarantine's own log line cannot prescribe different commands for one
-    // state. Both third-party legs are reachable here: the load boundary
-    // re-reads a creds-and-no-key profile as OAuth, but a key that survives
-    // its emptiness test and fails `validate_api_key` keeps the endpoint and
-    // reaches the keyless leg (pinned with `rt-badkey`).
-    oauth::refuse_if_chain_dead(&config, Some(profile), &canonical)?;
-    // A chain captured without `user:profile`/`subscriptionType` mints bearers
-    // that still authenticate but may not unlock plan-gated models — warn
-    // rather than refuse, since the roll is otherwise correct.
-    let plan_capable = oauth
-        .scopes
-        .as_ref()
-        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
-        && oauth.subscription_type.is_some();
-    if !plan_capable {
-        outln!(
-            "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
-             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
-             models. A fresh `clauth login {canonical}` browser sign-in fixes that."
-        );
-    }
-    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
-    // operator intent — the evidence still goes to quarantine first.
-    if claude::quarantine_misfilled_sidecar(&canonical)? {
-        outln!(
-            "clauth: '{canonical}' had a mis-filled sidecar (a rotating pair). It was \
-             quarantined under the profile's quarantine/ dir before arming."
-        );
-    }
-    let is_active = config.is_active(&canonical);
-    let was_rolling = profile.rolling_token;
     // Above the arm, whose gate refreshes the chain an unsaved bare-item
-    // login may have succeeded, and before the flag below is set, so a
-    // refused settle leaves nothing to roll back.
+    // login may have succeeded, and before the arm half below can touch the
+    // flag, so a refused settle leaves nothing to roll back.
     #[cfg(target_os = "macos")]
     let mut config = config;
     #[cfg(target_os = "macos")]
-    let _placed = if is_active {
+    let _placed = if config.is_active(&canonical) {
         let writer = claude::BareItemWriter::Switch;
         let settle =
             claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
@@ -2524,110 +2491,149 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     } else {
         None
     };
-    let handle: profile::ConfigHandle =
-        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
-    // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
-    // a failed report. Persist-after looked cleaner ("nothing durable on
-    // failure") and was wrong twice over: the gate's refresh leg stamps the
-    // sidecar through the rotation hook, and that hook is FLAG-GATED — arming
-    // with the flag still false made the very refresh the arm triggered stamp
-    // nothing — and a reader walking away from `clauth rolling-token | head`
-    // exits the process at the report, which would have left an armed rolling
-    // bearer with no flag and nothing ever re-stamping it. Rollback-on-bail
-    // keeps both invariants: the arm runs with the flag it needs, and a
-    // non-zero exit from the arm leaves the flag exactly as it was found.
-    // (After a SUCCESSFUL arm the set flag is the new truth — the live-install
-    // step at the bottom can still exit non-zero, correctly leaving it on.)
-    if profile::update_profile_config(&canonical, |p| {
-        p.rolling_token = true;
-        Ok(())
-    })?
-    .is_some()
-        && let Ok(mut cfg) = handle.lock()
-        && let Some(profile) = cfg.find_mut(&canonical)
-    {
-        profile.rolling_token = true;
-    }
-    let armed =
-        oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
-            // Re-read under the handle: the gate marks a terminally dead chain
-            // `auth_broken` on its way to degrading, and that is what separates
-            // "nothing to retry" from "the daemon will get it".
-            let chain_is_broken = handle
-                .lock()
-                .ok()
-                .is_some_and(|c| c.state.auth_broken.contains(&canonical.as_str().into()));
-            report_armed_sidecar(&canonical, chain_is_broken)
-        });
-    if let Err(e) = armed {
-        if !was_rolling {
-            // The arming error is the one the operator needs; a rollback that
-            // then cannot save its own config write must not replace it.
-            match profile::update_profile_config(&canonical, |p| {
-                p.rolling_token = false;
-                Ok(())
-            }) {
-                Ok(_) => {
-                    if let Ok(mut cfg) = handle.lock()
-                        && let Some(profile) = cfg.find_mut(&canonical)
-                    {
-                        profile.rolling_token = false;
-                    }
-                }
-                Err(save_err) => errln!("{}", rollback_stranded_warning(&canonical, &save_err)),
+    // The arm half: the flag persist, the arm and the rollback.
+    let report = match actions::arm_rolling_token(pre, oauth::refresh_result) {
+        Ok(report) => report,
+        Err(failure) => {
+            if let Some(save_err) = &failure.rollback_stranded {
+                errln!("{}", rollback_stranded_warning(&canonical, save_err));
+            }
+            match failure.refusal {
+                actions::RollingArmRefusal::Open(e) => return Err(e),
+                refusal => return Err(anyhow::anyhow!("{}", refusal.sentence(&canonical))),
             }
         }
-        return Err(e);
-    }
-    if is_active {
+    };
+    // The report lines FIRST, then the live install: a failed relink still
+    // tells the operator the arm landed (and the flag stays on), then exits
+    // non-zero.
+    print_rolling_arm_report(&canonical, &report);
+    if report.active {
         claude::force_link_profile_credentials(&canonical)?;
-        outln!("clauth: installed live. New sessions run on it immediately.");
+        outln!("{}", installed_live_line());
     } else {
-        outln!("clauth: it installs on the next switch:  clauth switch {canonical}");
+        outln!("{}", next_switch_install_line(&canonical));
     }
     Ok(())
 }
 
-/// The warning for a failed arm whose ROLLBACK also failed to save: the flag
-/// is durably on with nothing armed, and this line is the only thing telling
-/// the operator that state exists and how to leave it. A save the writer
-/// REFUSED over a line's shape is the file's problem, not the directory's, so
-/// it names the line instead of pointing at write permission. A separate fn so
-/// the copy is unit-pinned and a deleted print orphans it into a dead-code
-/// error — the warning is best-effort by design (the arming error still
-/// propagates), which is exactly what made it silently deletable.
-fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
-    if let Some(refusal) = save_err
-        .chain()
-        .find_map(|e| e.downcast_ref::<profile::ConfigEditRefusal>())
-    {
-        let key = refusal.key();
-        return format!(
-            "clauth: warning: could not roll the rolling-token flag back for \
-             '{canonical}': config.toml has `{key}` in a shape clauth cannot read. \
-             Fix or remove that line, then run `clauth static-token {canonical}` to clear it"
-        );
-    }
-    if let Some(parse) = save_err
-        .chain()
-        .find_map(|e| e.downcast_ref::<profile::ConfigParseRefusal>())
-        && let Some(position) = crate::format::parse_position(parse.position())
-    {
-        return format!(
-            "clauth: warning: could not roll the rolling-token flag back for \
-             '{canonical}': config.toml does not parse ({position}). Fix that line, then run \
-             `clauth static-token {canonical}` to clear it"
-        );
-    }
+/// The stdout warning for a chain captured without
+/// `user:profile`/`subscriptionType`: the minted bearers still authenticate
+/// but may not unlock plan-gated models, so the roll proceeds and this line
+/// says what is lost. A separate fn so the copy is unit-pinned and a deleted
+/// print orphans it into a dead-code error.
+fn plan_incapable_warning(canonical: &ProfileName) -> String {
     format!(
-        "clauth: warning: could not roll the rolling-token flag back for \
-         '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \
-         `clauth static-token {canonical}` to clear it"
+        "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
+         scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
+         models. A fresh `clauth login {canonical}` browser sign-in fixes that."
     )
 }
 
-/// The re-stamp promise `report_armed_sidecar` closes on — the DAEMON's to
-/// keep, so each health state gets its own claim and none may stand in for
+/// The stdout line for a mis-filled sidecar the arm quarantined first: the
+/// evidence is preserved under the profile's quarantine/ dir before the
+/// overwrite. A separate fn so the copy is unit-pinned and a deleted print
+/// orphans it into a dead-code error.
+fn misfill_quarantined_line(canonical: &ProfileName) -> String {
+    format!("clauth: {}", actions::misfill_quarantined_body(canonical))
+}
+
+/// The production printer of the arm's report lines, off the classification
+/// the arm half made — the same fn the tests call, so a word edited in a
+/// line reds a pin rather than drifting. The install lines stay with the
+/// caller: the live install runs between this print and them.
+fn print_rolling_arm_report(canonical: &ProfileName, report: &actions::RollingArmReport) {
+    match &report.outcome {
+        actions::RollingArmOutcome::Armed {
+            scopes,
+            plan,
+            daemon,
+        } => {
+            outln!(
+                "{}",
+                rolling_token_armed_line(canonical, scopes, plan, *daemon)
+            );
+            outln!("{}", scope_widening_disclosure(canonical));
+        }
+        actions::RollingArmOutcome::MintKept => {
+            outln!("{}", rolling_token_mint_kept_line(canonical));
+        }
+    }
+}
+
+/// The armed report line: what sessions now hold, read off the arm's
+/// classification rather than assumed. A separate fn so the copy is
+/// unit-pinned and a deleted print orphans it into a dead-code error.
+fn rolling_token_armed_line(
+    canonical: &ProfileName,
+    scopes: &[String],
+    plan: &Option<String>,
+    daemon: crate::daemon::DaemonHealth,
+) -> String {
+    // The re-stamp promise is the DAEMON's to keep, so it is only made when
+    // one is actually there to keep it.
+    let restamp = restamp_promise(daemon);
+    format!(
+        "clauth: rolling token armed for '{canonical}'. Sessions now hold the \
+         usage chain's access token: {} scope(s){}{}, and no refresh token. \
+         {restamp}",
+        scopes.len(),
+        if scopes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", scopes.join(", "))
+        },
+        if let Some(plan) = plan {
+            format!(", plan {plan}")
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// The mint-kept report line: the gate was ready but the chain could not be
+/// read, so sessions stay on the static mint while the flag's rotation hook
+/// re-stamps on its next pass. A separate fn so the copy is unit-pinned and
+/// a deleted print orphans it into a dead-code error.
+fn rolling_token_mint_kept_line(canonical: &ProfileName) -> String {
+    format!(
+        "clauth: '{canonical}' usage chain could not be read just now, so \
+         sessions stay on the static mint. The flag is set. The daemon \
+         re-stamps on its next rotation."
+    )
+}
+
+/// The install line for the active account's live install. A separate fn so
+/// the copy is unit-pinned and a deleted print orphans it into a dead-code
+/// error.
+fn installed_live_line() -> String {
+    "clauth: installed live. New sessions run on it immediately.".to_string()
+}
+
+/// The install line for an idle account: the arm lands on the next switch.
+/// A separate fn so the copy is unit-pinned and a deleted print orphans it
+/// into a dead-code error.
+fn next_switch_install_line(canonical: &ProfileName) -> String {
+    format!("clauth: it installs on the next switch:  clauth switch {canonical}")
+}
+
+/// The warning for a failed arm whose ROLLBACK also failed to save: the flag
+/// is durably on with nothing armed, and this line is the only thing telling
+/// the operator that state exists and how to leave it. The body lives in
+/// `actions::rollback_stranded_warning_body` (the TUI toasts it without the
+/// prefix); this wrapper is the CLI's `clauth: warning: ` spelling, kept as
+/// a separate fn so the copy is unit-pinned and a deleted print orphans it
+/// into a dead-code error — the warning is best-effort by design (the arming
+/// error still propagates), which is exactly what made it silently deletable.
+fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
+    format!(
+        "clauth: warning: {}",
+        actions::rollback_stranded_warning_body(canonical, save_err)
+    )
+}
+
+/// The re-stamp promise `rolling_token_armed_line` closes on — the DAEMON's
+/// to keep, so each health state gets its own claim and none may stand in for
 /// another: `Fresh` promising while no daemon runs is the arm reading as
 /// durable when nothing will re-stamp it, and `Absent`'s warning on a healthy
 /// daemon buries the one real signal in noise. A separate fn so the three
@@ -2662,84 +2668,6 @@ fn scope_widening_disclosure(canonical: &str) -> String {
          every one of those scopes. `clauth static-token {canonical}` puts the mint \
          back."
     )
-}
-
-/// Say what sessions now hold, read back off disk rather than assumed.
-///
-/// The gate returns `Ready` on three paths that armed NOTHING and left the
-/// preserved mint in place (dead chain, failed sidecar write with a live mint,
-/// transient chain trouble with a live mint), and `has_session_token` is true
-/// on all of them — so a flat "armed from the usage chain" line is a lie
-/// exactly when the operator most needs the truth. `sidecar_kind` separates
-/// them exactly.
-///
-/// No confirm prompt: a security prompt on a repeatable command gets clicked
-/// through. The printed scope list plus the SECURITY.md row is the honest
-/// middle, and it is printed AFTER the fact, when it describes something real.
-fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Result<()> {
-    let Some((kind, token)) = claude::sidecar_summary(canonical) else {
-        // The gate said Ready and `has_session_token` held, yet the read-back
-        // finds nothing parseable — a race or a filesystem fault. Claiming
-        // "armed" here would be exactly the assumed-not-read report this
-        // function's contract forbids.
-        anyhow::bail!(
-            "arming reported success but '{canonical}' has no readable sidecar to verify, \
-             so nothing was confirmed. Check permissions on ~/.clauth and re-run"
-        );
-    };
-    match kind {
-        // The gate returns `Ready` on three paths that armed NOTHING and left
-        // the mint in place, and they do not deserve one message. A dead chain
-        // is not something the daemon retries out of — it needs a re-login, and
-        // a script has to be able to tell that from success.
-        claude::SidecarKind::Mint if chain_is_broken => {
-            anyhow::bail!(
-                "'{canonical}' usage chain is dead, so sessions stay on the static mint and \
-                 nothing would re-stamp a rolling token. Run `clauth login {canonical}` to \
-                 revive the chain, then re-run. The rolling-token flag was left as it was."
-            );
-        }
-        claude::SidecarKind::Mint => {
-            outln!(
-                "clauth: '{canonical}' usage chain could not be read just now, so sessions \
-                 stay on the static mint. The flag is set. The daemon re-stamps on its next \
-                 rotation."
-            );
-        }
-        claude::SidecarKind::Misfilled => {
-            // The CLI pre-cleared one before arming, so reaching this means a
-            // writer raced a fresh rotating pair back into the sidecar.
-            anyhow::bail!(
-                "'{canonical}' sidecar was re-filled with a rotating pair while arming, so \
-                 the split is disengaged and nothing was armed. Re-run, and if it repeats \
-                 find what is writing session-token.json"
-            );
-        }
-        claude::SidecarKind::Rolling => {
-            let scopes = token.scopes.clone().unwrap_or_default();
-            let plan = token.subscription_type.clone().unwrap_or_default();
-            // The re-stamp promise is the DAEMON's to keep, so it is only
-            // made when one is actually there to keep it.
-            let restamp = restamp_promise(crate::daemon::daemon_health());
-            outln!(
-                "clauth: rolling token armed for '{canonical}'. Sessions now hold the usage \
-                 chain's access token: {} scope(s){}{}, and no refresh token. {restamp}",
-                scopes.len(),
-                if scopes.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", scopes.join(", "))
-                },
-                if plan.is_empty() {
-                    String::new()
-                } else {
-                    format!(", plan {plan}")
-                },
-            );
-            outln!("{}", scope_widening_disclosure(canonical));
-        }
-    }
-    Ok(())
 }
 
 /// `clauth static-token <profile>` — put the preserved `claude setup-token`
@@ -2938,7 +2866,7 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
     // fails closed with a clearer message instead; both cases still surface
     // as exit 1 via `cmd_api_key`.
     if !profile::profile_dir(&name)?.exists() {
-        anyhow::bail!("profile '{name}' not found");
+        anyhow::bail!("{}", actions::profile_not_found_head(name.as_str()));
     }
     let stored = profile::read_api_key(&name)?;
     let key = stored.as_deref().map(str::trim).filter(|s| !s.is_empty());

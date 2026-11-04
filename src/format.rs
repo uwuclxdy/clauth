@@ -310,6 +310,7 @@ impl Cause {
 /// The status is deliberately separable: CLI stderr and the daemon log show it
 /// (neither has a companion log to read it out of) while a toast and the MCP
 /// payload do not.
+#[derive(Debug)]
 pub(crate) struct Transient {
     cause: Cause,
     status: Option<u16>,
@@ -477,11 +478,13 @@ pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String
 /// matches lands on this sentence instead, since "expired" would be false.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
-/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
-/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
-/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
-/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
-/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// the shared arm's up-front quarantine bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line.
+/// `RollingArmRefusal::sentence`'s `DeadChainKeptMint` arm carries a fourth
+/// dead-chain sentence and is deliberately NOT routed: `classify_armed_sidecar`'s
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach
+/// `Broken` for a profile with a `base_url`, so a third-party branch there is
+/// dead code.
 /// The MCP pre-flight admits that target instead of refusing it, so it renders
 /// nothing (owner ruling 2026-08-30).
 /// The command is backticked to match [`third_party_keyless`], which renders

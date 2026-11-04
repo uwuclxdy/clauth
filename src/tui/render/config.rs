@@ -252,6 +252,9 @@ struct Snap {
     bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
     disabled: bool,
+    /// The account's login is quarantined (`AppState::auth_broken`): the
+    /// `switch to a rolling token` row's dim gate, beside `disabled`.
+    auth_broken: bool,
     /// The global active profile — one of the two gates (mirroring
     /// `actions::disable_profile`'s own gate) that dims the `disabled` row inert.
     is_active: bool,
@@ -370,6 +373,15 @@ impl Snap {
         !flag_only
     }
 
+    /// The `RollingTokenSwitch` gate — ONE spelling for both render readers
+    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row`
+    /// re-derives the same judgment from the live config): inert on a
+    /// disabled account or a quarantined login, the two states the CLI
+    /// refuses up front.
+    fn rolling_switch_gated(&self) -> bool {
+        self.disabled || self.auth_broken
+    }
+
     /// Blank snapshot for the `+ new` form and the empty fallback.
     fn blank(title: &str) -> Snap {
         Snap {
@@ -395,6 +407,7 @@ impl Snap {
             usage_probe_interval: String::new(),
             bell_threshold: String::new(),
             disabled: false,
+            auth_broken: false,
             is_active: false,
             has_live_session: false,
             logged_in: false,
@@ -521,6 +534,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                     .map(crate::tui::app::format_weekly_pct)
                     .unwrap_or_default(),
                 disabled: p.is_disabled(),
+                auth_broken: cfg.state.auth_broken.contains(&p.name),
                 is_active: cfg.is_active(&p.name),
                 // The marker probe reads fresh for the selected profile only
                 // (same as `session_token` below), but the job-store walk and
@@ -1309,6 +1323,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
+        | ConfigRow::RollingTokenSwitch
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => "",
@@ -1465,6 +1480,19 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
                 hint.push_str(" · the preserved mint goes too");
             }
             return Some(hint);
+        }
+        // Gate reason first (same order as the clear row: a gate only ever
+        // bites the armable state), then the disclosure — this hint is the
+        // TUI's entire statement that the session credential gets wider.
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() && snap.disabled => {
+            "cannot switch a disabled account"
+        }
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() => {
+            "cannot switch: this login is dead · log in again first"
+        }
+        ConfigRow::RollingTokenSwitch => {
+            "sessions get this login's full-scope token, re-stamped by the daemon · \
+             wider than a setup token · no refresh token"
         }
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
@@ -1872,6 +1900,30 @@ fn detail_row(
                 ("press again to clear", theme::danger().bold())
             } else {
                 ("clear long-lived token", theme::danger().bold())
+            };
+            Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
+        // The `switch to a rolling token` row: `Delete`'s button class —
+        // always-bold DANGER, `press again to switch` once armed — because an
+        // arm retargets every future switch and, on the active account, moves
+        // a running session's credentials. Dimmed/inert (arrow included,
+        // matching the gated `disabled` row) on a disabled account or a
+        // quarantined login: `run_config_row`'s own gate no-ops there, and
+        // `Snap::rolling_switch_gated` is the one spelling both render
+        // readers share.
+        ConfigRow::RollingTokenSwitch => {
+            let gated = snap.rolling_switch_gated();
+            let row_arrow = if gated && selected {
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
+            } else {
+                arrow
+            };
+            let (label, style) = if gated {
+                ("switch to a rolling token", theme::faint())
+            } else if armed_action == Some(ConfigRow::RollingTokenSwitch) {
+                ("press again to switch", theme::danger().bold())
+            } else {
+                ("switch to a rolling token", theme::danger().bold())
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
         }
