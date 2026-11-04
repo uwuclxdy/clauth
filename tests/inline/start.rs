@@ -161,6 +161,51 @@ fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
     );
 }
 
+/// The launch's announce line (a degraded resume's "resumed pinned", the
+/// no-daemon chain line, `start --auto`'s launch line) prints only once every
+/// startup step that can still refuse has passed: the `extras.announce` print
+/// is the statement right before claude's spawn, and `run_for_code` names
+/// `extras.announce` once. Read off the comment- and whitespace-stripped text,
+/// for the reason the teardown pin above gives.
+///
+/// What it cannot decide: a failure of the spawn itself still follows the
+/// line; an early print reached through another binding of `extras`; and a
+/// caller printing the line itself before `run_for_code` (the degraded
+/// resume's own launch-line tests cover that caller, the other two have
+/// none).
+#[test]
+fn the_announce_line_is_the_last_step_before_the_spawn() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run_for_code(")
+        .expect("run_for_code is defined")
+        .1;
+    let body = body
+        .split_once("\n}\n")
+        .expect("run_for_code ends at a top-level brace")
+        .0;
+    let dense: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let announce = "ifletSome(line)=&extras.announce{errln!(\"{line}\");}";
+    assert_eq!(
+        dense.matches("extras.announce").count(),
+        1,
+        "the announce line is printed from one place"
+    );
+    let before_spawn = dense
+        .split_once("letmutchild=command.spawn()")
+        .expect("run_for_code spawns claude")
+        .0;
+    assert!(
+        before_spawn.ends_with(announce),
+        "the announce line must be the statement right before the spawn"
+    );
+}
+
 /// The production teardown plus the sessions dir it reads, so a change to either
 /// shows up here. A fresh sessions dir holds one live marker: this session's.
 fn teardown(iso_root: &std::path::Path, claude_home: &std::path::Path) -> (usize, usize) {

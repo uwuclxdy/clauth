@@ -993,6 +993,11 @@ pub(crate) struct HerdrSettings {
     /// The sidebar row `clauth herdr install` appends gains the
     /// `$clauth_delegate` token, so a running delegate reads as text.
     pub(crate) delegate_row_text: bool,
+    /// Whether a herdr restore that dropped launch options refuses the
+    /// conversation's first prompt with the restore notice.
+    /// Read by the hook only; the TUI toggle persists it without pushing
+    /// anything live.
+    pub(crate) restore_notice: bool,
     /// Set once the first herdr-mode landing fires, so that landing happens
     /// exactly once; every later launch — herdr mode included — opens the
     /// top-level `home_tab` instead.
@@ -1008,6 +1013,7 @@ impl Default for HerdrSettings {
             border_label: false,
             delegate_dot: true,
             delegate_row_text: false,
+            restore_notice: true,
             first_landing_done: false,
         }
     }

@@ -4688,16 +4688,20 @@ pub(crate) enum HerdrOption {
     BorderLabel,
     DelegateDot,
     DelegateRowText,
+    /// The `restore notice` toggle: whether a herdr restore that dropped
+    /// launch options refuses the conversation's first prompt with the notice.
+    RestoreNotice,
 }
 
 /// The options section's row order — also the ↑↓ walk order.
-pub(crate) const HERDR_OPTIONS: [HerdrOption; 6] = [
+pub(crate) const HERDR_OPTIONS: [HerdrOption; 7] = [
     HerdrOption::PopupWidth,
     HerdrOption::PaneTag,
     HerdrOption::TagRefresh,
     HerdrOption::BorderLabel,
     HerdrOption::DelegateDot,
     HerdrOption::DelegateRowText,
+    HerdrOption::RestoreNotice,
 ];
 
 impl HerdrOption {
@@ -4710,6 +4714,7 @@ impl HerdrOption {
             Self::BorderLabel => "border label",
             Self::DelegateDot => "delegate dot",
             Self::DelegateRowText => "delegate row text",
+            Self::RestoreNotice => "restore notice",
         }
     }
 }
@@ -12517,7 +12522,7 @@ fn require_after_mint(app: &mut App, pid_at_mint: Option<u32>) {
 }
 
 /// The herdr detail's keymap: ↑↓ walks the `f  heal herdr config` line (while
-/// the check offers it, the stop above the first option) and the six option
+/// the check offers it, the stop above the first option) and the option
 /// rows, wrapping; `f` walks to the fix line; `↵` on it opens the heal
 /// confirm; space and ⏎ activate a focused option, `+`/`-` step the
 /// tag-refresh stepper. Only the herdr detail routes here — every other
@@ -12594,6 +12599,11 @@ fn activate_herdr_option(app: &mut App, row: HerdrOption) {
             if herdr_config_writable(app) {
                 open_herdr_row_text_confirm(app);
             }
+        }
+        // Persisted for the hook alone, which reads it before arming the
+        // notice: no `push_herdr_knob_change`, nothing live consumes it.
+        HerdrOption::RestoreNotice => {
+            toggle_herdr_bool(app, |h| h.restore_notice = !h.restore_notice);
         }
     }
 }

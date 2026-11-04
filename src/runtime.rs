@@ -4661,7 +4661,7 @@ fn swap_support(mode: LinkMode) -> Result<(), SwapUnsupported> {
 /// once into a log nobody is reading. The transport mode is known only inside
 /// [`ProfileRuntime::acquire`]'s state-lock hold — the same hold that writes the
 /// row — so this is where the two are kept consistent. The USER-facing refusal is
-/// `start::run`'s, before a tree is built or `claude` is spawned; this is the
+/// `start::run_for_code`'s, before a tree is built or `claude` is spawned; this is the
 /// floor under it, not a substitute for it.
 fn chain_opt_in_survives(requested: bool, isolation: Isolation, mode: LinkMode) -> bool {
     requested && isolation == Isolation::Shared && swap_support(mode).is_ok()
@@ -8103,8 +8103,17 @@ pub(crate) const MANAGED_ENV_KEYS: &[&str] = &[
 /// ([`crate::actions::outgoing_env_keys`]: the active profile's, or every
 /// configured profile's with no marker to read) from `command`'s inherited
 /// env, so the target's runtime `settings.json` is the sole source for them.
-/// Shared by `clauth start` and the MCP delegate. Call before layering any
-/// caller-supplied env, so a caller can still set a key back deliberately.
+/// Also drops [`crate::hook_resume::RESTORE_MARKER_ENV`] and the degrade
+/// notice env pair ([`crate::hook_resume::DEGRADE_NOTICE_ENV`],
+/// [`crate::hook_resume::DEGRADE_MARKER_ENV`]): the marker belongs to the one
+/// `claude` a herdr restore launched and the pair to the one a degraded
+/// `clauth resume --with-fallback` launched, never a `clauth start`, a
+/// delegate, or a resume that did not degrade, spawned from inside that
+/// conversation.
+/// Shared by `clauth start` and the MCP delegate; the bare `clauth __restore`
+/// drops the degrade pair through [`crate::hook_resume::restore_command`]
+/// instead. Call before layering any caller-supplied env, so a caller can
+/// still set a key back deliberately.
 pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_keys: &[String]) {
     for key in MANAGED_ENV_KEYS {
         command.env_remove(key);
@@ -8112,16 +8121,24 @@ pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_k
     for key in stale_env_keys {
         command.env_remove(key);
     }
+    command.env_remove(crate::hook_resume::RESTORE_MARKER_ENV);
+    command.env_remove(crate::hook_resume::DEGRADE_NOTICE_ENV);
+    command.env_remove(crate::hook_resume::DEGRADE_MARKER_ENV);
 }
 
 /// Whether a process-env `key` survives [`scrub_profile_env`] into the spawned
 /// child: false for every [`MANAGED_ENV_KEYS`] key (the subagent model among
-/// them) and for an outgoing activation's custom env key (`stale_env_keys`),
-/// true otherwise. The start demand's process-env leg derives from this same
-/// definition, so a scrubbed variable never names a model the session does not
-/// run.
+/// them), for the herdr restore marker, for the degrade notice env pair, and
+/// for an outgoing activation's custom env key (`stale_env_keys`), true
+/// otherwise. The start demand's process-env leg derives from this same
+/// definition, so a scrubbed variable never names a model the session does
+/// not run.
 pub(crate) fn env_survives_scrub(key: &str, stale_env_keys: &[String]) -> bool {
-    !MANAGED_ENV_KEYS.contains(&key) && !stale_env_keys.iter().any(|k| k == key)
+    !MANAGED_ENV_KEYS.contains(&key)
+        && key != crate::hook_resume::RESTORE_MARKER_ENV
+        && key != crate::hook_resume::DEGRADE_NOTICE_ENV
+        && key != crate::hook_resume::DEGRADE_MARKER_ENV
+        && !stale_env_keys.iter().any(|k| k == key)
 }
 
 /// True when `dir` resolves to the real `$HOME`. `CLAUDE_CONFIG_DIR` only
@@ -8458,6 +8475,32 @@ pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {
         macos_proc_args2(pid).map(|args| args.environ)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The process `pid`'s argv, argv0 first: `/proc/<pid>/cmdline` on linux with
+/// empty words dropped, the `KERN_PROCARGS2` argv on macOS. `None` where it
+/// cannot be read, and on every other platform.
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            cmdline
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect(),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_proc_args2(pid).map(|args| args.argv)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

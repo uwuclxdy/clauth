@@ -4361,7 +4361,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .map(|mut b| std::mem::take(&mut *b))
         .unwrap_or_default();
 
-    // Mirrors `start::run`'s own teardown legs, in the same window: the child
+    // Mirrors `start::run_for_code`'s own teardown legs, in the same window: the child
     // has exited and the guard is still alive, so the tree is there to read.
     // See `crate::sessions::stamp_run_sessions` and, on an isolated run,
     // `crate::start::rescue_teardown`.

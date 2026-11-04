@@ -1449,6 +1449,12 @@ case "$1" in
         ;;
     esac
     ;;
+  *)
+    # Opt-in: a foreground session spawn (never `--version`, `plugin`, or a
+    # `--bg` launch, which exits above) exits with the named code, so a test
+    # drives a launch whose child exits non-zero.
+    exit "${CLAUDE_SHIM_SESSION_EXIT-0}"
+    ;;
 esac
 exit 0
 "#;
@@ -1480,6 +1486,7 @@ pub(crate) struct FakeClaude<'a> {
     prev_stderr: Option<std::ffi::OsString>,
     prev_exit: Option<std::ffi::OsString>,
     prev_grandchild_hold: Option<std::ffi::OsString>,
+    prev_session_exit: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1591,6 +1598,12 @@ impl<'a> FakeClaude<'a> {
         unsafe {
             std::env::remove_var("CLAUDE_SHIM_GRANDCHILD_HOLD");
         }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would make every session spawn exit non-zero.
+        let prev_session_exit = std::env::var_os("CLAUDE_SHIM_SESSION_EXIT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_SESSION_EXIT");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1608,6 +1621,7 @@ impl<'a> FakeClaude<'a> {
             prev_stderr,
             prev_exit,
             prev_grandchild_hold,
+            prev_session_exit,
         }
     }
 
@@ -1679,6 +1693,18 @@ impl<'a> FakeClaude<'a> {
         // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
         unsafe { std::env::set_var("CLAUDE_SHIM_GRANDCHILD_HOLD", secs) };
     }
+
+    /// Make the session spawn exit with `code` while `--version` and `plugin`
+    /// calls still succeed, so a launch reaches its child and sees it fail.
+    /// Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_session_exit(&mut self, code: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_SESSION_EXIT", code) };
+    }
 }
 
 #[cfg(unix)]
@@ -1704,6 +1730,7 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_STDERR", &self.prev_stderr),
                 ("CLAUDE_SHIM_EXIT", &self.prev_exit),
                 ("CLAUDE_SHIM_GRANDCHILD_HOLD", &self.prev_grandchild_hold),
+                ("CLAUDE_SHIM_SESSION_EXIT", &self.prev_session_exit),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),

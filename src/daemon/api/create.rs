@@ -891,6 +891,9 @@ pub(crate) fn launch_command(launcher: Launcher, args: &[&str], cwd: &Path) -> C
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_PID",
         "CODEX_HOME",
+        crate::hook_resume::RESTORE_MARKER_ENV,
+        crate::hook_resume::DEGRADE_NOTICE_ENV,
+        crate::hook_resume::DEGRADE_MARKER_ENV,
     ] {
         command.env_remove(key);
     }

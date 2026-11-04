@@ -10027,6 +10027,37 @@ fn a_session_home_is_only_positional_once_anchored() {
     );
 }
 
+/// The herdr restore marker belongs to the one `claude` that `clauth
+/// __restore` launched: a `clauth start` or a delegate spawned from inside
+/// that conversation never inherits it.
+#[test]
+fn scrub_profile_env_drops_the_herdr_restore_marker() {
+    let mut cmd = std::process::Command::new("claude");
+    scrub_profile_env(&mut cmd, &[]);
+    assert_eq!(
+        crate::testutil::env_overrides(&cmd).get(crate::hook_resume::RESTORE_MARKER_ENV),
+        Some(&None),
+    );
+}
+
+/// The degrade notice belongs to the one `claude` a degraded `clauth resume`
+/// launched: every other spawn (a `clauth start`, a delegate, a resume that
+/// did not degrade) drops what it inherited, and the start demand's env leg
+/// never reads either half as a surviving variable.
+#[test]
+fn scrub_profile_env_drops_the_degrade_notice() {
+    let mut cmd = std::process::Command::new("claude");
+    scrub_profile_env(&mut cmd, &[]);
+    let overrides = crate::testutil::env_overrides(&cmd);
+    for key in [
+        crate::hook_resume::DEGRADE_NOTICE_ENV,
+        crate::hook_resume::DEGRADE_MARKER_ENV,
+    ] {
+        assert_eq!(overrides.get(key), Some(&None), "{key}");
+        assert!(!env_survives_scrub(key, &[]), "{key}");
+    }
+}
+
 #[test]
 fn cwd_is_real_home_matches_only_the_sandboxed_home() {
     let sandbox = HomeSandbox::new();

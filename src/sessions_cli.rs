@@ -119,14 +119,140 @@ fn build_listing(tokens: bool) -> Vec<WorkspaceGroup> {
     groups
 }
 
-/// `clauth resume <id|latest> [--profile <name>]` — resume a session through the
-/// existing `clauth start` spawn path (runtime prep, signal forwarding, lifetime
-/// guard), with `--resume <id>` injected and the session's recorded workspace as
-/// the child cwd. Never a second spawn implementation. `latest` = the newest
-/// session `clauth sessions` would list first; any other value is an exact id
-/// match. Either can name a session a live isolated run holds, which is refused
-/// by name rather than resumed or silently swapped for another.
-pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()> {
+/// What a `--with-fallback` resume decided about following the fallback chain.
+/// A restore never fails over it: the two degraded answers are reported in the
+/// session, at the user's first prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainOptIn {
+    /// No `--with-fallback` was asked for.
+    Off,
+    /// Every gate passed: the session follows the chain.
+    Follow,
+    /// A restore may beat the daemon up. The session still follows the chain;
+    /// the daemon adopts the row once it runs.
+    FollowAwaitingDaemon,
+    /// A hard refusal: the session resumes pinned, and this prompt notice says
+    /// why.
+    Degraded(String),
+}
+
+/// The full degrade notice, naming the account and the cause: the launch
+/// sentence, then the in-session refusal that follows it.
+fn degrade_notice(profile: &str, reason: &DegradeReason) -> ChainOptIn {
+    ChainOptIn::Degraded(format!(
+        "{}{}",
+        degrade_launch_line(profile, reason),
+        degrade_refusal(profile)
+    ))
+}
+
+/// The degrade notice's first sentence, the whole of what the launch prints:
+/// no prompt exists yet to refuse.
+fn degrade_launch_line(profile: &str, reason: &DegradeReason) -> String {
+    format!(
+        "clauth: resumed pinned to '{profile}', not following the fallback chain: {}.",
+        degrade_clause(profile, reason)
+    )
+}
+
+/// The degrade notice's second sentence, where a prompt exists to refuse.
+fn degrade_refusal(profile: &str) -> String {
+    format!(" This prompt was not sent: submit it again to continue on '{profile}'.")
+}
+
+/// The launch line of a degrade notice: what [`degrade_notice`] built, less the
+/// refusal sentence it appends after that line.
+fn degrade_notice_launch<'a>(notice: &'a str, profile: &str) -> &'a str {
+    notice
+        .strip_suffix(degrade_refusal(profile).as_str())
+        .unwrap_or(notice)
+}
+
+/// Everything a restore can degrade to pinned over. `Membership` is
+/// [`crate::start::MembershipRefusal`], the three chain gates a resume can
+/// degrade on; a resume is always `Isolation::Shared`, and a daemon it cannot
+/// reach keeps the chain instead of degrading, so the other arms have no
+/// clause to name.
+enum DegradeReason {
+    Membership(crate::start::MembershipRefusal),
+    /// The host structurally cannot execute a per-session credential swap.
+    Transport(String),
+}
+
+/// The clause the degrade notice names for a hard chain refusal.
+fn degrade_clause(profile: &str, reason: &DegradeReason) -> String {
+    match reason {
+        DegradeReason::Membership(crate::start::MembershipRefusal::NotOauth) => {
+            format!("'{profile}' is no longer an OAuth account")
+        }
+        DegradeReason::Membership(crate::start::MembershipRefusal::NotMember) => {
+            format!("'{profile}' is no longer a fallback-chain member")
+        }
+        DegradeReason::Membership(crate::start::MembershipRefusal::NoSecondMember) => {
+            "the fallback chain has no second account to move to".to_string()
+        }
+        DegradeReason::Transport(why) => {
+            format!("this host cannot swap credentials ({why})")
+        }
+    }
+}
+
+/// The chain verdict for `clauth resume --with-fallback`: every gate a
+/// `--with-fallback` start runs, but a hard refusal degrades to pinned instead
+/// of failing the restore. The transport probe runs before the daemon gate, so
+/// an unsupported host outranks a daemon that is not up yet.
+pub(crate) fn resume_chain_opt_in(
+    config: &AppConfig,
+    name: &crate::profile::ProfileName,
+    want: bool,
+) -> ChainOptIn {
+    if !want {
+        return ChainOptIn::Off;
+    }
+    let Some(profile) = config.find(name) else {
+        return degrade_notice(
+            name.as_str(),
+            &DegradeReason::Membership(crate::start::MembershipRefusal::NotMember),
+        );
+    };
+    if let Some(refusal) = crate::start::chain_membership_refusal(config, profile) {
+        return degrade_notice(name.as_str(), &DegradeReason::Membership(refusal));
+    }
+    match crate::runtime::unsupported_swap_transport(name) {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            return degrade_notice(name.as_str(), &DegradeReason::Transport(why.to_string()));
+        }
+        Err(e) => return degrade_notice(name.as_str(), &DegradeReason::Transport(e.to_string())),
+    }
+    match crate::daemon::singleton_held() {
+        Ok(true) => ChainOptIn::Follow,
+        Ok(false) | Err(_) => ChainOptIn::FollowAwaitingDaemon,
+    }
+}
+
+/// The flag-less form of [`run_resume_with`], kept for the tests that pin the
+/// pinned-only path; production dispatch always names the flag.
+#[cfg(test)]
+pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<i32> {
+    run_resume_with(target, profile_flag, false)
+}
+
+/// `clauth resume <id|latest> [--profile <name>] [--with-fallback]` — resume a
+/// session through the existing `clauth start` spawn path (runtime prep, signal
+/// forwarding, lifetime guard), with `--resume <id>` injected and the session's
+/// recorded workspace as the child cwd. Never a second spawn implementation.
+/// `latest` = the newest session `clauth sessions` would list first; any other
+/// value is an exact id match. Either can name a session a live isolated run
+/// holds, which is refused by name rather than resumed or silently swapped for
+/// another. `--with-fallback` keeps the chain the session was started with,
+/// degrading to pinned with an in-session notice when it no longer can.
+/// Returns the resumed `claude`'s exit code.
+pub(crate) fn run_resume_with(
+    target: &str,
+    profile_flag: Option<&str>,
+    with_fallback: bool,
+) -> Result<i32> {
     crate::platform::init();
     crate::runtime::gc_stale_runtimes();
     let config = load_config()?;
@@ -167,20 +293,67 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let canonical = resolve_profile_name(&config, &chosen)?;
 
-    let resume_args = vec!["--resume".to_string(), session.id];
+    let resume_args = vec!["--resume".to_string(), session.id.clone()];
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `clauth start <name>` uses. A resume never
-    // opts into the fallback chain — there is no `--with-fallback` on this
-    // surface to ask for it.
-    crate::start::run(
-        &config,
-        &canonical,
-        &resume_args,
-        Isolation::Shared,
-        Some(&workspace),
-        false,
-        None,
-    )
+    // store, the same lifecycle a bare `clauth start <name>` uses. A
+    // `--with-fallback` resume carries the chain it was started with, degrading
+    // to pinned with an in-session notice when it no longer can.
+    match resume_chain_opt_in(&config, &canonical, with_fallback) {
+        ChainOptIn::Off => crate::start::run_for_code(
+            &config,
+            &canonical,
+            &resume_args,
+            Isolation::Shared,
+            Some(&workspace),
+            crate::start::ChainStart::Off,
+            None,
+        ),
+        // The daemon was held when the gates were read; the spawn re-reads it
+        // under the same soft gate the degraded-wait arm uses, so a daemon
+        // that dies in between never turns the restore into a refusal.
+        ChainOptIn::Follow => crate::start::run_for_code(
+            &config,
+            &canonical,
+            &resume_args,
+            Isolation::Shared,
+            Some(&workspace),
+            crate::start::ChainStart::SoftDaemon,
+            None,
+        ),
+        ChainOptIn::FollowAwaitingDaemon => {
+            let line = format!(
+                "clauth: '{}' follows the fallback chain once `clauth daemon` runs",
+                canonical.as_str()
+            );
+            crate::start::run_for_code(
+                &config,
+                &canonical,
+                &resume_args,
+                Isolation::Shared,
+                Some(&workspace),
+                crate::start::ChainStart::SoftDaemon,
+                Some(line.as_str()),
+            )
+        }
+        ChainOptIn::Degraded(text) => {
+            // The launch line goes through the announce slot, so a refused
+            // launch never claims it resumed pinned. The notice rides the
+            // launched claude's own env, naming this conversation and this
+            // launcher: nothing sits on the shared record, so a launcher
+            // killed mid-session leaves nothing behind.
+            let marker = format!("{}:{}", session.id, std::process::id());
+            let launch = degrade_notice_launch(&text, canonical.as_str()).to_owned();
+            crate::start::run_for_code(
+                &config,
+                &canonical,
+                &resume_args,
+                Isolation::Shared,
+                Some(&workspace),
+                crate::start::ChainStart::Off,
+                crate::start::LaunchExtras::with_degrade(Some(launch), text, marker),
+            )
+        }
+    }
 }
 
 /// `clauth info <id|latest>` — print the exact `clauth resume` command, the
@@ -395,7 +568,7 @@ fn resume_candidates<'a>(config: &'a AppConfig, default: &'a str) -> (Vec<&'a st
 /// marked), read a line, and take the default on empty input. TTY-only —
 /// reached only when [`resume_profile_choice`] returns `should_prompt`. An
 /// explicit `--profile <disabled>` skips this prompt entirely and is still
-/// caught by `start::run`'s authoritative refusal.
+/// caught by `start::run_for_code`'s authoritative refusal.
 fn prompt_profile(config: &AppConfig, default: &str) -> Result<String> {
     let (enabled, default) = resume_candidates(config, default);
     outln!("resume under which account?");

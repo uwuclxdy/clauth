@@ -327,6 +327,11 @@ pub(crate) enum Command {
         /// Resume under this profile instead of prompting.
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
+        /// Follow the fallback chain, as `clauth start --with-fallback` does
+        ///
+        /// If this account can no longer follow the chain, the session resumes pinned to it and says why at your first prompt. Without a running `clauth daemon`, it follows the chain once the daemon starts.
+        #[arg(long)]
+        with_fallback: bool,
     },
 
     /// Print the resume command, workspace, and storage path for a session
@@ -534,6 +539,13 @@ pub(crate) enum Command {
     OauthToken {
         /// Profile whose OAuth access token to print.
         profile: String,
+    },
+
+    /// The hidden command herdr re-runs to restore a bare pane as `claude --resume <sid>`.
+    #[command(name = "__restore", hide = true)]
+    Restore {
+        /// The Claude Code session id to resume.
+        session_id: String,
     },
 
     /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
@@ -894,7 +906,7 @@ pub(crate) enum HerdrConfigCommand {
     /// Print one knob's value on its own line
     Get {
         /// Knob name: popup_width, pane_tag, tag_watch_secs, border_label,
-        /// delegate_dot, delegate_row_text.
+        /// delegate_dot, delegate_row_text, restore_notice.
         key: String,
     },
 }

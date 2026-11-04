@@ -805,12 +805,17 @@ fn which_and_sessions_take_only_json() {
 
 #[test]
 fn resume_and_info_take_a_target_with_resume_alone_taking_a_profile() {
-    let Command::Resume { target, profile } = command(&["resume", "latest"]) else {
+    let Command::Resume {
+        target, profile, ..
+    } = command(&["resume", "latest"])
+    else {
         panic!("must parse");
     };
     assert_eq!((target.as_str(), profile), ("latest", None));
 
-    let Command::Resume { target, profile } = command(&["resume", "abc123", "--profile", "acme"])
+    let Command::Resume {
+        target, profile, ..
+    } = command(&["resume", "abc123", "--profile", "acme"])
     else {
         panic!("must parse");
     };
@@ -1458,6 +1463,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::OauthToken { profile } => assert_eq!(profile, "acme"),
         other => panic!("__oauth-token must parse, got {other:?}"),
     }
+    match command(&["__restore", "sid-1"]) {
+        Command::Restore { session_id } => assert_eq!(session_id, "sid-1"),
+        other => panic!("__restore must parse, got {other:?}"),
+    }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
 
     let help = Cli::command().render_help().to_string();
@@ -1466,6 +1475,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "__complete",
         "__api-key",
         "__oauth-token",
+        "__restore",
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",

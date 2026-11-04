@@ -1578,10 +1578,10 @@ fn the_herdr_fix_line_is_a_walk_stop_reached_by_f_and_the_arrows() {
     }
 }
 
-/// A healthy herdr detail has no fix line, so the options walk keeps its six
-/// stops and `f` does nothing there.
+/// A healthy herdr detail has no fix line, so the options walk keeps one stop
+/// per option row and `f` does nothing there.
 #[test]
-fn a_herdr_detail_without_a_fix_keeps_the_six_option_walk() {
+fn a_herdr_detail_without_a_fix_walks_the_option_rows_alone() {
     use crate::tui::app::{HERDR_OPTIONS, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -3696,10 +3696,10 @@ fn herdr_options_app(config: ConfigStatus) -> App {
     app
 }
 
-/// The six rows render their real values and glyphs on BOTH tiers — the toggle
-/// glyph is the one control the tier changes, so each tier pins its own.
+/// The seven rows render their real values and glyphs on BOTH tiers — the
+/// toggle glyph is the one control the tier changes, so each tier pins its own.
 #[test]
-fn herdr_options_render_all_six_rows_on_both_tiers() {
+fn herdr_options_render_all_seven_rows_on_both_tiers() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = herdr_options_app(healthy_config());
     let row_with = |rows: &[String], label: &str| -> String {
@@ -3737,6 +3737,10 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
         row_with(&rows, "delegate row text").contains("○─"),
         "delegate row text off:\n{screen}"
     );
+    assert!(
+        row_with(&rows, "restore notice").contains("─●"),
+        "restore notice on:\n{screen}"
+    );
     drop(full);
 
     let compatible = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
@@ -3757,6 +3761,10 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
     assert!(
         row_with(&rows, "delegate row text").contains("[off]"),
         "delegate row text [off]:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "restore notice").contains("[on]"),
+        "restore notice [on]:\n{screen}"
     );
     drop(compatible);
 }

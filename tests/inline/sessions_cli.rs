@@ -2923,3 +2923,463 @@ fn run_switch_list_prints_the_plain_session_note_after_the_rows() {
         }
     }
 }
+
+// ── `clauth resume --with-fallback` ─────────────────────────────────────────
+
+#[test]
+fn resume_parses_with_fallback() {
+    use clap::Parser as _;
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "resume", "sid", "--with-fallback"])
+        .expect("the flag parses");
+    match cli.command {
+        Some(crate::cli::Command::Resume {
+            target,
+            with_fallback,
+            ..
+        }) => {
+            assert_eq!(target, "sid");
+            assert!(with_fallback);
+        }
+        other => panic!("expected resume, got {other:?}"),
+    }
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "resume", "sid"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(crate::cli::Command::Resume {
+            with_fallback: false,
+            ..
+        })
+    ));
+}
+
+/// The eligible base: OAuth, a chain member, and a second member to move to.
+fn chain_config(name: &str) -> crate::profile::AppConfig {
+    crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            fallback_chain: vec![name.into(), "spare".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![
+            crate::profile::Profile::new(name.to_string(), None, None),
+            crate::profile::Profile::new("spare".to_string(), None, None),
+        ],
+    }
+}
+
+fn degraded(profile: &str, clause: &str) -> ChainOptIn {
+    ChainOptIn::Degraded(format!(
+        "clauth: resumed pinned to '{profile}', not following the fallback chain: {clause}. \
+         This prompt was not sent: submit it again to continue on '{profile}'."
+    ))
+}
+
+/// A restore never fails over the chain: an ineligible account resumes pinned,
+/// with the approved notice copy naming why.
+#[test]
+fn an_ineligible_chain_resume_degrades_to_pinned_with_its_reason() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let name = crate::profile::ProfileName::from("original");
+
+    let mut outside = chain_config("original");
+    outside.state.fallback_chain = vec!["spare".into(), "other".into()];
+    assert_eq!(
+        resume_chain_opt_in(&outside, &name, true),
+        degraded(
+            "original",
+            "'original' is no longer a fallback-chain member"
+        )
+    );
+
+    let mut alone = chain_config("original");
+    alone.state.fallback_chain = vec!["original".into()];
+    assert_eq!(
+        resume_chain_opt_in(&alone, &name, true),
+        degraded(
+            "original",
+            "the fallback chain has no second account to move to"
+        )
+    );
+
+    let mut keyed = chain_config("original");
+    keyed.profiles[0] = crate::profile::Profile::new(
+        "original".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-test".to_string()),
+    );
+    assert_eq!(
+        resume_chain_opt_in(&keyed, &name, true),
+        degraded("original", "'original' is no longer an OAuth account")
+    );
+}
+
+/// The eligible twin follows the chain (or, on a host that cannot swap, names
+/// that clause), and no ask means no chain and no notice.
+#[test]
+fn an_eligible_chain_resume_follows_the_chain() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let name = crate::profile::ProfileName::from("original");
+    let config = chain_config("original");
+    assert_eq!(resume_chain_opt_in(&config, &name, false), ChainOptIn::Off);
+    let verdict = resume_chain_opt_in(&config, &name, true);
+    match crate::runtime::unsupported_swap_transport(&name).expect("probe the transport") {
+        None => assert_eq!(verdict, ChainOptIn::Follow),
+        Some(_) => assert!(
+            matches!(&verdict, ChainOptIn::Degraded(text)
+                if text.starts_with("clauth: resumed pinned to 'original', not following the fallback chain: this host cannot swap credentials (")),
+            "{verdict:?}"
+        ),
+    }
+}
+
+/// At boot herdr can restore a pane before the daemon is up. That gate alone
+/// keeps the chain: the session follows it once `clauth daemon` runs, never a
+/// pinned degrade.
+#[test]
+fn a_chain_resume_before_the_daemon_runs_keeps_the_chain() {
+    let _sb = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("original");
+    let verdict = resume_chain_opt_in(&chain_config("original"), &name, true);
+    match crate::runtime::unsupported_swap_transport(&name).expect("probe the transport") {
+        None => assert_eq!(verdict, ChainOptIn::FollowAwaitingDaemon),
+        Some(_) => assert!(matches!(verdict, ChainOptIn::Degraded(_)), "{verdict:?}"),
+    }
+}
+
+// ── the `--with-fallback` restore arms drive a real spawn ───────────────────
+//
+// `resume_chain_opt_in` above is pure; these drive `run_resume_with` through
+// the repo's claude shims so the arm that acts on its verdict is pinned too.
+// The degrade rig is an account the chain cannot hold, so its launch proves the
+// chain went OFF: had the arm kept it on, `start::run` would have refused
+// before spawning. The no-daemon rig is chain-eligible with nobody holding the
+// daemon lock, so its launch proves the soft gate, and the live row read
+// MID-spawn proves the chain stayed ON.
+
+/// A resumable session `known-session` whose recorded workspace exists, with
+/// `profiles` persisted and `chain` as the stored fallback chain.
+#[cfg(unix)]
+fn resume_with_fallback_rig(sb: &HomeSandbox, profiles: &[&str], chain: &[&str]) {
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    seed_profiles(profiles, &[]);
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.fallback_chain = chain.iter().map(|n| (*n).into()).collect();
+    crate::profile::save_app_state(&state).expect("save app state");
+
+    let workspace = sb.home().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let path = claude.join("projects/-w/known-session.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "known-session",
+            &workspace.to_string_lossy(),
+            "hi",
+        )],
+    );
+}
+
+/// Whether a chain-eligible account can follow the chain on this host at all.
+/// A copy host cannot swap credentials, so every chain-on restore degrades
+/// there and the no-daemon arms are unreachable.
+#[cfg(unix)]
+fn chain_host_supported() -> bool {
+    crate::runtime::unsupported_swap_transport(&crate::profile::ProfileName::from("original"))
+        .expect("probe the transport")
+        .is_none()
+}
+
+/// The one shim call that launched the resumed conversation.
+#[cfg(unix)]
+fn resume_spawns(fake: &crate::testutil::FakeClaude<'_>) -> Vec<String> {
+    fake.spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == "--resume"))
+        .map(|(_, argv)| argv)
+        .collect()
+}
+
+/// A hard chain refusal degrades to pinned: the launch still happens, with the
+/// chain off (a chain-on launch of this account refuses before any spawn),
+/// and the notice rides the launched claude's own env, naming the
+/// conversation and this launcher, never the shared record: a launcher killed
+/// mid-session (a closed terminal's SIGHUP) leaves nothing behind there for a
+/// later process of the conversation to be refused with.
+#[cfg(unix)]
+#[test]
+fn a_degraded_resume_hands_its_claude_the_notice_and_spawns_pinned() {
+    let sb = HomeSandbox::new();
+    // OAuth, but not a fallback-chain member.
+    resume_with_fallback_rig(&sb, &["original"], &[]);
+    let ChainOptIn::Degraded(notice) = degraded(
+        "original",
+        "'original' is no longer a fallback-chain member",
+    ) else {
+        panic!("the fixture clause must build a degrade notice");
+    };
+
+    // The slow shim keeps the resumed child alive for the observation, and the
+    // live row exists only while that child is alive (teardown unregisters it):
+    // waiting for the row, then reading the record, reads it MID-spawn.
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let record_path = crate::hook_note::record_path("known-session", None).expect("record path");
+    // The shim records its own pid; its argv and env, read while it runs, are
+    // what the resume really spawned.
+    let pid_file = sb.home().join(".slow-claude.pid");
+    let observer = std::thread::spawn(move || {
+        let seen = crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "original",
+            Duration::from_secs(20),
+        );
+        let record_notice =
+            crate::hook_note::load_record(&record_path).and_then(|r| r.restore_notice);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut argv: Vec<String> = Vec::new();
+        let mut environ: Vec<String> = Vec::new();
+        while argv.is_empty() && std::time::Instant::now() < deadline {
+            let pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok());
+            argv = pid
+                .and_then(crate::runtime::process_argv)
+                .map(|words| {
+                    words
+                        .into_iter()
+                        .map(|w| String::from_utf8_lossy(&w).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            environ = pid
+                .and_then(crate::runtime::process_environ)
+                .map(|bytes| {
+                    bytes
+                        .split(|b| *b == 0)
+                        .map(|w| String::from_utf8_lossy(w).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if argv.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        (!seen.is_empty(), record_notice, argv, environ)
+    });
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a degrade must resume pinned, not refuse");
+    drop(guard);
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+
+    let (live, record_notice, spawned, environ) = observer.join().expect("observer thread");
+    drop(shim);
+
+    assert!(live, "the resumed conversation was observed alive");
+    assert_eq!(
+        record_notice, None,
+        "nothing is armed on the shared record while the resume runs"
+    );
+    // macOS hides a platform binary's env (the `/bin/sh` shim) from its
+    // reader, so the env half is read on linux.
+    #[cfg(target_os = "linux")]
+    {
+        let notice_entry = format!("{}={notice}", crate::hook_resume::DEGRADE_NOTICE_ENV);
+        let marker_entry = format!(
+            "{}=known-session:{}",
+            crate::hook_resume::DEGRADE_MARKER_ENV,
+            std::process::id()
+        );
+        assert!(
+            environ.contains(&notice_entry),
+            "the launched claude carries the notice in its env"
+        );
+        assert!(
+            environ.contains(&marker_entry),
+            "the launched claude's env names the conversation and this launcher"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (environ, &notice);
+    assert!(
+        spawned
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == "known-session"),
+        "the launch resumes the requested conversation: {spawned:?}"
+    );
+    // At launch no prompt exists yet, so stderr carries the reason alone, never
+    // the refusal's "This prompt was not sent" sentence.
+    let launch_line = "clauth: resumed pinned to 'original', not following the fallback chain: \
+                       'original' is no longer a fallback-chain member.\n";
+    assert_eq!(
+        stderr.matches(launch_line).count(),
+        1,
+        "the degrade reason is said once on stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("This prompt was not sent"),
+        "no prompt exists at launch: {stderr:?}"
+    );
+    assert_eq!(
+        crate::hook_note::load_record(
+            &crate::hook_note::record_path("known-session", None).expect("record path")
+        )
+        .and_then(|r| r.restore_notice),
+        None,
+        "nothing is left on the record once the session ends"
+    );
+}
+
+/// A degraded resume whose claude exits non-zero (a refused resume, a crash, a
+/// signal) exits with that code and leaves no notice on the record for a
+/// later resume's first prompt.
+#[cfg(unix)]
+#[test]
+fn a_degraded_resume_that_exits_nonzero_keeps_the_code() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original"], &[]);
+    let mut fake = crate::testutil::FakeClaude::new(&sb);
+    fake.set_session_exit("3");
+    let code = run_resume_with("known-session", Some("original"), true)
+        .expect("a degrade must resume pinned, not refuse");
+    assert_eq!(code, 3, "clauth exits with the resumed claude's code");
+    assert_eq!(
+        crate::hook_note::load_record(
+            &crate::hook_note::record_path("known-session", None).expect("record path")
+        )
+        .and_then(|r| r.restore_notice),
+        None,
+        "no notice is left on the record"
+    );
+}
+
+/// A restore that beats the daemon up keeps the chain: the launch clears the
+/// soft daemon gate (a strict one would refuse the absent daemon before any
+/// spawn) and prints the wait once.
+#[cfg(unix)]
+#[test]
+fn a_no_daemon_resume_spawns_with_the_chain_on() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original", "spare"], &["original", "spare"]);
+    if !chain_host_supported() {
+        return;
+    }
+    let fake = crate::testutil::FakeClaude::new(&sb);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a no-daemon resume must keep the chain, not refuse");
+    drop(guard);
+
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+    assert!(
+        stderr.contains("clauth: 'original' follows the fallback chain once `clauth daemon` runs"),
+        "the wait is said once on stderr: {stderr:?}"
+    );
+    let spawns = resume_spawns(&fake);
+    assert_eq!(spawns.len(), 1, "one resume launch: {spawns:?}");
+
+    let record = crate::hook_note::load_record(
+        &crate::hook_note::record_path("known-session", None).expect("record path"),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        record.restore_notice, None,
+        "a no-daemon restore keeps the chain, so no prompt is refused"
+    );
+}
+
+/// The chain-on arm hands `follows_chain = true` to the runtime: read off the
+/// live row MID-spawn, which is the only place it is visible (teardown removes
+/// it). The shim keeps the child alive for the read.
+#[cfg(unix)]
+#[test]
+fn a_no_daemon_resume_registers_a_row_that_follows_the_chain() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original", "spare"], &["original", "spare"]);
+    if !chain_host_supported() {
+        return;
+    }
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let observer = std::thread::spawn(move || {
+        crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "original" && row.follows_chain,
+            Duration::from_secs(20),
+        )
+    });
+
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a no-daemon resume must keep the chain, not refuse");
+    let seen = observer.join().expect("observer thread");
+    drop(shim);
+
+    assert!(
+        seen.iter()
+            .any(|row| row.start_profile == "original" && row.follows_chain && !row.isolated),
+        "the resume's row must follow the chain ({} rows observed)",
+        seen.len()
+    );
+}
+
+/// A degrade whose launch is then refused (here a disabled account) resumed
+/// nothing, so stderr carries the refusal alone, never the launch line that
+/// says the session resumed pinned.
+#[cfg(unix)]
+#[test]
+fn a_refused_degraded_resume_never_says_it_resumed() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &[], &[]);
+    seed_profiles(&[], &["original"]);
+    let _fake = crate::testutil::FakeClaude::new(&sb);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let err = run_resume_with("known-session", Some("original"), true)
+        .expect_err("a disabled account refuses the launch");
+    drop(guard);
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+    assert!(
+        !stderr.contains("clauth: resumed pinned to 'original'"),
+        "a refused launch claimed a resume: {stderr:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        crate::disabled_account_refusal(&crate::profile::ProfileName::from("original")),
+        "the refusal is the disabled-account one"
+    );
+    assert_eq!(stderr, "", "the refusal is all the caller prints");
+}
+
+/// A degrade whose launch is then refused (here a disabled account) resumed
+/// nothing, so it must leave no notice behind: a later resume of the same
+/// conversation would otherwise have its first prompt refused for a restore
+/// that never happened.
+#[cfg(unix)]
+#[test]
+fn a_refused_degraded_resume_leaves_no_notice() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &[], &[]);
+    seed_profiles(&[], &["original"]);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+
+    run_resume_with("known-session", Some("original"), true)
+        .expect_err("a disabled account refuses the launch");
+
+    let record = crate::hook_note::load_record(
+        &crate::hook_note::record_path("known-session", None).expect("record path"),
+    )
+    .unwrap_or_default();
+    assert_eq!(record.restore_notice, None);
+    assert!(resume_spawns(&fake).is_empty(), "nothing was launched");
+}

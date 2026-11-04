@@ -502,7 +502,10 @@ printf '%s\n' "${{COMPREPLY[@]}}"
             "the typed prefix filters the words after `{verb}`"
         );
     }
-    assert_eq!(complete("clauth resume --", 2), vec!["--profile"]);
+    assert_eq!(
+        complete("clauth resume --", 2),
+        vec!["--profile", "--with-fallback"]
+    );
     // `resume --profile <name> <id>` is a valid order, so the id is still owed
     // after the flag's value; the flag's own value is a profile.
     assert_eq!(complete(r#"clauth resume --profile """#, 3), vec!["work"]);
@@ -1397,9 +1400,19 @@ fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     // install flags above.
     assert!(
         BASH.contains(
-            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text""#
+            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice""#
         ),
         "bash's `config get` arm offers the knobs and nothing else"
+    );
+    assert!(
+        ZSH.contains("'restore_notice[restore dropped-options notice]'"),
+        "zsh's `config get` arm offers the restore_notice knob"
+    );
+    assert!(
+        FISH.contains(
+            r#"-a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice" -d "Knob name""#
+        ),
+        "fish's `config get` arm offers the knobs and nothing else"
     );
     // The subcommand offer itself stays gated on `herdr` alone: the flag
     // offer below it is the only one the `install` clause may gate.

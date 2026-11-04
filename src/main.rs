@@ -239,9 +239,10 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
 /// print for this command: the user-facing commands only. The bare TUI/help
 /// path returns before this is reached; the daemon's stderr is `daemon.log`,
 /// `clauth mcp`'s is Claude Code's, a hook's is its caller's, `__complete`'s
-/// is the shell's prompt, and every hidden `__*`/helper command is a machine
-/// channel — none of them should print a notice onto the stderr their caller
-/// already owns.
+/// is the shell's prompt, and the hidden `__*`/helper commands below are
+/// machine channels — none of them should print a notice onto the stderr
+/// their caller already owns. `__restore` is not one: it becomes the pane's
+/// own `claude`, whose stderr is the user's terminal.
 fn load_notices_apply(command: &Command) -> bool {
     !matches!(
         command,
@@ -338,8 +339,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Resume { target, profile } => {
-            sessions_cli::run_resume(&target, profile.as_deref())
+        Command::Resume {
+            target,
+            profile,
+            with_fallback,
+        } => {
+            sessions_cli::run_resume_with(&target, profile.as_deref(), with_fallback).map(|code| {
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            })
         }
         Command::Info { target } => sessions_cli::run_info(&target),
         Command::Daemon {
@@ -389,6 +398,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => cmd_complete(codex, live_sessions, resumable),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::OauthToken { profile } => cmd_oauth_token(&profile),
+        Command::Restore { session_id } => hook_resume::run_restore(&session_id),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
         Command::Proxy { cmd } => cmd_proxy(cmd),
@@ -2266,8 +2276,9 @@ pub(crate) fn disabled_account_refusal(name: &ProfileName) -> String {
 
 /// Refuse `name` as a switch/start target when it's user-disabled. Called by
 /// [`cmd_switch`] and [`cmd_start`] as a friendly early check, and by
-/// `start::run` — the authoritative chokepoint every session-spawn path
-/// (`cmd_start`, `sessions_cli::run_resume`) funnels through — so all three
+/// `start::run_for_code` — the authoritative chokepoint every session-spawn
+/// path (`cmd_start`, `sessions_cli::run_resume_with`) funnels through — so
+/// all three
 /// callers share one message instead of drifting.
 fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {

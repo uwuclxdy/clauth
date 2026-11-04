@@ -2350,6 +2350,7 @@ fn option_row(
         HerdrOption::DelegateRowText => {
             spans.extend(toggle_value(settings.delegate_row_text, inert))
         }
+        HerdrOption::RestoreNotice => spans.extend(toggle_value(settings.restore_notice, inert)),
     }
     vec![Line::from(spans)]
 }
@@ -2387,7 +2388,8 @@ fn option_unit(row: HerdrOption) -> &'static str {
         | HerdrOption::PaneTag
         | HerdrOption::BorderLabel
         | HerdrOption::DelegateDot
-        | HerdrOption::DelegateRowText => "",
+        | HerdrOption::DelegateRowText
+        | HerdrOption::RestoreNotice => "",
     }
 }
 

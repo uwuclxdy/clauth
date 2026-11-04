@@ -74,7 +74,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
         COMPREPLY=( $(compgen -W "get" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ] && [ "${COMP_WORDS[3]}" = "get" ]; then
-        COMPREPLY=( $(compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "install" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
@@ -98,7 +98,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--profile --with-fallback" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "${COMP_WORDS[1]}" = "resume" ] || [ "${COMP_WORDS[1]}" = "info" ]; }; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "resume" ] && [ "${COMP_WORDS[2]}" = "--profile" ]; then
@@ -199,7 +199,7 @@ _clauth() {
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config ]]; then
         _values 'subcommand' 'get[print the knob value on one line]'
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config && "${words[4]}" == get ]]; then
-        _values 'key' 'popup_width[how the entrypoint pane opens]' 'pane_tag[publish the profile tag token]' 'tag_watch_secs[per-pane tag watcher interval]' 'border_label[split-pane border account label]' 'delegate_dot[delegate pane metadata]' 'delegate_row_text[delegate text beside the sidebar row]'
+        _values 'key' 'popup_width[how the entrypoint pane opens]' 'pane_tag[publish the profile tag token]' 'tag_watch_secs[per-pane tag watcher interval]' 'border_label[split-pane border account label]' 'delegate_dot[delegate pane metadata]' 'delegate_row_text[delegate text beside the sidebar row]' 'restore_notice[restore dropped-options notice]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == install ]]; then
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip every prompt]' '-y[skip every prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
@@ -265,13 +265,13 @@ _clauth() {
         local -a sids
         sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
         _describe 'session' sids
-        [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]'
+        [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]' '--with-fallback[follow the fallback chain, as clauth start --with-fallback does]'
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
         local -a sids
         sids=(${(f)"$(clauth __complete --resumable 2>/dev/null)"})
         _describe 'session' sids
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]] && (( ! profile_on_line )); then
-        _values 'flag' '--profile[resume under this profile instead of prompting]'
+        _values 'flag' '--profile[resume under this profile instead of prompting]' '--with-fallback[follow the fallback chain, as clauth start --with-fallback does]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
@@ -370,7 +370,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Inst
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"
 complete -c clauth -f -n "__fish_seen_subcommand_from config" -a get -d "Print the knob value on one line"
-complete -c clauth -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
+complete -c clauth -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice" -d "Knob name"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --key -d "Key that opens the dashboard"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip every prompt"
@@ -415,6 +415,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit t
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --live -d "Only the sessions running now; opens no transcript"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume; and not contains -- --profile (commandline -opc)" -a --profile -d "Resume under this profile instead of prompting"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume; and not contains -- --with-fallback (commandline -opc)" -a --with-fallback -d "Follow the fallback chain, as clauth start --with-fallback does"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
 complete -c clauth -f -n '__fish_seen_subcommand_from resume; and set -l t (commandline -opc); and test "$t[-1]" = --profile' -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session

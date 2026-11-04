@@ -2311,6 +2311,7 @@ fn herdr_settings_round_trip_through_the_app_load_path() {
         "border_label = true\n",
         "delegate_dot = false\n",
         "delegate_row_text = true\n",
+        "restore_notice = false\n",
         "first_landing_done = true\n",
     ));
     let config = crate::profile::load_config().expect("load");
@@ -2321,6 +2322,7 @@ fn herdr_settings_round_trip_through_the_app_load_path() {
         border_label: true,
         delegate_dot: false,
         delegate_row_text: true,
+        restore_notice: false,
         first_landing_done: true,
     };
     assert_eq!(config.state.herdr, want);
@@ -2379,6 +2381,7 @@ fn herdr_config_get_answers_every_default_with_no_profiles_toml() {
         ("border_label", "off"),
         ("delegate_dot", "on"),
         ("delegate_row_text", "off"),
+        ("restore_notice", "on"),
     ] {
         assert_eq!(
             herdr_value(&config.state.herdr, key).expect("value"),
@@ -2401,6 +2404,7 @@ fn herdr_config_get_honors_written_knobs_through_the_real_load_path() {
         "border_label = true\n",
         "delegate_dot = false\n",
         "delegate_row_text = true\n",
+        "restore_notice = false\n",
     ));
     let config = crate::profile::load_config().expect("load");
     for (key, want) in [
@@ -2410,6 +2414,7 @@ fn herdr_config_get_honors_written_knobs_through_the_real_load_path() {
         ("border_label", "on"),
         ("delegate_dot", "off"),
         ("delegate_row_text", "on"),
+        ("restore_notice", "off"),
     ] {
         assert_eq!(
             herdr_value(&config.state.herdr, key).expect("value"),
@@ -2535,6 +2540,7 @@ fn herdr_config_get_unknown_key_is_a_usage_error_naming_the_valid_keys() {
         "border_label",
         "delegate_dot",
         "delegate_row_text",
+        "restore_notice",
     ] {
         assert!(msg.contains(key), "the error must name {key}: {msg}");
     }

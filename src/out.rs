@@ -87,7 +87,7 @@ pub(crate) fn write_chunk<W: Write>(
 /// A reader that left ends the run at exit 0: it is not this run failing, so a
 /// pipeline reports whatever the reader returned. The exit is immediate and
 /// runs no destructor, which every stdout writer in the crate is already clear
-/// of — the session guards live inside `start::run`, which prints nothing.
+/// of — the session guards live inside `start::run_for_code`, which prints nothing.
 pub(crate) fn emit(args: Arguments<'_>, newline: bool) {
     #[cfg(test)]
     if captured(&args, newline) {

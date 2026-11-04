@@ -24633,6 +24633,28 @@ fn herdr_pane_tag_toggles_and_persists() {
     assert!(herdr_knobs().pane_tag, "and back");
 }
 
+/// `restore notice`: the last options row; space toggles the
+/// knob the hook reads before it arms the dropped-options notice, and the
+/// value persists through the real save/load path.
+#[test]
+fn herdr_restore_notice_toggles_and_persists() {
+    use super::{HERDR_OPTIONS, HerdrOption, KeyCode, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
+    assert_eq!(HERDR_OPTIONS.last(), Some(&HerdrOption::RestoreNotice));
+    assert_eq!(HerdrOption::RestoreNotice.label(), "restore notice");
+    let mut app = herdr_options_app();
+    app.services.herdr_options_cursor = HERDR_OPTIONS.len() - 1;
+    let space = crate::testutil::key(KeyCode::Char(' '));
+
+    assert!(herdr_knobs().restore_notice, "on by default");
+    handle_key(&mut app, space);
+    assert!(!herdr_knobs().restore_notice, "space flips on → off");
+    handle_key(&mut app, space);
+    assert!(herdr_knobs().restore_notice, "and back");
+}
+
 /// `tag refresh`: `+`/`-` step live with a floor of 1, ⏎ opens the typed editor
 /// (commits on ⏎, discards on ⎋, invalid input stays in the editor) — the
 /// Config-tab refresh-interval mechanism.
@@ -24829,8 +24851,8 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
     assert!(!herdr_knobs().delegate_row_text);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
-        app.services.herdr_options_cursor, 0,
-        "selection wraps past the inert row"
+        app.services.herdr_options_cursor, 6,
+        "selection walks past the inert row onto `restore notice`"
     );
 
     app.services.herdr_options_cursor = 4;

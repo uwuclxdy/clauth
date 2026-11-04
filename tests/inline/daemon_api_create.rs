@@ -1854,6 +1854,16 @@ fn the_launch_command_strips_the_session_env_and_runs_in_the_cwd() {
         ] {
             assert!(removed.contains(key), "{key} is removed: {removed:?}");
         }
+        // The restore marker and the degrade notice pair belong to the one
+        // claude a restore or a degraded resume launched, never a session the
+        // daemon starts.
+        for key in [
+            crate::hook_resume::RESTORE_MARKER_ENV,
+            crate::hook_resume::DEGRADE_NOTICE_ENV,
+            crate::hook_resume::DEGRADE_MARKER_ENV,
+        ] {
+            assert!(removed.contains(key), "{key} is removed: {removed:?}");
+        }
     }
     let claude = launch_command(Launcher::Claude, &["--bg"], cwd);
     let removed: std::collections::BTreeSet<String> = claude

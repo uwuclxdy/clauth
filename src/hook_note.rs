@@ -254,6 +254,50 @@ pub(crate) struct NoteRecord {
     /// (`resume_not_accepted`), so the next main-scope fire re-sends it.
     #[serde(default)]
     pub(crate) resume_pending: bool,
+    /// The option NAMES a bare `claude` conversation was STARTED with,
+    /// recorded at its first `SessionStart` — a startup, a `/clear`, or a fork,
+    /// whose new conversation id keeps the process — so a restored process's
+    /// option names can be compared with what it lost. Names only, as
+    /// [`crate::hook_resume::option_names`] reads them — never a positional
+    /// word, nor a value unless it is itself shaped like an option: a
+    /// credential passed on the command line must not reach the record or the
+    /// notice. `None` on every record written
+    /// before the field existed, and on a `clauth start` session, whose own
+    /// per-spawn flags would always differ from the restored argv.
+    #[serde(default)]
+    pub(crate) launch_options: Option<Vec<String>>,
+    /// The resume command (the report's argv tail) this record last reported
+    /// to herdr, written when the seq is minted. `None` on every record from
+    /// before the field existed: such a record's stored argv cannot be trusted
+    /// to be the one this fire would send, so the next fire re-reports once.
+    #[serde(default)]
+    pub(crate) reported_argv: Option<Vec<String>>,
+    /// The restore dropped or could not keep something: the next main-scope
+    /// prompt is refused with this text once (see [`crate::hook_resume`]).
+    /// Only the herdr arm writes it: the degrade notice rides the launched
+    /// claude's env, never this record.
+    #[serde(default)]
+    pub(crate) restore_notice: Option<String>,
+    /// The process [`Self::restore_notice`] belongs to, by the `CLAUDE_PID` the
+    /// herdr arm read: the restored process a herdr restore stamped. A take
+    /// delivers a record notice only to the process it names and drops a
+    /// notice that names another or none. Kept after a delivery as the herdr
+    /// arm's spent mark, so an in-process `/resume` back into the conversation
+    /// arms nothing and a second prompt of the same process gets nothing. The
+    /// degrade env take neither reads nor writes it; that channel's mark is
+    /// [`Self::degrade_told`].
+    #[serde(default)]
+    pub(crate) restore_notice_pid: Option<u32>,
+    /// The `CLAUDE_PID`s of claudes a degraded resume launched that were
+    /// already refused once with the env notice ([`crate::hook_resume`]): the
+    /// env take refuses each of them at most once, so a second prompt of the
+    /// same claude — or an in-process `/resume` back into the conversation —
+    /// is never refused again, whatever other processes of the conversation
+    /// deliver in between. Empty on every record written before the field
+    /// existed — the `#[serde(default)]` upgrade gate that keeps old records
+    /// parsing.
+    #[serde(default)]
+    pub(crate) degrade_told: Vec<u32>,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -406,6 +450,15 @@ pub(crate) fn run() -> Result<()> {
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
+    // A restore that dropped something refuses the restored process's first
+    // main-scope prompt once. Claude Code shows the reason to the user, keeps
+    // it out of the model's context, and re-attaches the original prompt to
+    // the block, so this fire's only document is the block envelope: the
+    // prompt never runs, and every other leg waits for the next one.
+    if let Some(reason) = crate::hook_resume::take_restore_notice(&payload) {
+        outln!("{}", block_envelope(&reason));
+        return Ok(());
+    }
     // One `load_config` per fire, shared by its two consumers — the account
     // note's resolve (gate-open only) and the nudge reader (every eligible
     // agent-spawn fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
@@ -488,6 +541,16 @@ fn envelope(event: &str, note: &str) -> serde_json::Value {
             "hookEventName": event,
             "additionalContext": note,
         }
+    })
+}
+
+/// Claude Code's `UserPromptSubmit` block shape: the reason is shown to the
+/// user and never reaches the model, and the host appends the original prompt
+/// to the very message that refuses it.
+pub(crate) fn block_envelope(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": reason,
     })
 }
 
@@ -891,8 +954,8 @@ fn touch_record(path: &Path) {
 /// something already holding it degrades after the wait instead of hanging.
 /// Today there is no such nesting: `note_for_inner`, `nudge_note`,
 /// `gc_conversation_records`, `hook_context::context_note` and the
-/// resume-report leg's seq mint and re-send arm are the only holders and none
-/// reaches another.
+/// resume-report leg's seq mint, re-send arm and restore-notice record and
+/// take are the only holders and none reaches another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -931,9 +994,9 @@ impl ScopeLock {
                 wait,
                 |waited| {
                     anyhow::anyhow!(
-                        "timed out after {:.0}s acquiring the scope lock; another clauth \
+                        "timed out after {} ms acquiring the scope lock; another clauth \
                          process or thread holds ~/.clauth/conversations/.lock",
-                        waited.as_secs_f64()
+                        waited.as_millis()
                     )
                 },
                 "failed to acquire the scope lock",

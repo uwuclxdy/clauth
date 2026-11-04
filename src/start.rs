@@ -150,6 +150,151 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
     )
 }
 
+/// Why `clauth start --with-fallback` refuses; [`refusal_message`] renders each
+/// cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainIneligible {
+    /// clap already refuses the flag pair; this arm is for a caller that
+    /// bypasses it, where `chain_opt_in_survives` would drop the opt-in
+    /// silently.
+    Isolated,
+    /// A third-party account gets a chain the walk cannot move it off, so an
+    /// opted-in one would follow nothing, in silence.
+    NotOauth,
+    /// `snapshot_session_chain` returns `None` for a member outside the chain,
+    /// so the row is skipped every tick with nothing said.
+    NotMember,
+    /// A chain holding only this profile gives `next_auto_switch_target`
+    /// nowhere to point. Same silence as a non-member.
+    NoSecondMember,
+    /// The daemon singleton's lock exists but cannot be tested.
+    DaemonUnchecked,
+    /// Only the daemon's decision leg writes `intended_member`, so with no
+    /// daemon the flag is inert.
+    NoDaemon,
+    /// The host structurally cannot execute a per-session credential swap.
+    Transport(crate::runtime::SwapUnsupported),
+}
+
+/// The `clauth start` refusal for `refusal`, each text pinned by
+/// `tests/inline/start.rs`.
+fn refusal_message(name: &ProfileName, refusal: &ChainIneligible) -> String {
+    match refusal {
+        ChainIneligible::Isolated => {
+            format!(
+                "'{name}': --with-fallback cannot be combined with --isolated, since an isolated session follows no chain"
+            )
+        }
+        ChainIneligible::NotOauth => {
+            format!(
+                "'{name}': --with-fallback needs an OAuth account, but this one has a custom base url"
+            )
+        }
+        ChainIneligible::NotMember => {
+            format!(
+                "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on the fallback tab of the `clauth` TUI, or start without it"
+            )
+        }
+        ChainIneligible::NoSecondMember => {
+            format!(
+                "'{name}': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab of the `clauth` TUI, or start without it"
+            )
+        }
+        ChainIneligible::DaemonUnchecked => {
+            format!(
+                "'{name}': --with-fallback needs a running daemon and this host could not be checked for one"
+            )
+        }
+        ChainIneligible::NoDaemon => {
+            format!(
+                "'{name}': --with-fallback needs a running daemon to decide switches, run `clauth daemon`"
+            )
+        }
+        ChainIneligible::Transport(why) => unsupported_host_refusal(name, *why),
+    }
+}
+
+/// The chain-membership gates, in the order both surfaces ask them. Narrower
+/// than [`ChainIneligible`] because these three are exactly what a restore can
+/// degrade on, and its own isolation is always `Shared`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipRefusal {
+    NotOauth,
+    NotMember,
+    NoSecondMember,
+}
+
+impl From<MembershipRefusal> for ChainIneligible {
+    fn from(refusal: MembershipRefusal) -> Self {
+        match refusal {
+            MembershipRefusal::NotOauth => Self::NotOauth,
+            MembershipRefusal::NotMember => Self::NotMember,
+            MembershipRefusal::NoSecondMember => Self::NoSecondMember,
+        }
+    }
+}
+
+/// The chain gates that answer WITHOUT touching the disk, in refusal order.
+/// Shared by `clauth start`'s refusal and the restore's degrade: both must ask
+/// the same questions or the two surfaces drift apart.
+pub(crate) fn chain_membership_refusal(
+    config: &AppConfig,
+    profile: &Profile,
+) -> Option<MembershipRefusal> {
+    let name = &profile.name;
+    if !profile.is_oauth() {
+        return Some(MembershipRefusal::NotOauth);
+    }
+    if !config.state.fallback_chain.iter().any(|n| n == name) {
+        return Some(MembershipRefusal::NotMember);
+    }
+    if !config.state.fallback_chain.iter().any(|n| n != name) {
+        return Some(MembershipRefusal::NoSecondMember);
+    }
+    None
+}
+
+/// How a start follows the fallback chain, if at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainStart {
+    /// No `--with-fallback`: the session stays on its launch account.
+    Off,
+    /// The flag is inert without a daemon, so a start refuses then.
+    Strict,
+    /// The daemon gate is soft: the row follows the chain even while no daemon
+    /// runs, and the daemon adopts it once it does. Every chain-on resume uses
+    /// this, so a daemon dying between the restore's own check and this one
+    /// never turns a restore into a refusal; the caller prints the wait for it
+    /// when it decided the daemon was not up.
+    SoftDaemon,
+}
+
+impl From<bool> for ChainStart {
+    fn from(follows_chain: bool) -> Self {
+        if follows_chain {
+            Self::Strict
+        } else {
+            Self::Off
+        }
+    }
+}
+
+impl ChainStart {
+    fn follows_chain(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// The strict gate the `--with-fallback` refusal tests drive.
+#[cfg(test)]
+fn refuse_unless_chain_eligible(
+    config: &AppConfig,
+    profile: &crate::profile::Profile,
+    isolation: Isolation,
+) -> Result<()> {
+    refuse_unless_chain_eligible_with(config, profile, isolation, ChainStart::Strict)
+}
+
 /// Every reason `--with-fallback` cannot be honored for `name`, refused before
 /// `acquire` builds a tree and long before `claude` is spawned. A flag that
 /// silently leaves the session on its launch account is the one outcome the live
@@ -159,77 +304,49 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
 /// order, and the transport probe runs last. That ordering is load-bearing: a
 /// start refused for a cause the user can act on never materializes a profile
 /// dir for an account that never launched.
-fn refuse_unless_chain_eligible(
+fn refuse_unless_chain_eligible_with(
     config: &AppConfig,
     profile: &crate::profile::Profile,
     isolation: Isolation,
+    chain: ChainStart,
 ) -> Result<()> {
     let name = &profile.name;
-    // clap already refuses the flag pair, so this is for a caller that bypasses
-    // it: `chain_opt_in_survives` drops an isolated opt-in silently, which is the
-    // one outcome every gate here exists to prevent.
     if isolation == Isolation::Isolated {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "'{name}': --with-fallback cannot be combined with --isolated, since an \
-             isolated session follows no chain"
-        ))
-        .into());
+        return Err(chain_refusal(name, &ChainIneligible::Isolated));
     }
-    // The decision leg's freshness gate reads only the OAuth status store. That
-    // is sound because a third-party-launched session gets a chain the walk
-    // cannot move it off — so an opted-in one would follow nothing, in silence.
-    if !profile.is_oauth() {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "'{name}': --with-fallback needs an OAuth account, but this one has a custom base url"
-        ))
-        .into());
+    if let Some(refusal) = chain_membership_refusal(config, profile) {
+        return Err(chain_refusal(name, &refusal.into()));
     }
-    // `snapshot_session_chain` returns `None` for a member outside the chain, so
-    // the row is skipped every tick with nothing said.
-    if !config.state.fallback_chain.iter().any(|n| n == name) {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on \
-             the fallback tab of the `clauth` TUI, or start without it"
-        ))
-        .into());
-    }
-    // Membership alone is not enough: a chain holding only this profile gives
-    // `next_auto_switch_target` nowhere to point, and both `Off` and a stay-put
-    // `None` write nothing on the session path. Same silence as a non-member.
-    if !config.state.fallback_chain.iter().any(|n| n != name) {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "'{name}': --with-fallback needs a second account in the fallback chain to \
-             move to; add one on the fallback tab of the `clauth` TUI, or start without it"
-        ))
-        .into());
-    }
-    // Only the daemon's decision leg writes `intended_member`, so with no daemon
-    // the flag is inert. `singleton_held` is the decision-side reader: it
-    // separates "nobody there" from "can't tell", and a host that cannot be
-    // checked cannot run the decider on it either, so both refuse.
-    let held = crate::daemon::singleton_held()
-        .with_context(|| {
-            format!(
-                "'{name}': --with-fallback needs a running daemon and this host could not be checked for one"
+    // `singleton_held` is the decision-side reader: it separates "nobody
+    // there" from "can't tell", and a host that cannot be checked cannot run
+    // the decider on it either, so both refuse a start. A restore keeps the
+    // chain through both: the row follows it once the daemon runs.
+    match crate::daemon::singleton_held() {
+        Ok(true) => {}
+        Ok(false) if chain == ChainStart::Strict => {
+            return Err(chain_refusal(name, &ChainIneligible::NoDaemon));
+        }
+        Err(e) if chain == ChainStart::Strict => {
+            return Err(StartRefusal::WithFallback(
+                e.context(refusal_message(name, &ChainIneligible::DaemonUnchecked)),
             )
-        })
-        .map_err(StartRefusal::WithFallback)?;
-    if !held {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "'{name}': --with-fallback needs a running daemon to decide switches, \
-             run `clauth daemon`"
-        ))
-        .into());
+            .into());
+        }
+        Ok(false) | Err(_) => {}
     }
-    // Last, because it is the only gate that touches disk.
+    // Last, because it is the only gate that touches disk. A restore runs it
+    // even with no daemon: an unsupported transport outranks the soft daemon
+    // gate, so the restore degrades with the transport clause.
     if let Some(why) = crate::runtime::unsupported_swap_transport(name)? {
-        return Err(StartRefusal::WithFallback(anyhow::anyhow!(
-            "{}",
-            unsupported_host_refusal(name, why)
-        ))
-        .into());
+        return Err(chain_refusal(name, &ChainIneligible::Transport(why)));
     }
     Ok(())
+}
+
+/// A `--with-fallback` refusal as the typed [`StartRefusal::WithFallback`]
+/// every surface maps to its error code.
+fn chain_refusal(name: &ProfileName, refusal: &ChainIneligible) -> anyhow::Error {
+    StartRefusal::WithFallback(anyhow::anyhow!("{}", refusal_message(name, refusal))).into()
 }
 
 /// The refusals every start runs before any side effect, shared by [`run`] and
@@ -245,12 +362,28 @@ pub(crate) fn admit<'a>(
     follows_chain: bool,
     claude_args: &[String],
 ) -> Result<&'a Profile> {
+    admit_with(
+        config,
+        name,
+        isolation,
+        ChainStart::from(follows_chain),
+        claude_args,
+    )
+}
+
+fn admit_with<'a>(
+    config: &'a AppConfig,
+    name: &ProfileName,
+    isolation: Isolation,
+    chain: ChainStart,
+    claude_args: &[String],
+) -> Result<&'a Profile> {
     crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
-    if follows_chain {
-        refuse_unless_chain_eligible(config, profile, isolation)?;
+    if chain.follows_chain() {
+        refuse_unless_chain_eligible_with(config, profile, isolation, chain)?;
     }
-    refuse_background_start(name, isolation, follows_chain, claude_args)?;
+    refuse_background_start(name, isolation, chain.follows_chain(), claude_args)?;
     Ok(profile)
 }
 
@@ -705,16 +838,48 @@ pub(crate) fn resumed_agent(claude_args: &[String]) -> ResumedAgent {
     }
 }
 
-/// Every resume form in the args: the exact-id values given (`--resume <v>`,
-/// `--resume=<v>`, `-r <v>`, `-r<v>`), and whether any form clauth cannot pin
-/// is present (`--continue`/`-c`, `--from-pr`, `--teleport`, `--cloud`, a bare
-/// `--resume` with no value or a `-`-prefixed token beside it, `-r=<v>`, whose
-/// `=` the short-option spelling hands Claude Code as part of the value). A
-/// value-taking `-r` in a short-flag cluster consumes the rest of its own token,
-/// else the next token; a `c` in the same cluster is `--continue` with getopt
-/// semantics.
+/// The exact-id resume values in the args and whether any unpinnable resume
+/// form is present; [`scan_resume_forms`] is the walk that finds them.
 fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
-    let claude_args = claude_option_args(claude_args);
+    let scan = scan_resume_forms(claude_option_args(claude_args));
+    (scan.values, scan.unpinnable)
+}
+
+/// What one argv token is, as far as the resume forms go.
+#[derive(Debug)]
+pub(crate) enum ResumeWord {
+    /// No resume form here: the token says how the process runs.
+    Kept,
+    /// A resume spelling, or the value one consumed: the token goes.
+    Dropped,
+    /// A short cluster that resumed and still carries other flags: those
+    /// flags, the `c` of `--continue` removed, for a caller to re-spell as
+    /// `-<rest>`. Never empty.
+    Remainder(String),
+}
+
+/// One walk over the args for every resume form Claude Code's parser accepts,
+/// so the transcripts clauth can pin and the restore argv a bare pane is
+/// compared against ([`crate::hook_resume`]) read them one way.
+///
+/// The forms: an exact-id value (`--resume <v>`, `--resume=<v>`, `-r <v>`,
+/// `-r<v>`) and whether any form clauth cannot pin is present (`--continue`/`-c`,
+/// `--from-pr`, `--teleport`, `--cloud`, a bare `--resume` with no value or a
+/// `-`-prefixed token beside it, `-r=<v>`, whose `=` the short-option spelling
+/// hands Claude Code as part of the value). A value-taking `-r` in a short-flag
+/// cluster consumes the rest of its own token, else the next token; a `c` in the
+/// same cluster is `--continue` with getopt semantics.
+pub(crate) struct ResumeScan<'a> {
+    /// One entry per input token, in order.
+    pub(crate) words: Vec<ResumeWord>,
+    /// The exact-id values the resume spellings gave.
+    pub(crate) values: Vec<&'a str>,
+    /// Whether any form clauth cannot pin to a transcript is present.
+    pub(crate) unpinnable: bool,
+}
+
+pub(crate) fn scan_resume_forms(claude_args: &[String]) -> ResumeScan<'_> {
+    let mut words = Vec::with_capacity(claude_args.len());
     let mut values = Vec::new();
     let mut unpinnable = false;
     let mut i = 0;
@@ -722,25 +887,56 @@ fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
         let arg = claude_args[i].as_str();
         if let Some(value) = arg.strip_prefix("--resume=") {
             values.push(value);
+            words.push(ResumeWord::Dropped);
         } else if arg == "--resume" {
             // A token starting with `-` is a flag, never a resume value
             // (`--resume --verbose` is a bare `--resume`).
             match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
                 Some(value) => {
                     values.push(value.as_str());
+                    words.push(ResumeWord::Dropped);
+                    words.push(ResumeWord::Dropped);
                     i += 1;
                 }
-                None => unpinnable = true,
+                None => {
+                    unpinnable = true;
+                    words.push(ResumeWord::Dropped);
+                }
             }
-        } else if arg == "--continue"
-            || arg == "--from-pr"
+        } else if arg == "--continue" {
+            // It resumes here, but names no transcript clauth can pin.
+            unpinnable = true;
+            words.push(ResumeWord::Dropped);
+        } else if arg == "--from-pr"
             || arg.starts_with("--from-pr=")
             || arg == "--teleport"
             || arg.starts_with("--teleport=")
             || arg == "--cloud"
             || arg.starts_with("--cloud=")
         {
+            // These start another conversation rather than resuming this one,
+            // so they are no resume spelling and the token stands.
             unpinnable = true;
+            words.push(ResumeWord::Kept);
+        } else if arg.starts_with("--session-id=") {
+            // Names the conversation the restore resumes, never an option a
+            // restore could drop: a conversation spelling the hook's strip
+            // removes, and no resume value (a pinned id is not a resume form).
+            words.push(ResumeWord::Dropped);
+        } else if arg == "--session-id" {
+            // The spaced spelling consumes its value like `--resume`, still a
+            // conversation spelling and still no resume value.
+            if claude_args.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
+                words.push(ResumeWord::Dropped);
+                words.push(ResumeWord::Dropped);
+                i += 1;
+            } else {
+                words.push(ResumeWord::Dropped);
+            }
+        } else if arg == "--fork-session" {
+            // A fork starts a new conversation id; the flag names the
+            // conversation, never an option a restore could drop.
+            words.push(ResumeWord::Dropped);
         } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.starts_with('-')) {
             match shorts.char_indices().find(|&(_, c)| c == 'r') {
                 Some((at, _)) => {
@@ -749,26 +945,53 @@ fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
                     let rest = &shorts[at + 1..];
                     if !rest.is_empty() {
                         values.push(rest);
+                        words.push(leftover_word(&shorts[..at]));
                     } else {
                         match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
                             Some(value) => {
                                 values.push(value.as_str());
+                                words.push(leftover_word(&shorts[..at]));
+                                words.push(ResumeWord::Dropped);
                                 i += 1;
                             }
-                            None => unpinnable = true,
+                            None => {
+                                unpinnable = true;
+                                words.push(leftover_word(&shorts[..at]));
+                            }
                         }
                     }
                     if shorts[..at].contains('c') {
                         unpinnable = true;
                     }
                 }
-                None if shorts.contains('c') => unpinnable = true,
-                None => {}
+                None if shorts.contains('c') => {
+                    unpinnable = true;
+                    words.push(leftover_word(shorts));
+                }
+                None => words.push(ResumeWord::Kept),
             }
+        } else {
+            words.push(ResumeWord::Kept);
         }
         i += 1;
     }
-    (values, unpinnable)
+    ResumeScan {
+        words,
+        values,
+        unpinnable,
+    }
+}
+
+/// A resumed short cluster's surviving flags: its prefix carries no `r`, so
+/// only the `c` of `--continue` comes out. A cluster that was all resume
+/// letters is [`ResumeWord::Dropped`].
+fn leftover_word(shorts: &str) -> ResumeWord {
+    let rest: String = shorts.chars().filter(|&c| c != 'c').collect();
+    if rest.is_empty() {
+        ResumeWord::Dropped
+    } else {
+        ResumeWord::Remainder(rest)
+    }
 }
 
 /// The model strings alone of [`member_launch_demand`]: what a call site that
@@ -1109,22 +1332,77 @@ fn refuse_background_start(
     Ok(())
 }
 
+/// What a launch prints and hands to the spawned claude beyond the runtime's
+/// own env: the announce line, and the degrade notice env pair a degraded
+/// `clauth resume --with-fallback` passes on. A plain `Option<&str>` converts
+/// to the announce-only shape, so callers that never degrade keep passing the
+/// announce line alone; [`LaunchExtras::with_degrade`] sets the pair whole,
+/// so no caller can build one with a lone half.
+pub(crate) struct LaunchExtras {
+    pub(crate) announce: Option<String>,
+    pub(crate) degrade: Option<(String, String)>,
+}
+
+impl LaunchExtras {
+    /// The degraded-resume shape: the launch line to announce and the notice
+    /// env pair — the notice text and the `<conversation>:<launcher pid>`
+    /// marker — which a degraded resume always carries together.
+    pub(crate) fn with_degrade(announce: Option<String>, notice: String, marker: String) -> Self {
+        Self {
+            announce,
+            degrade: Some((notice, marker)),
+        }
+    }
+}
+
+impl From<Option<&str>> for LaunchExtras {
+    fn from(announce: Option<&str>) -> Self {
+        Self {
+            announce: announce.map(str::to_owned),
+            degrade: None,
+        }
+    }
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &ProfileName,
     claude_args: &[String],
     isolation: Isolation,
     workspace: Option<&Path>,
-    follows_chain: bool,
-    announce: Option<&str>,
+    chain: impl Into<ChainStart>,
+    extras: impl Into<LaunchExtras>,
 ) -> Result<()> {
-    let profile = admit(config, name, isolation, follows_chain, claude_args)?;
-
-    // Announced after the refusals, so a start that `admit` refuses never
-    // announces first.
-    if let Some(line) = announce {
-        errln!("{line}");
+    let code = run_for_code(
+        config,
+        name,
+        claude_args,
+        isolation,
+        workspace,
+        chain,
+        extras,
+    )?;
+    if code != 0 {
+        std::process::exit(code);
     }
+    Ok(())
+}
+
+/// A session launch's exit code, with the process-exit decision left to the
+/// caller: a caller that must run something after the session ends cannot go
+/// through [`run`].
+pub(crate) fn run_for_code(
+    config: &AppConfig,
+    name: &ProfileName,
+    claude_args: &[String],
+    isolation: Isolation,
+    workspace: Option<&Path>,
+    chain: impl Into<ChainStart>,
+    extras: impl Into<LaunchExtras>,
+) -> Result<i32> {
+    let chain = chain.into();
+    let extras = extras.into();
+    let profile = admit_with(config, name, isolation, chain, claude_args)?;
 
     // The plugin-migration pre-flight: heal a broken or divergent clauth
     // marketplace registration before the session launches, so the session loads
@@ -1153,7 +1431,7 @@ pub(crate) fn run(
         // A background launch lands on the account's one fixed tree, which the
         // daemon adopts on its next tick. `--with-fallback` keeps its own
         // per-launch tree: the fixed tree never follows the chain.
-        if background_flag(claude_args).is_some() && !follows_chain {
+        if background_flag(claude_args).is_some() && !chain.follows_chain() {
             ProfileRuntime::acquire_background(
                 &profile.name,
                 BackgroundHold::Launcher,
@@ -1165,7 +1443,7 @@ pub(crate) fn run(
                 profile,
                 isolation,
                 &stale_env_keys,
-                follows_chain,
+                chain.follows_chain(),
                 crate::live_sessions::Launcher::Own,
             )?
         }
@@ -1189,6 +1467,15 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     engine.scrub_env(&mut command, &stale_env_keys);
+    // The degrade notice env pair, layered after the scrub so the scrub
+    // cannot drop it: it belongs to the one claude this degraded resume
+    // launches. Every other claude session clauth launches — a start, a
+    // delegate, a bare `__restore` — drops an inherited pair instead of
+    // passing it on.
+    if let Some((notice, marker)) = &extras.degrade {
+        command.env(crate::hook_resume::DEGRADE_NOTICE_ENV, notice);
+        command.env(crate::hook_resume::DEGRADE_MARKER_ENV, marker);
+    }
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings
@@ -1248,6 +1535,11 @@ pub(crate) fn run(
         spawn_cwd.as_deref(),
         &env_models,
     );
+    // Announced only after every startup step that can still refuse has
+    // passed: only the spawn's own failure can follow it.
+    if let Some(line) = &extras.announce {
+        errln!("{line}");
+    }
     let mut child = command.spawn().context("failed to spawn claude")?;
     // Record the child's pid and the launch demand's resolved families on the
     // row once the child exists: the daemon's spend-cap decision leg joins a
@@ -1298,14 +1590,11 @@ pub(crate) fn run(
         rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
 
-    // Drop runtime before process::exit so final sync + refcount cleanup runs.
+    // Drop runtime before the code reaches the caller's exit, so final sync +
+    // refcount cleanup runs.
     drop(runtime);
 
-    let code = status_code(outcome.status, outcome.signal);
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    Ok(status_code(outcome.status, outcome.signal))
 }
 
 /// Resolve the directory the spawned `claude` runs in and pin `command` to it.
