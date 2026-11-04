@@ -452,6 +452,22 @@ pub(crate) fn cap_drawn(text: &str, max: usize) -> String {
     kept
 }
 
+/// A server-sent code or result shown back to the operator with each character
+/// escaped on its own before the cut, so the cut can neither drop a control
+/// character nor split an escape; inside double quotes an apostrophe needs no
+/// escape, as `{:?}` on a string prints it.
+pub(crate) fn quoted_escaped(text: &str) -> String {
+    crate::format::truncate_escaped(
+        text,
+        40,
+        |c| match c {
+            '\'' => c.to_string(),
+            _ => c.escape_debug().to_string(),
+        },
+        true,
+    )
+}
+
 /// An RFC 3339 stamp as local wall-clock time, or the raw text (made
 /// terminal-safe) when it does not parse — a stamp shown verbatim beats one
 /// dropped.
@@ -749,19 +765,7 @@ pub(crate) fn outcome_line(
              run `clauth limit-reset {name} --list` to see what is left"
         )),
         ConsumeOutcome::Unknown(code) => {
-            // Each character is escaped on its own before the cut, so the cut
-            // can neither drop a control character nor split an escape; inside
-            // double quotes an apostrophe needs no escape, as `{:?}` on a string
-            // prints it.
-            let shown = crate::format::truncate_escaped(
-                &code,
-                40,
-                |c| match c {
-                    '\'' => c.to_string(),
-                    _ => c.escape_debug().to_string(),
-                },
-                true,
-            );
+            let shown = quoted_escaped(&code);
             Err(format!(
                 "codex answered the reset request for '{name}' with an unrecognized code \
                  {shown}, so the outcome is unconfirmed; {}",

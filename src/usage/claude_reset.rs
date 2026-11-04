@@ -17,12 +17,13 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::codex_reset::{
-    FailureVoice, cap_drawn, re_send_deadline, re_send_hint, read_failure as shared_read_failure,
-    read_reply, spend_failure as shared_spend_failure, stamp, trim_padding,
+    FailureVoice, cap_drawn, quoted_escaped, re_send_deadline, re_send_hint,
+    read_failure as shared_read_failure, read_reply, spend_failure as shared_spend_failure, stamp,
+    trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
 use super::fetch::AuthClient;
-use crate::format::{local_stamp, plural, shows_nothing, terminal_safe, truncate};
+use crate::format::{local_stamp, plural, shows_nothing, terminal_safe};
 
 /// The reset inventory read: the poll's `/usage` path plus the two query flags
 /// Claude Code's own read adds.
@@ -635,12 +636,14 @@ pub(crate) fn spend_outcome_line(
              unconfirmed; {}",
             re_send_hint(sent_at_ms)
         )),
-        SpendOutcome::Unknown(other) => Err(format!(
-            "Anthropic answered the reset request for '{name}' with an unrecognized result \
-             {:?}, so the outcome is unconfirmed; {}",
-            truncate(&other, 40),
-            re_send_hint(sent_at_ms)
-        )),
+        SpendOutcome::Unknown(other) => {
+            let shown = quoted_escaped(&other);
+            Err(format!(
+                "Anthropic answered the reset request for '{name}' with an unrecognized result \
+                 {shown}, so the outcome is unconfirmed; {}",
+                re_send_hint(sent_at_ms)
+            ))
+        }
     }
 }
 

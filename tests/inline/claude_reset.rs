@@ -407,7 +407,7 @@ fn server_text_drops_format_characters_and_is_bounded() {
         );
         assert!(
             !text.contains(&"x".repeat(41)),
-            "a server reason is cut to 40 characters: {text}"
+            "a server reason is cut to 40 cells: {text}"
         );
     }
     assert!(prompt.contains("\"Weekly refill\u{200b}\""), "{prompt}");
@@ -624,4 +624,45 @@ fn a_spend_reply_is_settled_only_on_a_defined_result() {
     ] {
         assert_eq!(spend_settled(&reply(json)), want, "{json}");
     }
+}
+
+/// A server reason is capped by drawn cells: a 2-cell glyph spends two of the
+/// 37 cells the 40-cell cap leaves beside its `...`, so 18 of them fit.
+#[test]
+fn a_server_reason_cap_counts_wide_glyphs_by_cells() {
+    let reason = "漢".repeat(70);
+    let json =
+        format!(r#"{{"result":"unavailable","reason":"{reason}","resets_left":1,"cleared":[]}}"#);
+    assert_eq!(
+        spend_outcome_line("cl1", &reply(&json), 1_700_000_000_000),
+        Err(format!(
+            "that limit reset on 'cl1' is unavailable ({}...), so no reset was used",
+            "漢".repeat(18)
+        ))
+    );
+}
+
+/// An unrecognized result is escaped before it is cut, as the codex arm's
+/// unrecognized code is: the two-cell `\n` escape counts against the 37-cell
+/// content budget, so 30 x's leave room for 5 y's, and `...` sits outside the
+/// quotes.
+#[test]
+fn an_unrecognized_result_is_cut_after_it_is_escaped() {
+    let sent_at_ms = 1_700_000_000_000;
+    let json = format!(
+        r#"{{"result":"{}\n{}","reason":null,"resets_left":null,"cleared":[]}}"#,
+        "x".repeat(30),
+        "y".repeat(20)
+    );
+    assert_eq!(
+        spend_outcome_line("cl1", &reply(&json), sent_at_ms),
+        Err(format!(
+            "Anthropic answered the reset request for 'cl1' with an unrecognized result \
+             \"{}\\n{}\"..., so the outcome is unconfirmed; a re-run before {} re-sends the \
+             same request",
+            "x".repeat(30),
+            "y".repeat(5),
+            resend_deadline(sent_at_ms)
+        ))
+    );
 }
