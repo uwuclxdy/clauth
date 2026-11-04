@@ -1591,11 +1591,11 @@ fn disabled_row_type_cell_does_not_pulse() {
             .map(|s| s.style.fg)
             .collect()
     };
-    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
-    // first frame, 1444ms its crest.
+    // The disabled `a` draws no row, so `b` draws first and starts its cycle
+    // unstaggered: 0ms is its sweep's flat first frame, 450ms its crest.
     assert_ne!(
-        enabled_snapshot(994),
-        enabled_snapshot(1444),
+        enabled_snapshot(0),
+        enabled_snapshot(450),
         "control: an enabled credentialed row's type cell really does animate"
     );
 }
@@ -8424,4 +8424,70 @@ fn each_providers_first_row_crests_apart_from_the_others() {
             );
         }
     }
+}
+
+/// A disabled account draws no Overview row and no count in the panel's
+/// title: the table lists the accounts that can serve.
+#[test]
+fn a_disabled_account_has_no_overview_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, ra) = polled("acct-a", 95.0, 10.0, 3600);
+    let (mut b, rb) = polled("acct-b", 95.0, 10.0, 3600);
+    b.disabled = true;
+    let (c, rc) = polled("acct-c", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(vec![(a, ra), (b, rb), (c, rc)], None, vec![]);
+    let app = App::new(config);
+    let rows = accounts_rows(&app, 110, 8);
+    assert!(
+        rows[0].contains("2 claude"),
+        "the title counts the rows shown: {:?}",
+        rows[0]
+    );
+    let table = rows.join("\n");
+    assert!(
+        table.contains("acct-a") && table.contains("acct-c"),
+        "{table}"
+    );
+    assert!(
+        !table.contains("acct-b"),
+        "the disabled account has no row: {table}"
+    );
+}
+
+/// A roster of disabled accounts alone says so, rather than reading as no
+/// roster at all.
+#[test]
+fn every_account_disabled_reads_its_own_empty_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut a, ra) = polled("acct-a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let (config, _readings) = config_with(vec![(a, ra)], None, vec![]);
+    let app = App::new(config);
+    let table = accounts_rows(&app, 110, 10).join("\n");
+    assert!(
+        table.contains("every claude account is disabled"),
+        "{table}"
+    );
+    assert!(!table.contains("no accounts yet"), "{table}");
+}
+
+/// The columns are sized off the rows the table draws: a disabled account's
+/// long name does not widen the name column.
+#[test]
+fn a_disabled_account_does_not_size_the_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut long, rl) = polled("a-disabled-account-with-a-long-name", 95.0, 10.0, 3600);
+    long.disabled = true;
+    let (alone, _) = config_with(vec![polled("a", 95.0, 10.0, 3600)], None, vec![]);
+    let (with_long, readings) = config_with(
+        vec![polled("a", 95.0, 10.0, 3600), (long, rl)],
+        None,
+        vec![],
+    );
+    let alone = App::new(alone);
+    let with_long = App::new(with_long);
+    assert_eq!(
+        OverviewWidths::new(110, &with_long, &readings).name,
+        OverviewWidths::new(110, &alone, &readings).name,
+    );
 }
