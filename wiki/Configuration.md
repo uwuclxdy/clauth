@@ -188,6 +188,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] border_label` | bool | `false` | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
+| `[herdr] restore_notice` | bool | `true` | after a herdr restore of a bare pane that lost launch options, refuse its first prompt once with a notice naming them ([Claude Code plugin](Claude-Code-Plugin)); off stops new notices arming |
 | `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
 | `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
 | `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all, herdr panes and background sessions alike; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
