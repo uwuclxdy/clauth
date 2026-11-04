@@ -85,6 +85,14 @@ advisor  = "opus"                         # advisorModel, the server-side adviso
 
 An unset `default` or `advisor` removes its key rather than leaving the last one in place. An account with no `advisor` row therefore strips any `advisorModel` from the `settings.json` a switch or a start writes. That includes a global one you set by hand or with Claude Code's own `/advisor` command: a switch removes it from `~/.claude/settings.json` itself, and a start leaves it out of the session's copy. Claude Code's advisor is then off on that account unless you ask for it with a `--advisor` flag, so set `advisor` on each account that should keep one. `advisor` takes an alias (`opus`) or a full model id, and it is a model like any other for what an account has to serve: `clauth start --auto` and the MCP delegate count it ([Auto-Switch](Auto-Switch#choosing-where-a-session-starts)). No built-in preset binds it.
 
+`effort` is a top-level key of its own, outside `[models]`:
+
+```toml
+effort  = "high"      # CLAUDE_CODE_EFFORT_LEVEL, the session's reasoning effort
+```
+
+It takes `low`, `medium`, `high`, `xhigh` or `max`, or any custom value, passed through verbatim. Every value rides `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the one effort carrier a running Claude Code re-reads live, so a set effort outranks `/effort` in the session — and clauth never writes `effortLevel`, which stays Claude Code's own key. An unset `effort` writes the env key empty, so `/effort` and Claude Code's default apply, and a live session moved to another account takes that account's effort within seconds. A `CLAUDE_CODE_EFFORT_LEVEL` exported in your shell is dropped at `clauth start` and delegate spawns, so it reaches neither. Every switch and launch rewrites `CLAUDE_CODE_EFFORT_LEVEL` in the settings file it writes, so a value you set there by hand is replaced by the account's effort, or by the empty value when it has none — set the account's `effort`, or its `[env]` key, instead. A `CLAUDE_CODE_EFFORT_LEVEL` in an account's own `[env]` outranks its `effort`.
+
 ## Presets
 
 A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Five ship built in:
@@ -225,7 +233,8 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
-| `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active; when one replaces a value your own `settings.json` held, clauth saves that value, and a switch to an account without the key puts it back unless you changed or deleted it meanwhile (never for a key clauth sets from an endpoint or model field; a value an older clauth replaced before an update was never saved, so that key is removed instead, and while an older clauth still runs and switches, a value you deleted can come back) |
+| `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active; when one replaces a value your own `settings.json` held, clauth saves that value, and a switch to an account without the key puts it back unless you changed or deleted it meanwhile (never for a key clauth sets from an endpoint, model or effort field; a value an older clauth replaced before an update was never saved, so that key is removed instead, and while an older clauth still runs and switches, a value you deleted can come back) |
+| `effort` | string | none | the account's reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` or a custom value; every value rides `CLAUDE_CODE_EFFORT_LEVEL` in settings.json ([above](Configuration#model-routing)). The Setup tab's `effort` row edits it |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent`, `advisor` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
