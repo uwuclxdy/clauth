@@ -27,7 +27,7 @@ mod scheduler;
 // it (S5) — the same `pub(crate)` + private-mod + cfg(test) re-export pattern
 // `scan_auto_switch` already uses.
 #[cfg(test)]
-pub(crate) use scheduler::{SchedulerState, tick};
+pub(crate) use scheduler::{SchedulerState, set_tick_fetch_deadline_override, tick};
 // Gated like its one caller, the re-entered daemon child.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use scheduler::CLAUTH_TEST_RUN_SCHEDULER;
@@ -36,9 +36,9 @@ pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
     compute_burn_rates_from_history, funded_wallet_rate, project_utilization,
 };
-pub(crate) use codex::fetch_codex_usage;
 #[cfg(test)]
 pub(crate) use codex::{clear_codex_usage_url_override, set_codex_usage_url_override};
+pub(crate) use codex::{codex_usage_url_owned, fetch_codex_usage_at};
 // The mapping is exercised directly by the codex chain tests, which drive a real
 // wham/usage body through the walk rather than hand-building a UsageInfo.
 #[cfg(test)]
@@ -116,9 +116,13 @@ pub(crate) use scheduler::{SeedPhase, set_seed_hook};
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.
+// The spacing and response-header constants ride along: the wire tests bound
+// their elapsed asserts off them, and no shipped path reads either outside
+// `fetch` itself.
 #[cfg(test)]
 pub(crate) use fetch::{
-    reserved_request_slot, reset_profile_fetched_for_test, reset_request_slots, set_compare_hook,
+    REQUEST_SPACING_MS, USAGE_HTTP_RECV_HEADERS_SECS, reserved_request_slot,
+    reset_profile_fetched_for_test, reset_request_slots, set_compare_hook,
 };
 // Test-only: the adopt's token → uuid memo outlives a call now, so it also
 // outlives a test. Cleared with the endpoint overrides that make it reachable.

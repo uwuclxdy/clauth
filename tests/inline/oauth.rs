@@ -3273,6 +3273,7 @@ fn a_captured_window_exhaustion_429_carries_the_limiters_rejection() {
         Some("rt-old"),
         Some(expires_at),
         None,
+        LockWait::NoWait,
     );
     let seen: Vec<String> = server
         .join()
@@ -3710,6 +3711,7 @@ fn the_kick_reserves_the_shared_anthropic_request_slot() {
         Some("rt-old"),
         None,
         None,
+        LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -3755,6 +3757,7 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
         Some("rt-old"),
         None,
         None,
+        LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -4723,6 +4726,7 @@ fn auto_start_kick_does_not_rotate_under_a_forced_live_session() {
         Some("rt-old"),
         None,
         None,
+        LockWait::NoWait,
     );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
@@ -7486,6 +7490,7 @@ fn a_kick_persist_refuses_a_foreign_login_over_a_live_stage() {
         Some("rt-old"),
         None,
         None,
+        LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -9453,7 +9458,15 @@ fn a_kick_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
     let config = crate::testutil::rotation_fixture_config(&pn(name));
     let seen = cut_landing_recording_mirrors(&config, name, None);
 
-    let result = auto_start_kick(&config, &pn(name), "at-mid", Some("rt-mid"), None, None);
+    let result = auto_start_kick(
+        &config,
+        &pn(name),
+        "at-mid",
+        Some("rt-mid"),
+        None,
+        None,
+        LockWait::NoWait,
+    );
     crate::oauth::set_keychain_mirror_hook(None);
     let paths = server.join().expect("listener");
 
@@ -9546,7 +9559,15 @@ fn a_kick_whose_stage_resolve_fails_sends_no_token() {
 
     let holder = crate::testutil::hold_state_flock();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let result = auto_start_kick(&config, &pn(name), "at-old", Some("rt-old"), None, None);
+    let result = auto_start_kick(
+        &config,
+        &pn(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+        LockWait::NoWait,
+    );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
     let paths = server.join().expect("listener");

@@ -707,6 +707,12 @@ pub(crate) struct KickResult {
     /// more (a logout landed mid-rotation): the caller drops its token-list
     /// entry rather than poll on a gone login.
     pub(crate) login_gone: bool,
+    /// The kick's rotation step skipped because the rotation lock is held by
+    /// another holder, in this process or another. A skip, not a failure: the
+    /// kick's caller retries on a later tick, and the queue does not charge
+    /// the elected member for it. False on every other path, an error opening
+    /// the lock file included — that fault is not a held lock.
+    pub(crate) lock_held: bool,
 }
 
 impl KickResult {
@@ -720,6 +726,7 @@ impl KickResult {
             rotated: None,
             blocked,
             login_gone: false,
+            lock_held: false,
         }
     }
 }
@@ -753,6 +760,7 @@ pub(crate) fn auto_start_kick(
     refresh_token: Option<&str>,
     access_expires_at: Option<i64>,
     spend_marker: SpendMarker<'_>,
+    wait: LockWait,
 ) -> KickResult {
     let first_rl = match kick(access_token) {
         Ok(()) => {
@@ -761,6 +769,7 @@ pub(crate) fn auto_start_kick(
                 rotated: None,
                 blocked: None,
                 login_gone: false,
+                lock_held: false,
             };
         }
         Err(KickError::Status(401, _)) => None,
@@ -790,9 +799,29 @@ pub(crate) fn auto_start_kick(
     // Pace the recovery before any lock is taken.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     // RotationGuard outermost across the HTTP window — acquired with no other
-    // lock held (the caller released the usage store before kicking).
-    let Ok(rotation_guard) = RotationGuard::acquire(name) else {
-        return KickResult::not_opened_with(first_rl);
+    // lock held (the caller released the usage store before kicking). Taken as
+    // `wait` says: the fetch-worker caller passes `NoWait` (a held lock is
+    // another holder rotating this account, and the tick abandons that worker
+    // at its deadline, so the kick is skipped now and retried on a later tick);
+    // the CLI's one-shot `prime_window` passes `Block`, since nothing in that
+    // process retries the prime.
+    let rotation_guard = match take_rotation_guard(name, wait) {
+        Ok(guard) => guard,
+        // A held lock is a skip, not a failure: the caller retries on a later
+        // tick, and the queue must not charge the elected member for a peer's
+        // rotation.
+        Err(RotationTakeError::Held(_)) => {
+            return KickResult {
+                lock_held: true,
+                ..KickResult::not_opened_with(first_rl)
+            };
+        }
+        // An open or flock fault is NOT a held lock: it says nothing about a
+        // peer, and a kick that could not even attempt its recovery still
+        // counts as the failure the queue charges.
+        Err(RotationTakeError::Unavailable(_)) => {
+            return KickResult::not_opened_with(first_rl);
+        }
     };
     // macOS only: clauth can't write the Keychain item this session's CC reads,
     // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
@@ -815,6 +844,7 @@ pub(crate) fn auto_start_kick(
                 rotated: Some(pair),
                 blocked: first_rl,
                 login_gone: false,
+                lock_held: false,
             };
         }
         SendRule::Quarantine => {
@@ -871,6 +901,7 @@ pub(crate) fn auto_start_kick(
                 login_gone: carried.is_none(),
                 rotated: carried,
                 blocked: first_rl,
+                lock_held: false,
             };
         }
         Err(PersistError::Failed(_)) => {
@@ -879,6 +910,7 @@ pub(crate) fn auto_start_kick(
                 rotated,
                 blocked: first_rl,
                 login_gone: false,
+                lock_held: false,
             };
         }
     }
@@ -906,6 +938,7 @@ pub(crate) fn auto_start_kick(
         rotated,
         blocked: if opened { None } else { retry_rl.or(first_rl) },
         login_gone: false,
+        lock_held: false,
     }
 }
 
@@ -1520,6 +1553,7 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
         refresh_token.as_deref(),
         expires_at,
         None,
+        LockWait::Block,
     );
     if let Some(rl) = kicked.blocked {
         let ceiling = rl
@@ -3326,7 +3360,7 @@ fn ensure_installable_with(
     if stage_needs_landing(name) {
         let guard = match take_rotation_guard(name, wait) {
             Ok(guard) => guard,
-            Err(busy) => return AuthGate::Transient(busy),
+            Err(busy) => return AuthGate::Transient(busy.into_transient()),
         };
         if let Err(refused) = land_stage_for_gate(config, name, &guard) {
             return AuthGate::Transient(refused);
@@ -3507,13 +3541,15 @@ fn vanilla_install_gate(
     gate_under_guard(config, name, refresher, &guard, horizon_ms, spend_marker)
 }
 
-/// How [`rolling_install_gate`] and [`ensure_installable`]'s stage lander take
-/// the profile's rotation lock.
+/// How [`rolling_install_gate`], [`ensure_installable`]'s stage lander and
+/// [`auto_start_kick`] take the profile's rotation lock.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LockWait {
+pub(crate) enum LockWait {
     /// Park behind an in-flight rotation. The switch/arm paths: a session
     /// start would rather wait a rotation out than install around it, and
     /// `acquire`'s blocking is what makes their pre/post-guard re-reads exact.
+    /// The CLI's one-shot window prime is the other caller: it runs once and
+    /// exits, so nothing in that process retries a prime that skipped.
     Block,
     /// Never park. The scheduler's re-stamp leg runs INLINE on the tick
     /// thread, and this gate's own acquisition carries no deadline — a `clauth
@@ -3523,7 +3559,9 @@ enum LockWait {
     /// the SESSION START's wait, not this one, and it waits tens of seconds anyway,
     /// which is a poll tick's whole budget many times over. A held lock returns
     /// Transient instead; the holder's own path re-stamps, or the scan retries
-    /// in minutes on an hours-wide horizon.
+    /// in minutes on an hours-wide horizon. The fetch-worker kick takes it for
+    /// the same reason: the tick abandons that worker at its deadline, so a
+    /// peer's rotation must not park it.
     NoWait,
     /// Never park, but keep [`Self::Block`]'s install arms: the daemon main
     /// loop's switch gate ([`ensure_installable_from_main_loop`]), whose stage
@@ -3533,6 +3571,25 @@ enum LockWait {
     NoWaitInstall,
 }
 
+/// Why [`take_rotation_guard`] did not take the lock. The held arm is
+/// contention — another open file description in this process or another holds
+/// it; the unavailable arm is a filesystem or permissions fault opening or
+/// flocking the lock file, never contention.
+enum RotationTakeError {
+    Held(crate::format::Transient),
+    Unavailable(crate::format::Transient),
+}
+
+impl RotationTakeError {
+    /// The user-facing cause, for the callers that fold both arms into one
+    /// `AuthGate`.
+    fn into_transient(self) -> crate::format::Transient {
+        match self {
+            Self::Held(t) | Self::Unavailable(t) => t,
+        }
+    }
+}
+
 /// Take `name`'s rotation lock as `wait` says. On the [`LockWait::Block`] path
 /// `acquire` BLOCKS on the flock, so its error arm is a filesystem or
 /// permissions problem under `~/.clauth` and never contention; on the
@@ -3540,15 +3597,16 @@ enum LockWait {
 fn take_rotation_guard(
     name: &ProfileName,
     wait: LockWait,
-) -> std::result::Result<RotationGuard, crate::format::Transient> {
+) -> std::result::Result<RotationGuard, RotationTakeError> {
     match wait {
-        LockWait::Block => {
-            RotationGuard::acquire(name).map_err(|_| rotation_lock_unavailable(name))
-        }
+        LockWait::Block => RotationGuard::acquire(name)
+            .map_err(|_| RotationTakeError::Unavailable(rotation_lock_unavailable(name))),
         LockWait::NoWait | LockWait::NoWaitInstall => match RotationGuard::try_acquire(name) {
             Ok(Some(guard)) => Ok(guard),
-            Ok(None) => Err(rotation_lock_held(name)),
-            Err(_) => Err(rotation_lock_unavailable(name)),
+            Ok(None) => Err(RotationTakeError::Held(rotation_lock_held(name))),
+            Err(_) => Err(RotationTakeError::Unavailable(rotation_lock_unavailable(
+                name,
+            ))),
         },
     }
 }
@@ -3660,7 +3718,7 @@ fn rolling_install_gate(
     // the chain, so it serializes with rotations on the cross-process guard.
     let guard = match take_rotation_guard(name, wait) {
         Ok(guard) => guard,
-        Err(busy) => return AuthGate::Transient(busy),
+        Err(busy) => return AuthGate::Transient(busy.into_transient()),
     };
     // Everything below stamps the sidecar from the stored chain or spends it,
     // so a staged pair lands first (the arm and re-stamp legs reach here

@@ -238,6 +238,11 @@ impl HomeSandbox {
         // lock deadline it did not set. The callback/feed bounds and the
         // marker-registration pose are the same class of process-global state.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::usage::set_tick_fetch_deadline_override(None);
+        // A fetch's tick deadline counts from its request slot, so a host slot
+        // the previous test booked would queue this test's first request behind
+        // the 5 s spacing before its deadline starts.
+        crate::usage::reset_request_slots();
         set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);
@@ -338,6 +343,7 @@ impl Drop for HomeSandbox {
         // the next one. The callback/feed bounds and the marker-registration
         // pose leak the same way, so they clear together.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::usage::set_tick_fetch_deadline_override(None);
         set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);

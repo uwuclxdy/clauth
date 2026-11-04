@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -147,7 +148,7 @@ static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, ProfileStamp>, rank
 /// window-reset kick fan-out) can't trip a 429; accounts on distinct hosts (each
 /// api-key provider) reserve independent slots and never wait on each other. Steady
 /// polling sits well below this rate, so it only bites on bursts.
-const REQUEST_SPACING_MS: u64 = 5_000;
+pub(crate) const REQUEST_SPACING_MS: u64 = 5_000;
 
 /// Origin all OAuth `/usage`, `/profile`, and `/v1/messages` kick requests target —
 /// they are hardcoded to this host regardless of a profile's `base_url`, so it is
@@ -187,9 +188,56 @@ pub(crate) fn await_request_slot(host: &str) {
         *slot = next;
         wait
     };
+    let wait = Duration::from_millis(wait_ms);
+    SLOT_CLOCK.with_borrow(|clock| {
+        if let Some(clock) = clock {
+            clock.restart_at(Instant::now() + wait);
+        }
+    });
     if wait_ms > 0 {
-        std::thread::sleep(Duration::from_millis(wait_ms));
+        std::thread::sleep(wait);
     }
+}
+
+/// When a fan-out worker last left, or is booked to leave, its host's request
+/// queue: the instant its tick's fetch deadline counts from. Starts at the
+/// worker's spawn; every [`await_request_slot`] the worker's thread makes moves
+/// it to that request's slot, so a worker queued behind [`REQUEST_SPACING_MS`]
+/// never spends its deadline waiting for its turn.
+pub(crate) struct RequestClock {
+    base: Instant,
+    started_ms: AtomicU64,
+}
+
+impl RequestClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            started_ms: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn started(&self) -> Instant {
+        self.base + Duration::from_millis(self.started_ms.load(Ordering::Relaxed))
+    }
+
+    fn restart_at(&self, at: Instant) {
+        let offset =
+            u64::try_from(at.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX);
+        self.started_ms.store(offset, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// The clock this thread's request slots move; set by a fan-out worker.
+    static SLOT_CLOCK: std::cell::RefCell<Option<Arc<RequestClock>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make every [`await_request_slot`] the calling thread makes move `clock`.
+/// Called first on a fan-out worker's own thread, which it then serves for life.
+pub(crate) fn watch_request_slots(clock: Arc<RequestClock>) {
+    SLOT_CLOCK.set(Some(clock));
 }
 
 /// Clear every host's reserved spacing slot. Test-only: a real-bytes listener
@@ -1282,7 +1330,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 const USAGE_HTTP_CONNECT_SECS: u64 = 4;
 /// Response-HEADER deadline for the same — the header phase's bound, armed from
 /// the phase's start and stopping once the headers arrive.
-const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
+pub(crate) const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
 
 /// The two deadlines a usage-style call carries, added — and the whole call's
 /// bound: [`usage_config`] arms `timeout_global` with this sum, whose upstream

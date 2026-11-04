@@ -2751,6 +2751,51 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     );
 }
 
+/// A failed account whose leg a left-running fetch worker holds has no deadline
+/// published (nothing is coming to fetch it): the fetch row reads `failed` with
+/// no retry countdown, and on the instance that fetches it is not `queued`.
+#[test]
+fn a_failed_fetch_row_with_no_deadline_reads_failed_not_queued() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let failed = lines
+        .iter()
+        .find(|l| l.contains("[ failed ]"))
+        .expect("the failed fetch row renders");
+    assert_eq!(
+        failed.split_whitespace().collect::<Vec<_>>(),
+        ["status", "[", "failed", "]"],
+        "the row names the failure and counts nothing down"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.split_whitespace().any(|word| word == "queued")),
+        "no row reads queued: {lines:?}"
+    );
+}
+
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
 /// (`HeaderState.streak`) so a deep slot reads as stuck from the count alone;
 /// a zero streak keeps the bare `retry in` suffix.

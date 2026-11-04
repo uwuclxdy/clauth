@@ -10,9 +10,9 @@ use crate::oauth::RefreshError;
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
-    FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, body_plan_verdict,
-    epoch_secs_to_iso, fetch_raw, five_hour_live, humanize_duration, iso_to_epoch_secs,
-    now_epoch_secs, now_ms, windows_maxed,
+    FetchError, PlanInfo, RequestClock, UsageInfo, UsageWindow, await_request_slot,
+    body_plan_verdict, epoch_secs_to_iso, fetch_raw, five_hour_live, humanize_duration,
+    iso_to_epoch_secs, now_epoch_secs, now_ms, watch_request_slots, windows_maxed,
 };
 use crate::harness::Harness;
 use crate::oauth::KickRateLimit;
@@ -25,6 +25,49 @@ use serde::{Deserialize, Serialize};
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a tick waits on one fan-out worker's outcome before it leaves the
+/// worker running and marks its account Failed, counted from the worker's last
+/// request slot. It stays above [`crate::runtime::FETCH_LEG_HOLD`], the longest
+/// a healthy leg holds the ROTATION lock — the bound the const assert below
+/// pins — so a slow but bounded rotation lands instead of reading Failed with
+/// its reading dropped. A leg that also waits out a peer's state flock
+/// (`crate::lock::state_lock_timeout`, 25 s in production, on top of that
+/// bound) can still read late while healthy, and its reading is dropped.
+const TICK_FETCH_DEADLINE: Duration = Duration::from_secs(90);
+
+const _: () = assert!(
+    TICK_FETCH_DEADLINE.as_nanos() > crate::runtime::FETCH_LEG_HOLD.as_nanos(),
+    "the tick fetch deadline must outlast a healthy fetch leg"
+);
+
+/// The per-worker wait [`TICK_FETCH_DEADLINE`] sets, or a shorter value a test
+/// poses a hung worker under. Production never sets the override.
+pub(crate) fn tick_fetch_deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = *TICK_FETCH_DEADLINE_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    TICK_FETCH_DEADLINE
+}
+
+// Process-global, not thread-local: the drains run on the tick's leg threads.
+// Reset by `HomeSandbox`, which serializes every test that sets it.
+#[cfg(test)]
+static TICK_FETCH_DEADLINE_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Set or clear the test-only deadline override. `None` restores
+/// [`TICK_FETCH_DEADLINE`].
+#[cfg(test)]
+pub(crate) fn set_tick_fetch_deadline_override(deadline: Option<Duration>) {
+    *TICK_FETCH_DEADLINE_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+}
 
 /// How often the fetch-lease holder re-trims the usage-history logs to their
 /// retention window. Coarse on purpose: the trim is a full read + rewrite per
@@ -155,6 +198,10 @@ pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 pub(crate) enum FetchLeg {
     OAuth,
     ThirdParty,
+    /// The codex usage leg. No claude display profile maps to it — codex
+    /// accounts are never claude config profiles — so the leg reads it through
+    /// the activity state's late count alone, and stamps no countdown.
+    Codex,
 }
 
 impl FetchLeg {
@@ -562,6 +609,20 @@ pub(crate) struct ProfileActivityState {
     scheduler_spends: u32,
     oauth: Option<ProfileActivity>,
     third_party: Option<ProfileActivity>,
+    /// The codex leg marks no activity (no codex spinner surface), so this slot
+    /// stays idle; it exists to give the codex late count the same per-leg home
+    /// the other legs have.
+    codex: Option<ProfileActivity>,
+    /// Per leg, how many fetch workers its drain left running past the tick
+    /// fetch deadline ([`abandon_worker`]), each until it exits. A count, not a
+    /// flag: one account can have two workers abandoned on the OAuth leg (its
+    /// pair's `/usage` fetch and a verdict-only probe retry), and the first
+    /// exit must not free the leg while the second still runs. The spinner is
+    /// gone and no second worker starts on the leg meanwhile, but a worker may
+    /// still spend the account's refresh token, so the account is not idle.
+    oauth_late: u32,
+    third_party_late: u32,
+    codex_late: u32,
 }
 
 impl ProfileActivityState {
@@ -569,6 +630,7 @@ impl ProfileActivityState {
         match leg {
             FetchLeg::OAuth => self.oauth,
             FetchLeg::ThirdParty => self.third_party,
+            FetchLeg::Codex => self.codex,
         }
     }
 
@@ -576,6 +638,33 @@ impl ProfileActivityState {
         match leg {
             FetchLeg::OAuth => &mut self.oauth,
             FetchLeg::ThirdParty => &mut self.third_party,
+            FetchLeg::Codex => &mut self.codex,
+        }
+    }
+
+    fn late(&self, leg: FetchLeg) -> bool {
+        let abandoned = match leg {
+            FetchLeg::OAuth => self.oauth_late,
+            FetchLeg::ThirdParty => self.third_party_late,
+            FetchLeg::Codex => self.codex_late,
+        };
+        abandoned > 0
+    }
+
+    fn late_count_mut(&mut self, leg: FetchLeg) -> &mut u32 {
+        match leg {
+            FetchLeg::OAuth => &mut self.oauth_late,
+            FetchLeg::ThirdParty => &mut self.third_party_late,
+            FetchLeg::Codex => &mut self.codex_late,
+        }
+    }
+
+    /// Raise `leg`'s fetch mark, unless that leg's worker was left running late:
+    /// the partition starts no other worker there, so the mark is the late
+    /// worker's own, and its drain already said it failed.
+    fn mark_fetch(&mut self, leg: FetchLeg, activity: ProfileActivity) {
+        if !self.late(leg) {
+            *self.fetch_mut(leg) = Some(activity);
         }
     }
 
@@ -591,6 +680,10 @@ impl ProfileActivityState {
             && self.scheduler_spends == 0
             && self.oauth.is_none()
             && self.third_party.is_none()
+            && self.codex.is_none()
+            && self.oauth_late == 0
+            && self.third_party_late == 0
+            && self.codex_late == 0
     }
 
     /// Retire the rotation marker, and only that one. `Switching` belongs to the
@@ -680,10 +773,10 @@ pub(crate) fn mark_activity(store: &ActivityStore, name: &ProfileName, activity:
         ProfileActivity::Idle => clear_activity(store, name),
         ProfileActivity::Queued | ProfileActivity::Fetching => {
             if let Ok(mut states) = store.lock() {
-                *states
+                states
                     .entry(name.to_string())
                     .or_default()
-                    .fetch_mut(FetchLeg::OAuth) = Some(activity);
+                    .mark_fetch(FetchLeg::OAuth, activity);
             }
         }
         ProfileActivity::Refreshing | ProfileActivity::Switching => {
@@ -854,10 +947,10 @@ pub(crate) fn mark_fetch_activity(store: &ActivityStore, key: &LegKey, activity:
                 }
             }
         } else {
-            *states
+            states
                 .entry(key.name.to_string())
                 .or_default()
-                .fetch_mut(key.leg) = Some(activity);
+                .mark_fetch(key.leg, activity);
         }
     }
 }
@@ -905,6 +998,12 @@ fn is_token_spend(state: &ProfileActivityState) -> bool {
             state.account,
             Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
         )
+}
+
+/// Whether a scheduler leg starts no fetch worker on `leg` this tick: a running
+/// token spend, or one left running past its deadline.
+fn holds_off_fetch(state: &ProfileActivityState, leg: FetchLeg) -> bool {
+    is_token_spend(state) || state.late(leg)
 }
 
 /// One lock-and-scan behind the account-marker queries. Poison fails closed.
@@ -1458,10 +1557,13 @@ fn fetch_with_rotation(
     // Per-profile rotation lock across the ENTIRE rotation leg — the adopt
     // below mutates the same stored credential fields as a refresh persist,
     // so both hold the same guard as `rotate_one_inner` (guard OUTERMOST,
-    // then config mutex + state flock inside). Blocking acquire is safe: the
-    // tick body holds no lock, so no deadlock risk. On acquire failure, fall
-    // back rather than touching the credentials unguarded.
-    let Ok(rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
+    // then config mutex + state flock inside). A held lock means another
+    // holder, in this process or another, is rotating this account, and a fetch
+    // worker must not park behind it: the tick waits on the worker only up to
+    // its deadline, which a peer's hold can outlast. So the rotation is skipped
+    // this fetch, as on a failed acquire, rather than touching the credentials
+    // unguarded.
+    let Ok(Some(rotation_guard)) = crate::runtime::RotationGuard::try_acquire(name) else {
         return bail_unrotated(&mut profile_fetch);
     };
 
@@ -2763,6 +2865,7 @@ fn run_fetch_flagged(
                 entry.refresh_token.as_deref(),
                 entry.access_expires_at,
                 Some((activity, shutting_down)),
+                crate::oauth::LockWait::NoWait,
             );
             // The kick leg's writes obey the landing's two-part gate: the durable
             // block (`kick_block.json`, section 1) and the queue-open history
@@ -2805,9 +2908,14 @@ fn run_fetch_flagged(
             match (disk, epoch_guard) {
                 (KickLanding::Matched, Some(_epoch)) => {
                     // Whatever leg fired it, the kick consumed the weekly-reset
-                    // re-test: a landed kick proved the account, a 429 recorded a
-                    // block the standing re-test leg continues from.
-                    if let Ok(mut pending) = weekly_reset_kicks.lock() {
+                    // re-test — unless its rotation skipped on a held lock with
+                    // no 429 to record: that skip answered nothing, and the
+                    // one-shot re-test must survive for the next tick. A landed
+                    // kick proved the account, a 429 recorded a block the
+                    // standing re-test leg continues from.
+                    if (!kicked.lock_held || next.is_some())
+                        && let Ok(mut pending) = weekly_reset_kicks.lock()
+                    {
                         pending.remove(&entry.name);
                     }
                     note_kick_outcome(kick_blocks, &entry.name, kicked.opened, next, now_secs);
@@ -2826,14 +2934,17 @@ fn run_fetch_flagged(
                         if lapsed {
                             crate::usage::note_queue_open(auto_start_queue, &entry.name, now_secs);
                         }
-                    } else if entry.may_open_window {
+                    } else if entry.may_open_window && !kicked.lock_held {
                         // An ELECTED kick that opened nothing. Step this member toward
                         // the election's skip threshold so a permanently kick-incapable
                         // account (the macOS `rotation_blocked_for` carve-out records no
                         // `KickBlock` and never sets `auth_broken`, so nothing else sees
                         // it) cannot head-of-line block the members behind it. The
                         // anchor deliberately does NOT move: nothing opened, so the next
-                        // tick re-elects immediately.
+                        // tick re-elects immediately. A kick whose rotation skipped on
+                        // a HELD rotation lock is the one exception: the skip is a
+                        // peer's rotation in progress, not this member's incapability,
+                        // the queue state stays untouched, and the next tick retries.
                         crate::usage::note_queue_kick_failed(
                             auto_start_queue,
                             &entry.name,
@@ -2845,9 +2956,13 @@ fn run_fetch_flagged(
                     // A flock wedge with the epoch unmoved keeps the kick's backoff
                     // as cadence: the memory kick block and the weekly-mark consume
                     // land, so the next interval does not re-kick an account the
-                    // limiter just refused. `kick_block.json` and the queue anchor
-                    // stay match-only (F5).
-                    if let Ok(mut pending) = weekly_reset_kicks.lock() {
+                    // limiter just refused — unless the kick skipped on a held lock
+                    // with no 429 to record, when the one-shot re-test survives for
+                    // the next tick. `kick_block.json` and the queue anchor stay
+                    // match-only.
+                    if (!kicked.lock_held || next.is_some())
+                        && let Ok(mut pending) = weekly_reset_kicks.lock()
+                    {
                         pending.remove(&entry.name);
                     }
                     note_kick_outcome(kick_blocks, &entry.name, kicked.opened, next, now_secs);
@@ -4320,31 +4435,49 @@ fn filter_suppressed(
 /// Fetch a pre-partitioned set of due OAuth profiles and apply outcomes to the
 /// usage stores. Mirrors [`fetch_third_party_due`]: partitioning + countdown
 /// publishing happen in `tick`; this leg only fetches. Each worker paces against
-/// the shared `api.anthropic.com` host inside `get_json`.
+/// the shared `api.anthropic.com` host inside `get_json`. The workers own `Arc`
+/// clones of what they touch: one left running past its deadline outlives the
+/// tick that spawned it.
 fn fetch_oauth_due(
     state: &SchedulerState,
     due: Vec<TokenEntry>,
     interval_ms: u64,
-    timed_out: Option<&AtomicBool>,
+    timed_out: Option<&Arc<AtomicBool>>,
 ) {
     let hosts = chain_session_hosts(&due, &state.poll_streaks);
-    fetch_oauth_due_with_flagged(state, due, interval_ms, timed_out, |entry| {
-        run_fetch_flagged(
-            &state.config,
-            entry,
-            &state.store,
-            &state.refetch_queue,
-            &state.activity,
-            &state.poll_streaks,
-            &state.kick_blocks,
-            &state.weekly_reset_kicks,
-            &hosts,
-            &state.auto_start_queue,
-            interval_ms,
-            timed_out,
-            &state.shutting_down,
-        )
-    });
+    let config = Arc::clone(&state.config);
+    let store = Arc::clone(&state.store);
+    let refetch_queue = Arc::clone(&state.refetch_queue);
+    let activity = Arc::clone(&state.activity);
+    let poll_streaks = Arc::clone(&state.poll_streaks);
+    let kick_blocks = Arc::clone(&state.kick_blocks);
+    let weekly_reset_kicks = Arc::clone(&state.weekly_reset_kicks);
+    let auto_start_queue = Arc::clone(&state.auto_start_queue);
+    let shutting_down = Arc::clone(&state.shutting_down);
+    let worker_timed_out = timed_out.cloned();
+    fetch_oauth_due_with_flagged(
+        state,
+        due,
+        interval_ms,
+        timed_out.map(Arc::as_ref),
+        move |entry| {
+            run_fetch_flagged(
+                &config,
+                entry,
+                &store,
+                &refetch_queue,
+                &activity,
+                &poll_streaks,
+                &kick_blocks,
+                &weekly_reset_kicks,
+                &hosts,
+                &auto_start_queue,
+                interval_ms,
+                worker_timed_out.as_deref(),
+                &shutting_down,
+            )
+        },
+    );
 }
 
 /// Fan out one worker per due profile and apply each outcome the instant its own
@@ -4355,11 +4488,13 @@ fn fetch_oauth_due(
 /// per-profile fetch: real [`run_fetch`] in production, a deterministic fake in
 /// tests. Marked `Queued`, not `Fetching`: the per-host throttle
 /// (`REQUEST_SPACING_MS`) serializes the HTTP, so each worker flips itself to
-/// `Fetching` (in `get_json`) only when its request clears the gate.
+/// `Fetching` (in `get_json`) only when its request clears the gate. Each worker
+/// is an owned thread, so the drain can leave one running past its deadline
+/// ([`drain_completions`]).
 #[cfg(test)]
 fn fetch_oauth_due_with<F>(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u64, run: F)
 where
-    F: Fn(TokenEntry) -> FetchOutcome + Sync,
+    F: Fn(TokenEntry) -> FetchOutcome + Send + Sync + 'static,
 {
     fetch_oauth_due_with_flagged(state, due, interval_ms, None, run)
 }
@@ -4374,91 +4509,327 @@ fn fetch_oauth_due_with_flagged<F>(
     timed_out: Option<&AtomicBool>,
     run: F,
 ) where
-    F: Fn(TokenEntry) -> FetchOutcome + Sync,
+    F: Fn(TokenEntry) -> FetchOutcome + Send + Sync + 'static,
 {
     for entry in &due {
         mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
     }
-    let expected = due.len();
-    let (tx, rx) = std::sync::mpsc::channel::<FetchOutcome>();
-    let run = &run;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = due
-            .into_iter()
-            .map(|entry| {
-                let name = entry.name.clone();
-                // Capture the spawn identity, the token the fetch sends, and the
-                // epoch FROM THE ENTRY — one consistent read at the partition,
-                // never a worker-side read the reload/change site could move
-                // ahead of the spawn.
-                let sent_access_token = entry.access_token.clone();
-                let oauth_identity = entry.oauth_identity.clone();
-                let epoch_at_spawn = entry.epoch_at_spawn;
-                let tx = tx.clone();
-                let h = scope.spawn(move || {
-                    let mut outcome = run(entry);
-                    outcome.sent_access_token = sent_access_token;
-                    outcome.oauth_identity = oauth_identity;
-                    outcome.epoch_at_spawn = epoch_at_spawn;
-                    // A drained receiver (already got its `expected` count) drops
-                    // this send; harmless. A panicking worker never reaches here.
-                    let _ = tx.send(outcome);
-                });
-                (name, h)
-            })
-            .collect();
-        // Drop the spare sender so the drain's `recv` unblocks once every worker's
-        // clone is gone (a panicked worker drops its clone on unwind) — it then
-        // never waits on a message that will never arrive.
-        drop(tx);
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, FetchOutcome)>();
+    let run = Arc::new(run);
+    let mut workers = Vec::with_capacity(due.len());
+    for entry in due {
+        let name = entry.name.clone();
+        // Capture the spawn identity, the token the fetch sends, and the
+        // epoch FROM THE ENTRY — one consistent read at the partition,
+        // never a worker-side read the reload/change site could move
+        // ahead of the spawn.
+        let sent_access_token = entry.access_token.clone();
+        let oauth_identity = entry.oauth_identity.clone();
+        let epoch_at_spawn = entry.epoch_at_spawn;
+        let ticket = WorkerTicket::new(FetchLeg::OAuth.key(name.clone()), epoch_at_spawn);
+        let exit = WorkerExit::new(&ticket, &state.activity);
+        let index = workers.len();
+        let tx = tx.clone();
+        let run = Arc::clone(&run);
+        let spawned = std::thread::Builder::new()
+            .name("clauth-usage-fetch".to_string())
+            .spawn(move || {
+                let exit = exit;
+                exit.watch_request_slots();
+                let mut outcome = run(entry);
+                outcome.sent_access_token = sent_access_token;
+                outcome.oauth_identity = oauth_identity;
+                outcome.epoch_at_spawn = epoch_at_spawn;
+                // A drain that stopped waiting on this worker drops this send;
+                // harmless. A panicking worker never reaches here.
+                let _ = tx.send((index, outcome));
+                drop(exit);
+            });
+        match spawned {
+            Ok(handle) => workers.push(FanoutWorker { ticket, handle }),
+            Err(e) => {
+                strand_oauth(state, &name, epoch_at_spawn);
+                logline!("clauth: '{name}': the usage fetch could not start: {e}");
+            }
+        }
+    }
+    // Drop the spare sender so the drain's wait ends once every worker's clone
+    // is gone (a panicked worker drops its clone on unwind).
+    drop(tx);
 
-        drain_oauth_completions(state, &rx, expected, interval_ms, timed_out);
+    drain_oauth_completions(state, &rx, &workers, interval_ms, timed_out);
 
-        // Reap the workers. A panicked worker sent nothing, so the leg it was
-        // queued on may still be set, and this is the only site left to free
-        // it. Neither account marker is the reap's: a rotation's spend claim
-        // uncounts itself on unwind (`SchedulerSpend`), and the account slot
-        // is the TUI's.
-        for (name, h) in handles {
-            if h.join().is_err() {
-                clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(name.clone()));
-                // No outcome exists to apply, so nothing this tick can say the
-                // fetch is healthy: record Failed, or the store keeps the
-                // previous tick's Fresh over a cache that keeps aging — the one
-                // producer of a stale cache behind a non-pill fetch row.
-                if let Ok(mut st) = state.status.lock() {
-                    st.insert(name.to_string(), FetchStatus::Failed);
+    // Reap the workers. A left-running or panicked worker sent nothing, so the
+    // leg it was queued on may still be set, and this is the only site left to
+    // free it. Neither account marker is the reap's: a rotation's spend claim
+    // uncounts itself on unwind (`SchedulerSpend`), and the account slot is the
+    // TUI's. A left-running worker still lands its own rotated pair in-worker;
+    // only its reading is dropped, and dropping its handle detaches it.
+    for worker in workers {
+        let name = &worker.ticket.key.name;
+        if worker.ticket.abandoned.load(Ordering::Relaxed) {
+            strand_oauth(state, name, worker.ticket.epoch_at_spawn);
+            withdraw_countdown(&state.next_refresh_per_profile, &worker.ticket.key);
+            log_left_running(name);
+        } else if worker.handle.join().is_err() {
+            strand_oauth(state, name, worker.ticket.epoch_at_spawn);
+        }
+    }
+}
+
+/// An OAuth worker that produced no outcome this tick: free its fetch mark and,
+/// while the account still reads the epoch the worker was spawned under, record
+/// Failed. Nothing this tick can say the fetch is healthy, so without it the
+/// store keeps the previous tick's Fresh over a cache that keeps aging — the one
+/// producer of a stale cache behind a non-pill fetch row.
+fn strand_oauth(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64) {
+    clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(name.clone()));
+    if let Some(_epoch) =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)
+        && let Ok(mut st) = state.status.lock()
+    {
+        st.insert(name.to_string(), FetchStatus::Failed);
+    }
+}
+
+/// The one line a worker left running past its deadline gets.
+fn log_left_running(name: &ProfileName) {
+    logline!(
+        "clauth: '{name}': usage fetch still running after {:?}; marked failed and left running",
+        tick_fetch_deadline()
+    );
+}
+
+/// The line a verdict-only probe retry left running past its deadline gets: it
+/// owns no status row, so unlike [`log_left_running`] it claims no Failed.
+fn log_retry_left_running(name: &ProfileName) {
+    logline!(
+        "clauth: '{name}': usage probe retry still running after {:?}; left running",
+        tick_fetch_deadline()
+    );
+}
+
+/// What one fan-out worker and its drain share: the worker's request clock and
+/// the exit/abandon handshake. `exited` and `abandoned` are written only under
+/// the activity-store lock, by [`WorkerExit`] and [`abandon_worker`], so of a
+/// worker ending just as its drain gives up on it, exactly one side acts.
+struct WorkerTicket {
+    key: LegKey,
+    epoch_at_spawn: u64,
+    clock: Arc<RequestClock>,
+    exited: AtomicBool,
+    abandoned: AtomicBool,
+    /// Whether abandoning this worker clears its leg key's fetch mark. False
+    /// only for a verdict-only probe retry: it rides its pair's `/usage` leg
+    /// key but sets no mark of its own, so that mark belongs to the pair's
+    /// worker and its abandon must leave it standing.
+    owns_mark: bool,
+    /// A left-running worker's completion signal: `HomeSandbox::drop` waits for
+    /// it to drop with the last ticket handle before it clears the home override.
+    #[cfg(test)]
+    sandbox_join: std::sync::OnceLock<Sender<()>>,
+}
+
+impl WorkerTicket {
+    fn new(key: LegKey, epoch_at_spawn: u64) -> Arc<Self> {
+        Arc::new(Self::with_mark(key, epoch_at_spawn, true))
+    }
+
+    /// A verdict-only probe retry's ticket: it does not own its leg key's mark.
+    fn verdict_only_retry(key: LegKey, epoch_at_spawn: u64) -> Arc<Self> {
+        Arc::new(Self::with_mark(key, epoch_at_spawn, false))
+    }
+
+    fn with_mark(key: LegKey, epoch_at_spawn: u64, owns_mark: bool) -> Self {
+        Self {
+            key,
+            epoch_at_spawn,
+            clock: Arc::new(RequestClock::new()),
+            exited: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            owns_mark,
+            #[cfg(test)]
+            sandbox_join: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// Moved into a fan-out worker and dropped as its last act, a panic included:
+/// closes its ticket and drops the late hold-off count of a worker its drain
+/// left running.
+struct WorkerExit {
+    ticket: Arc<WorkerTicket>,
+    activity: ActivityStore,
+}
+
+impl WorkerExit {
+    fn new(ticket: &Arc<WorkerTicket>, activity: &ActivityStore) -> Self {
+        Self {
+            ticket: Arc::clone(ticket),
+            activity: Arc::clone(activity),
+        }
+    }
+
+    /// Point this thread's request slots at the worker's clock.
+    fn watch_request_slots(&self) {
+        watch_request_slots(Arc::clone(&self.ticket.clock));
+    }
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let mut states = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ticket.exited.store(true, Ordering::Relaxed);
+        if self.ticket.abandoned.load(Ordering::Relaxed) {
+            let key = &self.ticket.key;
+            if let Some(state) = states.get_mut(key.name.as_str()) {
+                let abandoned = state.late_count_mut(key.leg);
+                *abandoned = abandoned.saturating_sub(1);
+                if state.is_idle() {
+                    states.remove(key.name.as_str());
                 }
             }
         }
-    });
+    }
 }
 
-/// Stream up to `expected` completions in the order their fetches COMPLETE (each
-/// worker sends on `rx` when its fetch returns), so a slow entry never stalls a
-/// faster one's spinner-clear and countdown behind it in the `due` list (the
-/// join-order stall). Ends early if `rx` disconnects — every sender dropped — so
-/// a panicked worker's missing message can never wedge a leg. Both fetch legs
-/// drain through here; they differ only in what one landing does.
-fn drain_completions<T>(rx: &Receiver<T>, expected: usize) -> impl Iterator<Item = T> + '_ {
-    std::iter::from_fn(move || rx.recv().ok()).take(expected)
+/// One spawned fan-out worker: its ticket, and the handle its reap joins unless
+/// the drain left it running.
+struct FanoutWorker {
+    ticket: Arc<WorkerTicket>,
+    handle: std::thread::JoinHandle<()>,
 }
 
-/// Apply up to `expected` OAuth outcomes in the order their fetches COMPLETE.
+/// Leave a worker past its deadline running, unless it has already exited: in
+/// the hold its exit takes, raise its leg's late count, so no second worker
+/// starts there until every abandoned worker on the leg exits, and drop the
+/// leg's fetch mark for a ticket that owns it. Returns whether it was left
+/// running.
+fn abandon_worker(activity: &ActivityStore, ticket: &WorkerTicket) -> bool {
+    {
+        let mut states = activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ticket.exited.load(Ordering::Relaxed) {
+            return false;
+        }
+        ticket.abandoned.store(true, Ordering::Relaxed);
+        let state = states.entry(ticket.key.name.to_string()).or_default();
+        if ticket.owns_mark {
+            *state.fetch_mut(ticket.key.leg) = None;
+        }
+        let late = state.late_count_mut(ticket.key.leg);
+        *late = late.saturating_add(1);
+    }
+    // Outside the hold: the registration asserts a live home sandbox, and a
+    // panic under the activity lock would poison the store for the process.
+    #[cfg(test)]
+    let _ = ticket
+        .sandbox_join
+        .set(crate::testutil::register_background_task());
+    true
+}
+
+/// Stream fan-out outcomes in the order their fetches COMPLETE (each worker
+/// sends its index and outcome on `rx` when its fetch returns), so a slow entry
+/// never stalls a faster one's spinner-clear and countdown behind it in the `due`
+/// list (the join-order stall). Both fetch legs drain through here; they differ
+/// only in what one landing does.
+///
+/// Each worker is waited on until [`tick_fetch_deadline`] past the instant it
+/// leaves its host's request queue ([`RequestClock`]), so a worker still queued
+/// behind the request spacing is never late. Once every worker still out is
+/// past its deadline, what is already queued is landed first, then each is left
+/// running ([`abandon_worker`]) and the stream ends; an outcome a left-running
+/// worker sends later is dropped. A worker that sent but has not yet run its
+/// exit when the stream gives up on it is still left running and its outcome
+/// dropped: only the instant between its send and its exit is exposed, and the
+/// account reads Failed for that tick. The stream ends early only when `rx`
+/// disconnects, which needs every worker gone. A worker that exits without
+/// sending (a panic) frees no wait: its slot stays pending until every pending
+/// deadline has passed, and the reap finds it.
+///
+/// One race arm is untested, accepted rather than pinned: the read after the
+/// abandon loop catches a worker that EXITED between the first `try_recv` and
+/// `abandon_worker`, after sending its outcome. No seam reaches that window
+/// deterministically (a worker exit inside a few-microsecond span). If the arm
+/// went away, that worker would be neither abandoned nor drained: its outcome
+/// drops unread, the reap's `join` is `Ok` so no strand runs, its `Fetching`
+/// mark stays up, and the previous tick's status stands for one cadence — a
+/// stale status and a stuck spinner until the next fetch.
+fn drain_completions<'a, T>(
+    rx: &'a Receiver<(usize, T)>,
+    workers: &'a [FanoutWorker],
+    activity: &'a ActivityStore,
+) -> impl Iterator<Item = T> + 'a {
+    let mut pending = vec![true; workers.len()];
+    std::iter::from_fn(move || {
+        loop {
+            if !pending.contains(&true) {
+                return None;
+            }
+            let now = std::time::Instant::now();
+            let deadline = tick_fetch_deadline();
+            let next_due = workers
+                .iter()
+                .zip(&pending)
+                .filter(|(_, pending)| **pending)
+                .map(|(worker, _)| worker.ticket.clock.started() + deadline)
+                .filter(|due| *due > now)
+                .min();
+            let (index, outcome) = match next_due {
+                Some(due) => match rx.recv_timeout(due - now) {
+                    Ok(sent) => sent,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                },
+                None => match rx.try_recv() {
+                    Ok(sent) => sent,
+                    Err(_) => {
+                        for (worker, pending) in workers.iter().zip(pending.iter_mut()) {
+                            if *pending && abandon_worker(activity, &worker.ticket) {
+                                *pending = false;
+                            }
+                        }
+                        // A worker that exited after the read above, before it
+                        // could be left running, sent its outcome first, unless
+                        // it panicked.
+                        match rx.try_recv() {
+                            Ok(sent) => sent,
+                            Err(_) => return None,
+                        }
+                    }
+                },
+            };
+            if let Some(slot) = pending.get_mut(index)
+                && *slot
+            {
+                *slot = false;
+                return Some(outcome);
+            }
+        }
+    })
+}
+
+/// Apply the `workers`' OAuth outcomes in the order their fetches COMPLETE,
+/// each worker waited on only to its deadline ([`drain_completions`]).
 /// Per outcome: clear the spinner, propagate a rotated token pair into the live
 /// snapshot, read `is_active` at apply time, write the outcome, republish the
 /// countdown.
 fn drain_oauth_completions(
     state: &SchedulerState,
-    rx: &Receiver<FetchOutcome>,
-    expected: usize,
+    rx: &Receiver<(usize, FetchOutcome)>,
+    workers: &[FanoutWorker],
     interval_ms: u64,
     timed_out: Option<&AtomicBool>,
 ) {
     // Each landing below takes its own short state-flock hold, but once one
     // landing or kick hold of the tick has timed out the batch's later
     // landings skip the flock without waiting and take the timeout path.
-    for outcome in drain_completions(rx, expected) {
+    for outcome in drain_completions(rx, workers, &state.activity) {
         clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(outcome.name.clone()));
         // Re-anchor (A→B): the ride-along forgot the disk caches and seeded the
         // new plan in its hold; forget the old account's memory here (bump epoch,
@@ -4597,63 +4968,79 @@ fn fetch_third_party_due_flagged(
         );
     }
 
-    let expected = due.len();
-    let (tx, rx) = std::sync::mpsc::channel::<ThirdPartyOutcome>();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, ThirdPartyOutcome)>();
     let fetcher = state.fetcher;
-    let handles: Vec<_> = due
-        .into_iter()
-        .map(|entry| {
-            let name = entry.name.clone();
-            // Captured before the entry moves into the worker: suppression is
-            // recorded against the credential that failed, never the bare name.
-            let fingerprint = entry.credential_fingerprint();
-            let key_fingerprint = entry.fetch_key_fingerprint();
-            // The spawn identity and epoch: the landing's section 1/2 gates.
-            // The epoch rides the entry, captured at the tick's partition.
-            let identity = entry.identity;
-            let epoch_at_spawn = entry.epoch_at_spawn;
-            // Captured for the same reason: only a Generic target's no-data
-            // rescan defers to the degraded floor, and `entry` moves next.
-            let is_generic = matches!(
-                &entry.target,
-                crate::providers::ThirdPartyTarget::Generic { .. }
-            );
-            // Reuse the endpoint that last worked so steady state is one request.
-            let hint = state.third_party_usage_store.lock().ok().and_then(|s| {
-                s.get(entry.name.as_str())
-                    .and_then(|st| st.endpoint.clone())
-            });
-            // Pace against this provider's host only: accounts on the same endpoint
-            // serialize, distinct hosts (and the Anthropic OAuth leg) run in parallel.
-            let host = entry.target.throttle_key();
-            let activity = Arc::clone(&state.activity);
-            let worker_key = FetchLeg::ThirdParty.key(entry.name.clone());
-            let outcome_name = name.clone();
-            let tx = tx.clone();
-            let h = std::thread::spawn(move || {
+    let mut workers = Vec::with_capacity(due.len());
+    let mut fingerprints = Vec::with_capacity(due.len());
+    for entry in due {
+        let index = workers.len();
+        let name = entry.name.clone();
+        // Captured before the entry moves into the worker: suppression is
+        // recorded against the credential that failed, never the bare name.
+        let fingerprint = entry.credential_fingerprint();
+        let key_fingerprint = entry.fetch_key_fingerprint();
+        // The spawn identity and epoch: the landing's section 1/2 gates.
+        // The epoch rides the entry, captured at the tick's partition.
+        let identity = entry.identity;
+        let epoch_at_spawn = entry.epoch_at_spawn;
+        // Captured for the same reason: only a Generic target's no-data
+        // rescan defers to the degraded floor, and `entry` moves next.
+        let is_generic = matches!(
+            &entry.target,
+            crate::providers::ThirdPartyTarget::Generic { .. }
+        );
+        // Reuse the endpoint that last worked so steady state is one request.
+        let hint = state.third_party_usage_store.lock().ok().and_then(|s| {
+            s.get(entry.name.as_str())
+                .and_then(|st| st.endpoint.clone())
+        });
+        // Pace against this provider's host only: accounts on the same endpoint
+        // serialize, distinct hosts (and the Anthropic OAuth leg) run in parallel.
+        let host = entry.target.throttle_key();
+        let ticket = WorkerTicket::new(FetchLeg::ThirdParty.key(name.clone()), epoch_at_spawn);
+        let exit = WorkerExit::new(&ticket, &state.activity);
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("clauth-usage-fetch".to_string())
+            .spawn(move || {
+                let exit = exit;
+                exit.watch_request_slots();
                 await_request_slot(&host);
-                mark_fetch_activity(&activity, &worker_key, ProfileActivity::Fetching);
+                mark_fetch_activity(&exit.activity, &exit.ticket.key, ProfileActivity::Fetching);
                 let result = fetcher(&entry.target, &entry.api_key, hint.as_deref());
-                // A drained receiver drops this; harmless. A panicking worker
-                // never reaches here and drops its sender, which ends the drain.
-                let _ = tx.send(ThirdPartyOutcome {
-                    name: outcome_name,
-                    fingerprint,
-                    key_fingerprint,
-                    identity,
-                    epoch_at_spawn,
-                    is_generic,
-                    result,
-                });
+                // A drain that stopped waiting on this worker drops this send;
+                // harmless. A panicking worker never reaches here.
+                let _ = tx.send((
+                    index,
+                    ThirdPartyOutcome {
+                        name,
+                        fingerprint,
+                        key_fingerprint,
+                        identity,
+                        epoch_at_spawn,
+                        is_generic,
+                        result,
+                    },
+                ));
+                drop(exit);
             });
-            (name, fingerprint, h)
-        })
-        .collect();
-    // Drop the spare sender so the drain unblocks once every worker's clone is
-    // gone (a panicked worker drops its clone on unwind).
+        match spawned {
+            Ok(handle) => {
+                workers.push(FanoutWorker { ticket, handle });
+                fingerprints.push(fingerprint);
+            }
+            Err(e) => {
+                let name = &ticket.key.name;
+                strand_third_party(state, name, epoch_at_spawn, fingerprint);
+                logline!("clauth: '{name}': the usage fetch could not start: {e}");
+            }
+        }
+    }
+    // Drop the spare sender so the drain's wait ends once every worker's clone
+    // is gone (a panicked worker drops its clone on unwind).
     drop(tx);
 
-    for outcome in drain_completions(&rx, expected) {
+    for outcome in drain_completions(&rx, &workers, &state.activity) {
         let ThirdPartyOutcome {
             name,
             fingerprint,
@@ -4835,23 +5222,46 @@ fn fetch_third_party_due_flagged(
         }
     }
 
-    // Reap the workers. A panicked worker sent nothing, so its `Fetching` mark
-    // would freeze the spinner and a Fresh status would sit over an aging cache
-    // (the OAuth reap's reason); this is the only site left to clear either.
-    for (name, fingerprint, h) in handles {
-        if h.join().is_err() {
-            clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
-            if let Ok(mut st) = state.third_party_status.lock() {
-                st.insert(name.to_string(), FetchStatus::Failed);
-            }
-            update_third_party_broken(
-                &state.third_party_broken,
-                &name,
-                KeyVerdictUpdate::Unchanged,
-                fingerprint,
-            );
+    // Reap the workers. A left-running or panicked worker sent nothing, so its
+    // `Fetching` mark would freeze the spinner and a Fresh status would sit over
+    // an aging cache (the OAuth reap's reason); this is the only site left to
+    // clear either. Dropping a left-running worker's handle detaches it.
+    for (worker, fingerprint) in workers.into_iter().zip(fingerprints) {
+        let name = &worker.ticket.key.name;
+        if worker.ticket.abandoned.load(Ordering::Relaxed) {
+            strand_third_party(state, name, worker.ticket.epoch_at_spawn, fingerprint);
+            withdraw_countdown(&state.next_refresh_per_profile, &worker.ticket.key);
+            log_left_running(name);
+        } else if worker.handle.join().is_err() {
+            strand_third_party(state, name, worker.ticket.epoch_at_spawn, fingerprint);
         }
     }
+}
+
+/// A third-party worker that produced no outcome this tick: free its fetch mark
+/// and, while the account still reads the epoch the worker was spawned under,
+/// record Failed and leave the key's dead mark as it stands.
+fn strand_third_party(
+    state: &SchedulerState,
+    name: &ProfileName,
+    epoch_at_spawn: u64,
+    fingerprint: u64,
+) {
+    clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
+    let Some(_epoch) =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::ThirdParty, epoch_at_spawn)
+    else {
+        return;
+    };
+    if let Ok(mut st) = state.third_party_status.lock() {
+        st.insert(name.to_string(), FetchStatus::Failed);
+    }
+    update_third_party_broken(
+        &state.third_party_broken,
+        name,
+        KeyVerdictUpdate::Unchanged,
+        fingerprint,
+    );
 }
 
 /// Section 1 for a third-party landing: one state-flock hold, compare the spawn
@@ -4954,6 +5364,17 @@ fn partition_and_merge<T: NamedEntry + Clone>(
         &streak_snapshot(&state.poll_streaks),
     );
     merge_forced(snapshot, forced, &mut due, &mut next, &state.activity, now);
+    // A leg its late worker holds has no fetch coming, so a past deadline
+    // published for it would draw `Queued` over its Failed row
+    // ([`display_activity`]). The stand-down mirror keeps its countdowns: it
+    // fetches nothing itself, and its partition does not come through here.
+    if let Ok(activity) = state.activity.lock() {
+        next.retain(|key, _| {
+            !activity
+                .get(key.name.as_str())
+                .is_some_and(|held| held.late(key.leg))
+        });
+    }
     (due, next)
 }
 
@@ -4987,6 +5408,15 @@ fn publish_one_countdown(
 ) {
     if let Ok(mut map) = nrpp.lock() {
         map.insert(key.clone(), stamped.as_millis().saturating_add(interval_ms));
+    }
+}
+
+/// Drop one leg's published countdown. A worker its drain left running keeps the
+/// leg from fetching, so the deadline published when the tick began would read
+/// past and `Queued` ([`display_activity`]) until the next tick republishes.
+fn withdraw_countdown(nrpp: &NextRefreshPerProfile, key: &LegKey) {
+    if let Ok(mut map) = nrpp.lock() {
+        map.remove(key);
     }
 }
 
@@ -6182,7 +6612,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         let excluded: HashSet<String> = match state.activity.lock() {
             Ok(a) => a
                 .iter()
-                .filter(|(_, state)| is_token_spend(state))
+                .filter(|(_, state)| holds_off_fetch(state, FetchLeg::OAuth))
                 .map(|(n, _)| n.clone())
                 .collect(),
             Err(_) => oauth_snapshot.iter().map(|e| e.name.to_string()).collect(),
@@ -6253,10 +6683,6 @@ pub(crate) fn tick(state: &SchedulerState) {
         // third-party leg's fetches. Against the OAuth leg they still add up:
         // a probe and a `/usage` poll reserve the one `api.anthropic.com`
         // request slot. The scans below run once all three are joined.
-        let probe_names: Vec<(LegKey, u64)> = probe_due
-            .iter()
-            .map(|e| (e.key(), e.epoch_at_spawn))
-            .collect();
         let probe = (!probe_due.is_empty()).then({
             let flag = Arc::clone(&timed_out);
             move || {
@@ -6266,46 +6692,17 @@ pub(crate) fn tick(state: &SchedulerState) {
             }
         });
         if !oauth_due.is_empty() {
-            fetch_oauth_due(state, oauth_due, interval_ms, Some(timed_out.as_ref()));
+            fetch_oauth_due(state, oauth_due, interval_ms, Some(&timed_out));
         }
         if let Some(h) = tp {
             // Worker panics are already swallowed inside `fetch_third_party_due`;
             // this join only reaps the leg thread itself.
             let _ = h.join();
         }
-        if let Some(h) = probe
-            && h.join().is_err()
-        {
-            // A panicked probe landed nothing, and neither did the entries
-            // after it: their marks are still up. Free those and say the fetch
-            // failed, rather than keep the last tick's status over a reading
-            // that did not come, but only where the probe still reads the name
-            // under the token it was spawned for: after a switch-off or a
-            // re-mint's forget nothing would ever move that status again.
-            for (key, epoch_at_spawn) in &probe_names {
-                let stranded = state.activity.lock().map_or(true, |a| {
-                    a.get(key.name.as_str())
-                        .is_some_and(|s| s.fetch(key.leg).is_some())
-                });
-                if !stranded {
-                    continue;
-                }
-                clear_fetch_activity(&state.activity, key);
-                let still_probed = state
-                    .config
-                    .lock()
-                    .is_ok_and(|c| c.find(&key.name).is_some_and(usage_probe_admits));
-                if still_probed
-                    && let Some(_epoch) = crate::usage::epoch_guard_if_current(
-                        &key.name,
-                        crate::usage::Half::OAuth,
-                        *epoch_at_spawn,
-                    )
-                    && let Ok(mut st) = state.status.lock()
-                {
-                    st.insert(key.name.to_string(), FetchStatus::Failed);
-                }
-            }
+        if let Some(h) = probe {
+            // Worker panics are contained inside `fetch_probe_due_flagged`'s
+            // own reap; this join only reaps the leg thread itself.
+            let _ = h.join();
         }
     });
 
@@ -6602,12 +6999,14 @@ fn note_probe_limiter(
     }
 }
 
-/// Probe each due entry in turn and land its answer through the OAuth leg's
-/// landing ([`apply_outcome_flagged`]): section 1 compares the setup token's
-/// identity and writes the cache and the history line, section 2 the store,
-/// the status and the cadence at the entry's own interval. One thread for the
-/// leg rather than one per entry: every probe waits on the same
-/// `api.anthropic.com` request slot.
+/// Probe each due entry on its own owned worker and land each answer through
+/// the OAuth leg's landing ([`apply_outcome_flagged`]): section 1 compares the
+/// setup token's identity and writes the cache and the history line, section 2
+/// the store, the status and the cadence at the entry's own interval. Every
+/// worker waits on the same `api.anthropic.com` request slot, so the requests
+/// still pace per host; the workers run in parallel, so a stalled probe never
+/// delays another entry's landing, and one past its deadline is left running
+/// ([`drain_completions`]).
 fn fetch_probe_due_flagged(
     state: &SchedulerState,
     due: Vec<ProbeEntry>,
@@ -6618,17 +7017,80 @@ fn fetch_probe_due_flagged(
     for entry in due.iter().filter(|e| !e.verdict_only) {
         mark_fetch_activity(&state.activity, &entry.key(), ProfileActivity::Queued);
     }
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, ProbeOutcome)>();
+    let mut workers = Vec::with_capacity(due.len());
+    // The verdict-only flag rides beside each WORKER (pushed only with the
+    // worker, below): a late or panicked worker sends nothing, and the reap
+    // needs it to know which strand rules apply. Pushed per due entry instead,
+    // a spawn failure would shift every later worker onto the wrong flag.
+    let mut verdict_only = Vec::with_capacity(due.len());
     for entry in due {
-        let key = entry.key();
+        let is_verdict_only = entry.verdict_only;
+        // The worker's ticket is the OAuth leg's: a probed account's reading,
+        // countdown and row are the OAuth ones, and the late count must hold
+        // off the same slot the next tick's partition reads. A verdict-only
+        // retry sets no mark, so its abandon must not clear the pair's.
+        let ticket = if is_verdict_only {
+            WorkerTicket::verdict_only_retry(entry.key(), entry.epoch_at_spawn)
+        } else {
+            WorkerTicket::new(entry.key(), entry.epoch_at_spawn)
+        };
+        let index = workers.len();
+        let tx = tx.clone();
         #[cfg(test)]
-        probe_panic::hit(entry.name.as_str());
-        // The row reads `Fetching` once the request has its slot, as the other
-        // legs' rows do, never while it queues behind another probe.
-        let answer = super::inference::anthropic::probe(&entry.token, || {
-            if !entry.verdict_only {
-                mark_fetch_activity(&state.activity, &key, ProfileActivity::Fetching);
+        let spawn_fails = probe_spawn_fail::hit(entry.name.as_str());
+        #[cfg(not(test))]
+        let spawn_fails = false;
+        let spawned = if spawn_fails {
+            Err(std::io::Error::other("armed probe spawn failure"))
+        } else {
+            let exit = WorkerExit::new(&ticket, &state.activity);
+            std::thread::Builder::new()
+                .name("clauth-usage-fetch".to_string())
+                .spawn(move || {
+                    let exit = exit;
+                    exit.watch_request_slots();
+                    #[cfg(test)]
+                    probe_panic::hit(entry.name.as_str());
+                    // The row reads `Fetching` once the request has its slot,
+                    // as the other legs' rows do, never while it queues behind
+                    // another probe.
+                    let answer = super::inference::anthropic::probe(&entry.token, || {
+                        if !entry.verdict_only {
+                            mark_fetch_activity(
+                                &exit.activity,
+                                &exit.ticket.key,
+                                ProfileActivity::Fetching,
+                            );
+                        }
+                    });
+                    // A drain that stopped waiting on this worker drops this
+                    // send; harmless. A panicking worker never reaches here.
+                    let _ = tx.send((index, ProbeOutcome { entry, answer }));
+                    drop(exit);
+                })
+        };
+        match spawned {
+            Ok(handle) => {
+                workers.push(FanoutWorker { ticket, handle });
+                verdict_only.push(is_verdict_only);
             }
-        });
+            Err(e) => {
+                let name = &ticket.key.name;
+                strand_probe(state, name, ticket.epoch_at_spawn, is_verdict_only);
+                logline!("clauth: '{name}': the usage probe could not start: {e}");
+            }
+        }
+    }
+    // Drop the spare sender so the drain's wait ends once every worker's clone
+    // is gone (a panicked worker drops its clone on unwind).
+    drop(tx);
+
+    for outcome in drain_completions(&rx, &workers, &state.activity) {
+        let ProbeOutcome { entry, answer } = outcome;
+        // Derived in the landing, never in the worker: the outer `Some` is
+        // "the answer WAS a reading", which the 2xx lift path
+        // (`note_probe_limiter` with a `None` block) runs on too.
         let limited = match &answer {
             super::inference::anthropic::ProbeAnswer::Reading { limited, .. } => Some(*limited),
             _ => None,
@@ -6640,6 +7102,7 @@ fn fetch_probe_due_flagged(
             note_probe_verdict(state, &entry, dead, timed_out);
             continue;
         }
+        let key = entry.key();
         let mut outcome = probe_outcome(&entry.name, answer);
         clear_fetch_activity(&state.activity, &key);
         // Switched off while the probe was out, the account is read by nothing,
@@ -6688,6 +7151,68 @@ fn fetch_probe_due_flagged(
             }
             note_probe_verdict(state, &entry, dead, timed_out);
         }
+    }
+
+    // Reap the workers (the OAuth fan-out's reap shape): a left-running or
+    // panicked worker sent nothing, so this is the only site left to free its
+    // mark and say the probe failed. A verdict-only worker owns no mark and no
+    // status of its own, so it gets only the log line.
+    for (worker, verdict_only) in workers.into_iter().zip(verdict_only) {
+        let name = &worker.ticket.key.name;
+        if worker.ticket.abandoned.load(Ordering::Relaxed) {
+            strand_probe(state, name, worker.ticket.epoch_at_spawn, verdict_only);
+            if verdict_only {
+                // A verdict-only retry owns no mark, status or countdown of
+                // its own: it published none, so it withdraws none and claims
+                // no Failed.
+                log_retry_left_running(name);
+            } else {
+                // The countdown this tick published for the entry stands no
+                // fetch: withdraw it, so the late account's timer cell reads
+                // blank.
+                withdraw_countdown(&state.next_refresh_per_profile, &worker.ticket.key);
+                log_left_running(name);
+            }
+        } else if worker.handle.join().is_err() {
+            strand_probe(state, name, worker.ticket.epoch_at_spawn, verdict_only);
+        }
+    }
+}
+
+/// One probe's answer plus the spawn-time entry its landing reads, sent on the
+/// leg's completion channel. The entry rides whole so the landing applies
+/// every per-entry rule: the token's fingerprint, the pair's identity for a
+/// verdict-only retry, the stamped spawn epoch.
+struct ProbeOutcome {
+    entry: ProbeEntry,
+    answer: super::inference::anthropic::ProbeAnswer,
+}
+
+/// A probe worker that produced no outcome this tick: free its fetch mark and,
+/// while the account still reads the token the worker was spawned under,
+/// record Failed — but only while the probe still admits the name, and never
+/// for a verdict-only retry, whose row belongs to the pair's own `/usage`
+/// fetch.
+fn strand_probe(
+    state: &SchedulerState,
+    name: &ProfileName,
+    epoch_at_spawn: u64,
+    verdict_only: bool,
+) {
+    if verdict_only {
+        return;
+    }
+    clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(name.clone()));
+    let still_probed = state
+        .config
+        .lock()
+        .is_ok_and(|c| c.find(name).is_some_and(usage_probe_admits));
+    if still_probed
+        && let Some(_epoch) =
+            crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)
+        && let Ok(mut st) = state.status.lock()
+    {
+        st.insert(name.to_string(), FetchStatus::Failed);
     }
 }
 
@@ -6740,6 +7265,41 @@ pub(crate) mod probe_panic {
             hook();
             panic!("the armed probe leg panic");
         }
+    }
+}
+
+/// Test seam: fail the probe fan-out's spawn for one named entry, the arm its
+/// `Builder::spawn` `Err` already handles (thread exhaustion), without needing
+/// the system's actual thread budget. RAII like [`probe_panic`]: an arm nothing
+/// consumed is disarmed on drop, and the leg's sandbox serializes the tests
+/// that drive it.
+#[cfg(test)]
+pub(crate) mod probe_spawn_fail {
+    use std::sync::{Mutex, PoisonError};
+
+    /// The entry whose next spawn fails; `None` when disarmed.
+    static ARMED: Mutex<Option<String>> = Mutex::new(None);
+
+    pub(crate) fn arm_at(name: &str) -> SpawnFailArm {
+        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(name.to_string());
+        SpawnFailArm
+    }
+
+    pub(crate) struct SpawnFailArm;
+
+    impl Drop for SpawnFailArm {
+        fn drop(&mut self) {
+            *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Whether this entry's spawn fails: takes the arm when it names `name`.
+    pub(super) fn hit(name: &str) -> bool {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|at| at.as_str() == name)
+            .is_some()
     }
 }
 
@@ -6865,40 +7425,106 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
             .cloned()
             .collect()
     };
+    // A worker the previous tick left running late owns the account's next
+    // poll: it stamped no cadence, so the name is due again, but no second
+    // worker starts beside it. Poison fails safe to skipping the leg, as the
+    // other partitions do.
+    let due: Vec<ProfileName> = match state.activity.lock() {
+        Ok(activity) => due
+            .into_iter()
+            .filter(|name| {
+                !activity
+                    .get(name.as_str())
+                    .is_some_and(|s| s.late(FetchLeg::Codex))
+            })
+            .collect(),
+        Err(_) => return,
+    };
     if due.is_empty() {
         return;
     }
 
-    for name in &due {
-        // Capture the epoch BEFORE `read_store_auth`: a codex login landing
-        // between the store read and the epoch read must still read as "moved"
-        // in section 2, never as an unmoved epoch under the old credential.
-        let epoch_at_spawn = crate::usage::epoch_value(name, crate::usage::Half::Codex);
-        // Read the chain from the profile store, never from a session home: the
-        // store is the one physical carrier (decision 8), and this leg holds no
-        // rotation guard because it only READS.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, CodexOutcome)>();
+    let mut workers = Vec::with_capacity(due.len());
+    for name in due {
+        // Spawn-side captures, on the tick thread: the epoch BEFORE
+        // `read_store_auth` — a codex login landing between the store read and
+        // the epoch read must still read as "moved" in section 2, never as an
+        // unmoved epoch under the old credential — and the identity from the
+        // SAME `auth.json` read that supplied the token it sends. The chain
+        // comes from the profile store, never a session home: the store is the
+        // one physical carrier, and this leg holds no rotation guard because it
+        // only READS.
+        let epoch_at_spawn = crate::usage::epoch_value(&name, crate::usage::Half::Codex);
         let Some(auth) = crate::codex_auth::read_store_auth(name.as_str()) else {
             continue;
         };
-        let Some(token) = auth.access_token() else {
+        let Some(token) = auth.access_token().map(str::to_owned) else {
             continue;
         };
-        // Capture the identity from the SAME `auth.json` read that supplied the
-        // token it sends.
         let identity = auth.account_id().map(str::to_string);
-        await_request_slot(CODEX_USAGE_ORIGIN);
-        let outcome = crate::usage::fetch_codex_usage(
-            token,
-            auth.account_id(),
-            auth.is_fedramp(),
-            now_epoch_secs(),
-        );
-        match outcome {
+        let fedramp = auth.is_fedramp();
+        // Resolved on THIS thread, once this account can actually fetch: the
+        // test override is thread-local (a worker resolving it on its own
+        // thread would miss it, and a test build panics without one), and a
+        // due name with no stored token must not reach the seam at all.
+        // Production resolves the same static URL per worker.
+        let url = crate::usage::codex_usage_url_owned();
+        let ticket = WorkerTicket::new(FetchLeg::Codex.key(name.clone()), epoch_at_spawn);
+        let exit = WorkerExit::new(&ticket, &state.activity);
+        let index = workers.len();
+        let tx = tx.clone();
+        let worker_name = name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("clauth-usage-fetch".to_string())
+            .spawn(move || {
+                let exit = exit;
+                exit.watch_request_slots();
+                await_request_slot(CODEX_USAGE_ORIGIN);
+                let result = crate::usage::fetch_codex_usage_at(
+                    &url,
+                    &token,
+                    identity.as_deref(),
+                    fedramp,
+                    now_epoch_secs(),
+                );
+                // A drain that stopped waiting on this worker drops this send;
+                // harmless. A panicking worker never reaches here.
+                let _ = tx.send((
+                    index,
+                    CodexOutcome {
+                        name: worker_name,
+                        epoch_at_spawn,
+                        identity,
+                        result,
+                    },
+                ));
+                drop(exit);
+            });
+        match spawned {
+            Ok(handle) => workers.push(FanoutWorker { ticket, handle }),
+            Err(e) => {
+                strand_codex(state, &name, epoch_at_spawn);
+                logline!("clauth: '{name}': the codex usage fetch could not start: {e}");
+            }
+        }
+    }
+    // Drop the spare sender so the drain's wait ends once every worker's clone
+    // is gone (a panicked worker drops its clone on unwind).
+    drop(tx);
+
+    for outcome in drain_completions(&rx, &workers, &state.activity) {
+        let CodexOutcome {
+            name,
+            epoch_at_spawn,
+            identity,
+            result,
+        } = outcome;
+        match result {
             Ok(mut info) => {
                 // The age clock: only a live poll re-ages the body, so the
                 // stamp reads `now_ms()` at the write — the poll's own moment,
-                // not the tick's start (the per-name loop waits on request
-                // slots and HTTP between the two) — mirroring the OAuth leg's
+                // not the tick's start — mirroring the OAuth leg's
                 // `info.fetched_at = Some(now.as_millis())`.
                 info.fetched_at = Some(crate::usage::now_ms());
                 crate::codex_auth::kick_reset(name.as_str());
@@ -6907,18 +7533,18 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
                 // Section 1: re-read `auth.json` under the flock and write the
                 // shared cache only while the captured account id still matches.
                 let matched = crate::lock::with_state_lock_flag(timed_out, |_held| {
-                    let (disk, unreadable) = crate::usage::read_codex_for_compare(name);
+                    let (disk, unreadable) = crate::usage::read_codex_for_compare(&name);
                     let ok = !unreadable && disk == identity;
                     if ok {
-                        write_profile_cache_for(Harness::Codex, name, USAGE_CACHE_FILE, &info);
+                        write_profile_cache_for(Harness::Codex, &name, USAGE_CACHE_FILE, &info);
                     }
                     Ok::<bool, anyhow::Error>(ok)
                 })
                 .unwrap_or_default();
-                // Section 2: the poll memo (cadence) and the store/status writes,
-                // gated on the epoch not having moved.
+                // Section 2: the poll memo (cadence) and the store/status
+                // writes, gated on the epoch not having moved.
                 let Some(_epoch) = crate::usage::epoch_guard_if_current(
-                    name,
+                    &name,
                     crate::usage::Half::Codex,
                     epoch_at_spawn,
                 ) else {
@@ -6945,7 +7571,7 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
                 crate::codex_auth::kick_codex(name.as_str());
                 // Cadence still stamps, only while the epoch has not moved.
                 let Some(_epoch) = crate::usage::epoch_guard_if_current(
-                    name,
+                    &name,
                     crate::usage::Half::Codex,
                     epoch_at_spawn,
                 ) else {
@@ -6960,7 +7586,7 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
             Err(_) => {
                 // Cadence still stamps, only while the epoch has not moved.
                 let Some(_epoch) = crate::usage::epoch_guard_if_current(
-                    name,
+                    &name,
                     crate::usage::Half::Codex,
                     epoch_at_spawn,
                 ) else {
@@ -6975,7 +7601,47 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
         }
     }
 
+    // Reap the workers (the OAuth fan-out's reap shape): a left-running or
+    // panicked worker sent nothing and stamped no cadence, so this is the only
+    // site left to say the poll failed. The codex leg has no countdown column,
+    // so nothing to withdraw.
+    for worker in workers {
+        let name = &worker.ticket.key.name;
+        if worker.ticket.abandoned.load(Ordering::Relaxed) {
+            strand_codex(state, name, worker.ticket.epoch_at_spawn);
+            log_left_running(name);
+        } else if worker.handle.join().is_err() {
+            strand_codex(state, name, worker.ticket.epoch_at_spawn);
+        }
+    }
+
     apply_codex_switch(state, &codex, interval_ms);
+}
+
+/// One codex usage fetch's result plus the spawn-time identity its landing
+/// gates on, sent on the leg's completion channel.
+struct CodexOutcome {
+    name: ProfileName,
+    epoch_at_spawn: u64,
+    /// The account id off the same `auth.json` read that supplied the token,
+    /// which section 1's re-read compares against.
+    identity: Option<String>,
+    result: Result<crate::usage::UsageInfo, FetchError>,
+}
+
+/// A codex worker that produced no outcome this tick: while the account still
+/// reads the epoch the worker was spawned under, record Failed — the same
+/// status surface the leg's own landing writes Fresh on.
+fn strand_codex(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64) {
+    clear_fetch_activity(&state.activity, &FetchLeg::Codex.key(name.clone()));
+    let Some(_epoch) =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::Codex, epoch_at_spawn)
+    else {
+        return;
+    };
+    if let Ok(mut st) = state.status.lock() {
+        st.insert(name.to_string(), FetchStatus::Failed);
+    }
 }
 
 /// Walk the codex chain over the readings just taken and move the codex active
@@ -8914,7 +9580,9 @@ fn scan_recovery(
 /// Poisoned `last_fetched` returns empty rather than `last=0` (which would mark
 /// all profiles due — fetch storm). Profiles currently `Switching` or `Refreshing`
 /// are excluded to avoid racing the switch worker on `TokenList` or `rotate_one_inner`
-/// on the single-use refresh token. Poisoned activity mutex fails safe to excluded.
+/// on the single-use refresh token, and so is a leg whose last worker is still
+/// running late, so a hang costs one worker rather than one per tick. Poisoned
+/// activity mutex fails safe to excluded.
 /// A quarantined entry's deadline widens by its `poll_backoff_ms` — read from the
 /// snapshot each partition, so the widening vanishes the tick the flag lifts.
 /// The 429 extra baked into `last_fetched` composes with that backoff; the sum
@@ -8954,7 +9622,9 @@ fn partition_due<T: NamedEntry + Clone>(
             .saturating_add(IntervalMs::from_millis(partition_extra));
         per_profile.insert(entry.key(), next.as_millis());
         let excluded = match act.as_ref() {
-            Ok(activity) => activity.get(entry.name()).is_some_and(is_token_spend),
+            Ok(activity) => activity
+                .get(entry.name())
+                .is_some_and(|state| holds_off_fetch(state, entry.leg())),
             Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
@@ -8967,9 +9637,9 @@ fn partition_due<T: NamedEntry + Clone>(
     (due, per_profile)
 }
 
-/// Merge forced (cadence-bypassing) entries into `due`. Skips profiles a token
-/// spend runs on (the same set [`partition_due`] drops) and entries already
-/// due.
+/// Merge forced (cadence-bypassing) entries into `due`. Skips the legs
+/// [`partition_due`] holds off (a token spend, a worker still running late) and
+/// entries already due.
 fn merge_forced<T: NamedEntry + Clone>(
     snapshot: &[T],
     forced: &HashSet<String>,
@@ -8981,18 +9651,22 @@ fn merge_forced<T: NamedEntry + Clone>(
     if forced.is_empty() {
         return;
     }
-    let spending: HashSet<String> = match activity.lock() {
-        Ok(activity) => activity
+    let held_off: HashSet<LegKey> = match activity.lock() {
+        Ok(activity) => snapshot
             .iter()
-            .filter(|(_, state)| is_token_spend(state))
-            .map(|(n, _)| n.clone())
+            .map(NamedEntry::key)
+            .filter(|key| {
+                activity
+                    .get(key.name.as_str())
+                    .is_some_and(|state| holds_off_fetch(state, key.leg))
+            })
             .collect(),
-        Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),
+        Err(_) => snapshot.iter().map(NamedEntry::key).collect(),
     };
     let mut extras: Vec<T> = Vec::with_capacity(forced.len());
     for entry in snapshot.iter().filter(|e| {
         forced.contains(e.name())
-            && !spending.contains(e.name())
+            && !held_off.contains(&e.key())
             && !due.iter().any(|d| d.name() == e.name())
     }) {
         per_profile_next.insert(entry.key(), now);
@@ -9099,8 +9773,9 @@ fn should_anchor_fetch(
 /// Force a single post-reset poll for every OAuth profile whose 5h window reset
 /// has passed since its last fetch (see [`should_anchor_fetch`]), so the overview
 /// leaves the stale pre-reset reading instead of holding it until the natural
-/// cadence slot. Skips a running token spend (`excluded`, the same set
-/// [`partition_due`] drops) and any name already `due`. A scheduled name's
+/// cadence slot. Skips every leg [`partition_due`] holds off (`excluded`: a
+/// running token spend or a worker still running late) and any name already
+/// `due`. A scheduled name's
 /// countdown is stamped to `now_ms` (fetching now), mirroring [`merge_forced`].
 /// Decomposed args (no [`SchedulerState`]) so the due decision tests directly.
 fn anchor_post_reset_oauth(

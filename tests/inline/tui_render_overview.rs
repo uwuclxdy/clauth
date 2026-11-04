@@ -1022,6 +1022,43 @@ fn failed_row_colors_countdown_red() {
     assert_eq!(countdown.style.fg, Some(theme::danger_color()));
 }
 
+/// A failed account whose leg a left-running fetch worker holds has no deadline
+/// published (nothing is coming to fetch it): the timer slot stays blank, never
+/// the spinner a past deadline would draw on the instance that fetches.
+#[test]
+fn a_failed_row_with_no_deadline_draws_a_blank_timer_slot_not_a_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "the instance that fetches is the one a past deadline turns into a spinner"
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(
+        crate::spinner::SPINNER_FRAMES
+            .iter()
+            .all(|frame| !text.contains(frame)),
+        "no spinner frame on the row: {text:?}"
+    );
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the timer slot is blank: {text:?}"
+    );
+}
+
 /// Every `(reset)` countdown suffix on a row, in column order.
 fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
     line.spans

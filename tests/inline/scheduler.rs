@@ -3987,7 +3987,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
     state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
     state.store.lock().unwrap().insert("w".to_string(), spent());
 
-    let run = |entry: super::TokenEntry| FetchOutcome {
+    let run = move |entry: super::TokenEntry| FetchOutcome {
         name: entry.name,
         info: Some(rolled.clone()),
         status: FetchStatus::Fresh,
@@ -4005,7 +4005,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         profile_attempt_at: None,
         reanchored: false,
     };
-    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
     assert!(
         state
             .weekly_reset_kicks
@@ -17015,7 +17015,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
     // the scope join instead of hanging.
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let release_rx = std::sync::Mutex::new(release_rx);
-    let worker = |entry: TokenEntry| -> super::FetchOutcome {
+    let worker = move |entry: TokenEntry| -> super::FetchOutcome {
         if entry.name == "slow" {
             let _ = release_rx.lock().unwrap().recv();
         }
@@ -18797,6 +18797,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
         Some("rt-old"),
         None,
         None,
+        crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -18927,6 +18928,7 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
         Some("rt-old"),
         None,
         None,
+        crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -19222,6 +19224,7 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
         Some("rt-old"),
         None,
         Some((&activity, &shutting_down)),
+        crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -19273,6 +19276,7 @@ fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
         Some("rt-old"),
         None,
         Some((&activity, &shutting_down)),
+        crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -24643,9 +24647,10 @@ fn drained_tokens(
     state.tokens = Arc::new(RankedMutex::new(vec![entry.clone()]));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity = crate::testutil::fresh_activity();
-    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
+    let config = config.clone();
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, move |e| {
         super::fetch_with_rotation(
-            config,
+            &config,
             &e,
             None,
             &refetch,
@@ -24932,8 +24937,15 @@ fn a_second_process_holding_the_spent_token_sends_the_staged_one() {
     ));
     let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
 
-    let _ =
-        crate::oauth::auto_start_kick(&peer, &chain_pn(name), "at-old", Some("rt-old"), None, None);
+    let _ = crate::oauth::auto_start_kick(
+        &peer,
+        &chain_pn(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+        crate::oauth::LockWait::NoWait,
+    );
     let seen = server.join().expect("listener");
 
     let sent: Vec<String> = seen
@@ -25182,18 +25194,26 @@ fn a_kick_refused_on_a_cleared_login_drops_the_entry_through_run_fetch() {
         },
     );
 
-    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
+    let worker_config = Arc::clone(&state.config);
+    let worker_store = Arc::clone(&state.store);
+    let worker_refetch_queue = Arc::clone(&state.refetch_queue);
+    let worker_activity = Arc::clone(&state.activity);
+    let worker_poll_streaks = Arc::clone(&state.poll_streaks);
+    let worker_kick_blocks = Arc::clone(&state.kick_blocks);
+    let worker_weekly_reset_kicks = Arc::clone(&state.weekly_reset_kicks);
+    let worker_auto_start_queue = Arc::clone(&state.auto_start_queue);
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, move |e| {
         super::run_fetch(
-            &state.config,
+            &worker_config,
             e,
-            &state.store,
-            &state.refetch_queue,
-            &state.activity,
-            &state.poll_streaks,
-            &state.kick_blocks,
-            &state.weekly_reset_kicks,
+            &worker_store,
+            &worker_refetch_queue,
+            &worker_activity,
+            &worker_poll_streaks,
+            &worker_kick_blocks,
+            &worker_weekly_reset_kicks,
             &HashSet::new(),
-            &state.auto_start_queue,
+            &worker_auto_start_queue,
             REFRESH_INTERVAL_MS,
         )
     });
@@ -25879,8 +25899,9 @@ fn a_rotated_pair_syncs_only_while_the_entry_still_holds_the_sent_token() {
 
     // A rebuild landed mid-flight (another thread put a new credential in the
     // entry), so the drain must leave the rebuilt entry alone.
-    let run = |entry: TokenEntry| {
-        if let Ok(mut t) = state.tokens.lock()
+    let tokens = Arc::clone(&state.tokens);
+    let run = move |entry: TokenEntry| {
+        if let Ok(mut t) = tokens.lock()
             && let Some(e) = t.iter_mut().find(|e| e.name == entry.name)
         {
             e.access_token = "rebuilt-token".into();
@@ -26578,11 +26599,12 @@ fn a_login_gone_drain_keeps_a_rebuilt_entry() {
     let mut spawned = token("lg");
     spawned.access_token = "sent".to_string();
     *state.tokens.lock().unwrap() = vec![spawned.clone()];
-    let run = |entry: TokenEntry| {
+    let tokens = Arc::clone(&state.tokens);
+    let run = move |entry: TokenEntry| {
         // The re-login lands while the fetch is in flight, rebuilding the entry.
         let mut rebuilt = entry.clone();
         rebuilt.access_token = "rebuilt".to_string();
-        *state.tokens.lock().unwrap() = vec![rebuilt];
+        *tokens.lock().unwrap() = vec![rebuilt];
         super::FetchOutcome::cached(&entry.name, super::FetchStatus::Cached, None, None)
             .with_login_gone()
     };
@@ -28964,6 +28986,7 @@ fn a_kick_holds_its_claim_until_its_pair_lands() {
                 Some("rt-old"),
                 None,
                 Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+                crate::oauth::LockWait::NoWait,
             )
         })
     };
@@ -29034,6 +29057,7 @@ fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
         Some("rt-old"),
         None,
         Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+        crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
 
@@ -31538,5 +31562,2060 @@ fn the_probe_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not()
     assert!(
         probe_reset_clears(false),
         "a profile in no chain is cleared"
+    );
+}
+
+// ── a hung fan-out worker never holds the tick ───────────────────────────────
+//
+// One account's fetch that never returns must not hold the drain: past the tick
+// fetch deadline the drain leaves the worker running, marks that account
+// Failed, logs one line naming it, and the other accounts' outcomes land.
+
+/// Held closed while `hung`'s fetch must stay in flight. Static, so both the
+/// third-party `fn` fetcher and a `'static` OAuth worker closure can reach it.
+static HUNG_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+fn wait_on_hung_gate() {
+    let (lock, cvar) = &HUNG_GATE;
+    let guard = lock.lock().unwrap();
+    let _released = cvar
+        .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| !*open)
+        .unwrap();
+}
+
+/// Opens the gate on drop, so the hung worker returns before the sandbox drops
+/// even when an assertion fails.
+struct HungRelease;
+impl Drop for HungRelease {
+    fn drop(&mut self) {
+        let (lock, cvar) = &HUNG_GATE;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+fn hung_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    if matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("hung")
+    ) {
+        wait_on_hung_gate();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+fn hung_third_party_state(names_urls: &[(&str, &str)]) -> super::SchedulerState {
+    let state = third_party_state(hung_fetcher);
+    let mut config = state.config.lock().unwrap();
+    for (name, url) in names_urls {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*name));
+        p.base_url = Some((*url).to_string());
+        p.api_key = Some("key".to_string());
+        // The landing compares the fetch's identity against the profile on
+        // disk; an in-memory-only profile reads as changed and lands nothing.
+        crate::profile::save_profile(&crate::profile::Profile::new(
+            (*name).to_string(),
+            Some((*url).to_string()),
+            Some("key".to_string()),
+        ))
+        .expect("save profile");
+        config.profiles.push(p);
+    }
+    drop(config);
+    state
+}
+
+const HUNG_URL: &str = "https://hung.tick-deadline.example";
+const OK_URL: &str = "https://ok.tick-deadline.example";
+
+#[test]
+fn a_hung_third_party_worker_is_left_running_and_its_account_marked_failed() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = hung_third_party_state(&[("hung", HUNG_URL), ("ok", OK_URL)]);
+    let due = vec![
+        join_order_entry("hung", HUNG_URL),
+        join_order_entry("ok", OK_URL),
+    ];
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    fetch_third_party_due(&state, due);
+    let took = started.elapsed();
+    drop(capture);
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the drain waited {took:?} on a hung worker past a 300 ms deadline"
+    );
+    let status = state.third_party_status.lock().unwrap();
+    assert_eq!(
+        status.get("hung"),
+        Some(&super::FetchStatus::Failed),
+        "the hung account is marked Failed"
+    );
+    assert_eq!(
+        status.get("ok"),
+        Some(&super::FetchStatus::Fresh),
+        "the other account's outcome landed"
+    );
+    drop(status);
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("hung")
+            .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+            .is_none(),
+        "the hung account's fetch mark is cleared"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged.iter().filter(|l| l.contains("'hung'")).count(),
+        1,
+        "one line names the hung account: {logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|l| l.contains("'ok'")),
+        "no line names the account that landed: {logged:?}"
+    );
+}
+
+#[test]
+fn a_hung_oauth_worker_is_left_running_and_its_account_marked_failed() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["hung", "ok"]);
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = completion_order_state();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    super::fetch_oauth_due_with(
+        &state,
+        vec![token("hung"), token("ok")],
+        REFRESH_INTERVAL_MS,
+        |entry: TokenEntry| -> super::FetchOutcome {
+            if entry.name == "hung" {
+                wait_on_hung_gate();
+            }
+            cached_outcome(&entry.name)
+        },
+    );
+    let took = started.elapsed();
+    drop(capture);
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the drain waited {took:?} on a hung worker past a 300 ms deadline"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("hung"),
+        Some(&super::FetchStatus::Failed),
+        "the hung account is marked Failed"
+    );
+    assert!(
+        state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("ok")),
+        "the other account's outcome landed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("hung")
+            .and_then(|a| a.fetch(FetchLeg::OAuth))
+            .is_none(),
+        "the hung account's fetch mark is cleared"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged.iter().filter(|l| l.contains("'hung'")).count(),
+        1,
+        "one line names the hung account: {logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|l| l.contains("'ok'")),
+        "no line names the account that landed: {logged:?}"
+    );
+}
+
+#[test]
+fn a_tick_returns_while_one_third_party_fetch_hangs() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = hung_third_party_state(&[("hung", HUNG_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("hung", HUNG_URL)];
+
+    let started = Instant::now();
+    super::tick(&state);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the tick waited {took:?} on a hung worker past a 300 ms deadline"
+    );
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("hung"),
+        Some(&super::FetchStatus::Failed),
+        "the hung account is marked Failed"
+    );
+}
+
+/// How many fetches entered [`respawn_counting_fetcher`] for `respawn`.
+static RESPAWN_FETCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn respawn_counting_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    if matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("respawn")
+    ) {
+        RESPAWN_FETCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        wait_on_hung_gate();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+const RESPAWN_URL: &str = "https://respawn.tick-deadline.example";
+
+/// One third-party account, `respawn`, whose fetch parks on [`HUNG_GATE`] and
+/// counts itself in [`RESPAWN_FETCHES`].
+fn respawn_state() -> super::SchedulerState {
+    let state = third_party_state(respawn_counting_fetcher);
+    {
+        let mut config = state.config.lock().unwrap();
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("respawn"));
+        p.base_url = Some(RESPAWN_URL.to_string());
+        p.api_key = Some("key".to_string());
+        config.profiles.push(p);
+    }
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("respawn", RESPAWN_URL)];
+    state
+}
+
+#[test]
+fn a_worker_left_running_holds_its_accounts_next_fetches_until_it_exits() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    RESPAWN_FETCHES.store(0, Ordering::SeqCst);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = respawn_state();
+
+    super::tick(&state);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("respawn"),
+        Some(&super::FetchStatus::Failed),
+        "the first tick left its worker running"
+    );
+    // The late worker stamped no fetch, so the cadence finds the account due.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    // A manual refresh bypasses the cadence.
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("respawn".to_string());
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+
+    assert_eq!(
+        RESPAWN_FETCHES.load(Ordering::SeqCst),
+        1,
+        "a due tick and a forced tick each started a second fetch beside the one still running"
+    );
+}
+
+#[test]
+fn a_worker_left_running_raises_no_spinner_when_it_reaches_its_request() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = completion_order_state();
+    let activity = Arc::clone(&state.activity);
+    let (marked_tx, marked_rx) = std::sync::mpsc::channel::<()>();
+
+    super::fetch_oauth_due_with(
+        &state,
+        vec![token("hung")],
+        REFRESH_INTERVAL_MS,
+        move |entry: TokenEntry| -> super::FetchOutcome {
+            wait_on_hung_gate();
+            super::mark_activity(&activity, &entry.name, ProfileActivity::Fetching);
+            let _ = marked_tx.send(());
+            cached_outcome(&entry.name)
+        },
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("hung"),
+        Some(&super::FetchStatus::Failed),
+        "the drain left the worker running"
+    );
+    drop(release);
+    marked_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the left-running worker reaches its request");
+
+    assert_eq!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("hung")
+            .and_then(|a| a.fetch(FetchLeg::OAuth)),
+        None,
+        "a worker its drain gave up on raised a spinner nothing will clear"
+    );
+}
+
+/// What the Overview timer slot and the Usage tab's fetch row both draw for the
+/// state's first profile: the shared derivation over the stores a tick leaves
+/// behind.
+fn respawn_display(state: &super::SchedulerState) -> ProfileActivity {
+    let profile = state
+        .config
+        .lock()
+        .unwrap()
+        .profiles
+        .first()
+        .cloned()
+        .expect("the respawn profile");
+    let selected = super::selected_activity(&state.activity.lock().unwrap(), &profile);
+    let next =
+        super::selected_next_refresh(&state.next_refresh_per_profile.lock().unwrap(), &profile);
+    super::display_activity(selected, next, true)
+}
+
+#[test]
+fn a_late_leg_draws_no_queued_spinner_over_its_failed_row() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = respawn_state();
+
+    super::tick(&state);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("respawn"),
+        Some(&super::FetchStatus::Failed),
+        "the first tick left its worker running"
+    );
+    assert_eq!(
+        respawn_display(&state),
+        ProfileActivity::Idle,
+        "right after the tick that left it running, the row reads its status, not Queued"
+    );
+
+    // The next tick partitions with the worker still late and republishes.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        respawn_display(&state),
+        ProfileActivity::Idle,
+        "a tick that holds the leg off republishes no past deadline for it"
+    );
+}
+
+#[test]
+fn a_worker_queued_behind_the_request_spacing_is_not_late() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    // Below the 5 s spacing: the second account on the host leaves the queue
+    // after its deadline would have run out had it counted from the spawn.
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_secs(1)));
+    let second_url = "https://ok.tick-deadline.example/second";
+    let state = hung_third_party_state(&[("first", OK_URL), ("second", second_url)]);
+
+    fetch_third_party_due(
+        &state,
+        vec![
+            join_order_entry("first", OK_URL),
+            join_order_entry("second", second_url),
+        ],
+    );
+
+    let status = state.third_party_status.lock().unwrap();
+    assert_eq!(
+        status.get("first"),
+        Some(&super::FetchStatus::Fresh),
+        "the account that took the first slot landed"
+    );
+    assert_eq!(
+        status.get("second"),
+        Some(&super::FetchStatus::Fresh),
+        "the account queued behind the spacing is not late: its deadline counts from its slot"
+    );
+}
+
+#[test]
+fn an_account_is_fetched_again_once_its_late_worker_exits() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let release = HungRelease;
+    RESPAWN_FETCHES.store(0, Ordering::SeqCst);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let state = respawn_state();
+
+    super::tick(&state);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("respawn"),
+        Some(&super::FetchStatus::Failed),
+        "the first tick left its worker running"
+    );
+    drop(release);
+    // Returns once the worker has exited: its ticket's registered sender drops
+    // with the last handle on the ticket.
+    crate::testutil::join_background_tasks();
+    assert!(
+        super::is_idle(&state.activity, &"respawn".into()),
+        "the worker exited, so its account is no longer busy"
+    );
+
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        RESPAWN_FETCHES.load(Ordering::SeqCst),
+        2,
+        "the account's next tick started a fetch once its late worker was gone"
+    );
+}
+
+/// A fan-out worker thread running `body` with its exit guard, wired as the
+/// drain sees one.
+fn drain_worker(
+    activity: &ActivityStore,
+    name: &str,
+    body: impl FnOnce(super::WorkerExit) + Send + 'static,
+) -> super::FanoutWorker {
+    let ticket = super::WorkerTicket::new(
+        FetchLeg::ThirdParty.key(crate::profile::ProfileName::from(name)),
+        0,
+    );
+    let exit = super::WorkerExit::new(&ticket, activity);
+    let handle = std::thread::spawn(move || body(exit));
+    super::FanoutWorker { ticket, handle }
+}
+
+fn is_late(activity: &ActivityStore, name: &str) -> bool {
+    activity
+        .lock()
+        .unwrap()
+        .get(name)
+        .is_some_and(|state| state.late(FetchLeg::ThirdParty))
+}
+
+#[test]
+fn a_worker_that_exits_without_sending_is_never_left_running() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(50)));
+    let activity = crate::testutil::fresh_activity();
+    let (_tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
+    let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+    let gone = drain_worker(&activity, "gone", move |exit| {
+        drop(exit);
+        let _ = gone_tx.send(());
+    });
+    let parked = drain_worker(&activity, "parked", move |exit| {
+        let _ = park_rx.recv();
+        drop(exit);
+    });
+    gone_rx.recv().expect("the first worker exited");
+    let workers = [gone, parked];
+
+    let landed: Vec<u32> = super::drain_completions(&rx, &workers, &activity).collect();
+
+    assert!(landed.is_empty(), "no worker sent an outcome");
+    assert!(
+        !workers[0].ticket.abandoned.load(Ordering::Relaxed) && !is_late(&activity, "gone"),
+        "a worker that already exited is not left running: nothing would ever clear its late mark"
+    );
+    assert!(
+        workers[1].ticket.abandoned.load(Ordering::Relaxed) && is_late(&activity, "parked"),
+        "the worker still out past its deadline is left running"
+    );
+
+    drop(park_tx);
+    for worker in workers {
+        worker.handle.join().expect("worker thread");
+    }
+    assert!(
+        !is_late(&activity, "parked"),
+        "the left-running worker's exit clears its late mark"
+    );
+}
+
+#[test]
+fn an_outcome_sent_just_before_the_drain_gives_up_still_lands() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(1)));
+    let activity = crate::testutil::fresh_activity();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel::<()>();
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+    // Sent, not yet exited: the instant between a worker's send and its exit.
+    let sender = drain_worker(&activity, "sender", move |exit| {
+        let _ = tx.send((0, 7));
+        let _ = sent_tx.send(());
+        let _ = park_rx.recv();
+        drop(exit);
+    });
+    sent_rx.recv().expect("the worker sent");
+    std::thread::sleep(Duration::from_millis(20));
+    let workers = [sender];
+
+    let landed: Vec<u32> = super::drain_completions(&rx, &workers, &activity).collect();
+
+    assert_eq!(
+        landed,
+        vec![7],
+        "a finished outcome already queued is landed, not discarded for a Failed"
+    );
+    drop(park_tx);
+    for worker in workers {
+        assert!(
+            !worker.ticket.abandoned.load(Ordering::Relaxed),
+            "a worker whose outcome landed is not also left running"
+        );
+        worker.handle.join().expect("worker thread");
+    }
+    assert!(!is_late(&activity, "sender"));
+}
+
+/// The rotation lock held by another process: the fetch leg skips its rotation
+/// and answers from cache, where it used to park on the lock until the holder
+/// let go.
+#[test]
+fn a_held_rotation_lock_skips_the_fetch_legs_rotation_instead_of_waiting() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-lock-held-fetch";
+    // `max` sits above the happy path (usage, then the token POST) so a leaked
+    // POST is recorded, never refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let holder = crate::testutil::hold_rotation_lock(name);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let outcome = super::fetch_with_rotation(
+                &config,
+                &entry,
+                None,
+                &refetch,
+                &activity,
+                &shutting_down,
+            );
+            let _ = tx.send(outcome);
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(10));
+        // Release the holder either way, so a leg that did park finishes.
+        drop(holder);
+        answered
+    });
+    let seen = server.join().expect("listener");
+
+    let outcome =
+        outcome.expect("the fetch leg answered without waiting on the held rotation lock");
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The kick's rotation leg, same lock held: it opens no window and rotates
+/// nothing, and answers without waiting.
+#[test]
+fn a_held_rotation_lock_skips_the_kicks_rotation_instead_of_waiting() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-lock-held-kick";
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let holder = crate::testutil::hold_rotation_lock(name);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let result = crate::oauth::auto_start_kick(
+                &config,
+                &crate::profile::ProfileName::from(name),
+                "at-old",
+                Some("rt-old"),
+                None,
+                None,
+                crate::oauth::LockWait::NoWait,
+            );
+            let _ = tx.send(result);
+        });
+        // Past the kick's own 2 s pacing before it reaches the lock.
+        let answered = rx.recv_timeout(Duration::from_secs(10));
+        drop(holder);
+        answered
+    });
+    let seen = server.join().expect("listener");
+
+    let result = result.expect("the kick answered without waiting on the held rotation lock");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "the first kick ran: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+    assert!(!result.opened, "no window opened");
+    assert_eq!(result.rotated, None, "nothing may be rotated");
+}
+
+/// An elected member whose kick meets a held rotation lock: the kick ran, its
+/// rotation skipped, and the queue charges it NO election failure — the skip
+/// is another holder's rotation in progress, not this member's incapability,
+/// so the next tick retries with the queue state untouched.
+#[test]
+fn a_held_rotation_lock_on_the_kick_costs_the_elected_member_no_queue_failure() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["elected".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("elected")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = collect_one_token_for_landing(&app_config);
+    entry.may_open_window = true; // elected this tick
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "elected".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now - 60)), // lapsed
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let holder = crate::testutil::hold_rotation_lock("elected");
+
+    let _outcome = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    drop(holder);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"elected".into(), crate::usage::now_epoch_secs()),
+        0,
+        "a kick whose rotation skipped on a held lock is no election failure"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "the kick ran: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+}
+
+/// A live-window re-test whose kick meets a held rotation lock: the kick ran,
+/// its rotation skipped, and the ONE re-test the weekly-reset mark buys must
+/// survive for the next tick. The skip is a peer's rotation in progress, not
+/// this member's answer, and the 401 left no block the standing `has_block`
+/// re-test could continue from — consuming the mark would lose the re-test
+/// until the next hard-cap rollover.
+#[test]
+fn a_held_lock_kick_keeps_the_weekly_reset_retest() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("weekly-retest")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
+    let name = ProfileName::from("weekly-retest");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "weekly-retest".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some(epoch_secs_to_iso(now + 5 * 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([name.clone()])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let holder = crate::testutil::hold_rotation_lock("weekly-retest");
+    crate::usage::reset_request_slots();
+
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &weekly_reset_kicks,
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    drop(holder);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        weekly_reset_kicks.lock().unwrap().contains(&name),
+        "a kick whose rotation skipped on a held lock consumed the weekly-reset re-test"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "the kick ran: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+}
+
+/// The same lock-held skip with a 429 on a clock-expired token: that kick DID
+/// record a real block, and the standing `has_block` re-test continues from it,
+/// so the one-shot weekly-reset mark is consumed exactly as any other recorded
+/// 429 consumes it.
+#[test]
+fn a_held_lock_kick_that_records_a_429_consumes_the_weekly_reset_retest() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let reset = now + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, now + 383_473);
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (429, limiter.clone(), String::new())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, Vec::new(), usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, Vec::new(), "{}".to_string())
+        } else {
+            (404, Vec::new(), "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("weekly-429")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = collect_one_token_for_landing(&app_config);
+    // Clock-expired: the 429 is the one case that still rotates, so the skip
+    // records the limiter's block.
+    entry.access_expires_at = Some(crate::usage::now_ms() as i64 - 60_000);
+    let name = ProfileName::from("weekly-429");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "weekly-429".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some(epoch_secs_to_iso(now + 5 * 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([name.clone()])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let holder = crate::testutil::hold_rotation_lock("weekly-429");
+    crate::usage::reset_request_slots();
+
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &blocks,
+        &weekly_reset_kicks,
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    drop(holder);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        super::kick_block(&blocks, &name).is_some(),
+        "the 429 the skip recorded stands as the block the standing re-test continues from"
+    );
+    assert!(
+        !weekly_reset_kicks.lock().unwrap().contains(&name),
+        "a held-lock skip that recorded a real 429 kept the weekly-reset re-test"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+}
+
+/// The held-lock skip of [`a_held_lock_kick_keeps_the_weekly_reset_retest`]
+/// with the landing itself on the timeout path: the tick's flag is pre-set, so
+/// the kick's section-1 hold skips the state flock and answers
+/// `KickLanding::Timeout` without waiting. The `Timeout` landing arm carries
+/// its own copy of the same guard, and a skip with no block recorded must keep
+/// the one-shot re-test there too.
+#[test]
+fn a_held_lock_kick_under_a_state_flock_timeout_keeps_the_weekly_reset_retest() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::AtomicBool;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("weekly-timeout")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
+    let name = ProfileName::from("weekly-timeout");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "weekly-timeout".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 1.0,
+                resets_at: Some(epoch_secs_to_iso(now + 5 * 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([name.clone()])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let holder = crate::testutil::hold_rotation_lock("weekly-timeout");
+    crate::usage::reset_request_slots();
+
+    // The tick's flag pre-set: the kick's section-1 hold takes the skipped-flock
+    // path at once instead of reading the state file.
+    let tick_timed_out = AtomicBool::new(true);
+    let _ = super::run_fetch_flagged(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &weekly_reset_kicks,
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+        Some(&tick_timed_out),
+        &AtomicBool::new(false),
+    );
+    drop(holder);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "the kick ran before the state-flock timeout landing: {seen:?}"
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().contains(&name),
+        "the Timeout landing arm's guard consumed the weekly-reset re-test after a held-lock skip"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+}
+
+/// The fetch worker's kick call site, driven through `run_fetch`: an auto-start
+/// member on a lapsed window whose kick meets a held rotation lock answers
+/// without waiting on the holder and sends no token POST. Its proof is the
+/// mutant `LockWait::NoWait` -> `LockWait::Block` at the call site, which
+/// parks the worker on the lock and reds the elapsed assert.
+#[test]
+fn a_held_rotation_lock_skips_the_fetch_workers_kick_instead_of_waiting() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::time::{Duration, Instant};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-lock-held-fetch-kick";
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    config.lock().unwrap().profiles[0].auto_start = true;
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: true,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let state = chain_state(&config, vec![entry.clone()]);
+    state.store.lock().unwrap().insert(
+        name.to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(crate::usage::now_epoch_secs() - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let holder = crate::testutil::hold_rotation_lock(name);
+
+    let worker_config = Arc::clone(&state.config);
+    let worker_store = Arc::clone(&state.store);
+    let worker_refetch_queue = Arc::clone(&state.refetch_queue);
+    let worker_activity = Arc::clone(&state.activity);
+    let worker_poll_streaks = Arc::clone(&state.poll_streaks);
+    let worker_kick_blocks = Arc::clone(&state.kick_blocks);
+    let worker_weekly_reset_kicks = Arc::clone(&state.weekly_reset_kicks);
+    let worker_auto_start_queue = Arc::clone(&state.auto_start_queue);
+    let started = Instant::now();
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, move |e| {
+        super::run_fetch(
+            &worker_config,
+            e,
+            &worker_store,
+            &worker_refetch_queue,
+            &worker_activity,
+            &worker_poll_streaks,
+            &worker_kick_blocks,
+            &worker_weekly_reset_kicks,
+            &HashSet::new(),
+            &worker_auto_start_queue,
+            REFRESH_INTERVAL_MS,
+        )
+    });
+    let took = started.elapsed();
+    drop(holder);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        took < Duration::from_secs(10),
+        "the fetch worker waited {took:?} on a held rotation lock instead of skipping its kick"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a held rotation lock must send no token POST: {seen:?}"
+    );
+}
+
+/// The CLI switch's one-shot window prime keeps the BLOCKING rotation wait: the
+/// CLI runs once and exits, so no later tick retries a prime that skipped the
+/// lock. The holder here lets go while the prime is parked on it, and the
+/// rotation (then the retry kick) must still run.
+#[test]
+fn a_cli_prime_waits_out_a_held_rotation_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-lock-held-prime";
+    // First kick, token POST, retry kick: the three requests a prime that waits
+    // the holder out makes. Sizing `max` to them lets the listener return as
+    // soon as the retry kick lands.
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let (base, server) = crate::testutil::serve_endpoints(3, move |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/v1/messages") {
+            if !signalled.swap(true, Ordering::SeqCst) {
+                let _ = first_tx.send(());
+            }
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    // `prime_window` kicks only an auto-start account; the fixture's blank
+    // profile leaves the opt-in off.
+    config.lock().unwrap().profiles[0].auto_start = true;
+    let holder = crate::testutil::hold_rotation_lock(name);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let opened = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let opened =
+                crate::oauth::prime_window(&config, &crate::profile::ProfileName::from(name));
+            let _ = tx.send(opened);
+        });
+        first_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first kick reached the stub");
+        // Three times the kick's own 2 s pacing before it reaches the lock, so
+        // the holder still stands when the acquire is attempted even on a
+        // loaded box; a shorter hold lets a `NoWait` regression pass.
+        std::thread::sleep(Duration::from_secs(6));
+        drop(holder);
+        rx.recv_timeout(Duration::from_secs(15))
+    });
+    let seen = server.join().expect("listener");
+
+    let opened = opened.expect("the prime answered after the holder let go");
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        2,
+        "the prime skipped its rotation instead of waiting the holder out: {seen:?}"
+    );
+    assert!(opened, "the retry kick opened the window: {seen:?}");
+}
+
+// ── a leg's own bound ends a stalled call ────────────────────────────────────
+
+/// A loopback endpoint that accepts every connection, reads the request head,
+/// and answers nothing until released. It counts what it accepted, so a test can
+/// pin how many fetches STARTED (each fetch is one request).
+struct SilentEndpoint {
+    base: String,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    listener: Option<std::thread::JoinHandle<()>>,
+    handlers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+/// How long a handler waits for the release before closing its socket anyway.
+/// Above every elapsed bound a test asserts on, so a call whose own deadline was
+/// removed reds that test's assertion instead of hanging the suite.
+const SILENT_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl SilentEndpoint {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let handlers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = {
+            let accepted = Arc::clone(&accepted);
+            let stop = Arc::clone(&stop);
+            let gate = Arc::clone(&gate);
+            let handlers = Arc::clone(&handlers);
+            std::thread::spawn(move || {
+                loop {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((sock, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            let gate = Arc::clone(&gate);
+                            let handle = std::thread::spawn(move || {
+                                let mut sock = sock;
+                                let _ = crate::testutil::read_request_head(&mut sock);
+                                let (lock, cvar) = &*gate;
+                                let open = lock.lock().unwrap();
+                                let _ = cvar
+                                    .wait_timeout_while(open, SILENT_HOLD, |open| !*open)
+                                    .unwrap();
+                                drop(sock);
+                            });
+                            handlers.lock().unwrap().push(handle);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        Self {
+            base,
+            accepted,
+            stop,
+            gate,
+            listener: Some(listener),
+            handlers,
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SilentEndpoint {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.stop.store(true, Ordering::SeqCst);
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        let handlers: Vec<_> = std::mem::take(&mut *self.handlers.lock().unwrap());
+        for handle in handlers {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The cached 5h reset has passed since this account's last fetch, so the
+/// post-reset anchor wants a poll — but the account's worker from the previous
+/// tick is still out. A second worker beside the hung one leaks a thread per
+/// tick and draws a Queued spinner over the Failed row.
+#[test]
+fn a_post_reset_anchor_does_not_respawn_a_late_oauth_worker() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let name = "anchor-late";
+    crate::testutil::register_names(&[name]);
+    let profile = save_unanchored_login(name, "anchor-late-access");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    let tokens = collect_tokens(&config);
+    let state = third_party_state(stub_ok_stats);
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = tokens;
+
+    // The cached 5h reset is past, plus the anchor's grace, and the last fetch
+    // predates it: `should_anchor_fetch` holds for this account.
+    let now = crate::usage::now_ms();
+    let reset_ms = now - RESET_ANCHOR_GRACE_MS - 60_000;
+    state.store.lock().unwrap().insert(
+        name.to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.25,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    i64::try_from(reset_ms / 1000).expect("epoch secs fit"),
+                )),
+            }),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key(name),
+        FetchStamp::at(EpochMs::from_millis(now - REFRESH_INTERVAL_MS - 60_000)),
+    );
+
+    super::tick(&state);
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "the first tick left its worker running"
+    );
+    assert_eq!(silent.accepted(), 1, "the first tick started one fetch");
+    assert_eq!(
+        respawn_display(&state),
+        ProfileActivity::Idle,
+        "the failed row reads its status, not Queued"
+    );
+
+    // The next tick partitions with the worker still late; the post-reset anchor
+    // must not put the same account back on the due list behind it.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+
+    assert_eq!(
+        silent.accepted(),
+        1,
+        "the post-reset anchor re-queued a late account: a second fetch started beside the one still running"
+    );
+    assert_eq!(
+        respawn_display(&state),
+        ProfileActivity::Idle,
+        "the re-queued account republished a past countdown, so the row reads Queued over Failed"
+    );
+}
+
+/// A codex usage worker's own HTTP bound ends a stalled `wham/usage` call well
+/// inside the tick fetch deadline, so the third-party leg still lands. The
+/// margin is the usage agent's whole-call deadline (`USAGE_HTTP_DEADLINES`,
+/// connect + headers) plus headroom for the third-party leg and the post-fetch
+/// scans; [`SILENT_HOLD`] sits above it, so a codex agent with no deadline reds
+/// the elapsed assert instead of hanging the run.
+#[test]
+fn a_tick_returns_while_one_codex_usage_fetch_hangs() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let name = "cxstall";
+    crate::testutil::write_codex_roster(&[name]);
+    let auth_path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), "auth.json")
+            .expect("auth path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir profile dir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+    )
+    .expect("write auth.json");
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::reset_request_slots();
+
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+
+    let started = Instant::now();
+    super::tick(&state);
+    let took = started.elapsed();
+    crate::usage::clear_codex_usage_url_override();
+
+    assert_eq!(
+        silent.accepted(),
+        1,
+        "the codex usage fetch reached the stall"
+    );
+    let bound = crate::usage::USAGE_HTTP_DEADLINES + Duration::from_secs(6);
+    assert!(
+        took < bound,
+        "the tick waited {took:?} on a stalled codex usage fetch, past the leg's own {bound:?} bound"
+    );
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("landed"),
+        Some(&super::FetchStatus::Fresh),
+        "the other leg's outcome still landed in the same tick"
+    );
+    assert!(
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("landed"),
+        "the third-party reading landed in the store"
+    );
+}
+
+/// One codex account's `auth.json` (the roster is one file for all names, so
+/// callers pass the full list to [`crate::testutil::write_codex_roster`]
+/// themselves).
+fn write_codex_account(name: &str) {
+    let auth_path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), "auth.json")
+            .expect("auth path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir profile dir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+    )
+    .expect("write auth.json");
+}
+
+/// Three due codex accounts on one stalling loopback (the one override URL
+/// serves every account's poll): each stalled fetch ends at the agent's
+/// response-header bound — `USAGE_HTTP_RECV_HEADERS_SECS`, the component of
+/// `USAGE_HTTP_DEADLINES` that fires on a loopback which accepts and never
+/// answers — so ONE leg bound plus the per-host spacing tail (two
+/// `REQUEST_SPACING_MS` steps for three workers) and a headroom margin bounds
+/// the whole tick, where the serial leg took N × the bound. The third-party
+/// leg's outcome still lands in the same tick.
+#[test]
+fn a_tick_returns_while_three_codex_usage_fetches_hang() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    crate::testutil::write_codex_roster(&["cxstall-a", "cxstall-b", "cxstall-c"]);
+    for name in ["cxstall-a", "cxstall-b", "cxstall-c"] {
+        write_codex_account(name);
+    }
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::reset_request_slots();
+
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+
+    let started = Instant::now();
+    super::tick(&state);
+    let took = started.elapsed();
+    crate::usage::clear_codex_usage_url_override();
+
+    assert_eq!(
+        silent.accepted(),
+        3,
+        "every codex account's poll reached the stall"
+    );
+    let bound = Duration::from_secs(crate::usage::USAGE_HTTP_RECV_HEADERS_SECS)
+        + Duration::from_millis(2 * crate::usage::REQUEST_SPACING_MS)
+        + Duration::from_secs(6);
+    assert!(
+        took < bound,
+        "the tick waited {took:?} on three stalled codex polls, past the one-bound-plus-spacing {bound:?} bound"
+    );
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("landed"),
+        Some(&super::FetchStatus::Fresh),
+        "the other leg's outcome still landed in the same tick"
+    );
+    assert!(
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("landed"),
+        "the third-party reading landed in the store"
+    );
+}
+
+/// A codex worker past the tick fetch deadline is left running, its account
+/// marked Failed, exactly one log line names it, and no second worker starts
+/// on the next tick while it is out. `silent` drops before the sandbox,
+/// opening its gate, and the sandbox joins the left-running worker the
+/// abandon registered.
+#[test]
+fn a_hung_codex_worker_is_left_running_and_its_account_marked_failed() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let name = "cxstall-late";
+    crate::testutil::write_codex_roster(&[name]);
+    write_codex_account(name);
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    crate::usage::reset_request_slots();
+
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    super::tick(&state);
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the tick waited {took:?} on a hung codex worker past a 300 ms deadline"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "the hung account is marked Failed"
+    );
+
+    // The next tick partitions the account due again (the late worker stamped
+    // no cadence) but starts no second worker beside it.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    drop(capture);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert_eq!(
+        silent.accepted(),
+        1,
+        "a due tick started a second fetch beside the one still running"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged
+            .iter()
+            .filter(|l| l.contains("'cxstall-late'"))
+            .count(),
+        1,
+        "one line names the hung account: {logged:?}"
+    );
+}
+
+/// The scheduler state for the probe fan-out tests: three setup-token probe
+/// accounts beside one healthy third-party account, off
+/// [`hung_third_party_state`] so the third-party fetcher stays a stub.
+fn probe_hung_state(names: &[&str]) -> super::SchedulerState {
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+    {
+        let mut config = state.config.lock().unwrap();
+        for name in names {
+            let pn = crate::profile::ProfileName::from(*name);
+            let mut profile = crate::testutil::blank_profile(&pn);
+            profile.usage_probe = true;
+            profile.usage_probe_interval_ms = 60_000;
+            crate::profile::save_profile(&profile).expect("save the profile");
+            crate::claude::write_session_token(&pn, SETUP_TOKEN, crate::usage::now_ms() as i64)
+                .expect("mint");
+            // What the loader records off the sidecar it finds, which
+            // [`super::usage_probe_admits`] gates on.
+            profile.has_long_lived_sidecar = true;
+            profile.setup_token_digest =
+                crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+            config.state.profiles.push(pn);
+            config.profiles.push(profile);
+        }
+    }
+    crate::testutil::register_names(names);
+    state
+}
+
+/// Three due probes on one stalling loopback: the same bound shape as the
+/// codex fan-out test — ONE leg bound (`TOKEN_HTTP_DEADLINES`, the kick/probe
+/// agent's whole-call ceiling; on a loopback which accepts and never answers
+/// the agent's 15 s response-header bound is the component that fires) plus
+/// the per-host spacing tail (two `REQUEST_SPACING_MS` steps) and a headroom
+/// margin — where the serial leg took N × the bound. The third-party leg's
+/// outcome still lands in the same tick.
+#[test]
+fn a_tick_returns_while_three_probes_hang() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_hung_state(&["probe-hang-a", "probe-hang-b", "probe-hang-c"]);
+    crate::usage::reset_request_slots();
+
+    let started = Instant::now();
+    super::tick(&state);
+    let took = started.elapsed();
+
+    assert_eq!(silent.accepted(), 3, "every probe reached the stall");
+    let bound = crate::oauth::TOKEN_HTTP_DEADLINES
+        + Duration::from_millis(2 * crate::usage::REQUEST_SPACING_MS)
+        + Duration::from_secs(6);
+    assert!(
+        took < bound,
+        "the tick waited {took:?} on three stalled probes, past the one-bound-plus-spacing {bound:?} bound"
+    );
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("landed"),
+        Some(&super::FetchStatus::Fresh),
+        "the other leg's outcome still landed in the same tick"
+    );
+}
+
+/// A probe worker past the tick fetch deadline is left running, its account
+/// marked Failed, exactly one log line names it, and no second worker starts
+/// while it is out. Driven at the leg's seam (as the hung OAuth worker test
+/// is): the tick runs the probe fan-out on its scope thread, whose lines a
+/// test thread cannot capture, so the leg is called directly. The hold-off
+/// gate is the partition the tick reads; `silent` drops before the sandbox,
+/// opening its gate, and the sandbox joins the left-running worker the
+/// abandon registered.
+#[test]
+fn a_hung_probe_worker_is_left_running_and_its_account_marked_failed() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let name = "probe-late";
+    let state = probe_state(name, 60_000, true);
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    assert_eq!(entries.len(), 1, "fixture: one due probe");
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    crate::usage::reset_request_slots();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    super::fetch_probe_due_flagged(&state, entries, None);
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the leg waited {took:?} on a hung probe worker past a 300 ms deadline"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "the hung account is marked Failed"
+    );
+    assert_eq!(silent.accepted(), 1, "the probe reached the stall");
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged.iter().filter(|l| l.contains("'probe-late'")).count(),
+        1,
+        "one line names the hung account: {logged:?}"
+    );
+    drop(capture);
+
+    // The next tick's partition would find the account due again (the late
+    // worker stamped no cadence) but holds it off while the worker is out.
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    let (due, _next) = partition_due(
+        std::slice::from_ref(&entries[0]),
+        crate::usage::now_ms(),
+        &state.last_fetched,
+        &state.activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::new(),
+    );
+    assert!(
+        due.is_empty(),
+        "a due partition started a second probe beside the one still running"
+    );
+}
+
+/// Whether the next partition holds `name`'s OAuth leg off.
+fn oauth_leg_held_off(state: &super::SchedulerState, name: &str) -> bool {
+    state
+        .activity
+        .lock()
+        .unwrap()
+        .get(name)
+        .is_some_and(|state| super::holds_off_fetch(state, FetchLeg::OAuth))
+}
+
+/// Both workers on one account's OAuth leg abandoned past the 300 ms override:
+/// the leg stays held off until the LAST of them exits, not the first. The two
+/// tickets run the real drain/abandon/exit path; a test cannot await one
+/// abandoned worker's exit through the fan-out itself, whose reap drops the
+/// join handles, so the worker shape is built here.
+#[test]
+fn a_late_leg_stays_held_off_until_every_abandoned_worker_exits() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = completion_order_state();
+    let name = "both-late";
+    let key = oauth_key(name);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+
+    let (_tx, rx) = std::sync::mpsc::channel::<(usize, ())>();
+    let spawn = |gate: Arc<(Mutex<bool>, Condvar)>| -> super::FanoutWorker {
+        let ticket = super::WorkerTicket::new(key.clone(), 0);
+        let exit = super::WorkerExit::new(&ticket, &state.activity);
+        let handle = std::thread::Builder::new()
+            .name("clauth-usage-fetch".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*gate;
+                let open = lock.lock().unwrap();
+                let _open = cvar
+                    .wait_timeout_while(open, Duration::from_secs(30), |open| !*open)
+                    .unwrap();
+                drop(exit);
+            })
+            .expect("spawn the test worker");
+        super::FanoutWorker { ticket, handle }
+    };
+    /// Opens the gate on drop, so a failed assertion still lets the parked
+    /// worker exit before the sandbox joins it.
+    struct GateRelease(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    let first_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let second_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let workers = vec![
+        spawn(Arc::clone(&first_gate)),
+        spawn(Arc::clone(&second_gate)),
+    ];
+    let first_release = GateRelease(Arc::clone(&first_gate));
+    let second_release = GateRelease(Arc::clone(&second_gate));
+    let landed: Vec<()> = super::drain_completions(&rx, &workers, &state.activity).collect();
+    assert!(
+        landed.is_empty(),
+        "nothing was sent, so the drain lands nothing"
+    );
+    assert!(
+        oauth_leg_held_off(&state, name),
+        "both workers were abandoned and still run, so the leg is late"
+    );
+
+    let mut workers = workers.into_iter();
+    let first = workers.next().expect("the first worker");
+    let second = workers.next().expect("the second worker");
+    drop(first_release);
+    first.handle.join().expect("the first worker exits");
+    assert!(
+        oauth_leg_held_off(&state, name),
+        "the first exit freed the leg while the second abandoned worker still runs"
+    );
+    drop(second_release);
+    second.handle.join().expect("the second worker exits");
+    assert!(
+        !oauth_leg_held_off(&state, name),
+        "the leg stays held off after every abandoned worker exited"
+    );
+}
+
+/// A probe entry as the leg takes it: built directly because the leg's `due`
+/// list is its argument.
+fn probe_entry_for(name: &str, verdict_only: bool) -> super::ProbeEntry {
+    super::ProbeEntry {
+        name: crate::profile::ProfileName::from(name),
+        token: SETUP_TOKEN.to_string(),
+        identity: crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN),
+        interval_ms: 60_000,
+        epoch_at_spawn: 0,
+        verdict_only,
+    }
+}
+
+/// Add a paired profile to `state`'s config, the shape a verdict-only retry
+/// belongs to (`usage_probe_admits` refuses it, so no Failed lands on its row).
+fn add_paired_profile(state: &super::SchedulerState, name: &str) {
+    let mut config = state.config.lock().unwrap();
+    let name = crate::profile::ProfileName::from(name);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = true;
+    profile.credentials = Some(crate::testutil::oauth_pair(name.as_str()));
+    config.profiles.push(profile);
+}
+
+/// A late probe worker withdraws the countdown this tick published for it, so
+/// its timer cell reads blank over the Failed row; a verdict-only retry owns no
+/// cell of its own and leaves the pair's alone. Its one log line carries no
+/// "marked failed" clause: it marks nothing.
+#[test]
+fn a_late_probe_withdraws_its_countdown_and_a_verdict_only_retry_keeps_the_pairs() {
+    use super::NamedEntry as _;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_state_over(&["probe-late"], 60_000, true);
+    add_paired_profile(&state, "probe-paired-late");
+    let normal = probe_entry_for("probe-late", false);
+    let retry = probe_entry_for("probe-paired-late", true);
+    let normal_key = normal.key();
+    let retry_key = retry.key();
+    let stamp = crate::usage::now_ms() + 60_000;
+    {
+        let mut next = state.next_refresh_per_profile.lock().unwrap();
+        next.insert(normal_key.clone(), stamp);
+        next.insert(retry_key.clone(), stamp);
+    }
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    crate::usage::reset_request_slots();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::fetch_probe_due_flagged(&state, vec![normal, retry], None);
+    drop(capture);
+
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        !next.contains_key(&normal_key),
+        "the late probe's countdown stands no fetch and must be withdrawn"
+    );
+    assert!(
+        next.contains_key(&retry_key),
+        "a verdict-only retry blanked the pair's timer cell"
+    );
+    drop(next);
+    assert_eq!(
+        state.status.lock().unwrap().get("probe-late"),
+        Some(&super::FetchStatus::Failed),
+        "the late probe reads Failed"
+    );
+    assert!(
+        state
+            .status
+            .lock()
+            .unwrap()
+            .get("probe-paired-late")
+            .is_none(),
+        "the verdict-only retry wrote a status row of its own"
+    );
+    let logged = lines.snapshot();
+    let retry_line = logged
+        .iter()
+        .find(|l| l.contains("'probe-paired-late'"))
+        .expect("the retry's one line");
+    assert_eq!(
+        *retry_line,
+        format!(
+            "clauth: 'probe-paired-late': usage probe retry still running after {:?}; left running",
+            super::tick_fetch_deadline()
+        ),
+        "the retry owns no Failed, so its line must not claim one"
+    );
+    let normal_line = logged
+        .iter()
+        .find(|l| l.contains("'probe-late'"))
+        .expect("the probe's one line");
+    assert_eq!(
+        *normal_line,
+        format!(
+            "clauth: 'probe-late': usage fetch still running after {:?}; marked failed and left running",
+            super::tick_fetch_deadline()
+        ),
+    );
+}
+
+/// A verdict-only probe retry rides its pair's OAuth leg key without owning that
+/// row's activity mark: leaving it running past the deadline must not clear the
+/// mark the pair's own `/usage` fetch still holds. Mutation: dropping the
+/// `owns_mark` guard in `abandon_worker` reds this test.
+#[test]
+fn an_abandoned_verdict_only_retry_keeps_the_pairs_fetch_mark() {
+    use super::NamedEntry as _;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_state_over(&["probe-late"], 60_000, true);
+    add_paired_profile(&state, "probe-paired-late");
+    let retry = probe_entry_for("probe-paired-late", true);
+    let retry_key = retry.key();
+    crate::usage::mark_fetch_activity(&state.activity, &retry_key, ProfileActivity::Fetching);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    crate::usage::reset_request_slots();
+
+    super::fetch_probe_due_flagged(&state, vec![retry], None);
+
+    assert_eq!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("probe-paired-late")
+            .and_then(|a| a.fetch(FetchLeg::OAuth)),
+        Some(ProfileActivity::Fetching),
+        "the abandoned verdict-only retry cleared its pair's live fetch mark"
+    );
+}
+
+/// One failed probe spawn must not shift the verdict-only flag onto the workers
+/// behind it: each stranded worker takes its own flag's walk, so the real probe
+/// after the failure still withdraws its timer cell and reads Failed, and the
+/// verdict-only retry after it still leaves the pair's cell and row alone.
+#[test]
+fn a_failed_probe_spawn_keeps_each_workers_verdict_only_flag() {
+    use super::NamedEntry as _;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_state_over(&["probe-failing", "probe-normal"], 60_000, true);
+    add_paired_profile(&state, "probe-paired");
+    let retry = probe_entry_for("probe-paired", true);
+    let retry_key = retry.key();
+    let normal_key = probe_entry_for("probe-normal", false).key();
+    let stamp = crate::usage::now_ms() + 60_000;
+    {
+        let mut next = state.next_refresh_per_profile.lock().unwrap();
+        next.insert(retry_key.clone(), stamp);
+        next.insert(normal_key.clone(), stamp);
+    }
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    crate::usage::reset_request_slots();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let arm = super::probe_spawn_fail::arm_at("probe-failing");
+    super::fetch_probe_due_flagged(
+        &state,
+        vec![
+            probe_entry_for("probe-failing", false),
+            retry,
+            probe_entry_for("probe-normal", false),
+        ],
+        None,
+    );
+    drop(arm);
+    drop(capture);
+
+    let logged = lines.snapshot();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("'probe-failing'") && l.contains("could not start")),
+        "the armed spawn failure fired: {logged:?}"
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        next.contains_key(&retry_key),
+        "the verdict-only worker after a failed spawn was stranded as a real probe: it withdrew the pair's timer cell"
+    );
+    assert!(
+        !next.contains_key(&normal_key),
+        "the real probe after a failed spawn was stranded as a verdict-only retry: its countdown stands"
+    );
+    drop(next);
+    assert_eq!(
+        state.status.lock().unwrap().get("probe-failing"),
+        Some(&super::FetchStatus::Failed),
+        "the probe whose spawn failed read no Failed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("probe-failing")
+            .is_none(),
+        "the probe whose spawn failed kept its activity mark"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("probe-normal"),
+        Some(&super::FetchStatus::Failed),
+        "the real probe after a failed spawn read no Failed"
+    );
+    assert!(
+        state.status.lock().unwrap().get("probe-paired").is_none(),
+        "the verdict-only retry wrote a status row of its own"
+    );
+}
+
+/// A due codex account with no stored `auth.json` is no fetch: the leg resolves
+/// the usage URL per account, only after a token is in hand, so a test build
+/// without an endpoint override reads no URL at all on a roster of tokenless
+/// names where the hoisted resolve panicked.
+#[test]
+fn a_due_codex_account_with_no_stored_token_resolves_no_usage_url() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "cx-tokenless";
+    crate::testutil::write_codex_roster(&[name]);
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+
+    super::codex_usage_tick(&state);
+
+    assert!(
+        state.status.lock().unwrap().get(name).is_none(),
+        "a tokenless account polled nothing and read no status"
+    );
+    assert!(
+        state.activity.lock().unwrap().get(name).is_none(),
+        "a tokenless account started no worker"
     );
 }

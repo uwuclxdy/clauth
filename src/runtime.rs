@@ -4304,7 +4304,7 @@ pub(crate) const ROTATION_LOCK_TIMEOUT: Duration = longer(
 /// guard, the longest holder [`ROTATION_LOCK_TIMEOUT`]'s list derives: two
 /// identity probes, the pre-spend stage landing, the token call, then the
 /// persist's landing.
-const FETCH_LEG_HOLD: Duration = crate::usage::USAGE_HTTP_DEADLINES
+pub(crate) const FETCH_LEG_HOLD: Duration = crate::usage::USAGE_HTTP_DEADLINES
     .saturating_add(crate::usage::USAGE_HTTP_DEADLINES)
     .saturating_add(KEYCHAIN_MIRROR_BUDGET)
     .saturating_add(crate::oauth::TOKEN_HTTP_DEADLINES)
