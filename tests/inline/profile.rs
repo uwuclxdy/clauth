@@ -7318,6 +7318,64 @@ fn a_save_writes_and_clears_the_advisor_row_in_place() {
     );
 }
 
+/// The `effort` scalar saves into the template in place: a set value
+/// uncomments the example where it sits, a changed value edits its own line,
+/// and clearing it turns the line back into the example so the file is byte
+/// for byte the template again.
+#[test]
+fn a_save_writes_changes_and_clears_the_effort_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("efforttoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("efforttoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# effort = \"high\"\n").count(),
+        1,
+        "the template holds one effort example:\n{original}"
+    );
+
+    let mut profile = load_profile(&ProfileName::from("efforttoggle")).unwrap();
+    profile.effort = Some("max".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# effort = \"high\"\n", "effort = \"max\"\n", 1)
+    );
+
+    profile.effort = Some("low".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# effort = \"high\"\n", "effort = \"low\"\n", 1)
+    );
+
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// An `effort` line in a hand-written file keeps the comments around it and
+/// the unknown key beside it through a set and a clear.
+#[test]
+fn an_effort_line_beside_comments_and_an_unknown_key_survives_a_save() {
+    let _home = HomeSandbox::new();
+    let body = "# deployment note\neffort = \"high\"  # tuned by hand\ncustom_unknown = \"keep\"\n";
+    let (mut profile, path) = hand_written_config("efforthand", body);
+    profile.effort = Some("max".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# deployment note\neffort = \"max\"  # tuned by hand\ncustom_unknown = \"keep\"\n"
+    );
+
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# deployment note\n# tuned by hand\ncustom_unknown = \"keep\"\n"
+    );
+}
+
 /// Every `ModelSettings` field is a `[models]` row the in-place writer edits.
 /// The literal names every field, so a new one stops this test compiling until
 /// it is listed here and in the writer's rows.
@@ -7532,6 +7590,17 @@ fn a_save_editing_a_multiline_string_value_is_refused() {
     let (mut profile, path) = hand_written_config("multibase", body);
     profile.base_url = Some("https://b.example".to_string());
     assert_save_refused(&profile, &path, body, "base_url");
+}
+
+/// A save that would edit an `effort` written as a multi-line string is
+/// refused and writes nothing.
+#[test]
+fn a_save_editing_a_multiline_effort_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "effort = \"\"\"high\"\"\"\n";
+    let (mut profile, path) = hand_written_config("multieffort", body);
+    profile.effort = Some("max".to_string());
+    assert_save_refused(&profile, &path, body, "effort");
 }
 
 /// A key clauth cannot read (a wrong type, a table where a value belongs, the
@@ -8021,6 +8090,20 @@ fn every_modelled_scalar_has_a_doc_and_an_example() {
     }
 }
 
+/// Every modelled scalar key's kind table names that key: a key in
+/// `MODELLED_SCALARS` with no `modelled_scalar` arm would be invisible to the
+/// shape check the writer refuses over.
+#[test]
+fn every_modelled_scalar_has_a_key_kind() {
+    for key in MODELLED_SCALARS {
+        assert_eq!(
+            modelled_scalar(key).map(|(_, name)| name),
+            Some(key),
+            "{key}"
+        );
+    }
+}
+
 /// Every scalar key a fully-set `ProfileConfig` serializes is in
 /// `MODELLED_SCALARS`: a scalar field added to the model without claiming a doc
 /// block and example fails this test.
@@ -8034,6 +8117,7 @@ fn every_profile_config_scalar_is_modelled() {
         usage_probe_interval_ms: Some(120_000),
         env: BTreeMap::new(),
         models: ModelSettings::default(),
+        effort: Some("x".to_string()),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8138,6 +8222,7 @@ fn every_profile_config_table_is_modelled() {
             subagent: Some("g".to_string()),
             advisor: Some("v".to_string()),
         },
+        effort: Some("x".to_string()),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8199,6 +8284,7 @@ fn a_save_writes_every_modelled_field_from_an_empty_file() {
         subagent: Some("g".to_string()),
         advisor: Some("v".to_string()),
     };
+    profile.effort = Some("high".to_string());
     profile.fallback_threshold = Some(50.0);
     profile.weekly_threshold = Some(70.0);
     profile.last_resort = true;
@@ -8448,6 +8534,10 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         (
             "disabled",
             "c7135e357c78e98ebb2da8705ee8a860c347dced15df33b4d9c331c0b7a098e6",
+        ),
+        (
+            "effort",
+            "6c78fc0ab64d4df00a2325391b3a9081f006eac6f95b3d835d9869ff139058c3",
         ),
         (
             "console",
@@ -9392,6 +9482,7 @@ fn a_capture_into_a_new_profile_keeps_its_keyless_url() {
         &mut config,
         "cn".into(),
         ModelSettings::default(),
+        None,
         crate::actions::CaptureSnapshot {
             credentials: Some(oauth_pair("c")),
             base_url: Some("http://127.0.0.1:1234".into()),

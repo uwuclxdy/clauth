@@ -5616,7 +5616,7 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
 /// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
 /// added to the model without a doc block and example fails a test.
 #[cfg(test)]
-const MODELLED_SCALARS: [&str; 17] = [
+const MODELLED_SCALARS: [&str; 18] = [
     "base_url",
     "api_key",
     "auto_start",
@@ -5634,6 +5634,7 @@ const MODELLED_SCALARS: [&str; 17] = [
     "check_credit_cap",
     "bell_threshold",
     "disabled",
+    "effort",
 ];
 
 /// The template shape of one modelled top-level scalar key: the comment block
@@ -5787,6 +5788,10 @@ fn push_scalar_doc(out: &mut String, key: &str) {
             );
             out.push_str("# its profile directory and credentials stay on disk untouched.\n");
         }
+        "effort" => {
+            out.push_str("# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n");
+            out.push_str("# (`effortLevel` is Claude Code's own key).\n");
+        }
         _ => unreachable!("no doc block for modelled scalar {key}"),
     }
 }
@@ -5812,6 +5817,7 @@ fn scalar_example(key: &str) -> String {
         "check_credit_cap" => "# check_credit_cap = false\n".to_string(),
         "bell_threshold" => "# bell_threshold = 95.0\n".to_string(),
         "disabled" => "# disabled = true\n".to_string(),
+        "effort" => "# effort = \"high\"\n".to_string(),
         _ => unreachable!("no example for modelled scalar {key}"),
     }
 }
@@ -6028,13 +6034,10 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str(concat!(
-        "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
-        "# (`effortLevel` is Claude Code's own key).\n",
-    ));
+    push_scalar_doc(&mut out, "effort");
     match profile.effort.as_deref() {
         Some(v) => out.push_str(&format!("effort = {}\n", toml_str(v))),
-        None => out.push_str("# effort = \"high\"\n"),
+        None => out.push_str(&scalar_example("effort")),
     }
     out.push('\n');
 
@@ -7030,6 +7033,7 @@ fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
     Some(match key {
         "base_url" => (ScalarKind::Str, "base_url"),
         "api_key" => (ScalarKind::Str, "api_key"),
+        "effort" => (ScalarKind::Str, "effort"),
         "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
         "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
         "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
@@ -7202,6 +7206,7 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
         "check_credit_cap" => on_disk.check_credit_cap != canonical.check_credit_cap,
         "bell_threshold" => on_disk.bell_threshold != canonical.bell_threshold,
         "disabled" => on_disk.disabled != canonical.disabled,
+        "effort" => on_disk.effort != canonical.effort,
         "console" => on_disk.console != canonical.console,
         "models" => on_disk.models != canonical.models,
         "env" => on_disk.env != canonical.env,
@@ -7368,6 +7373,7 @@ fn apply_config_edits(
         }
     }
     edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
+    edit_string_scalar(doc, &od.effort, &canonical.effort, "effort");
     edit_models(doc, &od.models, &canonical.models);
     edit_env(doc, &od.env, &canonical.env);
 }

@@ -64393,6 +64393,30 @@ mod effort_row {
         }
     }
 
+    /// The Setup row's save goes through the in-place writer: the template's
+    /// commented example becomes the value where it sits.
+    #[test]
+    fn space_writes_the_effort_line_in_place() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_account_app(None);
+        let path = crate::profile::profile_dir(&ProfileName::from("acct"))
+            .unwrap()
+            .join("config.toml");
+        let template = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            template.matches("# effort = \"high\"\n").count(),
+            1,
+            "the fixture holds one effort example:\n{template}"
+        );
+
+        put_cursor_on_effort(&mut app);
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            template.replacen("# effort = \"high\"\n", "effort = \"low\"\n", 1)
+        );
+    }
+
     #[test]
     fn space_on_a_custom_effort_resets_it_to_unset() {
         let _home = HomeSandbox::new();

@@ -377,7 +377,7 @@ fn an_unused_saved_base_url_says_so_on_its_row() {
         assert_eq!(note.style.fg, theme::dim().fg, "selected={selected}");
     }
     assert_eq!(
-        row_hint(ConfigRow::BaseUrl, &snap).as_deref(),
+        row_hint(ConfigRow::BaseUrl, &snap, "").as_deref(),
         Some("this account calls claude.ai until it has an api key")
     );
 
@@ -395,7 +395,7 @@ fn an_unused_saved_base_url_says_so_on_its_row() {
         "a used URL carries no note: {used:?}"
     );
     assert_eq!(
-        row_hint(ConfigRow::BaseUrl, &snap).as_deref(),
+        row_hint(ConfigRow::BaseUrl, &snap, "").as_deref(),
         Some("the API endpoint this account calls instead of claude.ai")
     );
 }

@@ -16369,6 +16369,52 @@ fn a_switch_mirrors_the_typed_endpoint_a_peer_dropped_the_key_from() {
     );
 }
 
+/// A switch onto an account whose effort a peer changed on disk mirrors it
+/// into memory: the Setup row answers what a fresh load of `config.toml`
+/// answers.
+#[test]
+fn a_switch_mirrors_an_effort_a_peer_changed_meanwhile() {
+    let _home = HomeSandbox::new();
+    let (_a, b) = seed_two_captured();
+    crate::profile::update_profile_config(&b, |p| {
+        p.effort = Some("high".to_string());
+        Ok(())
+    })
+    .expect("stage the effort")
+    .expect("b stays on the roster");
+    let mut config = crate::profile::load_config().expect("load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").effort.as_deref(),
+        Some("high"),
+        "control: memory holds the staged effort"
+    );
+
+    // The race: a peer changes the account's effort after this copy loaded.
+    crate::profile::update_profile_config(&b, |p| {
+        p.effort = Some("max".to_string());
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("b stays on the roster");
+    assert_eq!(
+        crate::profile::load_profile(&b)
+            .expect("control read")
+            .effort
+            .as_deref(),
+        Some("max"),
+        "control: the peer edit landed"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+
+    let fresh = crate::profile::load_profile(&b).expect("fresh load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").effort,
+        fresh.effort,
+        "memory mirrors the effort a fresh load holds"
+    );
+}
+
 /// A covering account switched off, then deleted while inactive: the next
 /// switch reads the user's value, never the deleted account's.
 #[test]

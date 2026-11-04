@@ -1557,6 +1557,7 @@ fn finish_switch(config: &mut AppConfig, target: Profile, held: &StateLockHeld) 
         profile.provider = target.provider;
         profile.env = target.env;
         profile.models = target.models;
+        profile.effort = target.effort;
     }
     Ok(())
 }
