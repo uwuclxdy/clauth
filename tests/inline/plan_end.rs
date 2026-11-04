@@ -123,3 +123,11 @@ fn a_plan_date_reads_an_iso_date_and_nothing_else() {
         Some(date(2026, 11, 5))
     );
 }
+
+#[test]
+fn days_left_counts_whole_days_and_none_once_ended() {
+    let today = date(2030, 4, 6);
+    assert_eq!(PlanEnd::Ends(date(2030, 4, 10)).days_left(today), Some(4));
+    assert_eq!(PlanEnd::Renews(today).days_left(today), Some(0));
+    assert_eq!(PlanEnd::Ended(date(2030, 4, 5)).days_left(today), None);
+}

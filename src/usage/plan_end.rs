@@ -59,6 +59,15 @@ impl PlanEnd {
             PlanEnd::Ends(day) | PlanEnd::Ended(day) | PlanEnd::Renews(day) => day,
         }
     }
+
+    /// Whole days from `today` to this end, `0` on the day itself; `None` for
+    /// an end already past.
+    pub(crate) fn days_left(self, today: NaiveDate) -> Option<i64> {
+        match self {
+            PlanEnd::Ended(_) => None,
+            end => Some((end.day() - today).num_days()),
+        }
+    }
 }
 
 /// The first monthly anniversary of `anchor` that falls on or after `today`,

@@ -83,6 +83,8 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "rate_strips",
             "cost_sums",
             "total_cost_counts_unpriced",
+            // The Overview's chip for a plan billing or ending within the week.
+            "a_plan_billing_or_ending_within_the_week",
         ],
     ),
     (
