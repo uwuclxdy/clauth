@@ -1,7 +1,7 @@
 //! Shared formatters and style helpers used across multiple screens.
 //! Screen-only helpers stay in their own modules.
 
-use chrono::{DateTime, Datelike, Local, NaiveDateTime, Timelike, Weekday};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Weekday};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
@@ -10,7 +10,8 @@ use crate::format::{account_tier, format_pct};
 pub(super) use crate::format::{grapheme_cell_width, grapheme_cells};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
-    FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
+    FetchStatus, PlanEnd, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs,
+    now_epoch_secs,
 };
 
 pub(super) fn fixed(value: &str, width: usize) -> String {
@@ -580,6 +581,30 @@ fn month_label(month: u32) -> &'static str {
         .get((month as usize).saturating_sub(1))
         .copied()
         .unwrap_or("jan")
+}
+
+/// The plan-end phrase the Usage tab's `plan` row carries: `renews dec 15
+/// (41d)`, `ends nov 20 (16d)`, `ends today`, `ended nov 2`: the day and the
+/// whole days from `today` to it. A day more than half a year away also
+/// names its year.
+pub(super) fn plan_end_text(end: PlanEnd, today: NaiveDate) -> String {
+    let verb = match end {
+        PlanEnd::Ends(_) => "ends",
+        PlanEnd::Ended(_) => "ended",
+        PlanEnd::Renews(_) => "renews",
+    };
+    let day = end.day();
+    let days = (day - today).num_days();
+    let date = if days.abs() > 183 {
+        format!("{} {}, {}", month_label(day.month()), day.day(), day.year())
+    } else {
+        format!("{} {}", month_label(day.month()), day.day())
+    };
+    match end {
+        PlanEnd::Ended(_) => format!("{verb} {date}"),
+        _ if days <= 0 => format!("{verb} today"),
+        _ => format!("{verb} {date} ({days}d)"),
+    }
 }
 
 /// Relative age of an epoch-ms timestamp: single largest unit under 30 days

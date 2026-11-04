@@ -1973,3 +1973,42 @@ fn a_named_accounts_advisor_row_prints_among_its_binds() {
         ],
     );
 }
+
+/// A row names when its plan ends or renews, and only when the operator gave
+/// a date: the marked `plan_ends` day, else the next `plan_renews` day.
+#[test]
+fn the_roster_names_when_a_plan_ends_or_renews() {
+    let _home = HomeSandbox::new();
+    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
+    let mut ending = Profile::new("ending".to_string(), None, None);
+    ending.plan_ends = Some(today + chrono::Duration::days(10));
+    save_profile(&ending).expect("save ending");
+    let mut renewing = Profile::new("renewing".to_string(), None, None);
+    renewing.plan_renews = Some(today + chrono::Duration::days(4));
+    save_profile(&renewing).expect("save renewing");
+    save_profile(&Profile::new("plain".to_string(), None, None)).expect("save plain");
+    save_app_state(&AppState {
+        active_profile: Some("plain".into()),
+        profiles: vec!["ending".into(), "renewing".into(), "plain".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    let rows = lines(&call_profiles(None, None));
+    let row = |name: &str| {
+        rows.iter()
+            .find(|l| l.starts_with(&format!("- {name} ")))
+            .unwrap_or_else(|| panic!("a {name} row in {rows:?}"))
+            .clone()
+    };
+    let day = |days| crate::usage::render_plan_date(today + chrono::Duration::days(days));
+    assert!(
+        row("ending").contains(&format!("; plan ends {}", day(10))),
+        "{rows:?}"
+    );
+    assert!(
+        row("renewing").contains(&format!("; plan renews {}", day(4))),
+        "{rows:?}"
+    );
+    assert!(!row("plain").contains("; plan "), "{rows:?}");
+}

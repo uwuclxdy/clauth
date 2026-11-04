@@ -494,6 +494,50 @@ fn list_table_leaves_a_live_account_unmarked() {
     );
 }
 
+/// The PLAN cell names when the plan ends or renews, off the profile's
+/// `plan_ends` and `plan_renews`, in plain ASCII.
+#[test]
+fn list_table_names_the_plan_end_in_the_plan_cell() {
+    let _home = HomeSandbox::new();
+    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
+    let mut ending = oauth("ending");
+    ending.plan_ends = Some(today + chrono::Duration::days(10));
+    let mut renewing = oauth("renewing");
+    renewing.plan_renews = Some(today + chrono::Duration::days(4));
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![ending, renewing],
+    };
+    warm_usage("ending", 10.0, 20.0);
+    warm_usage("renewing", 10.0, 20.0);
+    let table = render_table(
+        &config,
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
+    );
+    let row = |name: &str| {
+        table
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("a {name} row in {table:?}"))
+            .to_string()
+    };
+    let day = |days| crate::usage::render_plan_date(today + chrono::Duration::days(days));
+    assert!(
+        row("ending").contains(&format!("Max (ends {})", day(10))),
+        "got {table:?}"
+    );
+    assert!(
+        row("renewing").contains(&format!("Max (renews {})", day(4))),
+        "got {table:?}"
+    );
+}
+
 /// Both facts render. A user usually disables an account BECAUSE it died,
 /// so a `disabled` that masked `canceled` would hide the reason for the state it
 /// is reporting — the same erasure the Fallback tab's stacked pills prevent.
