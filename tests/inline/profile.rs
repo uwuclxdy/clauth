@@ -9324,6 +9324,63 @@ fn an_env_token_beside_a_hidden_url_makes_it_live_in_process() {
     );
 }
 
+/// An env edit mirrors the console pair beside the url the fresh read holds: a
+/// peer's console move on disk reaches memory whole, as a fresh load reads it.
+#[test]
+fn an_env_edit_mirrors_the_console_a_peer_moved() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("al");
+    let console_old = ConsoleCredential {
+        token: "console-old".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let mut target = Profile::new(
+        "al".to_string(),
+        Some("https://coding-intl.dashscope.aliyuncs.com".to_string()),
+        None,
+    );
+    target.set_console(Some(console_old.clone()));
+    crate::testutil::register_names(&["al"]);
+    save_profile(&target).expect("save target");
+    let mut config = load_config().expect("load");
+    assert_eq!(
+        config.find(&name).expect("al in memory").console,
+        Some(console_old),
+        "control: memory holds the console disk holds"
+    );
+
+    // The peer moves the console between this process's load and its env edit.
+    let console_peer = ConsoleCredential {
+        token: "console-peer".to_string(),
+        site: ConsoleSite::Domestic,
+        region: "cn-beijing".to_string(),
+    };
+    update_profile_config(&name, |p| {
+        p.set_console(Some(console_peer));
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("al stays on the roster");
+
+    crate::actions::edit_profile_env(&mut config, &name, |env| {
+        env.insert("FOO".to_string(), "bar".to_string());
+    })
+    .expect("env edit");
+
+    let memory = config.find(&name).expect("al in memory");
+    let fresh = load_profile(&name).expect("fresh load");
+    assert_eq!(
+        memory.console, fresh.console,
+        "memory holds the console a fresh load holds"
+    );
+    assert_eq!(
+        memory.saved_console(),
+        fresh.saved_console(),
+        "memory saves the console a fresh load saves"
+    );
+}
+
 /// A capture into a new profile of an OAuth login pointed at a keyless URL
 /// writes the typed URL, as a capture over a leftover `config.toml` does: it
 /// is hidden under the login and live once the store is gone.
@@ -9372,13 +9429,13 @@ fn a_preset_clear_after_a_repoint_never_restores_a_hidden_base_url() {
     crate::testutil::register_names(&["pr"]);
     let name = ProfileName::from("pr");
     let mut config = load_config().unwrap();
-    crate::actions::edit_profile_preset(&mut config, &name, |url, models| {
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models, _| {
         *url = Some("https://y.example".to_owned());
         *models = ModelSettings::default();
         Ok(())
     })
     .unwrap();
-    crate::actions::edit_profile_preset(&mut config, &name, |url, models| {
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models, _| {
         *url = None;
         *models = ModelSettings::default();
         Ok(())

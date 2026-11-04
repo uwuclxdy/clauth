@@ -1551,6 +1551,8 @@ fn finish_switch(config: &mut AppConfig, target: Profile, held: &StateLockHeld) 
     config.state.set_active(Some(name.clone()), held);
     if let Some(profile) = config.find_mut(&name) {
         profile.base_url = target.base_url;
+        profile.typed_endpoint = target.typed_endpoint;
+        profile.console = target.console;
         profile.api_key = target.api_key;
         profile.provider = target.provider;
         profile.env = target.env;
@@ -1844,7 +1846,7 @@ pub(crate) fn edit_profile_preferred_days(
 pub(crate) fn edit_profile_preset(
     config: &mut AppConfig,
     name: &ProfileName,
-    apply: impl FnOnce(&mut Option<String>, &mut ModelSettings) -> Result<()>,
+    apply: impl FnOnce(&mut Option<String>, &mut ModelSettings, &Profile) -> Result<()>,
 ) -> Result<()> {
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
@@ -1853,7 +1855,11 @@ pub(crate) fn edit_profile_preset(
             // From the saved URL, as `edit_profile_endpoint` does: a "keep"
             // over an unused saved URL keeps it.
             let mut base_url = fresh.saved_base_url();
-            apply(&mut base_url, &mut fresh.models)?;
+            // `apply` sees the block this read holds, so its moved-diff error
+            // can carry it to memory without a second disk read.
+            let mut models = fresh.models.clone();
+            apply(&mut base_url, &mut models, &*fresh)?;
+            fresh.models = models;
             fresh.replace_base_url(base_url);
             // Every endpoint edit re-derives the in-memory URL the way the next
             // load does: a keyless URL on an OAuth account hides in memory as
@@ -2030,6 +2036,7 @@ pub(crate) fn edit_profile_env(
                 let before = std::mem::replace(&mut profile.env, fresh.env.clone());
                 profile.base_url = fresh.base_url.clone();
                 profile.provider = fresh.provider;
+                profile.console = fresh.console.clone();
                 profile.typed_endpoint = fresh.typed_endpoint.clone();
                 before
             })

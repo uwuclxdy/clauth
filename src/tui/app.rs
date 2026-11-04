@@ -51,12 +51,12 @@ use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::plugin_host::ExeChange;
 use crate::profile::{
-    AppConfig, AppState, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
-    HomeTab, MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
-    MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
-    PopupWidth, Profile, ProfileId, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
-    WalkOrder, claim_profile_id, load_config, reload_fingerprint, require_profile_id,
-    update_app_state, update_profile_config,
+    AppConfig, AppState, ClockFormat, ConfigHandle, ConsoleCredential, ConsoleSite,
+    DivergenceChoice, HerdrSettings, HomeTab, MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS,
+    MAX_WEEKLY_SWITCH_PCT, MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS,
+    MIN_WEEKLY_SWITCH_PCT, ModelSettings, PopupWidth, Profile, ProfileId, ProfileName,
+    ReloadFingerprint, ResetDisplay, ThemeName, TypedEndpoint, WalkOrder, claim_profile_id,
+    load_config, reload_fingerprint, require_profile_id, update_app_state, update_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -26729,6 +26729,9 @@ fn preset_target_block(
 #[derive(Debug)]
 struct PresetDiffMoved {
     base_url: Option<String>,
+    typed_endpoint: TypedEndpoint,
+    console: Option<ConsoleCredential>,
+    provider: Option<crate::providers::Provider>,
     models: ModelSettings,
 }
 
@@ -26871,12 +26874,15 @@ fn apply_preset_to(
     // in both modes, so it needs no ask.
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(&mut cfg, &name, |url, models| {
+        edit_profile_preset(&mut cfg, &name, |url, models, fresh| {
             let (fresh_replaces, _) = preset.apply_diff(url.as_deref(), models);
             if !fresh_replaces.iter().all(|field| replaces.contains(field)) {
                 return Err(anyhow::Error::new(PresetDiffMoved {
-                    base_url: url.clone(),
-                    models: models.clone(),
+                    base_url: fresh.base_url.clone(),
+                    typed_endpoint: fresh.typed_endpoint.clone(),
+                    console: fresh.console.clone(),
+                    provider: fresh.provider,
+                    models: fresh.models.clone(),
                 }));
             }
             (*url, *models) = preset.applied_clearing(url, models, cleared);
@@ -26887,7 +26893,13 @@ fn apply_preset_to(
         Err(e) => match e.downcast::<PresetDiffMoved>() {
             Ok(moved) => {
                 if let Some(profile) = app.config().find_mut(&name) {
+                    // Copy the block the write read instead of re-deriving off
+                    // memory's login state, which the peer edit that fired this
+                    // can have outpaced.
                     profile.base_url = moved.base_url;
+                    profile.typed_endpoint = moved.typed_endpoint;
+                    profile.console = moved.console;
+                    profile.provider = moved.provider;
                     profile.models = moved.models;
                 }
                 offer_preset_apply(app, target.clone(), &preset);

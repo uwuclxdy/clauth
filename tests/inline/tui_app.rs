@@ -21840,6 +21840,285 @@ fn a_saved_preset_applies_onto_another_account() {
     );
 }
 
+/// A preset apply whose confirm raced a peer's config edit mirrors the block
+/// the write read with its typed url: the login hides that url in memory
+/// exactly as it does on a fresh load, and the peer's url reaches the row a
+/// save writes.
+#[test]
+fn a_preset_apply_over_a_peer_edit_mirrors_the_typed_endpoint() {
+    use super::{Modal, Tab, handle_key};
+    use crate::profile::Profile;
+    use crate::profile::ProfileName;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = ProfileName::from("target");
+    let mut target = Profile::new("target".to_string(), None, None);
+    // A login hides the saved url: the split state a derived-only mirror breaks.
+    target.credentials = Some(crate::testutil::oauth_pair("target"));
+    target.replace_base_url(Some("https://old.test/anthropic".to_string()));
+    target.rederive_base_url();
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    assert!(
+        target.base_url.is_none(),
+        "control: the url is saved, not live"
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+
+    // DeepSeek sets the endpoint and the tier rows; the target's subagent is a
+    // leftover, so the keep/clear confirm opens before the write.
+    pick_menu_entry(&mut app, "apply preset");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+
+    // A peer rewrites the account's url and fills its default model between the
+    // confirm and the write: the preset now replaces a row the confirm never
+    // named, and the block the write read carries the peer's url.
+    crate::profile::update_profile_config(&name, |p| {
+        p.replace_base_url(Some("https://peer.test/anthropic".to_string()));
+        p.models.default = Some("peer-default".to_string());
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("target stays on the roster");
+    let disk = crate::profile::load_profile(&name).expect("the peer state on disk");
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some("https://peer.test/anthropic"),
+        "control: the peer's url is saved"
+    );
+    assert!(disk.base_url.is_none(), "control: the login hides it");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // keep them
+
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetApply(_))),
+        "the moved diff re-asks over the block the write read"
+    );
+    let cfg = app.config();
+    let memory = cfg.find(&name).expect("target in memory");
+    let fresh = crate::profile::load_profile(&name).expect("fresh load");
+    assert_eq!(
+        memory.base_url, fresh.base_url,
+        "memory hides the peer url behind the login, as a fresh load does"
+    );
+    assert_eq!(
+        memory.saved_base_url(),
+        fresh.saved_base_url(),
+        "memory saves the peer url, as a fresh load does"
+    );
+    assert_eq!(memory.provider, fresh.provider);
+}
+
+/// A preset apply whose confirm raced a peer's repoint-and-logout mirrors the
+/// block the write read, never a re-derivation off memory's login: the peer's
+/// key drop hides the typed url in memory as a fresh load hides it.
+#[test]
+fn a_preset_apply_over_a_peer_key_drop_mirrors_the_fresh_derivation() {
+    use super::{Modal, Tab, handle_key};
+    use crate::profile::Profile;
+    use crate::profile::ProfileName;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = ProfileName::from("target");
+    let mut target = Profile::new("target".to_string(), None, None);
+    target.credentials = Some(crate::testutil::oauth_pair("target"));
+    // The saved url equals the DeepSeek preset's, so the confirm never names it.
+    target.api_key = Some("sk-x".to_string());
+    target.replace_base_url(Some("https://api.deepseek.com/anthropic".to_string()));
+    target.rederive_base_url();
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    assert_eq!(
+        target.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "control: the key makes the saved url live"
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+
+    pick_menu_entry(&mut app, "apply preset");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+
+    // The peer repoints the account and drops the key between confirm and write.
+    crate::profile::update_profile_config(&name, |p| {
+        p.replace_base_url(Some("https://peer.test/anthropic".to_string()));
+        p.api_key = None;
+        p.models.default = Some("peer-default".to_string());
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("target stays on the roster");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // keep them
+
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetApply(_))),
+        "the moved diff re-asks over the block the write read"
+    );
+    let cfg = app.config();
+    let memory = cfg.find(&name).expect("target in memory");
+    let fresh = crate::profile::load_profile(&name).expect("fresh load");
+    assert_eq!(
+        memory.provider, fresh.provider,
+        "memory names the provider a fresh load names"
+    );
+    assert_eq!(
+        memory.base_url, fresh.base_url,
+        "memory derives with the key the peer dropped, as a fresh load does"
+    );
+}
+
+/// A preset apply whose confirm raced a peer's repoint to another provider
+/// mirrors the provider the write read: a logged-out account's endpoint rows in
+/// memory answer a fresh load's.
+#[test]
+fn a_preset_apply_over_a_peer_repoint_mirrors_the_fresh_provider() {
+    use super::{Modal, Tab, handle_key};
+    use crate::profile::Profile;
+    use crate::profile::ProfileName;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = ProfileName::from("target");
+    // No login and no key: the saved url is the live one, so the derived url
+    // never moves and only a copied provider names the peer's.
+    let mut target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    assert_eq!(
+        target.provider,
+        Some(crate::providers::Provider::DeepSeek),
+        "control: the saved url names the preset's provider"
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+
+    pick_menu_entry(&mut app, "apply preset");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+
+    // The peer repoints the logged-out account to another provider between the
+    // confirm and the write.
+    crate::profile::update_profile_config(&name, |p| {
+        p.replace_base_url(Some(
+            "https://coding-intl.dashscope.aliyuncs.com".to_string(),
+        ));
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("target stays on the roster");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // keep them
+
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetApply(_))),
+        "the moved diff re-asks over the block the write read"
+    );
+    let cfg = app.config();
+    let memory = cfg.find(&name).expect("target in memory");
+    let fresh = crate::profile::load_profile(&name).expect("fresh load");
+    assert_eq!(
+        fresh.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "control: the peer url names another provider"
+    );
+    assert_eq!(
+        memory.provider, fresh.provider,
+        "memory names the provider a fresh load names"
+    );
+}
+
+/// A preset apply whose confirm raced a peer's repoint to another preset's
+/// endpoint mirrors the console pair the write read: the session the peer's
+/// repoint off Alibaba drops leaves memory too, as a fresh load reads it.
+#[test]
+fn a_preset_apply_over_a_peer_console_clear_mirrors_the_fresh_console() {
+    use super::{Modal, Tab, handle_key};
+    use crate::profile::Profile;
+    use crate::profile::ProfileName;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = ProfileName::from("target");
+    // The saved url equals the DeepSeek preset's, so the confirm never names it.
+    let mut target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    target.set_console(Some(crate::profile::ConsoleCredential {
+        token: "console-target".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    }));
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    assert!(
+        target.console.is_some(),
+        "control: the target holds a console session"
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["target"]);
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+
+    pick_menu_entry(&mut app, "apply preset");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+
+    // A peer applies a preset off Alibaba between the confirm and the write: the
+    // url moves and the console session is cleared on disk.
+    crate::profile::update_profile_config(&name, |p| {
+        p.replace_base_url(Some("https://api.z.ai/api/anthropic".to_string()));
+        p.set_console(None);
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("target stays on the roster");
+    let disk = crate::profile::load_profile(&name).expect("the peer state on disk");
+    assert!(
+        disk.console.is_none(),
+        "control: the peer's repoint dropped the console session"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // keep them
+
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetApply(_))),
+        "the moved diff re-asks over the block the write read"
+    );
+    let cfg = app.config();
+    let memory = cfg.find(&name).expect("target in memory");
+    let fresh = crate::profile::load_profile(&name).expect("fresh load");
+    assert_eq!(
+        memory.console, fresh.console,
+        "memory holds the console a fresh load holds"
+    );
+}
+
 /// A saved account carrying an endpoint, every model row and a subagent id,
 /// opened on `apply preset` → DeepSeek, which leaves `subagent` unset.
 fn preset_apply_target() -> super::App {

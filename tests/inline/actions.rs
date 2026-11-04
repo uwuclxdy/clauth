@@ -1573,7 +1573,7 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
     edit_profile_preset(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
-        |url, models| {
+        |url, models, _| {
             *url = Some("https://api.deepseek.com/anthropic".to_string());
             *models = ModelSettings {
                 default: Some("deepseek-chat".to_string()),
@@ -7916,7 +7916,7 @@ fn an_endpoint_edit_drops_the_third_party_disk_cache() {
     edit_profile_preset(
         &mut config,
         &crate::profile::ProfileName::from("cache-preset"),
-        |url, models| {
+        |url, models, _| {
             *url = Some("https://api.z.ai/api/anthropic".to_string());
             *models = crate::profile::ModelSettings::default();
             Ok(())
@@ -8096,7 +8096,7 @@ fn a_url_preset_on_an_oauth_account_stays_out_of_memory_and_settings() {
     config.state.active_profile = Some("acct".into());
     crate::profile::save_app_state(&config.state).expect("persist the active marker");
 
-    edit_profile_preset(&mut config, &name, |url, models| {
+    edit_profile_preset(&mut config, &name, |url, models, _| {
         *url = Some("https://y.example".to_string());
         *models = ModelSettings::default();
         Ok(())
@@ -8140,7 +8140,7 @@ fn a_preset_off_alibaba_drops_the_console_session() {
     crate::testutil::register_names(&["qwen"]);
     let mut config = inactive_config(p);
 
-    edit_profile_preset(&mut config, &name, |url, models| {
+    edit_profile_preset(&mut config, &name, |url, models, _| {
         *url = Some("https://api.deepseek.com/anthropic".to_string());
         *models = ModelSettings::default();
         Ok(())
@@ -8354,7 +8354,7 @@ fn a_failed_preset_save_restores_the_in_memory_profile() {
     let before = config.find(&name).expect("acct in the roster").clone();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
         .expect("chmod the profile dir read-only");
-    let err = edit_profile_preset(&mut config, &name, |url, models| {
+    let err = edit_profile_preset(&mut config, &name, |url, models, _| {
         *url = Some("https://api.example.com".to_string());
         *models = ModelSettings::default();
         Ok(())
@@ -8461,7 +8461,7 @@ fn a_models_only_preset_keeps_an_unused_saved_url() {
         },
         builtin: false,
     };
-    edit_profile_preset(&mut config, &name, |url, models| {
+    edit_profile_preset(&mut config, &name, |url, models, _| {
         (*url, *models) = preset.applied_clearing(url, models, &[]);
         Ok(())
     })
@@ -16305,6 +16305,70 @@ fn a_cover_landed_from_an_active_account_comes_back_on_switch_away() {
     );
 }
 
+/// A switch onto an account a peer dropped the api key from mirrors the typed
+/// endpoint and console beside the derived ones: every endpoint row in memory
+/// answers what a fresh load of `config.toml` answers.
+#[test]
+fn a_switch_mirrors_the_typed_endpoint_a_peer_dropped_the_key_from() {
+    let _home = HomeSandbox::new();
+    let (_a, b) = seed_two_captured();
+    // An Alibaba endpoint the account's key makes live, beside its login.
+    let url = "https://coding-intl.dashscope.aliyuncs.com";
+    crate::profile::update_profile_config(&b, |p| {
+        p.replace_base_url(Some(url.to_string()));
+        p.api_key = Some("sk-b".to_string());
+        Ok(())
+    })
+    .expect("stage the endpoint")
+    .expect("b stays on the roster");
+    let mut config = crate::profile::load_config().expect("load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").base_url.as_deref(),
+        Some(url),
+        "control: memory routes the keyed url"
+    );
+
+    // The race: a peer logs the account out and moves its console session, so
+    // disk hides the saved url behind the login while the typed url stands.
+    crate::profile::update_profile_config(&b, |p| {
+        p.api_key = None;
+        p.set_console(Some(crate::profile::ConsoleCredential {
+            token: "console-b".to_string(),
+            site: crate::profile::ConsoleSite::International,
+            region: "ap-southeast-1".to_string(),
+        }));
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("b stays on the roster");
+    let disk = crate::profile::load_profile(&b).expect("the peer state on disk");
+    assert_eq!(disk.base_url, None, "control: the login hides the url");
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some(url),
+        "control: the peer kept the typed url"
+    );
+    assert!(
+        disk.console.is_some(),
+        "control: the peer's console is saved"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+
+    let fresh = crate::profile::load_profile(&b).expect("fresh load");
+    let memory = config.find(&b).expect("b in memory");
+    assert_eq!(memory.base_url, fresh.base_url);
+    assert_eq!(
+        memory.saved_base_url(),
+        fresh.saved_base_url(),
+        "memory saves the url a fresh load saves"
+    );
+    assert_eq!(
+        memory.console, fresh.console,
+        "memory holds the console session a fresh load holds"
+    );
+}
+
 /// A covering account switched off, then deleted while inactive: the next
 /// switch reads the user's value, never the deleted account's.
 #[test]
@@ -18565,7 +18629,7 @@ fn every_settings_writer_applies_live_off_the_active_marker_on_disk() {
             edit_profile_model(c, n, |m| m.default = Some("own-model".into()))
         }),
         ("edit_profile_preset", "preset-model", |c, n| {
-            edit_profile_preset(c, n, |_, m| {
+            edit_profile_preset(c, n, |_, m, _| {
                 m.default = Some("preset-model".into());
                 Ok(())
             })
@@ -19377,7 +19441,7 @@ fn config_writer_cases() -> Vec<ConfigWriterCase> {
                     default: Some("preset-model".into()),
                     ..ModelSettings::default()
                 };
-                edit_profile_preset(c, n, |u, m| {
+                edit_profile_preset(c, n, |u, m, _| {
                     *u = Some(QWEN_BASE.to_string());
                     *m = models;
                     Ok(())
