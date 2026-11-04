@@ -107,6 +107,26 @@ fn the_census_diagnostics_route_through_the_durable_logfile_sink() {
     );
 }
 
+/// The keychain sign-out's restore hint names the switch verb in full: a bare
+/// `clauth <name>` reads as a flag for a dash-led name and as clauth's own
+/// command for a subcommand name. The sign-out body is macOS-only code no
+/// Linux run compiles, so the pin is a source scan (the census pin above).
+#[test]
+fn the_keychain_sign_out_hint_names_the_switch_command_in_full() {
+    let src = include_str!("../../src/keychain.rs");
+    let hint = "Run `clauth switch <name>` to put one back";
+    let count = |text: &str| text.matches(hint).count();
+    assert_eq!(
+        count(src),
+        1,
+        "the sign-out hint must sit in the source once, in the switch form"
+    );
+    // Positive control: the scan sees a synthetic carrier and rejects the bare
+    // form, so a scan that reads nothing cannot keep this pin green.
+    assert_eq!(count(&format!("a {hint} b")), 1);
+    assert_eq!(count("Run `clauth <name>` to put one back"), 0);
+}
+
 #[test]
 fn write_log_line_appends_each_call() {
     let path = std::env::temp_dir().join(format!("clauth-logline-{}.log", std::process::id()));

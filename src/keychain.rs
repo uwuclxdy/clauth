@@ -1914,7 +1914,7 @@ fn sign_out_saving_at(
         crate::claude::SignOut::Delete => {
             logline!(
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login). Run `clauth <name>` to put one back"
+                 stores no Claude login). Run `clauth switch <name>` to put one back"
             );
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }

@@ -43,6 +43,23 @@ pub(crate) struct Cli {
     pub(crate) command: Option<Command>,
 }
 
+/// Whether `name` is exactly a subcommand name or alias clap resolves at the
+/// root, hidden ones and clap's generated `help` included: such a word never
+/// reaches the bare `clauth <name>` switch ([`Command::External`]). Read off the
+/// built grammar so a subcommand added later counts without a second list.
+pub(crate) fn is_subcommand_name(name: &str) -> bool {
+    static NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let mut root = <Cli as clap::CommandFactory>::command();
+        // `build` is what adds the generated `help` subcommand.
+        root.build();
+        root.get_subcommands()
+            .flat_map(|sub| std::iter::once(sub.get_name()).chain(sub.get_all_aliases()))
+            .map(str::to_string)
+            .collect()
+    });
+    NAMES.iter().any(|known| known == name)
+}
+
 /// `--theme`'s two tiers. Auto-detection (`$COLORTERM`) picks one when the flag
 /// and the config-file key are both absent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -95,9 +112,9 @@ pub(crate) enum Command {
     /// browser flow. This is the way to adopt a login `claude` already minted,
     /// including the one a first account is refused over when the live file
     /// holds a login no profile owns. The first profile becomes the active
-    /// account; a later one needs `clauth <name>` to switch to. An existing
-    /// name is refused unless the login looks like that account's, which saves
-    /// it into it. Re-authenticating one is `clauth login <name>`.
+    /// account; a later one needs `clauth switch <name>` to switch to. An
+    /// existing name is refused unless the login looks like that account's,
+    /// which saves it into it. Re-authenticating one is `clauth login <name>`.
     Capture {
         /// Profile to save the current login under.
         profile: String,

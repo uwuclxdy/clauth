@@ -248,7 +248,7 @@ impl HomeSandbox {
         crate::claude_json::set_json_sync_lock_timeout_override(None);
         crate::claude_json::reset_last_synced();
         crate::claude_json::reset_pending_strip_state();
-        crate::profile::reset_torn_store_notice_for_test();
+        crate::profile::reset_load_notices_for_test();
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());

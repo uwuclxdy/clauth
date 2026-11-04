@@ -5793,7 +5793,7 @@ fn a_torn_store_notice_prints_once_per_account_per_process() {
 
     let capture = crate::out::ErrCapture::new();
     let guard = capture.capture_here();
-    let _armed = crate::profile::TornStoreNoticeArmed::new();
+    let _armed = crate::profile::LoadNoticesArmed::new();
 
     load_config().expect("first load");
     load_config().expect("second load");
@@ -5807,6 +5807,192 @@ fn a_torn_store_notice_prints_once_per_account_per_process() {
         String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
         expected,
         "two roster loads print the notice exactly once"
+    );
+}
+
+/// A torn store's reason can change between two loads of one account (a read
+/// failure, then a parse failure): the torn notice keys per account, so the
+/// second load prints nothing.
+#[test]
+fn a_torn_store_notice_prints_once_per_account_though_its_reason_changes() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-reason");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::create_dir_all(&store).expect("a directory in the store's place");
+    let io_error = crate::testutil::directory_read_error(&store);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let _armed = crate::profile::LoadNoticesArmed::new();
+
+    load_profile(&name).expect("a store that is a directory still loads");
+    std::fs::remove_dir(&store).expect("remove the directory");
+    std::fs::write(&store, TORN_STORE).expect("write torn credentials.json");
+    load_profile(&name).expect("a parse-torn store loads");
+
+    drop(guard);
+
+    let expected = format!(
+        "clauth: {name}: its stored login could not be read (credentials.json: {io_error}), so it \
+         shows as logged out until `clauth login {name}`\n"
+    );
+    assert_eq!(
+        String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
+        expected,
+        "one account keeps one torn line though its reason's text moved"
+    );
+}
+
+/// A stored name the roster never validated prints its bytes a name cannot
+/// hold as escapes: the notice cannot drive or reorder the terminal.
+#[test]
+fn a_name_notice_escapes_bytes_a_name_cannot_hold() {
+    let notice = crate::profile::NameNotice::of(
+        &crate::profile::ProfileName::from("-\u{1b}red"),
+        crate::harness::Harness::Claude,
+    )
+    .expect("a dash-led name is noticed");
+    assert_eq!(
+        notice.cli_line(),
+        "clauth: -\\u{001b}red: a name starting with '-' reads as a flag, so the commands clauth \
+         prints for it fail; rename it on the TUI's Setup tab"
+    );
+    assert_eq!(
+        notice.toast_body(),
+        "-\\u{001b}red starts with '-', so the commands clauth prints for it fail\n\
+         rename it on the Setup tab"
+    );
+}
+
+/// A notice's remedy clause follows its roster: a claude account is renamed
+/// on Setup, a codex account has no rename and is deleted and logged in again.
+/// Each surface's copy is pinned whole, so a clause cannot drift between them.
+#[test]
+fn a_name_notice_copy_picks_the_remedy_its_roster_has() {
+    let claude = |name: &str| {
+        crate::profile::NameNotice::of(
+            &crate::profile::ProfileName::from(name),
+            crate::harness::Harness::Claude,
+        )
+        .expect("a hazardous name is noticed")
+    };
+    let codex = |name: &str| {
+        crate::profile::NameNotice::of(
+            &crate::profile::ProfileName::from(name),
+            crate::harness::Harness::Codex,
+        )
+        .expect("a hazardous name is noticed")
+    };
+
+    assert_eq!(
+        claude("-x").cli_line(),
+        "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; rename it on the TUI's Setup tab"
+    );
+    assert_eq!(
+        claude("-x").toast_body(),
+        "-x starts with '-', so the commands clauth prints for it fail\nrename it on the Setup tab"
+    );
+    assert_eq!(
+        codex("-c").cli_line(),
+        "clauth: -c: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; delete it and log in again under another name"
+    );
+    assert_eq!(
+        codex("-c").toast_body(),
+        "-c starts with '-', so the commands clauth prints for it fail\ndelete it and log in \
+         again under another name"
+    );
+    assert_eq!(
+        claude("list").cli_line(),
+        "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch to \
+         this account; switch with `clauth switch list`, or rename it on the TUI's Setup tab"
+    );
+    assert_eq!(
+        claude("list").toast_body(),
+        "`clauth list` runs clauth's own command, not a switch to list\nswitch with `clauth \
+         switch list`, or rename it on the Setup tab"
+    );
+    assert_eq!(
+        codex("list").cli_line(),
+        "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch to \
+         this account; switch with `clauth switch list`, or delete it and log in again under \
+         another name"
+    );
+    assert_eq!(
+        codex("list").toast_body(),
+        "`clauth list` runs clauth's own command, not a switch to list\nswitch with `clauth \
+         switch list`, or delete it and log in again under another name"
+    );
+}
+
+/// A torn store's notice and refusal print a stored name's bytes a name cannot
+/// hold as escapes, like the name notices: neither line can drive or reorder
+/// the terminal.
+#[test]
+fn a_torn_store_line_escapes_bytes_a_name_cannot_hold() {
+    let mut profile =
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("x\u{1b}[31mred"));
+    profile.unreadable_credentials_store = Some(crate::profile::UnreadableStoreReason::Parse);
+
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&profile).expect("a torn store notices"),
+        "clauth: x\\u{001b}\\u{005b}31mred: its stored login could not be read \
+         (credentials.json does not parse), so it shows as logged out until \
+         `clauth login x\\u{001b}\\u{005b}31mred`"
+    );
+    assert_eq!(
+        crate::profile::unreadable_store_refusal(&profile).expect("a torn store refuses"),
+        "x\\u{001b}\\u{005b}31mred: its stored login could not be read \
+         (credentials.json does not parse); log in again with \
+         `clauth login x\\u{001b}\\u{005b}31mred` first, or the re-key would drop it"
+    );
+}
+
+/// The load notices print only on the thread the CLI dispatch armed: a roster
+/// load on a background thread (the `clauth start` watchdog's settings sync)
+/// writes nothing there, and must not spend the line the foreground load still
+/// owes.
+#[test]
+fn load_notices_print_only_on_the_arming_thread() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("-x");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save -x");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+
+    let capture = crate::out::ErrCapture::new();
+    let _guard = capture.capture_here();
+    let _armed = crate::profile::LoadNoticesArmed::new();
+
+    let behind = capture.clone();
+    std::thread::spawn(move || {
+        let _guard = behind.capture_here();
+        load_config().expect("a background roster load still loads");
+    })
+    .join()
+    .expect("the background load thread");
+
+    let before = capture.snapshot();
+    assert!(
+        before.is_empty(),
+        "a background load printed: {:?}",
+        String::from_utf8_lossy(&before)
+    );
+
+    load_config().expect("a load on the arming thread");
+    let after = capture.snapshot();
+    assert_eq!(
+        String::from_utf8_lossy(&after[before.len()..]),
+        "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; rename it on the TUI's Setup tab\n",
+        "the background load must not spend the arming thread's line"
     );
 }
 

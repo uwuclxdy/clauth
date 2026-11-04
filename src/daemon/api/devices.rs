@@ -243,15 +243,15 @@ impl Store {
     }
 }
 
-/// A device name, checked once where it enters: the profile-name charset, so a
-/// name is one token in a log line and in the table, and never [`LEGACY_NAME`].
+/// A device name, checked once where it enters: the new-profile-name charset,
+/// so a name is one token in a log line and in the table and never reads as a
+/// flag in `clauth devices revoke <name>`, and never [`LEGACY_NAME`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceName(String);
 
 impl DeviceName {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        crate::actions::validate_name_chars(raw)?;
-        let name = raw.trim();
+        let name = crate::actions::validate_new_name_chars(raw)?;
         if name.eq_ignore_ascii_case(LEGACY_NAME) {
             bail!(
                 "'{LEGACY_NAME}' is the name clauth gives the token it imports from an older \

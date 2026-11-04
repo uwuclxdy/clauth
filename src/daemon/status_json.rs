@@ -887,10 +887,11 @@ pub(crate) fn build_status(
 }
 
 /// [`build_status`] that also hands back the codex state it read, so the one
-/// daemon tick that both publishes the body and judges its pushes reads the
-/// roster once rather than twice (two reads can disagree mid-tick). `None` when
-/// the read failed: the body still publishes an empty codex roster, but the
-/// caller must not forget codex names on a guess that tick.
+/// daemon tick that publishes the body, judges its pushes and names the
+/// roster's unaddressable accounts reads the roster once rather than three
+/// times (two reads can disagree mid-tick). `None` when the read failed: the
+/// body still publishes an empty codex roster, but the caller must not forget
+/// codex names on a guess that tick.
 pub(crate) fn build_status_with_codex(
     config: &AppConfig,
     interval_ms: u64,

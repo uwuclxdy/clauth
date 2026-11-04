@@ -5644,7 +5644,7 @@ fn an_unreadable_live_slot_names_the_position_and_never_the_value() {
     let expected = format!(
         "clauth: re-stamped '{name}' but the live .credentials.json could not be \
          parsed to check its login (line 1, column 72); live file left untouched. Run \
-         `clauth {name}` to reinstall"
+         `clauth switch {name}` to reinstall"
     );
     assert!(
         snapshot.iter().any(|line| line == &expected),
@@ -5696,7 +5696,7 @@ fn a_restamp_over_an_empty_live_slot_names_the_bare_frame() {
     let expected = format!(
         "clauth: re-stamped '{name}' but the live .credentials.json could not be \
          parsed to check its login; live file left untouched. Run \
-         `clauth {name}` to reinstall"
+         `clauth switch {name}` to reinstall"
     );
     assert!(
         snapshot.iter().any(|line| line == &expected),
@@ -5747,7 +5747,7 @@ fn a_rotation_over_an_unreadable_live_slot_names_the_position_and_never_the_valu
     let expected = format!(
         "clauth: rotated '{name}' but the live .credentials.json could not be \
          parsed to check its login (line 1, column 72); live file left untouched. Run \
-         `clauth {name}` to reinstall"
+         `clauth switch {name}` to reinstall"
     );
     assert!(
         snapshot.iter().any(|line| line == &expected),
@@ -5795,7 +5795,7 @@ fn a_rotation_over_an_empty_live_slot_names_the_bare_frame() {
     let expected = format!(
         "clauth: rotated '{name}' but the live .credentials.json could not be \
          parsed to check its login; live file left untouched. Run \
-         `clauth {name}` to reinstall"
+         `clauth switch {name}` to reinstall"
     );
     assert!(
         snapshot.iter().any(|line| line == &expected),

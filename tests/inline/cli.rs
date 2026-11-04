@@ -1260,13 +1260,13 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
-/// Every machine channel keeps the torn-store notice off, arm by arm, and a
-/// user-facing command arms it. The exclusions match `torn_store_notice_applies`
-/// one-for-one, so dropping one arm reds here. `torn_store_notice_applies` is a
+/// Every machine channel keeps the load notices off, arm by arm, and a
+/// user-facing command arms them. The exclusions match `load_notices_apply`
+/// one-for-one, so dropping one arm reds here. `load_notices_apply` is a
 /// deny-list: a machine-channel command added later arms by default, so this
 /// list must grow with it.
 #[test]
-fn machine_channels_never_arm_the_torn_store_notice() {
+fn machine_channels_never_arm_the_load_notices() {
     for argv in [
         &["daemon"][..],
         &["mcp"],
@@ -1282,11 +1282,11 @@ fn machine_channels_never_arm_the_torn_store_notice() {
         &["herdr", "config", "get", "pane_tag"],
     ] {
         assert!(
-            !crate::torn_store_notice_applies(&command(argv)),
+            !crate::load_notices_apply(&command(argv)),
             "{argv:?} is a machine channel"
         );
     }
-    assert!(crate::torn_store_notice_applies(&command(&["list"])));
+    assert!(crate::load_notices_apply(&command(&["list"])));
 }
 
 #[test]
@@ -1685,6 +1685,32 @@ fn the_auto_help_names_the_configured_walk_order() {
              ({phrase:?}): {flat}"
         );
     }
+}
+
+/// The capture help names the switch verb in full: a bare `clauth <name>`
+/// reads as a flag for a dash-led name and as clauth's own command for a
+/// subcommand name. Pinned by equality over the about block, which clap
+/// renders from the same doc comment `capture --help` prints.
+#[test]
+fn the_capture_help_names_the_switch_command_in_full() {
+    let mut root = Cli::command();
+    let capture = root
+        .find_subcommand_mut("capture")
+        .expect("capture subcommand");
+    let help = capture.render_long_help().to_string();
+    let about = help.split("\n\nUsage:").next().expect("the about block");
+    let flat = about.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        flat,
+        "Save the login Claude Code is using now as a profile Reads the live \
+         ~/.claude/.credentials.json, plus whatever endpoint and api key Claude Code is running \
+         on, and stores it under <name>, with no browser flow. This is the way to adopt a login \
+         `claude` already minted, including the one a first account is refused over when the \
+         live file holds a login no profile owns. The first profile becomes the active \
+         account; a later one needs `clauth switch <name>` to switch to. An existing name is \
+         refused unless the login looks like that account's, which saves it into it. \
+         Re-authenticating one is `clauth login <name>`."
+    );
 }
 
 /// A multi-word unrecognized invocation is a usage error (exit 2), not the old
@@ -10166,4 +10192,73 @@ fn each_yes_help_names_the_streams_its_prompt_gate_reads() {
             .unwrap_or_default();
         assert_eq!(help, expected, "{path:?} --{id} help");
     }
+}
+
+// ── a dash-led stored name and the printed switch command ───────────────────
+
+/// An account stored under a dash-led name before new names refused one keeps
+/// working: the roster loads it, `clauth list` lists it, and `clauth switch --
+/// -x` (the `--` is the shell's escape) makes it the active account.
+#[test]
+fn an_existing_dash_led_account_still_loads_lists_and_switches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("-x");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&name)).expect("save -x");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("save state");
+
+    let config = load_config().expect("a roster holding -x loads");
+    assert!(config.find(&name).is_some(), "-x is in the loaded roster");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _guard = out.capture_here();
+        crate::dispatch(parse(&["list"]).expect("list parses")).expect("list runs");
+    }
+    let listed = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.split_whitespace().any(|w| w == "-x")),
+        "-x is listed:\n{listed}"
+    );
+
+    crate::dispatch(parse(&["switch", "--", "-x"]).expect("the escaped name parses"))
+        .expect("the switch to -x runs");
+    assert_eq!(
+        load_config()
+            .expect("reload")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("-x")
+    );
+}
+
+/// A capture beside an active account names the verb-first switch, which
+/// reaches the account whatever it is called.
+#[test]
+fn a_capture_beside_an_active_account_prints_the_switch_command() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "first");
+    config.state.active_profile = Some(ProfileName::from("first"));
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::write_live_creds(&crate::testutil::oauth_pair("uncaptured"));
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _guard = out.capture_here();
+        cmd_capture("work", false).expect("capture");
+    }
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        "clauth: captured into profile 'work'. Switch to it with:  clauth switch work\n"
+    );
 }

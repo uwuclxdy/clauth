@@ -2137,7 +2137,7 @@ fn land_pair_with(
                 Err(e) => {
                     logline!(
                         "clauth: rotated '{name}' but re-reading the install source failed: \
-                         {e:#}. Live file left untouched; run `clauth {name}` to reinstall"
+                         {e:#}. Live file left untouched; run `clauth switch {name}` to reinstall"
                     );
                     None
                 }
@@ -2171,13 +2171,13 @@ fn land_pair_with(
                         );
                         logline!(
                             "{head}; live file left untouched. Run \
-                             `clauth {name}` to reinstall"
+                             `clauth switch {name}` to reinstall"
                         )
                     }
                     Err(e) => logline!(
                         "clauth: rotated '{name}' but following the live .credentials.json \
                          failed: {e:#}. A running claude signs out when its old token expires; \
-                         run `clauth {name}` to reinstall"
+                         run `clauth switch {name}` to reinstall"
                     ),
                     Ok(_) => {}
                 }
@@ -2238,7 +2238,7 @@ fn land_pair_with(
         // A failed state flock surfaces as the `Err` from `with_state_lock` above,
         // so a poisoned/unavailable lock never looks like a successful rotation.
         // A mirror failure is loud but non-fatal: the rotation itself is durable,
-        // and a switch's reinstall (the `clauth {name}` the lines below name)
+        // and a switch's reinstall (the `clauth switch {name}` the lines below name)
         // rewrites the item. The next rotation does not: the stage goes below
         // whatever the mirror returned, and that rotation's gate no longer
         // counts the item's login among its candidates.
@@ -2260,7 +2260,7 @@ fn land_pair_with(
                     if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
                         logline!(
                             "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
-                         running claude signs out when its old token expires; run `clauth {name}` \
+                         running claude signs out when its old token expires; run `clauth switch {name}` \
                          to reinstall"
                         );
                     }
@@ -2274,7 +2274,7 @@ fn land_pair_with(
                 crate::keychain::ItemLoginState::Unreadable(e) => logline!(
                     "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous bearer keeps serving until \
-                 it expires. Run `clauth {name}` to reinstall"
+                 it expires. Run `clauth switch {name}` to reinstall"
                 ),
             }
         }
@@ -2306,7 +2306,7 @@ fn land_pair_with(
                     if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
                         logline!(
                             "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
-                         running claude signs out when its old token expires; run `clauth {name}` \
+                         running claude signs out when its old token expires; run `clauth switch {name}` \
                          to reinstall"
                         );
                     }
@@ -2320,7 +2320,7 @@ fn land_pair_with(
                 crate::keychain::ItemLoginState::Unreadable(e) => logline!(
                     "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous rolling bearer keeps \
-                 serving until it expires. Run `clauth {name}` to reinstall"
+                 serving until it expires. Run `clauth switch {name}` to reinstall"
                 ),
             }
         }
@@ -3129,7 +3129,7 @@ pub(crate) fn try_adopt_live_rotation(
         logline!(
             "clauth: adopted the live login for '{name}' but relinking \
              .credentials.json failed: {e:#}. A running claude signs out when \
-             its token expires; run `clauth {name}` to reinstall"
+             its token expires; run `clauth switch {name}` to reinstall"
         );
     }
     Some((
@@ -3984,7 +3984,7 @@ pub(crate) fn restamp_rolling_token(
             crate::keychain::ItemLoginState::Unreadable(e) => logline!(
                 "clauth: re-stamped '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous rolling bearer keeps \
-                 serving until it expires. Run `clauth {name}` to reinstall"
+                 serving until it expires. Run `clauth switch {name}` to reinstall"
             ),
         }
     }
@@ -4023,7 +4023,7 @@ pub(crate) fn restamp_rolling_token(
             Err(e) => {
                 logline!(
                     "clauth: re-stamped '{name}' but re-reading the sidecar failed: {e:#}. \
-                     Live file left untouched; run `clauth {name}` to reinstall"
+                     Live file left untouched; run `clauth switch {name}` to reinstall"
                 );
                 return gate;
             }
@@ -4043,12 +4043,14 @@ pub(crate) fn restamp_rolling_token(
                     ),
                     pos,
                 );
-                logline!("{head}; live file left untouched. Run `clauth {name}` to reinstall")
+                logline!(
+                    "{head}; live file left untouched. Run `clauth switch {name}` to reinstall"
+                )
             }
             Err(e) => logline!(
                 "clauth: re-stamped '{name}' but following the live .credentials.json failed: \
                  {e:#}. A running claude signs out when its old token expires; run \
-                 `clauth {name}` to reinstall"
+                 `clauth switch {name}` to reinstall"
             ),
             Ok(_) => {}
         }

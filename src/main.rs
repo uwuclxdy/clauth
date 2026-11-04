@@ -235,13 +235,14 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
     }
 }
 
-/// Whether the torn-store notice may print for this command: the user-facing
-/// commands only. The bare TUI/help path returns before this is reached; the
-/// daemon's stderr is `daemon.log`, `clauth mcp`'s is Claude Code's, a hook's
-/// is its caller's, `__complete`'s is the shell's prompt, and every hidden
-/// `__*`/helper command is a machine channel — none of them should print a
-/// notice onto the stderr their caller already owns.
-fn torn_store_notice_applies(command: &Command) -> bool {
+/// Whether the load notices (a torn store, an unaddressable account name) may
+/// print for this command: the user-facing commands only. The bare TUI/help
+/// path returns before this is reached; the daemon's stderr is `daemon.log`,
+/// `clauth mcp`'s is Claude Code's, a hook's is its caller's, `__complete`'s
+/// is the shell's prompt, and every hidden `__*`/helper command is a machine
+/// channel — none of them should print a notice onto the stderr their caller
+/// already owns.
+fn load_notices_apply(command: &Command) -> bool {
     !matches!(
         command,
         Command::Daemon { .. }
@@ -277,8 +278,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         return cmd_bare_help();
     };
 
-    if torn_store_notice_applies(&command) {
-        crate::profile::enable_torn_store_notice();
+    if load_notices_apply(&command) {
+        crate::profile::enable_load_notices();
     }
 
     match command {
@@ -1568,7 +1569,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             },
             None,
         )?;
-        outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+        outln!(
+            "clauth: captured into profile '{target}'. Switch to it with:  clauth switch {target}"
+        );
     } else {
         // A first account becomes the active one, linking the live slot.
         // Settled before the browser login, as the reauth arm is.
@@ -1587,7 +1590,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             },
             || run_oauth(false, &target),
         )?;
-        outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+        outln!(
+            "clauth: captured into profile '{target}'. Switch to it with:  clauth switch {target}"
+        );
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch. What
     // that costs depends on the kind, so the copy lives in one place with the
@@ -1618,7 +1623,7 @@ fn cmd_capture(profile: &str, as_new: bool) -> Result<()> {
     if became_active {
         outln!("clauth: captured into profile '{name}'. It is the active account.");
     } else {
-        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
+        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth switch {name}");
     }
     Ok(())
 }
@@ -1774,7 +1779,7 @@ fn cmd_login_setup_token(target: &str, exists: bool, model: Option<&str>, yes: b
     // fix the member card and the daemon line give, and a reader at the CLI is
     // told where the probe's switch lives, since no command turns it on.
     outln!(
-        "clauth: it takes effect on the next switch:  clauth {target}{}",
+        "clauth: it takes effect on the next switch:  clauth switch {target}{}",
         if exists {
             String::new()
         } else {
@@ -2051,12 +2056,12 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     } else if has_login {
         outln!(
             "clauth: cleared the long-lived token for '{target}'. Its stored OAuth login \
-             installs on the next switch:  clauth {target}"
+             installs on the next switch:  clauth switch {target}"
         );
     } else if on_disk.api_key.is_some() {
         outln!(
             "clauth: cleared the long-lived token for '{target}'. It stores no OAuth login, \
-             so switching to it authenticates by api key:  clauth {target}"
+             so switching to it authenticates by api key:  clauth switch {target}"
         );
     } else {
         outln!(
@@ -2512,7 +2517,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         claude::force_link_profile_credentials(&canonical)?;
         outln!("clauth: installed live. New sessions run on it immediately.");
     } else {
-        outln!("clauth: it installs on the next switch:  clauth {canonical}");
+        outln!("clauth: it installs on the next switch:  clauth switch {canonical}");
     }
     Ok(())
 }

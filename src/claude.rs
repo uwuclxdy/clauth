@@ -5235,11 +5235,13 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 /// `split_whitespace` can yield more than three tokens — the parser locates
 /// the literal `__api-key` subcommand token and takes the NEXT token as the
 /// profile name, requiring it to be the LAST token (no trailing flags) and
-/// to pass `validate_profile_name`'s charset (`[A-Za-z0-9_.@+-]+`, no leading
-/// dot). A foreign helper that happens to contain `__api-key` followed by a
-/// profile-shaped token still parses — acceptable because clauth only writes
-/// this string itself, and the subcommand name is unusual enough not to
-/// collide in practice. A hand-edited or corrupted helper that fails any of
+/// to pass the charset `validate_profile_name` allows (`[A-Za-z0-9_.@+-]+`,
+/// no leading dot; that gate further refuses a leading `-` and a clauth
+/// subcommand name, so every name clauth writes clears this check). A foreign
+/// helper that happens to contain `__api-key` followed by a profile-shaped
+/// token still parses — acceptable because clauth only writes this string
+/// itself, and the subcommand name is unusual enough not to collide in
+/// practice. A hand-edited or corrupted helper that fails any of
 /// the above yields `None` rather than risk a phantom profile lookup that
 /// returns the wrong account's key into [`capture_snapshot`].
 fn profile_name_from_helper(helper: &str) -> Option<String> {
@@ -6212,9 +6214,10 @@ const API_KEY_HELPER_SUBCMD: &str = "__api-key";
 /// `cmd` on Windows — per the Claude Code settings docs), so each token is
 /// shell-escaped by [`shell_quote`]. The profile name is constrained by
 /// `actions::validate_profile_name` to `[A-Za-z0-9_.@+-]+` with no leading
-/// dot — entirely within the safe-char set, so it round-trips unquoted; the
-/// helper-quoting exists for the exe path, which may contain spaces
-/// (`/Applications/...`, `C:\Program Files\...`).
+/// dot or `-`, and never a clauth subcommand name — entirely within the
+/// safe-char set, so it round-trips unquoted; the helper-quoting exists for
+/// the exe path, which may contain spaces (`/Applications/...`,
+/// `C:\Program Files\...`).
 fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
     let exe = crate::platform::installed_exe_path(exe);
     format!(

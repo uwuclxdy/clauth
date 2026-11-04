@@ -43,8 +43,9 @@ pub(crate) fn is_name_char(c: char) -> bool {
 }
 
 /// Every char an [`is_name_char`], not leading-dot, not empty. The charset
-/// half of [`validate_profile_name`], standing alone for names that live in a
-/// namespace of their own (the preset store), where neither roster has a say.
+/// half of [`validate_new_name_chars`], standing alone for names that live in
+/// a namespace of their own (the preset store), where neither roster has a
+/// say, and for re-checking names already stored, so it admits a leading `-`.
 /// Returns the trimmed name the checks ran against.
 pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     let trimmed = name.trim();
@@ -56,6 +57,19 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
         bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
     }
     Ok(trimmed)
+}
+
+/// [`validate_name_chars`] for a name being created, which also refuses a
+/// leading `-`: every command clauth prints for the name (`clauth login -x`)
+/// would parse it as a flag. Kept apart from the charset check because that
+/// one also re-checks names already stored, which must keep loading. Returns
+/// the trimmed name.
+pub(crate) fn validate_new_name_chars(name: &str) -> Result<&str> {
+    let trimmed = name.trim();
+    if trimmed.starts_with(['.', '-']) {
+        bail!("name: letters, digits and - _ . @ + only, and can't start with '.' or '-'");
+    }
+    validate_name_chars(trimmed)
 }
 
 /// Refuse a name the OTHER harness's roster holds, naming the holder. Profile
@@ -88,9 +102,27 @@ pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Res
     Ok(())
 }
 
-/// The full gate for creating or renaming a profile on `harness`: charset,
-/// then the other harness's roster (refused by name), then this harness's own
-/// duplicate check (`exclude` exempts the current name for rename-in-place).
+/// The creation rules that read neither roster: the new-name charset (a
+/// leading `-` refused) and the clauth subcommand refusal (the bare
+/// `clauth <name>` switch could never reach it; matched exactly, so `List`
+/// passes). [`validate_profile_name`] adds the two roster checks; the browser
+/// login's CLI entry ([`codex_browser_login_with`]) runs this alone on a name
+/// its roster-only pre-flight found no profile for, before any browser opens.
+fn validate_new_name(name: &str) -> Result<&str> {
+    let trimmed = validate_new_name_chars(name)?;
+    if crate::cli::is_subcommand_name(trimmed) {
+        bail!(
+            "'{trimmed}' is a clauth command, so `clauth {trimmed}` can never switch to it; \
+             pick another name"
+        );
+    }
+    Ok(trimmed)
+}
+
+/// The full gate for creating or renaming a profile on `harness`: the
+/// roster-free creation rules ([`validate_new_name`]), then the other
+/// harness's roster (refused by name), then this harness's own duplicate
+/// check (`exclude` exempts the current name for rename-in-place).
 ///
 /// Reads both rosters itself rather than trusting a caller-supplied list: the
 /// cross-harness half must run at every creation site, and a caller curating
@@ -101,7 +133,7 @@ pub(crate) fn validate_profile_name(
     harness: Harness,
     exclude: Option<&str>,
 ) -> Result<()> {
-    let trimmed = validate_name_chars(name)?;
+    let trimmed = validate_new_name(name)?;
     validate_foreign_harness_free(trimmed, harness)?;
     let own: Vec<String> = match harness {
         Harness::Claude => crate::profile::claude_roster_names()?
@@ -3140,12 +3172,17 @@ fn write_codex_profile_store(
     Ok(store)
 }
 
-/// The browser login's pre-browser gate: charset, then refuse ONLY a
-/// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
-/// full check under the lock allows it). Returns the name the landing writes
-/// under and, for a profile the codex roster holds, the [`ProfileId`] it
-/// re-auths. Extracted so the "own-roster passes, cross-harness refuses" rule
-/// is testable without opening a real browser; the TUI's `re-login` shares it.
+/// The browser login's pre-browser gate shared by the CLI's login and the
+/// TUI's `re-login`: charset, then a cross-harness clash refuses, then the
+/// codex roster resolves the name. An own-roster codex name is a re-auth,
+/// exempt from the creation rules (the landing still re-checks it under the
+/// lock); a name the roster does not hold resolves to no profile and the
+/// caller owns the rest — the CLI's [`codex_browser_login_with`] applies the
+/// creation rules there, before any browser opens, while the TUI's re-login
+/// refuses it as `no longer exists` because it never creates. Returns the name
+/// the landing writes under and, for a profile the codex roster holds, the
+/// [`ProfileId`] it re-auths. Extracted so the "own-roster passes,
+/// cross-harness refuses" rule is testable without opening a real browser.
 pub(crate) fn codex_browser_preflight(name: &str) -> Result<(String, Option<ProfileId>)> {
     let trimmed = validate_name_chars(name)?.to_string();
     validate_foreign_harness_free(&trimmed, Harness::Codex)?;
@@ -3229,13 +3266,18 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
 }
 
 /// [`codex_login_browser`]'s round trip and landing, with the browser flow
-/// injected: what the preflight found under `name` before `trip` is what the
-/// landing re-auths, or creates when it found nothing.
+/// injected: a name the preflight found no profile for is a create, so the
+/// creation rules run here before `trip` opens a browser; what the preflight
+/// found under `name` is what the landing re-auths, or creates when it found
+/// nothing.
 pub(crate) fn codex_browser_login_with(
     name: &str,
     trip: impl FnOnce() -> Result<crate::codex_login::CodexLoginOutcome>,
 ) -> Result<(String, crate::codex_login::CodexLoginOutcome)> {
     let (canonical, account) = codex_browser_preflight(name)?;
+    if account.is_none() {
+        validate_new_name(&canonical)?;
+    }
     let outcome = trip()?;
     let canonical = land_codex_login(&canonical, &outcome, account.as_ref())?;
     Ok((canonical, outcome))
@@ -4187,7 +4229,7 @@ pub(crate) fn capture_current_login(
     // owns; the CLI has no confirm flow, so it refuses with the owner named.
     match capture_owner_checked(config, snapshot.credentials.as_ref()) {
         CaptureOwner::Owned(owner) => bail!(
-            "these credentials already belong to '{owner}'; switch to it with:  clauth {owner}"
+            "these credentials already belong to '{owner}'; switch to it with:  clauth switch {owner}"
         ),
         CaptureOwner::LooksLike(matched) if !as_new => {
             let owner = matched.owner;

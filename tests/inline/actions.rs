@@ -1686,6 +1686,58 @@ fn the_own_roster_duplicate_keeps_the_rename_exemption() {
     assert!(validate_profile_name("cx", Harness::Codex, Some("cx")).is_ok());
 }
 
+/// A NEW name starting with `-` refuses on both harnesses: every command clauth
+/// prints for it (`clauth login -x`) would parse it as a flag. The `.` refusal
+/// shares the one line. The charset check alone keeps admitting it, because it
+/// also re-checks names already stored (the Keychain ownership ledger, the API's
+/// session create, the preset list, a codex re-login).
+#[test]
+fn a_new_name_starting_with_a_dash_is_refused() {
+    let _home = HomeSandbox::new();
+    let line = "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'";
+    for name in ["-x", "--x", "-", "---", " -x ", ".lead"] {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let err = validate_profile_name(name, harness, None)
+                .expect_err("a dash- or dot-led new name must refuse");
+            assert_eq!(err.to_string(), line, "{name:?} on {harness}");
+        }
+    }
+    assert!(
+        validate_profile_name("-x", Harness::Claude, Some("-x")).is_err(),
+        "a rename onto a dash-led name refuses too"
+    );
+    assert_eq!(
+        validate_name_chars("-x").expect("a stored dash-led name still passes the charset"),
+        "-x"
+    );
+    assert!(validate_profile_name("a-x", Harness::Claude, None).is_ok());
+}
+
+/// A NEW name equal to a clauth subcommand refuses: the bare `clauth <name>`
+/// switch loses to the subcommand, so `clauth list` could never reach it.
+/// Hidden subcommands and clap's generated `help` count; the match is exact,
+/// since `clauth List` is no subcommand and does reach the account.
+#[test]
+fn a_new_name_a_subcommand_holds_is_refused() {
+    let _home = HomeSandbox::new();
+    for name in ["list", "start", "switch", "help", "__api-key", "run"] {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let err = validate_profile_name(name, harness, None)
+                .expect_err("a subcommand name must refuse");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "'{name}' is a clauth command, so `clauth {name}` can never switch to it; \
+                     pick another name"
+                ),
+                "{harness}"
+            );
+        }
+    }
+    assert!(validate_profile_name("List", Harness::Claude, None).is_ok());
+    assert!(validate_profile_name("lister", Harness::Claude, None).is_ok());
+}
+
 /// The capture-name flavor: tolerate an own-roster collision (it routes into
 /// capture-into-existing) while still refusing to shadow the other harness.
 #[test]
@@ -3764,10 +3816,10 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
 
     let err = capture_current_login(&mut config, "work", false).expect_err("owned login refused");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("'first'") && msg.contains("clauth first"),
-        "names the owning profile and the switch to it: {msg}"
+    assert_eq!(
+        err.to_string(),
+        "these credentials already belong to 'first'; switch to it with:  clauth switch first",
+        "names the owning profile and the switch to it"
     );
     assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
     assert!(
@@ -9648,6 +9700,41 @@ fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
     let (name, account) = codex_browser_preflight("fresh").expect("fresh clears");
     assert_eq!(name, "fresh");
     assert!(account.is_none(), "a create carries no id");
+}
+
+/// A NEW codex name takes the creation rules at the CLI's login entry, before
+/// any browser opens: a leading `-` and a clauth subcommand are refused there,
+/// never after the browser trip. A stored name of either shape is a re-auth
+/// and stays exempt.
+#[test]
+fn codex_browser_login_refuses_a_new_unaddressable_name_before_the_trip() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["-c", "list"]);
+
+    let err = crate::actions::codex_browser_login_with("-newc", || {
+        panic!("the creation refusal must come before the browser trip");
+    })
+    .expect_err("a new dash-led name refuses");
+    assert_eq!(
+        err.to_string(),
+        "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'"
+    );
+
+    let err = crate::actions::codex_browser_login_with("start", || {
+        panic!("the creation refusal must come before the browser trip");
+    })
+    .expect_err("a new subcommand name refuses");
+    assert_eq!(
+        err.to_string(),
+        "'start' is a clauth command, so `clauth start` can never switch to it; pick another name"
+    );
+
+    let (name, account) = codex_browser_preflight("-c").expect("a stored dash name re-auths");
+    assert_eq!(name, "-c");
+    assert!(
+        account.is_some(),
+        "the re-auth carries the stored profile's id"
+    );
 }
 
 /// `clauth login <name> --codex --browser` on a codex account deleted and

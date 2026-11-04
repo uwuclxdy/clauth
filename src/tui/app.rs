@@ -4984,9 +4984,13 @@ pub(crate) struct CodexRow {
 /// itself on a cache miss for the plan), the same set `status --json` reads
 /// with no daemon running.
 pub(crate) fn codex_rows() -> Vec<CodexRow> {
-    let Ok(state) = crate::codex_profiles::CodexState::load() else {
-        return Vec::new();
-    };
+    crate::codex_profiles::CodexState::load()
+        .map(|state| codex_rows_from(&state))
+        .unwrap_or_default()
+}
+
+/// [`codex_rows`] over a roster already read.
+fn codex_rows_from(state: &crate::codex_profiles::CodexState) -> Vec<CodexRow> {
     let active = state.active_profile().cloned();
     state
         .profiles()
@@ -5018,6 +5022,18 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
             }
         })
         .collect()
+}
+
+/// Re-read the codex roster into [`App::codex_rows`], keeping the previous
+/// rows when the read fails: those also feed the name notices, which must not
+/// forget codex names on a guess and then re-raise them on recovery. Returns
+/// whether the read landed, for a caller that follows it with a placement.
+fn refresh_codex_rows(app: &mut App) -> bool {
+    let Ok(state) = crate::codex_profiles::CodexState::load() else {
+        return false;
+    };
+    app.codex_rows = codex_rows_from(&state);
+    true
 }
 
 // ── Login session ─────────────────────────────────────────────────────────────
@@ -5692,6 +5708,9 @@ pub(crate) struct App {
     /// rather than one string is what keeps a second notice from repainting
     /// the first.
     pub(crate) day_claim_notices: Vec<String>,
+    /// The unaddressable-name notices last surfaced, held as a set for the
+    /// reason `day_claim_notices` gives.
+    pub(crate) name_notices: Vec<crate::profile::NameNotice>,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
@@ -6468,6 +6487,7 @@ impl App {
             #[cfg(test)]
             tps_now_override: None,
             day_claim_notices: Vec::new(),
+            name_notices: Vec::new(),
             tick_count: 0,
             quit: false,
             exit_wait: false,
@@ -18869,7 +18889,7 @@ fn land_capture_login(app: &mut App, snapshot: Result<CaptureSnapshot>) {
                 ToastKind::Danger,
                 format!(
                     "these credentials already belong to '{owner}'\nswitch to it with:  {}",
-                    prose::cmd(&format!("clauth {owner}"))
+                    prose::cmd(&format!("clauth switch {owner}"))
                 ),
             );
             app.refresh_unsaved_live_login();
@@ -22810,7 +22830,7 @@ fn perform_codex_delete(app: &mut App, name: &str) {
             // row now at that index, clamped (across bands), the `+ new` row
             // only when no item row exists.
             let flat = app.profile_count() + old_index.unwrap_or(0);
-            app.codex_rows = codex_rows();
+            refresh_codex_rows(app);
             disarm_codex_2step(app);
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
@@ -22972,7 +22992,7 @@ fn drain_codex_login(app: &mut App) {
         }
         match result {
             Ok(canonical) => {
-                app.codex_rows = codex_rows();
+                refresh_codex_rows(app);
                 app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
             }
             Err(e) => app.toast(
@@ -25245,7 +25265,7 @@ fn commit_codex_account(app: &mut App) {
 /// Land a created codex account: re-read the codex snapshot, and put Setup and
 /// the Overview on the new row.
 fn finish_created_codex(app: &mut App, name: &str) {
-    app.codex_rows = codex_rows();
+    refresh_codex_rows(app);
     let new_idx = app
         .codex_rows
         .iter()
@@ -30273,6 +30293,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drop_gone_edit_hold(app);
 
     warn_day_claim_notices(app);
+    warn_name_notices(app);
     update_banner(app);
     app.prune_toasts();
 
@@ -30313,6 +30334,28 @@ pub(crate) fn warn_day_claim_notices(app: &mut App) {
     app.day_claim_notices = notices;
 }
 
+/// Say once, and again whenever the set changes, which stored accounts the
+/// printed commands cannot address: the TUI's half of the CLI's load notice.
+/// Same set-diff gate as [`warn_day_claim_notices`].
+pub(crate) fn warn_name_notices(app: &mut App) {
+    let notices = app
+        .config()
+        .name_notices(app.codex_rows.iter().map(|row| &row.name));
+    if notices == app.name_notices {
+        return;
+    }
+    let fresh: Vec<crate::profile::NameNotice> = notices
+        .iter()
+        .filter(|n| !app.name_notices.contains(n))
+        .cloned()
+        .collect();
+    for notice in fresh {
+        crate::logline::logline!("{}", notice.cli_line());
+        app.toast(ToastKind::Warning, notice.toast_body());
+    }
+    app.name_notices = notices;
+}
+
 /// Re-read the codex roster for the Overview's codex section and the header's
 /// account count, at most once a second: a roster TOML plus a few small files
 /// per account is cheap but not per-frame cheap, and both a `clauth login --codex`
@@ -30328,8 +30371,9 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
-    app.codex_rows = codex_rows();
-    app.place_overview_cursor();
+    if refresh_codex_rows(app) {
+        app.place_overview_cursor();
+    }
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`

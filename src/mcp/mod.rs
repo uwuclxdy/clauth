@@ -540,7 +540,7 @@ impl ProfileNotFoundFix {
             ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
             ProfileNotFoundFix::CodexAccount(held) => format!(
                 "{held} names a CODEX account, which these tools do not manage — they are Claude \
-                 Code only. Switch it with `clauth <name>`"
+                 Code only. Switch it with `clauth switch <name>`"
             ),
         }
     }

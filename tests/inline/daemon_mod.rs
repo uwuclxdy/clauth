@@ -4776,6 +4776,187 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
     );
 }
 
+/// A stored account the printed commands cannot address reaches the daemon's
+/// log once per change: a tick re-deriving the same roster is silent, the
+/// account leaving clears the gate quietly, and its return logs again.
+#[test]
+fn the_daemon_logs_an_unaddressable_account_name_once_per_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let dashed = crate::profile::ProfileName::from("-x");
+    let config = persist(
+        vec![
+            blank_profile(&dashed),
+            blank_profile(&crate::profile::ProfileName::from("work")),
+        ],
+        Some("work"),
+        60_000,
+    );
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let line = "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
+                prints for it fail; rename it on the TUI's Setup tab";
+
+    daemon.log_name_notices(None);
+    assert_eq!(lines.snapshot(), vec![line.to_string()]);
+
+    daemon.log_name_notices(None);
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "an unchanged tick writes no second line"
+    );
+
+    let held = {
+        let mut cfg = daemon.config.lock().expect("config mutex poisoned");
+        let at = cfg
+            .profiles
+            .iter()
+            .position(|p| p.name == dashed)
+            .expect("-x is loaded");
+        cfg.profiles.remove(at)
+    };
+    daemon.log_name_notices(None);
+    assert!(daemon.name_notices.is_empty(), "the gate clears");
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "the account leaving says nothing"
+    );
+
+    daemon
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .profiles
+        .push(held);
+    daemon.log_name_notices(None);
+    assert_eq!(
+        lines.snapshot(),
+        vec![line.to_string(), line.to_string()],
+        "its return logs again"
+    );
+}
+
+/// A codex roster's unaddressable names reach daemon.log through the same
+/// once-per-change gate as a claude one, so a hand-edited codex name is not
+/// silent on the headless surface.
+#[test]
+fn the_daemon_logs_an_unaddressable_codex_name_once_per_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::testutil::write_codex_roster(&["-c", "list"]);
+    let config = persist(
+        vec![blank_profile(&crate::profile::ProfileName::from("work"))],
+        Some("work"),
+        60_000,
+    );
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dash = "clauth: -c: a name starting with '-' reads as a flag, so the commands clauth \
+                prints for it fail; delete it and log in again under another name";
+    let list = "clauth: list: a bare `clauth list` runs clauth's own list command, never a \
+                switch to this account; switch with `clauth switch list`, or delete it and log \
+                in again under another name";
+    let codex = crate::codex_profiles::CodexState::load().expect("the codex roster loads");
+
+    daemon.log_name_notices(Some(&codex));
+    assert_eq!(lines.snapshot(), vec![dash.to_string(), list.to_string()]);
+
+    daemon.log_name_notices(Some(&codex));
+    assert_eq!(
+        lines.snapshot().len(),
+        2,
+        "an unchanged tick writes no second line"
+    );
+}
+
+/// The tick's own wiring, and a failed codex read inside it: one tick over a
+/// roster holding an unaddressable codex name logs its line, a tick whose read
+/// fails logs nothing, and the read's recovery writes no second line.
+#[test]
+fn a_tick_logs_an_unaddressable_codex_name_and_a_failed_read_re_logs_nothing() {
+    let _home = HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    crate::testutil::write_codex_roster(&["-c"]);
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let line = "clauth: -c: a name starting with '-' reads as a flag, so the commands clauth \
+                prints for it fail; delete it and log in again under another name";
+    let logged = |lines: &crate::logline::LogLines| {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|logged| logged.as_str() == line)
+            .count()
+    };
+
+    daemon.tick();
+    assert_eq!(logged(&lines), 1, "the tick logs the stored hazard");
+
+    crate::testutil::write_codex_state("profiles = [\"-c\"");
+    daemon.tick();
+    assert_eq!(
+        logged(&lines),
+        1,
+        "a failed read says nothing: {:?}",
+        lines.snapshot()
+    );
+    assert_eq!(
+        daemon.name_notices.len(),
+        1,
+        "and keeps the last notice set"
+    );
+
+    crate::testutil::write_codex_roster(&["-c"]);
+    daemon.tick();
+    assert_eq!(
+        logged(&lines),
+        1,
+        "the read's recovery is no change: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// One name held by both rosters is one account: the daemon logs it once, the
+/// way the CLI keys one line per account name, not once per roster row.
+#[test]
+fn the_daemon_logs_a_name_in_both_rosters_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::testutil::write_codex_roster(&["list"]);
+    let list = crate::profile::ProfileName::from("list");
+    let config = persist(vec![blank_profile(&list)], Some("list"), 60_000);
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let codex = crate::codex_profiles::CodexState::load().expect("the codex roster loads");
+
+    daemon.log_name_notices(Some(&codex));
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
+             to this account; switch with `clauth switch list`, or rename it on the TUI's \
+             Setup tab"
+                .to_string()
+        ],
+        "a name both rosters hold logs once"
+    );
+}
+
 /// A credit refusal on record is said on the log at its edges, whichever
 /// process wrote it: once when it lands, nothing while it stands, once when it
 /// clears, and once more from a fresh daemon over a refusal still standing

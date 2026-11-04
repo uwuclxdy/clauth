@@ -90,7 +90,11 @@ impl super::Daemon {
             self.drain_pending_switch_off();
         }
         self.reconcile_background_holds();
-        self.write_status();
+        // The status build's codex read also feeds the name notices, so a tick
+        // reads `codex-profiles.toml` once and cannot judge a codex roster its
+        // body did not describe.
+        let codex = self.write_status();
+        self.log_name_notices(codex.as_ref());
         // Honour a strip the switch-time strip deferred (its sync lock was held)
         // with no live `clauth start` wrapper to reconcile it. Try-once: never
         // parks this tick behind a held sync lock, and no ranked lock is held
@@ -197,6 +201,36 @@ impl super::Daemon {
             logline!("clauth: {msg}");
         }
         self.day_claim_notices = notices;
+    }
+
+    /// Log once per change which stored accounts the printed commands cannot
+    /// address: the headless half of `tui::app::warn_name_notices`, gated the
+    /// way [`Self::log_day_claim_notices`] is. `codex` is the tick's own roster
+    /// read — the one `write_status` built `status.json` from — never a fresh
+    /// load: two reads in one tick can disagree. A FAILED read judges the codex
+    /// half against the last successful one, so the read's recovery re-raises
+    /// nothing.
+    pub(super) fn log_name_notices(&mut self, codex: Option<&crate::codex_profiles::CodexState>) {
+        if let Some(codex) = codex {
+            self.last_codex_roster.clear();
+            self.last_codex_roster.extend_from_slice(codex.profiles());
+        }
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let notices = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .name_notices(self.last_codex_roster.iter());
+        if notices == self.name_notices {
+            return;
+        }
+        for notice in notices.iter().filter(|n| !self.name_notices.contains(n)) {
+            logline!("{}", notice.cli_line());
+        }
+        self.name_notices = notices;
     }
 
     /// Whether the next drain must be skipped rather than handed a wait: the

@@ -13043,7 +13043,7 @@ fn the_refusal_tells_a_codex_name_apart_from_an_unknown_one() {
     let real = profile_not_found_cross_harness("cx", ProfileNotFoundFix::CallProfiles);
     assert!(real.contains("CODEX account"), "{real}");
     assert!(
-        real.contains("Switch it with `clauth <name>`"),
+        real.contains("Switch it with `clauth switch <name>`"),
         "the fix names the surface that CAN: {real}"
     );
 
@@ -13105,13 +13105,13 @@ fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
     assert_eq!(
         first_line("cx"),
         "switch failed: profile not found: cx; cx names a CODEX account, which these tools \
-         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         do not manage — they are Claude Code only. Switch it with `clauth switch <name>`; \
          active profile none"
     );
     assert_eq!(
         first_line("CX"),
         "switch failed: profile not found: CX; cx names a CODEX account, which these tools \
-         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         do not manage — they are Claude Code only. Switch it with `clauth switch <name>`; \
          active profile none"
     );
 }
@@ -13155,7 +13155,7 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
     assert_eq!(
         err,
         "profile not found: cx; cx names a CODEX account, which these tools do not manage — \
-         they are Claude Code only. Switch it with `clauth <name>`"
+         they are Claude Code only. Switch it with `clauth switch <name>`"
     );
 }
 

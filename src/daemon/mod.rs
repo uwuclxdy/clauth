@@ -1787,6 +1787,9 @@ struct Daemon {
     /// changes at the midnight rollover and on a config edit, and is
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
+    /// The unaddressable-name notices last logged, the same set-gate as
+    /// `day_claim_notices` (`AppConfig::name_notices`).
+    name_notices: Vec<crate::profile::NameNotice>,
     /// The kind of the last background-hold strip-list read that failed and
     /// was logged, `None` once one reads: the read runs every tick, so a
     /// failure logs once per kind rather than once per tick.
@@ -1799,8 +1802,8 @@ struct Daemon {
     push_latches: crate::push::StatusLatches,
     /// The last codex roster this daemon read successfully, in memory only;
     /// empty until the first successful read. On a failed read it stands in
-    /// for the roster `queue_pushes` forgets against, so a failed read forgets
-    /// no codex names on a guess.
+    /// for the roster `queue_pushes` forgets against and `log_name_notices`
+    /// judges, so a failed read forgets or re-raises no codex names on a guess.
     last_codex_roster: Vec<ProfileName>,
     /// Runs `bell_command`; a seam so tests record the ring instead.
     ring_bell: fn(&str, &str) -> anyhow::Result<()>,
@@ -1881,6 +1884,7 @@ impl Daemon {
             switch_backoff: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            name_notices: Vec::new(),
             strip_list_failure: None,
             credit_capped: HashSet::new(),
             credit_refusals: crate::profile_cache::CreditRefusalWatch::default(),
@@ -2181,7 +2185,10 @@ impl Daemon {
     /// profile's cache files and sweeps the session flocks, and holding CONFIG
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
-    fn write_status(&mut self) {
+    ///
+    /// Hands back the codex roster the body was built from, so the tick's name
+    /// notices read it from this one load rather than a second.
+    fn write_status(&mut self) -> Option<crate::codex_profiles::CodexState> {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
         let snapshot = self.live_stores().snapshot();
         let live = snapshot.signals();
@@ -2212,6 +2219,7 @@ impl Daemon {
             cfg_snap.state.bell_command.as_deref(),
         );
         self.queue_pushes(&cfg_snap, &body.profiles, codex.as_ref());
+        codex
     }
 
     /// Say a spent usage-credit cap out loud, once per account per edge, on

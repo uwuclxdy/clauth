@@ -1727,7 +1727,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["cx"]), None);
@@ -1735,7 +1735,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: cx; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX", "zz"]), None);
@@ -1744,7 +1744,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX"]), None);
@@ -1752,7 +1752,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: CX; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `clauth switch <name>`"
     );
 }
 

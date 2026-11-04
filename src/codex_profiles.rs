@@ -139,6 +139,7 @@ impl CodexState {
         if state.weekly_switch_threshold.is_some() {
             state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
         }
+        crate::profile::notice_codex_load(state.profiles());
         Ok(state)
     }
 

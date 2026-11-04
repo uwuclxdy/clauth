@@ -11706,6 +11706,27 @@ fn codex_create_with_a_blank_name_refuses_and_creates_nothing() {
     );
 }
 
+/// The codex re-login runs only on a stored row and never creates, so a name
+/// the roster no longer holds (deleted from another terminal) reaches the
+/// operator as `no longer exists` and starts no browser flow — never the CLI's
+/// creation rule.
+#[test]
+fn a_codex_re_login_on_a_vanished_row_toasts_no_longer_exists_and_starts_nothing() {
+    use super::{ToastKind, start_codex_login};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+
+    start_codex_login(&mut app, "-newc");
+
+    assert!(app.codex_login.is_none(), "no login session starts");
+    assert!(
+        app.toasts.iter().any(|t| t.kind == ToastKind::Danger
+            && t.body == "login failed\ncodex profile '-newc' no longer exists"),
+        "the vanished row reaches the toast: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
 /// The claude state file under the sandboxed home, for byte-identical before/
 /// after comparison. A missing file is the empty snapshot.
 fn claude_state_file_bytes() -> Vec<u8> {
@@ -28588,6 +28609,302 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
     assert_eq!(app.toasts.len(), 2, "a collision re-introduced warns again");
 }
 
+/// Each stored account the printed commands cannot address warns once, toast
+/// and log line both, on the first tick; a tick over the same roster says
+/// nothing, and an account added later says only itself.
+#[test]
+fn an_unaddressable_account_name_warns_once_per_change() {
+    use super::{ToastKind, warn_name_notices};
+    use crate::profile::{Profile, ProfileName};
+    use crate::tui::render::prose::mark_commands;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let mut app = app_with(vec![
+        Profile::new("-x".to_string(), None, None),
+        Profile::new("list".to_string(), None, None),
+        Profile::new("work".to_string(), None, None),
+    ]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let toasts = |app: &App| -> Vec<(ToastKind, String)> {
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.clone()))
+            .collect()
+    };
+
+    warn_name_notices(&mut app);
+    let dash = (
+        ToastKind::Warning,
+        mark_commands(
+            "-x starts with '-', so the commands clauth prints for it fail\n\
+             rename it on the Setup tab",
+        ),
+    );
+    let list = (
+        ToastKind::Warning,
+        mark_commands(
+            "`clauth list` runs clauth's own command, not a switch to list\n\
+             switch with `clauth switch list`, or rename it on the Setup tab",
+        ),
+    );
+    assert_eq!(toasts(&app), vec![dash.clone(), list.clone()]);
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
+             prints for it fail; rename it on the TUI's Setup tab"
+                .to_string(),
+            "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
+             to this account; switch with `clauth switch list`, or rename it on the TUI's \
+             Setup tab"
+                .to_string(),
+        ]
+    );
+
+    warn_name_notices(&mut app);
+    assert_eq!(toasts(&app).len(), 2, "the next tick repaints nothing");
+    assert_eq!(lines.snapshot().len(), 2, "and logs nothing");
+
+    {
+        let mut cfg = app.config();
+        cfg.state.profiles.push(ProfileName::from("start"));
+        cfg.profiles
+            .push(Profile::new("start".to_string(), None, None));
+    }
+    warn_name_notices(&mut app);
+    assert_eq!(
+        toasts(&app),
+        vec![
+            dash,
+            list,
+            (
+                ToastKind::Warning,
+                mark_commands(
+                    "`clauth start` runs clauth's own command, not a switch to start\n\
+                     switch with `clauth switch start`, or rename it on the Setup tab",
+                ),
+            ),
+        ],
+        "an account added later raises only its own notice"
+    );
+}
+
+/// A codex roster's unaddressable names reach the same toast and log line as
+/// the claude roster's, with the remedy a codex account has (it has no rename,
+/// so deleting it and logging in again is the only one).
+#[test]
+fn an_unaddressable_codex_name_warns_once_per_change() {
+    use super::{ToastKind, warn_name_notices};
+    use crate::profile::Profile;
+    use crate::tui::render::prose::mark_commands;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::testutil::write_codex_roster(&["-c", "list"]);
+    let mut app = app_with(vec![Profile::new("work".to_string(), None, None)]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let toasts = |app: &App| -> Vec<(ToastKind, String)> {
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.clone()))
+            .collect()
+    };
+    warn_name_notices(&mut app);
+    assert_eq!(
+        toasts(&app),
+        vec![
+            (
+                ToastKind::Warning,
+                mark_commands(
+                    "-c starts with '-', so the commands clauth prints for it fail\n\
+                     delete it and log in again under another name",
+                ),
+            ),
+            (
+                ToastKind::Warning,
+                mark_commands(
+                    "`clauth list` runs clauth's own command, not a switch to list\n\
+                     switch with `clauth switch list`, or delete it and log in again under \
+                     another name",
+                ),
+            ),
+        ]
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: -c: a name starting with '-' reads as a flag, so the commands clauth \
+             prints for it fail; delete it and log in again under another name"
+                .to_string(),
+            "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
+             to this account; switch with `clauth switch list`, or delete it and log in again \
+             under another name"
+                .to_string(),
+        ]
+    );
+
+    warn_name_notices(&mut app);
+    assert_eq!(toasts(&app).len(), 2, "the next tick repaints nothing");
+    assert_eq!(lines.snapshot().len(), 2, "and logs nothing");
+}
+
+/// `on_tick`'s own wiring, and a failed codex read inside it: the first tick
+/// over a roster holding an unaddressable codex name warns, a tick whose read
+/// fails warns nothing and keeps the set, and the read's recovery raises no
+/// second warning.
+#[test]
+fn an_on_tick_warns_once_about_an_unaddressable_codex_name() {
+    use super::ToastKind;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::testutil::write_codex_roster(&["-c"]);
+    let mut app = app_with(vec![Profile::new("work".to_string(), None, None)]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let warnings = |app: &App| {
+        app.toasts
+            .iter()
+            .filter(|t| t.kind == ToastKind::Warning && t.body.contains("starts with '-'"))
+            .count()
+    };
+    let logged = |lines: &crate::logline::LogLines| {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|logged| logged.contains("-c: a name starting with"))
+            .count()
+    };
+
+    super::on_tick(&mut app);
+    assert_eq!(warnings(&app), 1, "the tick raises the stored hazard");
+    assert_eq!(logged(&lines), 1, "and logs it");
+
+    crate::testutil::write_codex_state("profiles = [\"-c\"");
+    app.last_codex_rows_refresh = None;
+    super::on_tick(&mut app);
+    assert_eq!(warnings(&app), 1, "a failed read raises nothing");
+    assert_eq!(logged(&lines), 1);
+    assert_eq!(app.name_notices.len(), 1, "and keeps the last notice set");
+
+    crate::testutil::write_codex_roster(&["-c"]);
+    app.last_codex_rows_refresh = None;
+    super::on_tick(&mut app);
+    assert_eq!(warnings(&app), 1, "the read's recovery is no change");
+    assert_eq!(logged(&lines), 1);
+}
+
+/// A failed codex read on a post-action refresh keeps the previous rows, the
+/// rule `poll_codex_rows` follows: the codex notices read those rows, so
+/// clearing them on a guess re-raises the warning on the next good poll.
+#[test]
+fn a_failed_codex_read_keeps_the_rows_on_a_post_action_refresh() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["-c"]);
+    let mut app = bare_app();
+    app.codex_rows = super::codex_rows();
+    assert!(
+        app.codex_rows.iter().any(|row| row.name.as_str() == "-c"),
+        "precondition: the roster reads"
+    );
+
+    crate::testutil::write_codex_state("profiles = [\"-c\"");
+    super::finish_created_codex(&mut app, "new-codex");
+
+    assert!(
+        app.codex_rows.iter().any(|row| row.name.as_str() == "-c"),
+        "a failed read keeps the rows: {:?}",
+        app.codex_rows
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// One name held by both rosters is one account: the TUI says it once, the way
+/// the CLI keys one line per account name, not once per roster row.
+#[test]
+fn a_name_in_both_rosters_warns_once() {
+    use super::{ToastKind, warn_name_notices};
+    use crate::profile::Profile;
+    use crate::tui::render::prose::mark_commands;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    crate::testutil::write_codex_roster(&["list"]);
+    let mut app = app_with(vec![Profile::new("list".to_string(), None, None)]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    warn_name_notices(&mut app);
+
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.clone()))
+            .collect::<Vec<_>>(),
+        vec![(
+            ToastKind::Warning,
+            mark_commands(
+                "`clauth list` runs clauth's own command, not a switch to list\n\
+                 switch with `clauth switch list`, or rename it on the Setup tab",
+            ),
+        )],
+        "a name both rosters hold is one account, so one toast"
+    );
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "and one log line: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A stored name of exactly `-` is a value to clap, not a flag: nothing the
+/// printed commands do with it fails, so it warns nothing while `-x` still
+/// does.
+#[test]
+fn a_stored_lone_dash_is_not_noticed() {
+    use super::{ToastKind, warn_name_notices};
+    use crate::profile::Profile;
+    use crate::tui::render::prose::mark_commands;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let mut app = app_with(vec![
+        Profile::new("-".to_string(), None, None),
+        Profile::new("-x".to_string(), None, None),
+    ]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    warn_name_notices(&mut app);
+    let bodies: Vec<(ToastKind, String)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![(
+            ToastKind::Warning,
+            mark_commands(
+                "-x starts with '-', so the commands clauth prints for it fail\n\
+                 rename it on the Setup tab",
+            ),
+        )],
+        "only -x warns"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
+             prints for it fail; rename it on the TUI's Setup tab"
+                .to_string()
+        ]
+    );
+}
+
 // ── the Fallback card's `preferred days` row ─────────────────────────────────
 
 /// The row's index in `FALLBACK_ROWS`, read off the list itself so a future
@@ -33313,8 +33630,8 @@ fn the_capture_refusal_styles_the_owners_switch_command() {
     );
     assert_prose_part(
         &prose_frame(&app, 120, 30),
-        "switch to it with: clauth play",
-        "clauth play",
+        "switch to it with: clauth switch play",
+        "clauth switch play",
         false,
         crate::tui::theme::dim(),
     );

@@ -185,6 +185,25 @@ fn a_device_name_takes_the_profile_charset_trimmed() {
     }
 }
 
+/// `clauth devices revoke -tab` reads `-tab` as a flag, so a device named that
+/// way could never be revoked by the command clauth prints for it.
+#[test]
+fn a_new_device_name_starting_with_a_dash_is_refused() {
+    for dashed in ["-tab", "--tab", "-", " -tab "] {
+        let err = DeviceName::parse(dashed).expect_err("a dash-led device name must refuse");
+        assert_eq!(
+            err.to_string(),
+            "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'",
+            "{dashed:?}"
+        );
+    }
+    assert_eq!(
+        name("tab-1").as_str(),
+        "tab-1",
+        "a dash inside the name stays legal"
+    );
+}
+
 #[test]
 fn the_legacy_name_is_reserved_in_any_case() {
     for reserved in ["legacy", "LEGACY", "Legacy"] {

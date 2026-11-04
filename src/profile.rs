@@ -16,6 +16,7 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
@@ -1784,6 +1785,36 @@ impl AppConfig {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// One notice per stored account whose name the commands clauth prints
+    /// cannot address, the claude roster then the codex one, each in roster
+    /// order. A name both rosters hold — or one listed twice — is one account,
+    /// so it is noticed at its first occurrence alone: the claude roster's,
+    /// the account a bare name resolves to and the only one Setup can rename,
+    /// while the codex row for the same name is a hand edit. New names refuse
+    /// both shapes at creation; these are the accounts stored before that, or
+    /// by hand.
+    pub(crate) fn name_notices<'a>(
+        &'a self,
+        codex: impl IntoIterator<Item = &'a ProfileName>,
+    ) -> Vec<NameNotice> {
+        let mut notices: Vec<NameNotice> = Vec::new();
+        for (name, harness) in self
+            .profiles
+            .iter()
+            .map(|profile| (&profile.name, Harness::Claude))
+            .chain(codex.into_iter().map(|name| (name, Harness::Codex)))
+        {
+            let Some(notice) = NameNotice::of(name, harness) else {
+                continue;
+            };
+            if notices.iter().any(|seen| seen.name == notice.name) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
     }
 
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
@@ -4311,83 +4342,250 @@ fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
     if rewrite {
         maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
     }
-    if unreadable_store_notice(&profile).is_some() {
-        notice_torn_store(&profile);
-    }
+    notice_profile_load(&profile);
     Ok(profile)
 }
 
-/// Whether the torn-store notice may print. Off by default — the TUI's stderr
-/// is its alternate screen, the daemon's is `daemon.log`, the MCP server's is
-/// Claude Code's, a hook's is its caller's — so only the CLI dispatch arms for
-/// the user-facing commands turn it on ([`enable_torn_store_notice`]).
-static TORN_STORE_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The thread the load notices may print on, if any. Off by default — the
+/// TUI's stderr is its alternate screen, the daemon's is `daemon.log`, the MCP
+/// server's is Claude Code's, a hook's is its caller's — so only the CLI
+/// dispatch arms, and for the user-facing commands alone
+/// ([`enable_load_notices`]). The arming thread is recorded because the flag
+/// is process-wide while stderr belongs to the foreground thread: a `clauth
+/// start` session's watchdog thread loads the roster mid-session, and a notice
+/// printed there would reach `errln!` — which panics on a write error no
+/// scheduler thread can answer for — on a screen Claude Code has already
+/// painted.
+static LOAD_NOTICES: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
 
-/// The account names whose notice already printed, so however many times one
-/// process reloads the roster, one torn store yields one line.
-static TORN_STORE_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The key of every notice already printed, so however many times one process
+/// reloads the roster, one torn store or one unaddressable name yields one
+/// line.
+static LOAD_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Turn the torn-store notice on for the rest of the process. Called once by
-/// the CLI dispatch, and only for the user-facing commands.
-pub(crate) fn enable_torn_store_notice() {
-    TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+fn load_notices_thread() -> std::sync::MutexGuard<'static, Option<std::thread::ThreadId>> {
+    LOAD_NOTICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// One stderr line naming an unreadable account, at most once per account per
-/// process. No-op unless [`enable_torn_store_notice`] ran and the account has
-/// not been named yet.
-fn notice_torn_store(profile: &Profile) {
-    if !TORN_STORE_NOTICE.load(std::sync::atomic::Ordering::Relaxed) {
+/// Turn the load notices on for the calling thread, and no other. Called once
+/// by the CLI dispatch, and only for the user-facing commands.
+pub(crate) fn enable_load_notices() {
+    *load_notices_thread() = Some(std::thread::current().id());
+}
+
+/// Whether this thread is the one [`enable_load_notices`] armed.
+fn load_notices_armed_here() -> bool {
+    *load_notices_thread() == Some(std::thread::current().id())
+}
+
+/// One load notice and the key it is deduplicated by.
+struct LoadNotice {
+    /// The identity the once-per-process set holds: a torn store keys by
+    /// ACCOUNT, so a reason whose text moved between two loads (a parse
+    /// failure, then an I/O failure) cannot print a second line; a name notice
+    /// keys by its account name too, so the two rosters — whose copy differs
+    /// by remedy — cannot print two lines for one name.
+    key: String,
+    line: String,
+}
+
+impl LoadNotice {
+    /// A name notice keyed by ACCOUNT, so the line of whichever roster loads
+    /// first is the only one printed.
+    fn for_name(notice: NameNotice) -> Self {
+        Self {
+            key: format!("name:{}", notice.name),
+            line: notice.cli_line(),
+        }
+    }
+}
+
+/// Print each notice once per process, skipping any key already told. No-op
+/// unless [`enable_load_notices`] ran on THIS thread.
+fn print_load_notices(notices: impl IntoIterator<Item = LoadNotice>) {
+    if !load_notices_armed_here() {
         return;
     }
-    let mut told = TORN_STORE_NOTICED
+    let mut told = LOAD_NOTICED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if told
-        .iter()
-        .any(|told_name| told_name == profile.name.as_str())
-    {
-        return;
+    for notice in notices {
+        if told.contains(&notice.key) {
+            continue;
+        }
+        crate::out::errln!("{}", notice.line);
+        told.push(notice.key);
     }
-    told.push(profile.name.as_str().to_string());
-    let Some(notice) = unreadable_store_notice(profile) else {
-        return;
-    };
-    crate::out::errln!("{notice}");
 }
 
-/// Test-only RAII: turn the torn-store notice on for the guard's lifetime,
-/// clearing it on drop so a test that loads a torn store cannot leak the
-/// enabled flag into a sibling test in the same process.
+/// The stderr lines a loaded account warrants: its unreadable store, then a
+/// name the printed commands cannot address.
+fn notice_profile_load(profile: &Profile) {
+    let store = unreadable_store_notice(profile).map(|line| LoadNotice {
+        // A key no name-notice can equal: those all start with `name:`.
+        key: format!("torn-store:{}", profile.name),
+        line,
+    });
+    let name = NameNotice::of(&profile.name, Harness::Claude).map(LoadNotice::for_name);
+    print_load_notices([store, name].into_iter().flatten());
+}
+
+/// The stderr lines a freshly loaded codex roster warrants: one per stored
+/// name the printed commands cannot address, through the same arming thread
+/// and once-per-process set as [`notice_profile_load`]. A name the claude
+/// roster also holds gets the CLAUDE copy even here: the codex roster may be
+/// the first one a command loads, and its account is the one a bare name
+/// resolves to.
+pub(crate) fn notice_codex_load(names: &[ProfileName]) {
+    // Checked here, not only in `print_load_notices`: an unarmed load must not
+    // read the claude roster for a line it will never print.
+    if !load_notices_armed_here() {
+        return;
+    }
+    let claude = load_app_state()
+        .map(|state| state.profiles)
+        .unwrap_or_default();
+    print_load_notices(names.iter().filter_map(|name| {
+        let harness = if claude.contains(name) {
+            Harness::Claude
+        } else {
+            Harness::Codex
+        };
+        NameNotice::of(name, harness).map(LoadNotice::for_name)
+    }));
+}
+
+/// Test-only RAII: arm the load notices for the guard's thread for its
+/// lifetime, clearing them on drop so a test that loads a torn store cannot
+/// leak the arming into a sibling test in the same process.
 #[cfg(test)]
-pub(crate) struct TornStoreNoticeArmed(());
+pub(crate) struct LoadNoticesArmed(());
 
 #[cfg(test)]
-impl TornStoreNoticeArmed {
+impl LoadNoticesArmed {
     pub(crate) fn new() -> Self {
-        TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+        enable_load_notices();
         Self(())
     }
 }
 
 #[cfg(test)]
-impl Drop for TornStoreNoticeArmed {
+impl Drop for LoadNoticesArmed {
     fn drop(&mut self) {
-        TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+        *load_notices_thread() = None;
     }
 }
 
-/// Test-only: put the torn-store notice back to its off default and clear the
-/// already-named set, so an in-process `dispatch()` test that armed the
-/// process-global flag cannot leak it into a sibling test. Called by the test
-/// home sandbox, which already resets the other process-global overrides.
+/// Test-only: put the load notices back to their off default and clear the
+/// already-printed set, so an in-process `dispatch()` test that armed cannot
+/// leak the arming into a sibling test. Called by the test home sandbox, which
+/// already resets the other process-global overrides.
 #[cfg(test)]
-pub(crate) fn reset_torn_store_notice_for_test() {
-    TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
-    TORN_STORE_NOTICED
+pub(crate) fn reset_load_notices_for_test() {
+    *load_notices_thread() = None;
+    LOAD_NOTICED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
+}
+
+/// What makes a stored account name unaddressable by the commands clauth
+/// prints for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameHazard {
+    /// A leading `-` longer than a lone `-`: clap reads `clauth login -x` as
+    /// a flag, while `clauth login -` parses as a value.
+    LeadingDash,
+    /// A clauth subcommand: a bare `clauth list` runs the command, never the
+    /// switch.
+    Subcommand,
+}
+
+/// A stored account whose name the printed commands cannot address, with the
+/// copy each surface shows for it. Its equality is the TUI's and the daemon's
+/// once-gate key: one account renamed, added or dropped changes the set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameNotice {
+    name: ProfileName,
+    hazard: NameHazard,
+    /// The roster that holds the name, which decides the remedy: a claude
+    /// account is renamed in place, a codex one has no rename at all.
+    harness: Harness,
+}
+
+impl NameNotice {
+    /// The notice `name` warrants on `harness`'s roster, `None` for an
+    /// ordinary name.
+    pub(crate) fn of(name: &ProfileName, harness: Harness) -> Option<Self> {
+        let hazard = if name.as_str() != "-" && name.starts_with('-') {
+            NameHazard::LeadingDash
+        } else if crate::cli::is_subcommand_name(name) {
+            NameHazard::Subcommand
+        } else {
+            return None;
+        };
+        Some(Self {
+            name: name.clone(),
+            hazard,
+            harness,
+        })
+    }
+
+    /// The remedy a CLI line ends with: a claude account is renamed on the
+    /// Setup tab; a codex account has no rename, so its only fix is deleting
+    /// it and logging in again under another name.
+    fn cli_remedy(&self) -> &'static str {
+        match self.harness {
+            Harness::Claude => "rename it on the TUI's Setup tab",
+            Harness::Codex => "delete it and log in again under another name",
+        }
+    }
+
+    /// [`Self::cli_remedy`] as the toast's detail line spells it: the toast
+    /// stands inside the TUI, so it names the tab alone.
+    fn toast_remedy(&self) -> &'static str {
+        match self.harness {
+            Harness::Claude => "rename it on the Setup tab",
+            Harness::Codex => "delete it and log in again under another name",
+        }
+    }
+
+    /// The one stderr line, also the line a TUI or daemon log records. The
+    /// name prints escaped where it holds a byte a name cannot
+    /// ([`crate::format::escape_unless`]), so a hand-edited roster cannot drive
+    /// the terminal or forge a line; a name of name chars is byte-identical.
+    pub(crate) fn cli_line(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.cli_remedy();
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "clauth: {name}: a name starting with '-' reads as a flag, so the commands \
+                 clauth prints for it fail; {remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "clauth: {name}: a bare `clauth {name}` runs clauth's own {name} command, never \
+                 a switch to this account; switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
+
+    /// The TUI toast body: the title line, then the detail line, the name
+    /// escaped as in [`Self::cli_line`].
+    pub(crate) fn toast_body(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.toast_remedy();
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "{name} starts with '-', so the commands clauth prints for it fail\n{remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "`clauth {name}` runs clauth's own command, not a switch to {name}\n\
+                 switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
 }
 
 /// Why a profile's committed `credentials.json` could not be read, recorded at
@@ -4421,7 +4619,7 @@ pub(crate) fn unreadable_store_notice(profile: &Profile) -> Option<String> {
         "clauth: {name}: {} ({}), so it shows as logged out until `clauth login {name}`",
         crate::format::STORED_LOGIN_UNREADABLE,
         unreadable_store_parenthetical(reason),
-        name = profile.name,
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
     ))
 }
 
@@ -4433,7 +4631,7 @@ pub(crate) fn unreadable_store_refusal(profile: &Profile) -> Option<String> {
         "{name}: {} ({}); log in again with `clauth login {name}` first, or the re-key would drop it",
         crate::format::STORED_LOGIN_UNREADABLE,
         unreadable_store_parenthetical(reason),
-        name = profile.name,
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
     ))
 }
 
