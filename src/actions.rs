@@ -2505,7 +2505,20 @@ pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppCon
 /// profile — the rename there replaces by remove-then-rename — and the next
 /// switch to either account re-links it.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathBuf>> {
+    switch_codex_profile_from(name, None)
+}
+
+/// [`switch_codex_profile`] that refuses — as
+/// [`crate::codex_profiles::CodexState::refuse_if_slot_moved`] — when the
+/// active slot no longer reads `expected` under the lock: the daemon decides
+/// on a state loaded before its polls, and a hand switch landing in between
+/// wins. The hand switch itself passes `None` and keeps no such check.
+pub(crate) fn switch_codex_profile_from(
+    name: &str,
+    expected: Option<Option<&str>>,
+) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {
+        state.refuse_if_slot_moved(expected)?;
         if !state.holds(name) {
             bail!("codex profile '{name}' not found");
         }
@@ -3001,6 +3014,11 @@ pub(crate) fn codex_login_capture_at(
         // atomically (symlink at a staging sibling, renamed over). Best-effort
         // — a host that cannot symlink keeps the copy and hears the cost.
         let adopted = adopt_operator_auth_slot(&auth_path, &store);
+        // The operator's codex now runs the login the user just captured —
+        // linked, or still the copy the capture read — so the capture ends
+        // the switch-off recovery record the way a switch does: the chain
+        // must not move the operator off the account just chosen.
+        state.clear_switched_off();
         Ok((canonical, reauth, adopted))
     })?;
 

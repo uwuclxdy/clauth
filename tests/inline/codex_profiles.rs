@@ -133,6 +133,35 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
     );
 }
 
+/// The switch-off marker's on-disk contract: a key a newer clauth wrote is
+/// read back, and the first switch drops the key from the file again — a
+/// save with the marker cleared never invents it, the same tolerance an
+/// older binary shows any unknown key.
+#[test]
+fn the_switch_off_marker_reads_back_and_a_switch_drops_the_key() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+
+    write_codex_state("profiles = [\"a\", \"b\"]\nswitched_off = true\n");
+    assert!(
+        CodexState::load().expect("load").switched_off(),
+        "the marker loads from disk"
+    );
+
+    CodexState::update(|state| {
+        state.set_active(Some("a"));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "active_profile = \"a\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\n",
+        "the switch clears the marker and the save drops the key"
+    );
+}
+
 /// An out-of-band hand-edit is normalized at load, the way `load_app_state`
 /// normalizes the claude line: the field itself reads as the default, so the
 /// next real save heals the file instead of carrying a line the walk never

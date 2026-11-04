@@ -22620,6 +22620,394 @@ fn apply_codex_switch_moves_the_on_disk_marker() {
     );
 }
 
+/// A codex chain the auto switch-off cleared re-arms on its own, the way the
+/// claude chain's switch-off recovery does: once a member's window recovers,
+/// the next poll's `apply_codex_switch` points the active slot at it, with no
+/// manual `clauth <name>`. The state the re-arm reads is the one the Off arm
+/// wrote — the recovery marker plus the empty slot, reloaded from disk.
+#[test]
+fn apply_codex_switch_rearms_a_switched_off_chain_when_a_member_recovers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None, "precondition: switched off");
+
+    // cx2's 5h window recovers; the next poll reloads the state the Off arm
+    // wrote and nothing else.
+    let idle = crate::usage::map_codex_usage(CODEX_IDLE, now_epoch_secs()).expect("maps");
+    state.store.lock().unwrap().insert("cx2".to_string(), idle);
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "the recovered member re-arms the cleared slot"
+    );
+}
+
+/// A slot a capture leaves empty arms nothing: the recovery reads the
+/// switch-off marker, which only the auto switch-off writes, so a recovered
+/// chain member changes nothing without a `clauth switch`.
+#[test]
+fn a_codex_slot_without_the_marker_stays_empty() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active(),
+        None,
+        "no marker, no re-arm: the captured-login shape stays empty"
+    );
+}
+
+/// A hand `clauth switch` ends the recovery record the switch-off wrote: the
+/// marker the recovery gate reads is cleared with the switch.
+#[test]
+fn a_hand_codex_switch_clears_the_switch_off_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None, "precondition: switched off");
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .switched_off(),
+        "precondition: the Off arm wrote the marker"
+    );
+
+    crate::actions::switch_codex_profile("cx2").expect("hand switch");
+    let reloaded = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(reloaded.active_profile().map(|n| n.as_str()), Some("cx2"));
+    assert!(
+        !reloaded.switched_off(),
+        "the hand switch cleared the marker"
+    );
+}
+
+/// A capture after the auto switch-off ends the recovery record the way a
+/// switch does: the operator's `auth.json` then links the account the user
+/// just chose, so a recovered chain member must not move the operator's codex
+/// off it. The cleared slot stays empty until `clauth switch <name>`.
+#[test]
+fn a_codex_capture_after_a_switch_off_ends_the_recovery() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None, "precondition: switched off");
+
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(&operator).expect("mkdir .codex");
+    std::fs::write(
+        operator.join("auth.json"),
+        crate::testutil::codex_auth_body("at.cx3", "rt.cx3"),
+    )
+    .expect("write operator auth");
+    // The re-arm moves the capture's link off cx3 only when cx2 has a store
+    // to point it at, so the fixture writes one.
+    crate::testutil::write_codex_store(
+        "cx2",
+        &crate::testutil::codex_auth_body("at.cx2", "rt.cx2"),
+    );
+    crate::actions::codex_login_capture_at(
+        "cx3",
+        "2026-11-04T12:00:00+00:00",
+        crate::actions::CodexLandMode::CreateOrReauth,
+    )
+    .expect("capture");
+
+    // cx2's window recovers; the next poll must not re-arm onto it.
+    let idle = crate::usage::map_codex_usage(CODEX_IDLE, now_epoch_secs()).expect("maps");
+    state.store.lock().unwrap().insert("cx2".to_string(), idle);
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active(),
+        None,
+        "the capture ended the recovery: a recovered member re-arms nothing"
+    );
+}
+
+/// The re-arm commits only when the on-disk slot still reads what the
+/// decision read (empty): a hand switch landing after the tick loaded the
+/// state wins, and the stale recovery writes nothing.
+#[test]
+fn a_codex_rearm_refuses_a_slot_moved_after_the_decision_read_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None, "precondition: switched off");
+    // The tick's decision snapshot, loaded before its polls.
+    let stale = crate::codex_profiles::CodexState::load().expect("load");
+
+    // cx2's window recovers, and a hand switch lands before the write.
+    let idle = crate::usage::map_codex_usage(CODEX_IDLE, now_epoch_secs()).expect("maps");
+    state.store.lock().unwrap().insert("cx2".to_string(), idle);
+    crate::actions::switch_codex_profile("cx1").expect("hand switch");
+    assert_eq!(codex_active().as_deref(), Some("cx1"));
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::apply_codex_switch(&state, &stale, REFRESH_INTERVAL_MS);
+    drop(capture);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "the hand pick wins: the re-arm refuses the moved slot"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        Vec::<String>::new(),
+        "a refused re-arm logs nothing"
+    );
+}
+
+/// The auto-switch commits only when the on-disk slot still reads what the
+/// decision read: a hand switch landing after the tick loaded the state wins
+/// over the chain's pick, the same guard as the re-arm's.
+#[test]
+fn a_codex_auto_switch_refuses_a_slot_moved_after_the_decision_read_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\", \"cx3\"]\nfallback_chain = [\"cx1\", \"cx2\", \"cx3\"]\n",
+        &[
+            ("cx1", CODEX_SPENT),
+            ("cx2", CODEX_IDLE),
+            ("cx3", CODEX_IDLE),
+        ],
+    );
+    // A hand switch lands after the decision read the slot naming cx1.
+    crate::actions::switch_codex_profile("cx3").expect("hand switch");
+    assert_eq!(codex_active().as_deref(), Some("cx3"));
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    drop(capture);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx3"),
+        "the hand pick wins: the auto-switch refuses the moved slot"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        Vec::<String>::new(),
+        "a refused auto-switch logs nothing"
+    );
+}
+
+/// The switch-off commits only when the on-disk slot still names the account
+/// the decision read: a hand switch landing in between keeps its account, and
+/// nothing arms the recovery for a slot it did not clear.
+#[test]
+fn a_codex_switch_off_refuses_a_slot_moved_after_the_decision_read_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    // A hand switch lands after the decision read the slot naming cx1.
+    crate::actions::switch_codex_profile("cx2").expect("hand switch");
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    drop(capture);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "the hand pick wins: the switch-off refuses the moved slot"
+    );
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .switched_off(),
+        "no marker either: the refused switch-off records nothing"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        Vec::<String>::new(),
+        "a refused switch-off logs nothing"
+    );
+}
+
+/// The first recovered member in chain order wins, as in the claude rule. The
+/// chain order differs from the roster's, and the spent head is skipped, so a
+/// roster-order or last-member pick names `cx1` where the chain names `cx2`.
+#[test]
+fn a_codex_rearm_takes_the_first_recovered_member_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"cx1\", \"cx2\", \"cx3\"]\nfallback_chain = [\"cx3\", \"cx2\", \"cx1\"]\nwrap_off = true\nswitched_off = true\n",
+        &[
+            ("cx1", CODEX_IDLE),
+            ("cx2", CODEX_IDLE),
+            ("cx3", CODEX_SPENT),
+        ],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+}
+
+/// A cleared slot over a chain with no recovered member stays clear.
+#[test]
+fn a_switched_off_codex_chain_with_no_recovered_member_stays_clear() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\nswitched_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None);
+}
+
+/// Recovery reads only a reading this process fetched fresh, as the claude
+/// rule does: a recovered window whose last fetch was not `Fresh` (a cached
+/// placeholder, a 429) arms nothing.
+#[test]
+fn a_codex_rearm_skips_a_recovered_member_whose_reading_is_not_fresh() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\nswitched_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("cx2".to_string(), crate::usage::FetchStatus::Cached);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active(), None, "a stale recovery arms nothing");
+}
+
+/// A quarantined member is never a re-arm target, however idle its last
+/// reading: the walk steps over it to the next recovered member.
+#[test]
+fn a_codex_rearm_skips_a_quarantined_recovered_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\nswitched_off = true\n",
+        &[("cx1", CODEX_IDLE), ("cx2", CODEX_IDLE)],
+    );
+    crate::testutil::write_codex_store(
+        "cx1",
+        &crate::testutil::codex_auth_body("acc.cx1", "refresh.cx1"),
+    );
+    crate::codex_auth::quarantine_for_test("cx1", "reused", "refresh.cx1");
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+}
+
+/// A member whose kick breaker tripped is never a re-arm target: its idle
+/// reading is what a chain that keeps 401ing freezes in.
+#[test]
+fn a_codex_rearm_skips_a_kick_rejected_recovered_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "profiles = [\"rearm-kick1\", \"rearm-kick2\"]\nfallback_chain = [\"rearm-kick1\", \"rearm-kick2\"]\nwrap_off = true\nswitched_off = true\n",
+        &[("rearm-kick1", CODEX_IDLE), ("rearm-kick2", CODEX_IDLE)],
+    );
+    // Three unhealed kicks: one past the breaker.
+    for _ in 0..3 {
+        crate::codex_auth::kick_codex("rearm-kick1");
+    }
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    crate::codex_auth::kick_reset("rearm-kick1");
+    assert_eq!(codex_active().as_deref(), Some("rearm-kick2"));
+}
+
+/// End to end through the real poll leg: its own 200 writes the `Fresh` status
+/// the recovery gates on, so the same tick re-arms the cleared slot with no
+/// test seeding `Fresh`. Each reply is chosen by the request's account id, not
+/// its arrival index: the poll order across members is not guaranteed. Names
+/// are unique so a process-global poll memo in another test cannot suppress
+/// the polls.
+#[test]
+fn a_codex_poll_rearms_a_switched_off_chain_end_to_end() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_state(
+        "profiles = [\"e2e-cx1\", \"e2e-cx2\"]\nfallback_chain = [\"e2e-cx1\", \"e2e-cx2\"]\nwrap_off = true\nswitched_off = true\n",
+    );
+    for name in ["e2e-cx1", "e2e-cx2"] {
+        crate::testutil::write_codex_store(
+            name,
+            &format!(
+                "{{\"tokens\":{{\"access_token\":\"at.{name}\",\"refresh_token\":\"rt.{name}\",\"account_id\":\"{name}\"}}}}"
+            ),
+        );
+    }
+    let (base, server) = crate::testutil::serve_endpoints_by_request(2, |raw, _i| {
+        match crate::testutil::request_header(raw, "chatgpt-account-id").as_deref() {
+            Some("e2e-cx1") => (200, Vec::new(), CODEX_SPENT.to_string()),
+            Some("e2e-cx2") => (200, Vec::new(), CODEX_IDLE.to_string()),
+            _ => (400, Vec::new(), String::new()),
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    let state = completion_order_state();
+    super::codex_usage_tick(&state);
+
+    crate::usage::clear_codex_usage_url_override();
+    let seen = server.join().expect("listener");
+    assert_eq!(seen.len(), 2, "both codex members polled");
+    for raw in &seen {
+        assert!(
+            matches!(
+                crate::testutil::request_header(raw, "chatgpt-account-id").as_deref(),
+                Some("e2e-cx1" | "e2e-cx2")
+            ),
+            "each poll carries its member's account id"
+        );
+    }
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("e2e-cx2"),
+        "the poll leg itself re-arms the cleared slot"
+    );
+}
+
 /// The daemon's auto-switch moves the operator's linked codex login with the
 /// marker, the same way a hand switch does: `apply_codex_switch` goes through
 /// `switch_codex_profile`, so bare `codex` follows the chain off a spent

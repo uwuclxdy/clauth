@@ -7645,51 +7645,88 @@ fn strand_codex(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64)
 }
 
 /// Walk the codex chain over the readings just taken and move the codex active
-/// slot when it says to. No executor and no pending-switch handshake: codex
-/// binds `auth.json` at start, so a switch lands at the NEXT codex session
-/// (settled question 1) rather than mid-flight — which is also why this cannot
-/// reuse the claude `SessionSwap` path.
+/// slot when it says to; with the slot clear AND the auto switch-off's marker
+/// set, re-arm it onto the first member whose window recovered, like the
+/// claude chain's switch-off recovery (a slot clauth leaves empty without a
+/// switch-off stays empty until a `clauth switch`). No executor and no
+/// pending-switch handshake: codex binds `auth.json` at start, so a switch
+/// lands at the NEXT codex session rather than mid-flight — which is also why
+/// this cannot reuse the claude `SessionSwap` path.
 fn apply_codex_switch(
     state: &SchedulerState,
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
 ) {
-    // Nothing off the claude config reaches this walk: the weekly line, like
-    // every other slot, is the codex file's own (decision 4).
-    let Some(mut snapshot) = crate::fallback::snapshot_codex_chain(codex, interval_ms) else {
-        return;
-    };
-    // Folded fix 1, answered where it actually bites rather than by changing a
-    // shared predicate: `is_exhausted_from_usage` reads a member with NO entry
-    // as un-exhausted, which is the only safe reading (a never-polled account
-    // may well have headroom) but is not PROOF of headroom — and a codex
-    // account starts in exactly that state. The freshness pass is what keeps an
-    // unknown member from outranking a known-good one, so it is filled here the
-    // same way the claude scan fills it, instead of leaving every codex member
-    // equally preferred forever.
-    if let Ok(st) = state.status.lock() {
-        snapshot.fresh = snapshot
-            .chain
-            .iter()
-            .filter(|m| matches!(st.get(m.name.as_str()), Some(FetchStatus::Fresh)))
-            .map(|m| m.name.clone())
-            .collect();
-    }
-    let Some(action) = crate::fallback::next_auto_switch_target(&snapshot, &state.store) else {
-        return;
+    // `is_exhausted_from_usage` reads a member with NO entry as un-exhausted,
+    // which is the only safe reading (a never-polled account may well have
+    // headroom) but is not PROOF of headroom — and a codex account starts in
+    // exactly that state. The freshness pass is what keeps an unknown member
+    // from outranking a known-good one, so it is filled here the same way the
+    // claude scan fills it, instead of leaving every codex member equally
+    // preferred forever. Recovery reads it as a hard gate.
+    let fresh: Vec<ProfileName> = state
+        .status
+        .lock()
+        .map(|st| {
+            codex
+                .fallback_chain()
+                .iter()
+                .filter(|name| matches!(st.get(name.as_str()), Some(FetchStatus::Fresh)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    // The slot the decision read: every auto-write below commits only while
+    // the disk still holds it, because the daemon decides on the state its
+    // tick loaded before the polls, and a hand switch landing in between
+    // wins.
+    let decision_slot = codex.active_profile().map(ProfileName::as_str);
+    let action = if codex.active_profile().is_none() {
+        // The recovery runs only for a slot the auto switch-off cleared (its
+        // marker): a capture or a delete that leaves the slot empty clears
+        // the marker and arms nothing, while a hand edit of `active_profile`
+        // leaves it in the file.
+        if !codex.switched_off() {
+            return;
+        }
+        let usage = crate::fallback::usage_snapshot(&state.store);
+        let Some(target) = crate::fallback::find_recovered_codex_member(codex, &usage, &fresh)
+        else {
+            return;
+        };
+        crate::fallback::SwitchAction::To(target)
+    } else {
+        // Nothing off the claude config reaches this walk: the weekly line,
+        // like every other slot, is the codex file's own.
+        let Some(mut snapshot) = crate::fallback::snapshot_codex_chain(codex, interval_ms) else {
+            return;
+        };
+        snapshot.fresh = fresh;
+        let Some(action) = crate::fallback::next_auto_switch_target(&snapshot, &state.store) else {
+            return;
+        };
+        action
     };
     match action {
         crate::fallback::SwitchAction::To(target) => {
-            match crate::actions::switch_codex_profile(target.as_str()) {
+            match crate::actions::switch_codex_profile_from(target.as_str(), Some(decision_slot)) {
+                // A hand switch landing after the decision read the slot wins
+                // silently: nothing was written, and there is nothing to tell.
+                Err(e)
+                    if e.downcast_ref::<crate::codex_profiles::CodexSlotMoved>()
+                        .is_some() => {}
                 Err(e) => logline!("clauth: codex auto-switch to '{target}' failed: {e:#}"),
                 Ok(repointed) => {
-                    // The chain moves off a spent account, so every task in
-                    // codex's shared app-server daemon is stalled on it anyway:
-                    // restarting it costs their stalled turn and lets them resume
-                    // on `target`. Only when this switch moved clauth's link, and
-                    // in the codex home whose link it moved: a daemon that merely
-                    // predates the operator's own login file runs an account
-                    // clauth does not manage, and its turns are healthy.
+                    // The switch moves off an account that was spent when
+                    // clauth decided it — the walk's active now, or the
+                    // account the switch-off left the link on, which may have
+                    // recovered on this same poll. Restarting the daemon costs
+                    // a stalled turn nothing, and a turn it cuts resumes on
+                    // `target`. Only when this switch moved clauth's link, and
+                    // in the codex home whose link it moved: a daemon that
+                    // merely predates the operator's own login file runs an
+                    // account clauth does not manage, and its turns are
+                    // healthy.
                     let stale_home = repointed
                         .as_deref()
                         .and_then(std::path::Path::parent)
@@ -7712,13 +7749,21 @@ fn apply_codex_switch(
             }
         }
         crate::fallback::SwitchAction::Off => {
-            if let Err(e) = crate::codex_profiles::CodexState::update(|st| {
+            match crate::codex_profiles::CodexState::update(|st| {
+                st.refuse_if_slot_moved(Some(decision_slot))?;
                 st.set_active(None);
+                st.mark_switched_off();
                 Ok(())
             }) {
-                logline!("clauth: codex switch-off failed: {e:#}");
-            } else {
-                logline!("clauth: every codex account is spent. Codex active slot cleared");
+                // A hand switch landing after the decision read the slot wins
+                // silently: the switch-off writes nothing and records no marker.
+                Err(e)
+                    if e.downcast_ref::<crate::codex_profiles::CodexSlotMoved>()
+                        .is_some() => {}
+                Err(e) => logline!("clauth: codex switch-off failed: {e:#}"),
+                Ok(()) => {
+                    logline!("clauth: every codex account is spent. Codex active slot cleared")
+                }
             }
         }
     }

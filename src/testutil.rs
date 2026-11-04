@@ -894,6 +894,16 @@ pub(crate) fn serve_endpoints_raw_with_headers(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, Vec<(String, String)>, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    serve_endpoints_by_request(max, move |raw, i| reply(&request_path(raw), i))
+}
+
+/// [`serve_endpoints_raw_with_headers`] whose reply reads the whole raw
+/// request, for a stub that answers by a request header (an account id) rather
+/// than by path or arrival index. Same listener, same deadlines.
+pub(crate) fn serve_endpoints_by_request(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, Vec<(String, String)>, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -959,7 +969,7 @@ pub(crate) fn serve_endpoints_raw_with_headers(
                 }
             }
             let text = String::from_utf8_lossy(&req).into_owned();
-            let (status, headers, body) = reply(&request_path(&text), i);
+            let (status, headers, body) = reply(&text, i);
             let extra: String = headers
                 .iter()
                 .map(|(k, v)| format!("{k}: {v}\r\n"))

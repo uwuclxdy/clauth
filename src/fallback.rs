@@ -1353,64 +1353,25 @@ pub(crate) fn snapshot_chain(
 }
 
 /// [`snapshot_chain`]'s codex twin, built from `codex-profiles.toml` instead of
-/// `AppConfig`. Chains are strictly per-harness (decision 4), so this reads the
-/// codex active slot, the codex chain, and the codex wrap-off — and nothing
-/// from the claude state.
-///
-/// Every member takes the DEFAULTS a claude member would inherit from a missing
-/// `Profile` record, because a codex profile has none: `profiles.toml` is
-/// untouched by the file split, so `config.find` cannot answer for these names
-/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
-/// thresholds) simply do not exist on this harness yet.
-///
-/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
-/// per the delivery spec: per-model weekly windows and the usage-credit cap
-/// verdict are claude concepts (`"7d fable"` and friends come from the
-/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
-/// and `wham/usage` has no equivalent. An armed gate would judge codex members
-/// against windows or a cap that can never appear.
-///
-/// `broken` and `kick_rejected` are filled HERE, where the claude builder
-/// leaves the second to the scheduler's scan: the codex verdicts live beside
-/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
-/// scheduler store, so this is the one place that can read them.
+/// `AppConfig`. Chains are strictly per-harness: this reads the codex active
+/// slot, the codex chain, and the codex wrap-off — and nothing from the claude
+/// state. Members and dead verdicts come from [`codex_chain_members`].
 pub(crate) fn snapshot_codex_chain(
     state: &crate::codex_profiles::CodexState,
     interval_ms: u64,
 ) -> Option<ChainSnapshot> {
     let active = state.active_profile()?.clone();
-    let chain: Vec<ProfileName> = state.fallback_chain().to_vec();
-    if !chain.iter().any(|n| n == &active) {
+    if !state.fallback_chain().iter().any(|n| n == &active) {
         return None;
     }
-    let weekly_pct = state.weekly_switch_threshold_pct();
-    let broken = chain
-        .iter()
-        .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
-        .cloned()
-        .collect();
-    let kick_rejected = chain
-        .iter()
-        .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
-        .cloned()
-        .collect();
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
     Some(ChainSnapshot {
         active,
-        chain: chain
-            .into_iter()
-            .map(|name| ChainMember {
-                name,
-                threshold: DEFAULT_THRESHOLD,
-                last_resort: false,
-                preferred: false,
-                max_spend: 0.0,
-                weekly_line: weekly_pct,
-                scoped_line: weekly_pct,
-                check_scoped: false,
-                check_credit_cap: false,
-                own_inference: false,
-            })
-            .collect(),
+        chain: members,
         switch_off_when_spent: state.switch_off_when_spent(),
         broken,
         burn_aware: false,
@@ -1431,6 +1392,88 @@ pub(crate) fn snapshot_codex_chain(
         credit_refused: Vec::new(),
         credit_skip: Vec::new(),
     })
+}
+
+/// The codex chain's switch-off recovery: with the codex active slot clear,
+/// the member [`find_recovered_member`] re-arms, walked in chain order like
+/// [`snapshot_codex_chain`]. A member is a candidate only while its status
+/// entry is `Fresh`: a codex poll in this process fetched it, or a re-seed
+/// restored a usage-cache reading younger than one refresh interval
+/// ([`crate::usage::scheduler::seed_codex_name`]), and a later failed poll
+/// does not clear it, so the gate vouches for a past success, not the latest
+/// poll. A quarantined member is dropped here because
+/// [`find_recovered_member`] reads no dead verdict of its own.
+pub(crate) fn find_recovered_codex_member(
+    state: &crate::codex_profiles::CodexState,
+    usage: &HashMap<String, UsageInfo>,
+    fresh: &[ProfileName],
+) -> Option<String> {
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
+    let candidates: Vec<ChainMember> = members
+        .into_iter()
+        .filter(|m| fresh.contains(&m.name) && !broken.contains(&m.name))
+        .collect();
+    find_recovered_member(&candidates, usage, &kick_rejected, WalkOrder::Chain)
+}
+
+/// The codex chain's members plus the two dead verdicts the walks read.
+struct CodexChain {
+    members: Vec<ChainMember>,
+    broken: Vec<ProfileName>,
+    kick_rejected: Vec<ProfileName>,
+}
+
+/// Every member takes the DEFAULTS a claude member would inherit from a missing
+/// `Profile` record, because a codex profile has none: `profiles.toml` is
+/// untouched by the file split, so `config.find` cannot answer for these names
+/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
+/// thresholds) simply do not exist on this harness yet.
+///
+/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
+/// per the delivery spec: per-model weekly windows and the usage-credit cap
+/// verdict are claude concepts (`"7d fable"` and friends come from the
+/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
+/// and `wham/usage` has no equivalent. An armed gate would judge codex members
+/// against windows or a cap that can never appear.
+///
+/// `broken` and `kick_rejected` are filled HERE, where the claude builder
+/// leaves the second to the scheduler's scan: the codex verdicts live beside
+/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
+/// scheduler store, so this is the one place that can read them.
+fn codex_chain_members(state: &crate::codex_profiles::CodexState) -> CodexChain {
+    let chain = state.fallback_chain();
+    let weekly_pct = state.weekly_switch_threshold_pct();
+    CodexChain {
+        broken: chain
+            .iter()
+            .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
+            .cloned()
+            .collect(),
+        kick_rejected: chain
+            .iter()
+            .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
+            .cloned()
+            .collect(),
+        members: chain
+            .iter()
+            .map(|name| ChainMember {
+                name: name.clone(),
+                threshold: DEFAULT_THRESHOLD,
+                last_resort: false,
+                preferred: false,
+                max_spend: 0.0,
+                weekly_line: weekly_pct,
+                scoped_line: weekly_pct,
+                check_scoped: false,
+                check_credit_cap: false,
+                own_inference: false,
+            })
+            .collect(),
+    }
 }
 
 /// [`snapshot_chain`] anchored on an explicit member instead of the global
