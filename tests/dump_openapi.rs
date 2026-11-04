@@ -22,6 +22,7 @@ fn dump(home: &Path) -> Command {
     cmd.args(["daemon", "--dump-openapi"])
         .env("HOME", home)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null());
     cmd
 }

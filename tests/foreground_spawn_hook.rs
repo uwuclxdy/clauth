@@ -22,6 +22,8 @@ fn run_hook(stdin: &str) -> (Option<i32>, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_clauth"))
         .arg("hook-foreground-spawn")
         .env("HOME", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .env("CLAUTH_NO_UPDATE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

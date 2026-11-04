@@ -644,7 +644,11 @@ fn fish_offers_resume_words_by_position() {
     for t in RESUME_TABS.iter().filter(|t| t.after.is_empty()) {
         let line = format!("{} {}", t.before, t.typed);
         let out = std::process::Command::new("fish")
-            .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+            .args([
+                "--no-config",
+                "-c",
+                &format!("{script}\ncomplete -C {line:?}"),
+            ])
             .output()
             .expect("run fish");
         let offered = String::from_utf8_lossy(&out.stdout).to_string();
@@ -947,7 +951,11 @@ _describe() { print -r -- "describe $1: ${(P)2}" }
         for (before, owed) in CASES {
             let line = format!("{before} ");
             let out = std::process::Command::new("fish")
-                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
                 .output()
                 .expect("run fish");
             let offered = String::from_utf8_lossy(&out.stdout).to_string();
@@ -1058,7 +1066,11 @@ fn fish_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
         .map(|before| {
             let line = format!("{before} ");
             let out = std::process::Command::new("fish")
-                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
                 .output()
                 .expect("run fish");
             let offered = String::from_utf8_lossy(&out.stdout).to_string();
@@ -2248,7 +2260,11 @@ fn fish_runs_the_proxy_guard() {
     let complete = |line: &str| {
         String::from_utf8_lossy(
             &std::process::Command::new("fish")
-                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
                 .output()
                 .expect("run fish")
                 .stdout,

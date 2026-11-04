@@ -52,6 +52,7 @@ fn server_command(home: &Path) -> Command {
         .env("HOME", home)
         .env("CLAUTH_MCP_PROBE", "1")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .env("HERDR_BIN_PATH", NO_HERDR_BIN);
     for var in HERDR_VARS {
         command.env_remove(var);

@@ -61,6 +61,8 @@ fn the_hook_delivers_the_folded_envelopes_prose_with_its_account() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_clauth"))
         .args(["mcp-await-job"])
         .env("HOME", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
