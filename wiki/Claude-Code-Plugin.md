@@ -33,7 +33,7 @@ The TUI's Services tab writes exactly that entry for you, into `~/.claude.json` 
 
 Every reply reads as prose; there is no format parameter.
 
-The four tools are Claude Code only: they see the Claude Code roster, and a codex profile ([Codex](Codex)) never appears in `profiles`. A codex profile named to `profiles`, `switch_profile` or `delegate` (one name or a fan-out list) is refused as a codex account the plugin does not manage, never as an unknown name; the match is case-insensitive and the refusal names the roster's spelling: ``profile not found: cx; cx names a CODEX account, which these tools do not manage — they are Claude Code only. Switch it with `clauth <name>` ``. A list mixing unknown and codex names keeps the tool's own fix for the unknown ones and adds the codex clause for the rest.
+The four tools are Claude Code only: they see the Claude Code roster, and a codex profile ([Codex](Codex)) never appears in `profiles`. A codex profile named to `profiles`, `switch_profile` or `delegate` (one name or a fan-out list) is refused as a codex account the plugin does not manage, never as an unknown name; the match is case-insensitive and the refusal names the roster's spelling: ``profile not found: cx; cx names a CODEX account, which these tools do not manage — they are Claude Code only. Switch it with `clauth switch <name>` ``. A list mixing unknown and codex names keeps the tool's own fix for the unknown ones and adds the codex clause for the rest.
 
 ## Hearing about changes: `since_your_last_call` and `monitor`
 
