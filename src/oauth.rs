@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::codex_auth::token_fingerprint;
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
@@ -2858,7 +2859,12 @@ fn adopt_refusal_should_announce(name: &ProfileName, key: &str) -> bool {
     {
         return false;
     }
-    crate::profile_cache::write_profile_cache(name, crate::profile_cache::ADOPT_REFUSAL_FILE, &key);
+    crate::profile_cache::write_profile_cache_for(
+        Harness::Claude,
+        name,
+        crate::profile_cache::ADOPT_REFUSAL_FILE,
+        &key,
+    );
     true
 }
 
@@ -2897,7 +2903,7 @@ pub(crate) fn try_adopt_live_rotation(
 ) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{
         ACCOUNT_ID_CACHE_FILE, ADOPT_REFUSAL_FILE, load_profile_cache, remove_profile_cache,
-        write_profile_cache,
+        write_profile_cache_for,
     };
 
     // CLA-SPLIT: this profile's live slot holds its STATIC session token, so
@@ -3078,7 +3084,7 @@ pub(crate) fn try_adopt_live_rotation(
         // above compared the mirror probe against it), so the anchor rides the
         // SAME hold that committed the store: a cross-process install's removal
         // landing in between cannot be overwritten by a stale uuid.
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
+        write_profile_cache_for(Harness::Claude, name, ACCOUNT_ID_CACHE_FILE, &live_id);
         Ok::<bool, anyhow::Error>(true)
     })
     .unwrap_or(false);

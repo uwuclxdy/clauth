@@ -14,11 +14,12 @@ use super::fetch::{
     epoch_secs_to_iso, fetch_raw, five_hour_live, humanize_duration, iso_to_epoch_secs,
     now_epoch_secs, now_ms, windows_maxed,
 };
+use crate::harness::Harness;
 use crate::oauth::KickRateLimit;
 use crate::profile::ProfileName;
 use crate::profile_cache::{
     KICK_BLOCK_CACHE_FILE, THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
-    profile_cache_mtime_ms, remove_profile_cache, write_profile_cache,
+    profile_cache_mtime_ms, remove_profile_cache, write_profile_cache_for,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2371,7 +2372,7 @@ fn note_kick_block_disk(name: &ProfileName, opened: bool, next: Option<KickBlock
     if opened {
         remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
     } else if let Some(next) = next {
-        write_profile_cache(name, KICK_BLOCK_CACHE_FILE, &next);
+        write_profile_cache_for(Harness::Claude, name, KICK_BLOCK_CACHE_FILE, &next);
     }
 }
 
@@ -3233,7 +3234,7 @@ fn apply_outcome_flagged(
                 if (is_fresh || plan_refresh.is_some())
                     && let Some(info) = merged.as_ref().or(cold_fill.as_ref())
                 {
-                    write_profile_cache(&outcome.name, USAGE_CACHE_FILE, info);
+                    write_profile_cache_for(Harness::Claude, &outcome.name, USAGE_CACHE_FILE, info);
                 }
                 if is_fresh && let Some(info) = merged.as_ref() {
                     crate::profile::append_usage_sample(&outcome.name, prev.as_ref(), info);
@@ -4076,7 +4077,17 @@ pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
 /// holding a login and a long-lived token unmeasurable there, and ask it for the
 /// login it already holds.
 pub(crate) fn any_fetch_leg_admits(p: &crate::profile::Profile) -> bool {
-    usage_poll_pair(p).is_some() || third_party_pollable(p) || usage_probe_admits(p)
+    oauth_cache_leg_admits(p) || third_party_pollable(p)
+}
+
+/// Whether a leg writing `usage_cache.json` admits this profile's shape: the
+/// OAuth `/usage` leg ([`usage_poll_pair`]) or the usage probe
+/// ([`usage_probe_admits`]), disabled-ness left out as in both. The startup
+/// seed's membership ([`collect_oauth_seed_names`]), and what keeps a hybrid's
+/// cached plan live while a retyped account's goes fossil
+/// ([`crate::profile_json::is_canceled_cached`]).
+pub(crate) fn oauth_cache_leg_admits(p: &crate::profile::Profile) -> bool {
+    usage_poll_pair(p).is_some() || usage_probe_admits(p)
 }
 
 /// Whether any fetch leg's work list holds this profile — the question the
@@ -4269,7 +4280,7 @@ pub(crate) fn collect_oauth_seed_names(
     config
         .profiles
         .iter()
-        .filter(|p| usage_poll_pair(p).is_some() || usage_probe_admits(p))
+        .filter(|p| oauth_cache_leg_admits(p))
         .map(|p| (p.name.to_string(), usage_interval_ms(p, poll_interval_ms)))
         .collect()
 }
@@ -4667,7 +4678,7 @@ fn fetch_third_party_due_flagged(
                     } else {
                         crate::profile_cache::clear_usage_verdict(&name);
                     }
-                    write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+                    write_profile_cache_for(Harness::Claude, &name, THIRD_PARTY_CACHE_FILE, &stats);
                     // The balance series rides the same write point as the stats
                     // cache — one landing fetch, one set of readings — and the
                     // fallback legs write none (a cached copy is not a reading).
@@ -6899,7 +6910,7 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
                     let (disk, unreadable) = crate::usage::read_codex_for_compare(name);
                     let ok = !unreadable && disk == identity;
                     if ok {
-                        write_profile_cache(name, USAGE_CACHE_FILE, &info);
+                        write_profile_cache_for(Harness::Codex, name, USAGE_CACHE_FILE, &info);
                     }
                     Ok::<bool, anyhow::Error>(ok)
                 })

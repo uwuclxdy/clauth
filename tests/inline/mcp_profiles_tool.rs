@@ -825,6 +825,49 @@ fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
     );
 }
 
+/// An OAuth account retyped to an api key of its own keeps the
+/// `usage_cache.json` its OAuth life wrote, and no leg rewrites it: a canceled
+/// plan left there is a fossil, so its roster row reads as it did before the
+/// file existed.
+#[test]
+fn the_roster_drops_a_retyped_accounts_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "moved".to_string(),
+        Some("https://llm.example.test".to_string()),
+        Some("sk-moved".to_string()),
+    ))
+    .expect("save moved");
+    save_app_state(&AppState {
+        active_profile: Some("moved".into()),
+        profiles: vec!["moved".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let before = lines(&call_profiles(None, None));
+
+    write_profile_cache(
+        &crate::profile::ProfileName::from("moved"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                plan_display_name: None,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped row"
+    );
+}
+
 /// The marker group is contiguous: a profile in all four states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.

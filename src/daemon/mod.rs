@@ -648,10 +648,10 @@ fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
                 // third-party-classified sink's picked reading is its provider
                 // stats, which carry no plan, so its OAuth plan never cancels it.
                 |n| {
-                    config
-                        .find(n)
-                        .is_some_and(|p| !p.usage_cache_is_third_party())
-                        && crate::profile_json::refuses_service_cached(n)
+                    config.find(n).is_some_and(|p| {
+                        !p.usage_cache_is_third_party()
+                            && crate::profile_json::refuses_service_cached(p)
+                    })
                 },
             )
         })

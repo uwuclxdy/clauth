@@ -2651,7 +2651,7 @@ fn disabling_persists_and_leaves_credentials_byte_unchanged() {
     assert_eq!(reloaded.refresh_token(), profile.refresh_token());
 }
 
-/// The real usage-cache writer (`profile_cache::write_profile_cache`) must
+/// The per-profile cache file write every cache writer ends in must
 /// create usage_cache.json at 0o600 and, when it has to create the per-profile
 /// dir, that dir at 0o700. Driven on a FRESH profile name so the dir does not
 /// pre-exist.
@@ -2673,7 +2673,7 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         "precondition: profile dir must not pre-exist for a fresh profile"
     );
 
-    // Drive the actual production writer.
+    // Drive the cache file write every production writer ends in.
     let info = crate::usage::UsageInfo::default();
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),

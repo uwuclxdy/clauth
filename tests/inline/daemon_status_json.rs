@@ -2373,7 +2373,11 @@ fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
     let members = crate::usage::auto_start_queue_members(
         &config,
         &[],
-        crate::profile_json::is_canceled_cached,
+        |n| {
+            config
+                .find(n)
+                .is_some_and(crate::profile_json::is_canceled_cached)
+        },
         crate::usage::no_five_hour_limit_cached,
     );
     let anchor = crate::usage::history_anchor(

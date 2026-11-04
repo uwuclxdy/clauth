@@ -5,12 +5,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::Harness;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
-    remove_profile_cache, write_profile_cache,
+    remove_profile_cache, write_profile_cache_for,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
@@ -1554,7 +1555,12 @@ pub(crate) fn decide_profile_fetch(name: &ProfileName, force: bool, now: u64) ->
 /// still stamps — the rate cap), and inside the re-anchor's hold after the
 /// anchor write (whose `forget_disk` removed the stamp).
 pub(crate) fn stamp_profile_fetch(name: &ProfileName, now: u64) -> bool {
-    crate::profile_cache::write_profile_cache_reported(name, PROFILE_FETCHED_CACHE_FILE, &now)
+    crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
+        name,
+        PROFILE_FETCHED_CACHE_FILE,
+        &now,
+    )
 }
 
 /// Write the in-memory `/profile` memo. Called by section 2 on a match, and on a
@@ -1739,7 +1745,8 @@ pub(crate) fn fetch_profile_plan(
                     crate::usage::forget_disk(name, crate::usage::Half::Throughput);
                 }
                 let plan = plan_from_profile(&p);
-                write_profile_cache(
+                write_profile_cache_for(
+                    Harness::Claude,
                     name,
                     USAGE_CACHE_FILE,
                     &UsageInfo {
@@ -1913,8 +1920,12 @@ pub(crate) fn reconcile_identity_anchor_to_held(
     // Write the new anchor first (an atomic replace), so a reader never sees
     // the anchor absent over a still-present login; only a failed write removes
     // it, leaving the profile unanchored, never on the displaced account.
-    let landed =
-        crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
+    let landed = crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
+        name,
+        ACCOUNT_ID_CACHE_FILE,
+        &new_uuid,
+    );
     if !landed {
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("clauth: {name}: could not write the identity anchor");
@@ -2090,7 +2101,8 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
     // write was meant to replace.
     #[cfg(test)]
     run_compare_hook(name.as_str());
-    if !crate::profile_cache::write_profile_cache_reported(
+    if !crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
         name,
         ACCOUNT_ID_CACHE_FILE,
         &AccountId::from(uuid.to_string()),
@@ -2107,7 +2119,7 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
 /// writes (credentials, `config.toml`, the anchor), so a reloading process that
 /// re-seeds from disk after the writes finds the seed already there, and this
 /// process's `forget_memory` re-seed picks it up once the hold drops. Writes the
-/// profile path DIRECTLY (never `write_profile_cache`): the new-account seed runs
+/// profile path DIRECTLY (never `write_profile_cache_for`): the new-account seed runs
 /// before the roster carries the name, so the off-roster gate would drop it. No
 /// `/profile` stamp and no TTL memo — the plan's next `/profile` stays due right
 /// after the login, and a failed one still keeps the seed.

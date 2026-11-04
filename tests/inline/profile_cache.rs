@@ -1,7 +1,71 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::harness::Harness;
 use crate::testutil::HomeSandbox;
+
+/// A claude leg's cache write admits only a claude profile: a name only the
+/// codex roster holds is refused, so no claude-shaped body reaches the cache
+/// the codex surfaces publish by name. Both harnesses resolve `<name>`'s
+/// profile dir, so the roster is what tells the two apart.
+#[test]
+fn a_claude_leg_refuses_a_codex_only_name() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let name = ProfileName::from("cx");
+    write_profile_cache_for(
+        Harness::Claude,
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    assert!(
+        profile_cache_path(&name, USAGE_CACHE_FILE).is_some_and(|p| !p.exists()),
+        "the claude leg must not write a codex profile's cache"
+    );
+}
+
+/// The reverse: a codex leg's cache write admits only a codex profile, so a
+/// claude-only name gets no codex-shaped body in its cache either.
+#[test]
+fn a_codex_leg_refuses_a_claude_only_name() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["claude-only"]);
+    let name = ProfileName::from("claude-only");
+    write_profile_cache_for(
+        Harness::Codex,
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    assert!(
+        profile_cache_path(&name, USAGE_CACHE_FILE).is_some_and(|p| !p.exists()),
+        "the codex leg must not write a claude profile's cache"
+    );
+}
+
+/// The gate's positive controls: each leg still writes its OWN roster's name.
+#[test]
+fn each_leg_still_writes_its_own_rosters_name() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["claude-native"]);
+    crate::testutil::write_codex_roster(&["cx"]);
+    for (harness, name) in [
+        (Harness::Claude, ProfileName::from("claude-native")),
+        (Harness::Codex, ProfileName::from("cx")),
+    ] {
+        write_profile_cache_for(
+            harness,
+            &name,
+            USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo::default(),
+        );
+        assert!(
+            load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
+            "the {harness} leg's own profile still lands"
+        );
+    }
+}
 
 /// The defect the guard closes: `UsageInfo` is all-`serde(default)`, so a read
 /// of the WRONG cache file — the third-party leg's bytes — deserialized into an

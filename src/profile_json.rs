@@ -22,22 +22,36 @@ fn cached_plan(name: &ProfileName) -> Option<PlanInfo> {
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
 }
 
+/// The on-disk plan a leg still maintains for `p`, or `None` when no leg does.
+/// A profile with an endpoint of its own that no `usage_cache.json` leg admits
+/// (an OAuth account retyped to an api key or to an `[env]` inference token of
+/// its own) reads `None`: a retype clears no caches, so the plan its OAuth life
+/// last wrote is still on disk, and nothing rewrites it. A hybrid, whose pair
+/// the OAuth leg still polls, and a logged-out OAuth account, whose figures live
+/// in that file, read their cached plan.
+fn maintained_plan(p: &Profile) -> Option<PlanInfo> {
+    if !p.is_oauth() && !crate::usage::oauth_cache_leg_admits(p) {
+        return None;
+    }
+    cached_plan(&p.name)
+}
+
 /// Cancellation for a surface holding a `load_config` profile but no store or
 /// snapshot: reads the on-disk plan, the one the OAuth store is seeded from.
-pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
-    cached_plan(name).is_some_and(|p| p.is_canceled())
+pub(crate) fn is_canceled_cached(p: &Profile) -> bool {
+    maintained_plan(p).is_some_and(|plan| plan.is_canceled())
 }
 
 /// An organization's refusal, read off the same on-disk plan as
 /// [`is_canceled_cached`], so a surface names which of the two it is.
-pub(crate) fn is_org_refused_cached(name: &ProfileName) -> bool {
-    cached_plan(name).is_some_and(|p| p.is_org_refused())
+pub(crate) fn is_org_refused_cached(p: &Profile) -> bool {
+    maintained_plan(p).is_some_and(|plan| plan.is_org_refused())
 }
 
 /// [`crate::fallback::refuses_service_from_info`] off the on-disk plan: the
 /// account cannot serve, canceled or refused by its organization.
-pub(crate) fn refuses_service_cached(name: &ProfileName) -> bool {
-    is_canceled_cached(name) || is_org_refused_cached(name)
+pub(crate) fn refuses_service_cached(p: &Profile) -> bool {
+    maintained_plan(p).is_some_and(|plan| plan.is_canceled() || plan.is_org_refused())
 }
 
 /// Display provider for a profile, one of three cases: a recognised
@@ -59,9 +73,10 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// Human account-tier label for an OAuth profile, preferring the fetched plan
 /// (the server's own plan name when it sends one, else the local tier map) over
 /// the bare OAuth `subscription_type` token (`max`). Read straight off the
-/// on-disk `/profile` cache, so it holds even before this session's first live
-/// fetch. `None` for third-party/api-key profiles and when neither a fetched
-/// plan nor a token hint is on disk.
+/// on-disk `/profile` cache through [`maintained_plan`], so it holds even before
+/// this session's first live fetch and a plan no leg feeds any more publishes
+/// nothing. `None` for third-party/api-key profiles and when neither a
+/// maintained plan nor a token hint is on disk.
 ///
 /// Cancellation is a STATUS, not a tier: the org drops to `claude_free` when a
 /// subscription is canceled, so a `Free` reading already carries it, and the
@@ -70,7 +85,7 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.usage_cache_is_third_party() {
         return None;
     }
-    let fetched = cached_plan(&profile.name).filter(PlanInfo::is_classified);
+    let fetched = maintained_plan(profile).filter(PlanInfo::is_classified);
     match fetched {
         Some(plan) => plan.short_label(),
         None => {

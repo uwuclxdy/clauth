@@ -705,6 +705,88 @@ fn tier_label_is_none_for_a_converted_profile() {
     );
 }
 
+/// The fossil drop reaches the published tier too: an env-token retype (an
+/// endpoint plus an `[env] ANTHROPIC_AUTH_TOKEN`, no OAuth pair) owns no
+/// `usage_cache.json` leg, so a `Free` plan its OAuth life left on disk reads
+/// the same tier as no cache file at all. A pair + endpoint + key keeps
+/// `usage_cache_is_third_party`'s early `None`, fossil plan or not, and a pair +
+/// endpoint + `[env]` token, which the OAuth leg still polls, keeps its tier.
+#[test]
+fn tier_label_drops_a_fossil_plan_on_an_env_token_retype() {
+    let _home = HomeSandbox::new();
+    let mut envtok = Profile::new(
+        "envtok-tier".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    envtok.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envtok-tier".to_string(),
+    );
+    crate::testutil::register_names(&["envtok-tier"]);
+    let without_cache = tier_label(&envtok);
+
+    let fossil = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            plan_display_name: None,
+            subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
+            email: None,
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("envtok-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+
+    assert_eq!(
+        tier_label(&envtok),
+        without_cache,
+        "a plan no leg feeds must not publish a tier"
+    );
+
+    let mut hybrid = crate::testutil::oauth_profile("both-tier", "rt-both-tier");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both-tier".to_string());
+    crate::testutil::register_names(&["both-tier"]);
+    let hybrid_without_cache = tier_label(&hybrid);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("both-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+
+    assert_eq!(
+        tier_label(&hybrid),
+        hybrid_without_cache,
+        "the hybrid's early None is where it is today, fossil plan or not"
+    );
+
+    // The hybrid whose tier does go through the maintained-plan read: a pair
+    // plus an endpoint authenticated by an `[env]` token keeps its figures in
+    // `usage_cache.json` and the OAuth leg still polls it, so its plan is live.
+    let mut env_hybrid = crate::testutil::oauth_profile("envboth-tier", "rt-envboth-tier");
+    env_hybrid.base_url = Some("https://llm.example.test".to_string());
+    env_hybrid.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envboth-tier".to_string(),
+    );
+    crate::testutil::register_names(&["envboth-tier"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("envboth-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+    assert_eq!(
+        tier_label(&env_hybrid),
+        Some("Free".to_string()),
+        "a hybrid the OAuth leg still polls publishes its cached tier"
+    );
+}
+
 /// The published `provider` field names exactly one of three cases: the
 /// recognised provider's display name, `"anthropic"` for a profile with no
 /// managed endpoint of its own, and `"generic"` for every other endpoint.
@@ -943,4 +1025,70 @@ fn published_windows_drops_a_lapsed_provider_bar() {
         "only the live 7d row survives: {windows:?}"
     );
     assert_eq!(windows[0].label, "7d");
+}
+
+/// What the daemon's `refuses_service_cached` consumers (the auto-start queue
+/// `status --json` publishes, the boot uncapped-spend warning) read: a refusal
+/// cached for a retyped account no leg feeds is no refusal, whether the retype
+/// left its credential in `api_key` or in an `[env]` inference token, while the
+/// same file on an account a leg still polls (including a pair+endpoint+env
+/// token hybrid), or on a logged-out OAuth account whose figures live there,
+/// still refuses.
+#[test]
+fn a_cached_refusal_binds_only_where_a_leg_feeds_the_file() {
+    let _home = HomeSandbox::new();
+    let mut hybrid = crate::testutil::oauth_profile("both", "rt-both");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both".to_string());
+    let mut envtok = Profile::new(
+        "envtok".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    envtok
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-envtok".to_string());
+    let mut env_hybrid = crate::testutil::oauth_profile("envboth", "rt-envboth");
+    env_hybrid.base_url = Some("https://llm.example.test".to_string());
+    env_hybrid.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envboth".to_string(),
+    );
+    let shapes = [
+        (
+            Profile::new(
+                "moved".to_string(),
+                Some("https://llm.example.test".to_string()),
+                Some("sk-moved".to_string()),
+            ),
+            false,
+        ),
+        (envtok, false),
+        (hybrid, true),
+        (env_hybrid, true),
+        (Profile::new("gone".to_string(), None, None), true),
+    ];
+    for (p, _) in &shapes {
+        crate::testutil::register_names(&[p.name.as_str()]);
+        write_profile_cache(
+            &p.name,
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                    ..PlanInfo::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    let got: Vec<(&str, bool)> = shapes
+        .iter()
+        .map(|(p, _)| (p.name.as_str(), refuses_service_cached(p)))
+        .collect();
+    let want: Vec<(&str, bool)> = shapes
+        .iter()
+        .map(|(p, refuses)| (p.name.as_str(), *refuses))
+        .collect();
+    assert_eq!(got, want);
 }

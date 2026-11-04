@@ -972,8 +972,8 @@ fn the_delegates_detail_names_rate_limited_traffic() {
     let _home = crate::testutil::HomeSandbox::new();
     let now_secs = (crate::usage::now_ms() / 1000) as i64;
     let profile = Profile::new("acct".to_string(), None, None);
-    // `record_rate_limit` writes through `write_profile_cache`, which persists
-    // only for a profile the saved app state names as configured.
+    // `record_rate_limit` writes through `write_profile_cache_for`, which
+    // persists only for a profile the saved app state names as configured.
     crate::profile::save_app_state(&AppState {
         profiles: vec![profile.name.clone()],
         ..AppState::default()

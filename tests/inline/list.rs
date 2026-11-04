@@ -281,6 +281,150 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
     );
 }
 
+/// The `clauth list` table for `config`, every profile shown.
+fn rendered_table(config: &AppConfig) -> String {
+    render_table(
+        config,
+        &build_profile_entries(
+            config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
+    )
+}
+
+/// An OAuth account retyped to an api key of its own (login gone, endpoint and
+/// key set) keeps the `usage_cache.json` its OAuth leg last wrote, since a
+/// retype clears no caches. No leg reads or rewrites that file for it any more,
+/// so a `canceled` plan left there is a fossil: its row renders exactly as it
+/// would with no such file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("moved");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped row"
+    );
+}
+
+/// The env-token twin of the fossil above: a retype whose endpoint credential
+/// sits in `env` rather than `api_key` (an `[env] ANTHROPIC_AUTH_TOKEN`, the
+/// shape `claude::has_inference_auth` counts) is a retype no OAuth leg feeds
+/// too, so the canceled plan its OAuth life left behind marks nothing.
+#[test]
+fn a_retyped_env_token_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut retyped = Profile::new(
+        "envtok".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    retyped
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-envtok".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![retyped],
+    };
+    config.state.active_profile = Some("envtok".into());
+    crate::testutil::register_names(&["envtok"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("envtok");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped env-token row"
+    );
+}
+
+/// The control beside the fossil case: an account that keeps its OAuth login
+/// next to an endpoint of its own is still polled by the OAuth leg, so the
+/// canceled plan that leg wrote is live, and its row gains the marker.
+#[test]
+fn a_hybrid_account_still_polled_keeps_its_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut hybrid = oauth("both");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![hybrid],
+    };
+    config.state.active_profile = Some("both".into());
+    crate::testutil::register_names(&["both"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("both");
+
+    let after = rendered_table(&config);
+    let row = |t: &str| {
+        t.lines()
+            .find(|l| l.contains("both"))
+            .expect("the hybrid row")
+            .to_string()
+    };
+    assert_eq!(
+        row(&after),
+        format!("{} (canceled)", row(&before)),
+        "the OAuth leg still feeds this account, so its canceled plan marks the row"
+    );
+}
+
+/// The org-refused twin of the retyped fossil: a refusal its OAuth life left in
+/// `usage_cache.json` marks nothing once no leg feeds that file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_org_refused_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_profile_cache(
+        &crate::profile::ProfileName::from("moved"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                ..PlanInfo::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a refusal no leg feeds any more must not mark the retyped row"
+    );
+}
+
 /// An organization's refusal is named apart from a canceled plan, here as on
 /// every other surface: `(org refused)`, never `(canceled)`.
 #[test]
@@ -1717,10 +1861,10 @@ fn list_table_prints_the_codex_section_alone_without_a_claude_account() {
     );
 }
 
-/// A codex row reads no claude-only state. The cache write admits a name either
-/// roster holds, so a claude fetch still carrying a deleted claude profile can
-/// land its canceled `/profile` body in the `usage_cache.json` of a codex
-/// profile re-captured under that name; the codex row must not read it as a
+/// A codex row reads no claude-only state. A build whose cache write admitted a
+/// name either roster holds could land a claude fetch's canceled `/profile` body
+/// in the `usage_cache.json` of a codex profile re-captured under that name, and
+/// that file outlives the upgrade; the codex row must not read it as a
 /// cancellation. That body carries no codex plan either, and a codex row with
 /// no plan shows the missing-data dash, never its provider's name.
 #[test]

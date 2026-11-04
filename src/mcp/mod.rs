@@ -359,9 +359,9 @@ fn profile_row(
     // An organization's refusal rides here the same way, named apart: clauth
     // refuses no delegate for it, though the organization refuses the account
     // itself.
-    if crate::profile_json::is_org_refused_cached(name) {
+    if crate::profile_json::is_org_refused_cached(p) {
         row["org_refused"] = serde_json::json!(true);
-    } else if crate::profile_json::is_canceled_cached(name) {
+    } else if crate::profile_json::is_canceled_cached(p) {
         row["canceled"] = serde_json::json!(true);
     }
     // Emitted only when true, beside `canceled`: a spent usage-credit cap. The

@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
@@ -4332,9 +4333,9 @@ fn carry_live_extra_into(
 /// Nothing is written when `source` carries none of them, so an absent parked
 /// file and an empty one never both mean "parked, and there was nothing" —
 /// [`restore_parked_mcp_logins`] would re-attach the empty one as if it were a
-/// login set. Best-effort like the carry itself: `write_profile_cache` swallows
-/// its own failures, and keeping MCP logins is a convenience where completing
-/// the capture or switch that triggered this is not.
+/// login set. Best-effort like the carry itself: `write_profile_cache_for`
+/// swallows its own failures, and keeping MCP logins is a convenience where
+/// completing the capture or switch that triggered this is not.
 fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
     let Some(obj) = source.as_object() else {
         return;
@@ -4346,7 +4347,8 @@ fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
     if parked.is_empty() {
         return;
     }
-    crate::profile_cache::write_profile_cache(
+    crate::profile_cache::write_profile_cache_for(
+        Harness::Claude,
         name,
         crate::profile_cache::MCP_LOGINS_FILE,
         &serde_json::Value::Object(parked),

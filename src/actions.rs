@@ -4220,7 +4220,7 @@ fn validate_capture_name<'a>(config: &AppConfig, name: &'a str) -> Result<&'a st
 }
 
 /// Undo a seed when the install's hold does not return `Ok`: the seed lands
-/// before the hold's fallible steps and bypasses `write_profile_cache`'s
+/// before the hold's fallible steps and bypasses `write_profile_cache_for`'s
 /// off-roster gate (a new account's directory may not be registered yet), so an
 /// error after it would strand a plan for a profile the roster never registered.
 /// `arm` runs on every seed attempt under the OAuth gate — a refused pairing or

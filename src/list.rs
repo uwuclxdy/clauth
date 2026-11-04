@@ -99,9 +99,10 @@ impl Row {
     fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
         let typed_name = &entry.name;
         // A codex row reads its entry alone. The claude-only reads below would
-        // answer off a file the codex name shares: the cache write admits a
-        // name either roster holds, so a claude body can land in a codex
-        // profile's `usage_cache.json`.
+        // answer off a file the codex name shares: a claude body can sit in a
+        // codex profile's `usage_cache.json` — the writer refuses to add one
+        // now, but a file an older build wrote survives, and both bodies are
+        // one `UsageInfo` type, so the read side cannot tell them apart.
         let claude = entry.harness != Harness::Codex.as_str();
         let profile = if claude {
             config.find(typed_name)
@@ -140,8 +141,8 @@ impl Row {
             disabled: profile.is_some_and(|p| p.is_disabled()),
             keyless: profile
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
-            canceled: claude && crate::profile_json::is_canceled_cached(typed_name),
-            org_refused: claude && crate::profile_json::is_org_refused_cached(typed_name),
+            canceled: profile.is_some_and(crate::profile_json::is_canceled_cached),
+            org_refused: profile.is_some_and(crate::profile_json::is_org_refused_cached),
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),

@@ -353,7 +353,11 @@ pub(crate) fn build_profile_entries(
         None => crate::usage::auto_start_queue_members(
             config,
             &blocked,
-            crate::profile_json::refuses_service_cached,
+            |n| {
+                config
+                    .find(n)
+                    .is_some_and(crate::profile_json::refuses_service_cached)
+            },
             crate::usage::no_five_hour_limit_cached,
         ),
     };

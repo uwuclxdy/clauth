@@ -2102,9 +2102,9 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
     };
     store.lock().unwrap().insert("a".to_string(), prior.clone());
     crate::testutil::register_names(&["a"]);
-    super::write_profile_cache(
+    crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("a"),
-        super::USAGE_CACHE_FILE,
+        crate::profile_cache::USAGE_CACHE_FILE,
         &prior,
     );
 
@@ -2283,9 +2283,9 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
         ..Default::default()
     };
     crate::testutil::register_names(&["a"]);
-    super::write_profile_cache(
+    crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("a"),
-        super::USAGE_CACHE_FILE,
+        crate::profile_cache::USAGE_CACHE_FILE,
         &prior,
     );
 
@@ -18129,7 +18129,8 @@ fn a_live_fetch_appends_the_sample_and_its_bridge() {
 /// `FetchStatus::Fresh`; here it is `from_fetch`.
 #[test]
 fn a_cached_body_appends_no_sample() {
-    use super::{FetchOutcome, FetchStatus, USAGE_CACHE_FILE, apply_outcome, write_profile_cache};
+    use super::{FetchOutcome, FetchStatus, USAGE_CACHE_FILE, apply_outcome};
+    use crate::profile_cache::write_profile_cache;
 
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, last_fetched, streaks) = history_stores();
@@ -18180,9 +18181,8 @@ fn a_cached_body_appends_no_sample() {
 /// disk.
 #[test]
 fn a_fresh_wire_reset_drops_the_prev_wire_sourced_window() {
-    use super::{
-        FetchOutcome, USAGE_CACHE_FILE, apply_outcome, load_profile_cache, write_profile_cache,
-    };
+    use super::{FetchOutcome, USAGE_CACHE_FILE, apply_outcome, load_profile_cache};
+    use crate::profile_cache::write_profile_cache;
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = crate::testutil::HomeSandbox::new();
@@ -18254,6 +18254,39 @@ fn a_fresh_wire_reset_drops_the_prev_wire_sourced_window() {
             "#79: a reset window carries no reset stamp to serve"
         );
     }
+}
+
+/// The claude OAuth landing must not seed a codex profile's shared usage
+/// cache: the profile dir is keyed by name alone, so a claude fetch still in
+/// flight across a delete-and-recreate of that name as a codex profile used to
+/// land a claude-shaped body in `usage_cache.json`, where the codex surfaces
+/// publish it as a reading. The writer admits only the writing leg's roster.
+#[test]
+fn a_claude_outcome_writes_no_cache_for_a_codex_only_name() {
+    use super::{FetchOutcome, USAGE_CACHE_FILE, apply_outcome};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let (store, status, last_fetched, streaks) = history_stores();
+    let profile = crate::profile::ProfileName::from("cx");
+
+    apply_outcome(
+        FetchOutcome::live(&profile, history_sample(61.0), None),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    assert!(
+        crate::profile_cache::profile_cache_path(&profile, USAGE_CACHE_FILE)
+            .is_some_and(|p| !p.exists()),
+        "a claude outcome must not land a claude-shaped body in a codex profile's usage cache"
+    );
 }
 
 /// The designed case the carry exists for: a Fresh `/usage` read in the same
@@ -26648,9 +26681,9 @@ fn a_reanchored_landing_forgets_memory_and_keeps_the_profile_stamp() {
         &rz,
         Some(&crate::profile::AccountId::from("u-b".to_string())),
     );
-    super::write_profile_cache(
+    crate::profile_cache::write_profile_cache(
         &rz,
-        super::USAGE_CACHE_FILE,
+        crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo {
             plan: Some(crate::usage::PlanInfo::default()),
             ..Default::default()

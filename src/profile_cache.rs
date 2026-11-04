@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::harness::Harness;
 use crate::profile::ProfileName;
 
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
@@ -98,7 +99,12 @@ struct DeadKey {
 /// per-profile cache: a record that never lands leaves the reader on the
 /// mtime derivation, which is the pre-record answer rather than a worse one.
 pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
-    write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
+    write_profile_cache_for(
+        Harness::Claude,
+        name,
+        THIRD_PARTY_AUTH_FILE,
+        &AuthVerdict { credential },
+    );
 }
 
 /// Drop both records — a live body from a fetch that authenticated with the
@@ -127,7 +133,7 @@ pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool 
 /// [`crate::usage::inference_key_fingerprint`]. Best-effort like
 /// [`write_auth_expired`].
 pub(crate) fn write_dead_key(name: &ProfileName, key: u64) {
-    write_profile_cache(name, DEAD_KEY_FILE, &DeadKey { key });
+    write_profile_cache_for(Harness::Claude, name, DEAD_KEY_FILE, &DeadKey { key });
 }
 
 /// Whether `name`'s dead-key record names the key it holds RIGHT NOW. A record
@@ -232,7 +238,7 @@ pub(crate) fn write_credit_refusal_flagged(
         #[cfg(test)]
         credit_refusal_park::park_if_armed();
         if record.take(refusal, anchored_account(name)) {
-            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+            write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
         }
         Ok(())
     });
@@ -265,7 +271,7 @@ pub(crate) fn clear_credit_refusal_flagged(
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
         let mut record = credit_refusal_record(name);
         record.clear(floor_ms);
-        write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
         Ok(())
     });
     if let Err(e) = held {
@@ -301,7 +307,7 @@ pub(crate) fn settle_credit_refusal(
             changed = true;
         }
         if changed {
-            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+            write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
         }
         Ok(())
     });
@@ -417,7 +423,8 @@ pub(crate) fn forget_credit_refusal(name: &ProfileName, now_ms: u64) {
     if !dir_exists {
         return;
     }
-    write_profile_cache(
+    write_profile_cache_for(
+        Harness::Claude,
         name,
         CREDIT_REFUSAL_CACHE_FILE,
         &CreditRefusalRecord {
@@ -547,7 +554,8 @@ pub(crate) fn write_touch_receipt(
         crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
         "the receipt is read back from the store's own directory, so it has to be written there",
     );
-    write_profile_cache(
+    write_profile_cache_for(
+        Harness::Claude,
         name,
         TOUCH_RECEIPT_FILE,
         &TouchReceipt {
@@ -633,46 +641,72 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
     })
 }
 
-/// Atomically write `value` to `<profile_dir>/<file>`. Failures are swallowed
+/// Atomically write `value` to `<profile_dir>/<file>`, admitting `name` only
+/// while the WRITING LEG's harness roster holds it. Failures are swallowed
 /// (cache is best-effort): a missing parent is created at 0o700, the file at
 /// 0o600, via a tmp + rename so a torn write reads as no cache rather than a
 /// parse failure.
 ///
-/// Skips names the on-disk record no longer carries: the fetch legs hold a
-/// stale in-memory config for up to a tick, and the parent creation above
+/// The harness gate keeps one harness's body out of the other's profile dir:
+/// both harnesses resolve `<profile_dir>` the same way, keyed by name, so a
+/// claude fetch still in flight across a delete-and-recreate of the name as a
+/// codex profile would otherwise land a claude-shaped `usage_cache.json` where
+/// the codex surfaces publish it as a reading. Admitting either roster can
+/// never catch that — the name IS an account, just not the writing leg's.
+///
+/// Skips names the leg's on-disk record no longer carries: the fetch legs hold
+/// a stale in-memory config for up to a tick, and the parent creation above
 /// would re-create a deleted profile's directory. Fail-closed — an unreadable
 /// record skips the write too. The tick-driven callers (usage fetch,
 /// scheduler) retry on the next tick; one-shot writers degrade to their
 /// documented safe answers instead (a lost touch receipt yields the raw
-/// mtime, an unseeded anchor reads as unanchored). Cost: one read + TOML
-/// parse of `profiles.toml` per write — the record is small, and the same
-/// read already backs the oauth adopt gate and the daemon's switch-target
-/// existence check.
-///
-/// "The record" means EITHER roster. The gate exists to skip names that are no
-/// longer accounts, and a codex profile is an account — it simply lives in
-/// `codex-profiles.toml`, which `is_configured` cannot see (it reads
-/// `profiles.toml` alone, by design). Checking only that one silently dropped
-/// every codex usage reading, so the cache the published feed and the Overview
-/// resolve BY NAME stayed empty forever while the fetch itself succeeded.
-pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
-    let _ = write_profile_cache_reported(name, file, value);
+/// mtime, an unseeded anchor reads as unanchored). Cost: one roster read (a
+/// TOML parse) per write — the record is small, and the claude read already
+/// backs the oauth adopt gate and the daemon's switch-target existence check.
+pub(crate) fn write_profile_cache_for<T: Serialize>(
+    harness: Harness,
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+) {
+    let _ = write_profile_cache_reported_for(harness, name, file, value);
 }
 
-/// [`write_profile_cache`] that reports whether the file write actually landed,
-/// so a caller whose cache is load-bearing (the identity anchor) can log a
-/// failure instead of taking the default silent swallow. `false` covers every
-/// skip (off-roster, unresolvable path, serialization) and a failed write alike.
-pub(crate) fn write_profile_cache_reported<T: Serialize>(
+/// [`write_profile_cache_for`] that reports whether the file write actually
+/// landed, so a caller whose cache is load-bearing (the identity anchor) can
+/// log a failure instead of taking the default silent swallow. `false` covers
+/// every skip (off-roster, unresolvable path, serialization) and a failed write
+/// alike.
+pub(crate) fn write_profile_cache_reported_for<T: Serialize>(
+    harness: Harness,
     name: &ProfileName,
     file: &str,
     value: &T,
 ) -> bool {
-    let configured = crate::profile::is_configured(name).unwrap_or(false)
-        || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
-    if !configured {
+    if !roster_holds(harness, name) {
         return false;
     }
+    write_cache_file(name, file, value)
+}
+
+/// Whether `harness`'s own roster holds `name`: `profiles.toml` for claude
+/// ([`crate::profile::is_configured`]), `codex-profiles.toml` for codex.
+fn roster_holds(harness: Harness, name: &ProfileName) -> bool {
+    match harness {
+        Harness::Claude => claude_roster_holds(name),
+        Harness::Codex => codex_roster_holds(name),
+    }
+}
+
+fn claude_roster_holds(name: &ProfileName) -> bool {
+    crate::profile::is_configured(name).unwrap_or(false)
+}
+
+fn codex_roster_holds(name: &ProfileName) -> bool {
+    crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()))
+}
+
+fn write_cache_file<T: Serialize>(name: &ProfileName, file: &str, value: &T) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
         return false;
     };
@@ -680,6 +714,23 @@ pub(crate) fn write_profile_cache_reported<T: Serialize>(
         return false;
     };
     crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+}
+
+/// Test-only either-roster writer: a fixture poses a cache under whichever
+/// roster holds the name without spelling the leg it stands in for. Production
+/// legs go through [`write_profile_cache_for`], which admits only their own
+/// harness, so this permissive form is unreachable from a non-test build.
+#[cfg(test)]
+pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
+    let _ = write_profile_cache_reported(name, file, value);
+}
+
+#[cfg(test)]
+fn write_profile_cache_reported<T: Serialize>(name: &ProfileName, file: &str, value: &T) -> bool {
+    if !(claude_roster_holds(name) || codex_roster_holds(name)) {
+        return false;
+    }
+    write_cache_file(name, file, value)
 }
 
 /// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the

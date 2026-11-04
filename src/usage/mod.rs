@@ -72,7 +72,7 @@ pub(crate) use scheduler::{
     dead_login_is_setup_token, decision_fresh_any, display_activity, end_rotation,
     fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
     kick_block_switch_grade, mark_activity, mark_fetch_activity, note_isolated_credit_refusal,
-    oauth_without_pair, polled_third_party_names, probes_switched_off,
+    oauth_cache_leg_admits, oauth_without_pair, polled_third_party_names, probes_switched_off,
     profile_credential_fingerprint, queued_switch_away_is_stale,
     raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
     reseed_keeping_cadence, seed_dead_logins, selected_activity, selected_next_refresh,
