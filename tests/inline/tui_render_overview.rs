@@ -4233,6 +4233,46 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
     );
 }
 
+/// A claude row carries the banked-reset chip its codex twin does, read off
+/// the account's own `limit_resets.json`: two usable draw `↺ 2`; zero usable
+/// or no reading draws none.
+#[test]
+fn a_claude_row_shows_the_reset_chip_from_its_side_read() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets("lr2c", 2, &["five_hour"], None, now);
+    crate::testutil::write_claude_limit_resets("lr2z", 0, &["five_hour"], None, now);
+    let (config, readings) = config_with(
+        vec![
+            polled("lr2c", 80.0, 40.0, 3600),
+            polled("lr2z", 80.0, 40.0, 3600),
+            polled("lr2n", 80.0, 40.0, 3600),
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let rows = band_rows(&app, &readings, 120, 12);
+    let row_of = |name: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name}: {rows:?}"))
+            .clone()
+    };
+    assert!(
+        row_of("lr2c").contains("↺ 2"),
+        "two usable resets draw the chip: {rows:?}"
+    );
+    assert!(
+        !row_of("lr2z").contains('↺'),
+        "zero usable draws none: {rows:?}"
+    );
+    assert!(
+        !row_of("lr2n").contains('↺'),
+        "no reading draws none: {rows:?}"
+    );
+}
+
 /// The cell sitting under the `t/s` header on `row`, padding included; empty
 /// when the column is dropped. Mirrors `five_hour_cell_text` so the pin proves
 /// the cell sits under its own header, not just that a blank exists somewhere.
@@ -8424,4 +8464,71 @@ fn each_providers_first_row_crests_apart_from_the_others() {
             );
         }
     }
+}
+
+/// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
+/// reading shows the chip: the chip reads the same file the leg wrote, the
+/// same predicate the pane now uses, never a profile-kind filter.
+#[test]
+fn a_hybrid_profile_with_a_reading_shows_the_reset_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "hy1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let (mut p, r) = profile("hy1", 80.0, 40.0, 3600);
+    p.base_url = Some("https://api.deepseek.com".to_string());
+    p.api_key = Some("sk-hybrid".to_string());
+    p.credentials = Some(crate::testutil::oauth_pair("hy1"));
+    let (config, readings) = config_with(vec![(p, r)], Some("hy1"), vec![]);
+    let app = App::new(config);
+    let rows = band_rows(&app, &readings, 120, 12);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("hy1") && row.contains("↺ 2")),
+        "the hybrid's chip renders whole: {rows:?}"
+    );
+}
+
+/// The claude chip rides the shared charge/shed slot: at the width where the
+/// codex chip sheds whole (below the name floor) the claude chip sheds whole
+/// too — the row carries no partial chip.
+#[test]
+fn a_claude_reset_chip_sheds_whole_where_the_codex_chip_sheds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "lr3c",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let (config, readings) =
+        config_with(vec![polled("lr3c", 80.0, 40.0, 3600)], Some("lr3c"), vec![]);
+    let app = App::new(config);
+
+    // Wide: the chip renders whole.
+    let rows = band_rows(&app, &readings, 120, 12);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("lr3c") && row.contains("↺ 2")),
+        "the chip renders whole at a wide pane: {rows:?}"
+    );
+
+    // Below the name floor (inner 30, the codex shed's width): the shared
+    // slot is shed, so the row draws no chip at all — never a clipped one.
+    let narrow = OverviewWidths::new(30, &app, &readings);
+    assert_eq!(
+        narrow.chip_w, 0,
+        "the shared slot is shed below the name floor"
+    );
+    let line = render_overview_row(&app, 0, &narrow, false, false, &readings);
+    assert!(
+        !line_text(&line).contains('↺'),
+        "no clipped chip on the row: {}",
+        line_text(&line)
+    );
 }

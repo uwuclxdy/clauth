@@ -75,7 +75,10 @@ pub(crate) fn clear_usage_endpoint_override() {
     *guard = None;
 }
 
-fn usage_endpoint() -> std::borrow::Cow<'static, str> {
+/// The `/usage` URL every OAuth leg resolves through, so a test's
+/// `testutil::EndpointSandbox` redirects the poll and the claude banked-reset
+/// side read alike.
+pub(crate) fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
         if let Some(url) = USAGE_ENDPOINT_OVERRIDE
@@ -727,11 +730,10 @@ impl PlanInfo {
 /// `/profile` sends no such status.
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
-/// One provider-neutral banked limit-reset reading. Only a codex poll fills it
-/// today, `usable` alone (its body names no windows and no end); the claude
-/// poll does not read the reset block yet, so a claude row carries no reading
-/// until it does. `None` means the harness carried no reading, never that the
-/// count was zero.
+/// One provider-neutral banked limit-reset reading. A codex poll fills
+/// `usable` alone (its body names no windows and no end); the claude
+/// scheduler's hourly side read fills every field. `None` means the harness
+/// carried no reading, never that the count was zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct LimitResets {
     pub(crate) usable: u32,
@@ -739,6 +741,11 @@ pub(crate) struct LimitResets {
     pub(crate) clears: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ends_at: Option<String>,
+    /// Epoch ms of the read that produced this reading, the side read's own
+    /// stamp. `None` on a codex reading (its poll stamps the surrounding
+    /// [`UsageInfo`] instead), so codex cache bytes do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fetched_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -775,9 +782,9 @@ pub(crate) struct UsageInfo {
     pub(crate) codex_limit_reached: Option<String>,
     /// Banked usage-limit resets the account can spend to reopen a window
     /// early. A codex poll fills it from its reset-credits block, which rides
-    /// the same response; the claude poll does not read the claude reset block
-    /// yet. The poll only reads it; spending one is `clauth limit-reset`, run
-    /// by the operator, which reads the block directly.
+    /// the same response; the claude arm's side read writes `limit_resets.json`
+    /// and never fills this field. The poll only reads it; spending one is
+    /// `clauth limit-reset`, run by the operator, which reads the block directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) limit_resets: Option<LimitResets>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only

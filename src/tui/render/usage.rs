@@ -455,7 +455,7 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(resets) = row.resets.filter(|n| *n > 0) {
         lines.push(Line::from(vec![
             key_span("resets"),
-            Span::styled(format!("↺ {resets} banked"), theme::accent()),
+            Span::styled(format!("{resets} left"), theme::accent()),
         ]));
     }
     lines.push(Line::from(vec![
@@ -614,6 +614,18 @@ fn build_usage_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w, readings));
     lines.push(Line::from(""));
+    // The banked-reset row sits right under the plan row, ahead of the
+    // pricing and status rows: the account's resets read as part of its
+    // facts (the codex pane keeps the same row in its own place). The
+    // file's presence is the predicate, as it is on the Overview chip: the
+    // leg writes `limit_resets.json` only for profiles with a claude OAuth
+    // pair (a hybrid with a pair included), so a pane without a reading
+    // draws no row.
+    if let Some(resets) = app.claude_resets.get(profile.name.as_str())
+        && let Some(row) = claude_resets_line(resets)
+    {
+        lines.insert(1, row);
+    }
     // The live speed/rate rows sit under the header, ahead of the usage bars:
     // they are the account's current figures, read off a fresh producer, and
     // render from the first frame.
@@ -726,6 +738,57 @@ fn build_usage_lines(
 
     lines.extend(render_stat_block(&stats, inner_w));
     with_notes(lines)
+}
+
+/// A claude reading's `resets` row is aged once it passes this: the hourly
+/// read missed a slot.
+const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
+
+/// The claude pane's `resets` row off the hourly side read: `N left`, the
+/// windows the next grant clears, its end as the local month/day, and the
+/// reading's age once it passes 75 min. Each `· …` part drops when its field
+/// is absent; no usable reset draws no row.
+fn claude_resets_line(resets: &crate::usage::LimitResets) -> Option<Line<'static>> {
+    if resets.usable == 0 {
+        return None;
+    }
+    let mut parts = vec![format!("{} left", resets.usable)];
+    if !resets.clears.is_empty() {
+        let labels = resets
+            .clears
+            .iter()
+            .map(|w| crate::usage::claude_reset::window_label(w))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("clears {labels}"));
+    }
+    if let Some(ends) = local_day(&resets.ends_at) {
+        parts.push(format!("until {ends}"));
+    }
+    if let Some(stamp) = resets
+        .fetched_at
+        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
+    {
+        parts.push(format!("read {}", relative_age(stamp)));
+    }
+    Some(Line::from(vec![
+        key_span("resets"),
+        Span::styled(parts.join(" · "), theme::accent()),
+    ]))
+}
+
+/// The next grant's end as the line dates it: the local month and day
+/// (`Oct 30`). `None` for an absent or unparseable stamp — the server's
+/// spelling rides through, and a shape clauth cannot date omits the part.
+fn local_day(ends_at: &Option<String>) -> Option<String> {
+    let raw = ends_at.as_deref()?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(
+        parsed
+            .with_timezone(&chrono::Local)
+            .format("%b %-d")
+            .to_string(),
+    )
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),

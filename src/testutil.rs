@@ -335,6 +335,7 @@ impl Drop for HomeSandbox {
         crate::usage::reset_pending_forgets_for_test();
         crate::usage::reset_profile_fetched_for_test();
         crate::usage::clear_seed_hooks_for_test();
+        crate::usage::clear_claude_resets_seed_apply_hooks_for_test();
         crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();
         // Clear the process-wide lock-timeout override after the joins above
@@ -2288,6 +2289,31 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     let holder = crate::profile::open_state_file(&path).expect("open holder handle");
     holder.lock().expect("hold the rotation lock");
     holder
+}
+
+/// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
+/// scheduler's hourly side read) as the leg writes it: the usable count, the
+/// next grant's raw window names and end, and the read's own epoch-ms stamp.
+pub(crate) fn write_claude_limit_resets(
+    name: &str,
+    usable: u32,
+    clears: &[&str],
+    ends_at: Option<&str>,
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "clears": clears,
+        "ends_at": ends_at,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
 }
 
 /// An empty scheduler activity store: the per-profile spend counts a test

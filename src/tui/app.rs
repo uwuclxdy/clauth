@@ -67,16 +67,16 @@ use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, MemoryStores,
-    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
+    ActivityStore, ClaudeResetsMemoLock, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt,
+    MemoryStores, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
     SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
     any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
-    collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
-    token_spend_in_flight, windows_maxed,
+    collect_tokens, is_idle, mark_activity, new_claude_resets_memo, now_ms, spawn_refresher,
+    switch_gate_in_flight, token_spend_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -5073,6 +5073,28 @@ fn refresh_codex_rows(app: &mut App) -> bool {
     true
 }
 
+/// The claude accounts' banked-reset readings, off each profile's own
+/// `limit_resets.json` (the scheduler's hourly side read), keyed by name.
+/// Loaded where [`codex_rows`] loads its caches — construction and the
+/// per-tick reload — so a pane reads one snapshot per second, never per frame.
+/// Takes the names, not the config, so the loader itself never reads the
+/// config; only the per-tick reload copies them under the Config guard and
+/// drops it before the file reads below.
+pub(crate) fn claude_resets(
+    names: &[crate::profile::ProfileName],
+) -> HashMap<String, crate::usage::LimitResets> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let reading = crate::profile_cache::load_profile_cache::<crate::usage::LimitResets>(
+                name,
+                crate::profile_cache::LIMIT_RESETS_FILE,
+            )?;
+            Some((name.to_string(), reading))
+        })
+        .collect()
+}
+
 // ── Login session ─────────────────────────────────────────────────────────────
 
 /// An in-flight login. The worker blocks up to the login bound in
@@ -5326,6 +5348,9 @@ pub(crate) struct App {
     /// Scheduler-only stores held here so `forget_memory` can reach the whole
     /// process's name-keyed state.
     pub(crate) weekly_reset_kicks: WeeklyResetKicks,
+    /// The claude banked-reset side read's cadence memo, shared with the
+    /// scheduler the same way [`Self::weekly_reset_kicks`] is.
+    pub(crate) claude_resets_memo: ClaudeResetsMemoLock,
     pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
@@ -5908,6 +5933,11 @@ pub(crate) struct App {
     /// One snapshot for both surfaces is also what keeps the header's count
     /// equal to the rows the Overview draws.
     pub(crate) codex_rows: Vec<CodexRow>,
+    /// The claude accounts' banked-reset readings, off each profile's own
+    /// `limit_resets.json` (the scheduler's hourly side read). Cached beside
+    /// `codex_rows` with the same contract: reloaded on the per-tick poll,
+    /// never read per frame.
+    pub(crate) claude_resets: HashMap<String, crate::usage::LimitResets>,
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
@@ -6084,6 +6114,7 @@ struct WorkerHandles {
     third_party_broken: ThirdPartyBroken,
     skipped_unreadable: SkippedUnreadable,
     weekly_reset_kicks: WeeklyResetKicks,
+    claude_resets_memo: ClaudeResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -6120,6 +6151,7 @@ impl WorkerHandles {
             third_party_broken: Arc::clone(&app.third_party_broken),
             skipped_unreadable: Arc::clone(&app.skipped_unreadable),
             weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+            claude_resets_memo: Arc::clone(&app.claude_resets_memo),
             suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
@@ -6243,6 +6275,7 @@ impl App {
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
         let skipped_unreadable: SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
         let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+        let claude_resets_memo = new_claude_resets_memo();
         let suppressed_auth_expired: SuppressedAuthExpiredStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
@@ -6354,6 +6387,13 @@ impl App {
         // tick refreshes the same pair from one read.
         let job_trees = crate::claude_jobs::job_trees();
         let live_sessions = crate::live_sessions::LiveTally::collect_in(&config, &job_trees);
+        let claude_resets = claude_resets(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let tps = crate::tps::load_cache();
         let daemon_health = crate::daemon::daemon_health();
         // The Overview pool actions read this record without the Services tab
@@ -6400,6 +6440,7 @@ impl App {
             third_party_broken,
             skipped_unreadable,
             weekly_reset_kicks,
+            claude_resets_memo,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
@@ -6606,6 +6647,7 @@ impl App {
             delegate_speed_walks: 0,
             last_finished_speeds_refresh: Instant::now(),
             codex_rows: codex_rows(),
+            claude_resets,
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
             shunt_pool_read_at_ms: None,
@@ -7284,6 +7326,7 @@ impl App {
             h.kick_blocks,
             h.auto_start_queue,
             h.weekly_reset_kicks,
+            h.claude_resets_memo,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -7319,6 +7362,7 @@ impl App {
             poll_streaks: Arc::clone(&self.poll_streaks),
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            claude_resets_memo: Arc::clone(&self.claude_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -31186,11 +31230,13 @@ pub(crate) fn warn_name_notices(app: &mut App) {
 }
 
 /// Re-read the codex roster for the Overview's codex section and the header's
-/// account count, at most once a second: a roster TOML plus a few small files
-/// per account is cheap but not per-frame cheap, and both a `clauth login --codex`
-/// in another terminal and a codex usage fetch land on a human timescale.
-/// Ungated by tab and by filter, so a `c` onto the codex view shows the current
-/// roster rather than the one from whenever the view last showed it.
+/// account count, and the claude banked-reset readings beside it, at most once
+/// a second: a roster TOML plus a few small files per account is cheap but not
+/// per-frame cheap, and a `clauth login --codex` in another terminal, a codex
+/// usage fetch and the reset side read's own file all land on a human
+/// timescale. Ungated by tab and by filter, so a `c` onto the codex view
+/// shows the current roster rather than the one from whenever the view last
+/// showed it.
 fn poll_codex_rows(app: &mut App) {
     const CODEX_ROWS_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -31203,6 +31249,13 @@ fn poll_codex_rows(app: &mut App) {
     if refresh_codex_rows(app) {
         app.place_overview_cursor();
     }
+    let names: Vec<crate::profile::ProfileName> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    app.claude_resets = claude_resets(&names);
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`

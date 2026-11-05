@@ -2598,7 +2598,7 @@ fn a_copy_back_moves_the_next_usage_bearer_to_the_stored_token() {
     let requests = server.join().expect("listener");
     let bearers: Vec<String> = requests
         .iter()
-        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter(|raw| crate::testutil::request_path(raw) == "/api/oauth/usage")
         .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
         .collect();
     assert_eq!(
@@ -10854,7 +10854,10 @@ fn the_tick_loop_switch_then_copy_back_follows_the_store() {
     let _home = HomeSandbox::new();
     crate::plugin_host::arm_heal_throttle_for_test();
     crate::herdr::arm_heal_throttle_for_test();
-    let (base, server) = crate::testutil::serve_endpoints_raw(8, |path, _| {
+    // Three accounts × (usage + profile) + the three claude banked-reset side
+    // reads the tick fires for them: nine requests. Eleven leaves room to
+    // record a tenth (a duplicated poll) instead of refusing it unseen.
+    let (base, server) = crate::testutil::serve_endpoints_raw(11, |path, _| {
         if path.starts_with("/api/oauth/usage") {
             (
                 200,
@@ -10912,7 +10915,7 @@ fn the_tick_loop_switch_then_copy_back_follows_the_store() {
     let requests = server.join().expect("listener");
     let mut bearers: Vec<String> = requests
         .iter()
-        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter(|raw| crate::testutil::request_path(raw) == "/api/oauth/usage")
         .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
         .collect();
     bearers.sort();

@@ -13963,6 +13963,7 @@ fn third_party_state_at_interval(
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15568,6 +15569,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15665,6 +15667,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15891,6 +15894,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16004,6 +16008,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16125,6 +16130,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16224,6 +16230,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16291,10 +16298,12 @@ fn auto_start_queue_election_is_wired_into_tick() {
         epoch_secs_to_iso(now_before + 5 * 3600),
         epoch_secs_to_iso(now_before + 7 * 24 * 3600),
     );
-    // A correct run makes five requests (one kick, two usage, two profile).
-    // Six leaves room to record the second kick when the election wiring is
-    // removed: the listener, rather than a refused socket, then catches it.
-    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+    // A correct run makes six requests: one kick, two usage, two profile, and
+    // the one claude banked-reset side read `tick` fires for the two accounts
+    // on their first pass (one account a tick). Eight leaves room to record
+    // the second kick when the election wiring is removed: the listener,
+    // rather than a refused socket, then catches it.
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
         if path.starts_with("/v1/messages") {
             (200, "{}".to_string())
         } else if path.starts_with("/api/oauth/usage") {
@@ -16343,6 +16352,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: auto_start_queue.clone(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16956,6 +16966,7 @@ fn completion_order_state() -> super::SchedulerState {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17856,6 +17867,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -17971,6 +17983,7 @@ fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -18566,6 +18579,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -21971,6 +21985,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22226,6 +22241,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22364,6 +22380,7 @@ fn auto_start_queue_election_leaves_out_a_plan_with_no_five_hour_limit() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22517,6 +22534,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -25477,6 +25495,9 @@ fn the_catch_up_runs_the_hooks_a_landed_stage_never_ran() {
     .expect("record P1");
     write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
     let state = chain_state(&config, Vec::new());
+    // The tick's claude reset side read for the pair's account dies on the
+    // refused port; only its failure matters here.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -25505,6 +25526,9 @@ fn the_catch_up_runs_no_hook_for_a_stage_whose_pair_is_spent() {
     .expect("record P1 and the staged pair");
     write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
     let state = chain_state(&config, Vec::new());
+    // The tick's claude reset side read for the pair's account dies on the
+    // refused port; only its failure matters here.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -25535,6 +25559,9 @@ fn the_catch_up_restamps_a_rolling_profiles_session_token() {
     // The rolling scan would stamp from memory on its own: hold it off, so the
     // stamp under test is the catch-up landing's.
     state.claude_rolling.lock().unwrap().next_scan_ms = u64::MAX;
+    // The tick's claude reset side read (and the re-stamp's refresh) die on
+    // the refused port; the chain token still lands.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -26187,6 +26214,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -27899,6 +27927,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -28057,6 +28086,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -29989,7 +30019,7 @@ fn probe_tick_answering_with(
     status: u16,
     body: &'static str,
 ) -> usize {
-    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, _| {
         (status, Vec::new(), body.into())
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
@@ -29997,12 +30027,75 @@ fn probe_tick_answering_with(
     server.join().expect("listener").len()
 }
 
-/// One tick against a listener nothing may reach.
-fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super::SchedulerState) {
-    let (listener, base) = crate::testutil::deaf_listener();
+/// One tick against a listener only the claude banked-reset side read may
+/// reach: a state whose OAuth pair is due sends its own side read and nothing
+/// else may land. `side_reads` is how many reads the caller's state has due
+/// (0 while no paired account's read is due, 1 for one pair on its first
+/// pass); the record's
+/// length is pinned by equality, so a forbidden poll or probe reds too, and
+/// every recorded path must be the read's. The stub ANSWERS every request it
+/// records, so a forbidden request shows up in the record instead of stalling
+/// the tick on the read's timeout and being refused at a closed port.
+fn probe_tick_expecting_none(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    side_reads: usize,
+) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let base = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("addr").port()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut seen: Vec<String> = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                        // Read the head before answering: a close with request
+                        // bytes unread RSTs the client on Windows.
+                        let raw = crate::testutil::drain_http_request(&mut sock);
+                        seen.push(crate::testutil::request_path(&String::from_utf8_lossy(
+                            &raw,
+                        )));
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                        let _ = sock.shutdown(std::net::Shutdown::Write);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        })
+    };
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
     super::tick(state);
-    crate::testutil::assert_nothing_sent(&listener);
+    // Every request the tick made was answered before it returned, so the
+    // record is complete here: stop the listener and read it back.
+    stop.store(true, Ordering::SeqCst);
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.len(),
+        side_reads,
+        "the tick sent more than its expected side reads: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|path| path == CEDAR_EMBER_READ),
+        "only the side read may reach the endpoint: {seen:?}"
+    );
 }
 
 /// A refused setup token beside a stored pair is never probed on the cadence,
@@ -30027,7 +30120,7 @@ fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
         .lock()
         .unwrap()
         .insert("paired".to_string(), fingerprint);
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 1);
 
     let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
         (200, probe_headers(), "{}".into())
@@ -30039,6 +30132,8 @@ fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
         .unwrap()
         .insert("paired".to_string());
     super::tick(&state);
+    // The probe tick above already spent the pair's once-an-hour side read, so
+    // this tick sends the retry alone.
     assert_eq!(server.join().expect("listener").len(), 1, "one retry");
     assert!(!crate::profile_cache::auth_expired_matches(
         &name,
@@ -30256,7 +30351,7 @@ fn status_after_a_probe_leg_panic(
     let state = probe_state("probed", 60_000, true);
     let config = state.config.clone();
     let _armed = super::probe_panic::arm_panic(move || hook(&config));
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert_eq!(
         oauth_fetch_mark(&state.activity, "probed"),
         None,
@@ -30346,7 +30441,7 @@ fn a_refused_setup_token_reads_auth_expired_and_rests() {
         );
         // Due again on cadence, still refused: nothing goes out.
         state.last_fetched.lock().unwrap().clear();
-        probe_tick_expecting_none(&home, &state);
+        probe_tick_expecting_none(&home, &state, 0);
         // The verdict stays and no countdown is published for the rest, so
         // the Overview's countdown slot stays blank beside the `⊘`.
         assert_eq!(
@@ -30375,7 +30470,7 @@ fn a_remint_re_admits_a_refused_setup_token() {
     let name = crate::profile::ProfileName::from("reminted-after-401");
     assert_eq!(probe_tick_answering(&home, &state, 401), 1);
     state.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
 
     crate::claude::write_session_token(&name, "sk-ant-oat01-fresh", crate::usage::now_ms() as i64)
         .expect("re-mint");
@@ -30414,7 +30509,7 @@ fn a_manual_refresh_retries_a_refused_setup_token_once() {
         "`r` retries it"
     );
     state.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
 }
 
 /// A chain of `a` (a stored pair, active) and `b`, an account the usage probe
@@ -30464,8 +30559,8 @@ fn a_refused_setup_token_is_no_walk_target() {
 
     assert_eq!(
         probe_tick_answering(&home, &state, 401),
-        1,
-        "the tick probes b"
+        2,
+        "the tick probes b and reads a's banked resets"
     );
     let queued: Vec<String> = state
         .pending_switch
@@ -30603,7 +30698,11 @@ fn start_auto_passes_over_a_refused_setup_token() {
             },
         );
     }
-    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        2,
+        "the probe of b, plus a's once-an-hour reset side read"
+    );
 
     let cfg = config.lock().unwrap().clone();
     let (rows, pick) = crate::fallback::start_walk(
@@ -30739,7 +30838,7 @@ fn a_probe_entry_the_snapshot_has_not_seen_waits() {
             },
         );
         if probes == 0 {
-            probe_tick_expecting_none(&home, &state);
+            probe_tick_expecting_none(&home, &state, 0);
         } else {
             assert_eq!(probe_tick_answering(&home, &state, 200), probes);
         }
@@ -30775,7 +30874,7 @@ fn spent_probe_state(refresh_spent: bool) -> super::SchedulerState {
 fn a_spent_probed_account_is_not_probed_with_refresh_spent_off() {
     let home = crate::testutil::HomeSandbox::new();
     let state = spent_probe_state(false);
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(
         !state
             .next_refresh_per_profile
@@ -30797,7 +30896,7 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
         &oauth_key("spent"),
         ProfileActivity::Queued,
     );
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(
         state
             .activity
@@ -31156,7 +31255,7 @@ fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
     );
     assert_eq!(probe_tick_answering(&home, &fetching, 401), 1);
     fetching.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &fetching);
+    probe_tick_expecting_none(&home, &fetching, 0);
     assert!(
         !fetching
             .next_refresh_per_profile
@@ -31325,7 +31424,9 @@ fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
     let state = chain_state(&config, Vec::new());
     let seed = crate::fallback::durable_key_rejected_seed(&config.lock().unwrap().profiles);
     state.third_party_broken.lock().unwrap().extend(seed);
-    probe_tick_expecting_none(&home, &state);
+    // The old holder holds the usage-fetch lease, so this tick stands down and
+    // reads nothing.
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(state.pending_switch.lock().unwrap().is_empty());
 
     // While it stands down the old holder records `dead` refused and lifts
@@ -31352,7 +31453,9 @@ fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
             .unwrap()
             .insert(name.to_string(), super::FetchStatus::Fresh);
     }
-    probe_tick_expecting_none(&home, &state);
+    // The old holder is gone: this tick wins the lease and reads the pair's
+    // resets, alongside the switch it takes off the seeded verdicts.
+    probe_tick_expecting_none(&home, &state, 1);
     let queued: Vec<String> = state
         .pending_switch
         .lock()
@@ -31789,6 +31892,7 @@ fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fres
         false,
         false,
         &Arc::new(RankedMutex::new(HashSet::new())),
+        &super::new_claude_resets_memo(),
         None,
         Some(&reset_member(name)),
     );
@@ -34006,4 +34110,1859 @@ fn a_due_codex_account_with_no_stored_token_resolves_no_usage_url() {
         state.activity.lock().unwrap().get(name).is_none(),
         "a tokenless account started no worker"
     );
+}
+
+/// The scheduler state for the claude reset side read: `profiles` in the
+/// config and their tokens collected, the way `due_oauth_state` builds one.
+fn resets_state(profiles: Vec<crate::profile::Profile>) -> super::SchedulerState {
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles,
+    };
+    let tokens = collect_tokens(&config);
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = tokens;
+    state
+}
+
+/// The side read's request target, as Claude Code sends it.
+const CEDAR_EMBER_READ: &str = "/api/oauth/usage?cedar_ember=1&skip_spend=1";
+
+/// Two banked grants usable now (`g-old`, `g-week`) and a third in cooldown;
+/// the server's next grant is `g-week`, which clears 5h and 7d and names no end.
+const CEDAR_EMBER_THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
+
+/// The reset side read runs once an hour per claude OAuth account and never
+/// for an api-key account; each read lands in that account's own
+/// `limit_resets.json` (the usable count, the next grant's windows and end,
+/// the read's own stamp) and leaves the plain usage cache untouched.
+#[test]
+fn a_claude_reset_read_runs_once_an_hour_per_oauth_account() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let a = save_unanchored_login("lr2a", "lr2a-tok");
+    let b = save_unanchored_login("lr2b", "lr2b-tok");
+    let mut key = oauth_profile_disabled("lr2k", false);
+    key.credentials = None;
+    key.api_key = Some("sk-lr2k".to_string());
+    crate::testutil::register_names(&["lr2a", "lr2b", "lr2k"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(5, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![a, b, key]);
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+
+    let before = crate::usage::now_ms();
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "one read per OAuth account, none for the key"
+    );
+    super::claude_resets_tick_at(&state, t + hour - 60_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "nothing inside the hour");
+    super::claude_resets_tick_at(&state, t + hour);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "each account again once the hour is up"
+    );
+
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        [
+            "Bearer lr2a-tok",
+            "Bearer lr2a-tok",
+            "Bearer lr2b-tok",
+            "Bearer lr2b-tok"
+        ],
+        "each read carries its own account's token"
+    );
+    for name in ["lr2a", "lr2b"] {
+        let profile = crate::profile::ProfileName::from(name);
+        let path = crate::profile::profile_subpath(&profile, "limit_resets.json").expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(
+            body["usable"], 2,
+            "{name}: g-old + g-week, not the cooling g-cool"
+        );
+        assert_eq!(
+            body["clears"],
+            serde_json::json!(["five_hour", "seven_day"]),
+            "{name}: the next grant's windows"
+        );
+        assert!(
+            body["ends_at"].is_null(),
+            "{name}: the next grant names no end"
+        );
+        let stamped = body["fetched_at"].as_u64().expect("stamped");
+        assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
+        let usage =
+            crate::profile::profile_subpath(&profile, super::USAGE_CACHE_FILE).expect("path");
+        assert!(
+            !usage.exists(),
+            "{name}: the side read writes no usage cache"
+        );
+    }
+    let key_file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr2k"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(!key_file.exists(), "an api-key account gets no reset read");
+}
+
+/// Lands one fresh `/usage` body for `name` whose 5h window sits at `util`%,
+/// into `state`'s own stores (the reset-read memo the tick reads included).
+fn land_five_hour(state: &super::SchedulerState, name: &str, util: f64, token: &str) {
+    use super::{FetchOutcome, FetchStatus, apply_outcome_to};
+    let profile = crate::profile::ProfileName::from(name);
+    apply_outcome_to(
+        state,
+        FetchOutcome {
+            name: profile.clone(),
+            info: Some(crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: util,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            }),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            from_headers: false,
+            refresh_failed: false,
+            login_gone: false,
+            plan_override: None,
+            retry_after: None,
+            // The identity a real spawn takes off the stored login, so the
+            // landing reads no login change and writes the store.
+            oauth_identity: crate::usage::spawn_oauth_identity(&profile, token),
+            sent_access_token: token.to_string(),
+            epoch_at_spawn: crate::usage::epoch_value(&profile, crate::usage::Half::OAuth),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
+        },
+    );
+    assert_eq!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|info| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(util),
+        "the fixture's landing wrote the store"
+    );
+}
+
+/// A window that reaches 100% between two landings brings the reset read
+/// forward once, inside the hour; a landing that stays at 100%, or one that
+/// rises short of it, brings nothing.
+#[test]
+fn a_window_reaching_full_reads_the_resets_once_inside_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2t", "lr2t-tok");
+    crate::testutil::register_names(&["lr2t"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_five_hour(&state, "lr2t", 90.0, "lr2t-tok");
+    land_five_hour(&state, "lr2t", 95.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a rise short of 100% reads nothing"
+    );
+
+    land_five_hour(&state, "lr2t", 100.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "reaching 100% reads once, inside the hour"
+    );
+
+    land_five_hour(&state, "lr2t", 100.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 15 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "staying at 100% reads nothing more"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// The reset-read memo belongs to one scheduler: a second, fresh scheduler for
+/// the same account reads on its first pass, whatever another scheduler in
+/// the same process read inside the hour. A process-wide memo would let one
+/// test's reads decide another test's request count under a one-process run.
+/// The name stays off the claude roster, so the first read writes no
+/// `limit_resets.json` for the second scheduler to seed its hour from.
+#[test]
+fn a_fresh_scheduler_reads_the_resets_whatever_another_one_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2s", "lr2s-tok");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let first = resets_state(vec![p.clone()]);
+    let second = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&first, t);
+    super::claude_resets_tick_at(&second, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each scheduler reads on its own first pass"
+    );
+    super::claude_resets_tick_at(&first, t + 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the first scheduler keeps its own hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// Production wiring pin for the claude side read: `tick` runs the leg, so a
+/// due OAuth account's `limit_resets.json` lands on a real tick (the cadence
+/// tests drive `claude_resets_tick_at` directly and never reach it).
+#[test]
+fn tick_runs_the_claude_resets_side_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2tk", "lr2tk-tok");
+    crate::testutil::register_names(&["lr2tk"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![p],
+    };
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.config.lock().unwrap() = config;
+    super::tick(&state);
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the tick ran the leg");
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr2tk"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(file.exists(), "the read landed its file");
+}
+
+/// The leg's eligibility: an `auth_broken` account, a disabled account and a
+/// pair with an empty access token each get no reset read, beside one healthy
+/// pair that must read — the live counter proves the three exclusions, not a
+/// dead listener.
+#[test]
+fn an_auth_broken_a_disabled_and_an_empty_token_account_get_no_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let good = save_unanchored_login("lr3ok", "lr3ok-tok");
+    let broken = save_unanchored_login("lr3br", "lr3br-tok");
+    let disabled = oauth_profile_disabled("lr3ds", true);
+    let mut empty = oauth_profile_disabled("lr3em", false);
+    if let Some(oauth) = empty
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.access_token = String::new();
+    }
+    crate::testutil::register_names(&["lr3ok", "lr3br", "lr3ds", "lr3em"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![good, broken, disabled, empty]);
+    state
+        .config
+        .lock()
+        .unwrap()
+        .state
+        .auth_broken
+        .push("lr3br".into());
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "only the healthy enabled pair with a token reads"
+    );
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        ["Bearer lr3ok-tok".to_string()],
+        "the one read carries the healthy account's token"
+    );
+}
+
+/// Lands one fresh `/usage` body for `name` whose 7d window sits at `util`%
+/// and whose per-model `weekly_scoped` set is `scoped` (label, util).
+fn land_windows(
+    state: &super::SchedulerState,
+    name: &str,
+    token: &str,
+    seven_day: Option<f64>,
+    scoped: Option<(&str, f64)>,
+) {
+    use super::{FetchOutcome, FetchStatus, apply_outcome_to};
+    let profile = crate::profile::ProfileName::from(name);
+    let usage = crate::usage::UsageInfo {
+        seven_day: seven_day.map(|util| crate::usage::UsageWindow {
+            utilization: util,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        weekly_scoped: scoped
+            .map(|(label, util)| {
+                vec![crate::usage::ScopedWindow {
+                    label: label.to_string(),
+                    window: crate::usage::UsageWindow {
+                        utilization: util,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    },
+                }]
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    apply_outcome_to(
+        state,
+        FetchOutcome {
+            name: profile.clone(),
+            info: Some(usage),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            from_headers: false,
+            refresh_failed: false,
+            login_gone: false,
+            plan_override: None,
+            retry_after: None,
+            oauth_identity: crate::usage::spawn_oauth_identity(&profile, token),
+            sent_access_token: token.to_string(),
+            epoch_at_spawn: crate::usage::epoch_value(&profile, crate::usage::Half::OAuth),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
+        },
+    );
+    assert!(
+        state.store.lock().unwrap().get(name).is_some(),
+        "the fixture's landing wrote the store"
+    );
+}
+
+/// A 7d window — and a per-model scoped one — crossing to 100% between two
+/// landings marks the account due, so the read comes forward inside the hour
+/// for those too, not the 5h window alone.
+#[test]
+fn a_seven_day_or_scoped_window_reaching_full_marks_the_account_due() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3w", "lr3w-tok");
+    crate::testutil::register_names(&["lr3w"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr3w", "lr3w-tok", Some(90.0), None);
+    land_windows(&state, "lr3w", "lr3w-tok", Some(100.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the 7d crossing reads once, inside the hour"
+    );
+
+    land_windows(&state, "lr3w", "lr3w-tok", None, Some(("7d opus", 50.0)));
+    land_windows(&state, "lr3w", "lr3w-tok", None, Some(("7d opus", 100.0)));
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the per-model scoped crossing reads once, inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A FIRST landing already at 100% (no previous stored reading) marks nothing:
+/// with nothing known about what the window read before, there is no crossing
+/// to act on, and the hourly read covers the account.
+#[test]
+fn a_first_landing_already_at_full_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3f", "lr3f-tok");
+    crate::testutil::register_names(&["lr3f"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr3f", "lr3f-tok", Some(100.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a first landing at 100% reads nothing more"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A re-login removes the old login's reading (`forget_disk`'s OAuth arm) and
+/// drops its hour from the memo, so the account reads inside the hour instead
+/// of seeding the old reading's hour under the new login. The reading's stamp
+/// is on the test's own clock, so a seeded hour would really hold the second
+/// pass.
+#[test]
+fn a_relogin_drops_the_reading_and_the_name_so_the_account_reads_inside_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3cm", "lr3cm-tok");
+    crate::testutil::register_names(&["lr3cm"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr3cm");
+    let minute = 60_000;
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    // The re-login's change site: the old login's reading goes, and the memo
+    // drops the name.
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    crate::usage::forget_memory(&state.memory_stores(), &name, crate::usage::Half::OAuth);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the re-logged account reads again inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A rename moves the whole profile directory (as `rename_profile` does), so
+/// the reading inside it rides along and dates the account's hour under the
+/// new name: the memo's drop of the old name reads nothing while the moved
+/// file is inside the hour. A name that lands with no reading under it — the
+/// fixture poses the rename back that way — reads on the next pass, so the
+/// drop is no hour of its own.
+#[test]
+fn a_rename_keeps_the_moved_readings_hour_under_the_new_name() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3rn", "lr3rn-tok");
+    crate::testutil::register_names(&["lr3rn", "lr3rn2"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = crate::usage::now_ms();
+    crate::usage::register_memory_stores();
+    let old = crate::profile::ProfileName::from("lr3rn");
+    let new = crate::profile::ProfileName::from("lr3rn2");
+    let rename = |from: &crate::profile::ProfileName, to: &crate::profile::ProfileName| {
+        state.config.lock().unwrap().profiles[0].name = to.as_str().into();
+        crate::usage::note_rename(from, to);
+        crate::usage::apply_pending_forgets(&state.memory_stores());
+    };
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    // The production rename moves the profile directory itself, so the
+    // reading it holds (the first read's, stamped on the real clock) rides
+    // to the new name; the seed dates the hour there.
+    std::fs::rename(
+        crate::profile::profile_dir(&old).expect("old dir"),
+        crate::profile::profile_dir(&new).expect("new dir"),
+    )
+    .expect("the profile directory moves");
+    rename(&old, &new);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the moved reading keeps the account's hour under its new name"
+    );
+
+    // The rename back lands on a name with no reading under it: the outbound
+    // rename dropped the old name's hour, so it reads again inside it
+    // instead of holding the stamp.
+    std::fs::remove_file(crate::profile::profile_subpath(&new, "limit_resets.json").expect("path"))
+        .expect("pose a name with no reading");
+    rename(&new, &old);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the rename back reads again: the memo's drop left it no hour to hold"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A forget landing while the side read is in flight — a re-login's
+/// `clear_memory` — leaves the read's file unwritten and the memo unstamped,
+/// so the account reads again under the new login on the next pass inside the
+/// hour instead of waiting out the old login's hour with the old count in its
+/// file.
+#[test]
+fn a_forget_in_flight_skips_the_reset_write_and_the_stamp() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3fg", "lr3fg-tok");
+    crate::testutil::register_names(&["lr3fg"]);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr3fg");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let forgot = Arc::new(AtomicBool::new(false));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let stores = state.memory_stores();
+        let name = name.clone();
+        let reads = Arc::clone(&reads);
+        let forgot = Arc::clone(&forgot);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                // The re-login lands while the read it races is on the wire:
+                // its forget runs before the answer that read waits for.
+                if !forgot.swap(true, Ordering::SeqCst) {
+                    crate::usage::forget_memory(&stores, &name, crate::usage::Half::OAuth);
+                }
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+
+    let t = 1_900_000_000_000;
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read went out");
+    assert!(!file.exists(), "a read whose login moved lands no file");
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .last_read_at
+            .contains_key("lr3fg"),
+        "a read whose login moved stamps no memo"
+    );
+
+    // The forget's drop stands: the next pass inside the hour reads again and
+    // lands under the login the account holds now.
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the unstamped account reads again inside the hour"
+    );
+    assert!(file.exists(), "the second pass lands its file");
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A tick that polls a paired account whose fresh body takes a window from
+/// under 100% to 100% reads the resets in the SAME tick: the due mark the
+/// landing sets sits in the memo the leg reads once the fan-out has joined,
+/// and the plain `/usage` poll precedes that read in the stub's record.
+#[test]
+fn a_tick_that_lands_a_full_window_reads_the_resets_in_the_same_tick() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3tk", "lr3tk-tok");
+    crate::testutil::register_names(&["lr3tk"]);
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    let under = format!(r#"{{"five_hour":{{"utilization":90.0,"resets_at":"{resets_at}"}}}}"#);
+    let full = format!(r#"{{"five_hour":{{"utilization":100.0,"resets_at":"{resets_at}"}}}}"#);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(6, {
+        let polls = Arc::clone(&polls);
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/usage" {
+                let nth = polls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    if nth == 0 {
+                        under.clone()
+                    } else {
+                        full.clone()
+                    },
+                )
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    // The second tick must poll again at once, or the crossing landing it
+    // needs would wait out a whole interval.
+    state.refresh_interval.store(0, Ordering::Relaxed);
+    // Neither tick spends a request on `/profile`: this test is about the poll
+    // and the side read.
+    crate::usage::take_profile_fetch(
+        &crate::profile::ProfileName::from("lr3tk"),
+        false,
+        crate::usage::now_ms(),
+    );
+
+    super::tick(&state);
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "the first tick polls");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the first tick's hourly read"
+    );
+
+    // The seam's own purpose: don't sleep out the per-host spacing window the
+    // first tick reserved.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the crossing landing's due mark is read in the same tick"
+    );
+
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let asked: Vec<String> = seen
+        .iter()
+        .map(|raw| crate::testutil::request_path(raw))
+        .filter(|path| path.as_str() == "/api/oauth/usage" || path.as_str() == CEDAR_EMBER_READ)
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "/api/oauth/usage",
+            CEDAR_EMBER_READ,
+            "/api/oauth/usage",
+            CEDAR_EMBER_READ,
+        ],
+        "each tick polls first, then reads the resets the landing marked due"
+    );
+}
+
+/// A login change's OAuth-half forget drops the banked-reset reading with the
+/// usage cache: the count belongs to the login that was read, so the Overview
+/// chip and the Usage row draw nothing until the new login's own side read.
+#[test]
+fn an_oauth_forget_drops_the_banked_resets_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("a");
+    crate::testutil::write_claude_limit_resets("a", 3, &[], None, 1_700_000_000_000);
+    let path = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    assert!(path.exists(), "fixture control: the reading is on disk");
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    assert!(!path.exists(), "the old login's reading is gone");
+}
+
+/// A scheduler that starts within the hour of a reading on disk (a daemon
+/// restart, a lease takeover, a TUI with no daemon) keeps that reading's hour
+/// instead of re-reading every account on its first tick; a reading an hour
+/// old or more, or none at all, reads on the first pass.
+#[test]
+fn a_new_scheduler_keeps_the_hour_of_the_reading_on_disk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let fresh = save_unanchored_login("lrf", "lrf-tok");
+    let stale = save_unanchored_login("lrs", "lrs-tok");
+    let unread = save_unanchored_login("lru", "lru-tok");
+    crate::testutil::register_names(&["lrf", "lrs", "lru"]);
+    let t: u64 = 1_900_000_000_000;
+    let minute: u64 = 60_000;
+    crate::testutil::write_claude_limit_resets("lrf", 2, &[], None, t - 30 * minute);
+    crate::testutil::write_claude_limit_resets("lrs", 2, &[], None, t - 61 * minute);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![fresh, stale, unread]);
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "only the accounts read an hour ago or never read on the first pass"
+    );
+    super::claude_resets_tick_at(&state, t + 31 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the fresh reading's hour runs out on its own clock"
+    );
+
+    drop(endpoints);
+    let bearers: Vec<String> = server
+        .join()
+        .expect("listener")
+        .iter()
+        .filter(|raw| crate::testutil::request_path(raw) == CEDAR_EMBER_READ)
+        .map(|raw| crate::testutil::request_header(raw, "authorization").unwrap_or_default())
+        .collect();
+    let mut first_pass = bearers[..2].to_vec();
+    first_pass.sort();
+    assert_eq!(
+        first_pass,
+        vec!["Bearer lrs-tok".to_string(), "Bearer lru-tok".to_string()],
+        "the first pass reads the stale and the unread account"
+    );
+    assert_eq!(
+        bearers[2], "Bearer lrf-tok",
+        "then the fresh one, past its hour"
+    );
+}
+
+/// A tick whose landing takes a chain member to 100% queues the switch before
+/// the side read goes out: the scans decide off the stores the landings just
+/// wrote and must not wait behind the reads. The stub's side-read handler
+/// reads the switch queue as the request arrives. The queue it observes is
+/// `scan_auto_switch`'s `pending_switch` alone; the session switch and
+/// recovery scans leave no store this test reads, so their order against the
+/// side read is not observed here.
+#[test]
+fn a_tick_reads_the_resets_after_the_switch_scan_queued_its_decision() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b"], Some("a"));
+    let mut tokens = collect_tokens(&config.lock().unwrap());
+    tokens.retain(|t| t.name.as_str() == "a");
+    assert_eq!(
+        tokens.len(),
+        1,
+        "the active member is on the poll's token list"
+    );
+    let state = chain_state(&config, tokens);
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    // The active member starts under 100% with headroom on the other, so the
+    // tick's landing is the crossing the switch scan acts on. The landing's
+    // own cadence stamp would defer the poll; this test drives it now.
+    land_five_hour(&state, "a", 90.0, "a");
+    state.last_fetched.lock().unwrap().clear();
+    state.store.lock().unwrap().insert(
+        "b".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(resets_at.clone()),
+            }),
+            ..Default::default()
+        },
+    );
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Fresh);
+    // Neither the poll nor this test spends a request on `/profile`.
+    crate::usage::take_profile_fetch(
+        &crate::profile::ProfileName::from("a"),
+        false,
+        crate::usage::now_ms(),
+    );
+
+    let full = format!(r#"{{"five_hour":{{"utilization":100.0,"resets_at":"{resets_at}"}}}}"#);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let side_reads = Arc::new(AtomicUsize::new(0));
+    let queued_at_read = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pending = state.pending_switch.clone();
+    let (base, server) = crate::testutil::serve_endpoints_raw(8, {
+        let polls = Arc::clone(&polls);
+        let side_reads = Arc::clone(&side_reads);
+        let queued_at_read = Arc::clone(&queued_at_read);
+        let pending = Arc::clone(&pending);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                side_reads.fetch_add(1, Ordering::SeqCst);
+                queued_at_read
+                    .lock()
+                    .unwrap()
+                    .push(!pending.lock().unwrap().is_empty());
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/usage" {
+                polls.fetch_add(1, Ordering::SeqCst);
+                (200, full.clone())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "the active member polls once"
+    );
+    assert_eq!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get("a")
+            .and_then(|info| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(100.0),
+        "the poll's landing crossed the window to full"
+    );
+    assert_eq!(
+        side_reads.load(Ordering::SeqCst),
+        1,
+        "the tick reads one due member: the crossing's"
+    );
+    assert_eq!(
+        *queued_at_read.lock().unwrap(),
+        vec![true],
+        "the side read went out after the switch scan had queued its decision"
+    );
+    // The other paired member's hourly read waits for a later tick.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        side_reads.load(Ordering::SeqCst),
+        2,
+        "the next tick reads the other paired member"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "the next tick's poll is inside the active member's interval"
+    );
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    let targets: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.target.clone())
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["b".to_string()],
+        "the crossing queued the switch onto the other member"
+    );
+}
+
+/// An account whose last poll answered 429 gets no side read and no memo stamp
+/// while the Retry-After deferral stands, so once the poll clears it the read
+/// happens at once instead of waiting out an hour stamped inside the backoff.
+#[test]
+fn a_rate_limited_account_sends_no_resets_read_until_its_deferral_clears() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr4rl", "lr4rl-tok");
+    crate::testutil::register_names(&["lr4rl"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("lr4rl".to_string(), super::FetchStatus::RateLimited);
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "a rate-limited account sends no side read inside its deferral"
+    );
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("lr4rl".to_string(), super::FetchStatus::Fresh);
+    // The same instant: a stamp taken under the deferral would hold the hour.
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "clear of the deferral, the account reads at once"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// The third-party half's forget leaves the banked-reset reading alone: the
+/// count belongs to the claude login, which an api-key change does not touch.
+#[test]
+fn a_third_party_forget_keeps_the_banked_resets_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("kept");
+    crate::testutil::write_claude_limit_resets("kept", 3, &[], None, 1_700_000_000_000);
+    let path = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    assert!(path.exists(), "fixture control: the reading is on disk");
+    crate::usage::forget_disk(&name, crate::usage::Half::ThirdParty);
+    assert!(
+        path.exists(),
+        "the third-party forget keeps the claude login's reading"
+    );
+}
+
+/// The seed's guards: a reading whose stamp is absent (a file written before
+/// the stamp existed), one stamped after the scheduler's clock (the clock
+/// stepped back), and one whose bytes do not parse each read on the first
+/// pass. The within-the-hour control beside them keeps its hour, so the
+/// three reads are the guards' doing, not a fixture that wrote no files.
+#[test]
+fn a_stamp_less_future_or_corrupt_reading_reads_on_the_first_pass() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let kept = save_unanchored_login("lr4k", "lr4k-tok");
+    let stamp_less = save_unanchored_login("lr40", "lr40-tok");
+    let future = save_unanchored_login("lr4f", "lr4f-tok");
+    let corrupt = save_unanchored_login("lr4c", "lr4c-tok");
+    crate::testutil::register_names(&["lr4k", "lr40", "lr4f", "lr4c"]);
+    let t = crate::usage::now_ms();
+    let hour = 60 * 60 * 1000;
+    let minute = 60_000;
+    crate::testutil::write_claude_limit_resets("lr4k", 2, &[], None, t - 10 * minute);
+    crate::testutil::write_claude_limit_resets("lr4f", 2, &[], None, t + hour);
+    // Both irregular files are written over a valid reading, so the fixture
+    // proves the leg's own path rather than a missing directory.
+    crate::testutil::write_claude_limit_resets("lr40", 2, &[], None, t);
+    let stamp_less_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr40"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &stamp_less_path,
+        r#"{"usable":2,"clears":[],"ends_at":null}"#,
+    )
+    .expect("write a stamp-less reading");
+    crate::testutil::write_claude_limit_resets("lr4c", 2, &[], None, t);
+    let corrupt_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr4c"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(&corrupt_path, "{\"usable\":").expect("write a corrupt reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![kept, stamp_less, future, corrupt]);
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the stamp-less, the future-stamped and the corrupt readings each read on the first pass"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A stored login another process replaces while the side read is in flight
+/// (a CLI `clauth login`) owns the account: this process's epoch does not
+/// move, so only the stored-identity compare under the state flock keeps the
+/// old login's count out of a file re-created under a fresh hour. The
+/// unstamped account is considered again inside the hour.
+#[test]
+fn a_login_change_in_flight_keeps_the_old_count_out_of_the_file() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr4id", "lr4id-tok");
+    crate::testutil::register_names(&["lr4id"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let replaced = Arc::new(AtomicBool::new(false));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        let replaced = Arc::clone(&replaced);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                // The re-login lands while the read it races is on the wire.
+                if !replaced.swap(true, Ordering::SeqCst) {
+                    save_unanchored_login("lr4id", "lr4id-new-tok");
+                }
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr4id");
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the read went out under the stored token"
+    );
+    assert!(
+        !file.exists(),
+        "a read whose stored login changed lands no reading"
+    );
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .last_read_at
+            .contains_key("lr4id"),
+        "a read whose stored login changed stamps no hour"
+    );
+
+    // The skip left no hour behind: the account is considered again inside it.
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the unstamped account reads again inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A credentials store that cannot be read at the write's compare blocks the
+/// file write but keeps the hour: the reload compare never forgets an
+/// unreadable half, so an unstamped account would re-read at the request
+/// spacing, not once an hour. Only a READABLE moved login drops the stamp.
+#[test]
+fn an_unreadable_credentials_store_blocks_the_write_but_keeps_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr8u", "lr8u-tok");
+    crate::testutil::register_names(&["lr8u"]);
+    let name = crate::profile::ProfileName::from("lr8u");
+    let store = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
+    std::fs::write(&store, "{\"claude_ai_oauth\":").expect("write an unreadable store");
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the read goes out");
+    assert!(
+        !file.exists(),
+        "an unreadable store blocks the reading's write"
+    );
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the unreadable store's attempt still stamps the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A forget landing between the seed's file read and its memo apply must not
+/// date the new login's hour from the old reading: the epoch captured at the
+/// snapshot no longer matches, so the seed is skipped and the account reads on
+/// the next pass instead of waiting out the old file's hour.
+#[test]
+fn a_forget_between_the_seed_read_and_its_apply_leaves_the_name_unseeded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr8s", "lr8s-tok");
+    crate::testutil::register_names(&["lr8s"]);
+    let name = crate::profile::ProfileName::from("lr8s");
+    let t = crate::usage::now_ms();
+    let minute = 60_000;
+    crate::testutil::write_claude_limit_resets("lr8s", 2, &[], None, t - 10 * minute);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    // The re-login's forget: the disk removal plus the memory drop.
+    super::set_claude_resets_seed_apply_hook("lr8s", {
+        let stores = state.memory_stores();
+        let name = name.clone();
+        move || {
+            crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+            crate::usage::forget_memory(&stores, &name, crate::usage::Half::OAuth);
+        }
+    });
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the moved name is skipped, so it sends no read under the old login"
+    );
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the next pass reads under the new login instead of the old file's hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A tick reads at most one due account: with two due and one marked due by a
+/// landing, the tick reads the marked one and the next tick reads the other.
+/// The bound is the tick path's alone — a direct `claude_resets_tick_at` pass
+/// still reads every due account.
+#[test]
+fn a_tick_reads_one_due_account_and_the_next_tick_reads_the_other() {
+    let home = crate::testutil::HomeSandbox::new();
+    let a = save_unanchored_login("lr9a", "lr9a-tok");
+    let b = save_unanchored_login("lr9b", "lr9b-tok");
+    crate::testutil::register_names(&["lr9a", "lr9b"]);
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, |path, _| {
+        if path == CEDAR_EMBER_READ {
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        } else {
+            (200, "{}".to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![a, b]);
+    // Neither account polls inside these ticks, so every request the stub
+    // records is a side read.
+    let deferred = FetchStamp::at(EpochMs::from_millis(
+        crate::usage::now_ms() + 2 * REFRESH_INTERVAL_MS,
+    ));
+    for name in ["lr9a", "lr9b"] {
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .insert(oauth_key(name), deferred);
+    }
+    // A landing's due mark leads even though `lr9a` comes first off the
+    // config walk.
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lr9b".to_string());
+    let file = |name: &str| {
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path")
+    };
+
+    super::tick(&state);
+    assert!(
+        file("lr9b").exists(),
+        "the tick reads the due-marked account"
+    );
+    assert!(
+        !file("lr9a").exists(),
+        "the tick leaves the other due account for a later tick"
+    );
+
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert!(
+        file("lr9a").exists(),
+        "the next tick reads the account left over"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A side-read stub that parks every request on its own thread until
+/// [`ParkedResets::release`], then answers it with three grants, so a parked
+/// read holds no listener. Drop releases and stops it, and never asserts.
+struct ParkedResets {
+    base: String,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParkedResets {
+    fn new() -> Self {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let (reads, gate, stop) = (Arc::clone(&reads), Arc::clone(&gate), Arc::clone(&stop));
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    let (reads, gate) = (Arc::clone(&reads), Arc::clone(&gate));
+                    std::thread::spawn(move || {
+                        let _ = sock.set_nonblocking(false);
+                        let _ = crate::testutil::read_request_head(&mut sock);
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        let (open, cvar) = &*gate;
+                        let guard = open.lock().unwrap_or_else(|e| e.into_inner());
+                        let _open = cvar
+                            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| {
+                                !*open
+                            })
+                            .unwrap_or_else(|e| e.into_inner());
+                        let body = CEDAR_EMBER_THREE_GRANTS;
+                        let _ = write!(
+                            sock,
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            }
+        });
+        Self {
+            base,
+            reads,
+            gate,
+            stop,
+            listener: Some(handle),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        let (open, cvar) = &*self.gate;
+        *open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for ParkedResets {
+    fn drop(&mut self) {
+        self.release();
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Wait out a left-running worker: its exit clears the account's activity row.
+fn wait_for_no_activity(state: &super::SchedulerState, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while state.activity.lock().unwrap().contains_key(name) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the left-running read of {name} never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_reads(stub: &ParkedResets, count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while stub.reads() < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {count} reads arrived",
+            stub.reads()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A side read that never answers leaves the pass at the tick's fetch deadline,
+/// well inside the read's own 15 s bound. The account's poll row owes it
+/// nothing: no status, no fetch mark, no held-off poll. Giving up on the read
+/// counts as a failed read, so it dates the hour and its late answer lands
+/// nothing.
+#[test]
+fn a_hung_resets_read_is_left_running_and_its_late_answer_lands_nothing() {
+    use std::time::{Duration, Instant};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh1", "lrh1-tok");
+    crate::testutil::register_names(&["lrh1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lrh1"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    super::claude_resets_tick_at(&state, t);
+    let took = started.elapsed();
+    drop(capture);
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the pass waited {took:?} on a hung read past a 300 ms deadline"
+    );
+    wait_for_reads(&stub, 1);
+    let logged = lines.snapshot();
+    let named: Vec<&String> = logged.iter().filter(|l| l.contains("'lrh1'")).collect();
+    assert_eq!(named.len(), 1, "one line names the account: {logged:?}");
+    assert!(
+        !named[0].contains("marked failed"),
+        "the side read marks no account failed: {named:?}"
+    );
+    assert!(
+        !state.status.lock().unwrap().contains_key("lrh1"),
+        "the side read owns no status row"
+    );
+    {
+        let activity = state.activity.lock().unwrap();
+        let row = activity.get("lrh1").expect("the left-running read's row");
+        assert!(row.fetch(FetchLeg::OAuth).is_none(), "no poll mark");
+        assert!(!row.late(FetchLeg::OAuth), "the poll is not held off");
+    }
+
+    stub.release();
+    wait_for_no_activity(&state, "lrh1");
+    assert!(!file.exists(), "a late answer lands nothing");
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 1);
+    assert_eq!(stub.reads(), 1, "the given-up read dates the hour");
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + hour);
+    assert_eq!(stub.reads(), 2, "the next hour reads again");
+    assert!(file.exists(), "a read that answers in time lands");
+
+    drop(endpoints);
+}
+
+/// While a read is left running its account gets no second one, whatever marks
+/// it due; the mark waits and fires once the read has exited.
+#[test]
+fn a_left_running_resets_read_gets_no_second_read_until_it_exits() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh2", "lrh2-tok");
+    crate::testutil::register_names(&["lrh2"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    let started = std::time::Instant::now();
+    super::claude_resets_tick_at(&state, t);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the pass waited {took:?} on a hung read past a 300 ms deadline"
+    );
+    wait_for_reads(&stub, 1);
+
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrh2".to_string());
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        stub.reads(),
+        1,
+        "no second read beside the left-running one"
+    );
+
+    stub.release();
+    wait_for_no_activity(&state, "lrh2");
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 2);
+    assert_eq!(stub.reads(), 2, "the due mark fires once the read exited");
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .due
+            .contains("lrh2"),
+        "the read consumed the mark"
+    );
+
+    drop(endpoints);
+}
+
+/// A due mark sorts first, so a marked account with a read left running would
+/// take the pass's one read if it left the due set after the limit.
+#[test]
+fn a_left_running_resets_read_leaves_the_passes_one_read_to_the_next_account() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let first = save_unanchored_login("lrl1", "lrl1-tok");
+    let second = save_unanchored_login("lrl2", "lrl2-tok");
+    crate::testutil::register_names(&["lrl1", "lrl2"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![first, second]);
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    wait_for_reads(&stub, 1);
+
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrl1".to_string());
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    wait_for_reads(&stub, 2);
+    assert!(
+        state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .due
+            .contains("lrl1"),
+        "the mark waits for the left-running read"
+    );
+
+    stub.release();
+    wait_for_no_activity(&state, "lrl1");
+    wait_for_no_activity(&state, "lrl2");
+    drop(endpoints);
+}
+
+/// A poll left running keeps its account's side read waiting without spending
+/// it: the skip stamps no hour, keeps the due mark and leaves the pass's one
+/// read to the next account, and the account reads once the poll has exited.
+#[test]
+fn a_poll_left_running_holds_the_resets_read_unstamped() {
+    let home = crate::testutil::HomeSandbox::new();
+    let held = save_unanchored_login("lrp1", "lrp1-tok");
+    let next = save_unanchored_login("lrp2", "lrp2-tok");
+    crate::testutil::register_names(&["lrp1", "lrp2"]);
+    let stub = ParkedResets::new();
+    stub.release();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![held, next]);
+    let file = |name: &str| {
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path")
+    };
+    let t = 1_900_000_000_000;
+    state
+        .activity
+        .lock()
+        .unwrap()
+        .entry("lrp1".to_string())
+        .or_default()
+        .oauth_late = 1;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrp1".to_string());
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    assert_eq!(
+        stub.reads(),
+        1,
+        "the pass's one read goes to the next account"
+    );
+    assert!(file("lrp2").exists(), "the next account landed");
+    assert!(!file("lrp1").exists(), "the held account sent no read");
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert!(memo.due.contains("lrp1"), "the skip keeps the due mark");
+        assert!(
+            !memo.last_read_at.contains_key("lrp1"),
+            "the skip stamps no hour"
+        );
+    }
+
+    state.activity.lock().unwrap().remove("lrp1");
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    assert_eq!(
+        stub.reads(),
+        2,
+        "the account reads once its poll has exited"
+    );
+    assert!(file("lrp1").exists(), "its reading landed");
+
+    drop(endpoints);
+}
+
+/// A token spend on the account keeps its side read waiting without spending
+/// it: the read would send the token the spend is replacing. The skip stamps no
+/// hour and keeps the due mark, and the account reads once the spend has ended.
+#[test]
+fn a_token_spend_holds_the_resets_read_unstamped() {
+    let home = crate::testutil::HomeSandbox::new();
+    let held = save_unanchored_login("lrt1", "lrt1-tok");
+    crate::testutil::register_names(&["lrt1"]);
+    let stub = ParkedResets::new();
+    stub.release();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![held]);
+    let name = crate::profile::ProfileName::from("lrt1");
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrt1".to_string());
+    super::mark_activity(&state.activity, &name, ProfileActivity::Refreshing);
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    assert_eq!(stub.reads(), 0, "no read beside the spend");
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert!(memo.due.contains("lrt1"), "the skip keeps the due mark");
+        assert!(
+            !memo.last_read_at.contains_key("lrt1"),
+            "the skip stamps no hour"
+        );
+    }
+
+    super::clear_activity(&state.activity, &name);
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    assert_eq!(
+        stub.reads(),
+        1,
+        "the account reads once the spend has ended"
+    );
+
+    drop(endpoints);
+}
+
+/// The side read spends no token and lands nothing, so what a switch or a
+/// rotate-all waits on does not wait on it.
+#[test]
+fn a_left_running_resets_read_leaves_the_account_free_to_switch() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrf1", "lrf1-tok");
+    crate::testutil::register_names(&["lrf1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+    wait_for_reads(&stub, 1);
+
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("lrf1")
+            .is_some_and(|row| row.late(FetchLeg::ClaudeResets)),
+        "the read is left running"
+    );
+    assert!(super::is_idle(
+        &state.activity,
+        &crate::profile::ProfileName::from("lrf1")
+    ));
+    assert!(!super::any_busy(&state.activity));
+
+    stub.release();
+    wait_for_no_activity(&state, "lrf1");
+    drop(endpoints);
+}
+
+/// What a read that never ran leaves behind: its attempt dates the hour and
+/// consumes the due mark, and nothing of the poll's or the file moves.
+fn assert_resets_attempt_dated(
+    state: &super::SchedulerState,
+    name: &str,
+    at: u64,
+    lines: &crate::logline::LogLines,
+    stub: &ParkedResets,
+) {
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert_eq!(memo.last_read_at.get(name), Some(&at), "the attempt's hour");
+        assert!(!memo.due.contains(name), "the attempt consumed the mark");
+    }
+    let logged = lines.snapshot();
+    let quoted = format!("'{name}'");
+    let named: Vec<&String> = logged.iter().filter(|l| l.contains(&quoted)).collect();
+    assert_eq!(named.len(), 1, "one line names the account: {logged:?}");
+    assert_eq!(stub.reads(), 0, "no request went out");
+    assert!(!state.status.lock().unwrap().contains_key(name));
+    assert!(!state.activity.lock().unwrap().contains_key(name));
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(!file.exists(), "no reading landed");
+}
+
+/// A worker that panics counts as a failed read, on the reap's panic arm.
+#[test]
+fn a_panicked_resets_read_dates_the_hour_with_one_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lrk1", "lrk1-tok");
+    crate::testutil::register_names(&["lrk1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrk1".to_string());
+
+    let _armed = super::probe_panic::arm_panic_at("lrk1", || {});
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_at(&state, t);
+    drop(capture);
+
+    assert_resets_attempt_dated(&state, "lrk1", t, &lines, &stub);
+    drop(endpoints);
+}
+
+/// A worker that could not start counts as a failed read too, on the spawn's
+/// `Err` arm.
+#[test]
+fn a_resets_read_that_cannot_start_dates_the_hour_with_one_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lrs1", "lrs1-tok");
+    crate::testutil::register_names(&["lrs1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrs1".to_string());
+
+    let _armed = super::probe_spawn_fail::arm_at("lrs1");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_at(&state, t);
+    drop(capture);
+
+    assert_resets_attempt_dated(&state, "lrs1", t, &lines, &stub);
+    drop(endpoints);
 }

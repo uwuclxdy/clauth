@@ -60,6 +60,18 @@ impl ResetStatus {
         let id = self.next_grant_id.as_deref()?;
         self.grants.iter().find(|g| g.id == id)
     }
+
+    /// The account's banked resets usable now: the sum of `resets_left` over
+    /// grants the server marks usable. The scheduler's side read lands this
+    /// count in `limit_resets.json`. Saturated, as the codex arm clamps its
+    /// server count: a body whose grants sum past `u32::MAX` reads as maxed,
+    /// never wraps or panics.
+    pub(crate) fn usable_resets(&self) -> u32 {
+        self.grants
+            .iter()
+            .filter(|g| g.usable_now)
+            .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
+    }
 }
 
 /// One grant, as the status block lists it. Every field but `id` defaults, so
@@ -92,6 +104,17 @@ impl Grant {
     /// Whether the server marks this grant spendable now.
     pub(crate) fn is_usable_now(&self) -> bool {
         self.usable_now
+    }
+
+    /// The window names this grant clears, raw server spelling — the side
+    /// read's file and the TUI's labels both take them off here.
+    pub(crate) fn clears(&self) -> &[String] {
+        &self.clears
+    }
+
+    /// The grant's ISO end stamp, raw server spelling.
+    pub(crate) fn ends_at(&self) -> Option<&str> {
+        self.ends_at.as_deref()
     }
 
     /// The server's label, or the generic name; control characters dropped,
@@ -247,6 +270,16 @@ pub(crate) fn read_url(origin: &str) -> String {
     format!("{origin}{READ_PATH}")
 }
 
+/// The side read's URL off the poll's own resolved `/usage` endpoint: that
+/// endpoint already ends in the path [`READ_PATH`] spells, so only its query
+/// flags join — the flags are spelled once, in [`READ_PATH`].
+pub(crate) fn read_url_from_endpoint(endpoint: &str) -> String {
+    let Some((_, query)) = READ_PATH.split_once('?') else {
+        return format!("{endpoint}{READ_PATH}");
+    };
+    format!("{endpoint}?{query}")
+}
+
 pub(crate) fn org_url(origin: &str) -> String {
     format!("{origin}{PROFILE_PATH}")
 }
@@ -266,8 +299,9 @@ pub(crate) fn new_request_id() -> anyhow::Result<String> {
 
 /// A cleared-window name as the terminal reads it: the short labels Claude
 /// Code's own copy uses, any other name as sent with its control characters
-/// dropped and cut to 40.
-fn window_label(name: &str) -> String {
+/// dropped and cut to 40. Shared by `--list` and the TUI's resets row, so the
+/// two surfaces never spell a label apart.
+pub(crate) fn window_label(name: &str) -> String {
     match name {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
@@ -397,12 +431,7 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
     let next = status.next_grant();
     let mut lines = vec![match next {
         Some(_) => {
-            let count: u32 = status
-                .grants
-                .iter()
-                .filter(|g| g.usable_now)
-                .map(|g| g.resets_left)
-                .sum();
+            let count = status.usable_resets();
             format!(
                 "clauth: '{name}' has {count} limit reset{} usable now.",
                 plural(count as usize)

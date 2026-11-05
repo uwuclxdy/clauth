@@ -666,3 +666,72 @@ fn an_unrecognized_result_is_cut_after_it_is_escaped() {
         ))
     );
 }
+
+/// Usable counts summing past `u32::MAX` read as maxed, never wrapping (a
+/// release build) or overflowing (a debug-build panic) — the codex arm clamps
+/// its server count the same way. A grant not usable now contributes nothing.
+#[test]
+fn usable_resets_saturates_instead_of_overflowing() {
+    let grant = |id: &str, left: u32, usable_now: bool| Grant {
+        id: id.to_string(),
+        label: String::new(),
+        resets_total: left,
+        resets_left: left,
+        ends_at: None,
+        clears: vec![],
+        paused: false,
+        usable_now,
+        percent_used: std::collections::HashMap::new(),
+        unavailable_reason: None,
+    };
+    let status = ResetStatus {
+        grants: vec![
+            grant("g1", u32::MAX, true),
+            grant("g2", u32::MAX, true),
+            grant("g3", u32::MAX, false),
+        ],
+        ..ResetStatus::default()
+    };
+    assert_eq!(status.usable_resets(), u32::MAX);
+    let just_one = ResetStatus {
+        grants: vec![grant("g1", u32::MAX, true)],
+        ..ResetStatus::default()
+    };
+    assert_eq!(
+        just_one.usable_resets(),
+        u32::MAX,
+        "one maxed grant is maxed"
+    );
+}
+
+/// `--list`'s count line reads the same saturated count the side read lands:
+/// two usable grants at `u32::MAX` say `4294967295`, never a wrapped sum or an
+/// overflow panic, and the grant that is not usable now adds nothing.
+#[test]
+fn the_list_count_line_saturates_like_the_side_read() {
+    let grant = |id: &str, left: u32, usable_now: bool| Grant {
+        id: id.to_string(),
+        label: String::new(),
+        resets_total: left,
+        resets_left: left,
+        ends_at: None,
+        clears: vec![],
+        paused: false,
+        usable_now,
+        percent_used: std::collections::HashMap::new(),
+        unavailable_reason: None,
+    };
+    let status = ResetStatus {
+        grants: vec![
+            grant("g1", u32::MAX, true),
+            grant("g2", u32::MAX, true),
+            grant("g3", 7, false),
+        ],
+        next_grant_id: Some("g1".to_string()),
+        ..ResetStatus::default()
+    };
+    assert_eq!(
+        describe_grants("cl1", &status)[0],
+        "clauth: 'cl1' has 4294967295 limit resets usable now."
+    );
+}

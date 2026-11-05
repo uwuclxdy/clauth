@@ -247,6 +247,12 @@ pub(crate) mod rank {
         /// codex landing's section 2, which also takes the usage stores (300/350)
         /// — so it ranks above them all as a leaf.
         CodexPolled = 1150;
+        /// Claude banked-reset side-read memo (`usage::scheduler`'s
+        /// `ClaudeResetsMemo`, one per scheduler state). The same leaf shape
+        /// as `CodexPolled`: taken alone by the leg (under `Config`, 400), the
+        /// forget and rename paths, and the landing's transition detector, so
+        /// it ranks above everything any of those nests with.
+        ClaudeResets = 1155;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true

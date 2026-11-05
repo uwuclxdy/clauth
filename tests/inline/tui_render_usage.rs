@@ -5918,7 +5918,7 @@ fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
         [
             "type      codex",
             "plan      plus",
-            "resets    ↺ 2 banked",
+            "resets    2 left",
             "status    ◌ read 2h ago",
             "",
         ],
@@ -5944,6 +5944,99 @@ fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
     assert_eq!(detail.len(), 10, "nothing after the 7d bar: {detail:?}");
 }
 
+/// The claude pane's `resets` rows, whitespace runs folded to one space so
+/// the pin reads the words, not the key column's width.
+fn claude_resets_rows(detail: &[String]) -> Vec<String> {
+    detail
+        .iter()
+        .filter(|r| r.starts_with("resets"))
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// `ends` as the resets line dates it: the local month and day.
+fn local_day(ends_secs: i64) -> String {
+    use chrono::TimeZone as _;
+    chrono::Local
+        .timestamp_opt(ends_secs, 0)
+        .single()
+        .expect("a local instant")
+        .format("%b %-d")
+        .to_string()
+}
+
+/// A claude account's pane carries its banked resets off the hourly side
+/// read: the usable count, the windows the next grant clears and its end;
+/// a reading under 75 min old carries no age.
+#[test]
+fn the_usage_claude_pane_shows_its_banked_resets() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ends = crate::usage::now_epoch_secs() + 20 * 86_400;
+    let ends_iso = chrono::DateTime::from_timestamp(ends, 0)
+        .expect("instant")
+        .to_rfc3339();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour", "seven_day"],
+        Some(&ends_iso),
+        crate::usage::now_ms() - 10 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        [format!(
+            "resets 1 left · clears 5h, 7d · until {}",
+            local_day(ends)
+        )],
+        "{detail:?}"
+    );
+}
+
+/// A reading older than 75 min (a missed hourly read) says its age.
+#[test]
+fn a_stale_claude_resets_reading_says_its_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - (3 * 3600 + 5 * 60) * 1000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2 left · clears 5h · read 3h ago"],
+        "{detail:?}"
+    );
+}
+
+/// No usable reset, or no reading at all: no `resets` row on a claude pane.
+#[test]
+fn a_claude_pane_without_a_usable_reset_has_no_resets_row() {
+    for usable in [Some(0), None] {
+        let _home = crate::testutil::HomeSandbox::new();
+        if let Some(n) = usable {
+            crate::testutil::write_claude_limit_resets(
+                "cl1",
+                n,
+                &["five_hour"],
+                None,
+                crate::usage::now_ms() - 60_000,
+            );
+        }
+        let app = t6_app();
+        let (_, detail) = t6_panes(&app);
+        assert!(
+            claude_resets_rows(&detail).is_empty(),
+            "usable {usable:?}: {detail:?}"
+        );
+    }
+}
+
 /// A quarantined codex account names it on a `login` row between `plan` and
 /// `resets`; without the quarantine the row is gone (the pane pin above).
 #[test]
@@ -5963,7 +6056,7 @@ fn a_quarantined_codex_account_shows_its_login_row() {
             "type      codex",
             "plan      plus",
             "login     [ needs re-login ]",
-            "resets    ↺ 2 banked",
+            "resets    2 left",
         ],
         "{detail:?}"
     );
@@ -6218,4 +6311,104 @@ fn a_third_party_stat_key_renders_dim_and_bold() {
     let spans = key_value_span("remaining", "$4.20", Style::default(), 8);
     assert_eq!(spans[0].content.trim(), "remaining");
     assert_eq!(spans[0].style, theme::label());
+}
+
+/// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
+/// reading shows the `resets` row: the file's presence is the one predicate,
+/// the same one the Overview chip reads, so the pane never narrows it to
+/// pure-OAuth accounts.
+#[test]
+fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["cl1"]);
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - 60_000,
+    );
+    let mut profile = crate::profile::Profile::new(
+        "cl1".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-hybrid".to_string()),
+    );
+    profile.credentials = Some(crate::testutil::oauth_pair("cl1"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("cl1")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.tab = crate::tui::app::Tab::Usage;
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 left · clears 5h"],
+        "{detail:?}"
+    );
+}
+
+/// The claude `resets` row sits right under the plan row — the pane's first
+/// two rows — wherever the other rows fall.
+#[test]
+fn the_claude_resets_row_sits_right_under_the_plan_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert!(
+        detail[0].starts_with("plan"),
+        "the plan row leads the pane: {detail:?}"
+    );
+    assert!(
+        detail[1].starts_with("resets"),
+        "the resets row sits right under the plan row: {detail:?}"
+    );
+}
+
+/// The age part appears only once the reading is older than 75 min: 74 min
+/// shows no `· read` part, 76 min says `1h`. The code compares strictly
+/// (`>`), so exactly 75 min is not aged; the renderer reads the real clock,
+/// so the pins sit one minute off the boundary instead of on it.
+#[test]
+fn the_resets_row_says_its_age_only_past_75_minutes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &[],
+        None,
+        crate::usage::now_ms() - 74 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 left"],
+        "74 min: no age part: {detail:?}"
+    );
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &[],
+        None,
+        crate::usage::now_ms() - 76 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 left · read 1h ago"],
+        "76 min: the age part: {detail:?}"
+    );
 }

@@ -215,7 +215,7 @@ fn draw_overview_accounts(
         OverviewWidths::new(list_area.width, app, readings)
     };
     let band_pad = if list_area.width > OVERVIEW_MAX_W {
-        let band_w = widths.row_width() + widths.codex_chip_w;
+        let band_w = widths.row_width() + widths.chip_w;
         // A row the tiers cannot fit into the cap (a codex reading too wide for
         // even the bare tiers, which `codex_label` prints unclamped) outgrows
         // the band; it draws flush left and clipped, as it did before the band
@@ -322,11 +322,13 @@ struct OverviewWidths {
     live: usize,
     /// `TPS_W` when the per-account speed column fits, `0` when it is dropped.
     tps: usize,
-    /// The codex rows' trailing `↺ N` chip slot (gap + the widest visible chip
-    /// text), charged whenever a visible codex row carries a banked reset and
-    /// the row has room for it; `0` when none does or the chip sheds whole, so
-    /// the renderer drops the chip instead of clipping it mid-glyph.
-    codex_chip_w: usize,
+    /// The rows' trailing `↺ N` chip slot (gap + the widest visible chip text
+    /// across codex and claude rows), charged whenever a visible row of either
+    /// kind carries a banked reset and the row has room for it; `0` when none
+    /// does or the chip sheds whole, so the renderer drops the chip instead of
+    /// clipping it mid-glyph. One shared slot: a chip never clips and sheds
+    /// the same way on both kinds.
+    chip_w: usize,
     gap: usize,
     /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
     /// currencies align in the column. `0` when no DeepSeek balance is cached.
@@ -441,7 +443,7 @@ impl OverviewWidths {
 
     /// The banded layout: the panel is past [`OVERVIEW_MAX_W`], so the columns
     /// lay out at the cap. There t/s outranks the wall-clock stamps — the bonus
-    /// charges only true slack — and the codex chip never pays with the name
+    /// charges only true slack — and the `↺ N` chip never pays with the name
     /// column: the name keeps its uncharged width and a chip that does not fit
     /// hides whole.
     fn new_banded(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
@@ -501,9 +503,9 @@ impl OverviewWidths {
             LabelWidths::default()
         };
         let labels = claude_labels.widest(codex_labels).widest(pool_labels);
-        // The widest `↺ N` chip text across visible codex rows, `0` when none
-        // carries a banked reset. Only the text: the gap before it joins the
-        // column gaps in the width budget below.
+        // The widest `↺ N` chip text across visible codex and claude rows, `0`
+        // when none carries a banked reset. Only the text: the gap before it
+        // joins the column gaps in the width budget below.
         let codex_chip_text = if app.harness_filter.shows_codex() {
             app.codex_rows
                 .iter()
@@ -514,6 +516,20 @@ impl OverviewWidths {
         } else {
             0
         };
+        let claude_chip_text = if app.harness_filter.shows_claude() {
+            app.config()
+                .profiles
+                .iter()
+                .filter_map(|p| app.claude_resets.get(p.name.as_str()))
+                .map(|r| r.usable)
+                .filter(|count| *count > 0)
+                .map(|count| grapheme_cells(&format!("↺ {count}")))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let chip_text = codex_chip_text.max(claude_chip_text);
         let (five_excess, seven_excess) = labels.excess();
         let (mut name, kind, mut five_hour, mut seven_day) =
             overview_tiers(max_name, total, labels);
@@ -582,18 +598,14 @@ impl OverviewWidths {
         // real leftover instead.
         let mut gap =
             (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
-        let mut codex_chip_w = if codex_chip_text > 0 {
-            gap + codex_chip_text
-        } else {
-            0
-        };
+        let mut chip_w = if chip_text > 0 { gap + chip_text } else { 0 };
 
         // The name column is the one flexible text column (the only column that
         // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
         // is at its ceiling and the clock bonus has taken what it wants, spare
-        // width goes to the name instead of stranding at the row end. The codex
-        // chip slot is charged after this, so the name absorbs its own slack
-        // exactly as it would without the chip.
+        // width goes to the name instead of stranding at the row end. The chip
+        // slot is charged after this, so the name absorbs its own slack exactly
+        // as it would without the chip.
         if gap == 8 {
             name += total.saturating_sub(
                 fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
@@ -605,20 +617,20 @@ impl OverviewWidths {
         // `NAME_READING_FLOOR`. Past that the chip sheds whole, nothing
         // charged: the name and gap revert to the uncharged layout, and the
         // renderer drops the chip rather than letting it peek in.
-        if codex_chip_text > 0 {
+        if chip_text > 0 {
             let name_uncharged = name;
             let gap_uncharged = gap;
             loop {
                 let row =
                     fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
                         + TIMER_SLOT
-                        + codex_chip_w;
+                        + chip_w;
                 if row <= total {
                     break;
                 }
                 if gap > GAP_MIN {
                     gap -= 1;
-                    codex_chip_w = gap + codex_chip_text;
+                    chip_w = gap + chip_text;
                 } else if !banded && name > NAME_READING_FLOOR {
                     // Banded, the name column keeps its uncharged width: the
                     // chip rides only the slack that is left once the name has
@@ -627,7 +639,7 @@ impl OverviewWidths {
                 } else {
                     name = name_uncharged;
                     gap = gap_uncharged;
-                    codex_chip_w = 0;
+                    chip_w = 0;
                     break;
                 }
             }
@@ -652,7 +664,7 @@ impl OverviewWidths {
             seven_day,
             live,
             tps,
-            codex_chip_w,
+            chip_w,
             gap,
             deepseek_amount_w,
             claude_labels,
@@ -662,12 +674,12 @@ impl OverviewWidths {
     }
 
     /// The width the table's widest row draws at these columns, before the
-    /// codex `↺ N` chip: the cursor and bell prefix, every column and its gap,
-    /// and the timer slot. The band centres on this plus [`Self::codex_chip_w`]:
-    /// the chip rides the row's trailing gap, so the widest row the layout can
-    /// draw is `row_width() + codex_chip_w` wide, and centring on `row_width()`
-    /// alone spends the leftover on the left margin that the chip's ride also
-    /// needs, clipping the chip just above the cap.
+    /// `↺ N` chip: the cursor and bell prefix, every column and its gap, and
+    /// the timer slot. The band centres on this plus [`Self::chip_w`]: the
+    /// chip rides the row's trailing gap, so the widest row the layout can
+    /// draw is `row_width() + chip_w` wide, and centring on `row_width()` alone
+    /// spends the leftover on the left margin that the chip's ride also needs,
+    /// clipping the chip just above the cap.
     fn row_width(&self) -> usize {
         fixed_overview_width_cols(
             self.name,
@@ -1016,7 +1028,7 @@ fn render_codex_row(
         spans.push(gap(widths));
         spans.push(Span::raw(" ".repeat(widths.tps)));
     }
-    if widths.codex_chip_w > 0
+    if widths.chip_w > 0
         && let Some(count) = row.resets
     {
         spans.push(gap(widths));
@@ -1497,6 +1509,19 @@ fn render_overview_row(
     if widths.tps > 0 {
         spans.push(gap(widths));
         spans.push(tps_cell(app, &profile.name, widths.tps));
+    }
+    // The banked-reset chip trails the columns on claude rows exactly as it
+    // does on codex rows: the shared slot above, so it sheds the same way and
+    // never sits under `live` or `t/s`.
+    if widths.chip_w > 0
+        && let Some(count) = app
+            .claude_resets
+            .get(profile.name.as_str())
+            .map(|r| r.usable)
+            .filter(|n| *n > 0)
+    {
+        spans.push(gap(widths));
+        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
 
     Line::from(spans)

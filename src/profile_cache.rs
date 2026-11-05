@@ -19,6 +19,10 @@ use crate::profile::ProfileName;
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
 pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
+/// Filename of the claude banked-reset side read's cache, relative to the
+/// per-profile dir. Written by the scheduler's hourly side read alone; the
+/// plain poll never touches it.
+pub(crate) const LIMIT_RESETS_FILE: &str = "limit_resets.json";
 
 /// The account uuid this profile's login last authenticated as (a bare JSON
 /// string). Derived data, backfilled on login and on every successful mirror
@@ -617,6 +621,7 @@ fn expected_cache_file<T: 'static>() -> Option<&'static str> {
     match TypeId::of::<T>() {
         t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
         t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
+        t if t == TypeId::of::<crate::usage::LimitResets>() => Some(LIMIT_RESETS_FILE),
         _ => None,
     }
 }
