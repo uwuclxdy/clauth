@@ -693,6 +693,14 @@ fn cert_and_key_are_required_together_and_only_with_listen() {
 
 // ── delete / disable / enable ───────────────────────────────────────────────
 
+/// `rename` takes the profile then the new name, both positional.
+#[test]
+fn rename_takes_the_profile_then_the_new_name() {
+    let Command::Rename { profile, new_name } = command(&["rename", "acme", "work"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((profile.as_str(), new_name.as_str()), ("acme", "work"));
+}
 #[test]
 fn delete_takes_yes_and_force_independently_in_any_order() {
     let Command::Delete {

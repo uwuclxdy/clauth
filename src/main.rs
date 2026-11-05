@@ -301,6 +301,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             force,
         } => cmd_delete(&profile, yes, force),
+        Command::Rename { profile, new_name } => cmd_rename(&profile, &new_name),
         Command::Disable { profile, yes } => cmd_disable(&profile, yes),
         Command::StaticToken {
             profile,
@@ -2407,6 +2408,40 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {
         return Err(crate::start::StartRefusal::Disabled { name: name.clone() }.into());
     }
+    Ok(())
+}
+
+/// `clauth rename <profile> <new>` — the Setup tab's rename from the shell.
+/// No confirm gate: a rename moves nothing out of reach and renames back the
+/// same way.
+fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let old = resolve_or_bail(&config, name, "rename")?;
+
+    let new_name = new_name.trim();
+    if new_name == old.as_str() {
+        outln!("clauth: '{old}' already has that name.");
+        return Ok(());
+    }
+    actions::validate_profile_name(
+        new_name,
+        crate::harness::Harness::Claude,
+        Some(old.as_str()),
+    )
+    .map_err(|e| usage_error(e.to_string()))?;
+    let new = ProfileName::from(new_name);
+
+    // Renaming the active profile relinks the live slot, the same settle
+    // `commit_rename` runs before its relink.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let was_active = config.is_active(&old);
+        settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::Switch)?
+    };
+    let rotation = actions::rotation_guard_for_mutation(&old)?;
+    actions::rename_profile(&mut config, &old, &new, &rotation)?;
+    outln!("clauth: renamed '{old}' to '{new}'.");
     Ok(())
 }
 

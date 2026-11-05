@@ -138,6 +138,17 @@ pub(crate) enum Command {
         force: bool,
     },
 
+    /// Rename a profile, keeping its credentials, chain slot, and settings
+    ///
+    /// The same rename as the TUI's Setup tab. Refused while a live `clauth
+    /// start` session holds the profile, and for a codex profile.
+    Rename {
+        /// Profile to rename.
+        profile: String,
+        /// The new name.
+        new_name: String,
+    },
+
     /// Hide a profile from auto-switch, usage polling, and the status feed
     ///
     /// Its dir and credentials stay on disk untouched. Refused for the active
