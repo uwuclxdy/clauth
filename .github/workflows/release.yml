@@ -20,7 +20,7 @@ env:
 # the tag push, with the full changelog already in the body so the notes ride
 # along in GitHub's release email. This workflow never creates the release or
 # touches its notes -- it only builds the per-OS binaries and uploads them (plus
-# sums + signature) to the release the script already published. One upload
+# the font license, sums + signature) to the release the script already published. One upload
 # point (the publish job), so no concurrent softprops find-or-create can
 # duplicate the release and orphan the notes.
 
@@ -95,11 +95,14 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
+      - name: Attach the embedded font's license
+        run: cp assets/login/fonts/OFL.txt artifacts/clauth-onest-OFL.txt
       - name: Generate + sign sha256sums.txt
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}

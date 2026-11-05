@@ -35,6 +35,7 @@ mod list;
 mod live_sessions;
 mod lock;
 mod lockorder;
+mod login_page;
 mod logline;
 mod mcp;
 mod mcp_sync;

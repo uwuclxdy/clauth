@@ -172,10 +172,9 @@ fn calls(code: &str, macro_name: &str) -> bool {
 ///
 /// Out of scope, each named: the TUI (`src/tui/`) and the MCP server's replies
 /// (`src/mcp/`) keep their own text rules, `src/testutil.rs` is test-only; [`GLYPH_EXEMPT`] lists the other
-/// surfaces outside the CLI's own text (the generated `config.toml` comments,
-/// the codex login browser page, the daemon API's OpenAPI document, which
-/// `daemon --dump-openapi` prints verbatim). [`glyph_allowed`] holds
-/// the two glyph kinds the CLI keeps.
+/// surfaces outside the CLI's own text (the generated `config.toml` comments
+/// and the daemon API's OpenAPI document, which `daemon --dump-openapi` prints
+/// verbatim). [`glyph_allowed`] holds the two glyph kinds the CLI keeps.
 ///
 /// A `\u{...}` escape in a string counts as the character it spells. Limits shared with
 /// `no_bare_print_macro_under_src`: a `//` inside a string literal hides the
@@ -252,27 +251,9 @@ fn glyph_allowed(c: char) -> bool {
     c == '\u{2192}' || ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
-/// Lines outside the CLI's own text, by file and a fragment of the line: each
-/// codex browser reply is quoted whole, so the CLI errors beside them stay
-/// scanned.
-const GLYPH_EXEMPT: [(&str, &str); 6] = [
+/// Lines outside the CLI's own text, by file and a fragment of the line.
+const GLYPH_EXEMPT: [(&str, &str); 2] = [
     ("src/profile.rs", "out.push_str(\"# "),
-    (
-        "src/codex_login.rs",
-        "\"waiting for the codex login\u{2026}\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"login state mismatch \u{2014} close this and retry\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"codex login complete \u{2014} return to your terminal.\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"codex login failed \u{2014} return to your terminal\"",
-    ),
     (
         "src/daemon/api/events.rs",
         "description = \"a server-sent-events stream",

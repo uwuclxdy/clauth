@@ -21,13 +21,13 @@
 //! - the RFC-8693 secondary exchange that mints `OPENAI_API_KEY` is
 //!   best-effort — its failure must not fail the login.
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::codex_auth::{CODEX_CLIENT_ID, CODEX_TOKEN_URL};
+use crate::login_page::{self, Id};
 use crate::logline::logline;
 use crate::oauth_login::{
     AuthorizeRejection, MAX_CALLBACK_HEAD_BYTES, WaitOver, base64url_nopad, percent_encode,
@@ -385,21 +385,18 @@ fn handle_callback(
         .unwrap_or("");
     if !target.starts_with(CALLBACK_PATH) {
         // Some other path (a favicon probe) — not the redirect.
-        write_reply(&mut stream, "waiting for the codex login…");
+        login_page::write_page(&mut stream, Id::CodexWaiting);
         return Ok(None);
     }
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     let state = query_param(query, "state").unwrap_or_default();
     if state != expected_state {
-        write_reply(&mut stream, "login state mismatch — close this and retry");
+        login_page::write_page(&mut stream, Id::CodexStateMismatch);
         bail!("codex login state mismatch (possible CSRF); aborted");
     }
     match query_param(query, "code") {
         Some(code) if !code.is_empty() => {
-            write_reply(
-                &mut stream,
-                "codex login complete — return to your terminal.",
-            );
+            login_page::write_page(&mut stream, Id::CodexSuccess);
             Ok(Some(code))
         }
         _ => {
@@ -407,12 +404,12 @@ fn handle_callback(
             // browser-supplied text: the code is parsed into RFC 6749's closed
             // set and its bytes dropped, the description never read.
             let Some(err) = query_param(query, "error") else {
-                write_reply(&mut stream, "codex login failed — return to your terminal");
+                login_page::write_page(&mut stream, Id::CodexNoCode);
                 bail!("codex login callback carried no code");
             };
             let rejection = AuthorizeRejection::parse(&err);
             let (page, line) = rejection_copy(&rejection);
-            write_reply(&mut stream, page);
+            login_page::write_page(&mut stream, page);
             logline!(
                 "clauth: the codex authorize callback refused the login: {}",
                 rejection.log_detail()
@@ -422,35 +419,18 @@ fn handle_callback(
     }
 }
 
-/// The reply page and the terminal line per rejection arm, every byte this
-/// module's own literal. The claude callback's `user_message` names anthropic
-/// in its vendor arms, so only the vendor-free declined line is shared.
-fn rejection_copy(rejection: &AuthorizeRejection) -> (&'static str, &'static str) {
+/// The page id and terminal line per rejection arm, every byte of the line
+/// this module's own literal. The claude callback's `user_message` names
+/// anthropic in its vendor arms, so only the vendor-free declined line is
+/// shared.
+fn rejection_copy(rejection: &AuthorizeRejection) -> (Id, &'static str) {
     match rejection {
-        AuthorizeRejection::Declined => (
-            "codex login canceled: you declined the authorization request. close this tab; \
-             you can retry from clauth any time.",
-            rejection.user_message(),
-        ),
-        AuthorizeRejection::Upstream(_) => (
-            "codex login failed: openai is having trouble. close this tab and retry from \
-             clauth in a moment.",
-            "openai is having trouble",
-        ),
-        AuthorizeRejection::Refused(_) | AuthorizeRejection::Unrecognized => (
-            "codex login failed: openai refused the login. close this tab and retry from \
-             clauth.",
-            "openai refused the login",
-        ),
+        AuthorizeRejection::Declined => (Id::CodexDeclined, rejection.user_message()),
+        AuthorizeRejection::Upstream(_) => (Id::CodexUpstream, "openai is having trouble"),
+        AuthorizeRejection::Refused(_) | AuthorizeRejection::Unrecognized => {
+            (Id::CodexRefused, "openai refused the login")
+        }
     }
-}
-
-fn write_reply(stream: &mut std::net::TcpStream, body: &str) {
-    let page = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(page.as_bytes());
 }
 
 /// codex's token response — three fields, and the code exchange returns all
