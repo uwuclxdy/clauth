@@ -110,14 +110,13 @@ fn draw_chain_selector(
                             // same total width it had as a bare number — nothing
                             // downstream shifts.
                             let ord = format!("#{}", i + 1);
-                            let rail = if selected && focused {
-                                Span::styled(
-                                    format!("{} {ord:>3} ", theme::CARET),
-                                    theme::accent().bold(),
-                                )
+                            let caret = if selected && focused {
+                                Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
                             } else {
-                                Span::styled(format!("  {ord:>3} "), theme::faint())
+                                Span::raw("  ")
                             };
+                            let ordinal = Span::styled(format!("{ord:>3} "), theme::faint());
+                            let rail_w = caret.width() + ordinal.width();
                             // A member still sits in `fallback_chain` on disk while
                             // disabled (only the walk skips it), so it renders as a
                             // normal row with a dim name; the exclusion itself
@@ -141,8 +140,7 @@ fn draw_chain_selector(
                                     app.installs_session_token(&p.name),
                                 )
                             });
-                            let rail_w = rail.width();
-                            let mut spans = vec![rail];
+                            let mut spans = vec![caret, ordinal];
                             match &reason {
                                 // The 1-cell marker is right-aligned at the row's last
                                 // content column (the scrollbar owns the padding cell
@@ -268,6 +266,7 @@ fn draw_chain_detail(
                 &name,
                 MemberCard {
                     focused: detail_focused,
+                    entered: app.fallback_detail_entered,
                     row_cursor: app.fallback_detail_cursor,
                     armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
                     editing: typed(FallbackRow::Threshold),
@@ -822,6 +821,9 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
 #[derive(Clone, Copy, Default)]
 struct MemberCard<'a> {
     focused: bool,
+    /// Whether the card's blurred tint may show: only once the shown member's
+    /// card has been entered, so a never-opened card shades nothing at rest.
+    entered: bool,
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&'a InputState>,
@@ -977,6 +979,7 @@ fn member_detail(
 ) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
+        entered,
         row_cursor,
         armed_remove,
         editing,
@@ -1166,8 +1169,9 @@ fn member_detail(
             width,
         );
         let start = lines.len();
+        let tinted = i == cursor && (focused || entered);
         lines.extend(row_lines.into_iter().map(|line| {
-            if selected {
+            if tinted {
                 highlight_row(line, width)
             } else {
                 line

@@ -11643,3 +11643,322 @@ fn the_rex_rows_other_values_stay_body_text_on_a_stale_marker() {
         );
     }
 }
+
+// ── blurred detail selection ─────────────────────────────────────────────────
+
+/// Ascend from the Services detail with the real key.
+fn ascend_services(app: &mut App) {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+}
+
+/// The blurred-pane selection: the detail row holding `label` keeps the
+/// `BG_HOVER` tint across its content width (padding columns excluded),
+/// shows no caret, and `label` reads `TEXT_DIM` without bold.
+fn assert_blurred_detail_selection(app: &App, label: &str) {
+    let mut term = Terminal::new(TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| {
+            let b = r.find(label)?;
+            r[..b].contains("││").then(|| (y, r[..b].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("{label} renders in the detail:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != crate::tui::theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred detail keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred detail draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(
+            cell(x).fg,
+            crate::tui::theme::text_dim_color(),
+            "{label} keeps its blurred color"
+        );
+        assert!(
+            !cell(x).modifier.contains(ratatui::style::Modifier::BOLD),
+            "{label} drops the bold on a blurred detail"
+        );
+    }
+}
+
+/// Ascending from the herdr detail keeps the option row the cursor left
+/// marked, so the next descend's landing row stays visible.
+#[test]
+fn a_blurred_herdr_detail_keeps_its_last_option_rows_tint() {
+    use crate::tui::app::HERDR_OPTIONS;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = herdr_options_app(healthy_config());
+    app.services.herdr_options_cursor = 1;
+    ascend_services(&mut app);
+    assert_eq!(
+        app.services.herdr_options_cursor, 1,
+        "the option cursor persists"
+    );
+    assert_blurred_detail_selection(&app, HERDR_OPTIONS[1].label());
+}
+
+/// Ascending from the plugin detail keeps the fix line the cursor left
+/// marked, so the next descend's landing line stays visible.
+#[test]
+fn a_blurred_plugin_detail_keeps_its_last_fix_lines_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.problem_cursor = 1;
+    ascend_services(&mut app);
+    assert_eq!(app.services.problem_cursor, 1, "the fix cursor persists");
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+// ── never-entered detail shading ─────────────────────────────────────────────
+
+/// The cells inside the detail pane (right of the `││` pane separator) that
+/// carry `BG_HOVER`.
+fn detail_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == crate::tui::theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A herdr detail the user never opened shades no option row: its cursor is
+/// a default, not a memory, so the blurred detail stays untinted.
+#[test]
+fn a_never_entered_herdr_detail_shades_no_option() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    let (rows, buf) = render(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered herdr detail shades nothing:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Entering the herdr detail once earns its remembered-row tint: walking to
+/// the `pane tag` option and ascending keeps that row tinted.
+#[test]
+fn an_entered_herdr_detail_keeps_the_walked_options_tint_after_ascending() {
+    use crate::tui::app::{HERDR_OPTIONS, ServicesFocus};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "enter descends");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.herdr_options_cursor, 1,
+        "the walk lands on pane tag"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    assert_blurred_detail_selection(&app, HERDR_OPTIONS[1].label());
+}
+
+/// Moving the Services selector to another row makes the herdr detail a new
+/// subject: its tint does not return with the selection.
+#[test]
+fn moving_the_services_selector_clears_the_herdr_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        herdr_check(&probe, Some(&healthy_config())),
+        plugin_check_with_problems(),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !detail_tinted_cells(&render(&app).1).is_empty(),
+        "the tint shows before the move"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.services.cursor, 0, "the selector wrapped back to herdr");
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the herdr detail is never-entered again"
+    );
+}
+
+/// A plugin detail the user never opened shades no fix line: its cursor is a
+/// default, not a memory, so the blurred detail stays untinted.
+#[test]
+fn a_never_entered_plugin_detail_shades_no_fix_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_with(plugin_check_with_problems());
+    let (rows, buf) = render(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered plugin detail shades nothing:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Entering the plugin detail once earns its remembered-row tint: walking to
+/// the `wire mcp server` fix and ascending keeps that line tinted.
+#[test]
+fn an_entered_plugin_detail_keeps_the_walked_fix_lines_tint_after_ascending() {
+    use crate::tui::app::ServicesFocus;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(plugin_check_with_problems());
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "enter descends");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.problem_cursor, 1,
+        "the walk lands on the wire fix"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+/// Moving the Services selector to another row makes the plugin detail a new
+/// subject: its fix-line tint does not return with the selection.
+#[test]
+fn moving_the_services_selector_clears_the_plugin_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !detail_tinted_cells(&render(&app).1).is_empty(),
+        "the tint shows before the move"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.cursor, 0,
+        "the selector wrapped back to plugin"
+    );
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the plugin detail is never-entered again"
+    );
+}
+
+/// A selector key that moves nothing keeps the subject: `PageUp` on the top
+/// row of a list shorter than a page leaves the entered plugin detail's
+/// remembered fix line tinted.
+#[test]
+fn a_selector_key_that_moves_nothing_keeps_the_entered_detail_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    // The page keys read the selector geometry the last frame published.
+    render(&app);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(
+        app.services.cursor, 0,
+        "PageUp on the top row moves nothing"
+    );
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+/// A fresh Services entry is a new subject, never a leave: a plugin detail
+/// nobody entered stays never-entered across a tab round trip, so a check
+/// order that puts it first shades no fix line.
+#[test]
+fn a_services_round_trip_leaves_a_never_entered_detail_untinted() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_ne!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "fixture control: → left Services"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "← returned to Services"
+    );
+    assert_eq!(
+        (
+            app.services.problem_entered,
+            app.services.herdr_options_entered
+        ),
+        (false, false),
+        "the fresh entry leaves both walk panes never-entered"
+    );
+    // The entry rebuilt the real check list (shunt first); restore the
+    // plugin-first order the render pin reads.
+    app.services.checks = vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ];
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the never-entered plugin detail shades nothing after the round trip"
+    );
+}

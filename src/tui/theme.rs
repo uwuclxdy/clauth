@@ -486,6 +486,10 @@ pub(crate) const BAR: &str = "┃";
 pub(crate) const TRACK: &str = "┊";
 /// Static waiting mark — `queued` / `idle`.
 pub(crate) const WAITING: &str = "◌";
+/// Ticked checkbox of a multi-select row.
+pub(crate) const CHECKBOX_ON: &str = "[x]";
+/// Unticked checkbox of a multi-select row.
+pub(crate) const CHECKBOX_OFF: &str = "[ ]";
 
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
 

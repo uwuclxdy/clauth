@@ -450,7 +450,7 @@ pub(crate) struct AccountOffers {
 }
 
 /// Accounts whose change sets are identical share one block: the shared rows
-/// once, then one toggle line per account.
+/// once, then one checkbox row per account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RebindBlock {
     pub(crate) rows: Vec<RowMove>,

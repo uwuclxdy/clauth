@@ -22,8 +22,9 @@ use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
     cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color,
-    picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value, value_caret,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, marked_picker_row, master_detail,
+    name_color, picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value,
+    value_caret,
 };
 use super::prose::{cmd, key_lit, spans as prose_spans};
 
@@ -98,9 +99,10 @@ pub(super) fn draw_band_selector(
                 rows.push(ratatui::widgets::ListItem::new(Line::from("")));
             }
             BandEntry::Heading(text) => {
-                let heading = if ranges
-                    .iter()
-                    .any(|&(hi, start, end)| hi == i && (start..end).contains(&pos))
+                let heading = if focused
+                    && ranges
+                        .iter()
+                        .any(|&(hi, start, end)| hi == i && (start..end).contains(&pos))
                 {
                     theme::label_active()
                 } else {
@@ -183,12 +185,8 @@ fn setup_selector_row(
                 return Line::from("");
             };
             let ns = theme::base();
-            let name = if row.broken {
-                format!("{} {}", theme::dead_credential_glyph(), row.name)
-            } else {
-                row.name.to_string()
-            };
-            picker_row(selected, focused, name, ns, width)
+            let mark = row.broken.then(|| dead_credential_mark(ns));
+            marked_picker_row(selected, focused, mark, row.name.to_string(), ns, width)
         }
         MainItemKind::Shunt(pi, ai) => {
             let Some(provider) = app.shunt_pool_row(pi, ai) else {
@@ -201,14 +199,16 @@ fn setup_selector_row(
             };
             // Names off the wire are escaped before render, the Overview's rule.
             let account = escape_control(&provider.0.name);
-            let name = if provider.0.needs_relogin {
-                format!("{} {account}", theme::dead_credential_glyph())
-            } else {
-                account
-            };
-            picker_row(selected, focused, name, ns, width)
+            let mark = provider.0.needs_relogin.then(|| dead_credential_mark(ns));
+            marked_picker_row(selected, focused, mark, account, ns, width)
         }
     }
+}
+
+/// The `× ` a selector row leads with while its credential is dead, in the
+/// row's resting name style.
+fn dead_credential_mark(style: Style) -> Span<'static> {
+    Span::styled(format!("{} ", theme::dead_credential_glyph()), style)
 }
 
 /// Snapshot taken under one short `config` guard, decoupled from render so
@@ -738,12 +738,15 @@ fn draw_codex_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             focus.0 = lines.len();
         }
         let line = Line::from(vec![arrow, Span::styled(label, style)]);
-        // The focused action row takes the claude detail's full-width tint.
-        lines.push(if selected {
-            highlight_row(line, inner.width as usize)
-        } else {
-            line
-        });
+        // The cursor row takes the claude detail's full-width tint, gated so
+        // a detail nobody entered shades nothing at rest.
+        lines.push(
+            if i == cursor && (actions_focused || app.config_detail_entered) {
+                highlight_row(line, inner.width as usize)
+            } else {
+                line
+            },
+        );
         if selected {
             focus.1 = lines.len();
         }
@@ -880,11 +883,15 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             focus.0 = lines.len();
         }
         let line = Line::from(vec![arrow, Span::styled(label, style)]);
-        lines.push(if selected {
-            highlight_row(line, inner.width as usize)
-        } else {
-            line
-        });
+        // The cursor row keeps its full-width tint, gated so a detail nobody
+        // entered shades nothing at rest.
+        lines.push(
+            if i == cursor && (actions_focused || app.config_detail_entered) {
+                highlight_row(line, inner.width as usize)
+            } else {
+                line
+            },
+        );
         if selected {
             focus.1 = lines.len();
         }
@@ -1216,8 +1223,9 @@ fn draw_settings_rows(
         if selected || is_editing {
             focus.0 = line_idx as usize;
         }
+        let tinted = i == cursor && (actions_focused || app.config_detail_entered);
         for line in row_lines {
-            lines.push(if selected {
+            lines.push(if tinted {
                 highlight_row(line, inner.width as usize)
             } else {
                 line

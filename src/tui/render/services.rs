@@ -277,9 +277,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
         .min(18);
 
     // The plugin detail walks its fixable problems while descended, and the
-    // herdr detail's heal line is a walk stop; the focused fix line carries
-    // the caret + hover tint.
-    let problem_focus = if !focused || app.services.diagnostic_focus || check.problems.is_empty() {
+    // herdr detail's heal line is a walk stop; the cursor's fix line carries
+    // the hover tint, and the caret while the detail holds focus.
+    let problem_focus = if app.services.diagnostic_focus || check.problems.is_empty() {
         None
     } else if check.label == "plugin" {
         Some(app.services.problem_cursor)
@@ -291,13 +291,20 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     // The rex row's health colours its `plugin` value, so the text follows the
     // dot (an idle row keeps body text); every other row keeps `value_tone`'s lookup.
     let rex_plugin_tone = (check.label == "rex").then(|| health_tone(check.health));
+    // The walk panes' remembered tint shows only once the pane was entered:
+    // a blurred detail nobody descended shades nothing.
+    let detail_entered = match check.label {
+        "plugin" => app.services.problem_entered,
+        "herdr" => app.services.herdr_options_entered,
+        _ => true,
+    };
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, line) in check.detail.iter().enumerate() {
         match problem_index(check, idx) {
             Some(pidx) => {
-                let selected = problem_focus == Some(pidx);
-                let line = problem_line(line, selected);
-                if selected {
+                let cursor_row = problem_focus == Some(pidx);
+                let line = problem_line(line, focused && cursor_row);
+                if cursor_row && (focused || detail_entered) {
                     lines.push(highlight_row(line, inner.width as usize));
                 } else {
                     lines.push(line);
@@ -342,6 +349,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     // than an index: a fix landing under the focused cursor can shrink the
     // problem set, and the render must never panic on a stale cursor.
     if check.label == "plugin"
+        && focused
         && problem_focus.is_some()
         && let Some(problem) = check.problems.get(app.services.problem_cursor)
     {
@@ -2179,14 +2187,17 @@ fn draw_herdr_detail(
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.
-    let mut focus = fix_focus.map_or((0usize, 1usize), |line| (line, line + 1));
+    let mut focus = fix_focus
+        .filter(|_| focused)
+        .map_or((0usize, 1usize), |line| (line, line + 1));
     let mut caret: Option<(u16, usize)> = None;
 
     for (i, row) in HERDR_OPTIONS.iter().enumerate() {
-        let selected = focused
-            && fix_focus.is_none()
+        let cursor_row = fix_focus.is_none()
             && !app.services.diagnostic_focus
-            && i == app.services.herdr_options_cursor;
+            && i == app.services.herdr_options_cursor
+            && (focused || app.services.herdr_options_entered);
+        let selected = focused && cursor_row;
         let row_editing = if *row == HerdrOption::TagRefresh {
             editing
         } else {
@@ -2215,7 +2226,7 @@ fn draw_herdr_detail(
                 );
                 caret = Some((cx, lines.len()));
                 for line in row_lines {
-                    lines.push(if selected {
+                    lines.push(if cursor_row {
                         highlight_row(line, inner.width as usize)
                     } else {
                         line
@@ -2225,7 +2236,7 @@ fn draw_herdr_detail(
             }
             None => {
                 for line in row_lines {
-                    lines.push(if selected {
+                    lines.push(if cursor_row {
                         highlight_row(line, inner.width as usize)
                     } else {
                         line

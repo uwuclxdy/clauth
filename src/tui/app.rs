@@ -1633,21 +1633,21 @@ pub(crate) enum ConfirmAction {
 
 /// The startup re-bind confirm: move accounts whose endpoint matches a
 /// built-in preset onto that preset's current model ids. Accounts sharing one
-/// change set sit in one block (the rows once, then a toggle line per account).
+/// change set sit in one block (the rows once, then a checkbox row per account).
 #[derive(Debug, Clone)]
 pub(crate) struct RebindForm {
     /// Blocks in first-seen order; each holds its shared rows + account names.
     pub(crate) blocks: Vec<crate::presets::RebindBlock>,
     /// Per-block per-account checked state, parallel to `blocks`.
     pub(crate) checked: Vec<Vec<bool>>,
-    /// Flat toggle-line index the cursor sits on, across blocks in render order.
+    /// Flat account-row index the cursor sits on, across blocks in render order.
     pub(crate) cursor: usize,
     /// Highlighted button: false = `not now`, true = `apply`.
     pub(crate) choice: bool,
     /// Followable body scroll offset, published and followed by the render.
     pub(crate) scroll: std::cell::Cell<usize>,
     /// Published by the last render: the chunked start line of each account
-    /// toggle (flat order), its one-line block end, the total line count and the
+    /// row (flat order), its one-line block end, the total line count and the
     /// viewport, so the page keys move the cursor the way the other choice
     /// menus do.
     pub(crate) starts: std::cell::RefCell<Vec<usize>>,
@@ -1663,7 +1663,7 @@ impl RebindForm {
         self.blocks.iter().map(|b| b.accounts.len()).sum()
     }
 
-    /// Map a flat toggle-line index to `(block, account)`.
+    /// Map a flat account-row index to `(block, account)`.
     pub(crate) fn account_at(&self, idx: usize) -> Option<(usize, usize)> {
         let mut remaining = idx;
         for (bi, block) in self.blocks.iter().enumerate() {
@@ -4378,10 +4378,18 @@ pub(crate) struct ServicesState {
     /// While the plugin detail is descended, ↑↓ and `f` walk these instead of
     /// scrolling the prose; `↵` opens the focused one's confirm.
     pub(crate) problem_cursor: usize,
+    /// True once the plugin detail's problem walk has been entered for the
+    /// shown row: a blurred detail keeps the fix line's tint only from then
+    /// on. Cleared on a selector move to another row.
+    pub(crate) problem_entered: bool,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
     pub(crate) herdr_options_cursor: usize,
+    /// True once the herdr detail has been entered for the shown row: a
+    /// blurred detail keeps its options rows' (and heal line's) tint only
+    /// from then on. Cleared on a selector move to another row.
+    pub(crate) herdr_options_entered: bool,
     /// Whether the herdr detail's focus sits on its `f  heal herdr config`
     /// line rather than on [`Self::herdr_options_cursor`]'s option. Read only
     /// while the check still offers that fix, so a heal that clears it hands
@@ -4474,7 +4482,9 @@ impl Default for ServicesState {
             delegates_block_ends: std::cell::RefCell::new(Vec::new()),
             delegates_has_descended: false,
             problem_cursor: 0,
+            problem_entered: false,
             herdr_options_cursor: 0,
+            herdr_options_entered: false,
             herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
@@ -4793,8 +4803,9 @@ pub(crate) enum SetupSelection {
 
 /// The shared claude-row cursor: its flat profile index plus a monotonic move
 /// count. Private fields force every writer through `Cursor::set`, which bumps
-/// the count only when the index actually changes — a write of the same value
-/// is no move. A hidden held selection records the count right after its own
+/// the count only when the index actually changes (a write of the same value
+/// is no move), or `Cursor::rehome`, which re-indexes the same account and
+/// never bumps. A hidden held selection records the count right after its own
 /// placement and restores only while the count still equals it, so a move away
 /// and back (which the old equality-on-the-shown-selection compare could not
 /// see) closes the window for good.
@@ -4819,6 +4830,12 @@ mod profile_cursor {
                 self.index = index;
                 self.moves += 1;
             }
+        }
+
+        /// Re-index the account the cursor already names after a roster change
+        /// shifted it: the same account under a new index is no move.
+        pub(crate) fn rehome(&mut self, index: usize) {
+            self.index = index;
         }
 
         /// The number of index-changing moves since the cursor was created.
@@ -5401,6 +5418,11 @@ pub(crate) struct App {
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
     pub(crate) config_action_cursor: usize,
+    /// True once the Setup detail has been entered for the shown subject: a
+    /// blurred detail keeps its cursor row's tint only from then on, so an
+    /// account nobody opened shades nothing. Cleared wherever the cursor
+    /// resets for a new subject.
+    pub(crate) config_detail_entered: bool,
     /// The descended codex detail's armed 2-step (`delete account`). A separate
     /// field from the claude draft's `armed_action` because the codex detail
     /// has no `ConfigDraft`. The second ⏎ acts on the identity the SELECTION
@@ -5430,12 +5452,21 @@ pub(crate) struct App {
     /// at-rest `+ new` on every reload — this re-land puts back both.
     /// Read once by the tick, never by the tab-switch or delete clamps.
     pub(crate) reload_was_on_new: bool,
+    /// Set beside [`App::reload_was_on_new`]: the claude account the shared
+    /// cursor named before the swap. Claude rows resolve by index, so the tick
+    /// re-points the cursor at this account when the reload kept it, and a
+    /// reload that dropped or renamed it lands on another account.
+    reload_selected_profile: Option<ProfileName>,
     /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
     /// Which Fallback pane has focus.
     pub(crate) fallback_focus: FallbackFocus,
     /// Cursor into the Fallback right pane (member rows or add-candidate list).
     pub(crate) fallback_detail_cursor: usize,
+    /// True once the member card has been entered for the shown member: a
+    /// blurred card keeps its cursor row's tint only from then on. Cleared
+    /// wherever the cursor resets for a new subject.
+    pub(crate) fallback_detail_entered: bool,
     /// The member card's one open edit, pinned to the member it opened on, or
     /// `None` at rest.
     pub(crate) fallback_edit: Option<MemberEdit<CardEdit>>,
@@ -5917,6 +5948,13 @@ pub(crate) struct App {
     /// The account a delete worker is removing; `None` while none runs. A
     /// second delete while one runs toasts that it is still running.
     pub(crate) deleting: Option<ProfileName>,
+    /// The claude account (`None` for `+ new`) the last deliberate selection
+    /// put the shared cursor on — or, on a descend, adopted where it rests —
+    /// while a delete runs, set when it starts. The worker removes the account
+    /// from the shared config in place, which shifts what an index names, so
+    /// the name is taken when the selection lands
+    /// ([`App::note_delete_selection`]), never re-read off the index.
+    delete_selected: Option<ProfileName>,
     /// Delete worker results; drained in `on_tick`.
     delete_rx: std::sync::mpsc::Receiver<DeleteResult>,
     delete_tx: std::sync::mpsc::Sender<DeleteResult>,
@@ -6381,10 +6419,12 @@ impl App {
             global_config_total: std::cell::Cell::new(0),
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            config_detail_entered: false,
             codex_detail_armed: false,
             pool_detail_armed: false,
             fallback_focus: FallbackFocus::Chain,
             fallback_detail_cursor: 0,
+            fallback_detail_entered: false,
             fallback_edit: None,
             fallback_day_stop: None,
             global_config_cursor: 0,
@@ -6397,6 +6437,7 @@ impl App {
             new_account_draft: None,
             preset_picker_open: PresetPickerOpen::None,
             reload_was_on_new: false,
+            reload_selected_profile: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
@@ -6544,6 +6585,7 @@ impl App {
             pool_mutation_rx,
             pool_mutation_tx,
             deleting: None,
+            delete_selected: None,
             delete_rx,
             delete_tx,
             bare_item_source: default_bare_item_source(),
@@ -7554,6 +7596,7 @@ impl App {
             // account). The delete and tab-switch clamps never read this flag.
             self.reload_was_on_new =
                 self.tab == Tab::Setup && self.setup_selection() == SetupSelection::New;
+            self.reload_selected_profile = self.profile_name_at(self.profile_cursor.read());
             let profile_names: Vec<ProfileName> =
                 fresh.profiles.iter().map(|p| p.name.clone()).collect();
             let probes_off = crate::usage::probes_switched_off(&self.config(), &fresh);
@@ -7996,6 +8039,37 @@ impl App {
         self.reload_selected_note();
     }
 
+    /// While a delete runs, the account a deliberate placement just put the
+    /// shared claude cursor on (`None` on `+ new`) is the one the landing
+    /// holds. Every deliberate claude placement calls this, whether or not the
+    /// index changed; a descend into a saved account's detail counts, naming
+    /// the account the cursor already rests on. The writers that only follow
+    /// the roster (the clamp, the reload's `+ new` re-land, the Overview's tick
+    /// syncs) never do.
+    ///
+    /// `placed` is the account's name when the caller already resolved it:
+    /// recording that name keeps the landing bound to the placed account, not
+    /// to whatever account an index read names later. `None` samples the
+    /// account under the shared cursor.
+    fn note_delete_selection(&mut self, placed: Option<ProfileName>) {
+        #[cfg(test)]
+        if let Some(gone) = REMOVE_BEFORE_DELETE_NOTE.with(|c| c.borrow_mut().take()) {
+            self.config().profiles.retain(|p| p.name != gone);
+        }
+        if self.deleting.is_some() {
+            self.delete_selected =
+                placed.or_else(|| self.profile_name_at(self.profile_cursor.read()));
+        }
+    }
+
+    /// [`App::note_delete_selection`] for an Overview placement: only one that
+    /// rests on a claude row places the shared cursor.
+    fn note_overview_delete_selection(&mut self) {
+        if matches!(self.current_main_item(), Some(MainItemKind::Profile(_))) {
+            self.note_delete_selection(None);
+        }
+    }
+
     /// Re-read the selected account's note from disk.
     pub(crate) fn reload_selected_note(&mut self) {
         self.note_text = self
@@ -8129,7 +8203,9 @@ impl App {
     /// [`App::rehome_selection`] reads; the other slot's clear rides the user
     /// step alone ([`App::step_selection`]), never this placement path, so a
     /// rehome clears nothing. Setup's past-end (`+ new`) and Usage's past-end
-    /// differ only in where the shared cursor rests.
+    /// differ only in where the shared cursor rests. A claude or past-end
+    /// placement is the funnel for every key step and rehome that names the
+    /// account a running delete's landing holds; a codex or pool one leaves it.
     fn place_selection(&mut self, kind: SelectionSlotKind, pos: usize) {
         self.selection_slot_mut(kind).clear();
         self.pending_pool_landing = None;
@@ -8149,6 +8225,7 @@ impl App {
                     self.profile_cursor.set(*i);
                     self.reload_selected_note();
                 }
+                self.note_delete_selection(None);
             }
             None => {
                 let slot = self.selection_slot_mut(kind);
@@ -8158,6 +8235,7 @@ impl App {
                     SelectionSlotKind::Setup => self.profile_count(),
                     SelectionSlotKind::Usage => self.profile_count().saturating_sub(1),
                 });
+                self.note_delete_selection(None);
             }
         }
     }
@@ -8244,10 +8322,22 @@ impl App {
                 slot.index = Some(index);
                 slot.remembered = None;
                 slot.remembered_moves = None;
+                // The restore re-placed the selection without a key: the
+                // shown subject changed, so its detail starts never-entered.
+                if kind == SelectionSlotKind::Setup {
+                    self.config_action_cursor = 0;
+                    self.config_detail_entered = false;
+                }
                 return;
             }
             if !self.holds_setup_item(&remembered) {
                 self.selection_slot_mut(kind).clear();
+                // The held identity is gone for good: the selection now
+                // resolves to the shared claude row, a new subject.
+                if kind == SelectionSlotKind::Setup {
+                    self.config_action_cursor = 0;
+                    self.config_detail_entered = false;
+                }
             }
         }
         let Some(item) = self.selection_slot(kind).item.clone() else {
@@ -8269,6 +8359,12 @@ impl App {
                 let slot = self.selection_slot_mut(kind);
                 slot.remembered = Some(item);
                 slot.remembered_moves = Some(moves);
+                // The park re-placed the selection without a key: the shown
+                // subject changed, so its detail starts never-entered.
+                if kind == SelectionSlotKind::Setup {
+                    self.config_action_cursor = 0;
+                    self.config_detail_entered = false;
+                }
             }
             return;
         }
@@ -8284,6 +8380,12 @@ impl App {
         };
         self.place_selection(kind, pos);
         self.leave_selection_detail(kind);
+        // The drop re-placed the selection without a key: the shown subject
+        // changed, so its detail starts never-entered.
+        if kind == SelectionSlotKind::Setup {
+            self.config_action_cursor = 0;
+            self.config_detail_entered = false;
+        }
     }
 
     fn rehome_setup_selection(&mut self) {
@@ -8292,6 +8394,42 @@ impl App {
 
     fn rehome_usage_selection(&mut self) {
         self.rehome_selection(SelectionSlotKind::Usage);
+    }
+
+    /// The claude account the current Setup selection names, `None` off a
+    /// claude row.
+    fn setup_profile_name(&self) -> Option<ProfileName> {
+        match self.setup_selection() {
+            SetupSelection::Item(MainItemKind::Profile(i)) => self.profile_name_at(i),
+            SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..))
+            | SetupSelection::New => None,
+        }
+    }
+
+    /// Re-point the shared claude cursor at `held` after an in-place roster
+    /// change, so every tab sharing it keeps the account it was on; a `held`
+    /// the roster lost leaves the index for the caller's clamp.
+    fn hold_profile_cursor_on(&mut self, held: Option<&ProfileName>) {
+        let index =
+            held.and_then(|name| self.config().profiles.iter().position(|p| &p.name == name));
+        if let Some(index) = index {
+            self.profile_cursor.rehome(index);
+        }
+    }
+
+    /// A roster change landed the Setup selection on another subject than
+    /// `held` (a claude account, or `+ new` as `None`) without a key: that
+    /// subject's detail starts never-entered at its first row. A codex or pool
+    /// selection is held by identity and resets on its own rehome.
+    fn reset_setup_detail_unless_on(&mut self, held: Option<&ProfileName>) {
+        let on_claude_or_new = matches!(
+            self.setup_selection(),
+            SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New
+        );
+        if on_claude_or_new && self.setup_profile_name().as_ref() != held {
+            self.config_action_cursor = 0;
+            self.config_detail_entered = false;
+        }
     }
 
     /// The current Setup selection as a codex-row index, `None` off a codex row.
@@ -8480,6 +8618,7 @@ impl App {
             self.overview_cursor = next;
             self.overview_remembered = self.current_main_item();
             self.sync_overview_profile_selection();
+            self.note_overview_delete_selection();
             // A selection change on another tab replaces a held-but-hidden
             // identity in both slots: the read must not restore it over this
             // pick.
@@ -9012,6 +9151,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             // writes the remembered item (a filter only hides it).
             app.harness_filter = app.harness_filter.next();
             app.place_overview_cursor();
+            app.note_overview_delete_selection();
             app.overview_selector.offset.set(0);
             return;
         }
@@ -9874,6 +10014,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                         Some(i) => {
                             app.profile_cursor.set(i);
                             app.reload_selected_note();
+                            app.note_delete_selection(Some(name));
                         }
                         None => {
                             // The account is gone (deleted, or renamed by
@@ -9920,6 +10061,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                             Some(i) => {
                                 app.setup.item = None;
                                 app.profile_cursor.set(i);
+                                app.note_delete_selection(Some(name));
                             }
                             None => leave_config_detail(app),
                         }
@@ -9927,11 +10069,13 @@ fn switch_tab(app: &mut App, tab: Tab) {
                     None => {
                         app.setup.item = None;
                         app.profile_cursor.set(app.profile_count());
+                        app.note_delete_selection(None);
                     }
                 }
             } else {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_action_cursor = 0;
+                app.config_detail_entered = false;
                 disarm_codex_2step(app);
                 disarm_pool_2step(app);
                 // A suspended `+ new` form re-homes the selector onto its row.
@@ -9940,6 +10084,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                     app.setup.item = None;
                     app.profile_cursor.set(app.profile_count());
                     app.reload_selected_note();
+                    app.note_delete_selection(None);
                 } else {
                     // Fresh entry: land on the shared claude row (a remembered
                     // codex or pool selection is its own item, kept across a
@@ -9962,11 +10107,13 @@ fn switch_tab(app: &mut App, tab: Tab) {
                 // (`repin_member_edit` also closes the edit once the member left
                 // the chain, as a deleted account's Setup edit does).
                 repin_member_edit(app);
-                sync_profile_from_chain(app);
+                if let Some(name) = sync_profile_from_chain(app) {
+                    app.note_delete_selection(Some(name));
+                }
             } else {
                 app.chain_cursor = chain_cursor_for_profile(app);
                 sync_profile_from_chain(app);
-                leave_fallback_detail(app);
+                drop_fallback_detail(app);
             }
         }
         Tab::Config => {
@@ -9986,6 +10133,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
             // fresh entry resets the descent and the selection.
             if keyboard_owner(app).is_none() {
                 leave_shunt_detail(app);
+                // A fresh entry is a new subject, not a leave: every detail
+                // starts never-entered, whatever the ascend above flagged.
+                app.services.problem_entered = false;
+                app.services.herdr_options_entered = false;
                 app.services.cursor = 0;
                 app.services.detail_scroll = 0;
                 app.services.shunt_scroll.set(0);
@@ -10598,6 +10749,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
             let len = app.services.row_count();
+            let before = app.services.cursor;
             match key.code {
                 KeyCode::Up if len > 0 => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
@@ -10659,6 +10811,13 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     walk_to_next_fix(app);
                 }
                 _ => {}
+            }
+            // Another row is a new subject: its detail starts never-entered,
+            // whatever row the last one was left on. A key that moved nothing
+            // keeps the remembered row.
+            if app.services.cursor != before {
+                app.services.problem_entered = false;
+                app.services.herdr_options_entered = false;
             }
         }
         ServicesFocus::Detail => {
@@ -12189,6 +12348,15 @@ fn leave_shunt_detail(app: &mut App) {
     app.services.shunt_remove_refusal.take();
     app.services.shunt_token_refusal.take();
     app.services.focus = ServicesFocus::List;
+    // Leaving a detail the user was in is the one event every ascend path
+    // (esc, ←, a tab switch, an editor's own q) funnels through, so the
+    // entered flag flips here. The Services fresh entry also calls this with
+    // no descent behind it, and clears both flags right after.
+    match app.services.selected_check().map(|c| c.label) {
+        Some("plugin") => app.services.problem_entered = true,
+        Some("herdr") => app.services.herdr_options_entered = true,
+        _ => {}
+    }
 }
 
 /// `esc` on a config row that is not editing: fold its entry (back to the
@@ -14289,6 +14457,7 @@ fn open_new_profile_form_inner(app: &mut App, require: bool) {
     disarm_switch(app);
     do_switch(app, Tab::Setup);
     app.profile_cursor.set(app.profile_count());
+    app.note_delete_selection(None);
     app.config_action_cursor = 0;
     let mut draft = build_draft_new();
     draft.base_url = InputState::new(&url);
@@ -14299,6 +14468,7 @@ fn open_new_profile_form_inner(app: &mut App, require: bool) {
     });
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
+    app.config_detail_entered = true;
 }
 
 /// A picker pick: open the overwrite confirm naming what it replaces. The
@@ -16589,6 +16759,10 @@ fn land_created_selection(app: &mut App, setup_item: Option<SetupItem>, overview
     app.setup.index = None;
     app.setup.clear();
     app.overview_remembered = Some(overview);
+    // The landing moved the selection onto a new subject without a key: its
+    // detail starts at its first row, never-entered.
+    app.config_action_cursor = 0;
+    app.config_detail_entered = false;
 }
 
 /// Land a finished pool add on the new pool row once the re-read publishes it:
@@ -17980,9 +18154,10 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         1 if idx + 1 < app.config().profiles.len() => idx + 1,
         _ => return,
     };
-    let result = {
+    let (result, moved) = {
         let mut cfg = app.config();
-        reorder_profile(&mut cfg, idx, new_idx)
+        let result = reorder_profile(&mut cfg, idx, new_idx);
+        (result, cfg.profiles.get(new_idx).map(|p| p.name.clone()))
     };
     if let Err(e) = result {
         app.toast(
@@ -17996,6 +18171,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     }
     app.profile_cursor.set(new_idx);
     app.move_overview_cursor(new_idx);
+    app.note_delete_selection(moved);
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -19642,19 +19818,18 @@ fn chain_cursor_for_profile(app: &App) -> usize {
 
 /// If the current `chain_cursor` points at a `Member`, sync `profile_cursor` to that
 /// member's index in the profile list. Leaves `profile_cursor` unchanged on `Add` or
-/// when the name is not found (e.g. empty chain).
-fn sync_profile_from_chain(app: &mut App) {
+/// when the name is not found (e.g. empty chain). Returns the member it placed the
+/// cursor on, so a caller recording the placement holds the resolved name.
+fn sync_profile_from_chain(app: &mut App) -> Option<ProfileName> {
     let chain_pos = app.chain_cursor;
-    let profile_idx = {
+    let (idx, placed) = {
         let cfg = app.config();
-        match cfg.state.fallback_chain.get(chain_pos) {
-            Some(name) => cfg.profiles.iter().position(|p| p.name == *name),
-            None => None,
-        }
+        let placed = cfg.state.fallback_chain.get(chain_pos)?.clone();
+        let idx = cfg.profiles.iter().position(|p| p.name == placed)?;
+        (idx, placed)
     };
-    if let Some(idx) = profile_idx {
-        app.profile_cursor.set(idx);
-    }
+    app.profile_cursor.set(idx);
+    Some(placed)
 }
 
 fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
@@ -19665,31 +19840,45 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             reorder_chain_member(app, 1)
         }
         KeyCode::Up => {
-            app.chain_cursor = if app.chain_cursor == 0 {
+            let next = if app.chain_cursor == 0 {
                 last
             } else {
                 app.chain_cursor - 1
             };
-            sync_profile_from_chain(app);
+            select_chain_item(app, next);
         }
         KeyCode::Down => {
-            app.chain_cursor = if app.chain_cursor >= last {
+            let next = if app.chain_cursor >= last {
                 0
             } else {
                 app.chain_cursor + 1
             };
-            sync_profile_from_chain(app);
+            select_chain_item(app, next);
         }
         KeyCode::PageUp => {
-            app.chain_cursor = selector_page_up(app.chain_cursor, &app.chain_selector);
-            sync_profile_from_chain(app);
+            select_chain_item(app, selector_page_up(app.chain_cursor, &app.chain_selector));
         }
         KeyCode::PageDown => {
-            app.chain_cursor = selector_page_down(app.chain_cursor, &app.chain_selector);
-            sync_profile_from_chain(app);
+            select_chain_item(
+                app,
+                selector_page_down(app.chain_cursor, &app.chain_selector),
+            );
         }
         KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
+    }
+}
+
+/// Move the chain selector to `next`. Landing on another item starts its card
+/// on the first row; staying put keeps the row the card was left on.
+fn select_chain_item(app: &mut App, next: usize) {
+    if next != app.chain_cursor {
+        app.fallback_detail_cursor = 0;
+        app.fallback_detail_entered = false;
+    }
+    app.chain_cursor = next;
+    if let Some(name) = sync_profile_from_chain(app) {
+        app.note_delete_selection(Some(name));
     }
 }
 
@@ -20226,7 +20415,7 @@ pub(crate) fn no_usage_confirm_detail(name: &str, active: bool) -> String {
 fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
     let candidates = chain_candidates(app);
     if candidates.is_empty() {
-        leave_fallback_detail(app);
+        drop_fallback_detail(app);
         return;
     }
     let last = candidates.len() - 1;
@@ -20333,7 +20522,7 @@ fn commit_chain_add(app: &mut App, name: &ProfileName) {
     // When the picker empties, `+ add` disappears — land on the new member.
     let remaining = chain_candidates(app);
     if remaining.is_empty() {
-        leave_fallback_detail(app);
+        drop_fallback_detail(app);
         app.chain_cursor = chain_items(app).len().saturating_sub(1);
     } else {
         app.fallback_detail_cursor = app.fallback_detail_cursor.min(remaining.len() - 1);
@@ -20391,18 +20580,26 @@ fn enter_fallback_detail(app: &mut App) {
         Some(ChainItemKind::Add) if !chain_candidates(app).is_empty() => {}
         _ => return,
     }
-    app.fallback_detail_cursor = 0;
     app.fallback_edit = None;
     app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_entered = true;
 }
 
 /// Return focus to the chain list, clearing any armed remove or live edit and
-/// the card's remembered day-list stop.
+/// the card's remembered day-list stop. The card keeps its row cursor, so a
+/// re-descend lands where the user left.
 fn leave_fallback_detail(app: &mut App) {
     app.fallback_focus = FallbackFocus::Chain;
-    app.fallback_detail_cursor = 0;
     app.fallback_edit = None;
     app.fallback_day_stop = None;
+}
+
+/// [`leave_fallback_detail`] for a card whose subject changed under it: the
+/// row cursor starts over on the next card, never-entered again.
+fn drop_fallback_detail(app: &mut App) {
+    leave_fallback_detail(app);
+    app.fallback_detail_cursor = 0;
+    app.fallback_detail_entered = false;
 }
 
 /// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
@@ -20668,7 +20865,7 @@ fn repin_member_edit(app: &mut App) {
         };
         match slot {
             Some(i) => app.chain_cursor = i,
-            None => leave_fallback_detail(app),
+            None => drop_fallback_detail(app),
         }
     }
     if app
@@ -21196,7 +21393,7 @@ fn remove_chain_member(app: &mut App, name: &ProfileName) {
     if !app.save_state_delta(|s, _held| s.fallback_chain.retain(|n| n != name)) {
         return;
     }
-    leave_fallback_detail(app);
+    drop_fallback_detail(app);
     let items_len = chain_items(app).len();
     if app.chain_cursor >= items_len {
         app.chain_cursor = items_len.saturating_sub(1);
@@ -22499,20 +22696,30 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     let sel_len = app.setup_items().len() + 1; // includes trailing `+ new` row
 
     match app.config_focus {
-        ConfigFocus::Profiles => match key.code {
-            KeyCode::Up => step_setup_cursor(app, -1, sel_len),
-            KeyCode::Down => step_setup_cursor(app, 1, sel_len),
-            KeyCode::PageUp => {
-                let next = selector_page_up(app.setup_position(), &app.setup_selector);
-                app.step_selection(SelectionSlotKind::Setup, next);
+        ConfigFocus::Profiles => {
+            let before = app.setup_position();
+            match key.code {
+                KeyCode::Up => step_setup_cursor(app, -1, sel_len),
+                KeyCode::Down => step_setup_cursor(app, 1, sel_len),
+                KeyCode::PageUp => {
+                    let next = selector_page_up(app.setup_position(), &app.setup_selector);
+                    app.step_selection(SelectionSlotKind::Setup, next);
+                }
+                KeyCode::PageDown => {
+                    let next = selector_page_down(app.setup_position(), &app.setup_selector);
+                    app.step_selection(SelectionSlotKind::Setup, next);
+                }
+                KeyCode::Enter => enter_config_detail(app),
+                _ => {}
             }
-            KeyCode::PageDown => {
-                let next = selector_page_down(app.setup_position(), &app.setup_selector);
-                app.step_selection(SelectionSlotKind::Setup, next);
+            // The blurred detail tints its cursor row, so another account's
+            // detail must not inherit the row the last one was left on: the
+            // new subject starts at its first row, never-entered.
+            if app.setup_position() != before {
+                app.config_action_cursor = 0;
+                app.config_detail_entered = false;
             }
-            KeyCode::Enter => enter_config_detail(app),
-            _ => {}
-        },
+        }
         ConfigFocus::Actions => {
             // The codex and pool detail panes run their own row lists and
             // actions; the claude path (and the `+ new` form) keep `config_rows`.
@@ -22844,6 +23051,7 @@ fn perform_codex_delete(app: &mut App, name: &str) {
             disarm_codex_2step(app);
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
+            app.config_detail_entered = false;
             let items = app.setup_items();
             let pos = if items.is_empty() {
                 0
@@ -23213,7 +23421,6 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
 
 /// Enter the detail pane, seeding a draft for the current selection.
 fn enter_config_detail(app: &mut App) {
-    app.config_action_cursor = 0;
     // Descending into the shown row adopts it: a held-but-hidden identity is
     // replaced, never restored over the pane the user is now editing.
     app.setup.clear();
@@ -23243,7 +23450,9 @@ fn enter_config_detail(app: &mut App) {
         app.setup.item = None;
         app.setup.index = None;
         app.profile_cursor.set(app.profile_count());
+        app.note_delete_selection(None);
         app.config_focus = ConfigFocus::Actions;
+        app.config_detail_entered = true;
         return;
     }
     match app.setup_selection() {
@@ -23257,6 +23466,7 @@ fn enter_config_detail(app: &mut App) {
         SetupSelection::Item(MainItemKind::Profile(i)) => {
             if let Some(name) = app.profile_name_at(i) {
                 app.config_draft = Some(build_draft_existing(app, &name));
+                app.note_delete_selection(Some(name));
             } else {
                 return;
             }
@@ -23271,6 +23481,7 @@ fn enter_config_detail(app: &mut App) {
         }
     }
     app.config_focus = ConfigFocus::Actions;
+    app.config_detail_entered = true;
 }
 
 /// Jump to the `+ new` create form (global `n`): disarm, suspend and switch
@@ -23304,6 +23515,7 @@ fn land_new_account(app: &mut App) {
     app.setup.index = None;
     app.setup.clear();
     app.profile_cursor.set(app.profile_count());
+    app.note_delete_selection(None);
     app.config_action_cursor = 0;
     // Restore a suspended `+ new` form: an open-field one still sits in
     // `config_draft` (the suspend kept it), an at-rest one in its own home.
@@ -23324,6 +23536,7 @@ fn land_new_account(app: &mut App) {
         app.config_draft = Some(draft);
     }
     app.config_focus = ConfigFocus::Actions;
+    app.config_detail_entered = true;
 }
 
 /// Jump to the focused Overview row's Setup editor (global `e`): the same
@@ -25923,6 +26136,7 @@ fn finish_created_profile(app: &mut App, name: &str) {
         .position(|p| p.name == name)
         .unwrap_or(0);
     app.profile_cursor.set(new_idx);
+    app.note_delete_selection(Some(ProfileName::from(name)));
     land_created_item(app, None, MainItemKind::Profile(new_idx));
 }
 
@@ -26191,6 +26405,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
         return;
     }
     app.deleting = Some(name.clone());
+    app.delete_selected = app.profile_name_at(app.profile_cursor.read());
     let config = Arc::clone(&app.config);
     let tx = app.delete_tx.clone();
     let bare_item_tx = app.bare_item_tx.clone();
@@ -26299,6 +26514,16 @@ thread_local! {
     static DELETE_WORKER_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: the next [`App::note_delete_selection`] first removes the
+    /// armed account from the shared config, standing in for the delete
+    /// worker's in-place removal landing between a caller's name resolve and
+    /// its record.
+    static REMOVE_BEFORE_DELETE_NOTE: std::cell::RefCell<Option<ProfileName>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Makes every delete worker started on the calling thread panic until dropped.
 #[cfg(test)]
 pub(crate) struct DeleteWorkerPanics(bool);
@@ -26322,6 +26547,7 @@ impl Drop for DeleteWorkerPanics {
 pub(crate) fn drain_profile_delete(app: &mut App) {
     while let Ok(result) = app.delete_rx.try_recv() {
         app.deleting = None;
+        let held = app.delete_selected.take();
         match result {
             DeleteResult::Ran(_, Ok(DeleteRan::Held)) => {}
             DeleteResult::Ran(name, Ok(DeleteRan::Deleted)) => {
@@ -26329,15 +26555,19 @@ pub(crate) fn drain_profile_delete(app: &mut App) {
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 // A draft opened on another account while the worker ran stays.
-                if !app
+                let lands = !app
                     .config_draft
                     .as_ref()
-                    .is_some_and(|d| d.editing_name.as_deref() != Some(name.as_str()))
-                {
+                    .is_some_and(|d| d.editing_name.as_deref() != Some(name.as_str()));
+                if lands {
                     app.config_focus = ConfigFocus::Profiles;
                     app.config_draft = None;
                 }
+                app.hold_profile_cursor_on(held.as_ref());
                 app.clamp_profile_cursor();
+                if lands {
+                    app.reset_setup_detail_unless_on(held.as_ref());
+                }
                 app.toast(ToastKind::Success, format!("deleted '{name}'"));
             }
             DeleteResult::Ran(_, Err(e)) => {
@@ -26512,6 +26742,7 @@ fn open_preset_picker(app: &mut App) {
                 .or_else(|| Some(build_draft_new()));
             app.config_focus = ConfigFocus::Actions;
             app.config_action_cursor = 0;
+            app.config_detail_entered = true;
             app.preset_picker_open = if restored {
                 PresetPickerOpen::Restored
             } else {
@@ -28033,8 +28264,8 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keys on the re-bind confirm. `↑`/`↓` walk the account toggle lines, `space`
-/// flips the one under the cursor, `←`/`→` pick the button, `PageUp`/`PageDown`
+/// Keys on the re-bind confirm. `↑`/`↓` walk the checkbox rows, `space`
+/// toggles the box under the cursor, `←`/`→` pick the button, `PageUp`/`PageDown`
 /// page the cursor through the published geometry. `⏎` runs the highlighted
 /// button; `esc`/`q` are `not now`.
 fn handle_rebind_key(app: &mut App, key: KeyEvent) {
@@ -30175,6 +30406,8 @@ pub(crate) fn on_tick(app: &mut App) {
 
     refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
+        let held = app.reload_selected_profile.take();
+        app.hold_profile_cursor_on(held.as_ref());
         app.clamp_profile_cursor();
         // Setup's `+ new` selection is the trailing row, never an index. A
         // mounted form keeps its row through the clamp while the roster holds
@@ -30187,6 +30420,9 @@ pub(crate) fn on_tick(app: &mut App) {
         // run by the clamp.
         if app.reload_was_on_new {
             app.profile_cursor.set(app.profile_count());
+        }
+        if app.tab == Tab::Setup {
+            app.reset_setup_detail_unless_on(held.as_ref());
         }
         if app.profile_count() == 0 {
             app.usage_detail_focus = StatusFocus::List;

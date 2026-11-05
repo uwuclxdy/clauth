@@ -16432,6 +16432,1227 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
     );
 }
 
+/// The member card remembers its row across an ascend, so re-entering lands
+/// where the user left instead of back on the first row.
+#[test]
+fn reentering_a_fallback_card_returns_to_the_row_it_left() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.fallback_focus,
+        super::FallbackFocus::Detail,
+        "enter descends"
+    );
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.fallback_detail_cursor, 3,
+        "the walk lands on the fourth row"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        app.fallback_focus,
+        super::FallbackFocus::Chain,
+        "esc ascends"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.fallback_focus,
+        super::FallbackFocus::Detail,
+        "enter descends again"
+    );
+    assert_eq!(
+        app.fallback_detail_cursor, 3,
+        "re-descending returns to the row the card was left on"
+    );
+}
+
+/// Setup's detail re-enters on the row it was left on, as the Fallback card
+/// does; moving the selector to another account starts that account's detail
+/// at its first row.
+#[test]
+fn reentering_a_setup_detail_returns_to_the_row_it_left() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "enter descends"
+    );
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.config_action_cursor, 3,
+        "the walk lands on the fourth row"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "esc ascends"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_action_cursor, 3,
+        "re-descending returns to the row the detail was left on"
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    let before = app.profile_cursor;
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_ne!(
+        app.profile_cursor, before,
+        "fixture control: ↓ moved the selector to the other account"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "another account's detail starts at its first row"
+    );
+}
+
+/// A snapshot change that re-homes Setup's selection without a key (the codex
+/// account the selection held left the listing) also starts the new subject's
+/// detail at its first row: the blurred pane must not tint a stale row from
+/// the account the selection left.
+#[test]
+fn a_rehome_starts_the_new_subjects_detail_at_its_first_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.codex_rows = vec![super::CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_codex_index(),
+        Some(0),
+        "the selector moved onto the codex row"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "enter descends"
+    );
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.config_action_cursor, 1,
+        "the walk lands on the delete row"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "esc ascends"
+    );
+
+    // The codex snapshot drops the account while Setup shows it (the tick's
+    // re-read agrees: the sandboxed listing holds none); the tick's rehome
+    // re-places the selection without a key.
+    app.codex_rows = vec![];
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the rehomed selection's detail starts at its first row"
+    );
+
+    // The blurred detail shades nothing: no stale row from the codex detail.
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    assert_eq!(tinted, Vec::new(), "the blurred detail shades nothing");
+}
+
+/// The cells right of the `││` pane separator that carry `BG_HOVER` on a full
+/// frame: the Setup detail's tinted cells.
+fn setup_detail_tinted_cells(app: &App) -> Vec<(u16, u16)> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let from = row[..sep].chars().count() + 1;
+        for x in from..row.chars().count() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// Walk Setup's first account to its last row (`delete account`), arm it and
+/// confirm: the delete worker starts on that account.
+fn delete_first_account_from_its_detail(app: &mut App) {
+    super::handle_key(app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "enter descends"
+    );
+    super::handle_key(app, key(KeyCode::Up));
+    assert_eq!(
+        super::config_rows(app).get(app.config_action_cursor),
+        Some(&super::ConfigRow::Delete),
+        "↑ wraps to the delete row"
+    );
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("a"),
+        "the second ⏎ starts the delete"
+    );
+}
+
+/// Deleting an account from its detail lands the selection on the next
+/// account without a key: that account was never entered, so its detail
+/// starts at its first row and its blurred frame shades nothing.
+#[test]
+fn a_delete_landing_starts_the_next_accounts_detail_never_entered() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    delete_first_account_from_its_detail(&mut app);
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "the selection landed on the next account"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "the landing ascends to the selector"
+    );
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the next account's detail starts at its first row"
+    );
+    assert!(
+        !app.config_detail_entered,
+        "the next account's detail is never-entered"
+    );
+    assert_eq!(
+        setup_detail_tinted_cells(&app),
+        Vec::new(),
+        "the blurred detail shades no row of an account nobody entered"
+    );
+}
+
+/// A delete landing while the user has opened another account's detail keeps
+/// that detail: focus, the row walked to and its entered state all stay.
+#[test]
+fn a_delete_landing_under_another_accounts_open_detail_keeps_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    delete_first_account_from_its_detail(&mut app);
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .and_then(|d| d.editing_name.as_deref()),
+        Some("b"),
+        "precondition: b's detail is open while the delete runs"
+    );
+    assert_eq!(app.config_action_cursor, 2, "precondition: b's walk");
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "b's open detail keeps focus"
+    );
+    assert_eq!(app.config_action_cursor, 2, "b's detail keeps its row");
+    assert!(app.config_detail_entered, "b's detail stays entered");
+}
+
+/// The Setup selection holds its account across a delete landing, as codex
+/// and pool rows already do: an account the user moved to, entered, walked
+/// and left while an earlier account's delete ran is still the selection once
+/// the delete lands, with its own remembered row and entered state. An index
+/// left in place would land on the account after it, carrying the walked row.
+#[test]
+fn a_delete_landing_keeps_the_selection_on_the_account_walked_during_the_run() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+    ]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    delete_first_account_from_its_detail(&mut app);
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 2, true),
+        "precondition: b's detail was walked to its third row and left"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 2, true),
+        "the selection stays on b with b's own remembered row"
+    );
+}
+
+/// A reload that drops the selected account (another process deleted it)
+/// moves the selection onto the next account without a key: its detail
+/// starts never-entered at its first row, its blurred frame shading nothing.
+#[test]
+fn a_reload_dropping_the_selected_account_starts_the_next_detail_never_entered() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let a = crate::testutil::blank_profile(&ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&ProfileName::from("b"));
+    persist_roster(&[a.clone(), b.clone()]);
+    let mut app = app_with(vec![a, b.clone()]);
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (app.config_action_cursor, app.config_detail_entered),
+        (3, true),
+        "precondition: a's detail was entered and left on its fourth row"
+    );
+
+    persist_roster(&[b]);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "fixture control: the reload dropped a and the selection shows b"
+    );
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "b's detail starts at its first row"
+    );
+    assert!(!app.config_detail_entered, "b's detail is never-entered");
+    assert_eq!(
+        setup_detail_tinted_cells(&app),
+        Vec::new(),
+        "the blurred detail shades no row of an account nobody entered"
+    );
+}
+
+/// A reload that keeps the selected account keeps its detail's remembered
+/// row and entered state, however the rest of the roster moved.
+#[test]
+fn a_reload_keeping_the_selected_account_keeps_its_remembered_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&ProfileName::from("b"));
+    let c = crate::testutil::blank_profile(&ProfileName::from("c"));
+    persist_roster(&[a.clone(), b.clone()]);
+    let mut app = app_with(vec![a.clone(), b]);
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    persist_roster(&[a, c]);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("c")).is_some(),
+        "fixture control: the reload ran"
+    );
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("a"),
+        "the selection still shows a"
+    );
+    assert_eq!(
+        (app.config_action_cursor, app.config_detail_entered),
+        (3, true),
+        "a's detail keeps its remembered row and entered state"
+    );
+}
+
+/// A delete whose own account is the selection when it lands moves the
+/// selection onto the next account never-entered at its first row, even after
+/// the user walked the deleted account's detail again during the run.
+#[test]
+fn a_delete_landing_on_the_deleted_account_walked_during_the_run_starts_the_next_detail_never_entered()
+ {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+    ]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    delete_first_account_from_its_detail(&mut app);
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("a"), 2, true),
+        "precondition: a's detail was walked to its third row and left"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 0, false),
+        "the next account's detail starts never-entered at its first row"
+    );
+    assert_eq!(
+        setup_detail_tinted_cells(&app),
+        Vec::new(),
+        "the blurred detail shades no row of an account nobody entered"
+    );
+}
+
+/// A delete of an account after the selected one shifts no index under the
+/// selection: it stays on its account with its own remembered row.
+#[test]
+fn a_delete_landing_after_the_selected_account_keeps_its_remembered_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+    ]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("a"), 2, true),
+        "precondition: a's detail was walked to its third row and left"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("a"), 2, true),
+        "the selection stays on a with a's own remembered row"
+    );
+}
+
+/// Block until the delete worker has removed `name` from the shared config in
+/// place. Its result stays queued until the test drains it, so the caller sits
+/// in the window between the removal and the landing.
+fn wait_for_the_worker_to_remove(app: &App, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.config().find(&ProfileName::from(name)).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete worker never removed '{name}'"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A key that moves no selection, handled after the worker removed the
+/// account but before its landing, is no choice of the account the removal
+/// shifted the index onto: the next account still starts never-entered at its
+/// first row.
+#[test]
+fn an_inert_key_between_the_removal_and_the_landing_keeps_the_next_detail_never_entered() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    delete_first_account_from_its_detail(&mut app);
+    wait_for_the_worker_to_remove(&app, "a");
+    assert!(
+        app.deleting.is_some(),
+        "precondition: the delete has not landed yet"
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Char('x')));
+    drain_delete(&mut app);
+
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 0, false),
+        "the next account's detail starts never-entered at its first row"
+    );
+    assert_eq!(
+        setup_detail_tinted_cells(&app),
+        Vec::new(),
+        "the blurred detail shades no row of an account nobody entered"
+    );
+}
+
+/// Leaving the detail and switching tabs between the removal and the landing
+/// clamps the shared cursor off the vanished last row onto the account before
+/// it: that follows the roster, so the landing still starts that account
+/// never-entered.
+#[test]
+fn a_tab_switch_between_the_removal_and_the_landing_keeps_the_previous_detail_never_entered() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    wait_for_the_worker_to_remove(&app, "b");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    assert_ne!(app.tab, Tab::Setup, "precondition: the tab switched");
+    drain_delete(&mut app);
+
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("a"), 0, false),
+        "a's detail starts never-entered at its first row"
+    );
+}
+
+/// A tick placement during the run is a placement the landing keeps: a pool
+/// row the user moved to hides, the rehome puts the selection on the first
+/// claude row, and the delete then lands there instead of on the last claude
+/// account a key named.
+#[test]
+fn a_rehome_placement_during_the_run_survives_the_delete_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 0)),
+        "precondition: the selection sits on the pool row past d"
+    );
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_setup_selection();
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("a"),
+        "precondition: the hidden pool row put the selection on the first row"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("a"),
+        "the landing keeps the rehome's placement"
+    );
+}
+
+/// A held `e` that resolves on a tick during the run opens its account's
+/// detail there: the landing keeps the selection on that account under its
+/// open draft, never on the account a key last named.
+#[test]
+fn a_held_edit_landing_during_the_run_survives_the_delete_landing() {
+    use super::{EditTarget, LossWarningTarget};
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("c"),
+        "precondition: the last key named c"
+    );
+    app.loss_pending = Some(LossWarningTarget::EditAccount(EditTarget::Profile(
+        ProfileName::from("d"),
+    )));
+    super::settle_loss_pending(&mut app, true);
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .and_then(|d| d.editing_name.as_deref()),
+        Some("d"),
+        "precondition: the held edit opened d's detail"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.as_deref()),
+        ),
+        (Some("d"), Some("d")),
+        "the selection stays on d under d's open draft"
+    );
+}
+
+/// The worker's removal shifts the account under the cursor's index; a rehome
+/// that then drops the pool row the user stepped onto places the selection on
+/// the account now at that same index. The landing keeps that account, never
+/// the one a key named before the shift.
+#[test]
+fn a_rehome_onto_the_cursors_own_index_after_the_removal_survives_the_delete_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    delete_first_account_from_its_detail(&mut app);
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("c"),
+        "precondition: the walk named c"
+    );
+    let _ = park.release.send(());
+    wait_for_the_worker_to_remove(&app, "a");
+    assert!(
+        app.deleting.is_some(),
+        "precondition: the delete has not landed yet"
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 0)),
+        "precondition: the selection sits on the pool row past d"
+    );
+    app.shunt_pool = one_provider_pool(&[]);
+    app.rehome_setup_selection();
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "precondition: the dropped pool row put the selection on d"
+    );
+
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "the landing keeps the account the rehome placed"
+    );
+}
+
+/// A key step back onto the claude row the cursor's index already names, after
+/// the removal shifted that index onto another account, is a choice of that
+/// account: the landing keeps it.
+#[test]
+fn a_step_back_onto_the_cursors_own_index_after_the_removal_survives_the_delete_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    delete_first_account_from_its_detail(&mut app);
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("c"),
+        "precondition: the walk named c"
+    );
+    let _ = park.release.send(());
+    wait_for_the_worker_to_remove(&app, "a");
+    assert!(
+        app.deleting.is_some(),
+        "precondition: the delete has not landed yet"
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 0)),
+        "precondition: the selection sits on the pool row past d"
+    );
+    super::handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "precondition: the step back named d"
+    );
+
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "the landing keeps the account the step chose"
+    );
+}
+
+/// A rehome that lands on the index the cursor already holds, with no removal
+/// in between, is still a placement: after a tab switch pulled the selection
+/// off `+ new` onto d, a dropped pool row places it on d again, and the walk
+/// the user then makes in d's detail survives the landing.
+#[test]
+fn a_rehome_onto_the_cursors_own_index_without_a_removal_survives_the_delete_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "precondition: the walk reached `+ new`"
+    );
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    super::handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        (
+            app.tab,
+            app.setup_profile_name().as_ref().map(ProfileName::as_str)
+        ),
+        (Tab::Setup, Some("d")),
+        "precondition: the tab switch pulled the selection onto d"
+    );
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 0)),
+        "precondition: the selection sits on the pool row past d"
+    );
+    app.shunt_pool = one_provider_pool(&[]);
+    app.rehome_setup_selection();
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("d"), 2, true),
+        "precondition: the rehome placed d, whose detail was walked and left"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("d"), 2, true),
+        "the landing keeps d with d's own remembered row"
+    );
+}
+
+/// Descending into the account a tab-switch clamp placed the selection on is a
+/// choice of that account: the detail walked there survives the delete
+/// landing, never reset to the account a key last named.
+#[test]
+fn an_entered_account_after_a_clamp_placement_survives_the_delete_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.tab = Tab::Setup;
+    let park = crate::lock::flock_wait_park::arm();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.deleting.as_ref().map(ProfileName::as_str),
+        Some("b"),
+        "precondition: b's delete runs"
+    );
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "precondition: the walk reached `+ new`"
+    );
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    super::handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        (
+            app.tab,
+            app.setup_profile_name().as_ref().map(ProfileName::as_str)
+        ),
+        (Tab::Setup, Some("d")),
+        "precondition: the tab switch pulled the selection onto d"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("d"), 2, true),
+        "precondition: d's detail was entered and walked"
+    );
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the delete landed"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("d"), 2, true),
+        "the landing keeps the account the descend chose, with the row it walked"
+    );
+}
+
+/// A descend into a saved account records the account it resolved, even when
+/// the delete worker's in-place removal lands between that resolve and the
+/// record: the landing holds the entered account.
+#[test]
+fn an_enter_records_the_account_it_resolved_across_an_interleaved_removal() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    app.tab = Tab::Setup;
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.setup_profile_name().as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "precondition: the cursor rests on d"
+    );
+
+    app.deleting = Some(ProfileName::from("b"));
+    super::REMOVE_BEFORE_DELETE_NOTE.with(|c| *c.borrow_mut() = Some(ProfileName::from("b")));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.config().find(&ProfileName::from("b")).is_none(),
+        "fixture control: the interleaved removal landed"
+    );
+    assert_eq!(
+        app.delete_selected.as_ref().map(ProfileName::as_str),
+        Some("d"),
+        "the enter records the account it resolved, not the shifted index"
+    );
+}
+
+/// A reorder records the account it moved, even when the delete worker's
+/// in-place removal shifts the roster between the reorder and the record: the
+/// landing holds the moved account.
+#[test]
+fn a_reorder_records_the_account_it_moved_across_an_interleaved_removal() {
+    use super::{KeyEvent, KeyModifiers};
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&ProfileName::from("a")),
+        crate::testutil::blank_profile(&ProfileName::from("b")),
+        crate::testutil::blank_profile(&ProfileName::from("c")),
+        crate::testutil::blank_profile(&ProfileName::from("d")),
+    ]);
+    for _ in 0..2 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(2)),
+        "precondition: the Overview cursor rests on c"
+    );
+
+    app.deleting = Some(ProfileName::from("a"));
+    super::REMOVE_BEFORE_DELETE_NOTE.with(|c| *c.borrow_mut() = Some(ProfileName::from("a")));
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the interleaved removal landed"
+    );
+    assert_eq!(
+        app.config()
+            .profiles
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c", "b", "d"],
+        "fixture control: the reorder moved c ahead of b"
+    );
+    assert_eq!(
+        app.delete_selected.as_ref().map(ProfileName::as_str),
+        Some("c"),
+        "the reorder records the account it moved, not the shifted index"
+    );
+}
+
+/// A reload that drops an account before the selected one keeps the
+/// selection on its account, with its own remembered row and entered state.
+#[test]
+fn a_reload_dropping_an_earlier_account_keeps_the_selection_and_its_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = crate::testutil::blank_profile(&ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&ProfileName::from("b"));
+    let c = crate::testutil::blank_profile(&ProfileName::from("c"));
+    persist_roster(&[a.clone(), b.clone(), c.clone()]);
+    let mut app = app_with(vec![a, b.clone(), c.clone()]);
+    app.tab = Tab::Setup;
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..3 {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 3, true),
+        "precondition: b's detail was entered and left on its fourth row"
+    );
+
+    persist_roster(&[b, c]);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+
+    assert!(
+        app.config().find(&ProfileName::from("a")).is_none(),
+        "fixture control: the reload dropped a"
+    );
+    assert_eq!(
+        (
+            app.setup_profile_name().as_ref().map(ProfileName::as_str),
+            app.config_action_cursor,
+            app.config_detail_entered,
+        ),
+        (Some("b"), 3, true),
+        "the selection stays on b with b's own remembered row"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn reorder_chain_member_keeps_the_cursor_when_the_save_fails() {
@@ -29081,9 +30302,11 @@ fn leaving_the_card_forgets_the_custom_stop() {
         "esc left the card"
     );
     super::handle_key(&mut app, key(KeyCode::Enter));
-    for _ in 0..preferred_days_row() {
-        super::handle_key(&mut app, key(KeyCode::Down));
-    }
+    assert_eq!(
+        app.fallback_detail_cursor,
+        preferred_days_row(),
+        "the card re-enters on the row it left"
+    );
     step_days(&mut app, &presets_then_never, "after leaving the card");
 
     // A tab switch away and back leaves the card too (`⌥digit`: `←`/`→`/`tab`
@@ -43782,7 +45005,7 @@ fn rebind_space_flips_the_account_under_the_cursor() {
 }
 
 #[test]
-fn rebind_up_down_walk_the_toggle_lines_with_wraparound() {
+fn rebind_up_down_walk_the_checkbox_rows_with_wraparound() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = rebind_app(None, rebind_fixture());
     let cursor = |app: &App| match app.modals.last() {
@@ -44033,7 +45256,7 @@ fn a_custom_id_written_after_the_offer_survives_the_apply() {
 }
 
 /// The page keys move the cursor through the geometry the render published
-/// (not a bare scroll), so `space` always flips a visible account. 25 accounts
+/// (not a bare scroll), so `space` toggles a visible account's box. 25 accounts
 /// at 100×24, drawn before every key the way `run_loop` does: the first
 /// PageDown lands mid-list, the second reaches the last account, PageUp comes
 /// back mid-list.

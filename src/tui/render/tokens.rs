@@ -1274,10 +1274,14 @@ fn card(
         None => section_box(title, focused, first, area.width),
     };
     if let Some(m) = meta {
-        // The badge closes with a border cell of its own (`… badge ─╮`), the
-        // same rule the meta-slot family follows — the card border is the
-        // unfocused `LINE`.
-        block = block.title(meta_line(m, Style::default().fg(theme::line_color())));
+        // The badge closes with a border cell of its own (`… badge ─╮`), so
+        // that dash carries the card's own border token.
+        let border = if focused {
+            theme::line_strong()
+        } else {
+            theme::line()
+        };
+        block = block.title(meta_line(m, border));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

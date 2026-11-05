@@ -509,6 +509,19 @@ pub(super) fn picker_row(
     name_style: Style,
     width: u16,
 ) -> Line<'static> {
+    marked_picker_row(selected, focused, None, name, name_style, width)
+}
+
+/// [`picker_row`] with an icon `mark` before the name. The mark is its own
+/// span so a selected row promotes the name alone.
+pub(super) fn marked_picker_row(
+    selected: bool,
+    focused: bool,
+    mark: Option<Span<'static>>,
+    name: String,
+    name_style: Style,
+    width: u16,
+) -> Line<'static> {
     // Caret only in the focused pane; blurred rows keep BG_HOVER via select_line.
     let arrow = if selected && focused {
         Span::styled(
@@ -518,16 +531,19 @@ pub(super) fn picker_row(
     } else {
         Span::raw("  ")
     };
+    let mark_w = mark.as_ref().map_or(0, Span::width);
     // A profile name longer than the selector (an email address passes
     // `validate_name_chars`) clamps with `…` instead of running past the pane
     // edge — the marked Fallback arm's clamp, without the marker column.
-    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2));
-    let line = Line::from(vec![
-        arrow,
-        Span::styled(text, bold_when(name_style, selected && focused)),
-        Span::raw(pad),
-    ]);
-    select_line(line, selected, focused, width)
+    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2 + mark_w));
+    let mut spans = vec![arrow];
+    spans.extend(mark);
+    spans.push(Span::styled(
+        text,
+        bold_when(name_style, selected && focused),
+    ));
+    spans.push(Span::raw(pad));
+    select_line(Line::from(spans), selected, focused, width)
 }
 
 /// The empty state's two text lines (dim hint, hotkey-accented action), shared
@@ -896,9 +912,9 @@ pub(crate) fn follow_scroll_offset(
 }
 
 /// Tail-priority variant for the re-bind confirm's first account: when the
-/// focus range (the block head..the cursor's toggle) is taller than the
-/// viewport, the toggle — the end — stays visible instead of the head, so
-/// `space` always flips a visible account.
+/// focus range (the block head..the cursor's account row) is taller than the
+/// viewport, that row — the end — stays visible instead of the head, so
+/// `space` always toggles a visible account's box.
 pub(crate) fn follow_scroll_offset_tail(
     total: usize,
     viewport: usize,

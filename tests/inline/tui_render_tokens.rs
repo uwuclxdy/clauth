@@ -429,6 +429,50 @@ fn total_card_groups_kv_rows_and_carries_the_range_meta() {
     assert!(out.contains("1,000"), "session count is comma-grouped");
 }
 
+/// A focused card's border is one token: the dashes closing its meta badge
+/// must not fall back to the blurred line color.
+#[test]
+fn a_focused_cards_meta_dashes_carry_the_focused_border() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_dash_focus = crate::tui::app::CardKind::Total;
+    let (w, h) = (120u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains(" TOTAL "))
+        .expect("the total card renders");
+    let cells: Vec<char> = rows[y].chars().collect();
+    let title_x = rows[y]
+        .find(" TOTAL ")
+        .map(|b| rows[y][..b].chars().count());
+    let title_x = title_x.expect("title column");
+    let left = (0..title_x).rev().find(|&x| cells[x] == '╭').expect("╭");
+    let right = (title_x..cells.len())
+        .find(|&x| cells[x] == '╮')
+        .expect("╮");
+    let strong = crate::tui::theme::line_strong_color();
+    let off: Vec<(usize, ratatui::style::Color)> = (left..=right)
+        .filter_map(|x| {
+            let cell = buf.cell((x as u16, y as u16)).unwrap();
+            (matches!(cell.symbol(), "─" | "╭" | "╮") && cell.fg != strong).then_some((x, cell.fg))
+        })
+        .collect();
+    assert!(
+        rows[y].contains("jun 21 ─╮"),
+        "the meta badge renders on the focused card, got {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        off,
+        Vec::new(),
+        "every border cell of the focused card's top row is the focused border color"
+    );
+}
+
 // ── model rows: unpriced cost dash ────────────────────────────────────────────
 
 #[test]

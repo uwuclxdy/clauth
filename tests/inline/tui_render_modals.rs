@@ -3488,7 +3488,7 @@ fn render_rebind(form: &crate::tui::app::RebindForm, width: u16, height: u16) ->
 }
 
 /// The re-bind confirm renders its grouped body through `draw_rebind` itself:
-/// every row, the toggle glyphs, the cursor mark, and the button pair, pinned
+/// every row, the checkbox marks, the cursor mark, and the button pair, pinned
 /// by equality against the rendered buffer.
 #[test]
 fn the_rebind_confirm_renders_its_grouped_body() {
@@ -3507,15 +3507,15 @@ fn the_rebind_confirm_renders_its_grouped_body() {
             "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
-            "│  ❯ ─● D1                                                                                                                                                              │",
-            "│    ─● D2                                                                                                                                                              │",
+            "│  ❯ [x] D1                                                                                                                                                             │",
+            "│    [x] D2                                                                                                                                                             │",
             "│                                                                                                                                                                       │",
             "│    default  deepseek-chat  → opus                                                                                                                                     │",
             "│    opus     (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
             "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
-            "│    ─● DS1                                                                                                                                                             │",
+            "│    [x] DS1                                                                                                                                                            │",
             "│                                                                                                                                                                       │",
             "│                                                                                                                                                                       │",
             "│                                                                                                                                                     not now   apply   │",
@@ -3525,9 +3525,155 @@ fn the_rebind_confirm_renders_its_grouped_body() {
     );
 }
 
+/// The re-bind confirm over a bare frame with `D2` unticked, cursor on `D1`.
+fn rebind_pick_buffer() -> ratatui::buffer::Buffer {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut form = rebind_render_form();
+    form.checked[0][1] = false;
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| draw_rebind(f, f.area(), &form)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// The modal's account row whose content ends in ` name`: `(y, content
+/// left x, content right x, content text)`, the content spanning the cells
+/// inside the border and the 2-cell modal padding.
+fn rebind_account_row(buf: &ratatui::buffer::Buffer, name: &str) -> (u16, u16, u16, String) {
+    let (top, bottom, left, right) = modal_bounds(buf);
+    let (from, to) = (left + 3, right - 3);
+    (top + 1..bottom)
+        .find_map(|y| {
+            let text: String = (from..=to).map(|x| buf[(x, y)].symbol()).collect();
+            let text = text.trim_end().to_string();
+            text.ends_with(&format!(" {name}"))
+                .then_some((y, from, to, text))
+        })
+        .unwrap_or_else(|| panic!("no `{name}` account row in the confirm"))
+}
+
+/// Picking accounts is a multi-select, so each pick reads as a checkbox
+/// (`[x]` / `[ ]`), not an on/off switch, on both tiers alike.
+#[test]
+fn the_rebind_confirm_marks_each_pick_with_a_checkbox_on_both_tiers() {
+    use crate::tui::theme::{self, Tier};
+    /// One tier's account rows, the ticked and unticked box colors, and the
+    /// tier's `ACCENT` / `TEXT_DIM` tokens.
+    type TierFrame = (
+        Tier,
+        Vec<String>,
+        [ratatui::style::Color; 3],
+        [ratatui::style::Color; 3],
+        [ratatui::style::Color; 2],
+    );
+    let tiers = [Tier::Full, Tier::Compatible];
+    // Both tiers render before any assertion, so one red names both. The
+    // modal is located while its tier is held: its border color is per tier.
+    let frames: Vec<TierFrame> = tiers
+        .iter()
+        .map(|&tier| {
+            let _tier = crate::testutil::TierSandbox::new(tier);
+            let buf = rebind_pick_buffer();
+            let rows = ["D1", "D2", "DS1"]
+                .iter()
+                .map(|n| rebind_account_row(&buf, n).3)
+                .collect();
+            let fg = |name: &str, offset: u16| {
+                let (y, from, _, _) = rebind_account_row(&buf, name);
+                buf[(from + offset, y)].fg
+            };
+            (
+                tier,
+                rows,
+                [fg("D1", 2), fg("D1", 3), fg("D1", 4)],
+                [fg("D2", 2), fg("D2", 3), fg("D2", 4)],
+                [theme::accent_color(), theme::text_dim_color()],
+            )
+        })
+        .collect();
+    let want = ["❯ [x] D1", "  [ ] D2", "  [x] DS1"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|(tier, rows, ..)| (*tier, rows.clone()))
+            .collect::<Vec<_>>(),
+        tiers.map(|t| (t, want.clone())).to_vec(),
+        "caret, then the checkbox, then the account, on both tiers"
+    );
+    for (tier, _, ticked, unticked, [accent, dim]) in &frames {
+        assert_eq!(*ticked, [*accent; 3], "{tier:?}: a ticked box is ACCENT");
+        assert_eq!(
+            [unticked[0], unticked[2]],
+            [*dim; 2],
+            "{tier:?}: an unticked box's brackets are TEXT_DIM"
+        );
+    }
+}
+
+/// The confirm's caret is the app's one selection caret: `ACCENT + bold`.
+#[test]
+fn the_rebind_confirm_caret_is_accent_bold() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let buf = rebind_pick_buffer();
+    let (y, from, _, text) = rebind_account_row(&buf, "D1");
+    assert!(text.starts_with('❯'), "the caret sits on D1: {text:?}");
+    let caret = &buf[(from, y)];
+    assert_eq!(
+        (
+            caret.fg,
+            caret.modifier.contains(ratatui::style::Modifier::BOLD)
+        ),
+        (crate::tui::theme::accent_color(), true),
+        "the caret is ACCENT + bold"
+    );
+}
+
+/// The focused account row reads like every other selected row: label
+/// `TEXT + bold` on a `BG_HOVER` tint spanning the content width, while an
+/// unfocused account's label stays `TEXT_DIM`.
+#[test]
+fn the_rebind_confirm_focused_row_takes_the_selected_row_treatment() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let buf = rebind_pick_buffer();
+    let (y, from, to, _) = rebind_account_row(&buf, "D1");
+    let untinted: Vec<u16> = (from..=to)
+        .filter(|&x| buf[(x, y)].bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<u16>::new(),
+        "the focused row is tinted to the padding boundary"
+    );
+    let (_, from, _, text) = rebind_account_row(&buf, "D1");
+    let at = (text.chars().count() - 2) as u16;
+    let label = |x: u16| {
+        let c = &buf[(from + x, y)];
+        (c.fg, c.modifier.contains(Modifier::BOLD))
+    };
+    assert_eq!(
+        [label(at), label(at + 1)],
+        [(theme::text_color(), true); 2],
+        "the focused label is TEXT + bold"
+    );
+    let (y2, from2, _, text2) = rebind_account_row(&buf, "D2");
+    let at2 = (text2.chars().count() - 2) as u16;
+    let other = |x: u16| {
+        let c = &buf[(from2 + x, y2)];
+        (c.fg, c.modifier.contains(Modifier::BOLD))
+    };
+    assert_eq!(
+        [other(at2), other(at2 + 1)],
+        [(theme::text_dim_color(), false); 2],
+        "an unfocused label stays TEXT_DIM"
+    );
+}
+
 /// On a terminal shorter than the list, the view follows the cursor: with the
-/// cursor on the last account, its toggle line is on screen while the first
-/// block's toggle has scrolled out.
+/// cursor on the last account, its checkbox row is on screen while the first
+/// block's has scrolled out.
 #[test]
 fn the_rebind_confirm_follows_its_cursor_on_a_short_terminal() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
@@ -3536,19 +3682,18 @@ fn the_rebind_confirm_follows_its_cursor_on_a_short_terminal() {
     let rows = render_rebind(&form, 100, 12);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("─● DS1"),
+        joined.contains("[x] DS1"),
         "the cursor's account is on screen: {joined}"
     );
     assert!(
-        !joined.contains("─● D1 "),
+        !joined.contains("[x] D1 "),
         "the first block scrolled out: {joined}"
     );
 }
 
 /// Returning to a block's first account (Down wraps the cursor back) keeps the
 /// block head on screen: the confirm message and its `default` row, not just
-/// the tail toggles. 20 accounts in one block at 100×24, the reviewer's R2-Q3
-/// shape.
+/// the tail rows. 20 accounts in one block at 100×24.
 #[test]
 fn the_rebind_confirm_wrap_back_shows_the_block_head() {
     use crate::profile::Profile;
@@ -3585,22 +3730,22 @@ fn the_rebind_confirm_wrap_back_shows_the_block_head() {
     );
 }
 
-/// A block taller than the viewport: the cursor's first-account toggle line
+/// A block taller than the viewport: the cursor's first-account checkbox row
 /// stays on screen even though the widened focus reaches back to the block head
-/// (the toggle wins over the head).
+/// (the checkbox row wins over the head).
 #[test]
 fn the_rebind_confirm_first_toggle_stays_visible_when_its_block_outgrows_the_viewport() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let form = rebind_render_form();
     let joined = render_rebind(&form, 100, 12).join("\n");
     assert!(
-        joined.contains("─● D1"),
+        joined.contains("[x] D1"),
         "the first account's toggle is on screen: {joined}"
     );
 }
 
 /// Reach-back into a block after the first: `Up` into block 1's first account
-/// keeps that block's change set on screen, not just its toggle.
+/// keeps that block's change set on screen, not just its checkbox row.
 #[test]
 fn up_into_a_later_blocks_first_account_shows_its_rows() {
     use crate::profile::Profile;

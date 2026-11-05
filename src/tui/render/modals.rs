@@ -429,8 +429,8 @@ struct ModalGeometry<'a> {
 
 /// Which end of a focus range stays visible when it is taller than the
 /// viewport: every option list keeps its head (the row's start); the re-bind
-/// confirm keeps its tail (the cursor's toggle line), so `space` always flips
-/// a visible account.
+/// confirm keeps its tail (the cursor's account row), so `space` always
+/// toggles a visible account's box.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusEnd {
     Head,
@@ -1427,9 +1427,9 @@ fn loss_warning_buttons(state: &LossWarningState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The startup re-bind confirm: grouped account moves, one toggle line per
+/// The startup re-bind confirm: grouped account moves, one checkbox row per
 /// account, and a `not now` / `apply` button pair. The view follows the cursor
-/// and the render publishes each account toggle's line geometry for the page
+/// and the render publishes each account row's line geometry for the page
 /// keys, the same follow/paging shape the other choice menus use.
 fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     let row_w = form
@@ -1459,11 +1459,11 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
         Line::from(""),
     ];
 
-    // The pre-chunk line index of each account toggle, in flat order, plus each
+    // The pre-chunk line index of each account row, in flat order, plus each
     // block's first line: the first account's focus reaches back to it so the
     // block's change set (and, for block 0, the confirm's message) stays on
     // screen when the cursor returns to it.
-    let mut toggle_lines: Vec<usize> = Vec::new();
+    let mut account_row_lines: Vec<usize> = Vec::new();
     let mut block_starts: Vec<usize> = Vec::new();
     let mut flat = 0usize;
     for (bi, block) in form.blocks.iter().enumerate() {
@@ -1480,27 +1480,33 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
             )));
         }
         for (ai, account) in block.accounts.iter().enumerate() {
-            toggle_lines.push(lines.len());
+            account_row_lines.push(lines.len());
             let selected = flat == form.cursor;
+            // Every span carries the tint, so the scroller pads the row to the
+            // padding boundary.
+            let tint = selected.then(theme::bg_hover);
             let arrow = if selected {
-                Span::styled("\u{276f} ", theme::accent())
+                Span::styled(
+                    format!("{} ", theme::CARET),
+                    with_bg(theme::accent().bold(), tint),
+                )
             } else {
                 Span::raw("  ")
             };
-            let toggle = if form.checked[bi][ai] {
-                Span::styled(theme::toggle_on().to_string(), theme::accent())
+            let checkbox = if form.checked[bi][ai] {
+                Span::styled(theme::CHECKBOX_ON, with_bg(theme::accent(), tint))
             } else {
-                Span::styled(theme::toggle_off().to_string(), theme::faint())
+                Span::styled(theme::CHECKBOX_OFF, with_bg(theme::dim(), tint))
             };
             let name_style = if selected {
-                theme::accent()
+                with_bg(theme::body().bold(), tint)
             } else {
                 theme::dim()
             };
             lines.push(Line::from(vec![
                 arrow,
-                toggle,
-                Span::raw(" "),
+                checkbox,
+                Span::styled(" ", with_bg(Style::default(), tint)),
                 Span::styled(account.clone(), name_style),
             ]));
             flat += 1;
@@ -1516,7 +1522,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     .alignment(Alignment::Right);
 
     let focus = form.account_at(form.cursor).and_then(|(bi, ai)| {
-        toggle_lines.get(form.cursor).map(|&line| {
+        account_row_lines.get(form.cursor).map(|&line| {
             let start = if ai == 0 { block_starts[bi] } else { line };
             (start..line + 1, &form.scroll, FocusEnd::Tail)
         })
@@ -1535,7 +1541,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     );
     form.viewport.set(d.viewport as usize);
     form.total.set(d.total);
-    let starts: Vec<usize> = toggle_lines
+    let starts: Vec<usize> = account_row_lines
         .iter()
         .map(|&line| d.line_starts[line])
         .collect();

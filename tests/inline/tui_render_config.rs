@@ -2909,3 +2909,310 @@ fn an_editing_setup_field_paints_no_sunken_fill() {
         line.spans
     );
 }
+
+// ── blurred detail rows, band headings and selector icons ────────────────────
+
+/// One claude account (`xqz1`), one codex account (`cx1`, quarantined when
+/// `broken`) and one pool account (`alpha`) on the Setup tab, so every band
+/// and every detail renderer is one selector step apart.
+fn three_band_setup_app(broken: bool) -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::{CodexRow, ShuntPool, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("xqz1")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("xqz1"))],
+    });
+    app.tab = Tab::Setup;
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    app.shunt_pool = ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![PoolAccount {
+            name: "alpha".to_string(),
+            available: true,
+            near_quota: false,
+            cooldown_secs_remaining: None,
+            needs_relogin: false,
+            paused: false,
+            disabled: false,
+            utilization_5h: None,
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
+            plan: None,
+            status: None,
+        }],
+    }]);
+    app
+}
+
+fn press(app: &mut App, code: ratatui::crossterm::event::KeyCode) {
+    crate::tui::app::handle_key(app, crate::testutil::key(code));
+}
+
+fn setup_frame(app: &App) -> ratatui::buffer::Buffer {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Select the `steps`-th selector row below the first, descend into its
+/// detail, then ascend back to the selector with the real keys.
+fn descend_and_ascend(app: &mut App, steps: usize) {
+    use ratatui::crossterm::event::KeyCode;
+    for _ in 0..steps {
+        press(app, KeyCode::Down);
+    }
+    press(app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    press(app, KeyCode::Esc);
+    assert_eq!(app.config_focus, ConfigFocus::Profiles, "esc ascends");
+}
+
+/// The blurred-pane selection: the row holding `label` inside a bordered pane
+/// keeps the `BG_HOVER` tint across its content width (padding columns
+/// excluded), shows no caret, and its label is `label_fg` without bold.
+fn assert_blurred_selection(
+    buf: &ratatui::buffer::Buffer,
+    label: &str,
+    label_fg: ratatui::style::Color,
+) {
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| {
+            let b = r.find(label)?;
+            r[..b].contains('│').then(|| (y, r[..b].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("{label} renders in a pane:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred pane keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred pane draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(cell(x).fg, label_fg, "{label} keeps its blurred color");
+        assert!(
+            !cell(x).modifier.contains(Modifier::BOLD),
+            "{label} drops the bold on a blurred pane"
+        );
+    }
+}
+
+/// Ascending from a claude account's detail keeps the row the cursor left
+/// marked, so the next descend's landing row stays visible.
+#[test]
+fn a_blurred_claude_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 0);
+    assert_eq!(
+        config_rows(&app).get(app.config_action_cursor),
+        Some(&ConfigRow::Name),
+        "the cursor rests on the name row"
+    );
+    assert_blurred_selection(&setup_frame(&app), "name", theme::text_dim_color());
+}
+
+/// Ascending from a codex account's detail keeps its last action row marked.
+#[test]
+fn a_blurred_codex_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 1);
+    assert_blurred_selection(&setup_frame(&app), "re-login", theme::accent_color());
+}
+
+/// Ascending from a pool account's detail keeps its last action row marked.
+#[test]
+fn a_blurred_pool_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 2);
+    assert_blurred_selection(&setup_frame(&app), "refresh", theme::accent_color());
+}
+
+/// A band heading is the current-section cue, so it lifts only while the
+/// selector itself holds focus on a row under it.
+#[test]
+fn a_band_heading_lifts_only_while_the_selector_holds_focus() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    press(&mut app, KeyCode::Down);
+    let heading = |buf: &ratatui::buffer::Buffer| -> Vec<(ratatui::style::Color, bool)> {
+        let rows = crate::testutil::buffer_rows(buf);
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with("│   codex "))
+            .unwrap_or_else(|| panic!("the codex heading renders:\n{}", rows.join("\n")));
+        (4..9)
+            .map(|x| {
+                let c = buf.cell((x, y as u16)).unwrap();
+                (c.fg, c.modifier.contains(Modifier::BOLD))
+            })
+            .collect()
+    };
+    assert_eq!(
+        heading(&setup_frame(&app)),
+        vec![(theme::text_color(), true); 5],
+        "the selector holds focus on a codex row: the heading reads TEXT + bold"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    assert_eq!(
+        heading(&setup_frame(&app)),
+        vec![(theme::text_dim_color(), true); 5],
+        "focus sits in the detail pane: the heading drops to TEXT_DIM + bold"
+    );
+}
+
+/// Selection promotes the name alone: the dead-credential `×` before it is
+/// an icon and keeps its own color and weight.
+#[test]
+fn the_dead_credential_glyph_keeps_its_style_on_a_selected_row() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(true);
+    let needle = format!("{} cx1", theme::dead_credential_glyph());
+    let styles = |buf: &ratatui::buffer::Buffer| {
+        let rows = crate::testutil::buffer_rows(buf);
+        let (y, col) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, r)| r.find(&needle).map(|b| (y, r[..b].chars().count())))
+            .unwrap_or_else(|| panic!("{needle} renders:\n{}", rows.join("\n")));
+        let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap().clone();
+        let (mark, name) = (cell(col), cell(col + 2));
+        (
+            (mark.fg, mark.modifier.contains(Modifier::BOLD)),
+            name.modifier.contains(Modifier::BOLD),
+        )
+    };
+    let (rest_mark, rest_name_bold) = styles(&setup_frame(&app));
+    assert!(!rest_name_bold, "an unselected name is not bold");
+    press(&mut app, KeyCode::Down);
+    let (sel_mark, sel_name_bold) = styles(&setup_frame(&app));
+    assert!(sel_name_bold, "the selected, focused name promotes to bold");
+    assert_eq!(
+        sel_mark, rest_mark,
+        "the glyph keeps its unselected color and weight (fg, bold)"
+    );
+}
+
+// ── never-entered detail shading ─────────────────────────────────────────────
+
+/// The cells inside the detail pane (right of the `││` master-detail
+/// separator) that carry `BG_HOVER`.
+fn detail_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A detail the user never opened shades no row: its cursor is a default,
+/// not a memory, so the blurred claude detail stays untinted.
+#[test]
+fn a_never_entered_setup_detail_shades_no_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = three_band_setup_app(false);
+    let buf = setup_frame(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered detail shades nothing:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// Entering the detail once earns its remembered-row tint: walking to the
+/// `auto-start` row and ascending keeps that whole row tinted.
+#[test]
+fn an_entered_setup_detail_keeps_the_walked_rows_tint_after_ascending() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.config_action_cursor, 1,
+        "the walk lands on the auto-start row"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.config_focus, ConfigFocus::Profiles, "esc ascends");
+    assert_blurred_selection(&setup_frame(&app), "auto-start", theme::text_dim_color());
+}
+
+/// Moving the selector to another account makes that account's detail a new
+/// subject: the previous account's tint does not return with it.
+#[test]
+fn moving_the_selector_to_another_account_clears_the_detail_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 0);
+    assert_blurred_selection(&setup_frame(&app), "name", theme::text_dim_color());
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        detail_tinted_cells(&setup_frame(&app)),
+        Vec::new(),
+        "the codex detail nobody entered shades nothing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        detail_tinted_cells(&setup_frame(&app)),
+        Vec::new(),
+        "the claude detail is never-entered again"
+    );
+}
