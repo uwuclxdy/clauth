@@ -556,6 +556,11 @@ fn agent(timeout: Duration) -> ureq::Agent {
         // host, and any other one's delays and errors would be the forward
         // proxy's.
         .proxy(None)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into()
 }

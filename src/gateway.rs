@@ -2570,6 +2570,11 @@ fn direct_config(
         .max_redirects(0)
         .max_redirects_will_error(false)
         .proxy(None)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 #[derive(Deserialize)]

@@ -65,6 +65,7 @@ mod spinner;
 mod start;
 mod status;
 mod throughput;
+mod tls_roots;
 mod token_ledger;
 mod tokens;
 mod tps;

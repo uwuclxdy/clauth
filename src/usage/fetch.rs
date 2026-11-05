@@ -1362,6 +1362,11 @@ pub(super) fn usage_config(
         // Without this flag those branches are unreachable and every HTTP error
         // collapses into `Network`.
         .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 /// A usage-style agent with `whole` as its end-to-end bound — built once for

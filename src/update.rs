@@ -468,6 +468,11 @@ fn metadata_agent(bound: Duration) -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_global(Some(bound))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into()
 }

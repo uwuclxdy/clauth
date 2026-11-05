@@ -372,6 +372,11 @@ pub(crate) fn token_agent(whole: Duration) -> ureq::Agent {
         // reads the status from the `Ok` response and `refresh` checks it
         // explicitly below.
         .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into()
 }

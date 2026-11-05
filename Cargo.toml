@@ -27,7 +27,10 @@ dirs = "7.0.0"
 # strips that prefix wherever a plain form exists, so the adopted shunt config
 # is stored and shown as its plain drive path (a no-op elsewhere).
 dunce = "1.0.5"
-ureq = "3.4.2"
+# `platform-verifier` trusts the OS root store instead of ureq's bundled
+# Mozilla roots, and `SSL_CERT_FILE` (curl/OpenSSL semantics) replaces it:
+# `src/tls_roots.rs` holds the one decision every agent build site takes.
+ureq = { version = "3.4.2", features = ["platform-verifier"] }
 self-replace = "1.5.0"
 signal-hook = "0.4.4"
 shlex = "2.0.1"

@@ -210,6 +210,8 @@ pub(crate) struct HomeSandbox {
     prev_claude_pid: Option<std::ffi::OsString>,
     prev_codex_home: Option<std::ffi::OsString>,
     prev_operator_codex_home: Option<std::ffi::OsString>,
+    prev_ssl_cert_file: Option<std::ffi::OsString>,
+    prev_ssl_cert_dir: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
@@ -291,6 +293,17 @@ impl HomeSandbox {
             std::env::remove_var("CODEX_HOME");
             std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME");
         }
+        // The TLS root decision reads these on every agent build: a runner's
+        // own bundle would otherwise decide every test's trust store (and the
+        // root decision logs a warning inside whichever test builds first). A
+        // test that WANTS one pins it with [`EnvPin`].
+        let prev_ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
+        let prev_ssl_cert_dir = std::env::var_os("SSL_CERT_DIR");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
         Self {
             _tmp: tmp,
             _guard: guard,
@@ -300,6 +313,8 @@ impl HomeSandbox {
             prev_claude_pid,
             prev_codex_home,
             prev_operator_codex_home,
+            prev_ssl_cert_file,
+            prev_ssl_cert_dir,
         }
     }
 
@@ -374,6 +389,14 @@ impl Drop for HomeSandbox {
         match self.prev_codex_home.take() {
             Some(prev) => unsafe { std::env::set_var("CODEX_HOME", prev) },
             None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match self.prev_ssl_cert_file.take() {
+            Some(prev) => unsafe { std::env::set_var("SSL_CERT_FILE", prev) },
+            None => unsafe { std::env::remove_var("SSL_CERT_FILE") },
+        }
+        match self.prev_ssl_cert_dir.take() {
+            Some(prev) => unsafe { std::env::set_var("SSL_CERT_DIR", prev) },
+            None => unsafe { std::env::remove_var("SSL_CERT_DIR") },
         }
         match self.prev_operator_codex_home.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUTH_OPERATOR_CODEX_HOME", prev) },
