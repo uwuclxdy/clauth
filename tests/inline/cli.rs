@@ -4145,6 +4145,28 @@ mod static_token_verdicts {
 mod armed_report_copy {
     use super::*;
 
+    /// The active account's confirm line promises what the clear will do, so
+    /// each of its three arms is pinned whole: this line is TTY-only and no
+    /// behavioral test reaches it.
+    #[test]
+    fn the_active_clear_prompt_names_what_the_account_falls_back_to() {
+        assert_eq!(
+            clear_active_note("acme", true, false),
+            "clauth: 'acme' is active. Clearing relinks the live credentials onto its stored \
+             OAuth login, and running sessions follow."
+        );
+        assert_eq!(
+            clear_active_note("acme", false, true),
+            "clauth: 'acme' is active and stores no OAuth login. Clearing signs Claude Code \
+             out, leaving 'acme' on its api key, and running sessions follow."
+        );
+        assert_eq!(
+            clear_active_note("acme", false, false),
+            "clauth: 'acme' is active and stores no login at all. Clearing signs Claude Code \
+             out, and running sessions follow."
+        );
+    }
+
     /// The four clear copy lines, pinned on CONTENT like every other line in
     /// this mod: single-caller keeps a deleted print a dead-code error, but
     /// only a pin keeps the WORDS — both pre-prompt lines are TTY-only, so no

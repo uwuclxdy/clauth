@@ -161,8 +161,8 @@ pub(crate) enum Command {
     /// the preserved mint backup, and the rolling-token flag together, so the
     /// profile's stored OAuth login is what switches install again and
     /// nothing re-creates a sidecar afterwards. The live credentials are
-    /// relinked when the profile is active, and the clear is refused when the
-    /// profile stores no other login.
+    /// relinked when the profile is active, and the clear is refused when it
+    /// would remove the profile's last stored credential.
     #[command(name = "static-token")]
     StaticToken {
         /// Profile whose long-lived token to operate on.

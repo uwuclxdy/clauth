@@ -1900,12 +1900,14 @@ fn setup_token_into(
 /// therefore relinked in the same operation, which on Linux a live session picks
 /// up on the next mtime move.
 ///
-/// Refuses when the profile has no other login to fall back to (a name created
-/// by `--setup-token` alone stores no OAuth pair): clearing there would strip its
-/// only credential. `--yes` skips the confirm, never that guard.
+/// Refuses when clearing would remove the profile's last stored credential (a
+/// name created by `--setup-token` alone stores no OAuth pair); a flag-only
+/// account has no such credential and is not refused. `--yes` skips the confirm,
+/// never that guard.
 ///
-/// "Other login" includes an API KEY, so the fall-back is not always an OAuth
-/// pair and the copy branches on which it is (`claude::has_stored_oauth_login`).
+/// A fall-back can be an API KEY, so it is not always an OAuth pair and the copy
+/// branches on which it is (`claude::has_stored_oauth_login`,
+/// then the profile's `api_key`), with a third arm for an account holding neither.
 /// An api-key profile clears onto an absent install source, where the relink
 /// removes the live slot and, on macOS, signs the Keychain out — correct, since
 /// an active api-key profile must not leave an Anthropic login serving, but the
@@ -1953,22 +1955,15 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             );
         }
         // What the confirm promises has to be what happens, so it reads the same
-        // fact the relink below branches on. An api-key profile reaches here with
-        // nothing to relink ONTO, and telling it a login comes back is the one
-        // wrong thing to say before an irreversible prompt.
+        // fact the relink below branches on. A profile with no OAuth login reaches
+        // here with nothing to relink ONTO, and telling it a login comes back is
+        // the one wrong thing to say before an irreversible prompt.
         if active {
-            if claude::has_stored_oauth_login(target) {
-                outln!(
-                    "clauth: '{target}' is active. Clearing relinks the live credentials onto \
-                     its stored OAuth login, and running sessions follow."
-                );
-            } else {
-                outln!(
-                    "clauth: '{target}' is active and stores no OAuth login. Clearing signs \
-                     Claude Code out, leaving '{target}' on its api key, and running sessions \
-                     follow."
-                );
-            }
+            let has_login = claude::has_stored_oauth_login(target);
+            outln!(
+                "{}",
+                clear_active_note(target, has_login, profile.api_key.is_some())
+            );
         }
         if rolling_armed {
             outln!("{}", clear_disarm_note(target));
@@ -2165,6 +2160,27 @@ fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) ->
 /// and no rolling flag, read before the prompt and again under the guard.
 fn clear_nothing_note(target: &str) -> String {
     format!("clauth: '{target}' holds no long-lived token, so nothing to clear.")
+}
+
+/// The pre-prompt warning of what an active account falls back to, single-caller
+/// and pinned on content for the reason [`clear_disarm_note`] gives.
+fn clear_active_note(target: &str, has_login: bool, has_api_key: bool) -> String {
+    if has_login {
+        format!(
+            "clauth: '{target}' is active. Clearing relinks the live credentials onto its \
+             stored OAuth login, and running sessions follow."
+        )
+    } else if has_api_key {
+        format!(
+            "clauth: '{target}' is active and stores no OAuth login. Clearing signs Claude Code \
+             out, leaving '{target}' on its api key, and running sessions follow."
+        )
+    } else {
+        format!(
+            "clauth: '{target}' is active and stores no login at all. Clearing signs Claude Code \
+             out, and running sessions follow."
+        )
+    }
 }
 
 /// The pre-prompt warning that a rolling profile's re-stamping stops with the
