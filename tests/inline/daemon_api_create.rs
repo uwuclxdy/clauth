@@ -1156,6 +1156,76 @@ fn background_id_keeps_only_lowercase_hex() {
     assert_eq!(background_id("backgrounded · 3FDE53E3\n".as_bytes()), None);
 }
 
+/// A no-prompt launch prints a note after the id on the same line (measured on
+/// Claude Code 2.1.318), and the id is still the whole first word: a longer or
+/// shorter word never reads as one.
+#[test]
+fn background_id_reads_the_first_word_after_the_dot() {
+    assert_eq!(
+        background_id(BG_IDLE_STDOUT.as_bytes()),
+        Some(BG_ID.to_string())
+    );
+    assert_eq!(
+        background_id("backgrounded · 3fde53e3 some other note\n".as_bytes()),
+        Some(BG_ID.to_string())
+    );
+    for stdout in [
+        "backgrounded · 3fde53e3\r\n",
+        "backgrounded · 3fde53e3\t(idle)\n",
+        "backgrounded · bad\nbackgrounded · 3fde53e3\n",
+        "backgrounded · 3fde53e3\nbackgrounded · aaaaaaaa\n",
+    ] {
+        assert_eq!(
+            background_id(stdout.as_bytes()),
+            Some(BG_ID.to_string()),
+            "{stdout}"
+        );
+    }
+    for stdout in [
+        "backgrounded · (idle) 3fde53e3\n",
+        "backgrounded · 3fde53e3a (idle)\n",
+        "backgrounded · 3fde53e (idle)\n",
+        "backgrounded · 3FDE53E3 (idle)\n",
+        "backgrounded · (idle)\n",
+    ] {
+        assert_eq!(background_id(stdout.as_bytes()), None, "{stdout}");
+    }
+}
+
+/// A create with no prompt starts an idle session and answers both ids, never
+/// a 502 over a session that is running.
+#[test]
+fn background_with_no_prompt_answers_both_ids() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _calls) = herdr_untouched();
+    let (spawn, _launches) = launch_seam(Some((true, BG_IDLE_STDOUT, "")));
+    let ctx = ctx_bg(probe, spawn);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+}
+
 /// A quarantined codex login on the pane arm answers 409 `login_quarantined`
 /// with `clauth start`'s own sentence, before any herdr call.
 #[test]
@@ -1204,6 +1274,8 @@ fn a_quarantined_codex_login_is_refused_before_a_tab_opens() {
 
 /// `claude --bg`'s stdout as captured on Claude Code 2.1.303.
 const BG_STDOUT: &str = "Starting background service…\nbackgrounded · 3fde53e3\n  claude attach 3fde53e3\n  claude logs 3fde53e3\n  claude stop 3fde53e3\n";
+/// The head of what a no-prompt `claude --bg` printed on 2.1.318.
+const BG_IDLE_STDOUT: &str = "backgrounded · 3fde53e3 (idle — send a prompt to start)\n  claude agents             list sessions\n";
 const BG_ID: &str = "3fde53e3";
 /// The `sessionId` `testutil::write_claude_job` writes for [`BG_ID`].
 const BG_SESSION: &str = "3fde53e3-0a6e-4b11-883e-fca3a218ae52";

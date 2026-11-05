@@ -40,9 +40,8 @@ const SESSION_LAUNCH_TIMEOUT: Duration = Duration::from_secs(65);
 /// only this long past the exit, not to the run's bound.
 const SESSION_LAUNCH_DRAIN: Duration = Duration::from_secs(2);
 
-/// The bound the background session id read retries within: the record lands
-/// shortly after the `backgrounded · <id>` line. Still unread -> `null`, never
-/// an error.
+/// The bound the background session id read retries within. Still unread ->
+/// `null`, never an error.
 const SESSION_ID_READ_BOUND: Duration = Duration::from_secs(2);
 
 /// The fixed sentences; nothing off the wire reaches a body.
@@ -257,7 +256,9 @@ fn profile_roster(
     Ok(None)
 }
 
-/// The 8-hex job id off `claude --bg`'s `backgrounded · <id>` line.
+/// The 8-hex job id off `claude --bg`'s `backgrounded · <id>` line. The id is
+/// the first word after the dot: a no-prompt launch follows it with a note on
+/// the same line (`(idle — send a prompt to start)` on Claude Code 2.1.318).
 fn background_id(stdout: &[u8]) -> Option<String> {
     // `claude --bg` separates the id with a middle dot (U+00B7); matched as its
     // UTF-8 bytes so the source stays ASCII.
@@ -266,13 +267,16 @@ fn background_id(stdout: &[u8]) -> Option<String> {
         let Some(rest) = line.strip_prefix(PREFIX) else {
             continue;
         };
-        let id = String::from_utf8_lossy(rest).trim().to_string();
+        let rest = String::from_utf8_lossy(rest);
+        let Some(id) = rest.split_whitespace().next() else {
+            continue;
+        };
         if id.len() == 8
             && id
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         {
-            return Some(id);
+            return Some(id.to_string());
         }
     }
     None
