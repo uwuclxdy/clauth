@@ -299,6 +299,12 @@ pub(crate) struct ProfileEntry {
     /// daemon's body lacks it, so a reader defaults it to `false`.
     #[serde(default)]
     pub(crate) credit_capped: bool,
+    /// The banked usage-limit reset count clauth last read: a claude account's
+    /// `limit_resets.json`, a codex account's usage cache. `null` with no
+    /// reading, never a zero nothing read. Never required: an older daemon's
+    /// body lacks it.
+    #[serde(default)]
+    pub(crate) limit_resets: Option<u32>,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -661,6 +667,7 @@ pub(crate) fn build_profile_entries(
                 spend,
                 extra_usage,
                 credit_capped,
+                limit_resets: crate::profile_cache::claude_limit_resets(name),
             }
         })
         .collect()
@@ -744,6 +751,10 @@ pub(crate) fn build_codex_entries(
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: cached
+                    .as_ref()
+                    .and_then(|u| u.limit_resets.as_ref())
+                    .map(|r| r.usable),
             }
         })
         .collect()

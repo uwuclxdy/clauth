@@ -4690,6 +4690,33 @@ fn profile_entry_requires_only_what_every_supported_daemon_sends() {
         documents("ProfileEntry", "auto_start_queue"),
         "ProfileEntry documents auto_start_queue"
     );
+    assert!(
+        documents("ProfileEntry", "limit_resets"),
+        "ProfileEntry documents limit_resets"
+    );
+}
+
+/// The API's account view carries the banked count each account's last read
+/// found, off the built body a missing feed falls back to.
+#[test]
+fn status_serves_the_banked_resets_each_account_read() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    crate::testutil::write_claude_limit_resets("beta", 3, &[], None, 1);
+    crate::testutil::write_claude_limit_resets("alpha", 2, &[], None, 1);
+
+    let body = body_json(&call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), "")));
+    let count = |name: &str| {
+        body["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("entry")["limit_resets"]
+            .clone()
+    };
+    assert_eq!(count("beta"), 3, "beta reached the route");
+    assert_eq!(count("alpha"), 2, "alpha reached the route");
 }
 
 /// `SessionRow`'s `via`/`lacks` stay optional (the 2026-10-16 additive-field

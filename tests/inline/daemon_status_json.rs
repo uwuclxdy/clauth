@@ -116,6 +116,9 @@ fn build_status_top_level_shape_and_active() {
             "fetched_at",
             "harness",
             "has_live_session",
+            // Additive: the banked usage-limit reset count clauth last read,
+            // `null` with no reading.
+            "limit_resets",
             "name",
             "next_refresh_at",
             "provider",
@@ -2205,6 +2208,7 @@ fn status_body_matches_legacy_json_bytes() {
                     percent: Some(12.428),
                 }),
                 credit_capped: false,
+                limit_resets: Some(3),
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2230,6 +2234,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2258,6 +2263,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: None,
             },
         ],
     };
@@ -2276,18 +2282,18 @@ fn status_body_matches_legacy_json_bytes() {
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
-        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
-        r#""extra_usage":null,"credit_capped":false}]}"#,
+        r#""extra_usage":null,"credit_capped":false,"limit_resets":null}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -3868,4 +3874,110 @@ fn build_status_ages_a_probed_account_at_its_probe_interval() {
     let v = status_value(&config, 90_000, None, false);
     assert_eq!(entry(&v, "probed")["stale"], false);
     assert_eq!(entry(&v, "polled")["stale"], true);
+}
+
+/// A claude entry publishes the count its `limit_resets.json` holds: a reading
+/// of zero is `0`, and an account with no reading is `null`, never a zero
+/// clauth did not read.
+#[test]
+fn a_claude_entry_publishes_the_banked_resets_it_read() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("banked"),
+            oauth_profile("spent"),
+            oauth_profile("unread"),
+            Profile::new(
+                "keyed".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                Some("key".to_string()),
+            ),
+        ],
+    };
+    crate::testutil::register_names(&["banked", "spent", "unread", "keyed"]);
+    crate::testutil::write_claude_limit_resets("banked", 3, &["five_hour"], None, 1);
+    crate::testutil::write_claude_limit_resets("spent", 0, &[], None, 1);
+    crate::testutil::write_claude_limit_resets("keyed", 1, &[], None, 1);
+
+    let v = status_value(&config, 300_000, None, false);
+    let count = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))["limit_resets"]
+            .clone()
+    };
+    assert_eq!(count("banked"), 3);
+    assert_eq!(count("spent"), 0);
+    assert!(count("unread").is_null(), "nothing read publishes null");
+    assert_eq!(
+        count("keyed"),
+        1,
+        "the file decides, as on the Overview chip"
+    );
+}
+
+/// A codex entry publishes the count its usage cache carries, the one the poll
+/// read off `wham/usage`; a cache with no count is `null`.
+#[test]
+fn a_codex_entry_publishes_the_banked_resets_its_poll_read() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["held", "spent", "plain", "cold"]);
+    let cache = |usable: Option<u32>| crate::usage::UsageInfo {
+        limit_resets: usable.map(|usable| crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(2)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("spent"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(0)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("plain"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(None),
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000);
+    let count = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .limit_resets
+    };
+    assert_eq!(count("held"), Some(2));
+    assert_eq!(count("spent"), Some(0), "a read zero stays a zero");
+    assert_eq!(count("plain"), None, "a cache with no count publishes null");
+    assert_eq!(count("cold"), None, "no cache publishes null");
+}
+
+/// This reader takes a body from a daemon older than the field: a missing key
+/// reads as no count.
+#[test]
+fn an_entry_from_an_older_daemon_reads_with_no_banked_resets() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let mut v = status_value(&config, 300_000, None, false);
+    let profiles = v["profiles"].as_array_mut().unwrap();
+    profiles[0].as_object_mut().unwrap().remove("limit_resets");
+
+    let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
+    assert_eq!(entries[0].limit_resets, None);
+    assert_eq!(entries[0].name.as_str(), "work");
 }

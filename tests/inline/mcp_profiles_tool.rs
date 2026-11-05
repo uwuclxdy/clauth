@@ -70,6 +70,52 @@ fn lines(result: &CallToolResult) -> Vec<String> {
     first_text(result).lines().map(str::to_string).collect()
 }
 
+/// A row names the banked resets its account's last read found, singular at
+/// one, and says nothing at zero or with no reading.
+#[test]
+fn a_row_names_the_banked_limit_resets_it_read() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let row = || lines(&call_profiles(Some(vec!["solo"]), None));
+
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "no reading names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("solo", 2, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             2 limit resets banked"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 1, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             1 limit reset banked"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 0, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a reading of zero names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("vendor", 1, &[], None, 1);
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; 1 limit reset banked; \
+             no api key"
+        ],
+        "the file decides, on an api-key account too",
+    );
+}
+
 #[test]
 fn names_filter_selects_one_profile_case_insensitively() {
     let _home = HomeSandbox::new();

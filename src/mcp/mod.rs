@@ -39,8 +39,8 @@ use crate::logline::logline;
 use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
 use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
-    write_dead_key,
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, claude_limit_resets, load_profile_cache,
+    write_auth_expired, write_dead_key,
 };
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
@@ -378,6 +378,10 @@ fn profile_row(
         && usage.as_ref().is_some_and(|u| u.credit_capped())
     {
         row["credit_capped"] = serde_json::json!(true);
+    }
+    // Absent with no reading: a row never carries a zero nothing read.
+    if let Some(banked) = claude_limit_resets(name) {
+        row["limit_resets"] = serde_json::json!(banked);
     }
     row
 }

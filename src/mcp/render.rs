@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use serde_json::Value;
 
-use crate::format::{format_pct, humanize_span, local_stamp};
+use crate::format::{format_pct, humanize_span, local_stamp, plural};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
@@ -1094,6 +1094,14 @@ fn profile_line(row: &Value) -> String {
     let api_key_account = row["windows"].get("kind").and_then(Value::as_str) == Some("third_party");
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
+    }
+    if let Some(banked) = row.get("limit_resets").and_then(Value::as_u64)
+        && banked > 0
+    {
+        out.push_str(&format!(
+            "; {banked} limit reset{} banked",
+            plural(banked as usize)
+        ));
     }
     // One snapshot per call, the Overview live column's per-account slice.
     if let Some(sessions) = row.get("live_sessions").and_then(Value::as_u64)
