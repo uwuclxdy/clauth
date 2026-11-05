@@ -359,6 +359,7 @@ fn bare_claude_starts_kind_claude_and_reads_back_blocked() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -467,6 +468,7 @@ fn a_profile_runs_clauth_start_and_answers_null_status() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -1218,6 +1220,7 @@ fn background_with_no_prompt_answers_both_ids() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -1388,6 +1391,7 @@ fn background_on_a_profile_launches_clauth_start_bg_and_answers_both_ids() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -1523,6 +1527,7 @@ fn pane_with_fallback_runs_clauth_start_with_fallback() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -1840,7 +1845,12 @@ fn a_record_that_never_reads_answers_a_null_session_id() {
         (resp.status, body_json(&resp)),
         (
             200,
-            serde_json::json!({"ok": true, "background_id": BG_ID, "session_id": null})
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": null,
+            })
         )
     );
     assert!(
@@ -1925,6 +1935,7 @@ fn a_successful_background_launch_logs_each_stderr_line() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -1988,6 +1999,7 @@ fn a_chatty_background_launch_logs_a_bounded_number_of_lines() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -2033,6 +2045,7 @@ fn a_silent_background_launch_logs_no_stderr_line() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -2281,7 +2294,12 @@ fn a_session_id_that_is_not_a_uuid_is_never_relayed() {
         (resp.status, body_json(&resp)),
         (
             200,
-            serde_json::json!({"ok": true, "background_id": BG_ID, "session_id": null})
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": null,
+            })
         )
     );
     assert_eq!(

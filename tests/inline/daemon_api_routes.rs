@@ -4588,6 +4588,49 @@ fn background_session_created_requires_a_nullable_session_id() {
     );
 }
 
+/// `POST /sessions`' 200 is a discriminated `oneOf`: without the `mapping`,
+/// `swagger_parser` 1.45.0 emits a union that cannot decode (measured
+/// 2026-11-05). `type` came after both objects shipped, so it stays off their
+/// required sets.
+#[test]
+fn the_create_answer_is_a_discriminated_one_of() {
+    let doc = openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    assert_eq!(
+        value["paths"]["/api/v1/sessions"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"],
+        serde_json::json!({
+            "oneOf": [
+                {"$ref": "#/components/schemas/SessionCreated"},
+                {"$ref": "#/components/schemas/BackgroundSessionCreated"},
+            ],
+            "discriminator": {
+                "propertyName": "type",
+                "mapping": {
+                    "pane": "#/components/schemas/SessionCreated",
+                    "background": "#/components/schemas/BackgroundSessionCreated",
+                },
+            },
+        }),
+        "the 200's schema"
+    );
+    assert_eq!(
+        served_required("SessionCreated"),
+        ["agent_status", "ok", "pane_id", "tab_id", "workspace_id"],
+        "SessionCreated's required set"
+    );
+    assert_eq!(
+        served_schema("SessionCreated")["properties"]["type"],
+        serde_json::json!({"type": "string", "enum": ["pane"]}),
+        "the pane arm's tag"
+    );
+    assert_eq!(
+        served_schema("BackgroundSessionCreated")["properties"]["type"],
+        serde_json::json!({"type": "string", "enum": ["background"]}),
+        "the background arm's tag"
+    );
+}
+
 /// The served OpenAPI document's `components.schemas.<schema>` node.
 fn served_schema(schema: &str) -> serde_json::Value {
     let doc = openapi_document_bytes().expect("document serializes");

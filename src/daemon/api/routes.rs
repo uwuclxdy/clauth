@@ -1193,15 +1193,16 @@ impl utoipa::Modify for BearerScheme {
     }
 }
 
-/// `POST /sessions`' 200 is `oneOf` the unchanged pane [`super::create::SessionCreated`]
-/// and the new background [`super::create::BackgroundSessionCreated`], so the
-/// two arms stay two schemas rather than one with optional fields.
+/// `POST /sessions`' 200 is `oneOf` the pane [`super::create::SessionCreated`]
+/// and the background [`super::create::BackgroundSessionCreated`], discriminated
+/// on each body's `type`, so the two arms stay two schemas rather than one with
+/// optional fields.
 struct SessionsCreateOneOf;
 
 impl utoipa::Modify for SessionsCreateOneOf {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         use utoipa::openapi::RefOr;
-        use utoipa::openapi::schema::{OneOfBuilder, RefBuilder};
+        use utoipa::openapi::schema::{Discriminator, OneOfBuilder, Ref};
 
         let Some(path_item) = openapi.paths.paths.get_mut("/api/v1/sessions") else {
             return;
@@ -1215,10 +1216,22 @@ impl utoipa::Modify for SessionsCreateOneOf {
         let Some(content) = response.content.get_mut("application/json") else {
             return;
         };
+        let [pane, background] = [
+            <create::SessionCreated as utoipa::ToSchema>::name(),
+            <create::BackgroundSessionCreated as utoipa::ToSchema>::name(),
+        ]
+        .map(Ref::from_schema_name);
         content.schema = Some(
             OneOfBuilder::new()
-                .item(RefBuilder::new().ref_location_from_schema_name("SessionCreated"))
-                .item(RefBuilder::new().ref_location_from_schema_name("BackgroundSessionCreated"))
+                .discriminator(Some(Discriminator::with_mapping(
+                    "type",
+                    [
+                        ("pane", pane.ref_location.clone()),
+                        ("background", background.ref_location.clone()),
+                    ],
+                )))
+                .item(pane)
+                .item(background)
                 .into(),
         );
     }

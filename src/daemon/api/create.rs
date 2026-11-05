@@ -107,9 +107,28 @@ pub(crate) struct SessionCreateBody {
     prompt: Option<String>,
 }
 
+// Each answer's `type` tag is a one-variant enum, so a body cannot carry the
+// other arm's value. Plain comments and `#[schema(inline)]` keep the served
+// property a bare `type` + `enum`: a doc comment would become its
+// `description`, and without `inline` it would be a `$ref`. The field came after
+// both objects shipped, so it stays optional in the schema.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum PaneTag {
+    Pane,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum BackgroundTag {
+    Background,
+}
+
 /// The answer a created session carries.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionCreated {
+    #[schema(inline, required = false)]
+    r#type: PaneTag,
     ok: bool,
     workspace_id: String,
     tab_id: String,
@@ -125,6 +144,8 @@ pub(crate) struct SessionCreated {
 /// stdout, and the record's `sessionId` read back, `null` when it never read.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct BackgroundSessionCreated {
+    #[schema(inline, required = false)]
+    r#type: BackgroundTag,
     ok: bool,
     background_id: String,
     #[schema(required = true)]
@@ -433,6 +454,7 @@ fn launch_background_session(
     Response::serialize(
         200,
         &BackgroundSessionCreated {
+            r#type: BackgroundTag::Background,
             ok: true,
             background_id: id,
             session_id,
@@ -545,7 +567,7 @@ fn close_tab(ctx: &ApiContext, tab_id: &str, device: &str) {
     path = "/api/v1/sessions",
     request_body = SessionCreateBody,
     responses(
-        (status = 200, description = "the pane was created and the agent started (`agent_status` is herdr's answer read back after the start, `null` for a `pane run`), or a background session launched with the job id and the record's session id (`null` when it never read)", body = SessionCreated),
+        (status = 200, description = "`type` names the arm: `pane`, the pane was created and the agent started (`agent_status` is herdr's answer read back after the start, `null` for a `pane run`), or `background`, a background session launched with the job id and the record's session id (`null` when it never read)", body = SessionCreated),
         (status = 400, description = "the body held no parseable cwd, or a cwd that is not an absolute existing directory, both a profile and a kind, a profile whose name is not shaped like one, a kind outside 1..=32 ascii lowercase letters or digits, a workspace outside 1..=32 chars of letters, digits or colons, background with a kind or workspace, background on a codex-roster profile, with_fallback with a kind or without a profile, prompt without background, or an empty or NUL-holding prompt (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)", body = ErrorBody),
@@ -769,6 +791,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
     Response::serialize(
         200,
         &SessionCreated {
+            r#type: PaneTag::Pane,
             ok: true,
             workspace_id: created.workspace_id,
             tab_id: created.tab_id,
