@@ -3,12 +3,16 @@
 //! # Design
 //!
 //! Two-phase load, emitted as two events per run so the tab paints instantly:
-//! 1. **Base stats** ([`load_base`]) — parsed from `~/.claude/stats-cache.json`,
-//!    which Claude Code maintains as a pre-aggregated lifetime snapshot. A single
-//!    small JSON file, so it returns in well under a millisecond and is the tab's
-//!    first paint instead of a blank "reading ~/.claude".
+//! 1. **Base stats** ([`load_frozen_base`]) — parsed from
+//!    `~/.clauth/stats-base.json`, a frozen copy of the
+//!    `~/.claude/stats-cache.json` Claude Code maintains as a pre-aggregated
+//!    lifetime snapshot. The global file advances when a shared tree's `/stats`
+//!    result goes back at the tree's end; the frozen copy does not, so the tab's
+//!    figures never move with it. A single small JSON file, so it returns in well
+//!    under a millisecond and is the tab's first paint instead of a blank
+//!    "reading ~/.claude".
 //! 2. **Live top-up** ([`merge_topup`]) — appends days from `~/.claude/projects/`
-//!    transcripts strictly newer than the cache's `lastComputedDate`, avoiding
+//!    transcripts strictly newer than the base's `lastComputedDate`, avoiding
 //!    double-counting days already in the snapshot. The recursive sweep also
 //!    reaches subagent/workflow transcripts under `<session>/subagents/`. Each
 //!    response is deduplicated by `message.id` (a content composite when absent,
@@ -54,6 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use crate::logline::logline;
 use crate::poll::run_polling_loop;
 use crate::pricing::HourTokens;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
@@ -644,6 +649,14 @@ struct StatsCacheFile {
     hour_counts: HashMap<String, u64>,
 }
 
+/// `StatsCacheFile`'s date alone: a body whose other fields changed shape still
+/// yields its `lastComputedDate`, so a publish or freeze does not stop silently.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatsCacheDate {
+    last_computed_date: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct WireActivity {
@@ -763,6 +776,13 @@ const ADVISOR_ITERATION: &str = "advisor_message";
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
+/// Claude Code's aggregate, in `~/.claude` and in a shared tree.
+pub(crate) const STATS_CACHE_FILE: &str = "stats-cache.json";
+
+/// The tab's base under `~/.clauth`: the first dated global stats cache clauth
+/// saw, frozen before any publish replaces a dated file.
+pub(crate) const STATS_BASE_FILE: &str = "stats-base.json";
+
 /// Why the stats-cache base read failed: each failure maps to its own lowercase
 /// cause line, without exposing an upstream error body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,12 +831,145 @@ pub(crate) fn read_error(e: &std::io::Error, path: &Path) -> TokensLoadError {
 /// transcript top-up ([`merge_topup`]). Fails with the typed cause the tab
 /// surfaces.
 pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError> {
-    let cache_path = claude_dir.join("stats-cache.json");
-    let raw = match std::fs::read_to_string(&cache_path) {
-        Ok(raw) => raw,
-        Err(e) => return Err(read_error(&e, &cache_path)),
+    parse_stats_file(&claude_dir.join(STATS_CACHE_FILE))
+}
+
+/// [`load_base`] over the frozen base ([`STATS_BASE_FILE`]), freezing it first
+/// when none exists. The tab's cutoff is the frozen `lastComputedDate`, so a
+/// later global file never hands ledger days (cache split, hours, served-model
+/// correction) over to stats-cache rows that carry none of those. An unusable
+/// frozen file costs the freeze, never the tab: the global file stands in.
+pub(crate) fn load_frozen_base(
+    claude_dir: &Path,
+    clauth_dir: &Path,
+) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = freeze_stats_base(claude_dir, clauth_dir) {
+        logline!("clauth: could not freeze the stats base: {e}");
+    }
+    match parse_stats_file(&clauth_dir.join(STATS_BASE_FILE)) {
+        Ok(stats) => Ok(stats),
+        Err(TokensLoadError::Missing) => load_base(claude_dir),
+        Err(e) => {
+            logline!(
+                "clauth: reading the global stats cache, the frozen base failed: {}",
+                e.cause_line()
+            );
+            load_base(claude_dir)
+        }
+    }
+}
+
+/// Test seam for [`freeze_stats_base`]'s second frozen-file check: a hook run
+/// once between the global read and the check, posing a publisher that froze
+/// the same base while this one read. Test-only.
+#[cfg(test)]
+pub(crate) struct StatsFreezeRereadHook;
+
+#[cfg(test)]
+thread_local! {
+    static STATS_FREEZE_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl StatsFreezeRereadHook {
+    pub(crate) fn arm(hook: impl FnMut() + 'static) -> Self {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatsFreezeRereadHook {
+    fn drop(&mut self) {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_stats_freeze_reread_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&STATS_FREEZE_REREAD_HOOK) {
+        hook();
+    }
+}
+
+/// Copy the global stats cache to the frozen base, unless a frozen file is
+/// already there; it is never overwritten. A global file that does not exist,
+/// or holds no date the tab could cut off at, has nothing to freeze, which is
+/// `Ok`. A frozen body without a date would outlive every dated replacement of
+/// the global file and pin the tab's cutoff to that file for good.
+pub(crate) fn freeze_stats_base(claude_dir: &Path, clauth_dir: &Path) -> std::io::Result<()> {
+    let frozen = clauth_dir.join(STATS_BASE_FILE);
+    let is_frozen = || frozen.metadata().is_ok_and(|meta| meta.is_file());
+    if is_frozen() {
+        return Ok(());
+    }
+    let bytes = match read_stats_bytes(&claude_dir.join(STATS_CACHE_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    let wire: StatsCacheFile = match serde_json::from_str(&raw) {
+    if stats_cache_date(&bytes).is_none() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    run_stats_freeze_reread_hook();
+    // A publisher freezes before it moves a dated global file, so its moved
+    // bytes can only be in hand here with the frozen file already in place. A
+    // global that was absent has nothing to freeze: the moved file is the base.
+    if is_frozen() {
+        return Ok(());
+    }
+    crate::profile::atomic_write_600(&frozen, bytes)
+}
+
+/// Refuse anything at `path` but a regular file, links followed: a FIFO would
+/// hang the reading thread.
+fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        // The kind `read_error` maps a directory to, so the tab's typed cause
+        // line does not change.
+        return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+    }
+    Err(std::io::Error::other("not a regular file"))
+}
+
+/// The bytes of the regular file at `path`, links followed.
+pub(crate) fn read_stats_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    require_regular_file(path)?;
+    std::fs::read(path)
+}
+
+/// A stats-cache body's `lastComputedDate` as epoch seconds; `None` for a body
+/// that does not parse or carries no usable date. The date is checked against
+/// the calendar first: the arithmetic parser accepts `2026-99-99`, which would
+/// sort after every real date.
+pub(crate) fn stats_cache_date(bytes: &[u8]) -> Option<i64> {
+    let wire: StatsCacheDate = serde_json::from_slice(bytes).ok()?;
+    let date = wire.last_computed_date?;
+    chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+    iso_to_epoch_secs(&format!("{date}T00:00:00+00:00"))
+}
+
+/// Parse the stats cache at `path` into the base view-model. A FIFO or a
+/// directory at either stats-cache name is refused instead of read.
+fn parse_stats_file(path: &Path) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = require_regular_file(path) {
+        return Err(read_error(&e, path));
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => return Err(read_error(&e, path)),
+    };
+    parse_stats_json(raw.as_bytes())
+}
+
+fn parse_stats_json(raw: &[u8]) -> Result<TokenStats, TokensLoadError> {
+    let wire: StatsCacheFile = match serde_json::from_slice(raw) {
         Ok(wire) => wire,
         Err(e) => return Err(TokensLoadError::InvalidJson(e.to_string())),
     };
@@ -924,8 +1077,9 @@ pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError
 }
 
 /// Full synchronous load: parse the stats-cache, sweep transcripts once, merge.
-/// Test-only — the background [`spawn`] loader uses `load_base` + `merge_topup`
-/// directly so it can paint the base instantly and reuse its per-file cache.
+/// Test-only — the background [`spawn`] loader uses [`load_frozen_base`] +
+/// `merge_topup` directly so it can paint the base instantly and reuse its
+/// per-file cache.
 #[cfg(test)]
 pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let mut base = load_base(claude_dir).ok()?;
@@ -1994,9 +2148,10 @@ pub(crate) enum TokensEvent {
 ///
 /// `claude_dir` and `clauth_dir` must already be resolved by the caller — the
 /// worker never re-resolves `home_dir()`, matching the pattern in `status::spawn`.
-/// `clauth_dir` is where the durable per-day ledger lives; `None` disables it (the
-/// tab still works off stats-cache + transcripts, just without the aged-day
-/// backfill / cold-start bound).
+/// `clauth_dir` holds the durable per-day ledger and the frozen stats base;
+/// `None` disables both (the tab still works off the global stats cache +
+/// transcripts, just without the aged-day backfill, the cold-start bound, or a
+/// cutoff that stays put).
 pub(crate) fn spawn(
     tx: Sender<TokensEvent>,
     refresh_rx: Receiver<()>,
@@ -2007,7 +2162,11 @@ pub(crate) fn spawn(
         let mut cache = TopUpCache::default();
 
         let run = |cache: &mut TopUpCache| {
-            let mut base = match load_base(&claude_dir) {
+            let loaded = match clauth_dir.as_deref() {
+                Some(dir) => load_frozen_base(&claude_dir, dir),
+                None => load_base(&claude_dir),
+            };
+            let mut base = match loaded {
                 Ok(base) => base,
                 Err(cause) => {
                     let _ = tx.send(TokensEvent::Failed(cause));

@@ -3121,10 +3121,11 @@ fn run_adopt_reread_hook() {
     }
 }
 
-/// Rescue a runtime root into the global store, one way: the transcripts under
-/// `projects/`, then the session sidecars under `sidecars`' rule. Returns
-/// `(transcripts, sidecars)`. Best-effort throughout: an error is logged and
-/// counted as left, never fails the caller. Shared by
+/// Rescue a runtime root into the global store, one way: a shared tree's
+/// `stats-cache.json` result first ([`publish_stats_cache`]), then the
+/// transcripts under `projects/`, then the session sidecars under `sidecars`'
+/// rule. Returns `(transcripts, sidecars)`. Best-effort throughout: an error is
+/// logged and counted as left, never fails the caller. Shared by
 /// [`crate::start::rescue_teardown`] and every tombstone ([`rescue_tombstone`]),
 /// so an unrescued tree is lifted at its deletion site rather than only on a
 /// clean exit. Its rescue-lock waits share one budget
@@ -3140,6 +3141,8 @@ pub(crate) fn rescue_runtime(
     // shared tree's run is placed off its live process.
     if sidecars == crate::sessions::SidecarSource::Isolated {
         crate::usage::note_isolated_credit_refusal(root);
+    } else {
+        publish_stats_cache(root, claude_home);
     }
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
     let transcripts =
@@ -3155,6 +3158,104 @@ pub(crate) fn rescue_runtime(
         );
     }
     (transcripts, sidecars)
+}
+
+/// Test seam for [`publish_stats_cache`]'s re-check under the state flock: a
+/// hook run once between the pre-lock date check and the flock, posing another
+/// tree's publish landing while this one waits. Test-only.
+#[cfg(test)]
+pub(crate) struct StatsPublishRereadHook;
+
+#[cfg(test)]
+thread_local! {
+    static STATS_PUBLISH_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl StatsPublishRereadHook {
+    pub(crate) fn arm(hook: impl FnMut() + 'static) -> Self {
+        STATS_PUBLISH_REREAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatsPublishRereadHook {
+    fn drop(&mut self) {
+        STATS_PUBLISH_REREAD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_stats_publish_reread_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&STATS_PUBLISH_REREAD_HOOK) {
+        hook();
+    }
+}
+
+/// Carry a shared tree's `/stats` result back to the global store: Claude Code
+/// replaces the tree's `stats-cache.json` by rename, so nothing else ever
+/// reaches `~/.claude`. Goes back only when its `lastComputedDate` is strictly
+/// later than the global file's, or the global file is absent, and only with
+/// the old bytes frozen first; a seed copy's mtime says nothing, and a copy
+/// tree's inherited file is safe under the same date rule. A link in the tree
+/// resolves to the global file itself. Best-effort: logged, never fails.
+fn publish_stats_cache(root: &Path, claude_home: &Path) {
+    let copy = root.join(crate::tokens::STATS_CACHE_FILE);
+    if crate::sessions::is_symlink(&copy) {
+        return;
+    }
+    let Ok(bytes) = crate::tokens::read_stats_bytes(&copy) else {
+        return;
+    };
+    let Some(date) = crate::tokens::stats_cache_date(&bytes) else {
+        logline!(
+            "clauth: left {} unpublished: no usable lastComputedDate",
+            copy.display()
+        );
+        return;
+    };
+    let global = claude_home.join(crate::tokens::STATS_CACHE_FILE);
+    // Checked before the flock so the usual tree, whose seed copy never moved,
+    // costs a sweep no wait, and again inside it because two trees can end
+    // together holding different dates.
+    if !stats_cache_is_behind(&global, date) {
+        return;
+    }
+    #[cfg(test)]
+    run_stats_publish_reread_hook();
+    let published = with_state_lock(|_held| {
+        if !stats_cache_is_behind(&global, date) {
+            return Ok(false);
+        }
+        crate::tokens::freeze_stats_base(claude_home, &clauth_dir()?)
+            .context("failed to freeze the stats base")?;
+        atomic_write_600(&global, &bytes)
+            .with_context(|| format!("failed to write {}", global.display()))?;
+        Ok(true)
+    });
+    match published {
+        Ok(true) => logline!(
+            "clauth: published {} to {}",
+            copy.display(),
+            global.display()
+        ),
+        Ok(false) => {}
+        Err(e) => logline!("clauth: left {} unpublished: {e:#}", copy.display()),
+    }
+}
+
+/// Whether the global stats cache may be replaced by a body dated `date`. An
+/// operator's link stays, and a file with no date to compare outranks any.
+fn stats_cache_is_behind(global: &Path, date: i64) -> bool {
+    if crate::sessions::is_symlink(global) {
+        return false;
+    }
+    match crate::tokens::read_stats_bytes(global) {
+        Ok(bytes) => crate::tokens::stats_cache_date(&bytes).is_some_and(|held| held < date),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Retire a dead runtime tree from its live name, inside the removal's state
@@ -3395,10 +3496,11 @@ fn claim_is_named(_file: &File, _path: &Path) -> bool {
 /// Whether a dead shared tree is a copy of the global store: a copy host's
 /// build copies every entry and links none, so a tree is a copy iff none of its
 /// top-level entries is a link. A linking build links what `~/.claude` holds
-/// plus the `projects` and `jobs` stores it can create there; one that linked
-/// nothing (an empty `~/.claude` it could not write) reads as a copy too. An
-/// unreadable tree or entry reads as no copy, whose sibling rule never drops a
-/// file.
+/// except `stats-cache.json`, which it copies so Claude Code's rename cannot
+/// replace the link, plus the `projects` and `jobs` stores it can create there;
+/// one that linked nothing (an empty `~/.claude` it could not write) reads as a
+/// copy too. An unreadable tree or entry reads as no copy, whose sibling rule
+/// never drops a file.
 fn is_copy_tree(tree: &Path) -> bool {
     std::fs::read_dir(tree).is_ok_and(|mut entries| {
         entries.all(|entry| entry.is_ok_and(|e| e.file_type().is_ok_and(|t| !t.is_symlink())))
@@ -7789,8 +7891,11 @@ impl ProfileRuntime {
 /// recovery and splitting it is not. The daemon's watchdog aborts a wedged main
 /// loop within 30 s of the wedge — inside the second 25 s acquire — so the FIRST
 /// retry is the common recovery. Two retries covers a slow abort without holding
-/// the exiting session open past ~75 s, after which the next run's GC is the
-/// fallback.
+/// the exiting session open past ~75 s. A rescue's stats-cache publish takes one
+/// more state flock after them, and the `Ours` supervisor path takes a second
+/// retried hold after its stop, so a teardown's waits reach ~100 s on the
+/// single-hold shape and ~175 s plus the stop on the split one; after that the
+/// next run's GC is the fallback.
 const TEARDOWN_ACQUIRE_RETRIES: u32 = 2;
 
 /// Take the state flock for teardown, retrying a
@@ -10117,6 +10222,10 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///   isolation would hide project history and installed commands. The
 ///   supervisor state is per-config-dir, so sharing it would hand every tree
 ///   one supervisor's roster.
+/// - **Copied on a linking host:** `stats-cache.json`. Claude Code replaces it
+///   by rename, which would only replace a link, so the tree holds a real copy
+///   that [`rescue_runtime`] sends back when its `lastComputedDate` is later.
+///   The base the Tokens tab reads is frozen before this walk.
 /// - **Per-profile:** `settings.json` (merged with profile overrides),
 ///   `.credentials.json` (the profile's own OAuth token chain), and
 ///   `.claude.json` (a copy seeded from `~/.claude.json`). Settings are
@@ -10188,6 +10297,12 @@ fn build_runtime_dir_with_active_env(
     prune_dangling_links(runtime)?;
     let mut store_notes = Vec::new();
     if isolation == Isolation::Shared {
+        // Every mode: a copy host's mirror can move the global file too.
+        if let Err(e) = clauth_dir().and_then(|dir| {
+            crate::tokens::freeze_stats_base(claude_home, &dir).map_err(anyhow::Error::from)
+        }) {
+            logline!("clauth: could not freeze the stats base: {e:#}");
+        }
         store_notes = ensure_store_links(claude_home, runtime, mode)?;
     }
 
@@ -10234,6 +10349,12 @@ fn build_runtime_dir_with_active_env(
         if dst.symlink_metadata().is_ok() {
             continue;
         }
+        if mode == LinkMode::Real
+            && file_name == crate::tokens::STATS_CACHE_FILE
+            && seed_stats_cache(&entry.path(), &dst)
+        {
+            continue;
+        }
         pending.push((entry.path(), dst));
     }
     materialize_entries(pending, mode)?;
@@ -10243,6 +10364,21 @@ fn build_runtime_dir_with_active_env(
     reconcile_credentials(&creds_link, canonical, mode)?;
 
     Ok(store_notes)
+}
+
+/// Give a linking tree its own `stats-cache.json`. False when it could not, so
+/// the walk links the entry as it stands: a start the base allowed must never
+/// be refused by a directory, a dangling link or a full disk at this name.
+fn seed_stats_cache(src: &Path, dst: &Path) -> bool {
+    let seeded =
+        crate::tokens::read_stats_bytes(src).and_then(|bytes| atomic_write_600(dst, bytes));
+    if let Err(e) = &seeded {
+        logline!(
+            "clauth: linking {} instead of copying it: {e}",
+            src.display()
+        );
+    }
+    seeded.is_ok()
 }
 
 /// Stores Claude Code writes through its config dir and clauth reads from

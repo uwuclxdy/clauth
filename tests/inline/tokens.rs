@@ -12,6 +12,232 @@ fn write_stats_cache(claude_dir: &std::path::Path, json: &str) {
     std::fs::write(claude_dir.join("stats-cache.json"), json).expect("write stats-cache");
 }
 
+fn stats_at(date: &str) -> String {
+    format!(
+        r#"{{"version":5,"lastComputedDate":"{date}","dailyActivity":[],"dailyModelTokens":[],"totalSessions":0,"totalMessages":0}}"#
+    )
+}
+
+/// The cutoff is the frozen file's, so moving `~/.claude/stats-cache.json` on
+/// never hands ledger days over to Claude Code's rows.
+#[test]
+fn the_tab_keeps_its_cutoff_after_the_global_stats_cache_moves() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+    let first = load_frozen_base(&claude_dir, &clauth_dir).expect("first load");
+    assert_eq!(first.last_computed_date.as_deref(), Some("2026-06-09"));
+
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    let second = load_frozen_base(&claude_dir, &clauth_dir).expect("second load");
+    assert_eq!(second.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// An unusable frozen file costs the freeze, never the tab.
+#[test]
+fn a_torn_frozen_base_falls_back_to_the_global_file() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    std::fs::write(clauth_dir.join("stats-base.json"), "{not json").expect("write torn");
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-11-04"));
+}
+
+/// With nothing to freeze, the load fails exactly as the global read does.
+#[test]
+fn no_stats_cache_anywhere_keeps_the_missing_error() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+
+    let frozen = load_frozen_base(&claude_dir, &clauth_dir).expect_err("nothing to read");
+    let plain = load_base(&claude_dir).expect_err("nothing to read");
+    assert_eq!(frozen.cause_line(), plain.cause_line());
+    assert!(!clauth_dir.join("stats-base.json").exists());
+}
+
+/// A freeze that cannot land costs the tab nothing: the global file answers.
+#[test]
+fn an_unwritable_frozen_base_still_loads_the_global_file() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::write(&clauth_dir, "a file where the dir belongs").expect("write");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// Torn bytes carry no date, so freezing them would pin the tab to the global
+/// file forever; the freeze waits for a dated body instead.
+#[test]
+fn a_torn_global_stats_cache_freezes_nothing() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, "{not json");
+
+    let _ = load_frozen_base(&claude_dir, &clauth_dir);
+    assert!(
+        !clauth_dir.join("stats-base.json").exists(),
+        "the torn global froze"
+    );
+
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+    assert_eq!(
+        std::fs::read_to_string(clauth_dir.join("stats-base.json")).expect("frozen base"),
+        stats_at("2026-06-09"),
+        "the good global froze"
+    );
+}
+
+/// Two publishers read the same absent frozen base; the one that freezes first
+/// while the other is between its checks keeps its bytes.
+#[test]
+fn a_freeze_that_loses_the_race_keeps_the_first_publishers_bytes() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    let first = stats_at("2026-06-09");
+    let frozen = clauth_dir.join("stats-base.json");
+    let frozen_for_hook = frozen.clone();
+    let first_for_hook = first.clone();
+    let _hook = StatsFreezeRereadHook::arm(move || {
+        // The other publisher freezes the base while this one reads the global.
+        std::fs::write(&frozen_for_hook, &first_for_hook).expect("the other publisher freezes");
+    });
+
+    freeze_stats_base(&claude_dir, &clauth_dir).expect("freeze");
+
+    assert_eq!(
+        std::fs::read_to_string(&frozen).expect("frozen base"),
+        first,
+        "the loser overwrote the first publisher's bytes"
+    );
+}
+
+/// A directory at the frozen name is no frozen file: the global stands in.
+#[cfg(unix)]
+#[test]
+fn a_directory_at_the_frozen_base_falls_back_to_the_global() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(clauth_dir.join("stats-base.json")).expect("mkdir frozen name");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("global stands in");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// Opening a FIFO for reading blocks until a writer arrives, so a read at the
+/// frozen name would hang the tab's worker before its first paint.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_frozen_base_cannot_hang_the_loader() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    crate::testutil::mkfifo(&clauth_dir.join("stats-base.json"));
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (claude, clauth) = (claude_dir, clauth_dir);
+    std::thread::spawn(move || {
+        let loaded = load_frozen_base(&claude, &clauth);
+        let _ = done_tx.send(loaded.map(|stats| stats.last_computed_date));
+    });
+    let date = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the loader hung on a FIFO at the frozen base")
+        .expect("the global file stands in");
+    assert_eq!(date.as_deref(), Some("2026-06-09"));
+}
+
+/// The stand-in read takes the same regular-file guard: a FIFO at the global
+/// name is refused instead of opened.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_global_stats_cache_cannot_hang_the_loader() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    crate::testutil::mkfifo(&claude_dir.join("stats-cache.json"));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let claude = claude_dir;
+    std::thread::spawn(move || {
+        let loaded = load_base(&claude);
+        let _ = done_tx.send(loaded.map(|stats| stats.last_computed_date));
+    });
+    let refused = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stand-in read hung on a FIFO at the global name");
+    assert!(refused.is_err(), "a FIFO carries no stats: {refused:?}");
+}
+
+/// The background worker reads the frozen base on every refresh, so a global
+/// file that moves after the freeze never moves the tab's cutoff.
+#[test]
+fn the_spawn_worker_keeps_the_frozen_cutoff_across_a_refresh() {
+    fn next_base(rx: &std::sync::mpsc::Receiver<TokensEvent>) -> String {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(TokensEvent::Base(stats)) => {
+                    return stats.last_computed_date.clone().expect("a cutoff");
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no Base event from the tokens worker: {e}"),
+            }
+        }
+    }
+
+    fn next_loaded(rx: &std::sync::mpsc::Receiver<TokensEvent>) {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(TokensEvent::Loaded(_)) => return,
+                Ok(TokensEvent::Failed(cause)) => {
+                    panic!("the tokens worker failed: {}", cause.cause_line())
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+            }
+        }
+    }
+
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    spawn(tx, refresh_rx, claude_dir.clone(), Some(clauth_dir));
+    assert_eq!(next_base(&rx), "2026-06-09");
+
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    refresh_tx.send(()).expect("refresh the worker");
+    assert_eq!(next_base(&rx), "2026-06-09");
+    // Phase 2 (`persist_ledger`) ends with `Loaded`; let it finish before the
+    // sandbox's tempdir goes, or the ledger write recreates `.clauth` under it.
+    next_loaded(&rx);
+    drop(refresh_tx);
+}
+
 fn make_claude_dir(sandbox: &HomeSandbox) -> std::path::PathBuf {
     let dir = sandbox.home().join(".claude");
     std::fs::create_dir_all(&dir).expect("create .claude");

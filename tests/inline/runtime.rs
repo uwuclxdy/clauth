@@ -6754,6 +6754,571 @@ fn build_runtime_dir_shared_keeps_operator_extensions() {
     });
 }
 
+fn stats_cache_body(date: &str) -> String {
+    format!(
+        r#"{{"version":5,"lastComputedDate":"{date}","dailyActivity":[],"dailyModelTokens":[],"totalSessions":0,"totalMessages":0}}"#
+    )
+}
+
+/// Claude Code replaces `stats-cache.json` by rename, which on a link only
+/// replaces the link: the tree holds a real copy, so its write stays reachable
+/// for the publish at the tree's end.
+#[cfg(unix)]
+#[test]
+fn a_shared_link_tree_holds_a_real_copy_of_the_stats_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let body = stats_cache_body("2026-06-09");
+        fs::write(claude_home.join("stats-cache.json"), &body).expect("write stats");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("shared");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let copy = runtime.join("stats-cache.json");
+        let meta = copy.symlink_metadata().expect("copy present");
+        assert!(meta.file_type().is_file(), "a real file, not a link");
+        assert_eq!(fs::read_to_string(&copy).expect("read copy"), body);
+    });
+}
+
+/// A tree build freezes the base before anything can move the global file.
+#[test]
+fn a_tree_build_freezes_the_stats_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let body = stats_cache_body("2026-06-09");
+        fs::write(claude_home.join("stats-cache.json"), &body).expect("write stats");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("shared");
+        let canonical = tmp.path().join("creds.json");
+        fs::create_dir_all(crate::profile::clauth_dir().expect("clauth dir")).expect("mkdir");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let frozen = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("stats-base.json");
+        assert_eq!(fs::read_to_string(frozen).expect("frozen base"), body);
+    });
+}
+
+/// Rescues a tree holding `tree_body` over a global holding `global_body`, and
+/// answers the global file's text afterward (`None`: absent).
+fn stats_after_rescue(
+    home: &Path,
+    global_body: Option<&str>,
+    tree_body: &str,
+    source: crate::sessions::SidecarSource,
+) -> Option<String> {
+    let claude_home = fake_claude_home(home);
+    fs::create_dir_all(crate::profile::clauth_dir().expect("clauth dir")).expect("mkdir");
+    let global = claude_home.join("stats-cache.json");
+    if let Some(body) = global_body {
+        fs::write(&global, body).expect("write global");
+    }
+    let tree = home.join("tree");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    fs::write(tree.join("stats-cache.json"), tree_body).expect("write tree copy");
+    rescue_runtime(&tree, &claude_home, source);
+    fs::read_to_string(&global).ok()
+}
+
+/// The publish that advances the global file: the date moves on, and the base
+/// the Tokens tab reads keeps the bytes from before the move.
+#[test]
+fn a_later_stats_cache_goes_back_and_the_old_bytes_stay_frozen() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let old = stats_cache_body("2026-06-09");
+        let new = stats_cache_body("2026-11-04");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&old),
+            &new,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(new.as_str()));
+        let frozen = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("stats-base.json");
+        assert_eq!(fs::read_to_string(frozen).expect("frozen base"), old);
+    });
+}
+
+/// A tree that was later than the global before the flock must not write over
+/// a global another tree moved meanwhile.
+#[test]
+fn a_publish_rechecks_the_global_under_the_flock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = fake_claude_home(tmp.path()).join("stats-cache.json");
+        let moved = stats_cache_body("2026-11-05");
+        let global_for_hook = global.clone();
+        let moved_for_hook = moved.clone();
+        let _hook = crate::runtime::StatsPublishRereadHook::arm(move || {
+            // Another tree's publish lands between this one's date check and
+            // its flock.
+            fs::write(&global_for_hook, &moved_for_hook).expect("write the moved global");
+        });
+
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&stats_cache_body("2026-06-09")),
+            &stats_cache_body("2026-11-04"),
+            crate::sessions::SidecarSource::Shared,
+        );
+
+        assert_eq!(after.as_deref(), Some(moved.as_str()));
+    });
+}
+
+/// Only the first move freezes: a second publish leaves the frozen bytes alone.
+#[test]
+fn a_second_publish_keeps_the_first_frozen_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let first = stats_cache_body("2026-06-09");
+        let second = stats_cache_body("2026-11-04");
+        let third = stats_cache_body("2026-11-05");
+        let source = || crate::sessions::SidecarSource::Shared;
+        stats_after_rescue(tmp.path(), Some(&first), &second, source());
+        let after = stats_after_rescue(tmp.path(), Some(&second), &third, source());
+        assert_eq!(after.as_deref(), Some(third.as_str()));
+        let frozen = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("stats-base.json");
+        assert_eq!(fs::read_to_string(frozen).expect("frozen base"), first);
+    });
+}
+
+/// A tree that wrote the file on a box whose `~/.claude` never had one seeds it.
+#[test]
+fn a_stats_cache_the_global_store_lacks_goes_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let new = stats_cache_body("2026-11-04");
+        let after = stats_after_rescue(
+            tmp.path(),
+            None,
+            &new,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(new.as_str()));
+    });
+}
+
+/// `lastComputedDate` decides, never the clock: the tree's copy is the file
+/// written last here, and it still holds the older date.
+#[test]
+fn an_older_stats_cache_stays_out_whatever_its_mtime() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-11-04");
+        let tree = stats_cache_body("2026-06-09");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            &tree,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// An equal date is no news: a seed copy the session never rewrote changes
+/// nothing, even with other bytes beside the date.
+#[test]
+fn an_equal_stats_cache_date_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-11-04");
+        let tree = global.replace("\"totalSessions\":0", "\"totalSessions\":7");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            &tree,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// A torn or foreign tree copy has no date to compare, so the global file stays.
+#[test]
+fn an_unreadable_tree_stats_cache_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-06-09");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            "{not json",
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// A tree copy with no date to compare blocks the publish and says so once.
+#[test]
+fn a_dateless_tree_stats_cache_logs_why_it_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-06-09");
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("stats-cache.json"), &global).expect("write global");
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        fs::write(tree.join("stats-cache.json"), "{not json").expect("write tree copy");
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+
+        rescue_runtime(&tree, &claude_home, crate::sessions::SidecarSource::Shared);
+        drop(capture);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("stats-cache.json")).expect("read global"),
+            global
+        );
+        assert_eq!(
+            lines.snapshot(),
+            [format!(
+                "clauth: left {} unpublished: no usable lastComputedDate",
+                tree.join("stats-cache.json").display()
+            )]
+        );
+    });
+}
+
+/// An isolated tree shares nothing with the global store, its stats included.
+#[test]
+fn an_isolated_tree_publishes_no_stats_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-06-09");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            &stats_cache_body("2026-11-04"),
+            crate::sessions::SidecarSource::Isolated,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// The way a dead tree really goes, a crashed session's included: its rescue
+/// claim held, then the state flock for the publish.
+#[test]
+fn a_tombstoned_tree_publishes_its_stats_cache() {
+    let sb = HomeSandbox::new();
+    let global = sb.home().join(".claude/stats-cache.json");
+    fs::create_dir_all(global.parent().expect("parent")).expect("mkdir .claude");
+    let old = stats_cache_body("2026-06-09");
+    fs::write(&global, &old).expect("write global");
+    let new = stats_cache_body("2026-11-04");
+    let tombstone = sb.home().join(".clauth/profiles/stats/runtime.rescuing");
+    fs::create_dir_all(&tombstone).expect("mkdir tombstone");
+    fs::write(tombstone.join("stats-cache.json"), &new).expect("write tree copy");
+
+    rescue_tombstone(&tombstone);
+
+    assert_eq!(fs::read_to_string(&global).expect("read global"), new);
+    let frozen = sb.home().join(".clauth/stats-base.json");
+    assert_eq!(fs::read_to_string(frozen).expect("frozen base"), old);
+    assert!(tombstone.symlink_metadata().is_err(), "the tree stayed");
+}
+
+/// A copy tree's date is as good as a link tree's: a `/stats` past its last
+/// mirror tick still goes back.
+#[test]
+fn a_copy_tree_publishes_a_later_stats_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let new = stats_cache_body("2026-11-04");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&stats_cache_body("2026-06-09")),
+            &new,
+            crate::sessions::SidecarSource::SharedCopy,
+        );
+        assert_eq!(after.as_deref(), Some(new.as_str()));
+    });
+}
+
+/// A date the parser refuses is no date: `soon` sorts after every `2026-…`.
+#[test]
+fn a_stats_cache_with_no_real_date_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-06-09");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            &stats_cache_body("soon"),
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// A calendar-invalid date is no date: the arithmetic parser accepts
+/// `2026-99-99`, which sorts after every real date, so it must be refused
+/// before the comparison rather than go back.
+#[test]
+fn an_impossible_stats_cache_date_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let global = stats_cache_body("2026-06-09");
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&global),
+            &stats_cache_body("2026-99-99"),
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(global.as_str()));
+    });
+}
+
+/// A body whose other fields changed shape still carries its date: the date
+/// read takes only `lastComputedDate`, so a new Claude Code shape publishes.
+#[test]
+fn a_stats_cache_with_a_changed_field_shape_publishes_on_its_date() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let new = r#"{"version":5,"lastComputedDate":"2026-11-04","totalSessions":"many"}"#;
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some(&stats_cache_body("2026-06-09")),
+            new,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some(new));
+    });
+}
+
+/// A global file with no date to compare is not an absent one.
+#[test]
+fn an_undated_global_stats_cache_stays() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let after = stats_after_rescue(
+            tmp.path(),
+            Some("{not json"),
+            &stats_cache_body("2026-11-04"),
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(after.as_deref(), Some("{not json"));
+    });
+}
+
+/// A pre-upgrade tree still links the file; following the link would read
+/// something that is no result of this tree.
+#[cfg(unix)]
+#[test]
+fn a_linked_tree_stats_cache_stays_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let global = stats_cache_body("2026-06-09");
+        fs::write(claude_home.join("stats-cache.json"), &global).expect("write global");
+        let elsewhere = tmp.path().join("elsewhere.json");
+        fs::write(&elsewhere, stats_cache_body("2026-11-04")).expect("write target");
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        std::os::unix::fs::symlink(&elsewhere, tree.join("stats-cache.json")).expect("link");
+
+        rescue_runtime(&tree, &claude_home, crate::sessions::SidecarSource::Shared);
+
+        let after = fs::read_to_string(claude_home.join("stats-cache.json")).expect("read");
+        assert_eq!(after, global);
+    });
+}
+
+/// An operator's link at the global name stays a link, its target untouched.
+#[cfg(unix)]
+#[test]
+fn a_global_stats_cache_link_stays_a_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let old = stats_cache_body("2026-06-09");
+        let target = tmp.path().join("dotfiles-stats.json");
+        fs::write(&target, &old).expect("write target");
+        let global = claude_home.join("stats-cache.json");
+        std::os::unix::fs::symlink(&target, &global).expect("link");
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        fs::write(
+            tree.join("stats-cache.json"),
+            stats_cache_body("2026-11-04"),
+        )
+        .expect("write tree copy");
+
+        rescue_runtime(&tree, &claude_home, crate::sessions::SidecarSource::Shared);
+
+        assert!(
+            crate::sessions::is_symlink(&global),
+            "the link was replaced"
+        );
+        assert_eq!(fs::read_to_string(&target).expect("read target"), old);
+    });
+}
+
+/// No freeze, no publish: a later result must not cost the old bytes.
+#[cfg(unix)]
+#[test]
+fn a_failed_freeze_publishes_nothing() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let tmp = tempfile::tempdir().expect("tempdir");
+    if fs::metadata(tmp.path()).expect("stat tempdir").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can write any directory");
+        return;
+    }
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let old = stats_cache_body("2026-06-09");
+        let global = claude_home.join("stats-cache.json");
+        fs::write(&global, &old).expect("write global");
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        fs::write(
+            tree.join("stats-cache.json"),
+            stats_cache_body("2026-11-04"),
+        )
+        .expect("write tree copy");
+        let clauth = crate::profile::clauth_dir().expect("clauth dir");
+        fs::create_dir_all(&clauth).expect("mkdir");
+        crate::lock::with_state_lock(|_held| Ok(())).expect("seed the lock file");
+        fs::set_permissions(&clauth, fs::Permissions::from_mode(0o500)).expect("chmod");
+
+        rescue_runtime(&tree, &claude_home, crate::sessions::SidecarSource::Shared);
+
+        fs::set_permissions(&clauth, fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert_eq!(fs::read_to_string(&global).expect("read"), old);
+        assert!(!clauth.join("stats-base.json").exists());
+    });
+}
+
+/// `~/.claude` can hold anything at the name; none of it may refuse a start,
+/// and the walk links it as it stands.
+#[cfg(unix)]
+#[test]
+fn a_directory_at_the_stats_cache_name_keeps_its_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("stats-cache.json")).expect("mkdir");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(crate::profile::clauth_dir().expect("clauth dir")).expect("mkdir");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &make_profile("shared"),
+            &tmp.path().join("creds.json"),
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a directory at the name must not fail the build");
+
+        assert!(crate::sessions::is_symlink(
+            &runtime.join("stats-cache.json")
+        ));
+    });
+}
+
+/// A FIFO is read by nobody: the walk holds the state flock, so a blocking
+/// read at this name would hang every start on the box.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_stats_cache_name_is_linked_unread() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        crate::testutil::mkfifo(&claude_home.join("stats-cache.json"));
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(crate::profile::clauth_dir().expect("clauth dir")).expect("mkdir");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &make_profile("shared"),
+            &tmp.path().join("creds.json"),
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a FIFO at the name must not fail the build");
+
+        assert!(crate::sessions::is_symlink(
+            &runtime.join("stats-cache.json")
+        ));
+    });
+}
+
+/// A world-readable global file loses that on every copy clauth writes.
+#[cfg(unix)]
+#[test]
+fn every_stats_cache_copy_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let global = claude_home.join("stats-cache.json");
+        fs::write(&global, stats_cache_body("2026-06-09")).expect("write global");
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o644)).expect("chmod");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let clauth = crate::profile::clauth_dir().expect("clauth dir");
+        fs::create_dir_all(&clauth).expect("mkdir");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &make_profile("shared"),
+            &tmp.path().join("creds.json"),
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+        let copy = runtime.join("stats-cache.json");
+        assert_eq!(mode(&copy), 0o600);
+        assert_eq!(mode(&clauth.join("stats-base.json")), 0o600);
+
+        fs::write(&copy, stats_cache_body("2026-11-04")).expect("rewrite copy");
+        rescue_runtime(
+            &runtime,
+            &claude_home,
+            crate::sessions::SidecarSource::Shared,
+        );
+        assert_eq!(mode(&global), 0o600);
+    });
+}
+
 /// Isolated settings start from an empty base, so operator hooks never leak.
 #[test]
 fn build_runtime_dir_isolated_settings_drop_operator_config() {

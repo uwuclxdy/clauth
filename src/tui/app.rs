@@ -5685,8 +5685,9 @@ pub(crate) struct App {
     /// Services tab state; UI-thread-only, recomputed on focus + `r` (no thread).
     pub(crate) services: ServicesState,
 
-    /// Global token-usage stats read from `~/.claude` (stats-cache + recent
-    /// transcript top-up); `None` until the loader posts its first result.
+    /// Token-usage stats from the frozen base under `~/.clauth` (the global
+    /// `~/.claude` stats-cache only as its stand-in) + recent transcript
+    /// top-up; `None` until the loader posts its first result.
     pub(crate) token_stats: Option<crate::tokens::TokenStats>,
     /// Set when the loader reported a failure and no stats are cached — the tab
     /// shows an error instead of a perpetual "parsing stats-cache.json".
@@ -6337,11 +6338,12 @@ impl App {
             status::spawn(status_sender, status_refresh_rx);
         }
 
-        // Token-usage loader: reads `~/.claude/stats-cache.json` + recent
-        // transcripts off the UI thread. Same test-skip rationale as the status
-        // worker — a detached thread could outlive a test's `HOME_OVERRIDE`. The
-        // `~/.claude` path is resolved once here so the worker never re-resolves
-        // `home_dir()` (which would race the override).
+        // Token-usage loader: reads the frozen base under `~/.clauth` (the global
+        // `~/.claude/stats-cache.json` only as its stand-in) + recent transcripts
+        // off the UI thread. Same test-skip rationale as the status worker — a
+        // detached thread could outlive a test's `HOME_OVERRIDE`. Both paths are
+        // resolved once here so the worker never re-resolves `home_dir()` (which
+        // would race the override).
         let (tokens_sender, tokens_events) =
             std::sync::mpsc::channel::<crate::tokens::TokensEvent>();
         let (tokens_refresh, tokens_refresh_rx) = std::sync::mpsc::channel::<()>();
