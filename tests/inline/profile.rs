@@ -6654,7 +6654,7 @@ fn load_config_a_setgid_dir_keeps_setgid() {
 }
 
 /// Every top-level name in the set — the rescue's `SIDECAR_TREES` plus
-/// the store-link dirs `jobs` and `projects` — is retightened. The names are
+/// the store-link dirs in `SHARED_STORES` — is retightened. The names are
 /// hand-listed, not read from the constant, so a dropped or renamed entry reds
 /// here instead of hiding in a mirrored loop.
 #[cfg(unix)]

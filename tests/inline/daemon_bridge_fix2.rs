@@ -468,6 +468,35 @@ fn the_production_resolver_reads_a_background_rows_tree() {
     assert_eq!(resolved.proc_start, start);
 }
 
+/// A peer no `live_sessions` row joins resolves from the global
+/// `~/.claude/sessions` — the arm a shared tree on a box without the store
+/// takes (SB-3).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_production_resolver_reads_the_global_store_for_an_unjoined_peer() {
+    let _home = HomeSandbox::new();
+    let mut peer = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("the peer child");
+    let peer_pid = peer.id();
+    let start = crate::testutil::proc_start_of(peer_pid).expect("field 22");
+    let sessions = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join(format!("{peer_pid}.json")),
+        format!(r#"{{"sessionId":"4242-0","pid":{peer_pid},"procStart":"{start}"}}"#),
+    )
+    .expect("record");
+    let resolved = production_resolver()(peer_pid).expect("resolve from the global store");
+    let _ = peer.kill();
+    let _ = peer.wait();
+    assert_eq!(resolved.session_id, "4242-0");
+    assert_eq!(resolved.proc_start, start);
+}
+
 /// A peer trickling one byte at a time is cut off at the whole-request
 /// deadline, not at any per-read bound (A#2/A#9).
 #[test]

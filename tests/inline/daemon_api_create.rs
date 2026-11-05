@@ -1887,6 +1887,168 @@ fn the_background_audit_line_names_ids_and_prompt_length_only() {
     );
 }
 
+/// A successful launch's stderr — where `clauth start` names each store it
+/// could not create — reaches the daemon log one line per line of stderr, so
+/// no note hides another behind the per-line bound, and the 200 answer carries
+/// no new field.
+#[test]
+fn a_successful_background_launch_logs_each_stderr_line() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((
+        true,
+        BG_IDLE_STDOUT,
+        "clauth: could not create /home/u/.claude/jobs: Permission denied (os error 13); this session's background jobs stay in its own tree\n\
+         clauth: could not create /home/u/.claude/projects: Permission denied (os error 13); this session's transcripts stay in its own tree\n\
+         \n\
+         clauth: could not create /home/u/.claude/sessions: Permission denied (os error 13); this session's background sessions stay there\n\
+         a\x07b\n",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    let said = "clauth api: device 'test' background launch said:";
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            format!(
+                "{said} clauth: could not create /home/u/.claude/jobs: Permission denied (os \
+                 error 13); this session's background jobs stay in its own t..."
+            ),
+            format!(
+                "{said} clauth: could not create /home/u/.claude/projects: Permission denied (os \
+                 error 13); this session's transcripts stay in its own t..."
+            ),
+            format!(
+                "{said} clauth: could not create /home/u/.claude/sessions: Permission denied (os \
+                 error 13); this session's background sessions stay ther..."
+            ),
+            format!("{said} a b"),
+            format!(
+                "clauth api: device 'test' created a background session form='profile:acme' \
+                 with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+                 session_id='{BG_SESSION}' prompt_len=0"
+            ),
+        ]
+    );
+}
+
+/// A child printing more than the cap costs a bounded number of log lines.
+#[test]
+fn a_chatty_background_launch_logs_a_bounded_number_of_lines() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((
+        true,
+        BG_IDLE_STDOUT,
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    let mut expected: Vec<String> = (1..=8)
+        .map(|n| format!("clauth api: device 'test' background launch said: {n}"))
+        .collect();
+    expected.push(format!(
+        "clauth api: device 'test' created a background session form='profile:acme' \
+         with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+         session_id='{BG_SESSION}' prompt_len=0"
+    ));
+    assert_eq!(lines.snapshot(), expected,);
+}
+
+/// A launch that prints nothing on stderr adds no such line: the audit line is
+/// the only one.
+#[test]
+fn a_silent_background_launch_logs_no_stderr_line() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((true, BG_IDLE_STDOUT, "")));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth api: device 'test' created a background session form='profile:acme' \
+             with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+             session_id='{BG_SESSION}' prompt_len=0"
+        )]
+    );
+}
+
 /// The production launch command: `current_exe()` for the clauth arm, the
 /// body's cwd, stdin closed, and the session env a daemon may carry removed
 /// (herdr's five pane vars, the Claude Code session and config vars, codex's

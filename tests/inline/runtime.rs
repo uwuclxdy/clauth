@@ -3036,11 +3036,11 @@ fn a_shared_tree_links_projects_on_a_box_without_the_store() {
     });
 }
 
-/// An isolated Real tree links neither `jobs` nor `projects`, and creates
-/// neither store. The shared-only gate is what keeps an isolated session's CC
-/// (empty settings → default 30-day cleanupPeriodDays) from cleaning the user's
-/// transcripts through a linked `projects`, and its `--bg` records from naming
-/// a store that never sees them.
+/// An isolated Real tree links none of `jobs`, `projects` or `sessions`, and
+/// creates none of them. The shared-only gate is what keeps an isolated
+/// session's CC (empty settings → default 30-day cleanupPeriodDays) from
+/// cleaning the user's transcripts through a linked `projects`, and its `--bg`
+/// records from naming a store that never sees them.
 #[test]
 fn an_isolated_tree_links_no_stores_on_a_box_without_them() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3056,6 +3056,10 @@ fn an_isolated_tree_links_no_stores_on_a_box_without_them() {
         assert!(
             !claude_home.join("projects").exists(),
             "the fixture starts without a projects store"
+        );
+        assert!(
+            !claude_home.join("sessions").exists(),
+            "the fixture starts without a sessions store"
         );
         let runtime = tmp.path().join("runtime-isolated");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
@@ -3081,12 +3085,20 @@ fn an_isolated_tree_links_no_stores_on_a_box_without_them() {
             "an isolated tree links no projects store"
         );
         assert!(
+            !runtime.join("sessions").exists(),
+            "an isolated tree links no sessions store"
+        );
+        assert!(
             !claude_home.join("jobs").exists(),
             "an isolated build creates no jobs store"
         );
         assert!(
             !claude_home.join("projects").exists(),
             "an isolated build creates no projects store"
+        );
+        assert!(
+            !claude_home.join("sessions").exists(),
+            "an isolated build creates no sessions store"
         );
     });
 }
@@ -4486,6 +4498,10 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
                     "projects",
                     "transcripts stay in its own tree and are lost when it ends",
                 ),
+                (
+                    "sessions",
+                    "background sessions stay in its own tree, where the clauth app cannot reach them",
+                ),
             ]
             .map(|(store, consequence)| {
                 format!(
@@ -4505,12 +4521,20 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
             "no projects store was created"
         );
         assert!(
+            claude_home.join("sessions").symlink_metadata().is_err(),
+            "no sessions store was created"
+        );
+        assert!(
             runtime.join("jobs").symlink_metadata().is_err(),
             "the tree links no jobs store"
         );
         assert!(
             runtime.join("projects").symlink_metadata().is_err(),
             "the tree links no projects store"
+        );
+        assert!(
+            runtime.join("sessions").symlink_metadata().is_err(),
+            "the tree links no sessions store"
         );
     });
 }

@@ -3497,10 +3497,10 @@ fn claim_is_named(_file: &File, _path: &Path) -> bool {
 /// build copies every entry and links none, so a tree is a copy iff none of its
 /// top-level entries is a link. A linking build links what `~/.claude` holds
 /// except `stats-cache.json`, which it copies so Claude Code's rename cannot
-/// replace the link, plus the `projects` and `jobs` stores it can create there;
-/// one that linked nothing (an empty `~/.claude` it could not write) reads as a
-/// copy too. An unreadable tree or entry reads as no copy, whose sibling rule
-/// never drops a file.
+/// replace the link, plus the [`SHARED_STORES`] it can create there; one that
+/// linked nothing (an empty `~/.claude` it could not write) reads as a copy too.
+/// An unreadable tree or entry reads as no copy, whose sibling rule never drops
+/// a file.
 fn is_copy_tree(tree: &Path) -> bool {
     std::fs::read_dir(tree).is_ok_and(|mut entries| {
         entries.all(|entry| entry.is_ok_and(|e| e.file_type().is_ok_and(|t| !t.is_symlink())))
@@ -10451,15 +10451,21 @@ pub(crate) const SHARED_STORES: &[(&str, &str)] = &[
         "projects",
         "transcripts stay in its own tree and are lost when it ends",
     ),
+    (
+        "sessions",
+        "background sessions stay in its own tree, where the clauth app cannot reach them",
+    ),
 ];
 
 /// Link the stores a shared tree must reach: Claude Code writes `jobs`
-/// (background job records) and `projects` (transcripts) through its config
-/// dir, and clauth reads them from `~/.claude`. The build's walk only visits
-/// what `~/.claude` already holds, so a box that never wrote either offers no
-/// store for the walk to link, and the record would land inside the tree,
-/// out of sight of `claude agents` run outside it, and a transcript there is
-/// never indexed and dies with the tree.
+/// (background job records), `projects` (transcripts) and `sessions` (live
+/// session records) through its config dir, and clauth reads them from
+/// `~/.claude`. The build's walk only visits what `~/.claude` already holds, so
+/// a box that never wrote one offers no store for the walk to link. A job
+/// record would land inside the tree, out of sight of `claude agents` run
+/// outside it; a transcript there stays unindexed until the tree's rescue; and
+/// a live record there never reaches the mod bridge, which reads a peer no
+/// `live_sessions` row joins from `~/.claude`.
 ///
 /// Shared trees on the linking transport only: a copy-host tree never gets the
 /// global job store linked or copied in (the walk and the mirror both skip

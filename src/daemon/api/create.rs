@@ -44,6 +44,11 @@ const SESSION_LAUNCH_DRAIN: Duration = Duration::from_secs(2);
 /// `null`, never an error.
 const SESSION_ID_READ_BOUND: Duration = Duration::from_secs(2);
 
+/// The stderr lines one successful background launch may put in the daemon log:
+/// more than the shared stores' notes, and short of letting a chatty child fill
+/// the log per create.
+const SESSION_LAUNCH_SAID_LINES: usize = 8;
+
 /// The fixed sentences; nothing off the wire reaches a body.
 const SESSION_CREATION_OFF: &str = "session creation is off; set `session_creation = true` \
                                    under `[serve]` in profiles.toml to enable it";
@@ -357,7 +362,7 @@ fn refusal_response(refusal: &crate::start::StartRefusal) -> Response {
 /// One background launch through the seam, reduced to its answer: 200 with the
 /// job id and (best-effort) session id, 502 for a launch that fails, never
 /// answers, or prints no job id, 503 when clauth is stopping that tree's
-/// background service. The child's output reaches daemon.log only.
+/// background service. The child's stderr reaches daemon.log only.
 fn launch_background_session(
     ctx: &ApiContext,
     launcher: Launcher,
@@ -389,6 +394,16 @@ fn launch_background_session(
             sanitize_for_log(stderr.trim_end())
         );
         return Response::refused(502, "background_refused", BACKGROUND_REFUSED);
+    }
+    for said in String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(SESSION_LAUNCH_SAID_LINES)
+    {
+        logline!(
+            "clauth api: device '{device}' background launch said: {}",
+            sanitize_for_log(said.trim_end())
+        );
     }
     let Some(id) = background_id(&out.stdout) else {
         let stdout = String::from_utf8_lossy(&out.stdout);

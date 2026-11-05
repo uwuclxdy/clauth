@@ -2982,7 +2982,7 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
 
 /// Clear the group and other bits on the `~/.claude` dirs clauth's rescue and
 /// store-link writers create — the rescue's [`crate::sessions::SIDECAR_TREES`],
-/// the store-link dirs `jobs` and `projects`, and each direct child of
+/// the store-link dirs [`crate::runtime::SHARED_STORES`], and each direct child of
 /// `projects/` (CC's and clauth's alike) — so the session-id listing those
 /// trees expose stays owner-only. A dir those writers created under an older
 /// build keeps its umask mode forever (nothing revisits it once the bytes stop
