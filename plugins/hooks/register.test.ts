@@ -1,5 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
-import type { HttpInit, On } from 'claude-code'
+import type { Plugin } from 'claude-code/testing'
+import type { HttpInit, On, ToolCallResult } from 'claude-code'
 
 // The test worker has the runtime's timers but not their declarations in the
 // type file; the budget and race tests await real time through it.
@@ -184,35 +185,107 @@ function installNoteCommand(on: On, answer: { stdout?: string; exitCode?: number
   return runs
 }
 
-// Nothing runs beneath a test's hooks, so a raised classic event settles on the
-// test's own bottom; this installs one.
-function classicBottom(
-  on: On,
-  result: { block?: string; additionalContext?: string[] } = {},
-): void {
-  on('classic.PostToolUse', ($, e, next) => result)
+// Nothing runs beneath a test's hooks, so a tool call settles on the test's
+// own bottom; this installs one, answering every tool with what `answer`
+// holds when the call reaches it (the caller mutates it between calls).
+function toolBottom(on: On, answer: { value: ToolCallResult } = { value: { result: 'ok' } }): void {
+  on('tool.call', ($, e, next) => answer.value)
 }
 
-// A PostToolUse payload as the engine raises it, with the event's own scope.
-function toolEvent(id: string, agentId?: string) {
+// A tool call as the engine raises one, in the main loop or a subagent's.
+function toolCall(agentId?: string) {
+  return { tool: 'Bash' as const, command: 'ls', ...(agentId !== undefined ? { agentId } : {}) }
+}
+
+// A main-scope agent-spawn call, the one call the headroom nudge computes on.
+function spawnCall(agentId?: string) {
   return {
-    tool_name: 'Bash',
-    tool_input: { command: 'ls' },
-    tool_response: 'ok',
-    tool_use_id: id,
-    ...(agentId !== undefined ? { agent_id: agentId } : {}),
+    tool: 'Agent' as const,
+    description: 'look',
+    prompt: 'look around',
+    ...(agentId !== undefined ? { agentId } : {}),
   }
 }
 
-// A main-scope agent-spawn call, the one PostToolUse the headroom nudge
-// computes on.
-function spawnEvent(id: string) {
-  return { ...toolEvent(id), tool_name: 'Agent' }
+// The end of a subagent's run, as `turn.complete` carries it.
+function agentEnd(agentId: string) {
+  return {
+    reason: 'answer' as const,
+    answer: '',
+    durationMs: 1,
+    isAborted: false,
+    turnId: `t-${agentId}`,
+    agentId,
+  }
 }
 
-// The bottom for a classic event other than PostToolUse.
-function stopBottom(on: On): void {
+// A subagent's stop, as the engine raises `classic.SubagentStop`.
+function subagentStop(agentId: string) {
+  return {
+    agent_id: agentId,
+    agent_transcript_path: `/home/u/.claude/projects/p/x/subagents/agent-${agentId}.jsonl`,
+    agent_type: 'general-purpose',
+    stop_hook_active: false,
+  }
+}
+
+// The classic events a session raises after a tool call and at a subagent's
+// stop. The mod hooks neither; a test that plays a session through raises
+// them, and settles them on these bottoms.
+function classicBottoms(on: On): void {
+  on('classic.PostToolUse', ($, e, next) => ({}))
   on('classic.SubagentStop', ($, e, next) => ({}))
+}
+
+// The organization's policy plugin as Claude Code seats it for Team and
+// Enterprise and on a machine with managed settings (`cc-plugin-sec-default`,
+// outermost): every classic event, and the attachment, hook-context and
+// compaction rows, go on past the person's plugins, as that plugin sends them.
+// Each hook logs the links it passed over, which a session reports to the
+// person as skipped hooks.
+const POLICY: Plugin = {
+  name: 'policy',
+  tier: 'prepend',
+  register(on) {
+    on('classic.*', async ($, e, next) => {
+      const settled = await next.to(e, 'append')
+      for (const link of next.trace) {
+        if (link.outcome === 'skipped') await $.ui.log(`${link.plugin}: ${next.event} skipped`)
+      }
+      return settled
+    })
+    on('session.append', { door: ['attachment', 'hook-context', 'compaction'] }, async ($, e, next) => {
+      const settled = await next.to(e, 'append')
+      for (const link of next.trace) {
+        if (link.outcome === 'skipped') await $.ui.log(`${link.plugin}: ${next.event} skipped`)
+      }
+      return settled
+    })
+  },
+}
+
+// The lines the policy plugin logged for the links it passed over.
+function installSkipLog(on: On): string[] {
+  const lines: string[] = []
+  on('ui.log', ($, e, next) => {
+    lines.push(e.text)
+    return { value: undefined }
+  })
+  return lines
+}
+
+// A row at a door the policy plugin keeps from the person's plugins.
+function reservedRow(door: 'attachment' | 'hook-context' | 'compaction', uuid: string) {
+  return {
+    message: {
+      type: 'attachment' as const,
+      name: 'date_change',
+      content: [{ type: 'text' as const, text: 'x' }],
+    },
+    door,
+    origin: { kind: 'engine' as const },
+    uuid,
+  }
 }
 
 const ASK = { decision: 'ask' as const }
@@ -1476,32 +1549,27 @@ test('N2: session.end awaits the end post before returning', async ($, on) => {
   expect(ended).toBe(true)
 })
 
-// The note command runs on the event's own scope, and its envelope reaches
-// the model as the event's context.
-test('P1: the note command runs on the event and its envelope reaches the model', async ($, on) => {
+// The note command runs on the call's own scope, and its envelope reaches
+// the model as the result's context.
+test('P1: the note command runs on the call and its envelope reaches the model', async ($, on) => {
   setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, {
     stdout: noteEnvelope(
       'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
     ),
   })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  const out = await $.classic.PostToolUse({
-    session_id: 'sid-1',
-    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
-    ...toolEvent('tu-1'),
-  })
+  const out = await $.tool.call(toolCall())
 
-  expect(out.additionalContext).toEqual([
+  expect(out.context).toEqual([
     'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
   ])
   expect(runs).toHaveLength(1)
-  expect(runs[0].argv).toEqual(['clauth', 'hook-profile-changed-note'])
-  expect(runs[0].init?.timeoutMs).toBe(10_000)
-  expect(JSON.parse(runs[0].init?.stdin ?? '')).toEqual({
+  expect(runs[0]!.argv).toEqual(['clauth', 'hook-profile-changed-note'])
+  expect(runs[0]!.init?.timeoutMs).toBe(10_000)
+  expect(JSON.parse(runs[0]!.init?.stdin ?? '')).toEqual({
     session_id: 'sid-1',
-    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
     hook_event_name: 'PostToolUse',
     tool_name: 'Bash',
   })
@@ -1511,46 +1579,47 @@ test('P1: the note command runs on the event and its envelope reaches the model'
 // carry both; its text must reach the model unchanged.
 test('P2: the 600k context note reaches the model unchanged', async ($, on) => {
   setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const note =
     'clauth: context window usage has exceeded 600k tokens. consider writing or updating a handoff prompt so a fresh session can take over.'
   installNoteCommand(on, { stdout: noteEnvelope(note) })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  const out = await $.classic.PostToolUse(toolEvent('tu-1'))
+  const out = await $.tool.call(toolCall())
 
-  expect(out.additionalContext).toEqual([note])
+  expect(out.context).toEqual([note])
 })
 
 // The whole cost being removed: the command is a subprocess, and the tool
-// events inside one cadence window must not each pay for one.
+// calls inside one cadence window must not each pay for one.
 test('P3: tool calls in one cadence window share one subprocess', async ($, on) => {
   const { clock } = setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  for (const id of ['tu-1', 'tu-2', 'tu-3']) await $.classic.PostToolUse(toolEvent(id))
+  for (let i = 0; i < 3; i += 1) await $.tool.call(toolCall())
   expect(runs).toHaveLength(1)
 
   await clock.advance(NOTE_CADENCE_MS - 1)
-  await $.classic.PostToolUse(toolEvent('tu-4'))
+  await $.tool.call(toolCall())
   expect(runs).toHaveLength(1)
 
   await clock.advance(1)
-  const out = await $.classic.PostToolUse(toolEvent('tu-5'))
+  const out = await $.tool.call(toolCall())
   expect(runs).toHaveLength(2)
-  expect(out.additionalContext).toEqual(['note'])
+  expect(out.context).toEqual(['note'])
 })
 
-// The mod sits above whatever else answers the event: its note joins that
-// context instead of replacing it.
+// The mod sits above whatever else answers the call: its note joins that
+// context instead of replacing it, and the result passes through.
 test('P4: the note joins the chain context, it does not replace it', async ($, on) => {
   setup(on)
   installNoteCommand(on, { stdout: noteEnvelope('note') })
-  classicBottom(on, { additionalContext: ['beneath'], block: 'stop' })
+  toolBottom(on, { value: { result: 'kept', context: ['beneath'] } })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  const out = await $.classic.PostToolUse(toolEvent('tu-1'))
+  const out = await $.tool.call(toolCall())
 
-  expect(out).toEqual({ block: 'stop', additionalContext: ['beneath', 'note'] })
+  expect(out.result).toBe('kept')
+  expect(out.context).toEqual(['beneath', 'note'])
 })
 
 // The command is silent in the ordinary case, and a failure is silence too: a
@@ -1559,39 +1628,40 @@ test('P5: a silent, failing or unparseable command adds no context', async ($, o
   const { clock } = setup(on)
   const answer: { stdout?: string; exitCode?: number } = { stdout: '' }
   const runs = installNoteCommand(on, answer)
-  classicBottom(on, { block: 'kept' })
+  toolBottom(on, { value: { result: 'kept' } })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
 
-  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+  const first = await $.tool.call(toolCall())
+  expect(first.result).toBe('kept')
+  expect(first.context).toBeUndefined()
 
   await clock.advance(NOTE_CADENCE_MS)
   answer.exitCode = 1
-  expect(await $.classic.PostToolUse(toolEvent('tu-2'))).toEqual({ block: 'kept' })
+  const second = await $.tool.call(toolCall())
+  expect(second.result).toBe('kept')
+  expect(second.context).toBeUndefined()
 
   await clock.advance(NOTE_CADENCE_MS)
   answer.exitCode = 0
   answer.stdout = 'not json'
-  expect(await $.classic.PostToolUse(toolEvent('tu-3'))).toEqual({ block: 'kept' })
+  const third = await $.tool.call(toolCall())
+  expect(third.result).toBe('kept')
+  expect(third.context).toBeUndefined()
   expect(runs).toHaveLength(3)
 })
 
-// A subagent's fire carries its own scope, so the command's per-scope record
+// A subagent's call carries its own scope, so the command's per-scope record
 // lands on the subagent's, never the main thread's.
-test('P6: a subagent fire feeds the command its own agent scope', async ($, on) => {
+test('P6: a subagent call feeds the command its own agent scope', async ($, on) => {
   setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse({
-    session_id: 'sid-1',
-    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
-    ...toolEvent('tu-1', 'a1'),
-  })
+  await $.tool.call(toolCall('a1'))
 
   expect(runs).toHaveLength(1)
-  expect(JSON.parse(runs[0].init?.stdin ?? '')).toEqual({
+  expect(JSON.parse(runs[0]!.init?.stdin ?? '')).toEqual({
     session_id: 'sid-1',
-    transcript_path: '/home/u/.claude/projects/p/x.jsonl',
     hook_event_name: 'PostToolUse',
     tool_name: 'Bash',
     agent_id: 'a1',
@@ -1603,18 +1673,18 @@ test('P6: a subagent fire feeds the command its own agent scope', async ($, on) 
 // also leaves the window where it stood.
 test('P7: a main-scope agent spawn runs inside the window without taking it', async ($, on) => {
   const { clock } = setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse(toolEvent('tu-1'))
+  await $.tool.call(toolCall())
   await clock.advance(1_000)
-  await $.classic.PostToolUse(spawnEvent('tu-2'))
+  await $.tool.call(spawnCall())
 
   expect(runs).toHaveLength(2)
-  expect((JSON.parse(runs[1].init?.stdin ?? '') as { tool_name?: string }).tool_name).toBe('Agent')
+  expect((JSON.parse(runs[1]!.init?.stdin ?? '') as { tool_name?: string }).tool_name).toBe('Agent')
 
   await clock.advance(NOTE_CADENCE_MS - 1_000)
-  await $.classic.PostToolUse(toolEvent('tu-3'))
+  await $.tool.call(toolCall())
   expect(runs).toHaveLength(3)
 })
 
@@ -1622,46 +1692,49 @@ test('P7: a main-scope agent spawn runs inside the window without taking it', as
 // window, and one subagent's never spend another's.
 test('P8: the window is per scope, not per module', async ($, on) => {
   const { clock } = setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse(toolEvent('tu-1'))
+  await $.tool.call(toolCall())
   await clock.advance(1_000)
-  await $.classic.PostToolUse(toolEvent('tu-2', 'a1'))
+  await $.tool.call(toolCall('a1'))
   expect(runs).toHaveLength(2)
 
   await clock.advance(1_000)
-  await $.classic.PostToolUse(toolEvent('tu-3'))
+  await $.tool.call(toolCall())
   expect(runs).toHaveLength(2)
-  await $.classic.PostToolUse(toolEvent('tu-4', 'a2'))
+  await $.tool.call(toolCall('a2'))
   expect(runs).toHaveLength(3)
 })
 
-// The scope key carries the session too, so a fire naming another
-// conversation never spends this one's window.
-test('P9: the window key carries the session id', async ($, on) => {
+// The windows belong to a session: a new one (a `/clear`, a resume) starts
+// with every window open, so its first call is checked.
+test('P9: a session start opens every window', async ($, on) => {
   const { clock } = setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse({ session_id: 'sid-1', transcript_path: '/t', ...toolEvent('tu-1') })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
   await clock.advance(1_000)
-  await $.classic.PostToolUse({ session_id: 'sid-2', transcript_path: '/t', ...toolEvent('tu-2') })
-  expect(runs).toHaveLength(2)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(4)
 })
 
-// A subagent's stop drops its window entry: nothing else bounds the map, and
-// a stale entry could only withhold a run a later fire owes.
-test('P10: a subagent stop releases its window entry', async ($, on) => {
+// A subagent's run ending drops its window entry: nothing else bounds the
+// map but the sweep, and a stale entry could only withhold a run a later
+// call owes.
+test('P10: a subagent run ending releases its window entry', async ($, on) => {
   const { clock } = setup(on)
-  classicBottom(on)
-  stopBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse(toolEvent('tu-1', 'a1'))
+  await $.tool.call(toolCall('a1'))
   await clock.advance(1_000)
-  await $.classic.SubagentStop({ agent_id: 'a1' })
-  await $.classic.PostToolUse(toolEvent('tu-2', 'a1'))
+  await $.turn.complete(agentEnd('a1'))
+  await $.tool.call(toolCall('a1'))
   expect(runs).toHaveLength(2)
 })
 
@@ -1669,44 +1742,126 @@ test('P10: a subagent stop releases its window entry', async ($, on) => {
 // first await, so a burst inside one window is still one process.
 test('P11: a parallel burst inside one window runs once', async ($, on) => {
   setup(on)
-  classicBottom(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await Promise.all(
-    ['tu-1', 'tu-2', 'tu-3', 'tu-4'].map(id => $.classic.PostToolUse(toolEvent(id))),
-  )
+  await Promise.all([0, 1, 2, 3].map(() => $.tool.call(toolCall())))
   expect(runs).toHaveLength(1)
 })
 
 // A run the engine rejects (its 10 s bound, a missing `clauth`) is silence,
-// and the tool event still settles with what the hooks beneath answered.
+// and the call still settles with what the hooks beneath answered.
 test('P12: a rejected run adds no context', async ($, on) => {
   setup(on)
-  classicBottom(on, { block: 'kept' })
+  toolBottom(on, { value: { result: 'kept' } })
   on('process.run', async () => {
     throw new Error('spawn failed')
   })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+  const out = await $.tool.call(toolCall())
+  expect(out.result).toBe('kept')
+  expect(out.context).toBeUndefined()
 })
 
-// An agent-spawn call skips the cadence only on the main scope: a subagent's
-// spawn is its own scope's ordinary fire, so its own window still holds it.
-test('P14: a subagent agent-spawn call does not bypass its window', async ($, on) => {
-  const { clock } = setup(on)
-  classicBottom(on)
-  const runs = installNoteCommand(on, { stdout: '' })
+// PostToolUse fired for an answered call alone: a refused or errored call
+// carries no note, and leaves the window open for the next answered one.
+test('P13: a refused or errored call runs nothing and spends no window', async ($, on) => {
+  setup(on)
+  const answer: { value: ToolCallResult } = { value: { deny: 'not here' } }
+  toolBottom(on, answer)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
-  await $.classic.PostToolUse(toolEvent('tu-1', 'a1'))
-  await clock.advance(1_000)
-  await $.classic.PostToolUse({ ...toolEvent('tu-2', 'a1'), tool_name: 'Agent' })
+
+  expect((await $.tool.call(toolCall())).deny).toBe('not here')
+  answer.value = { isError: true, result: 'boom', text: 'boom' }
+  expect((await $.tool.call(toolCall())).isError).toBe(true)
+  expect(runs).toHaveLength(0)
+
+  answer.value = { result: 'ok' }
+  expect((await $.tool.call(toolCall())).context).toEqual(['note'])
   expect(runs).toHaveLength(1)
 })
 
-test('Q1: a hook failing before next still lets the hooks beneath answer', async ($, on) => {
-  on('clock.now', () => { throw new Error('clock down') })
-  classicBottom(on, { block: 'kept' })
+// An agent-spawn call skips the cadence only on the main scope: a subagent's
+// spawn is its own scope's ordinary call, so its own window still holds it.
+test('P14: a subagent agent-spawn call does not bypass its window', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
   const runs = installNoteCommand(on, { stdout: '' })
-  expect(await $.classic.PostToolUse(toolEvent('tu-1'))).toEqual({ block: 'kept' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.tool.call(spawnCall('a1'))
+  expect(runs).toHaveLength(1)
+})
+
+test('Q1: a hook failing after next still answers what the hooks beneath did', async ($, on) => {
+  on('clock.now', () => { throw new Error('clock down') })
+  toolBottom(on, { value: { result: 'kept' } })
+  const runs = installNoteCommand(on, { stdout: '' })
+  const out = await $.tool.call(toolCall())
+  expect(out.result).toBe('kept')
+  expect(out.context).toBeUndefined()
   expect(runs).toHaveLength(0)
+})
+
+// --- under the organization's policy plugin (group S) ---
+
+// Where Claude Code seats `cc-plugin-sec-default` the session tells the
+// person of every hook of theirs it passes over. A session raising a turn's
+// worth of events (rows at every door, a tool call and its PostToolUse, a
+// subagent's call, stop and end) must pass over none of the mod's.
+test('S1: no hook of the mod is passed over by the policy plugin', { plugins: [POLICY] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  installNoteCommand(on, { stdout: '' })
+  const skipped = installSkipLog(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.session.append(appendRow('u1'))
+  await $.session.append(reservedRow('attachment', 'r1'))
+  await $.session.append(reservedRow('hook-context', 'r2'))
+  await $.session.append(reservedRow('compaction', 'r3'))
+  await $.tool.call(toolCall())
+  await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: 'ok', tool_use_id: 'tu-1' })
+  await $.tool.call(toolCall('a1'))
+  await $.classic.SubagentStop(subagentStop('a1'))
+  await $.turn.complete(agentEnd('a1'))
+  await clock.settle()
+
+  expect(skipped).toEqual([])
+  // The rows the policy plugin keeps to itself post no wake; the next row
+  // the mod sees wakes the daemon's tail for them.
+  expect(bridge.events.filter(b => b.kind === 'append').map(b => b.uuid)).toEqual(['u1'])
+})
+
+// The note is what the classic hook carried; with the policy plugin seated it
+// must still reach the model, on the tool call itself.
+test('S2: under the policy plugin the note still reaches the model', { plugins: [POLICY] }, async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(spawnCall())
+  await $.classic.PostToolUse({ tool_name: 'Agent', tool_input: {}, tool_response: 'ok', tool_use_id: 'tu-1' })
+
+  expect(out.context).toEqual(['note'])
+  expect(runs).toHaveLength(1)
+})
+
+// A subagent's stop released its window through a classic hook; with the
+// policy plugin seated the release must still happen.
+test('S3: under the policy plugin a subagent run ending releases its window', { plugins: [POLICY] }, async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.classic.SubagentStop(subagentStop('a1'))
+  await $.turn.complete(agentEnd('a1'))
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
 })

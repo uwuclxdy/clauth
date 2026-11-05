@@ -818,6 +818,8 @@ fn note_for_inner(
     });
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
+    } else if record.transcript.is_none() {
+        record.transcript = inherited_transcript(payload);
     }
     // The account this scope's record held before the fire. The owner-store
     // write keys on this: only a first attribution or a real change reaches
@@ -1025,6 +1027,18 @@ fn inherited_baseline(payload: &Payload) -> Option<String> {
     payload.agent_id.as_ref()?;
     let main = record_path(&payload.session_id, None).ok()?;
     load_record(&main)?.told
+}
+
+/// The transcript a subagent scope's record keeps when its fire names none:
+/// the main thread's. The hooks module's fires come from a `tool.call` hook,
+/// which the engine hands no transcript path, while the conversation's
+/// `SessionStart` fire stamps one on the main record; without it the sweep
+/// would keep a subagent's record for the orphan age instead of reaping it
+/// with its conversation.
+fn inherited_transcript(payload: &Payload) -> Option<PathBuf> {
+    payload.agent_id.as_ref()?;
+    let main = record_path(&payload.session_id, None).ok()?;
+    load_record(&main)?.transcript
 }
 
 /// The change test, against the record this scope carries. `current` is `None`

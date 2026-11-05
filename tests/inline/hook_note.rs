@@ -1265,6 +1265,44 @@ fn a_record_that_never_carried_a_transcript_ages_out() {
     assert!(!path.exists(), "and an aged one is reaped");
 }
 
+/// A subagent fire from the hooks module names no transcript (its `tool.call`
+/// hook is handed none), so the subagent's record takes the one the main
+/// record's `SessionStart` fire stamped, and the sweep reaps it with its
+/// conversation rather than after the orphan age. A main fire that names none
+/// keeps what its record already held.
+#[test]
+fn a_subagent_fire_without_a_transcript_takes_the_main_records() {
+    let home = HomeSandbox::new();
+    let transcript = home.home().join("conv.jsonl");
+    let mut start = payload("SessionStart", "conv-sub-transcript");
+    start.transcript = Some(transcript.clone());
+    note_for(&start, &watch(1, 0), &kerry);
+
+    let mut sub = payload("PostToolUse", "conv-sub-transcript");
+    sub.agent_id = Some("a1".to_string());
+    note_for(&sub, &watch(1, 0), &kerry);
+    note_for(
+        &payload("PostToolUse", "conv-sub-transcript"),
+        &watch(1, 0),
+        &kerry,
+    );
+
+    let stored = |agent: Option<&str>| {
+        load_record(&record_path("conv-sub-transcript", agent).expect("path"))
+            .and_then(|r| r.transcript)
+    };
+    assert_eq!(
+        stored(Some("a1")),
+        Some(transcript.clone()),
+        "the subagent's record takes the conversation's transcript",
+    );
+    assert_eq!(
+        stored(None),
+        Some(transcript),
+        "a main fire with no transcript keeps the one its record held",
+    );
+}
+
 /// An empty or relative `transcript_path` is dropped at the boundary rather
 /// than stored: `Path::new("").exists()` is false, so storing it verbatim aimed
 /// the sweep at a live conversation's record.

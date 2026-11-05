@@ -33,6 +33,15 @@ const NOTE_TIMEOUT_MS = 10_000
 // in `src/hook_note.rs`).
 const AGENT_SPAWN_TOOLS: readonly string[] = ['Task', 'Agent']
 const NOTE_COMMAND = ['clauth', 'hook-profile-changed-note'] as const
+// The rows an `append` wake is posted for. Where an organization seats its
+// policy plugin (`cc-plugin-sec-default`, outermost for Team and Enterprise
+// and on a machine with managed settings), attachment, hook-context and
+// compaction rows, a Skill's tool messages and a managed plugin's notes go on
+// past the person's plugins, and a hook that matches them is reported skipped
+// to the session. `door` is pinned, so a hook narrowed to these doors is never
+// in the chain for the others. The daemon tails the transcript file on each
+// wake, so a row left out here reaches the phone with the next one.
+const APPEND_DOORS = ['prompt', 'command', 'response', 'tool-result', 'delivery', 'notice', 'queue'] as const
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
@@ -473,24 +482,25 @@ function stopPollLoop(): void {
 // The scope one note fire speaks for.
 type NoteScope = {
   session_id: string
-  transcript_path: string
   tool_name: string
   agent_id?: string
 }
 
 // The window one fire belongs to: a subagent's calls never spend the main
-// thread's window or another subagent's.
-function noteWindowKey(e: { session_id: string; agent_id?: string }): string {
-  return `${e.session_id}/${e.agent_id ?? ''}`
+// thread's window or another subagent's. The session's own windows start
+// over at each `session.start`, so the loop alone names the scope.
+function noteWindowKey(agentId: string | undefined): string {
+  return agentId ?? ''
 }
 
-// The classic hook input the note command reads, taken from the event the
-// engine raised: `clauth`'s own parser keeps these fields, and the scope is
-// the event's, so a subagent's note lands on the subagent's record.
+// The classic hook input the note command reads, built from the tool call:
+// `clauth`'s own parser keeps these fields, and the scope is the call's, so a
+// subagent's note lands on the subagent's record. No transcript path rides
+// along: the engine hands a hook none, and the command takes a subagent
+// record's from the main record its `SessionStart` fire stamped.
 function noteInput(e: NoteScope): string {
   return JSON.stringify({
     session_id: e.session_id,
-    transcript_path: e.transcript_path,
     hook_event_name: 'PostToolUse',
     tool_name: e.tool_name,
     ...(e.agent_id !== undefined ? { agent_id: e.agent_id } : {}),
@@ -558,7 +568,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.append', async ($, e, next) => {
+  on('session.append', { door: APPEND_DOORS }, async ($, e, next) => {
     if (!inert) {
       void postEvent($, 'append', {
         uuid: e.uuid,
@@ -577,6 +587,10 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A subagent's run ends as its turn does: its note window goes with it.
+    // Nothing else bounds the map but the sweep, and a stale entry could only
+    // withhold a run a later fire owes.
+    if (e.agentId !== undefined) lastNoteAt.delete(noteWindowKey(e.agentId))
     if (!inert && e.agentId === undefined) {
       turnId = null
       interruptedTurn = null
@@ -594,17 +608,26 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('classic.PostToolUse', async ($, e, next) => {
+  // The mid-turn note rides a tool call's result, not `classic.PostToolUse`:
+  // where an organization seats its policy plugin every classic event goes on
+  // past the person's plugins, so a classic hook here would never run there.
+  // A result's `context` reaches the model as a PostToolUse hook's
+  // `additionalContext` did, one reminder after the result.
+  on('tool.call', async ($, e, next) => {
+    const settled = await next(e)
+    // PostToolUse fired for an answered call alone: a refusal or an error
+    // carries no note and spends no window.
+    if (settled.deny !== undefined || settled.isError === true) return settled
     // A main-scope agent-spawn call is what the headroom nudge is computed
     // on, and a skipped fire never replays it, so it runs the command
     // whatever the window says and leaves the window where it stood.
-    const spawn = e.agent_id === undefined && AGENT_SPAWN_TOOLS.includes(e.tool_name)
+    const spawn = e.agentId === undefined && AGENT_SPAWN_TOOLS.includes(e.tool)
     if (!spawn) {
-      const key = noteWindowKey(e)
+      const key = noteWindowKey(e.agentId)
       const now = await $.clock.now()
       const lastAt = lastNoteAt.get(key)
-      if (lastAt !== undefined && now - lastAt < NOTE_CADENCE_MS) return next(e)
-      // A scope that never fires its stop ages out here, so the map holds
+      if (lastAt !== undefined && now - lastAt < NOTE_CADENCE_MS) return settled
+      // A scope whose run never completes ages out here, so the map holds
       // only the scopes that ran inside one window.
       for (const [stale, at] of lastNoteAt) {
         if (now - at >= NOTE_CADENCE_MS) lastNoteAt.delete(stale)
@@ -613,15 +636,13 @@ export const register: Register = on => {
       // the window instead of each spawning.
       lastNoteAt.set(key, now)
     }
-    const settled = await next(e)
-    const note = await runNote($, e)
+    const note = await runNote($, {
+      session_id: await $.session.id(),
+      tool_name: e.tool,
+      ...(e.agentId !== undefined ? { agent_id: e.agentId } : {}),
+    })
     if (note === null) return settled
-    return { ...settled, additionalContext: [...(settled.additionalContext ?? []), note] }
-  }).catch(($, e, next) => next(e))
-
-  on('classic.SubagentStop', async ($, e, next) => {
-    lastNoteAt.delete(noteWindowKey(e))
-    return next(e)
+    return { ...settled, context: [...(settled.context ?? []), note] }
   }).catch(($, e, next) => next(e))
 
   on(
