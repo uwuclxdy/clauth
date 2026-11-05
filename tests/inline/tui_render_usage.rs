@@ -1439,6 +1439,88 @@ fn header_lines_plan_shows_the_server_plan_name() {
     );
 }
 
+/// The `plan` row names the next billing day off `plan_renews`, and a marked
+/// `plan_ends` in its place; a row too narrow for the phrase keeps the plan
+/// name alone.
+#[test]
+fn header_lines_plan_names_the_renewal_or_the_marked_end() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "dated",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let row = |profile: &crate::profile::Profile, width: u16| -> Vec<Span<'static>> {
+        header_lines(profile, &header, width, &readings)
+            .first()
+            .map(|l| l.spans.clone())
+            .unwrap_or_default()
+    };
+    let text =
+        |spans: &[Span<'static>]| -> String { spans.iter().map(|s| s.content.clone()).collect() };
+    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
+
+    let plan_row = text(&row(&profile, 52));
+    assert!(
+        !plan_row.contains("renews") && !plan_row.contains("ends"),
+        "no plan date given, no phrase: {plan_row:?}"
+    );
+
+    profile.plan_renews = Some(today + chrono::Duration::days(20));
+    let spans = row(&profile, 52);
+    let plan_row = text(&spans);
+    assert!(
+        plan_row.contains("Claude Ultra · renews ") && plan_row.ends_with("(20d)"),
+        "the billing day rides the plan row, got {plan_row:?}"
+    );
+    let tail = spans.last().expect("a tail span");
+    assert_eq!(
+        tail.style,
+        crate::tui::theme::faint(),
+        "a renewal reads faint"
+    );
+
+    profile.plan_ends = Some(today + chrono::Duration::days(10));
+    let spans = row(&profile, 52);
+    let plan_row = text(&spans);
+    assert!(
+        plan_row.contains("Claude Ultra · ends ") && plan_row.ends_with("(10d)"),
+        "a marked end replaces the renewal, got {plan_row:?}"
+    );
+    let tail = spans.last().expect("a tail span");
+    assert_eq!(
+        tail.style,
+        crate::tui::theme::warning(),
+        "an ending plan reads in the warning color"
+    );
+
+    let narrow = text(&row(&profile, 24));
+    assert!(
+        narrow.contains("Claude Ultra") && !narrow.contains("ends"),
+        "a row with no room keeps the plan name alone, got {narrow:?}"
+    );
+}
+
 /// With no fetched plan AND no tier the token can claim, the `plan` row takes
 /// the house no-data dash in the faint no-data treatment. The bare "Claude" it
 /// printed before named a plan the account never had.

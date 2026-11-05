@@ -619,7 +619,7 @@ pub(crate) struct StartArgs {
     /// with headroom for the models this session will run (`--model`, the
     /// model in your settings, the subagent model, the advisor model), taken
     /// in your `walk_order`: chain position by default, else the soonest
-    /// weekly reset or the most weekly headroom.
+    /// weekly reset, the most weekly headroom or the soonest plan end.
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:

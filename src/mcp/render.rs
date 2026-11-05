@@ -1095,6 +1095,14 @@ fn profile_line(row: &Value) -> String {
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
     }
+    // When the plan ends or renews, only when known: a plan that ends soon is
+    // quota to spend before it goes.
+    if let Some(end) = row.get("plan_end")
+        && let Some(kind) = end.get("kind").and_then(Value::as_str)
+        && let Some(date) = end.get("date").and_then(Value::as_str)
+    {
+        out.push_str(&format!("; plan {kind} {date}"));
+    }
     // One snapshot per call, the Overview live column's per-account slice.
     if let Some(sessions) = row.get("live_sessions").and_then(Value::as_u64)
         && sessions > 0

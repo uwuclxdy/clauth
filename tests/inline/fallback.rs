@@ -101,6 +101,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -1248,6 +1250,8 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let recovered_usage = |seven_reset: String| {
         usage_both(
@@ -1299,6 +1303,8 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1364,6 +1370,8 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
         active: "gamma".into(),
@@ -1556,6 +1564,8 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1616,6 +1626,8 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1682,6 +1694,8 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
         active: "gamma".into(),
@@ -1767,6 +1781,8 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "beta".into(),
@@ -1938,6 +1954,8 @@ fn headroom_member(name: &str, preferred: bool) -> ChainMember {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }
 }
 
@@ -2323,6 +2341,310 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
     );
 }
 
+// ── walk order `soonest-plan-end` ────────────────────────────────────────────
+//
+// Each accept pass lands on the accepted member whose plan ends first: every
+// plan marked ending (`plan_ends`) by its day, then every renewing plan by its
+// next billing day (`plan_renews`, carried forward monthly). A member with
+// neither, or whose marked day is past, ranks last. With no `preferred`, a
+// healthy active walks home to that member, like `soonest-weekly-reset`.
+
+/// A clear reading: 10% of the 5h window and of the week.
+fn clear_week() -> UsageInfo {
+    usage_both(
+        Some(window(10.0, Some(live_reset()))),
+        Some(window(10.0, Some(reset_in(3 * 86_400)))),
+    )
+}
+
+/// The local date `days` from today, the frame a plan date is read in.
+fn local_day_in(days: i64) -> chrono::NaiveDate {
+    let today = crate::usage::local_date_of(now_epoch_secs()).expect("today resolves");
+    today + chrono::Duration::days(days)
+}
+
+/// A clear chain member whose plan bills `days` from today.
+fn renewing(name: &str, days: i64) -> Fixture {
+    let mut fixture = profile_with_usage(name, Some(95.0), Some(clear_week()));
+    fixture.profile.plan_renews = Some(local_day_in(days));
+    fixture
+}
+
+/// A clear chain member whose canceled plan ends `days` from today.
+fn ending(name: &str, days: i64) -> Fixture {
+    let mut fixture = profile_with_usage(name, Some(95.0), Some(clear_week()));
+    fixture.profile.plan_ends = Some(local_day_in(days));
+    fixture
+}
+
+#[test]
+fn walk_order_soonest_plan_end_lands_on_the_soonest_renewal() {
+    let (mut config, readings) = config_with_chain(
+        vec![
+            renewing("alpha", 20),
+            renewing("beta", 3),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    );
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("alpha".to_string())),
+        "chain order takes the slot after gamma"
+    );
+    config.state.walk_order = Some(WalkOrder::SoonestPlanEnd);
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("beta".to_string())),
+        "beta bills in 3 days, alpha in 20"
+    );
+}
+
+/// A plan marked ending is spent before any renewing plan, even one that
+/// bills sooner: what it leaves unspent is lost at its end.
+#[test]
+fn walk_order_soonest_plan_end_spends_an_ending_plan_before_a_sooner_renewal() {
+    let (mut config, readings) = config_with_chain(
+        vec![
+            renewing("beta", 3),
+            ending("alpha", 25),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    );
+    config.state.walk_order = Some(WalkOrder::SoonestPlanEnd);
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("alpha".to_string())),
+        "alpha ends in 25 days and ranks ahead of beta billing in 3"
+    );
+}
+
+/// A member with no plan date and one whose marked day is past rank after a
+/// member that renews, whatever their chain position.
+#[test]
+fn walk_order_soonest_plan_end_ranks_unknown_and_ended_plans_last() {
+    let (mut config, readings) = config_with_chain(
+        vec![
+            profile_with_usage("unread", Some(95.0), Some(clear_week())),
+            ending("ended", -1),
+            renewing("renews", 10),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    );
+    config.state.walk_order = Some(WalkOrder::SoonestPlanEnd);
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("renews".to_string())),
+        "only the renewing member has a plan end to rank by"
+    );
+    // With no member left that has one, the unknowns keep chain position.
+    config
+        .state
+        .fallback_chain
+        .retain(|n| n.as_str() != "renews");
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("unread".to_string())),
+        "ties among members with no plan end keep chain position"
+    );
+}
+
+/// The ordering stays inside one accept pass: an ending plan that is spent
+/// never outranks a clear member, it only orders where a pass lands.
+#[test]
+fn walk_order_soonest_plan_end_never_reorders_across_the_accept_pass_ladder() {
+    let mut spent = profile_with_util("spent", Some(95.0), Some(100.0));
+    spent.profile.plan_ends = Some(local_day_in(2));
+    let (mut config, readings) = config_with_chain(
+        vec![
+            spent,
+            profile_with_usage("clear", Some(95.0), Some(clear_week())),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    );
+    config.state.walk_order = Some(WalkOrder::SoonestPlanEnd);
+    assert_eq!(
+        walk_config(&config, &HashSet::new(), &readings),
+        Some(SwitchAction::To("clear".to_string())),
+        "a spent ending plan is no headroom target"
+    );
+}
+
+/// A chain member carrying `plan_ends` and `plan_renews` as given.
+fn dated_member(
+    name: &str,
+    preferred: bool,
+    plan_ends: Option<chrono::NaiveDate>,
+    plan_renews: Option<chrono::NaiveDate>,
+) -> ChainMember {
+    ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
+        plan_ends,
+        plan_renews,
+    }
+}
+
+/// A snapshot of `chain` under `order` with `active` live, every member fresh.
+fn dated_snapshot(active: &str, chain: Vec<ChainMember>, order: WalkOrder) -> ChainSnapshot {
+    let fresh = chain.iter().map(|m| m.name.clone()).collect();
+    ChainSnapshot {
+        active: active.into(),
+        chain,
+        switch_off_when_spent: false,
+        broken: vec![],
+        burn_aware: false,
+        walk_order: order,
+        interval_ms: 60_000,
+        burn_floor_pct: 98.0,
+        burn_horizon_cap_ms: 60_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        skipped_unreadable: vec![],
+        reading_dead: vec![],
+        fresh,
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
+    }
+}
+
+/// With no `preferred` anywhere, a healthy active walks home to the clear and
+/// fresh member whose plan ends first, then parks there; `chain` stays put.
+#[test]
+fn walk_order_soonest_plan_end_walks_a_healthy_active_home_and_parks() {
+    let chain = |beta_ends: Option<chrono::NaiveDate>| {
+        vec![
+            dated_member("alpha", false, None, Some(local_day_in(2))),
+            dated_member("beta", false, beta_ends, Some(local_day_in(20))),
+            dated_member("gamma", false, None, Some(local_day_in(10))),
+        ]
+    };
+    let usage = HashMap::from([
+        ("alpha".to_string(), clear_week()),
+        ("beta".to_string(), clear_week()),
+        ("gamma".to_string(), clear_week()),
+    ]);
+    let walk = |active: &str, beta_ends, order| {
+        next_auto_switch_target_for_test(&dated_snapshot(active, chain(beta_ends), order), &usage)
+    };
+    let marked = Some(local_day_in(12));
+    assert_eq!(
+        walk("gamma", marked, WalkOrder::Chain),
+        None,
+        "chain mode has no home pass"
+    );
+    assert_eq!(
+        walk("gamma", marked, WalkOrder::SoonestPlanEnd),
+        Some(SwitchAction::To("beta".to_string())),
+        "beta's plan ends: it is home ahead of alpha billing sooner"
+    );
+    assert_eq!(
+        walk("beta", marked, WalkOrder::SoonestPlanEnd),
+        None,
+        "landed on the ending plan, the walk parks"
+    );
+    assert_eq!(
+        walk("gamma", None, WalkOrder::SoonestPlanEnd),
+        Some(SwitchAction::To("alpha".to_string())),
+        "with no plan marked ending, home is the soonest billing day"
+    );
+    assert_eq!(
+        walk("alpha", None, WalkOrder::SoonestPlanEnd),
+        None,
+        "home on the soonest billing day, the walk parks"
+    );
+}
+
+/// A `preferred` member keeps its behavior whatever the mode: the plan-end
+/// home pass never runs beside it.
+#[test]
+fn walk_order_soonest_plan_end_home_never_outranks_preferred() {
+    let snap = dated_snapshot(
+        "home",
+        vec![
+            dated_member("home", true, None, Some(local_day_in(20))),
+            dated_member("ending", false, Some(local_day_in(3)), None),
+        ],
+        WalkOrder::SoonestPlanEnd,
+    );
+    let usage = HashMap::from([
+        ("home".to_string(), clear_week()),
+        ("ending".to_string(), clear_week()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage),
+        None,
+        "the active is the preferred home: it stays"
+    );
+}
+
+/// Recovery after a switch-off and `clauth start --auto` both visit in the
+/// same plan-end order.
+#[test]
+fn walk_order_soonest_plan_end_orders_recovery_and_the_start_walk() {
+    let chain = vec![
+        dated_member("b", false, None, Some(local_day_in(3))),
+        dated_member("a", false, Some(local_day_in(5)), None),
+    ];
+    let store = store_with_infos(vec![("b", clear_week()), ("a", clear_week())]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "chain mode keeps the first recovered member in chain order"
+    );
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::SoonestPlanEnd),
+        Some("a".to_string()),
+        "the ending plan recovers first"
+    );
+
+    let _sb = start_walk_sandbox(&["first", "ending"]);
+    let mut first = start_walk_profile("first");
+    first.profile.plan_renews = Some(local_day_in(3));
+    let mut ending = start_walk_profile("ending");
+    ending.profile.plan_ends = Some(local_day_in(5));
+    let (mut config, _readings) = config_with_chain(vec![first, ending], "first");
+    let fetched = || {
+        let mut usage = clear_week();
+        usage.fetched_at = Some(crate::usage::now_ms() - 60_000);
+        usage
+    };
+    start_walk_write_usage("first", &fetched());
+    start_walk_write_usage("ending", &fetched());
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
+    assert_eq!(pick, Some(0), "chain order starts on the first member");
+    config.state.walk_order = Some(WalkOrder::SoonestPlanEnd);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
+    assert_eq!(pick, Some(1), "soonest-plan-end starts on the ending plan");
+}
+
 // ── recovery_target ──────────────────────────────────────────────────────────
 //
 // After switch-off-all (no active profile), find a chain member whose
@@ -2342,6 +2664,8 @@ fn find_recovered_returns_first_member_below_threshold() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2354,6 +2678,8 @@ fn find_recovered_returns_first_member_below_threshold() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -2388,6 +2714,8 @@ fn find_recovered_skips_exhausted_members() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2400,6 +2728,8 @@ fn find_recovered_skips_exhausted_members() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -2423,6 +2753,8 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2435,6 +2767,8 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -2458,6 +2792,8 @@ fn find_recovered_uses_threshold_per_member() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
@@ -2470,6 +2806,8 @@ fn find_recovered_uses_threshold_per_member() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -2495,6 +2833,8 @@ fn find_recovered_recovers_when_window_expired() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -2521,6 +2861,8 @@ fn find_recovered_recovers_when_windowless() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -2544,6 +2886,8 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -4576,6 +4920,8 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4710,6 +5056,8 @@ fn a_third_party_active_never_projects_its_burn() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4898,6 +5246,8 @@ fn weekly_dead_member_never_recovers() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -6239,6 +6589,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
+                plan_renews: None,
             },
             ChainMember {
                 name: "b".into(),
@@ -6251,6 +6603,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
+                plan_renews: None,
             },
             ChainMember {
                 name: "c".into(),
@@ -6263,6 +6617,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
+                plan_renews: None,
             },
         ],
         switch_off_when_spent: true,
@@ -6339,6 +6695,8 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
@@ -7035,6 +7393,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
         ChainMember {
             name: "c".into(),
@@ -7047,6 +7407,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
+            plan_renews: None,
         },
     ];
     let store = store_with_infos(vec![
@@ -7085,6 +7447,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     }];
     assert_eq!(
         find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
@@ -7112,6 +7476,8 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let chain = vec![
         mkmember("a", false),
@@ -7169,6 +7535,8 @@ fn recovery_respects_each_members_gates() {
         check_scoped,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
     let store = store_with_infos(vec![
@@ -9334,6 +9702,8 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -9556,6 +9926,8 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -9729,6 +10101,8 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
@@ -10051,6 +10425,8 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = ChainSnapshot {
         active: "gamma".into(),
@@ -10224,6 +10600,8 @@ fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference,
+        plan_ends: None,
+        plan_renews: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -10281,6 +10659,8 @@ fn a_capped_own_endpoint_member_recovers() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference,
+        plan_ends: None,
+        plan_renews: None,
     };
     let chain = vec![member("a", false), member("b", true)];
     let store = store_with_infos(vec![
@@ -10372,6 +10752,8 @@ fn find_recovered_prefers_a_member_whose_credit_cap_is_not_spent() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
+        plan_renews: None,
     };
     let chain = vec![member("b"), member("c")];
     let store = store_with_infos(vec![
