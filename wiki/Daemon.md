@@ -157,7 +157,7 @@ Limits: 8 KiB of headers, 64 KiB of body, 100 requests and 120 seconds per conne
 
 **Neither bound is a response-time budget, and a switch is the case where that matters.** The events stream is the one answer that consumes the whole lifetime on purpose: it runs until the connection's 120 s and then closes cleanly, so a client sizes its reconnect against the same budget (it ends earlier when it falls 64 session frames behind); the chain routes wait on the same flock as the switch and answer `503 state_locked` the same way. The 10s applies to one read or one write, not to the handler between them: `POST /api/v1/switch` waits up to 25 seconds for the cross-process state flock (`clauth`'s own bound, sized around a macOS Keychain switch) and may run a token refresh after that, so a switch can legitimately take tens of seconds before a single byte of the response is written. Nothing times out — the whole of it sits inside the connection's 120s lifetime — but a client that sets a 10s socket deadline because this page mentions 10s will give up on a switch that was about to succeed. Size a client timeout against the 120s, and treat a `503 state_locked` (state lock held) as the retryable answer rather than an abandoned request; a `503 daemon_stopping` clears only once a daemon is back.
 
-Readers should follow the same evolution rule as the feed (below): ignore unknown fields, and refuse only on a `schema` greater than what they know. The OpenAPI document lists these status fields but never as `required`: `active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `gateway`, `proxies`, `tps`, `profiles[].auto_start_queue`, `credit_billed_families`, `profiles[].spend`, `profiles[].extra_usage`, `profiles[].credit_capped`, `binary_replaced` and `binary_removed`, so a client generated from it also reads the `GET /api/v1/status` body of a daemon as old as v0.16.0.
+Readers should follow the same evolution rule as the feed (below): ignore unknown fields, and refuse only on a `schema` greater than what they know. The OpenAPI document lists these status fields but never as `required`: `active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `gateway`, `proxies`, `tps`, `profiles[].auto_start_queue`, `credit_billed_families`, `profiles[].spend`, `profiles[].extra_usage`, `profiles[].credit_capped`, `profiles[].limit_resets`, `binary_replaced` and `binary_removed`, so a client generated from it also reads the `GET /api/v1/status` body of a daemon as old as v0.16.0.
 
 ## `~/.clauth/status.json`
 
@@ -256,7 +256,8 @@ Compare more than the modification time when you do. A daemon rewrites this file
       "third_party": null,
       "spend": { "enabled": true, "percent": 12.0 },
       "extra_usage": null,
-      "credit_capped": false
+      "credit_capped": false,
+      "limit_resets": 2
     },
     {
       "name": "cx",
@@ -283,7 +284,8 @@ Compare more than the modification time when you do. A daemon rewrites this file
       "third_party": null,
       "spend": null,
       "extra_usage": null,
-      "credit_capped": false
+      "credit_capped": false,
+      "limit_resets": null
     }
   ]
 }
@@ -344,11 +346,12 @@ Compare more than the modification time when you do. A daemon rewrites this file
 | `profiles[].spend` | Additive (schema stays `2`; absent from an older writer ⇒ `null`). The usage-credit `spend` block as `{ "enabled": bool, "percent": float \| null }` — `null` when the cached usage carries no `spend` block, `percent` `null` when the wire sent none (never a fabricated `0`). No dollar amount ever reaches the feed. |
 | `profiles[].extra_usage` | Additive (schema stays `2`; absent from an older writer ⇒ `null`). The legacy credit block as `{ "enabled": bool, "percent": float \| null }`, its `percent` the block's `utilization`; `null` without the block, `percent` `null` when unread. No dollar amount ever reaches the feed. |
 | `profiles[].credit_capped` | Additive `bool` (schema stays `2`; absent from an older writer ⇒ `false`). Derived cap verdict, `true` when either block is capped: `spend` with billing on is capped when both amounts read and `used >= limit`, otherwise when its `percent >= 100`; `extra_usage` with `is_enabled` on is capped when its `utilization >= 100`, else when both amounts read and `used_credits >= monthly_limit`. Nothing read is no cap. |
+| `profiles[].limit_resets` | Additive `integer \| null` (schema stays `2`; absent from an older writer ⇒ `null`). The usable banked usage-limit resets clauth last read: a Claude Code entry's from its hourly read, a codex entry's from its usage poll. `null` = no reading, `0` = read as none. A Claude Code count is not dated by the entry's `fetched_at` or `stale`, which describe the usage cache, and it can lag a spend until the next read. |
 | `profiles[]` membership | A user-disabled account (`clauth disable`) is excluded from `profiles[]` by default; no field marks a profile disabled, absence from the array IS the signal. The active profile is always present regardless of its own disabled flag, so `active_profile` never names a profile missing from `profiles[]`. Every codex profile is always present (a codex profile cannot be disabled), after the Claude Code entries; on a codex entry `auto_start` is `false`, `auto_start_queue`, `bell_threshold`, `third_party`, `spend` and `extra_usage` are `null` and `credit_capped` is `false`, and `windows[]` carries the `5h` and `7d` rows its usage poll filled. |
 
 ### Evolution rule (the load-bearing part)
 
-- **Writers**: additive only under the same `schema`: new fields may appear, existing fields never change type/meaning. A breaking change bumps `schema`. The codex fields (`active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `profiles[].harness`, the `"unknown"` `auth_status` value and the codex entries themselves) are additive under schema `2`: a reader that knows none of them sees the Claude Code feed alone, with the codex entries trailing the array. The `gateway` object and every `gateway.state` value are additive under schema `2` the same way, the `proxies` array with every `proxies[].state` value is additive under schema `2` the same way again, the `tps` object is additive under schema `2` the same way once more, and the `credit_billed_families` array with `profiles[].spend`, `profiles[].extra_usage` and `profiles[].credit_capped` is additive under schema `2` the same way, as are the `binary_replaced` and `binary_removed` booleans. `fetch_status` `"AuthExpired"` on an OAuth entry, for a setup token the server refused to the usage probe, is a widened value under schema `2` too: a reader that knew it for third-party entries alone reads it the same way there.
+- **Writers**: additive only under the same `schema`: new fields may appear, existing fields never change type/meaning. A breaking change bumps `schema`. The codex fields (`active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `profiles[].harness`, the `"unknown"` `auth_status` value and the codex entries themselves) are additive under schema `2`: a reader that knows none of them sees the Claude Code feed alone, with the codex entries trailing the array. The `gateway` object and every `gateway.state` value are additive under schema `2` the same way, the `proxies` array with every `proxies[].state` value is additive under schema `2` the same way again, the `tps` object is additive under schema `2` the same way once more, and the `credit_billed_families` array with `profiles[].spend`, `profiles[].extra_usage` and `profiles[].credit_capped` is additive under schema `2` the same way, as are `profiles[].limit_resets` and the `binary_replaced` and `binary_removed` booleans. `fetch_status` `"AuthExpired"` on an OAuth entry, for a setup token the server refused to the usage probe, is a widened value under schema `2` too: a reader that knew it for third-party entries alone reads it the same way there.
 - **Readers**: ignore unknown fields; default absent optional fields (absent `auth_status` ⇒ `"ok"`, absent `harness` ⇒ `"claude"`); refuse only on `schema` greater than what they know, showing "daemon newer than me" rather than garbage.
 
 ## `clauth status --json`
