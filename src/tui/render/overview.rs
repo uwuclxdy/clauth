@@ -133,11 +133,12 @@ fn more_members_line(hidden: usize) -> Line<'static> {
 
 /// The accounts panel's title-right meta: one count per harness — every
 /// harness whatever the filter shows, since the counts describe the rows the
-/// table lists, never the view. A roster with no accounts drops out of the
-/// words; with all empty there is nothing to count and no slot renders.
+/// table lists, never the view; a disabled account has no row, so no count.
+/// A roster with no accounts drops out of the words; with all empty there is
+/// nothing to count and no slot renders.
 fn harness_counts(app: &App) -> String {
     let mut terms: Vec<String> = Vec::new();
-    let claude_n = app.config().profiles.len();
+    let claude_n = app.config().enabled_profiles().count();
     if claude_n > 0 {
         terms.push(format!("{claude_n} claude"));
     }
@@ -193,13 +194,29 @@ fn draw_overview_accounts(
             ShuntPool::NotRead(_) => true,
             ShuntPool::Absent => false,
         };
-    if app.config().profiles.is_empty() && codex.is_empty() && !shunt_draws {
+    // A disabled account draws no row, so a roster of disabled accounts alone
+    // leaves the table as empty as no roster at all; it says which.
+    let (roster_n, shown_n) = {
+        let cfg = app.config();
+        (cfg.profiles.len(), cfg.enabled_profiles().count())
+    };
+    if shown_n == 0 && codex.is_empty() && !shunt_draws {
         app.overview_selector.offset.set(0);
         app.overview_selector.viewport.set(0);
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        if roster_n == 0 {
+            empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        } else {
+            empty_state(
+                frame,
+                inner,
+                "every claude account is disabled",
+                "\u{2325}4",
+                "to enable one on setup",
+            );
+        }
         return;
     }
 
@@ -231,7 +248,7 @@ fn draw_overview_accounts(
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
     let reset_fmt = ResetFmt::from_state(&app.config().state);
-    let entries = app.band_entries(app.harness_filter);
+    let entries = app.band_entries(app.harness_filter, true);
     let ranges = App::heading_ranges(&entries);
 
     // One pass over the shared band walk builds both the rendered rows and the
@@ -276,8 +293,8 @@ fn draw_overview_accounts(
             BandEntry::Item(item) => {
                 starts.push(rendered);
                 let line = match *item {
-                    MainItemKind::Profile(_) => {
-                        render_overview_row(app, flat, &widths, flat == sel, focused, readings)
+                    MainItemKind::Profile(idx) => {
+                        render_overview_row(app, idx, &widths, flat == sel, focused, readings)
                     }
                     MainItemKind::Codex(idx) => {
                         render_codex_row(&codex[idx], flat, &widths, flat == sel, app.anim_ms())
@@ -450,16 +467,16 @@ impl OverviewWidths {
 
     fn build(width: u16, banded: bool, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
+        // Sized off the rows the table draws: a disabled account has none.
         let max_name = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
         let claude_labels = if app.harness_filter.shows_claude() {
-            LabelWidths::of(app.config().profiles.iter().map(|p| {
+            LabelWidths::of(app.config().enabled_profiles().map(|p| {
                 let (five, seven) = overview_windows(p, readings);
                 // A DeepSeek row's 5h cell holds its balance, not a reading.
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
@@ -635,8 +652,7 @@ impl OverviewWidths {
 
         let deepseek_amount_w = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
@@ -1213,6 +1229,12 @@ fn render_overview_row(
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
+    // The row's place in the drawn list, the step its crest staggers by: the
+    // claude rows lead the list, less every disabled account, which has none.
+    let position = cfg.profiles[..idx]
+        .iter()
+        .filter(|p| !p.is_disabled())
+        .count();
 
     let active = cfg.is_active(&profile.name);
     let disabled = profile.is_disabled();
@@ -1381,7 +1403,12 @@ fn render_overview_row(
         && !no_tier
     {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        spans.extend(identity_wave_spans(&clamped, provider, idx, app.anim_ms()));
+        spans.extend(identity_wave_spans(
+            &clamped,
+            provider,
+            position,
+            app.anim_ms(),
+        ));
         spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
@@ -1550,8 +1577,7 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
 /// column header and the per-row cell both swap to carry it.
 fn any_deepseek(app: &App) -> bool {
     app.config()
-        .profiles
-        .iter()
+        .enabled_profiles()
         .any(|p| p.provider == Some(Provider::DeepSeek))
 }
 
