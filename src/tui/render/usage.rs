@@ -17,8 +17,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{
-    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset, relative_age,
-    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
+    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset, plan_end_text,
+    relative_age, reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
@@ -31,8 +31,8 @@ use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
-    UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
+    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, PlanEnd, ProfileActivity, QueueSlot,
+    StreakCounts, UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
     kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
     switch_grade_kick_lifts,
 };
@@ -1355,8 +1355,17 @@ fn header_lines(
         None => Span::styled("—".to_string(), theme::faint()),
     };
     let plan_key = key_span("plan");
-    let left_w = plan_key.width() + plan_w;
+    let mut left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
+    // When the plan ends or renews, beside its name while the row has room.
+    if let Some((text, style)) = plan_end_tail(profile) {
+        let tail = format!(" · {text}");
+        let tail_w = grapheme_cells(&tail);
+        if left_w + tail_w <= inner_w as usize {
+            left_w += tail_w;
+            plan_spans.push(Span::styled(tail, style));
+        }
+    }
     // A plan with no 5h limit has no window the kick could open, so the
     // countdown would name a kick that never fires.
     let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
@@ -1373,6 +1382,19 @@ fn header_lines(
     }
     lines.extend(status_lines(profile, header, inner_w, readings));
     lines
+}
+
+/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: a plan
+/// marked ending in the warning color, a renewal faint. `None` when the
+/// profile carries neither `plan_ends` nor `plan_renews`.
+fn plan_end_tail(profile: &Profile) -> Option<(String, Style)> {
+    let today = crate::usage::local_date_of(now_epoch_secs())?;
+    let end = profile.plan_dates().end(today)?;
+    let style = match end {
+        PlanEnd::Renews(_) => theme::faint(),
+        PlanEnd::Ends(_) | PlanEnd::Ended(_) => theme::warning(),
+    };
+    Some((plan_end_text(end, today), style))
 }
 
 /// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure

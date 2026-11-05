@@ -210,12 +210,12 @@ fn draw_overview_accounts(
     // most `OVERVIEW_MAX_W` cells, and past that the band the row settles on is
     // centred. The panel itself stays full width.
     let widths = if list_area.width > OVERVIEW_MAX_W {
-        OverviewWidths::new_banded(OVERVIEW_MAX_W, app, readings)
+        OverviewWidths::new_banded(OVERVIEW_MAX_W, list_area.width, app, readings)
     } else {
         OverviewWidths::new(list_area.width, app, readings)
     };
     let band_pad = if list_area.width > OVERVIEW_MAX_W {
-        let band_w = widths.row_width() + widths.codex_chip_w;
+        let band_w = widths.row_width() + widths.chip_w;
         // A row the tiers cannot fit into the cap (a codex reading too wide for
         // even the bare tiers, which `codex_label` prints unclamped) outgrows
         // the band; it draws flush left and clipped, as it did before the band
@@ -322,11 +322,12 @@ struct OverviewWidths {
     live: usize,
     /// `TPS_W` when the per-account speed column fits, `0` when it is dropped.
     tps: usize,
-    /// The codex rows' trailing `↺ N` chip slot (gap + the widest visible chip
+    /// The rows' trailing chip slot, shared by a codex row's `↺ N` and a
+    /// claude row's plan chip ([`plan_chip`]) (gap + the widest visible chip
     /// text), charged whenever a visible codex row carries a banked reset and
     /// the row has room for it; `0` when none does or the chip sheds whole, so
     /// the renderer drops the chip instead of clipping it mid-glyph.
-    codex_chip_w: usize,
+    chip_w: usize,
     gap: usize,
     /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
     /// currencies align in the column. `0` when no DeepSeek balance is cached.
@@ -409,7 +410,7 @@ const FIVE_HOUR_MAX: usize = 26;
 /// figure.
 const FIVE_HOUR_MIN: usize = 4;
 /// Narrowest an account name gets: once the 5h column is down to its bare
-/// reading, or to make room for the codex rows' `↺ N` chip. The chain panel's
+/// reading, or to make room for the rows' trailing chip. The chain panel's
 /// name floor.
 const NAME_READING_FLOOR: usize = 6;
 /// Widest the 7d column reaches before the wall-clock stamp bonus.
@@ -436,19 +437,21 @@ impl OverviewWidths {
     /// The unbanded layout: the panel is at or below [`OVERVIEW_MAX_W`], so the
     /// columns lay out at the panel's own width.
     fn new(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
-        Self::build(width, false, app, readings)
+        Self::build(width, width, false, app, readings)
     }
 
     /// The banded layout: the panel is past [`OVERVIEW_MAX_W`], so the columns
     /// lay out at the cap. There t/s outranks the wall-clock stamps — the bonus
-    /// charges only true slack — and the codex chip never pays with the name
-    /// column: the name keeps its uncharged width and a chip that does not fit
-    /// hides whole.
-    fn new_banded(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
-        Self::build(width, true, app, readings)
+    /// charges only true slack — and the trailing chip never pays with the name
+    /// column: the name keeps its uncharged width. A slot holding a plan chip
+    /// ([`plan_chip`]), a warning, may ride the panel's margin past the cap,
+    /// `room` being the panel's own width; a codex `↺ N` alone keeps to the
+    /// cap. A chip that fits neither hides whole.
+    fn new_banded(width: u16, room: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
+        Self::build(width, room, true, app, readings)
     }
 
-    fn build(width: u16, banded: bool, app: &App, readings: &ReadingsSnapshot) -> Self {
+    fn build(width: u16, room: u16, banded: bool, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
         let max_name = app
             .config()
@@ -513,6 +516,29 @@ impl OverviewWidths {
                 .unwrap_or(0)
         } else {
             0
+        };
+        // The widest plan chip across visible claude rows: a plan that bills or
+        // ends within the week ([`plan_chip`]).
+        let plan_chip_text = if app.harness_filter.shows_claude() {
+            let cfg = app.config();
+            let today = crate::usage::local_date_of(now_epoch_secs());
+            cfg.profiles
+                .iter()
+                .filter_map(|p| plan_chip(p, cfg.is_auth_broken(&p.name), readings, today?))
+                .map(|chip| grapheme_cells(&chip))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let chip_text = codex_chip_text.max(plan_chip_text);
+        // Where the trailing chip may reach: the cap, or past it into the
+        // panel's own margin when the slot carries a plan chip, which warns of
+        // a plan billing or ending this week and must not hide for a margin.
+        let chip_room = if banded && plan_chip_text > 0 {
+            usize::from(room).max(total)
+        } else {
+            total
         };
         let (five_excess, seven_excess) = labels.excess();
         let (mut name, kind, mut five_hour, mut seven_day) =
@@ -582,16 +608,12 @@ impl OverviewWidths {
         // real leftover instead.
         let mut gap =
             (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
-        let mut codex_chip_w = if codex_chip_text > 0 {
-            gap + codex_chip_text
-        } else {
-            0
-        };
+        let mut chip_w = if chip_text > 0 { gap + chip_text } else { 0 };
 
         // The name column is the one flexible text column (the only column that
         // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
         // is at its ceiling and the clock bonus has taken what it wants, spare
-        // width goes to the name instead of stranding at the row end. The codex
+        // width goes to the name instead of stranding at the row end. The
         // chip slot is charged after this, so the name absorbs its own slack
         // exactly as it would without the chip.
         if gap == 8 {
@@ -605,20 +627,20 @@ impl OverviewWidths {
         // `NAME_READING_FLOOR`. Past that the chip sheds whole, nothing
         // charged: the name and gap revert to the uncharged layout, and the
         // renderer drops the chip rather than letting it peek in.
-        if codex_chip_text > 0 {
+        if chip_text > 0 {
             let name_uncharged = name;
             let gap_uncharged = gap;
             loop {
                 let row =
                     fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
                         + TIMER_SLOT
-                        + codex_chip_w;
-                if row <= total {
+                        + chip_w;
+                if row <= chip_room {
                     break;
                 }
                 if gap > GAP_MIN {
                     gap -= 1;
-                    codex_chip_w = gap + codex_chip_text;
+                    chip_w = gap + chip_text;
                 } else if !banded && name > NAME_READING_FLOOR {
                     // Banded, the name column keeps its uncharged width: the
                     // chip rides only the slack that is left once the name has
@@ -627,7 +649,7 @@ impl OverviewWidths {
                 } else {
                     name = name_uncharged;
                     gap = gap_uncharged;
-                    codex_chip_w = 0;
+                    chip_w = 0;
                     break;
                 }
             }
@@ -652,7 +674,7 @@ impl OverviewWidths {
             seven_day,
             live,
             tps,
-            codex_chip_w,
+            chip_w,
             gap,
             deepseek_amount_w,
             claude_labels,
@@ -662,10 +684,10 @@ impl OverviewWidths {
     }
 
     /// The width the table's widest row draws at these columns, before the
-    /// codex `↺ N` chip: the cursor and bell prefix, every column and its gap,
-    /// and the timer slot. The band centres on this plus [`Self::codex_chip_w`]:
+    /// trailing chip: the cursor and bell prefix, every column and its gap,
+    /// and the timer slot. The band centres on this plus [`Self::chip_w`]:
     /// the chip rides the row's trailing gap, so the widest row the layout can
-    /// draw is `row_width() + codex_chip_w` wide, and centring on `row_width()`
+    /// draw is `row_width() + chip_w` wide, and centring on `row_width()`
     /// alone spends the leftover on the left margin that the chip's ride also
     /// needs, clipping the chip just above the cap.
     fn row_width(&self) -> usize {
@@ -1016,7 +1038,7 @@ fn render_codex_row(
         spans.push(gap(widths));
         spans.push(Span::raw(" ".repeat(widths.tps)));
     }
-    if widths.codex_chip_w > 0
+    if widths.chip_w > 0
         && let Some(count) = row.resets
     {
         spans.push(gap(widths));
@@ -1498,8 +1520,55 @@ fn render_overview_row(
         spans.push(gap(widths));
         spans.push(tps_cell(app, &profile.name, widths.tps));
     }
+    if widths.chip_w > 0
+        && let Some(today) = crate::usage::local_date_of(now_epoch_secs())
+        && let Some(chip) = plan_chip(profile, cfg.is_auth_broken(&profile.name), readings, today)
+    {
+        spans.push(gap(widths));
+        spans.push(Span::styled(chip, theme::warning()));
+    }
 
     Line::from(spans)
+}
+
+/// How many days ahead a plan's billing or end earns its Overview chip: one
+/// weekly window. A plan billing or ending inside it may leave this week's
+/// allowance part spent, since the week does not reset on the billing day:
+/// spend it here first, or cancel before the plan bills again.
+const PLAN_CHIP_DAYS: i64 = 7;
+
+/// The trailing chip a claude row carries while its plan bills or ends within
+/// [`PLAN_CHIP_DAYS`]: `billing in 3d` / `billing today` off `plan_renews`,
+/// `ends in 3d` / `ends today` off `plan_ends`. Only a working account carries
+/// one: never a disabled one, one whose login is broken, or one whose plan is
+/// canceled or refused by its organization, which has no billing left to
+/// plan around.
+fn plan_chip(
+    profile: &Profile,
+    auth_broken: bool,
+    readings: &ReadingsSnapshot,
+    today: chrono::NaiveDate,
+) -> Option<String> {
+    if profile.is_disabled()
+        || auth_broken
+        || crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name))
+    {
+        return None;
+    }
+    let end = profile.plan_dates().end(today)?;
+    let days = end.days_left(today)?;
+    if days >= PLAN_CHIP_DAYS {
+        return None;
+    }
+    let verb = match end {
+        crate::usage::PlanEnd::Renews(_) => "billing",
+        crate::usage::PlanEnd::Ends(_) | crate::usage::PlanEnd::Ended(_) => "ends",
+    };
+    Some(if days <= 0 {
+        format!("{verb} today")
+    } else {
+        format!("{verb} in {days}d")
+    })
 }
 
 /// The row's speed cell: the account's live speed off a fresh producer, blank

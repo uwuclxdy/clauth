@@ -179,6 +179,8 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -797,4 +799,30 @@ fn the_bracketed_bar_label_keeps_two_rounded_decimals() {
             );
         }
     }
+}
+
+/// The Usage tab's plan-end phrase: the day it falls on and how many days
+/// away, `today` for one due today, the bare day for one already past, and
+/// the year for a day more than half a year out.
+#[test]
+fn plan_end_text_names_the_day_and_the_days_left() {
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    let today = day(2026, 11, 4);
+    assert_eq!(
+        plan_end_text(PlanEnd::Ends(day(2026, 11, 20)), today),
+        "ends nov 20 (16d)"
+    );
+    assert_eq!(plan_end_text(PlanEnd::Ends(today), today), "ends today");
+    assert_eq!(
+        plan_end_text(PlanEnd::Ended(day(2026, 11, 2)), today),
+        "ended nov 2"
+    );
+    assert_eq!(
+        plan_end_text(PlanEnd::Ends(day(2027, 8, 1)), today),
+        "ends aug 1, 2027 (270d)"
+    );
+    assert_eq!(
+        plan_end_text(PlanEnd::Renews(day(2026, 12, 15)), today),
+        "renews dec 15 (41d)"
+    );
 }

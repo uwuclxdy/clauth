@@ -292,6 +292,8 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -357,6 +359,8 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -435,6 +439,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -1321,6 +1327,8 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -7005,7 +7013,7 @@ fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
                 // Above the cap the renderer runs the banded layout at
                 // `OVERVIEW_MAX_W`; the model follows it.
                 let widths = if w > 126 {
-                    OverviewWidths::new_banded(OVERVIEW_MAX_W, &app, &readings)
+                    OverviewWidths::new_banded(OVERVIEW_MAX_W, w, &app, &readings)
                 } else {
                     OverviewWidths::new(w, &app, &readings)
                 };
@@ -8424,4 +8432,118 @@ fn each_providers_first_row_crests_apart_from_the_others() {
             );
         }
     }
+}
+
+/// The local date `days` from today, the frame a plan date is read in.
+fn plan_day_in(days: i64) -> chrono::NaiveDate {
+    crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap()
+        + chrono::Duration::days(days)
+}
+
+/// A working account whose plan bills or ends inside the week carries a
+/// warning chip after its columns, `billing in Nd` off `plan_renews` and
+/// `ends in Nd` / `ends today` off `plan_ends`; a week out or more carries
+/// none.
+#[test]
+fn a_plan_billing_or_ending_within_the_week_carries_a_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut billing, billing_r) = polled("billing", 95.0, 10.0, 3600);
+    billing.plan_renews = Some(plan_day_in(3));
+    let (mut ending, ending_r) = polled("ending", 95.0, 10.0, 3600);
+    ending.plan_ends = Some(plan_day_in(0));
+    let (mut later, later_r) = polled("later", 95.0, 10.0, 3600);
+    later.plan_renews = Some(plan_day_in(7));
+    let (config, readings) = config_with(
+        vec![(billing, billing_r), (ending, ending_r), (later, later_r)],
+        Some("billing"),
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = |idx| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+    let billing_row = row(0);
+    let chip = billing_row.spans.last().expect("a trailing span");
+    assert_eq!(chip.content, "billing in 3d");
+    assert_eq!(
+        chip.style.fg,
+        theme::warning().fg,
+        "the chip reads in the warning color"
+    );
+    assert!(
+        line_text(&row(1)).ends_with("ends today"),
+        "{}",
+        line_text(&row(1))
+    );
+    let later_text = line_text(&row(2));
+    assert!(
+        !later_text.contains("billing") && !later_text.contains("ends"),
+        "a billing day a week out earns no chip: {later_text}"
+    );
+}
+
+/// Only a working account carries the chip: never a disabled one or one whose
+/// login is broken, however soon its plan bills.
+#[test]
+fn a_plan_chip_needs_a_working_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut disabled, disabled_r) = polled("disabled", 95.0, 10.0, 3600);
+    disabled.plan_renews = Some(plan_day_in(2));
+    disabled.disabled = true;
+    let (mut broken, broken_r) = polled("broken", 95.0, 10.0, 3600);
+    broken.plan_ends = Some(plan_day_in(2));
+    let (mut config, readings) = config_with(
+        vec![(disabled, disabled_r), (broken, broken_r)],
+        None,
+        vec![],
+    );
+    config.state.auth_broken.push("broken".into());
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    for idx in 0..2 {
+        let text = line_text(&render_overview_row(
+            &app, idx, &widths, false, true, &readings,
+        ));
+        assert!(
+            !text.contains("billing") && !text.contains("ends"),
+            "no chip on a row that cannot serve: {text}"
+        );
+    }
+}
+
+/// On a panel past the band's cap the plan chip rides the margin beside the
+/// band rather than hiding, even when the capped row is already full: long
+/// names and wall-clock stamps.
+#[test]
+fn a_plan_chip_rides_the_margin_past_the_band_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "an-account-named-long@example.org";
+    let (mut p, r) = polled(name, 95.0, 10.0, 3600);
+    p.plan_ends = Some(plan_day_in(4));
+    let usage = r.usage.clone();
+    let (mut config, _readings) = config_with(vec![(p, r)], Some(name), vec![]);
+    config.state.reset_display = Some(ResetDisplay::Both);
+    let app = App::new(config);
+    for (n, info) in usage {
+        app.usage_store.lock().expect("usage store").insert(n, info);
+    }
+    let rows = accounts_rows(&app, 200, 8);
+    assert!(
+        rows[2].contains("ends in 4d"),
+        "the chip shows on a 200-column panel: {:?}",
+        rows[2]
+    );
+    let capped = OverviewWidths::new_banded(
+        OVERVIEW_MAX_W,
+        OVERVIEW_MAX_W,
+        &app,
+        &app.readings_snapshot(),
+    );
+    let wide = OverviewWidths::new_banded(OVERVIEW_MAX_W, 200, &app, &app.readings_snapshot());
+    assert_eq!(
+        (wide.name, wide.kind, wide.five_hour, wide.seven_day),
+        (capped.name, capped.kind, capped.five_hour, capped.seven_day),
+        "riding the margin costs the band's columns nothing"
+    );
 }

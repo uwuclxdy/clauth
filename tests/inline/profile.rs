@@ -2475,6 +2475,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -8310,6 +8312,8 @@ fn every_profile_config_scalar_is_modelled() {
         rolling_token: true,
         preferred: true,
         preferred_days: vec!["sat".to_string()],
+        plan_ends: Some("2026-12-31".to_string()),
+        plan_renews: Some("2026-12-15".to_string()),
         max_auto_spend: Some(0.0),
         check_weekly: Some(false),
         check_scoped: Some(false),
@@ -8415,6 +8419,8 @@ fn every_profile_config_table_is_modelled() {
         rolling_token: true,
         preferred: true,
         preferred_days: vec!["sat".to_string()],
+        plan_ends: Some("2026-12-31".to_string()),
+        plan_renews: Some("2026-12-15".to_string()),
         max_auto_spend: Some(0.0),
         check_weekly: Some(false),
         check_scoped: Some(false),
@@ -8692,6 +8698,14 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         (
             "preferred_days",
             "fd83d4867fb64b1be1e65d7fb4b2f2e2de0a84cfe84abba1a2dc7b25b78a5cfc",
+        ),
+        (
+            "plan_ends",
+            "5d6468b8b134899b5447ce1d331904d1af059b268b5f3670a22d9ec8a61bb029",
+        ),
+        (
+            "plan_renews",
+            "18a64bad58623f35933c5ace3295207f9ceff9f0fe992ed2d044ca5bf7a8e151",
         ),
         (
             "rolling_token",
@@ -8978,6 +8992,152 @@ fn a_load_keeps_a_typoed_weekday_line_commented_above_the_fixed_one() {
     let expected = "# preferred_days = [\"sat\", \"Saturdy\"]\npreferred_days = [\"sat\"]\nlast_resort = true\n";
     assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     assert_next_load_writes_nothing("days", &path, expected);
+}
+
+/// A `plan_ends` date reads into the profile, and the load leaves a canonical
+/// line alone.
+#[test]
+fn a_load_reads_a_plan_ends_date_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "plan_ends = \"2026-11-20\"  # canceled on the 3rd\nlast_resort = true\n";
+    let path = raw_config("ends", body);
+    let profile = load_profile(&ProfileName::from("ends")).unwrap();
+    assert_eq!(
+        profile.plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 20)
+    );
+    assert_next_load_writes_nothing("ends", &path, body);
+}
+
+/// A `plan_ends` that is no date is commented out where it sits, as typed,
+/// and the plan keeps its renewal.
+#[test]
+fn a_load_comments_out_an_unreadable_plan_ends() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "endstypo",
+        "plan_ends = \"20/11/2026\"\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("endstypo")).unwrap();
+    assert_eq!(profile.plan_ends, None);
+    let expected = "# plan_ends = \"20/11/2026\"\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endstypo", &path, expected);
+}
+
+/// A readable date spelled without its zero padding is written back in its
+/// `YYYY-MM-DD` form, in place.
+#[test]
+fn a_load_writes_an_unpadded_plan_ends_in_its_canonical_form() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("endspad", "plan_ends = \"2026-12-1\"\n");
+    let profile = load_profile(&ProfileName::from("endspad")).unwrap();
+    assert_eq!(
+        profile.plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 12, 1)
+    );
+    let expected = "plan_ends = \"2026-12-01\"\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endspad", &path, expected);
+}
+
+/// The `plan_ends` scalar saves into the template in place: a set date
+/// uncomments the example where it sits, and clearing it turns the line back
+/// into the example, so the file is byte for byte the template again.
+#[test]
+fn a_save_writes_and_clears_the_plan_ends_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("endstoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("endstoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# plan_ends = \"2026-12-31\"\n").count(),
+        1,
+        "the template holds one plan_ends example:\n{original}"
+    );
+
+    let mut profile = load_profile(&ProfileName::from("endstoggle")).unwrap();
+    profile.plan_ends = chrono::NaiveDate::from_ymd_opt(2026, 11, 20);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# plan_ends = \"2026-12-31\"\n",
+            "plan_ends = \"2026-11-20\"\n",
+            1
+        )
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("endstoggle"))
+            .unwrap()
+            .plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 20),
+        "the saved date reads back"
+    );
+
+    profile.plan_ends = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// `plan_renews` reads like `plan_ends`: a canonical date stays as written, a
+/// typo is commented out where it sits, and both keys save into the template
+/// in place and clear back to it.
+#[test]
+fn plan_renews_reads_saves_and_clears_like_plan_ends() {
+    let _home = HomeSandbox::new();
+    let body = "plan_renews = \"2026-12-15\"  # from the billing page\n";
+    let path = raw_config("renews", body);
+    assert_eq!(
+        load_profile(&ProfileName::from("renews"))
+            .unwrap()
+            .plan_renews,
+        chrono::NaiveDate::from_ymd_opt(2026, 12, 15)
+    );
+    assert_next_load_writes_nothing("renews", &path, body);
+
+    let path = raw_config("renewstypo", "plan_renews = \"8 dec\"\n");
+    assert_eq!(
+        load_profile(&ProfileName::from("renewstypo"))
+            .unwrap()
+            .plan_renews,
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# plan_renews = \"8 dec\"\n"
+    );
+
+    save_profile_config(&Profile::new("renewstoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("renewstoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# plan_renews = \"2026-12-15\"\n").count(),
+        1,
+        "the template holds one plan_renews example:\n{original}"
+    );
+    let mut profile = load_profile(&ProfileName::from("renewstoggle")).unwrap();
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+    profile.plan_ends = chrono::NaiveDate::from_ymd_opt(2026, 11, 20);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original
+            .replacen(
+                "# plan_ends = \"2026-12-31\"\n",
+                "plan_ends = \"2026-11-20\"\n",
+                1
+            )
+            .replacen(
+                "# plan_renews = \"2026-12-15\"\n",
+                "plan_renews = \"2027-01-31\"\n",
+                1
+            )
+    );
+    profile.plan_renews = None;
+    profile.plan_ends = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
 /// Every weekday a typo: the line is just commented out, no empty list.

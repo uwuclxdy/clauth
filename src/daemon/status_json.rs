@@ -29,8 +29,8 @@ use crate::profile_json::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
-    selected_next_refresh, windows_maxed,
+    FetchStatus, LegKey, PlanEnd, UsageInfo, is_stuck_rate_limited, local_date_of, ms_to_iso,
+    now_ms, render_plan_date, selected_next_refresh, windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -195,6 +195,34 @@ pub(crate) struct CapBlock {
     pub(crate) percent: Option<f64>,
 }
 
+/// When a profile's plan ends or renews ([`crate::usage::PlanEnd`]), as
+/// published per profile. The whole object is `null` when the profile carries
+/// neither `plan_ends` nor `plan_renews`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub(crate) struct PlanEndEntry {
+    /// `ends`: the profile's `plan_ends`, today or later; `ended`: that day is
+    /// past; `renews`: the next billing day off `plan_renews`, carried
+    /// forward a month at a time once it passes.
+    pub(crate) kind: String,
+    /// `YYYY-MM-DD`, a local calendar day.
+    pub(crate) date: String,
+}
+
+impl PlanEndEntry {
+    /// The published form of `end`.
+    pub(crate) fn of(end: PlanEnd) -> Self {
+        let kind = match end {
+            PlanEnd::Ends(_) => "ends",
+            PlanEnd::Ended(_) => "ended",
+            PlanEnd::Renews(_) => "renews",
+        };
+        Self {
+            kind: kind.to_string(),
+            date: render_plan_date(end.day()),
+        }
+    }
+}
+
 /// One `profiles[]` entry of the published `status.json` body — the shape both
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
 /// the reader (`clauth list`'s table rows) derive from, so a reader's field
@@ -299,6 +327,10 @@ pub(crate) struct ProfileEntry {
     /// daemon's body lacks it, so a reader defaults it to `false`.
     #[serde(default)]
     pub(crate) credit_capped: bool,
+    /// Additive (schema stays 2): when the plan ends or renews, `null` when
+    /// neither is known. Never required: an older daemon's body lacks it.
+    #[serde(default)]
+    pub(crate) plan_end: Option<PlanEndEntry>,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -627,6 +659,9 @@ pub(crate) fn build_profile_entries(
                     percent: e.utilization,
                 });
             let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
+            let plan_end = local_date_of((now / 1000) as i64)
+                .and_then(|today| p.plan_dates().end(today))
+                .map(PlanEndEntry::of);
 
             ProfileEntry {
                 name: name.clone(),
@@ -661,6 +696,7 @@ pub(crate) fn build_profile_entries(
                 spend,
                 extra_usage,
                 credit_capped,
+                plan_end,
             }
         })
         .collect()
@@ -744,6 +780,8 @@ pub(crate) fn build_codex_entries(
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                // A ChatGPT plan's end is not read.
+                plan_end: None,
             }
         })
         .collect()
