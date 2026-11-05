@@ -24151,6 +24151,16 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     };
     let holds_credential_piece = crate::claude::session_token_status(name).is_some()
         || crate::claude::has_static_backup(name);
+    // The row was armed on a snapshot: a disarm landing since then can leave
+    // nothing to clear, and relinking anyway reports a clear that touched
+    // nothing.
+    if !holds_credential_piece && !on_disk.rolling_token {
+        app.toast(
+            ToastKind::Info,
+            format!("'{name}' holds no long-lived token, so nothing to clear"),
+        );
+        return;
+    }
     if holds_credential_piece && on_disk.credentials.is_none() && on_disk.api_key.is_none() {
         app.toast(
             ToastKind::Danger,
@@ -24159,6 +24169,11 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
         return;
     }
     let rolling_armed = on_disk.rolling_token;
+    let rolled = if rolling_armed {
+        " · re-stamping off"
+    } else {
+        ""
+    };
     if rolling_armed {
         // The PERSIST is written onto a fresh disk read, never the in-memory
         // snapshot — another process's config edit may have landed since the
@@ -24188,15 +24203,28 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             p.rolling_token = false;
         }
     }
-    if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
+    let removed = match crate::claude::quarantine_misfilled_sidecar(name)
         .and_then(|_| crate::claude::clear_session_token(name))
     {
-        app.toast(
-            ToastKind::Danger,
-            format!("clear failed\n{}", escape_control(&error_toast_detail(&e))),
-        );
-        return;
-    }
+        Ok(removed) => removed,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "clear failed{rolled}\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return;
+        }
+    };
+    // A clear that removed no sidecar (a flag or a preserved mint alone) opens
+    // on what it found rather than claiming a removal.
+    let opener = if removed {
+        format!("cleared the long-lived token for '{name}'")
+    } else {
+        format!("found no long-lived token in use for '{name}'")
+    };
     app.session_tokens.remove(name.as_str());
     // Read AFTER the clear, so it names the store the relink actually finds:
     // `install_source_path` falls back to `credentials.json` only once the
@@ -24218,7 +24246,10 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     if active && let Err(e) = force_link_profile_credentials(name) {
         app.toast(
             ToastKind::Danger,
-            format!("relink failed\n{}", escape_control(&error_toast_detail(&e))),
+            format!(
+                "relink failed{rolled}\n{}",
+                escape_control(&error_toast_detail(&e))
+            ),
         );
         return;
     }
@@ -24239,11 +24270,6 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
         }
         (false, false) => "; it stores no login at all · log in before switching to it",
     };
-    let rolled = if rolling_armed {
-        " · re-stamping off"
-    } else {
-        ""
-    };
     // The backup goes LAST, after the relink: failing between the sidecar
     // removal and the relink would leave an active profile's live slot a
     // dangling symlink under a toast reading "clear failed", a broken login
@@ -24261,8 +24287,7 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             app.toast(
                 ToastKind::Danger,
                 format!(
-                    "cleared the long-lived token for '{name}'{tail}{rolled}, but the preserved \
-                     mint remains\n{}",
+                    "{opener}{tail}{rolled}, but the preserved mint remains\n{}",
                     escape_control(&error_toast_detail(&e))
                 ),
             );
@@ -24278,10 +24303,7 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     } else {
         ""
     };
-    app.toast(
-        ToastKind::Success,
-        format!("cleared the long-lived token for '{name}'{tail}{rolled}{swept}"),
-    );
+    app.toast(ToastKind::Success, format!("{opener}{tail}{rolled}{swept}"));
 }
 
 /// API-account "re-login": re-enter the base url + api key inline, mirroring the

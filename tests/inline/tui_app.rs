@@ -7757,6 +7757,336 @@ fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
     );
 }
 
+/// A flag-only clear removes no token, so the toast must not open with
+/// "cleared the long-lived token": its headline names that none was in use,
+/// and every other part (the tail, the disarm) reads as before.
+#[test]
+fn a_flag_only_clear_toast_names_no_removed_token() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("solo".to_string(), None, None);
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["solo"]);
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("solo"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let done: Vec<&str> = app
+        .toasts
+        .iter()
+        .filter(|t| matches!(t.kind, ToastKind::Success))
+        .map(|t| t.body.as_str())
+        .collect();
+    assert_eq!(
+        done,
+        [
+            "found no long-lived token in use for 'solo'; it stores no login at all · log in \
+             before switching to it · re-stamping off"
+        ],
+        "all toasts: {:?}",
+        app.toasts
+    );
+}
+
+/// A mis-filled sidecar holds a rotating pair, not a long-lived token: the
+/// clear quarantines it and removes no long-lived token, so the toast must
+/// open on what it found. Gating the opener on "a sidecar was present" (the
+/// under-guard presence read) instead of on the removal itself would print
+/// "cleared the long-lived token" for an account that never held one.
+#[test]
+fn a_misfilled_sidecar_clear_toast_names_no_removed_token() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new("mf".to_string(), None, Some("sk-mf-fixture".to_string()));
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["mf"]);
+    seed_session_token("mf", Some("rt-misfill"));
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("mf"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let done: Vec<&str> = app
+        .toasts
+        .iter()
+        .filter(|t| matches!(t.kind, ToastKind::Success))
+        .map(|t| t.body.as_str())
+        .collect();
+    assert_eq!(
+        done,
+        [
+            "found no long-lived token in use for 'mf'; it stores no login, so it runs on its \
+             api key"
+        ],
+        "all toasts: {:?}",
+        app.toasts
+    );
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("mf")).expect("profile dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the mis-fill left the sidecar slot"
+    );
+}
+
+/// Armed while the flag was set, confirmed after another process turned it
+/// off: under the guard nothing is left to clear (no sidecar, no preserved
+/// mint, no flag), so the press reports that and claims no clear.
+#[test]
+fn a_clear_whose_flag_was_disarmed_meanwhile_reports_nothing_to_clear() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("solo".to_string(), None, None);
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["solo"]);
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("solo"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    crate::profile::update_profile_config(&crate::profile::ProfileName::from("solo"), |p| {
+        p.rolling_token = false;
+        Ok(())
+    })
+    .expect("out-of-band disarm");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let reported: Vec<(bool, &str)> = app
+        .toasts
+        .iter()
+        .filter(|t| !matches!(t.kind, ToastKind::Warning))
+        .map(|t| (matches!(t.kind, ToastKind::Info), t.body.as_str()))
+        .collect();
+    assert!(
+        reported.contains(&(
+            true,
+            "'solo' holds no long-lived token, so nothing to clear"
+        )),
+        "the press reports nothing to clear in the Info tone: {:?}",
+        app.toasts
+    );
+    assert!(
+        !app.toasts
+            .iter()
+            .any(|t| matches!(t.kind, ToastKind::Success)),
+        "nothing was cleared, so no Success toast: {:?}",
+        app.toasts
+    );
+}
+
+/// The flag persist lands, then the sidecar removal itself fails: the flag is
+/// already off on disk, so the failure toast must still carry the disarm — a
+/// re-run finds nothing to clear and cannot report it.
+#[test]
+fn a_failed_sidecar_removal_still_reports_the_disarm() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new(
+        "broken".to_string(),
+        None,
+        Some("sk-broken-fixture".to_string()),
+    );
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["broken"]);
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("broken"))
+        .expect("profile dir");
+    // A non-empty directory in the sidecar slot fails `remove_file`, nothing
+    // else: the status read treats it as absent, so the clear reaches the
+    // removal after the flag persist landed.
+    std::fs::create_dir(dir.join("session-token.json")).expect("block the sidecar slot");
+    std::fs::write(dir.join("session-token.json").join("pin"), "x").expect("pin");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("broken"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let danger: Vec<&str> = app
+        .toasts
+        .iter()
+        .filter(|t| matches!(t.kind, ToastKind::Danger))
+        .map(|t| t.body.as_str())
+        .collect();
+    // The detail line is the OS's own error text, which differs per platform;
+    // the head line is clauth's and pinned by equality.
+    let heads: Vec<&str> = danger.iter().filter_map(|b| b.lines().next()).collect();
+    assert_eq!(
+        heads,
+        ["clear failed · re-stamping off"],
+        "all toasts: {:?}",
+        app.toasts
+    );
+    // The OS cause before the separator varies per platform; the line count
+    // and clauth's own context after it do not.
+    assert_eq!(danger.len(), 1, "one failure toast: {:?}", app.toasts);
+    let lines: Vec<&str> = danger[0].lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "the toast names the failure and its cause on two lines: {:?}",
+        danger[0]
+    );
+    assert!(
+        lines[1].ends_with(" · remove session-token.json"),
+        "the detail names the failed removal: {:?}",
+        lines[1]
+    );
+    let p =
+        crate::profile::load_profile(&crate::profile::ProfileName::from("broken")).expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the fixture: the flag persist landed before the removal failed"
+    );
+}
+
+/// The flag persist lands, then the forcing RELINK fails: the flag is already
+/// off on disk, so the failure toast must still carry the disarm — a re-run
+/// finds nothing to clear and cannot report it. The live slot is a non-empty
+/// directory, so the removal the relink makes for a profile storing no OAuth
+/// login fails. The head line is clauth's and pinned by equality; the detail's
+/// clauth context is pinned without the OS cause, which differs per platform.
+#[test]
+fn a_failed_relink_still_reports_the_disarm() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("rl".to_string(), None, Some("sk-rl-fixture".to_string()));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["rl"]);
+    let live = home.home().join(".claude").join(".credentials.json");
+    std::fs::create_dir_all(&live).expect("block the live slot");
+    std::fs::write(live.join("pin"), "x").expect("pin");
+
+    let mut app = app_with(vec![acct]);
+    make_active(&mut app, "rl");
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("rl"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let danger: Vec<&str> = app
+        .toasts
+        .iter()
+        .filter(|t| matches!(t.kind, ToastKind::Danger))
+        .map(|t| t.body.as_str())
+        .collect();
+    assert_eq!(danger.len(), 1, "one failure toast: {:?}", app.toasts);
+    let lines: Vec<&str> = danger[0].lines().collect();
+    assert_eq!(
+        lines[0], "relink failed · re-stamping off",
+        "all toasts: {:?}",
+        app.toasts
+    );
+    assert_eq!(
+        lines.len(),
+        2,
+        "the toast names the failure and its cause on two lines: {:?}",
+        danger[0]
+    );
+    assert!(
+        lines[1].ends_with(" · failed to remove .credentials.json"),
+        "the detail names the failed relink: {:?}",
+        lines[1]
+    );
+    let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rl")).expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the fixture: the flag persist landed before the relink failed"
+    );
+}
+
+/// A clear that removes no sidecar but fails to remove the preserved mint
+/// still opens on what it found: the failure names the mint that remains
+/// without claiming a removal. The account is flag-armed and holds an api key,
+/// so the disarm and the api-key tail ride the same line.
+#[test]
+fn a_backup_only_failure_names_the_mint_that_remains() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("bo".to_string(), None, Some("sk-bo-fixture".to_string()));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["bo"]);
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("bo")).expect("profile dir");
+    // A directory in the backup slot fails `remove_file`, nothing else: no
+    // sidecar exists, so the failure is the only removal that can go wrong.
+    std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup slot");
+    std::fs::write(dir.join("session-token.static.json").join("pin"), "x").expect("pin");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("bo"),
+    ));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let heads: Vec<&str> = app
+        .toasts
+        .iter()
+        .filter(|t| matches!(t.kind, ToastKind::Danger))
+        .filter_map(|t| t.body.lines().next())
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "found no long-lived token in use for 'bo'; it stores no login, so it runs on its \
+             api key · re-stamping off, but the preserved mint remains"
+        ],
+        "all toasts: {:?}",
+        app.toasts
+    );
+    let p = crate::profile::load_profile(&crate::profile::ProfileName::from("bo")).expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the fixture: the flag persist landed before the backup removal failed"
+    );
+}
+
 /// The other-login refusal is re-checked from DISK under the guard — the TUI
 /// half of the CLI's own re-check, and stricter: `reload_fingerprint` does not
 /// stat `credentials.json`, so an out-of-band log-out (a script's `rm`, another

@@ -4330,6 +4330,122 @@ mod static_token_clear {
         drop(home);
     }
 
+    /// The "nothing to clear" re-check is UNDER the guard, not only on the
+    /// pre-prompt snapshot: a disarm landing inside the wait leaves nothing to
+    /// act on, and the fall-through would relink the live slot for a clear that
+    /// touched nothing. Driven through the guard itself: the test holds the
+    /// profile's rotation lock, disarms the flag while the clear is parked on
+    /// `acquire`, and releases. The skipped relink is the discriminator — the
+    /// live slot stays byte-for-byte the fixture's regular file, where the
+    /// fall-through repoints it at the stored login.
+    #[test]
+    fn the_nothing_to_clear_check_is_rechecked_under_the_guard() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-nothing", true, true);
+        let name = crate::profile::ProfileName::from("cl-nothing");
+        let dir = crate::profile::profile_dir(&name).expect("dir");
+        let state = crate::profile::AppState {
+            profiles: vec!["cl-nothing".into()],
+            active_profile: Some("cl-nothing".into()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("activate");
+        crate::claude::force_link_profile_credentials(&name).expect("link");
+        let live = home.home().join(".claude").join(".credentials.json");
+        assert_eq!(
+            std::fs::read_link(&live).expect("live is a symlink"),
+            dir.join("credentials.json"),
+            "fixture: the live slot starts on the stored login, so the fall-through \
+             would move it"
+        );
+
+        // One attempt of the race. NOTHING between the guard acquire and the
+        // join may panic: an unwound attempt would detach the worker, release
+        // the flock, and drop the sandbox out from under a thread that then
+        // resolves the REAL home. Every fallible step in the window reports
+        // through the return value instead.
+        let attempt = || -> (bool, String) {
+            // A lost attempt took the fall-through, which relinks the live
+            // slot and lands the stage; restore every fixture fact for the
+            // next try. The stage's base is fp("rt-usage"), hand-computed: the
+            // first 8 bytes of its SHA-256, hex.
+            crate::profile::update_profile_config(&name, |p| {
+                p.rolling_token = true;
+                Ok(())
+            })
+            .expect("re-arm");
+            std::fs::remove_file(&live).expect("drop the live link");
+            std::fs::write(&live, b"fixture live bytes").expect("regular live file");
+            std::fs::write(
+                dir.join("credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"at-usage","refreshToken":"rt-usage"}}"#,
+            )
+            .expect("reset the store");
+            std::fs::write(
+                dir.join("credentials.json.staged"),
+                r#"{"base":"b4c7820f3e3e5e70","base_access":"at-usage",
+                    "creds":{"claudeAiOauth":{"accessToken":"at-stage","refreshToken":"rt-stage"}}}"#,
+            )
+            .expect("seed the stage");
+            let guard = crate::runtime::RotationGuard::acquire(&name).expect("hold the lock");
+            let worker =
+                std::thread::spawn(move || super::cmd_static_token_clear("cl-nothing", true));
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            // Parked on the flock = past every pre-guard read. A worker that
+            // already finished took the pre-prompt path and proves nothing.
+            let parked = !worker.is_finished();
+            let disarmed = crate::profile::update_profile_config(&name, |p| {
+                p.rolling_token = false;
+                Ok(())
+            })
+            .is_ok();
+            drop(guard);
+            let result = worker.join().expect("the clear thread survives");
+            let detail = match &result {
+                Ok(()) => "the clear returned success".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            // The arm returns before the clear writes or relinks anything, so
+            // the live slot is still the fixture's regular file; the
+            // fall-through's relink would have made it a symlink to the store.
+            let untouched = std::fs::read(&live)
+                .is_ok_and(|bytes| bytes.as_slice() == b"fixture live bytes")
+                && std::fs::symlink_metadata(&live)
+                    .is_ok_and(|meta| !meta.file_type().is_symlink());
+            // Only a worker that passed the guard runs `land_stage_for_install`,
+            // so a landed stage is an effect the pre-prompt arm can never have:
+            // a slow worker that read the disarm at the pre-prompt snapshot
+            // returns with the stage and the store as the fixture wrote them.
+            let landed = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
+                &dir.join("credentials.json"),
+            )
+            .is_ok_and(|creds| creds.access_token() == Some("at-stage"));
+            (
+                parked && disarmed && result.is_ok() && untouched && landed,
+                detail,
+            )
+        };
+
+        // The under-guard leg is what this test is FOR, so retry a lost race
+        // instead of silently degrading into a second pin of the pre-prompt
+        // check: five parked-thread attempts losing 250ms each is not a
+        // plausible machine, it is a broken re-check.
+        let mut last = String::new();
+        let mut under_guard = false;
+        for _ in 0..5 {
+            let (won, detail) = attempt();
+            last = detail;
+            if won {
+                under_guard = true;
+                break;
+            }
+        }
+        assert!(
+            under_guard,
+            "the UNDER-GUARD nothing-to-clear arm never fired across five attempts: {last}"
+        );
+    }
+
     /// The preserved mint goes LAST, after the relink: a backup-removal
     /// failure between the sidecar removal and the relink would leave an
     /// ACTIVE profile's live slot a dangling symlink under a bare "remove

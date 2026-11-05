@@ -1927,7 +1927,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // file by hand) is exactly the state where an early "nothing to clear"
     // would leave the daemon to re-create what the operator was told is gone.
     if !sidecar_present && !backup_present && !rolling_armed {
-        outln!("clauth: '{target}' holds no long-lived token, so nothing to clear.");
+        outln!("{}", clear_nothing_note(target));
         return Ok(());
     }
     // The other-login guard covers the backup slot too: a preserved mint is
@@ -2007,12 +2007,21 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // during it — acting on the pre-prompt `active` relinks the wrong world
     // in both directions.
     let on_disk = profile::load_profile(target)?;
+    let sidecar_present = claude::session_token_status(target).is_some();
+    let backup_present = claude::has_static_backup(target);
+    // The pre-prompt "nothing to clear" re-checks here on the same three facts:
+    // a disarm landing during the prompt leaves nothing, and relinking anyway
+    // would report a clear that touched nothing.
+    if !sidecar_present && !backup_present && !on_disk.rolling_token {
+        outln!("{}", clear_nothing_note(target));
+        return Ok(());
+    }
     // The other-login REFUSAL re-checks here too — it is the one decision in
     // this function that can strip a profile of its last credential, and the
     // prompt above is an unbounded wait a log-out can land inside: a profile
     // that stored an OAuth pair when the prompt was printed may store nothing
     // by the time the operator confirms.
-    if (claude::session_token_status(target).is_some() || claude::has_static_backup(target))
+    if (sidecar_present || backup_present)
         && on_disk.credentials.is_none()
         && on_disk.api_key.is_none()
     {
@@ -2028,6 +2037,49 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             Ok(())
         })?;
     }
+    let removed = match clear_after_persist(target, rolling_armed, &on_disk) {
+        Ok(removed) => removed,
+        Err(err) => {
+            // The flag persist above already landed, so this is the only
+            // chance to report it: a re-run finds nothing to clear and says so.
+            for line in clear_postscripts(target, rolling_armed, false) {
+                outln!("{line}");
+            }
+            return Err(err);
+        }
+    };
+    // The backup goes LAST, after the relink: failing between the sidecar
+    // removal and the relink would leave an active profile's live slot a
+    // dangling symlink under a bare "remove failed" — a broken login reported
+    // as nothing-happened. From here the live slot is already sound, so a
+    // failed removal is exactly what its context says and no more.
+    let backup_removed = claude::clear_static_backup(target).with_context(|| {
+        let state = if removed {
+            format!("the long-lived token for '{target}' is cleared")
+        } else {
+            format!("found no long-lived token in use for '{target}'")
+        };
+        format!(
+            "{state}, but the preserved mint at session-token.static.json remains. Remove it \
+             by hand, or re-run"
+        )
+    })?;
+    for line in clear_postscripts(target, false, backup_removed) {
+        outln!("{line}");
+    }
+    Ok(())
+}
+
+/// The clear's steps after the `rolling_token` persist, reported in the order
+/// the operator must read them: the sidecar's fate, the relink, then the
+/// disarm. Split from the command so a failure here can report the persist the
+/// caller already made — a plain `?` would return a durable disarm unmentioned,
+/// and the next run finds nothing to clear and cannot say it happened.
+fn clear_after_persist(
+    target: &profile::ProfileName,
+    rolling_armed: bool,
+    on_disk: &profile::Profile,
+) -> Result<bool> {
     // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
     // detect, and one the operator did not name: the prompt says "the
     // long-lived token", and a rotating pair is precisely not that. Every
@@ -2035,7 +2087,14 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // and the plain-delete argument on `clear_static_backup` stays scoped to
     // the operator's own mint.
     claude::quarantine_misfilled_sidecar(target)?;
-    claude::clear_session_token(target)?;
+    let removed = claude::clear_session_token(target)?;
+    // A clear that removed no sidecar (a flag or a preserved mint alone) opens
+    // on what it found rather than claiming a removal.
+    let opener = if removed {
+        format!("cleared the long-lived token for '{target}'")
+    } else {
+        format!("found no long-lived token in use for '{target}'")
+    };
     let active = load_config()?.is_active(target);
     // Re-read AFTER the clear: `install_source_path` only falls back to
     // `credentials.json` once the sidecar is gone, so this is the store the
@@ -2045,12 +2104,12 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         claude::force_link_profile_credentials(target)?;
         if has_login {
             outln!(
-                "clauth: cleared the long-lived token for '{target}' and relinked the live \
+                "clauth: {opener} and relinked the live \
                  credentials onto its stored OAuth login."
             );
         } else if on_disk.api_key.is_some() {
             outln!(
-                "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
+                "clauth: {opener} and signed Claude Code \
                  out: it stores no OAuth login, so '{target}' authenticates by api key."
             );
         } else {
@@ -2058,48 +2117,38 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             // other login is refused above): claiming an api key the profile
             // does not hold would be this line's own lie.
             outln!(
-                "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
+                "clauth: {opener} and signed Claude Code \
                  out: it stores no login at all now. Run `clauth login {target}` before \
                  switching to it."
             );
         }
     } else if has_login {
         outln!(
-            "clauth: cleared the long-lived token for '{target}'. Its stored OAuth login \
+            "clauth: {opener}. Its stored OAuth login \
              installs on the next switch:  clauth switch {target}"
         );
     } else if on_disk.api_key.is_some() {
         outln!(
-            "clauth: cleared the long-lived token for '{target}'. It stores no OAuth login, \
+            "clauth: {opener}. It stores no OAuth login, \
              so switching to it authenticates by api key:  clauth switch {target}"
         );
     } else {
         outln!(
-            "clauth: cleared the long-lived token for '{target}'. It stores no login at all \
+            "clauth: {opener}. It stores no login at all \
              now. Run `clauth login {target}` before switching to it."
         );
     }
-    // The backup goes LAST, after the relink: failing between the sidecar
-    // removal and the relink would leave an active profile's live slot a
-    // dangling symlink under a bare "remove failed" — a broken login reported
-    // as nothing-happened. From here the live slot is already sound, so a
-    // failed removal is exactly what its context says and no more.
-    let backup_removed = claude::clear_static_backup(target).with_context(|| {
-        format!(
-            "the long-lived token for '{target}' is cleared, but the preserved mint at \
-             session-token.static.json remains. Remove it by hand, or re-run"
-        )
-    })?;
-    for line in clear_postscripts(target, rolling_armed, backup_removed) {
+    // The disarm already landed on disk, so its postscript prints before the
+    // caller's backup removal: a failed removal must not swallow it.
+    for line in clear_postscripts(target, rolling_armed, false) {
         outln!("{line}");
     }
-    Ok(())
+    Ok(removed)
 }
 
-/// The post-clear report, composed as a value so its GATING is pinnable: there
-/// is no stdout capture in this crate by construction, so a test cannot see
-/// what the command printed — but it can see what this returns for each state,
-/// and the single caller keeps a deleted print a dead-code error.
+/// The post-clear report, composed as a value so its GATING is pinnable
+/// in-process; what each call site prints is pinned through the spawned
+/// binary (`tests/static_token_clear_cli.rs`).
 fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if rolling_armed {
@@ -2109,6 +2158,12 @@ fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) ->
         lines.push(clear_backup_postscript(target));
     }
     lines
+}
+
+/// The report for a clear with nothing to act on: no sidecar, no preserved mint
+/// and no rolling flag, read before the prompt and again under the guard.
+fn clear_nothing_note(target: &str) -> String {
+    format!("clauth: '{target}' holds no long-lived token, so nothing to clear.")
 }
 
 /// The pre-prompt warning that a rolling profile's re-stamping stops with the
