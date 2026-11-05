@@ -14,7 +14,8 @@ use super::chain::reason_marker;
 use super::format::{
     NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, duration_label,
     fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_resume,
-    spinner_frame, spinner_style, truncate, window_label, window_summary_spans_bracketed,
+    spinner_frame, spinner_style, truncate, window_label, window_note_spans,
+    window_summary_spans_bracketed,
 };
 use super::header::identity_wave_spans;
 use super::panes::{
@@ -1195,6 +1196,10 @@ fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
     }
 }
 
+/// The 5h cell of a plan with no 5h limit: the Usage tab's `no limit on this
+/// plan`, cut to fit the column.
+const NO_FIVE_HOUR_LIMIT: &str = "no limit";
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1434,6 +1439,19 @@ fn render_overview_row(
             widths.five_hour,
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
+        ))
+    } else if five_window.is_none()
+        && readings
+            .usage_of(&profile.name)
+            .is_some_and(|usage| usage.no_five_hour_limit)
+    {
+        // A plan with no 5h limit names that shape, as the Usage tab does,
+        // rather than the no-data dash an unread account gets.
+        flatten(window_note_spans(
+            NO_FIVE_HOUR_LIMIT,
+            widths.five_hour,
+            widths.claude_labels.five,
+            true,
         ))
     } else {
         flatten(window_summary_spans_bracketed(

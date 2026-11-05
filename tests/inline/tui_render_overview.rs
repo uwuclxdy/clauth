@@ -8425,3 +8425,40 @@ fn each_providers_first_row_crests_apart_from_the_others() {
         }
     }
 }
+
+/// A plan with no 5h limit reads `no limit` in the 5h column, as the Usage tab
+/// says it; an account that merely has no 5h reading keeps the no-data dash.
+#[test]
+fn a_plan_with_no_five_hour_limit_reads_no_limit_in_the_five_hour_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let week = |name: &str, marked: bool| {
+        let (p, mut r) = polled(name, 95.0, 10.0, 3600);
+        let usage = r.usage.get_mut(name).unwrap();
+        usage.five_hour = None;
+        usage.seven_day = Some(UsageWindow {
+            utilization: 52.0,
+            resets_at: Some(reset_in(5 * 86_400)),
+        });
+        usage.no_five_hour_limit = marked;
+        (p, r)
+    };
+    let (config, readings) = config_with(
+        vec![week("ultra", true), week("unread", false)],
+        Some("ultra"),
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let ultra = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
+    let unread = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+    assert!(ultra.contains("no limit"), "{ultra}");
+    assert!(!unread.contains("no limit"), "{unread}");
+    assert!(
+        unread.contains(super::super::format::NO_DATA),
+        "no reading keeps the dash: {unread}"
+    );
+}

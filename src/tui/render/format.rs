@@ -203,6 +203,29 @@ fn rail_cells(width: usize, label_w: usize) -> usize {
     width.saturating_sub(3 + label_w).min(BAR_CELLS)
 }
 
+/// A cell that holds a note instead of a reading (`no limit`), on the reading
+/// rail the no-data dash sits on, so its right edge meets the readings' in the
+/// rows around it. A note the column cannot hold degrades to that dash.
+pub(super) fn window_note_spans(
+    note: &str,
+    width: usize,
+    label_w: usize,
+    include_bar: bool,
+) -> Vec<Span<'static>> {
+    let note_w = grapheme_cells(note);
+    let rail = if include_bar && width >= BAR_FLOOR + 3 + label_w {
+        3 + rail_cells(width, label_w) + label_w
+    } else {
+        label_w
+    };
+    let text = if note_w <= width {
+        format!("{note:>right$}", right = rail.max(note_w))
+    } else {
+        format!("{NO_DATA:>rail$}")
+    };
+    vec![Span::styled(text, theme::faint())]
+}
+
 /// A window's reading as the bracketed bar prints it, so a column can size its
 /// label width off the same text its rows render.
 pub(super) fn window_label(window: &UsageWindow) -> String {
