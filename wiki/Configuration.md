@@ -233,6 +233,8 @@ clauth edits `config.toml` in place: a save changes only the keys whose setting 
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
+| `plan_ends` | string | none | the day this account's canceled plan ends, as `"YYYY-MM-DD"` in local time, copied from claude.ai's billing page (`Your subscription will be canceled on …`). No endpoint clauth reads names it: Anthropic's profile shows a cancellation only once the plan has ended. Wins over `plan_renews`. The Usage tab's `plan` row, `clauth list`, `status.json` and the plugin's roster show it. A value that is no date is commented out on the next load |
+| `plan_renews` | string | none | the next day this account's plan bills, as `"YYYY-MM-DD"` in local time, copied from claude.ai's billing page; once it passes, clauth carries it forward to the same day of each following month (a 31st bills on a shorter month's last day). No endpoint clauth reads names it. Shown like `plan_ends` |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |

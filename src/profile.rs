@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Local, Weekday};
+use chrono::{Datelike, Local, NaiveDate, Weekday};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -398,6 +398,15 @@ pub(crate) struct Profile {
     /// answered and which only lets serving chain members claim. Lets one account own the weekend without an external
     /// job rewriting `config.toml` twice a day.
     pub(crate) preferred_days: Vec<Weekday>,
+    /// The local day this account's canceled plan ends, copied by the operator
+    /// off claude.ai's billing page: `/profile` shows a cancellation only once
+    /// the plan has ended. Wins over `plan_renews`. Read through
+    /// [`Profile::plan_dates`]: see [`crate::usage::PlanDates`].
+    pub(crate) plan_ends: Option<NaiveDate>,
+    /// A local billing day of this account's renewing plan, copied by the
+    /// operator off claude.ai's billing page; once it passes, the plan renews
+    /// on its monthly anniversaries. No endpoint clauth reads names it.
+    pub(crate) plan_renews: Option<NaiveDate>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
     /// usage chain's current access token on every rotation (full scopes,
     /// `subscriptionType` and `rateLimitTier`, no refresh token — sessions get
@@ -512,6 +521,15 @@ fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth
 }
 
 impl Profile {
+    /// The two plan dates the operator gave this profile (`plan_ends`,
+    /// `plan_renews`), the one input every plan-end surface reads.
+    pub(crate) fn plan_dates(&self) -> crate::usage::PlanDates {
+        crate::usage::PlanDates {
+            ends: self.plan_ends,
+            renews: self.plan_renews,
+        }
+    }
+
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
@@ -529,6 +547,8 @@ impl Profile {
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -2103,6 +2123,14 @@ struct ProfileConfig {
     /// drops it from disk, which is the visible signal it was not understood.
     #[serde(default)]
     preferred_days: Vec<String>,
+    /// The `YYYY-MM-DD` behind [`Profile::plan_ends`]. A string rather than a
+    /// date so an unreadable value costs this key alone: the load reads it as
+    /// unset and comments the line out.
+    #[serde(default)]
+    plan_ends: Option<String>,
+    /// The `YYYY-MM-DD` behind [`Profile::plan_renews`], read the same way.
+    #[serde(default)]
+    plan_renews: Option<String>,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -4868,6 +4896,14 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         last_resort: config.last_resort,
         preferred: config.preferred,
         preferred_days: parse_preferred_days(&config.preferred_days),
+        plan_ends: config
+            .plan_ends
+            .as_deref()
+            .and_then(crate::usage::parse_plan_date),
+        plan_renews: config
+            .plan_renews
+            .as_deref()
+            .and_then(crate::usage::parse_plan_date),
         rolling_token: config.rolling_token,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -4918,6 +4954,8 @@ fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
         last_resort: profile.last_resort,
         preferred: profile.preferred,
         preferred_days: render_preferred_days(&profile.preferred_days),
+        plan_ends: profile.plan_ends.map(crate::usage::render_plan_date),
+        plan_renews: profile.plan_renews.map(crate::usage::render_plan_date),
         rolling_token: profile.rolling_token,
         max_auto_spend: profile.max_auto_spend,
         // Default-on booleans render as commented examples when on, so the
@@ -5820,7 +5858,7 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
 /// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
 /// added to the model without a doc block and example fails a test.
 #[cfg(test)]
-const MODELLED_SCALARS: [&str; 18] = [
+const MODELLED_SCALARS: [&str; 20] = [
     "base_url",
     "api_key",
     "auto_start",
@@ -5831,6 +5869,8 @@ const MODELLED_SCALARS: [&str; 18] = [
     "last_resort",
     "preferred",
     "preferred_days",
+    "plan_ends",
+    "plan_renews",
     "rolling_token",
     "max_auto_spend",
     "check_weekly",
@@ -5933,6 +5973,16 @@ fn push_scalar_doc(out: &mut String, key: &str) {
             );
             out.push_str("# does not is dropped on the next rewrite.\n");
         }
+        "plan_ends" => {
+            out.push_str("# The day this account's canceled plan ends (YYYY-MM-DD, local time), as\n");
+            out.push_str("# claude.ai's billing page states it. clauth cannot read a cancellation\n");
+            out.push_str("# before the plan ends. Wins over plan_renews.\n");
+        }
+        "plan_renews" => {
+            out.push_str("# The next day this account's plan bills (YYYY-MM-DD, local time), as\n");
+            out.push_str("# claude.ai's billing page states it; once it passes, the plan renews\n");
+            out.push_str("# on the same day of each following month. clauth cannot read it.\n");
+        }
         "rolling_token" => {
             out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
             out.push_str("# chain's current access token on every rotation (plan-gated models\n");
@@ -6014,6 +6064,8 @@ fn scalar_example(key: &str) -> String {
         "last_resort" => "# last_resort = true\n".to_string(),
         "preferred" => "# preferred = true\n".to_string(),
         "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n".to_string(),
+        "plan_ends" => "# plan_ends = \"2026-12-31\"\n".to_string(),
+        "plan_renews" => "# plan_renews = \"2026-12-15\"\n".to_string(),
         "rolling_token" => "# rolling_token = true\n".to_string(),
         "max_auto_spend" => "# max_auto_spend = 5.0\n".to_string(),
         "check_weekly" => "# check_weekly = false\n".to_string(),
@@ -6183,6 +6235,21 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("]\n");
     }
     out.push('\n');
+
+    for (key, date) in [
+        ("plan_ends", profile.plan_ends),
+        ("plan_renews", profile.plan_renews),
+    ] {
+        push_scalar_doc(&mut out, key);
+        match date {
+            Some(date) => out.push_str(&format!(
+                "{key} = {}\n",
+                toml_str(&crate::usage::render_plan_date(date))
+            )),
+            None => out.push_str(&scalar_example(key)),
+        }
+        out.push('\n');
+    }
 
     push_scalar_doc(&mut out, "rolling_token");
     if profile.rolling_token {
@@ -7238,6 +7305,8 @@ fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
         "base_url" => (ScalarKind::Str, "base_url"),
         "api_key" => (ScalarKind::Str, "api_key"),
         "effort" => (ScalarKind::Str, "effort"),
+        "plan_ends" => (ScalarKind::Str, "plan_ends"),
+        "plan_renews" => (ScalarKind::Str, "plan_renews"),
         "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
         "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
         "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
@@ -7403,6 +7472,8 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
         "last_resort" => on_disk.last_resort != canonical.last_resort,
         "preferred" => on_disk.preferred != canonical.preferred,
         "preferred_days" => on_disk.preferred_days != canonical.preferred_days,
+        "plan_ends" => on_disk.plan_ends != canonical.plan_ends,
+        "plan_renews" => on_disk.plan_renews != canonical.plan_renews,
         "rolling_token" => on_disk.rolling_token != canonical.rolling_token,
         "max_auto_spend" => on_disk.max_auto_spend != canonical.max_auto_spend,
         "check_weekly" => on_disk.check_weekly != canonical.check_weekly,
@@ -7538,6 +7609,15 @@ fn apply_config_edits(
             edit_preferred_days_load(doc, &od.preferred_days, &canonical.preferred_days);
         }
     }
+    for (key, od_date, ca_date) in [
+        ("plan_ends", &od.plan_ends, &canonical.plan_ends),
+        ("plan_renews", &od.plan_renews, &canonical.plan_renews),
+    ] {
+        match mode {
+            ConfigEditMode::Save => edit_string_scalar(doc, od_date, ca_date, key),
+            ConfigEditMode::Load => edit_plan_date_load(doc, od_date, ca_date, key),
+        }
+    }
     edit_bool_scalar(
         doc,
         od.rolling_token,
@@ -7598,6 +7678,25 @@ fn edit_threshold_load(
         comment_out_scalar(doc, key);
     } else {
         edit_f64_scalar(doc, od, ca, key);
+    }
+}
+
+/// An unreadable `plan_ends` or `plan_renews` date is commented out in place,
+/// the way an ignored threshold is; a readable one spelled another way is
+/// written back in its `YYYY-MM-DD` form.
+fn edit_plan_date_load(
+    doc: &mut toml_edit::DocumentMut,
+    od: &Option<String>,
+    ca: &Option<String>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_none() {
+        comment_out_scalar(doc, key);
+    } else {
+        edit_string_scalar(doc, od, ca, key);
     }
 }
 

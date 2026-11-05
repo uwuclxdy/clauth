@@ -379,6 +379,13 @@ fn profile_row(
     {
         row["credit_capped"] = serde_json::json!(true);
     }
+    // When the plan ends or renews, emitted only when the operator gave a
+    // date: the picker is choosing where to spend, and a plan that ends soon
+    // is quota to use first. The same object `status.json` publishes.
+    if let Some(end) = crate::usage::local_date_of(now).and_then(|today| p.plan_dates().end(today))
+    {
+        row["plan_end"] = serde_json::json!(crate::daemon::PlanEndEntry::of(end));
+    }
     row
 }
 

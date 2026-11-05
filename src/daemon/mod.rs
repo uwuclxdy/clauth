@@ -70,7 +70,7 @@ use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::{
-    ProfileEntry, build_codex_entries, build_profile_entries, build_status,
+    PlanEndEntry, ProfileEntry, build_codex_entries, build_profile_entries, build_status,
 };
 // The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).

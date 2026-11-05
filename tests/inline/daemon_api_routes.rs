@@ -4658,8 +4658,8 @@ fn status_body_requires_only_what_every_supported_daemon_sends() {
 }
 
 /// [`status_body_requires_only_what_every_supported_daemon_sends`] for one
-/// `profiles[]` entry: `auto_start_queue` is `#[serde(default)]`, so it is
-/// documented but optional.
+/// `profiles[]` entry: `auto_start_queue` and `plan_end` are
+/// `#[serde(default)]`, so they are documented but optional.
 #[test]
 fn profile_entry_requires_only_what_every_supported_daemon_sends() {
     assert_eq!(
@@ -4686,10 +4686,12 @@ fn profile_entry_requires_only_what_every_supported_daemon_sends() {
         ],
         "ProfileEntry's required set"
     );
-    assert!(
-        documents("ProfileEntry", "auto_start_queue"),
-        "ProfileEntry documents auto_start_queue"
-    );
+    for additive in ["auto_start_queue", "plan_end"] {
+        assert!(
+            documents("ProfileEntry", additive),
+            "ProfileEntry documents {additive}"
+        );
+    }
 }
 
 /// `SessionRow`'s `via`/`lacks` stay optional (the 2026-10-16 additive-field

@@ -18,6 +18,10 @@ pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
+// When a plan ends or renews, off the two dates the operator copies from
+// claude.ai's billing page.
+mod plan_end;
+pub(crate) use plan_end::{PlanDates, PlanEnd, local_date_of, parse_plan_date, render_plan_date};
 // The auto-start kick sends the probe's request, so the two cannot drift apart.
 pub(crate) use inference::anthropic::send as anthropic_send;
 mod scheduler;
