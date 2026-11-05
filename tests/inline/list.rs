@@ -281,6 +281,33 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
     );
 }
 
+/// The disabled ACTIVE account stays listed on a plain run, and its row says
+/// it is disabled.
+#[test]
+fn list_table_marks_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    let mut work = oauth("work");
+    work.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![work],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines, [HEADER, &format!("{WORK_ROW} (disabled)")]);
+}
+
 /// The `clauth list` table for `config`, every profile shown.
 fn rendered_table(config: &AppConfig) -> String {
     render_table(

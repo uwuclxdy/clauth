@@ -110,6 +110,8 @@ fn build_status_top_level_shape_and_active() {
             "bell_threshold",
             // Additive (#93): the usage-credit cap, no dollar amounts.
             "credit_capped",
+            // Additive: the account's disabled flag, on every body.
+            "disabled",
             "extra_usage",
             "fallback",
             "fetch_status",
@@ -309,6 +311,92 @@ fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles(
         names.contains(&active_name),
         "active_profile must always resolve against an entry in profiles[] — no dangling reference"
     );
+}
+
+/// Each entry says whether its account is disabled, on the default body too:
+/// the disabled ACTIVE account is the one absence cannot reveal there.
+#[test]
+fn every_entry_says_whether_its_account_is_disabled() {
+    let _home = HomeSandbox::new();
+    let mut active_off = oauth_profile("active-off");
+    active_off.disabled = true;
+    let mut other_off = oauth_profile("other-off");
+    other_off.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![active_off, oauth_profile("on"), other_off],
+    };
+    config.state.active_profile = Some("active-off".into());
+
+    let flags = |include_disabled: bool| -> Vec<(String, serde_json::Value)> {
+        status_value(&config, 300_000, None, include_disabled)["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap().to_owned(),
+                    p["disabled"].clone(),
+                )
+            })
+            .collect()
+    };
+    let entry = |name: &str, disabled: bool| (name.to_owned(), serde_json::json!(disabled));
+    assert_eq!(
+        flags(false),
+        [entry("active-off", true), entry("on", false)],
+        "the default body marks the disabled active account"
+    );
+    assert_eq!(
+        flags(true),
+        [
+            entry("active-off", true),
+            entry("on", false),
+            entry("other-off", true),
+        ],
+        "the whole-roster body marks every disabled account"
+    );
+
+    // Being active says nothing about being disabled.
+    let mut enabled_active = config.clone();
+    enabled_active.state.active_profile = Some("on".into());
+    let body = status_value(&enabled_active, 300_000, None, false);
+    let on = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "on")
+        .expect("the active entry");
+    assert_eq!(on["active"], serde_json::json!(true));
+    assert_eq!(on["disabled"], serde_json::json!(false));
+}
+
+/// A codex entry carries the field too, so a reader needs no harness check;
+/// the codex roster has no disabled state, so it always reads `false`.
+#[test]
+fn a_codex_entry_reads_as_enabled() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\"]\n",
+    )
+    .unwrap();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("on")],
+    };
+
+    let v = status_value(&config, 300_000, None, false);
+    let codex = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "cx1")
+        .expect("the codex entry");
+    assert_eq!(codex["active"], serde_json::json!(true));
+    assert_eq!(codex["disabled"], serde_json::json!(false));
 }
 
 // ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
@@ -2212,6 +2300,7 @@ fn status_body_matches_legacy_json_bytes() {
                 credit_capped: false,
                 limit_resets: Some(3),
                 limit_resets_read_at: Some("2026-09-12T23:40:00+00:00".to_string()),
+                disabled: false,
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2239,6 +2328,7 @@ fn status_body_matches_legacy_json_bytes() {
                 credit_capped: false,
                 limit_resets: None,
                 limit_resets_read_at: None,
+                disabled: false,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2269,6 +2359,7 @@ fn status_body_matches_legacy_json_bytes() {
                 credit_capped: false,
                 limit_resets: None,
                 limit_resets_read_at: None,
+                disabled: false,
             },
         ],
     };
@@ -2288,20 +2379,20 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
         r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3,"#,
-        r#""limit_resets_read_at":"2026-09-12T23:40:00+00:00"},"#,
+        r#""limit_resets_read_at":"2026-09-12T23:40:00+00:00","disabled":false},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
         r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
-        r#""limit_resets_read_at":null},"#,
+        r#""limit_resets_read_at":null,"disabled":false},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
         r#""extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
-        r#""limit_resets_read_at":null}]}"#,
+        r#""limit_resets_read_at":null,"disabled":false}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 

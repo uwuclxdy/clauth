@@ -313,6 +313,12 @@ pub(crate) struct ProfileEntry {
     /// stand in for this. Never required: an older daemon's body lacks it.
     #[serde(default)]
     pub(crate) limit_resets_read_at: Option<String>,
+    /// The account is user-disabled. Absence from `profiles[]` cannot say so:
+    /// the active account is listed either way.
+    /// Never required: an older daemon's body lacks it, so a reader defaults
+    /// it to `false`.
+    #[serde(default)]
+    pub(crate) disabled: bool,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -684,6 +690,7 @@ pub(crate) fn build_profile_entries(
                     .and_then(|r| r.fetched_at)
                     .filter(|at| *at <= now_ms())
                     .map(ms_to_iso),
+                disabled: p.is_disabled(),
             }
         })
         .collect()
@@ -775,6 +782,8 @@ pub(crate) fn build_codex_entries(
                 // A codex count rides the usage cache, so the time that file
                 // landed dates it, as it dates the entry; no count dates nothing.
                 limit_resets_read_at: banked_resets.and(mtime_ms).map(ms_to_iso),
+                // The codex roster has no disabled state.
+                disabled: false,
             }
         })
         .collect()

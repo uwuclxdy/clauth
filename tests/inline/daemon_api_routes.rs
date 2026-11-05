@@ -4741,6 +4741,15 @@ fn profile_entry_requires_only_what_every_supported_daemon_sends() {
         documents("ProfileEntry", "limit_resets_read_at"),
         "ProfileEntry documents limit_resets_read_at"
     );
+    assert!(
+        documents("ProfileEntry", "disabled"),
+        "ProfileEntry documents disabled"
+    );
+    assert_eq!(
+        served_schema("ProfileEntry")["properties"]["disabled"]["type"],
+        serde_json::json!("boolean"),
+        "disabled is a plain boolean"
+    );
 }
 
 /// The API's account view carries the banked count each account's last read
