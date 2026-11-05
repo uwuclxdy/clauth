@@ -4144,10 +4144,10 @@ mod static_token_verdicts {
 /// deleted print is a dead-code error under `-D warnings`).
 mod armed_report_copy {
     use super::*;
+    use crate::testutil::HomeSandbox;
 
     /// The active account's confirm line promises what the clear will do, so
-    /// each of its three arms is pinned whole: this line is TTY-only and no
-    /// behavioral test reaches it.
+    /// each of its three arms is pinned whole.
     #[test]
     fn the_active_clear_prompt_names_what_the_account_falls_back_to() {
         assert_eq!(
@@ -4167,10 +4167,152 @@ mod armed_report_copy {
         );
     }
 
+    /// An ACTIVE api-key account with a long-lived sidecar and the rolling flag
+    /// as given: the shape whose confirm line promises the api-key fall-back.
+    fn active_api_key_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(
+            name.to_string(),
+            None,
+            Some("sk-ant-api03-confirm-fixture".to_string()),
+        );
+        profile.rolling_token = rolling_flag;
+        crate::profile::save_profile(&profile).expect("save profile");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            active_profile: Some(profile.name.clone()),
+            ..Default::default()
+        })
+        .expect("activate");
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from(name),
+            "sk-ant-oat01-clear-confirm-mint000000",
+            crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+        )
+        .expect("mint the sidecar");
+    }
+
+    /// An ACTIVE account holding nothing but the rolling flag: the third arm of
+    /// the confirm line, and the shape with no other login to refuse over.
+    fn active_flag_only_profile(name: &str) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = true;
+        crate::profile::save_profile(&profile).expect("save profile");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            active_profile: Some(profile.name.clone()),
+            ..Default::default()
+        })
+        .expect("activate");
+    }
+
+    /// ANSWERING NO: the TTY-only prompt arm runs, the account keeps its
+    /// long-lived token and its flag. The seam stands in for both the TTY check
+    /// and the read, so this arm is reachable in-process.
+    #[test]
+    fn the_active_clear_prompt_declines_on_n_without_touching_anything() {
+        let home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-n", true);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-n"))
+            .expect("dir");
+        let _confirm = ClearConfirmAnswer::set(&home, "n\n");
+        let out = crate::out::OutCapture::new();
+        let _capture = out.capture_here();
+
+        cmd_static_token_clear("cl-confirm-n", false).expect("declining the prompt is a success");
+
+        let stdout = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+        assert_eq!(
+            stdout,
+            format!(
+                "clauth: 'cl-confirm-n' is active and stores no OAuth login. Clearing signs \
+                 Claude Code out, leaving 'cl-confirm-n' on its api key, and running sessions \
+                 follow.\n{}\nClear the long-lived token for 'cl-confirm-n'? [y/N] clauth: \
+                 aborted. 'cl-confirm-n' left unchanged.\n",
+                clear_disarm_note("cl-confirm-n")
+            )
+        );
+        assert!(
+            dir.join("session-token.json").exists(),
+            "a declined clear leaves the long-lived token on disk"
+        );
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("cl-confirm-n"))
+                .expect("reload");
+        assert!(
+            reloaded.rolling_token,
+            "a declined clear leaves the rolling flag armed"
+        );
+    }
+
+    /// ANSWERING YES: the same arm runs past the prompt and the token is gone.
+    #[test]
+    fn the_active_clear_prompt_clears_the_token_on_y() {
+        let home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-y", false);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-y"))
+            .expect("dir");
+        let _confirm = ClearConfirmAnswer::set(&home, "y\n");
+
+        cmd_static_token_clear("cl-confirm-y", false).expect("the confirmed clear succeeds");
+
+        assert!(
+            !dir.join("session-token.json").exists(),
+            "a confirmed clear removes the long-lived token"
+        );
+    }
+
+    /// The flag-only active account is the arm that must not promise an api key
+    /// it does not hold; answering yes still clears the flag it does hold.
+    #[test]
+    fn the_flag_only_active_clear_prompt_clears_the_flag_on_y() {
+        let home = HomeSandbox::new();
+        active_flag_only_profile("cl-confirm-flag");
+        let _confirm = ClearConfirmAnswer::set(&home, "y\n");
+        let out = crate::out::OutCapture::new();
+        let _capture = out.capture_here();
+
+        cmd_static_token_clear("cl-confirm-flag", false).expect("the confirmed clear succeeds");
+
+        let stdout = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+        assert_eq!(
+            stdout.lines().next(),
+            Some(
+                "clauth: 'cl-confirm-flag' is active and stores no login at all. Clearing signs \
+                 Claude Code out, and running sessions follow."
+            )
+        );
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("cl-confirm-flag"))
+                .expect("reload");
+        assert!(
+            !reloaded.rolling_token,
+            "a confirmed clear disarms the flag and nothing re-stamps the sidecar"
+        );
+    }
+
+    /// With no answer to read, the clear refuses before touching anything. The
+    /// real terminal check is pinned on the binary
+    /// (`a_clear_off_a_terminal_without_yes_refuses`).
+    #[test]
+    fn a_clear_with_no_answer_and_no_yes_refuses() {
+        let _home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-tty", false);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-tty"))
+            .expect("dir");
+
+        let err = cmd_static_token_clear("cl-confirm-tty", false).expect_err("no terminal");
+
+        assert_eq!(
+            err.to_string(),
+            "pass --yes to clear the long-lived token for 'cl-confirm-tty' non-interactively"
+        );
+        assert!(dir.join("session-token.json").exists());
+    }
+
     /// The four clear copy lines, pinned on CONTENT like every other line in
-    /// this mod: single-caller keeps a deleted print a dead-code error, but
-    /// only a pin keeps the WORDS — both pre-prompt lines are TTY-only, so no
-    /// behavioral test ever executes them, and the two postscripts are the
+    /// this mod: single-caller keeps a deleted print a dead-code error, and the
+    /// behavioral tests above reach the active and disarm lines through the
+    /// confirm seam, but only a pin keeps the WORDS — and the two postscripts are the
     /// operator's only confirmation of what actually moved.
     #[test]
     fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {

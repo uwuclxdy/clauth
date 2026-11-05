@@ -1913,7 +1913,6 @@ fn setup_token_into(
 /// an active api-key profile must not leave an Anthropic login serving, but the
 /// opposite of the relink every line here used to promise.
 fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
-    use std::io::IsTerminal as _;
     platform::init();
 
     let config = load_config()?;
@@ -1949,7 +1948,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
 
     let active = config.is_active(target);
     if !yes {
-        if !std::io::stdin().is_terminal() {
+        // A test's installed answer stands in for the TTY check as well as the
+        // read, so the prompt's arm runs in-process without a terminal.
+        #[cfg(test)]
+        let seam_answer = CLEAR_CONFIRM_ANSWER.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        let interactive = seam_answer.is_some();
+        #[cfg(not(test))]
+        let interactive = {
+            use std::io::IsTerminal as _;
+            std::io::stdin().is_terminal()
+        };
+        if !interactive {
             anyhow::bail!(
                 "pass --yes to clear the long-lived token for '{target}' non-interactively"
             );
@@ -1972,8 +1982,14 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             outln!("{}", clear_backup_note(target));
         }
         out!("Clear the long-lived token for '{target}'? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
+        #[cfg(test)]
+        let answer = seam_answer.unwrap_or_default();
+        #[cfg(not(test))]
+        let answer = {
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            answer
+        };
         if !reauth_confirmed(&answer) {
             outln!("clauth: aborted. '{target}' left unchanged.");
             return Ok(());
@@ -2183,10 +2199,43 @@ fn clear_active_note(target: &str, has_login: bool, has_api_key: bool) -> String
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the answer a test's clear command confirms with, standing in
+    /// for both the TTY check and the read. Thread-local so a concurrent test's
+    /// answer never reaches this thread's command.
+    static CLEAR_CONFIRM_ANSWER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only RAII over [`CLEAR_CONFIRM_ANSWER`], cleared on drop. Tied to the
+/// `HomeSandbox` so it cannot outlive the test's home, and `!Send` because the
+/// slot is this thread's.
+#[cfg(test)]
+pub(crate) struct ClearConfirmAnswer<'a>(
+    std::marker::PhantomData<(&'a crate::testutil::HomeSandbox, *const ())>,
+);
+
+#[cfg(test)]
+impl<'a> ClearConfirmAnswer<'a> {
+    pub(crate) fn set(_home: &'a crate::testutil::HomeSandbox, answer: &str) -> Self {
+        CLEAR_CONFIRM_ANSWER.with(|slot| *slot.borrow_mut() = Some(answer.to_string()));
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClearConfirmAnswer<'_> {
+    fn drop(&mut self) {
+        CLEAR_CONFIRM_ANSWER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// The pre-prompt warning that a rolling profile's re-stamping stops with the
 /// clear. Single-caller fns, like the arm-report copy and for the same reason:
-/// there is no stdout capture, so the unit pin is on content and a deleted
-/// print orphans the fn into a dead-code error under `-D warnings`.
+/// the confirm seam reaches the print in a test, but only a content pin keeps
+/// the WORDS, and a deleted print orphans the fn into a dead-code error under
+/// `-D warnings`.
 fn clear_disarm_note(target: &str) -> String {
     format!("clauth: '{target}' is on the rolling token. Clearing also turns its re-stamping off.")
 }
