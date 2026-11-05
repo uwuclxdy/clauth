@@ -257,6 +257,14 @@ preferred_days = ["sat", "sun"]
 
 Two accounts naming the same day is not rejected: the chain returns to whichever of them reads clear first, so nothing is left with nobody home. clauth still says so once — a toast in the TUI, a line in the log — and says it again at the midnight rollover or after an edit, never once per tick.
 
+## TLS trust
+
+clauth's outbound HTTPS trusts the OS trust store — the same roots curl uses — instead of a bundled set. The `SSL_CERT_FILE` environment variable replaces that store with the certificates in the named file (curl/OpenSSL semantics): exactly those certificates are the roots. `SSL_CERT_DIR` is not read while the file is set.
+
+A file clauth cannot use — unreadable, not a regular file, too large, or carrying no certificate — logs one warning naming it. On Linux clauth then fails closed with no trust roots (the platform verifier would re-read the same unguarded file), exactly as curl behaves, until the file is fixed or unset; on macOS and Windows the system store answers instead.
+
+Login/refresh, usage and codex usage keep the roots they resolved at their first request, so a change to the file's contents takes a restart to reach them; the pricing and status feeds, proxy checks, update checks and gateway probes read it again on each call.
+
 ## Storage layout
 
 ```
