@@ -2402,15 +2402,15 @@ impl Daemon {
 
     /// The headless half of the 5h bell, judged on the figures this tick just
     /// published so the bell and the feed never disagree. With no
-    /// `bell_command` the latch is left as it is,
-    /// so setting one mid-crossing does not re-announce a bell already rung.
+    /// `bell_command` a present account keeps its latch as it is, so setting
+    /// one mid-crossing does not re-announce a bell already rung; a deleted
+    /// account is forgotten either way.
     fn ring_bells(
         &mut self,
         roster: &[crate::profile::Profile],
         entries: &[status_json::ProfileEntry],
         command: Option<&str>,
     ) {
-        let Some(command) = command else { return };
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its standing bell
         // must not re-arm when it comes back into view. Only a deleted account
@@ -2418,6 +2418,7 @@ impl Daemon {
         // whole bell population.
         let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
         self.bells.forget_absent(&present);
+        let Some(command) = command else { return };
         for entry in entries {
             let fresh = entry_fresh(entry);
             let util = entry

@@ -5921,6 +5921,53 @@ fn an_account_deleted_from_the_roster_re_arms_the_headless_bell() {
     );
 }
 
+/// The forget is about the roster, not the bell's delivery: an account deleted
+/// while no `bell_command` is set is still gone, so re-creating it past the
+/// line under a command rings a fresh crossing.
+#[test]
+fn an_account_deleted_with_no_bell_command_set_re_arms_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    // The command goes, then the account goes under it.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.state.bell_command = None;
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    d.write_status();
+    // The account comes back past the line with the command set again.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-bell");
+        profile.bell_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.bell_command = Some("notify-send %s".to_string());
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+        ]
+    );
+}
+
 /// A disabled account is hidden from the body but still on the roster, so its
 /// standing bell must survive the hide: re-enabling it still past the line
 /// rings nothing new. The ringing account is non-active, since the active
