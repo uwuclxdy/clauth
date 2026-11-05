@@ -1,5 +1,5 @@
 //! `clauth rename` against the real binary: the record and the profile
-//! directory move together, and each refusal exits 2 with nothing moved.
+//! directory move together, and a refusal of either name moves nothing.
 //!
 //! Unix only, for the reason `tests/oauth_token_cli.rs` gives: the child
 //! resolves its home through `$HOME`, which only Unix lets a test point at a
@@ -92,28 +92,31 @@ fn rename_moves_the_record_and_the_directory() {
 
 #[test]
 fn rename_refuses_and_moves_nothing() {
-    let cases: &[(&[&str], &str)] = &[
+    let cases: &[(&[&str], i32, &str)] = &[
         (
             &["rename", "spare", "MAIN"],
+            1,
             "Error: a profile named 'MAIN' already exists\n",
         ),
         (
             &["rename", "cx", "work"],
+            2,
             "Error: 'cx' is a codex profile; rename is claude-only\n",
         ),
         (
             &["rename", "nope", "work"],
+            2,
             "Error: profile 'nope' not found\navailable: main, spare\n",
         ),
     ];
-    for (args, stderr) in cases {
+    for (args, code, stderr) in cases {
         let home = tempfile::tempdir().unwrap();
         seed_roster(home.path());
         let before = roster(home.path());
 
         let out = run(home.path(), args);
 
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(out.status.code(), Some(*code), "{args:?}");
         assert_eq!(String::from_utf8_lossy(&out.stderr), *stderr, "{args:?}");
         assert_eq!(
             roster(home.path()),
@@ -122,6 +125,26 @@ fn rename_refuses_and_moves_nothing() {
         );
         assert!(profile_dir(home.path(), "spare").exists(), "{args:?}");
     }
+}
+
+/// A claude name reaches the codex roster only through the new name's check,
+/// and a roster that fails to load there is a runtime failure, not bad usage.
+#[test]
+fn a_corrupt_codex_roster_fails_the_rename_as_a_runtime_error() {
+    let home = tempfile::tempdir().unwrap();
+    seed_roster(home.path());
+    std::fs::write(
+        home.path().join(".clauth").join("codex-profiles.toml"),
+        "profiles = [not toml",
+    )
+    .unwrap();
+    let before = roster(home.path());
+
+    let out = run(home.path(), &["rename", "spare", "work"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(roster(home.path()), before);
+    assert!(profile_dir(home.path(), "spare").exists());
 }
 
 #[test]

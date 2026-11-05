@@ -2412,9 +2412,11 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 }
 
 /// `clauth rename <profile> <new>` — the Setup tab's rename from the shell.
-/// No confirm gate: a rename moves nothing out of reach and renames back the
-/// same way.
+/// No confirm gate, same as the Setup tab: nothing is removed. A name that
+/// `validate_new_name` now refuses can't be renamed back to, though.
 fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
+    use crate::harness::Harness;
+
     platform::init();
     let mut config = load_config()?;
     let old = resolve_or_bail(&config, name, "rename")?;
@@ -2424,12 +2426,7 @@ fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
         outln!("clauth: '{old}' already has that name.");
         return Ok(());
     }
-    actions::validate_profile_name(
-        new_name,
-        crate::harness::Harness::Claude,
-        Some(old.as_str()),
-    )
-    .map_err(|e| usage_error(e.to_string()))?;
+    actions::validate_profile_name(new_name, Harness::Claude, Some(old.as_str()))?;
     let new = ProfileName::from(new_name);
 
     // Renaming the active profile relinks the live slot, the same settle
@@ -2437,7 +2434,12 @@ fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let _placed = {
         let was_active = config.is_active(&old);
-        settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::Switch)?
+        let placed =
+            settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::Switch)?;
+        // The settle's prompt can save an unplaced login under the name typed
+        // here, so the check above may no longer hold.
+        actions::validate_profile_name(new_name, Harness::Claude, Some(old.as_str()))?;
+        placed
     };
     let rotation = actions::rotation_guard_for_mutation(&old)?;
     actions::rename_profile(&mut config, &old, &new, &rotation)?;

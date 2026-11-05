@@ -2276,7 +2276,11 @@ pub(crate) fn rename_profile(
         note_rename(old, new);
 
         if was_active {
-            link_profile_credentials(new)?;
+            // The record has landed, so a bare refusal here would read as a
+            // failed rename, and its retry as `'old' not found`.
+            link_profile_credentials(new).with_context(|| {
+                format!("renamed '{old}' to '{new}', but the live credentials were not relinked")
+            })?;
         }
         Ok(())
     })?;

@@ -140,8 +140,9 @@ pub(crate) enum Command {
 
     /// Rename a profile, keeping its credentials, chain slot, and settings
     ///
-    /// The same rename as the TUI's Setup tab. Refused while a live `clauth
-    /// start` session holds the profile, and for a codex profile.
+    /// The same rename as the TUI's Setup tab. Stops the profile's background
+    /// supervisors first. Refused while a live `clauth start` session holds the
+    /// profile or a supervisor can't be stopped, and for a codex profile.
     Rename {
         /// Profile to rename.
         profile: String,
