@@ -448,8 +448,15 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .map(|e| format!(", ends {}", stamp(e)))
             .unwrap_or_default();
         let suffix = if marked { "  (used next)" } else { "" };
+        // A banked reset the server will not spend yet is still left, but it
+        // is not available: the rows must add up to the header's usable count.
+        let count_word = if grant.usable_now {
+            "available"
+        } else {
+            "left"
+        };
         lines.push(format!(
-            "  {} {}: {} of {} left, clears {}, {}{ends}{suffix}",
+            "  {} {}: {} of {} {count_word}, clears {}, {}{ends}{suffix}",
             if marked { "*" } else { " " },
             grant.label(),
             grant.resets_left,
@@ -472,7 +479,7 @@ pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> S
         )
     };
     let mut prompt = format!(
-        "{head} It clears {} now and cannot be undone; {} of {} left on it.",
+        "{head} It clears {} now and cannot be undone; {} of {} available on it.",
         clears_summary(&grant.clears),
         grant.resets_left,
         grant.resets_total,

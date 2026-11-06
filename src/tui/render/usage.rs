@@ -455,7 +455,7 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(resets) = row.resets.filter(|n| *n > 0) {
         lines.push(Line::from(vec![
             key_span("resets"),
-            Span::styled(format!("{resets} left"), theme::accent()),
+            Span::styled(format!("{resets} available"), theme::accent()),
         ]));
     }
     lines.push(Line::from(vec![
@@ -622,7 +622,7 @@ fn build_usage_lines(
     // pair (a hybrid with a pair included), so a pane without a reading
     // draws no row.
     if let Some(resets) = app.claude_resets.get(profile.name.as_str())
-        && let Some(row) = claude_resets_line(resets)
+        && let Some(row) = claude_resets_line(resets, inner_w)
     {
         lines.insert(1, row);
     }
@@ -744,15 +744,16 @@ fn build_usage_lines(
 /// read missed a slot.
 const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
-/// The claude pane's `resets` row off the hourly side read: `N left`, the
+/// The claude pane's `resets` row off the hourly side read: `N available`, the
 /// windows the next grant clears, its end as the local month/day, and the
 /// reading's age once it passes 75 min. Each `· …` part drops when its field
-/// is absent; no usable reset draws no row.
-fn claude_resets_line(resets: &crate::usage::LimitResets) -> Option<Line<'static>> {
+/// is absent; no usable reset draws no row. A row past `inner_w` ends on `…`,
+/// so a cut date never reads as a different date.
+fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Option<Line<'static>> {
     if resets.usable == 0 {
         return None;
     }
-    let mut parts = vec![format!("{} left", resets.usable)];
+    let mut parts = vec![format!("{} available", resets.usable)];
     if !resets.clears.is_empty() {
         let labels = resets
             .clears
@@ -771,9 +772,10 @@ fn claude_resets_line(resets: &crate::usage::LimitResets) -> Option<Line<'static
     {
         parts.push(format!("read {}", relative_age(stamp)));
     }
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
     Some(Line::from(vec![
         key_span("resets"),
-        Span::styled(parts.join(" · "), theme::accent()),
+        Span::styled(truncate(&parts.join(" · "), value_width), theme::accent()),
     ]))
 }
 

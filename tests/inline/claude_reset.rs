@@ -46,8 +46,8 @@ fn a_grant_list_marks_the_servers_next_grant() {
         describe_grants("cl1", &status(THREE_GRANTS)),
         [
             "clauth: 'cl1' has 2 limit resets usable now.",
-            "    Old refill: 1 of 1 left, clears 5h, usable now",
-            "  * Weekly refill: 1 of 2 left, clears 5h and 7d, usable now  (used next)",
+            "    Old reset: 1 of 1 available, clears 5h, usable now",
+            "  * Weekly reset: 1 of 2 available, clears 5h and 7d, usable now  (used next)",
             "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable (cooldown)",
         ]
     );
@@ -67,11 +67,32 @@ fn a_grant_with_an_end_names_it_after_its_state() {
     );
     let lines = describe_grants("cl1", &status(&body));
     assert!(
-        lines[2].starts_with("  * Weekly refill: 1 of 2 left, clears 5h and 7d, usable now, ends "),
+        lines[2]
+            .starts_with("  * Weekly reset: 1 of 2 available, clears 5h and 7d, usable now, ends "),
         "{}",
         lines[2]
     );
     assert!(lines[2].ends_with("  (used next)"), "{}", lines[2]);
+}
+
+/// The server's label is cut to 40 cells on both surfaces that print it.
+#[test]
+fn a_long_server_label_is_cut_on_both_surfaces() {
+    let body = THREE_GRANTS.replacen(
+        r#""label": "Weekly reset""#,
+        &format!(r#""label": "{}""#, "x".repeat(500)),
+        1,
+    );
+    let status = status(&body);
+    let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
+    let cut = format!("{}...", "x".repeat(37));
+    assert!(prompt.contains(&format!("\"{cut}\" on 'cl1'")), "{prompt}");
+    let lines = describe_grants("cl1", &status);
+    assert!(
+        lines[2].starts_with(&format!("  * {cut}: 1 of 2")),
+        "{}",
+        lines[2]
+    );
 }
 
 #[test]
@@ -80,8 +101,8 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     let grant = at_limit.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &at_limit, grant),
-        "clauth: use the limit reset \"Weekly refill\" on 'cl1'? It clears 5h and 7d now \
-         and cannot be undone; 1 of 2 left on it."
+        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+         and cannot be undone; 1 of 2 available on it."
     );
 
     let early = status(
@@ -96,19 +117,19 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     let grant = early.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &early, grant),
-        "clauth: use the limit reset \"Weekly refill\" on 'cl1'? It clears 5h and 7d now \
-         and cannot be undone; 1 of 2 left on it. 'cl1' still has 60% of its 7d left.",
+        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+         and cannot be undone; 1 of 2 available on it. 'cl1' still has 60% of its 7d left.",
         "short of a limit, the warning names the cleared window the reset throws the most \
          headroom away on"
     );
 
     let untitled =
-        status(&THREE_GRANTS.replacen(r#""label": "Weekly refill""#, r#""label": """#, 1));
+        status(&THREE_GRANTS.replacen(r#""label": "Weekly reset""#, r#""label": """#, 1));
     let grant = untitled.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &untitled, grant),
         "clauth: use a limit reset on 'cl1'? It clears 5h and 7d now and cannot be undone; \
-         1 of 2 left on it."
+         1 of 2 available on it."
     );
 }
 
@@ -123,8 +144,8 @@ fn the_prompt_names_the_weekly_reset_it_leaves_in_place() {
     let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
     assert!(
         prompt.starts_with(
-            "clauth: use the limit reset \"Weekly refill\" on 'cl1'? It clears 5h and 7d now \
-             and cannot be undone; 1 of 2 left on it. The weekly reset stays "
+            "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+             and cannot be undone; 1 of 2 available on it. The weekly reset stays "
         ),
         "{prompt}"
     );
@@ -136,8 +157,8 @@ fn the_prompt_names_the_weekly_reset_it_leaves_in_place() {
 #[test]
 fn server_text_reaches_the_terminal_without_control_characters() {
     let body = THREE_GRANTS.replacen(
-        r#""label": "Weekly refill""#,
-        r#""label": "Weekly\u001b]52;c;AAAA\u0007 refill""#,
+        r#""label": "Weekly reset""#,
+        r#""label": "Weekly\u001b]52;c;AAAA\u0007 reset""#,
         1,
     );
     let status = status(&body);
@@ -146,7 +167,7 @@ fn server_text_reaches_the_terminal_without_control_characters() {
     for text in std::iter::once(&prompt).chain(lines.iter()) {
         assert!(!text.chars().any(char::is_control), "{text:?}");
     }
-    assert!(prompt.contains("\"Weekly]52;c;AAAA refill\""), "{prompt}");
+    assert!(prompt.contains("\"Weekly]52;c;AAAA reset\""), "{prompt}");
 }
 
 #[test]
@@ -359,8 +380,8 @@ fn a_grant_list_with_no_next_grant_still_lists_every_grant() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    Old refill: 1 of 1 left, clears 5h, usable now",
-            "    Weekly refill: 1 of 2 left, clears 5h and 7d, usable now",
+            "    Old reset: 1 of 1 available, clears 5h, usable now",
+            "    Weekly reset: 1 of 2 available, clears 5h and 7d, usable now",
             "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable (cooldown)",
         ]
     );
@@ -388,8 +409,8 @@ fn server_text_drops_format_characters_and_is_bounded() {
     let long = "x".repeat(500);
     let body = THREE_GRANTS
         .replacen(
-            r#""label": "Weekly refill""#,
-            "\"label\": \"Weekly\u{202e} refill\u{200b}\"",
+            r#""label": "Weekly reset""#,
+            "\"label\": \"Weekly\u{202e} reset\u{200b}\"",
             1,
         )
         .replacen(
@@ -410,7 +431,7 @@ fn server_text_drops_format_characters_and_is_bounded() {
             "a server reason is cut to 40 cells: {text}"
         );
     }
-    assert!(prompt.contains("\"Weekly refill\u{200b}\""), "{prompt}");
+    assert!(prompt.contains("\"Weekly reset\u{200b}\""), "{prompt}");
 }
 
 /// A reason that says the server could not settle the outcome is never read
@@ -558,7 +579,7 @@ fn a_blank_stamp_reads_as_no_stamp() {
         describe_grants("cl1", &status),
         [
             "clauth: 'cl1' has 1 limit reset usable now.",
-            "  * limit reset: 1 of 1 left, clears 5h, usable now  (used next)",
+            "  * limit reset: 1 of 1 available, clears 5h, usable now  (used next)",
         ]
     );
 

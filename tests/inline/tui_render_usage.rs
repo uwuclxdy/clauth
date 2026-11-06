@@ -5918,7 +5918,7 @@ fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
         [
             "type      codex",
             "plan      plus",
-            "resets    2 left",
+            "resets    2 available",
             "status    ◌ read 2h ago",
             "",
         ],
@@ -5987,7 +5987,7 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     assert_eq!(
         claude_resets_rows(&detail),
         [format!(
-            "resets 1 left · clears 5h, 7d · until {}",
+            "resets 1 available · clears 5h, 7d · until {}",
             local_day(ends)
         )],
         "{detail:?}"
@@ -6009,7 +6009,7 @@ fn a_stale_claude_resets_reading_says_its_age() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 left · clears 5h · read 3h ago"],
+        ["resets 2 available · clears 5h · read 3h ago"],
         "{detail:?}"
     );
 }
@@ -6056,7 +6056,7 @@ fn a_quarantined_codex_account_shows_its_login_row() {
             "type      codex",
             "plan      plus",
             "login     [ needs re-login ]",
-            "resets    2 left",
+            "resets    2 available",
         ],
         "{detail:?}"
     );
@@ -6347,7 +6347,7 @@ fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 left · clears 5h"],
+        ["resets 1 available · clears 5h"],
         "{detail:?}"
     );
 }
@@ -6394,7 +6394,7 @@ fn the_resets_row_says_its_age_only_past_75_minutes() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 left"],
+        ["resets 1 available"],
         "74 min: no age part: {detail:?}"
     );
     crate::testutil::write_claude_limit_resets(
@@ -6408,7 +6408,56 @@ fn the_resets_row_says_its_age_only_past_75_minutes() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 left · read 1h ago"],
+        ["resets 1 available · read 1h ago"],
         "76 min: the age part: {detail:?}"
+    );
+}
+
+/// A row too wide for its pane ends on `…`: a bare clip turned `until Nov 26`
+/// into a false `until Nov 2`. At 55 columns the pane holds 51 cells, 41 of
+/// them after the key, one short of this 42-cell value. A row that fits keeps
+/// every part, the exact fit included.
+#[test]
+fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
+    use chrono::TimeZone as _;
+
+    fn row_at(app: &App, width: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+            .expect("terminal");
+        term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let at = rows
+            .iter()
+            .find(|r| r.contains("resets  "))
+            .unwrap_or_else(|| panic!("a resets row at {width}: {rows:?}"));
+        let tail = &at[at.find("resets  ").expect("the row")..];
+        let end = tail.find(['│', '┊', '┃']).unwrap_or(tail.len());
+        tail[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let ends = chrono::Local
+        .with_ymd_and_hms(2099, 11, 26, 12, 0, 0)
+        .single()
+        .expect("a local instant")
+        .to_rfc3339();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour", "seven_day"],
+        Some(&ends),
+        crate::usage::now_ms() - 10 * 60_000,
+    );
+    let app = t6_app();
+
+    assert_eq!(
+        row_at(&app, 55),
+        "resets 1 available · clears 5h, 7d · until Nov …"
+    );
+    assert_eq!(
+        row_at(&app, 56),
+        "resets 1 available · clears 5h, 7d · until Nov 26",
+        "42 cells in a 42-cell budget fit"
     );
 }
