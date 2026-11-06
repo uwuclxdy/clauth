@@ -246,13 +246,18 @@ pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
 /// records nothing and logs it: the 429 is lost, and the member's next one
 /// places it again. The hold shares the tick's `timed_out` flag: once any
 /// landing or kick hold of the tick has timed out, it takes that path at once
-/// rather than wait out the flock again.
+/// rather than wait out the flock again. A spent `lease` ticket (the tick's
+/// instance lost the fetch lease) records nothing, checked inside the hold.
 pub(crate) fn write_credit_refusal_flagged(
     name: &ProfileName,
     refusal: &CreditRefusal,
     timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
         let mut record = credit_refusal_record(name);
         #[cfg(test)]
         credit_refusal_park::park_if_armed();
@@ -269,7 +274,7 @@ pub(crate) fn write_credit_refusal_flagged(
 /// [`write_credit_refusal_flagged`] outside a tick.
 #[cfg(test)]
 pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
-    write_credit_refusal_flagged(name, refusal, None);
+    write_credit_refusal_flagged(name, refusal, None, None);
 }
 
 /// Drop `name`'s credit refusal, a later successful turn on the member or a
@@ -281,13 +286,17 @@ pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) 
 /// higher floor on record stays, and so does a refusal past `floor_ms`, which
 /// another session recorded after the caller read the one the turn cleared.
 /// Held under the state flock like [`write_credit_refusal_flagged`], and a
-/// timed-out wait clears nothing.
+/// timed-out wait clears nothing; neither does a spent `lease` ticket.
 pub(crate) fn clear_credit_refusal_flagged(
     name: &ProfileName,
     floor_ms: u64,
     timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
         let mut record = credit_refusal_record(name);
         record.clear(floor_ms);
         write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
@@ -301,7 +310,7 @@ pub(crate) fn clear_credit_refusal_flagged(
 /// [`clear_credit_refusal_flagged`] outside a tick.
 #[cfg(test)]
 pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
-    clear_credit_refusal_flagged(name, floor_ms, None);
+    clear_credit_refusal_flagged(name, floor_ms, None, None);
 }
 
 /// Record `refusal` for `name` as [`write_credit_refusal_flagged`] does, then

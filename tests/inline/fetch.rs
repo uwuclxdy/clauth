@@ -3050,6 +3050,78 @@ fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
     );
 }
 
+/// The `/profile` ride-along is a write path of the fetch worker: one that runs
+/// under a spent lease ticket re-anchors nothing and seeds nothing, and the
+/// same read under a current ticket does.
+#[test]
+fn a_profile_read_under_a_spent_ticket_writes_no_ride_along() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    crate::testutil::register_names(&["p5"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    let anchor = || {
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string())
+    };
+    let lease = crate::daemon::FetchLease::new();
+    let read_under = |ticket: crate::daemon::LeaseTicket<'_>| {
+        let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+            (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+        });
+        let _sandbox = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision {
+            lease: Some(ticket),
+            ..ProfileFetchDecision::default()
+        };
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        decision.reanchored
+    };
+
+    assert!(
+        !read_under(crate::testutil::spent_lease_ticket(&lease)),
+        "a read under a spent ticket re-anchored"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-a"),
+        "a read under a spent ticket moved the anchor"
+    );
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "a read under a spent ticket seeded the usage cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        read_under(current),
+        "control: the same read under a current ticket re-anchors"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-b"),
+        "control: the anchor moves"
+    );
+}
+
 /// A `/profile` read that re-anchors the profile on another account drops its
 /// credit refusal, as a login as another account does: the refusal was the old
 /// account's. The control, the same read naming the anchored account, keeps

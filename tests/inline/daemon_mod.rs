@@ -168,7 +168,9 @@ fn active_of(d: &Daemon) -> Option<String> {
 
 /// The drain marks the daemon's own skip store; the refresher's scan must read
 /// the SAME `Arc`, or a mark is invisible to every scan and N4 returns while the
-/// suite stays green. Pinned through the refresher's test-only recording seam.
+/// suite stays green. The drain's lease guard must read the same `FetchLease`
+/// the refresher's watchdog watches, or a release is invisible to it. Pinned
+/// through the refresher's test-only recording seam.
 #[test]
 fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     let _home = HomeSandbox::new();
@@ -187,6 +189,13 @@ fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     assert!(
         std::sync::Arc::ptr_eq(&recorded, &daemon.skipped_unreadable),
         "the refresher's scan must read the same store the drain marks"
+    );
+    let (watchdog_lease, _) = crate::usage::LAST_REFRESHER_START
+        .with(|slot| slot.borrow().clone())
+        .expect("the refresher records the lease it hands its watchdog");
+    assert!(
+        std::sync::Arc::ptr_eq(&watchdog_lease, &daemon.fetch_lease),
+        "the watchdog must release the same lease the drain reads"
     );
 }
 
@@ -566,6 +575,377 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         active_of(&daemon).as_deref(),
         Some("beta"),
         "an idle, clean, installable target must be switched to"
+    );
+}
+
+/// A queued switch must not execute once the daemon lost the fetch lease:
+/// the decision was queued under a ticket the watchdog then released, and
+/// the holder that took over owns every switch decision. The record clears
+/// with the skip.
+#[test]
+fn drain_pending_switch_does_not_execute_once_the_daemon_lost_the_lease() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    // The daemon held the lease when the decision was queued, then lost it
+    // the watchdog's way.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    stage_switch(&daemon, "beta");
+    // A first deferral stages the backoff record the skip must clear.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+    daemon.drain_pending_switch();
+    assert!(
+        daemon.switch_backoff.is_some(),
+        "fixture control: the mid-fetch drain stages a backoff"
+    );
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon must not execute the queued switch"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the record clears with the skip"
+    );
+    assert!(
+        daemon.switch_backoff.is_none(),
+        "the skip clears the backoff the deferral staged"
+    );
+}
+
+/// A watchdog release landing while the switch's AUTH-1 gate runs refuses both
+/// the gate's refresh and the apply: the decision came from the queue, and the
+/// holder that took over decides. The release rides the gate's own seam.
+#[test]
+fn drain_pending_switch_applies_nothing_when_the_lease_dies_inside_its_gate() {
+    let home = HomeSandbox::new();
+    let beta = expired_profile_with_creds("beta", "at-beta");
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+            beta,
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    // A spending gate is the failure, so the stub takes one more request than
+    // a refusing run would ever send.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    // A real backoff for a DIFFERENT target: a gamma mid-fetch defers, and the
+    // skip's reset is unconditional. The beta drain below never gates on it.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("gamma"),
+        ProfileActivity::Fetching,
+    );
+    stage_switch(&daemon, "gamma");
+    daemon.drain_pending_switch();
+    assert!(
+        daemon
+            .switch_backoff
+            .as_ref()
+            .is_some_and(|b| b.target == "gamma"),
+        "fixture control: the mid-fetch gamma drain stages a backoff"
+    );
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate runs"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        Vec::<String>::new(),
+        "a stood-down gate sent a token request"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the record clears with the skip"
+    );
+    assert!(
+        daemon.switch_backoff.is_none(),
+        "the skip clears the backoff the gamma deferral staged"
+    );
+}
+
+/// A watchdog release landing before the switch gate's adopt refuses the gate
+/// before that durable write: the stood-down daemon adopts nothing and lifts no
+/// quarantine. The live-lease control adopts the moved pair, so the assertions
+/// mean the lease.
+#[test]
+fn drain_pending_switch_adopts_nothing_when_the_lease_dies_before_its_gate() {
+    let _home = HomeSandbox::new();
+    let beta = expired_profile_with_creds("beta", "at-beta");
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), beta],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let beta_name = crate::profile::ProfileName::from("beta");
+    // The store moved past the entry's token (a peer's advance), and the
+    // entry's token is on the spent record: a rotation past it ADOPTS the store.
+    crate::oauth::record_spent(&beta_name, "rt-at-beta");
+    {
+        let mut moved = crate::profile::load_profile(&beta_name).expect("load the fixture store");
+        let oauth = moved
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture's pair");
+        oauth.access_token = "at-moved".to_string();
+        oauth.refresh_token = Some("rt-moved".to_string());
+        oauth.expires_at = Some(future_expiry());
+        crate::profile::save_profile(&moved).expect("save the moved store");
+    }
+    let mut daemon = daemon_for(config);
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .set_auth_broken(&beta_name, true);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate waits"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&beta_name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-at-beta"),
+        "a stood-down gate adopted the newer disk pair"
+    );
+    assert!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "a stood-down gate lifted the quarantine"
+    );
+
+    // Control: the same fixture under a live lease adopts the moved pair and
+    // lifts the quarantine, so the assertions above mean the lease.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&beta_name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-moved"),
+        "control: a live-lease gate adopts the newer disk pair"
+    );
+    assert!(
+        !daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "control: the adopt lifts the quarantine"
+    );
+}
+
+/// A watchdog release landing before the gate's quarantine refuses the gate
+/// before that durable write: the stood-down daemon leaves the unrefreshable
+/// target unquarantined. The same fixture under a live lease quarantines it.
+#[test]
+fn drain_pending_switch_quarantines_nothing_when_the_lease_dies_before_its_gate() {
+    let _home = HomeSandbox::new();
+    let mut beta = expired_profile_with_creds("beta", "at-beta");
+    let beta_name = crate::profile::ProfileName::from("beta");
+    if let Some(oauth) = beta
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.refresh_token = None;
+    }
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), beta],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate waits"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    assert!(
+        !daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "a stood-down gate quarantined the target"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+
+    // Control: the same fixture under a live lease quarantines the target.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "control: a live-lease gate quarantines the unrefreshable login"
+    );
+}
+
+/// The same gate on the switch-off drain: a queued switch-off must not
+/// execute once the daemon lost the lease, and the flag clears with the skip.
+#[test]
+fn drain_pending_switch_off_does_not_execute_once_the_daemon_lost_the_lease() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon must not switch off"
+    );
+    assert!(
+        !*daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the record clears with the skip"
     );
 }
 
@@ -10585,7 +10965,7 @@ fn a_daemons_spend_drain_waits_on_its_own_schedulers_claims() {
     let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
         &daemon.activity,
         &name,
-        &daemon.shutting_down,
+        daemon.shutting_down.as_ref(),
     )
     .expect("an unset flag admits the spend");
 

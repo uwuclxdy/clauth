@@ -663,9 +663,13 @@ pub(crate) fn kick_rate_limit_at(
 /// Sends a 1-token Haiku message to start the 5-hour usage window. Mirrors what
 /// Claude Code does silently on launch. Shares the `api.anthropic.com` per-host
 /// request-spacing slot so a same-instant multi-profile window-reset doesn't burst
-/// `/v1/messages`.
-fn kick(access_token: &str) -> std::result::Result<(), KickError> {
-    kick_to(messages_endpoint().as_ref(), access_token)
+/// `/v1/messages`. `Ok(None)` is a skip, not an opening: the caller's ticket
+/// check refused after the spacing-slot wait, so no POST went out.
+fn kick(
+    access_token: &str,
+    on_turn: impl FnOnce() -> bool,
+) -> std::result::Result<Option<()>, KickError> {
+    kick_to(messages_endpoint().as_ref(), access_token, on_turn)
 }
 
 /// The kick's actual work, with the target `url` parameterized so a loopback
@@ -676,10 +680,19 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 /// (`x-claude-code-session-id`, `x-client-request-id`) clauth has no honest value
 /// for, and the host-derived `x-stainless-arch/os/runtime-version` (see
 /// [`KICK_STAINLESS_PACKAGE_VERSION`]). The kick reads the status and, on a 429,
-/// the limiter's headers.
-fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> {
-    let response = crate::usage::anthropic_send(url, access_token, || {})
-        .map_err(|e| KickError::Other(anyhow::Error::from(e)))?;
+/// the limiter's headers. `Ok(None)` is the skip: `on_turn` refused after the
+/// spacing-slot wait, so nothing was sent and the caller records no attempt.
+fn kick_to(
+    url: &str,
+    access_token: &str,
+    on_turn: impl FnOnce() -> bool,
+) -> std::result::Result<Option<()>, KickError> {
+    let response = match crate::usage::anthropic_send(url, access_token, on_turn)
+        .map_err(|e| KickError::Other(anyhow::Error::from(e)))?
+    {
+        Some(response) => response,
+        None => return Ok(None),
+    };
     if response.status >= 400 {
         let rate_limit = (response.status == 429).then(|| {
             kick_rate_limit_at(
@@ -691,7 +704,7 @@ fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> 
         });
         return Err(KickError::Status(response.status, rate_limit));
     }
-    Ok(())
+    Ok(Some(()))
 }
 
 /// Outcome of an [`auto_start_kick`]. `opened` is whether the 5h window opened
@@ -753,11 +766,12 @@ impl KickResult {
 ///
 /// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (kick → rotate →
 /// retry kick → caller's usage re-fetch); none of the sleeps holds the rotation
-/// lock. `spend_marker` is the scheduler's activity store and shutdown flag,
-/// which drive the spinner and the quit wait; the CLI passes `None`. The two
-/// travel as one pair so the refresh always runs under a
+/// lock. `spend_marker` is the scheduler's activity store and spend gate (the
+/// shutdown flag plus the fetch tick's lease ticket), which drive the spinner
+/// and the quit wait; the CLI passes `None`. The two travel as one pair so the
+/// refresh always runs under a
 /// [`crate::usage::claim_scheduler_spend_unless_shutting_down`] claim, held
-/// through the land of the minted pair; a set flag bails unrotated.
+/// through the land of the minted pair; a refusing gate bails unrotated.
 pub(crate) fn auto_start_kick(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -767,8 +781,14 @@ pub(crate) fn auto_start_kick(
     spend_marker: SpendMarker<'_>,
     wait: LockWait,
 ) -> KickResult {
-    let first_rl = match kick(access_token) {
-        Ok(()) => {
+    // The kick POST opens a window on the account, so a fetch tick that lost
+    // the lease sends none: the new holder decides whether to open it.
+    let lease_spent = || spend_marker.is_some_and(|(_, gate)| gate.lease_spent());
+    if lease_spent() {
+        return KickResult::not_opened();
+    }
+    let first_rl = match kick(access_token, || !lease_spent()) {
+        Ok(Some(())) => {
             return KickResult {
                 opened: true,
                 rotated: None,
@@ -777,6 +797,9 @@ pub(crate) fn auto_start_kick(
                 lock_held: false,
             };
         }
+        // The ticket died while the kick waited on the spacing slot: no
+        // window opened and nothing was charged — the new holder decides.
+        Ok(None) => return KickResult::not_opened(),
         Err(KickError::Status(401, _)) => None,
         // Rate limit (429): rotate only if the access token is also clock-expired;
         // a still-valid token can't be unstuck by a refresh, so refuse to spend it.
@@ -803,6 +826,13 @@ pub(crate) fn auto_start_kick(
     };
     // Pace the recovery before any lock is taken.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
+    // The watchdog can release the lease across that pace: the recovery's
+    // first writes (an adopted pair, a quarantine) and the gate's claim all sit
+    // below, so a spent ticket bails here, before any of them. The claim stays
+    // as the second gate for a release landing further down.
+    if lease_spent() {
+        return KickResult::not_opened_with(first_rl);
+    }
     // RotationGuard outermost across the HTTP window — acquired with no other
     // lock held (the caller released the usage store before kicking). Taken as
     // `wait` says: the fetch-worker caller passes `NoWait` (a held lock is
@@ -863,9 +893,10 @@ pub(crate) fn auto_start_kick(
     // Fetching from the answer on, for the retry kick + the caller's fetch (the
     // kick runs inside the scheduler's fetch leg).
     let Ok(claim) = crate::usage::claim_marked_spend(spend_marker, name) else {
-        // The shutdown flag is set: a spend that started now could die
-        // between the token endpoint's answer and its stage write, so
-        // bail unrotated — no token sent, no marker raised.
+        // The shutdown flag is set (a spend that started now could die
+        // between the token endpoint's answer and its stage write), or the
+        // fetch tick lost the lease: bail unrotated — no token sent, no
+        // marker raised.
         return KickResult::not_opened_with(first_rl);
     };
     let refreshed = settle_refresh_answer(
@@ -926,15 +957,25 @@ pub(crate) fn auto_start_kick(
 
     // Pace rotate → retry kick, then retry kick → the caller's usage re-fetch.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
-    let (opened, retry_rl) = match kick(&access) {
-        Ok(()) => (true, None),
-        Err(KickError::Status(429, rl)) => (false, rl),
-        Err(e) => {
-            logline!(
-                "{name}: 5h window retry kick failed after rotation: {}",
-                describe_kick_failure(&e)
-            );
-            (false, None)
+    // The minted pair above is already persisted and rides back in `rotated`;
+    // only the window-opening POST is withheld once the lease is spent.
+    let (opened, retry_rl) = if lease_spent() {
+        (false, None)
+    } else {
+        match kick(&access, || !lease_spent()) {
+            Ok(Some(())) => (true, None),
+            // The ticket died while the retry waited on the spacing slot:
+            // the minted pair still rides back, only the window-opening POST
+            // is withheld.
+            Ok(None) => (false, None),
+            Err(KickError::Status(429, rl)) => (false, rl),
+            Err(e) => {
+                logline!(
+                    "{name}: 5h window retry kick failed after rotation: {}",
+                    describe_kick_failure(&e)
+                );
+                (false, None)
+            }
         }
     };
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
@@ -3275,11 +3316,13 @@ pub(crate) enum AuthGate {
     /// HTTP status, the TUI toast and the MCP payload do not, and the retry
     /// advice follows the failure instead of being one hardcoded sentence.
     Transient(crate::format::Transient),
-    /// The daemon is stopping: the refresh was refused under the rotation
-    /// lock, so no token request went out. A staged pair or disk rotation the
-    /// gate adopted before that point stays adopted. Only a caller that passed
-    /// a `spend_marker` can see it; a caller passing `None` never reaches this
-    /// arm.
+    /// The configured stop refusal: the shutdown flag or the tick's spent lease
+    /// ticket refused the spend, so no token request went out. The gate checks
+    /// the marker before its rotation-lock wait and again after it, so a spent
+    /// ticket stops it before the adopt; a shutdown landing later can still
+    /// leave an adoption the gate made above the claim. Only a caller that
+    /// passed a `spend_marker` can see it; a caller passing `None` never reaches
+    /// this arm.
     Stopping,
 }
 
@@ -3294,9 +3337,9 @@ pub(crate) enum AuthGate {
 /// [`refresh_result`]). The config mutex is never held across the HTTP refresh,
 /// and the per-profile `RotationGuard` wraps the refresh so a live session or
 /// sibling worker cannot double-spend the single-use token. `spend_marker` is
-/// the daemon's activity store and shutdown flag, claimed under the rotation
-/// lock right before the refresh; a caller without a daemon stop path passes
-/// `None`.
+/// the daemon's activity store and shutdown flag: checked before the
+/// rotation-lock wait and again after it, then claimed under the lock right
+/// before the refresh; a caller without a daemon stop path passes `None`.
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -3463,6 +3506,12 @@ fn run_keychain_mirror_hook() {
     });
 }
 
+/// Whether the gate's spend marker refuses its spend: the shutdown flag is
+/// set, or the lease ticket the tick carried is spent.
+fn marker_refuses(spend_marker: SpendMarker<'_>) -> bool {
+    spend_marker.is_some_and(|(_, gate)| gate.refuses())
+}
+
 /// The pre-CLA-ROLL gate, byte-for-byte: static session-token profiles gate on
 /// the token's clock; vanilla OAuth profiles refresh when inside `horizon_ms`
 /// of expiry, under the rotation guard.
@@ -3524,6 +3573,13 @@ fn vanilla_install_gate(
         Ok(_) => {}
     }
 
+    // A tick whose lease is already gone owns no spend: refuse before the wait
+    // for the rotation lock, so nothing below writes durably for a stand-down
+    // instance. A release landing DURING the wait is caught again at
+    // `gate_under_guard`'s entry, before its adopt.
+    if marker_refuses(spend_marker) {
+        return AuthGate::Stopping;
+    }
     // RotationGuard across the HTTP window (single-use double-spend guard),
     // acquired with no config lock held. Contention does NOT land in the `else`
     // below: `acquire` blocks on the flock, so a sibling worker or live session
@@ -4390,6 +4446,11 @@ fn gate_under_guard(
     fresh_horizon_ms: i64,
     spend_marker: SpendMarker<'_>,
 ) -> AuthGate {
+    // The wait for the rotation lock is the span a watchdog release lands in:
+    // re-check before the adopt, this gate's first durable write.
+    if marker_refuses(spend_marker) {
+        return AuthGate::Stopping;
+    }
     // A failed adoption flock is a refusal, never a no-op: proceeding would
     // spend the already-spent single-use token from the stale in-memory pair.
     if let Err(e) = adopt_disk_rotation(config, name, guard) {

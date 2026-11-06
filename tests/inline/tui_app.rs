@@ -2962,6 +2962,130 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
     );
 }
 
+/// A queued switch must not execute once the TUI lost the fetch lease: the
+/// decision was queued under a ticket the watchdog then released, and the
+/// holder that took over decides. The record clears with the skip.
+#[test]
+fn on_tick_does_not_execute_a_queued_switch_once_the_tui_lost_the_lease() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("tp-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        });
+    // The TUI held the lease when the decision was queued, then lost it the
+    // watchdog's way.
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+
+    // First tick drains the queued decision (and drops it); the second would
+    // complete a switch had one been dispatched.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "a stood-down TUI must not execute the queued switch"
+    );
+    assert!(
+        app.pending_switch.lock().expect("pending").is_empty(),
+        "the record clears with the skip"
+    );
+}
+
+/// A wrap-off queued under a lease this TUI has since lost must not execute:
+/// the holder that took over decides. The control runs the same fixture under
+/// a live lease first, so the second half tests the lease, not the fixture.
+#[test]
+fn a_switch_off_queued_under_a_lost_lease_does_not_execute() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("tp-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+
+    let mut live = App::new(AppConfig {
+        state: state.clone(),
+        profiles: vec![tp.clone(), oauth.clone()],
+    });
+    live.bootstrap_started = true;
+    *live.pending_switch_off.lock().expect("flag") = true;
+    super::drain_pending_switch_off(&mut live);
+    assert_eq!(
+        live.config().state.active_profile,
+        None,
+        "control: a live-lease TUI executes the queued switch-off"
+    );
+
+    crate::profile::save_app_state(&state).expect("re-persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    *app.pending_switch_off.lock().expect("flag") = true;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "a stood-down TUI executed the queued switch-off"
+    );
+}
+
 /// The TUI's own drain re-checks the queued target's login ON DISK and drops a
 /// target that holds none, the daemon drain's twin: the in-memory profile here
 /// still carries a pair while its store on disk holds nothing (the login went
@@ -3327,8 +3451,9 @@ fn the_projected_switch_caption_passes_over_a_member_with_a_credit_refusal() {
 
 /// The TUI's drain marks `app.skipped_unreadable`; the refresher's scan must
 /// read the SAME `Arc`, or a mark is invisible to every scan and N4 returns
-/// while the suite stays green. Pinned through the refresher's test-only
-/// recording seam.
+/// while the suite stays green. The drain's lease guard must read the same
+/// `FetchLease` the refresher's watchdog watches, or a release is invisible to
+/// it. Pinned through the refresher's test-only recording seam.
 #[test]
 fn the_tui_refresher_scans_the_same_skip_store_the_drain_marks() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -3342,6 +3467,13 @@ fn the_tui_refresher_scans_the_same_skip_store_the_drain_marks() {
     assert!(
         std::sync::Arc::ptr_eq(&recorded, &app.skipped_unreadable),
         "the refresher's scan must read the same store the drain marks"
+    );
+    let (watchdog_lease, _) = crate::usage::LAST_REFRESHER_START
+        .with(|slot| slot.borrow().clone())
+        .expect("the refresher records the lease it hands its watchdog");
+    assert!(
+        std::sync::Arc::ptr_eq(&watchdog_lease, &app.fetch_lease),
+        "the watchdog must release the same lease the drain reads"
     );
 }
 
@@ -19878,6 +20010,7 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
                 invalid_grant: true,
             })
         },
+        false,
     );
     super::drain_switch_gates(&mut app);
 
@@ -19911,6 +20044,7 @@ fn tui_switch_gate_passes_a_healthy_target_through() {
         &mut app,
         crate::profile::ProfileName::from("healthy".to_string()),
         |_, _| panic!("a healthy target must not spend a refresh"),
+        false,
     );
     super::drain_switch_gates(&mut app);
 
@@ -19942,6 +20076,7 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
                 crate::oauth::TokenFailure::Transport,
             ))
         },
+        false,
     );
     super::drain_switch_gates(&mut app);
 
@@ -20007,6 +20142,7 @@ fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
                 scope: None,
             })
         },
+        false,
     );
     super::drain_switch_gates(&mut app);
 
@@ -20051,6 +20187,7 @@ fn tui_switch_gate_recovers_a_flagged_target() {
                 scope: None,
             })
         },
+        false,
     );
     super::drain_switch_gates(&mut app);
 
@@ -20063,6 +20200,398 @@ fn tui_switch_gate_recovers_a_flagged_target() {
         !app.config()
             .is_auth_broken(&crate::profile::ProfileName::from("flagged")),
         "the successful refresh lifts the flag"
+    );
+}
+
+/// A queued switch whose gate spends its refresh while the watchdog releases
+/// the lease applies nothing: the decision came from the queue, and the holder
+/// that took over decides. The release rides the gate's own answer.
+#[test]
+fn a_queued_switch_does_not_apply_when_the_lease_dies_inside_its_gate() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("tp-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", already_expired());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    let lease = std::sync::Arc::clone(&app.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate refreshes"
+        );
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // The first tick dispatches through the gate; the second drains its answer.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "fixture control: the queued gate spent its refresh"
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "a stood-down TUI applied the queued switch"
+    );
+}
+
+/// A user's switch is their own call: its gate answer lands and moves the
+/// account even when the watchdog releases the lease while the gate runs. Only
+/// a queue-dispatched decision is dropped.
+#[test]
+fn a_user_switch_gate_result_lands_after_the_lease_is_released() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "beta"]);
+    let alpha = stored_oauth_profile("alpha", far_future());
+    let beta = stored_oauth_profile("beta", already_expired());
+    let names = vec![ProfileName::from("alpha"), ProfileName::from("beta")];
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: names.clone(),
+        fallback_chain: names.clone(),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha")).expect("link alpha");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("alpha")),
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles: vec![alpha, beta],
+    });
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&app.fetch_lease);
+    super::spawn_switch_gate(
+        &mut app,
+        ProfileName::from("beta"),
+        move |_, _| {
+            assert!(
+                lease.release_if_stale(
+                    crate::usage::now_ms()
+                        + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                    crate::daemon::LEASE_STALE_BOUND,
+                ),
+                "the watchdog releases the holder while the gate refreshes"
+            );
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-beta-new".to_string(),
+                refresh_token: "rt-beta-new".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+        },
+        false,
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("beta"),
+        "a user-initiated gate result after a release must move the account"
+    );
+}
+
+/// An app whose active `alpha` is linked clean and whose queued switch to
+/// `beta` was dispatched through a settle that asks: the bare-item question is
+/// up and the lease is held.
+fn queued_switch_held_by_a_settle(beta: &str, beta_expires_at: i64) -> App {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    crate::testutil::register_names(&["alpha", beta]);
+    let names = vec![ProfileName::from("alpha"), ProfileName::from(beta)];
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha")).expect("link alpha");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![
+            stored_oauth_profile("alpha", far_future()),
+            stored_oauth_profile(beta, beta_expires_at),
+        ],
+    });
+    app.bootstrap_started = true;
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(crate::claude::BareItemUnplaced::NotCached)],
+    );
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: beta.to_string(),
+            key_rejected_cause: None,
+        });
+    // 1st tick: drain the queue, dispatch through the gate's settle.
+    // 2nd tick: drain the held answer into the question.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItem(_))),
+        "fixture control: the settle held the switch into a question"
+    );
+    app
+}
+
+/// Answer the held switch's question with `replace` and drain what it posts.
+fn answer_the_held_switch(app: &mut App) {
+    super::handle_key(app, key(KeyCode::Char('p')));
+    land_bare_item_answers(app);
+    super::drain_switch_gates(app);
+}
+
+/// A queued switch whose bare-item settle held it resumes through the write's
+/// carried origin: a watchdog release while the question sits refuses it, and a
+/// lease this TUI still holds lets it land. Control first.
+#[test]
+fn a_queued_switch_resumed_from_a_held_settle_does_not_apply_after_release() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Control: a lease this TUI holds lets the resumed queued switch land.
+    let mut live = queued_switch_held_by_a_settle("beta", far_future());
+    answer_the_held_switch(&mut live);
+    assert_eq!(
+        live.config().state.active_profile.as_deref(),
+        Some("beta"),
+        "control: a held lease executes the resumed queued switch"
+    );
+    drop(live);
+
+    // The same fixture, the lease released while the question sat.
+    let mut app = queued_switch_held_by_a_settle("beta", far_future());
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder while the question sits"
+    );
+    answer_the_held_switch(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("alpha"),
+        "a stood-down TUI applied the resumed queued switch"
+    );
+}
+
+/// A queued switch whose held write resumes into a gate that spends its
+/// refresh: the watchdog release inside that gate drops the answer, so the
+/// stood-down TUI applies nothing. The live-lease control lands it.
+#[test]
+fn a_queued_switch_resumed_from_a_held_settle_does_not_apply_when_the_lease_dies_inside_its_gate() {
+    let home = crate::testutil::HomeSandbox::new();
+
+    // Control: a held lease lets the resumed gate refresh and land.
+    let mut live = queued_switch_held_by_a_settle("beta", already_expired());
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let control_endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    answer_the_held_switch(&mut live);
+    drop(control_endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "control: the resumed gate spent its refresh"
+    );
+    assert_eq!(
+        live.config().state.active_profile.as_deref(),
+        Some("beta"),
+        "control: a held lease executes the resumed queued switch"
+    );
+    drop(live);
+
+    // The same fixture under a name of its own (the control's refresh marked
+    // its token spent), the release inside the re-spawned gate.
+    let mut app = queued_switch_held_by_a_settle("beta2", already_expired());
+    let lease = std::sync::Arc::clone(&app.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the resumed gate refreshes"
+        );
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    answer_the_held_switch(&mut app);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "fixture control: the resumed gate spent its refresh"
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("alpha"),
+        "a stood-down TUI applied the resumed queued switch"
+    );
+}
+
+/// A user's own switch held by the same settle keeps applying after a lease
+/// release: only the queue's origin is refused.
+#[test]
+fn a_user_switch_resumed_from_a_held_settle_applies_after_a_release() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "beta"]);
+    let names = vec![ProfileName::from("alpha"), ProfileName::from("beta")];
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha")).expect("link alpha");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![
+            stored_oauth_profile("alpha", far_future()),
+            stored_oauth_profile("beta", far_future()),
+        ],
+    });
+    app.bootstrap_started = true;
+    install_fake_source(
+        &mut app,
+        vec![FakeSettle::Ask(crate::claude::BareItemUnplaced::NotCached)],
+    );
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    super::perform_switch(&mut app, &ProfileName::from("beta"));
+    super::drain_switch_gates(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::BareItem(_))),
+        "fixture control: the settle held the switch into a question"
+    );
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder while the question sits"
+    );
+    answer_the_held_switch(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("beta"),
+        "a user's switch resumed after a release must move the account"
+    );
+}
+
+/// The user's confirm is the user origin end to end: a watchdog release inside
+/// its gate does not refuse the switch.
+#[test]
+fn a_confirmed_switch_applies_after_the_lease_is_released() {
+    use super::ConfirmAction;
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "beta"]);
+    let names = vec![ProfileName::from("alpha"), ProfileName::from("beta")];
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha")).expect("link alpha");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![
+            stored_oauth_profile("alpha", far_future()),
+            stored_oauth_profile("beta", already_expired()),
+        ],
+    });
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&app.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate refreshes"
+        );
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::run_confirm_action(&mut app, ConfirmAction::Switch("beta".to_string()));
+    super::drain_switch_gates(&mut app);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "fixture control: the confirm's gate spent its refresh"
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("beta"),
+        "a user's confirmed switch after a release must move the account"
     );
 }
 
@@ -20084,6 +20613,7 @@ fn tui_switch_gate_pending_blocks_switches_and_waits_for_modals() {
         &mut app,
         crate::profile::ProfileName::from("first".to_string()),
         |_, _| panic!("healthy target: no refresh"),
+        false,
     );
     // Un-drained gate = switch in flight: a second switch is refused.
     super::run_confirm_action(&mut app, ConfirmAction::Switch("second".to_string()));
@@ -58249,6 +58779,7 @@ fn a_panicking_switch_gate_worker_still_sends_an_answer() {
             &mut app,
             crate::profile::ProfileName::from("work".to_string()),
             panics,
+            false,
         );
     }));
     assert!(caught.is_err(), "the panicking gate must unwind");
@@ -62040,7 +62571,10 @@ fn the_bare_item_question_renders_every_choice() {
             ProfileName::from("alpha"),
             ProfileName::from("beta"),
         ),
-        super::BareItemWrite::Switch(ProfileName::from("beta")),
+        super::BareItemWrite::Switch {
+            name: ProfileName::from("beta"),
+            queued: false,
+        },
     )));
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
@@ -62349,13 +62883,16 @@ fn a_switch_the_settle_holds_never_reaches_its_auth_gate() {
             crate::claude::BareItemUnplaced::UnknownAccount,
         )],
     );
-    super::spawn_switch_gate(&mut app, ProfileName::from("dead"), |_, _| {
-        panic!("a held switch must not reach its gate")
-    });
+    super::spawn_switch_gate(
+        &mut app,
+        ProfileName::from("dead"),
+        |_, _| panic!("a held switch must not reach its gate"),
+        false,
+    );
     super::drain_switch_gates(&mut app);
     assert!(matches!(
         bare_item_form(&app).write,
-        super::BareItemWrite::Switch(ref name) if name.as_str() == "dead"
+        super::BareItemWrite::Switch { ref name, .. } if name.as_str() == "dead"
     ));
     assert!(
         !app.config().is_auth_broken(&ProfileName::from("dead")),
@@ -62380,9 +62917,12 @@ fn a_replaced_switch_gates_then_switches_holding_the_placement() {
             crate::claude::BareItemUnplaced::UnknownAccount,
         )],
     );
-    super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
-        panic!("a healthy target must not spend a refresh")
-    });
+    super::spawn_switch_gate(
+        &mut app,
+        ProfileName::from("healthy"),
+        |_, _| panic!("a healthy target must not spend a refresh"),
+        false,
+    );
     super::drain_switch_gates(&mut app);
     *super::BARE_ITEM_PLACEMENTS.lock().unwrap() = Some((unsaved_item(), Vec::new()));
     super::handle_key(&mut app, key(KeyCode::Char('p')));
@@ -63149,7 +63689,10 @@ fn a_switch_settle_never_shows_the_keychain_check_toast() {
     );
     super::spawn_bare_item_settle(
         &mut app,
-        super::BareItemWrite::Switch(ProfileName::from("work")),
+        super::BareItemWrite::Switch {
+            name: ProfileName::from("work"),
+            queued: false,
+        },
     );
     assert_eq!(
         toast_bodies_of(&app, super::ToastKind::Info),
@@ -63429,13 +63972,16 @@ fn held_switch_app(settles: Vec<FakeSettle>) -> App {
     ]);
     crate::profile::save_app_state(&app.config().state).expect("persist state");
     install_fake_source(&mut app, settles);
-    super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
-        panic!("a healthy target must not spend a refresh")
-    });
+    super::spawn_switch_gate(
+        &mut app,
+        ProfileName::from("healthy"),
+        |_, _| panic!("a healthy target must not spend a refresh"),
+        false,
+    );
     super::drain_switch_gates(&mut app);
     assert!(matches!(
         bare_item_form(&app).write,
-        super::BareItemWrite::Switch(ref name) if name.as_str() == "healthy"
+        super::BareItemWrite::Switch { ref name, .. } if name.as_str() == "healthy"
     ));
     assert!(
         crate::usage::is_idle(&app.activity, &ProfileName::from("healthy")),
@@ -63668,9 +64214,12 @@ fn a_switch_whose_first_settle_panicked_toasts_the_switch_failure() {
     crate::profile::save_app_state(&app.config().state).expect("persist state");
     install_fake_source(&mut app, vec![FakeSettle::Panic]);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::spawn_switch_gate(&mut app, ProfileName::from("healthy"), |_, _| {
-            panic!("a panicked settle must not reach its gate")
-        });
+        super::spawn_switch_gate(
+            &mut app,
+            ProfileName::from("healthy"),
+            |_, _| panic!("a panicked settle must not reach its gate"),
+            false,
+        );
     }));
     assert!(caught.is_err(), "the settle panicked");
     super::drain_switch_gates(&mut app);
@@ -63696,9 +64245,12 @@ fn a_switch_whose_gate_panicked_after_its_settle_refuses_as_a_refresh_failure() 
         app_with_unlinked_profiles(vec![stored_oauth_profile("stale", already_expired())]);
     install_fake_source(&mut app, vec![FakeSettle::Settled]);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::spawn_switch_gate(&mut app, ProfileName::from("stale"), |_, _| {
-            panic!("test seam: the gate's refresh panicked")
-        });
+        super::spawn_switch_gate(
+            &mut app,
+            ProfileName::from("stale"),
+            |_, _| panic!("test seam: the gate's refresh panicked"),
+            false,
+        );
     }));
     assert!(caught.is_err(), "the gate panicked");
     super::drain_switch_gates(&mut app);

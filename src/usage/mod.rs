@@ -61,13 +61,13 @@ pub(crate) use scheduler::{
     ActivityStore, ClaudeResetsMemoLock, DeadLoginStats, FetchLeg, FetchStatus, KickBlock,
     KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, PendingSwitchTarget, PollStreaks,
-    ProfileActivity, RefetchQueue, RotateDone, SkippedUnreadable, SpendMarker, StartupReceiver,
-    StartupSender, StartupSignal, StatusStore, StreakCounts, SuppressedAuthExpiredStore,
-    ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks,
-    ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy, any_fetch_leg_admits,
-    any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party, build_token_entries,
-    claim_marked_spend, claim_scheduler_spend_unless_shutting_down, clear_activity,
-    collect_oauth_seed_names, collect_probe_seeds, collect_third_party_entries,
+    ProfileActivity, RefetchQueue, RotateDone, SkippedUnreadable, SpendGate, SpendMarker,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
+    any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
+    build_token_entries, claim_marked_spend, claim_scheduler_spend_unless_shutting_down,
+    clear_activity, collect_oauth_seed_names, collect_probe_seeds, collect_third_party_entries,
     collect_third_party_seed_names, collect_token_seeds, collect_tokens,
     current_key_rejected_names, dead_login_fingerprint, dead_login_is_setup_token,
     decision_fresh_any, display_activity, end_rotation, fill_chain_snapshot_stores, is_idle,
@@ -104,6 +104,8 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 #[cfg(test)]
 pub(crate) use scheduler::LAST_REFRESHER_SKIP_STORE;
+#[cfg(test)]
+pub(crate) use scheduler::LAST_REFRESHER_START;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
 #[cfg(test)]
 pub(crate) use scheduler::clear_claude_resets_seed_apply_hooks_for_test;

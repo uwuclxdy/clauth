@@ -13,7 +13,8 @@
 //!   * `claim_by_replacing` (`--replace`) terminates the running daemon and takes
 //!     over, refusing to signal a pid it can't confirm is a running clauth daemon.
 //!   * `FetchLease` is the single-fetcher lease over `usage-fetch.lock`: exactly
-//!     one holder at a time, held for life, released on drop so a waiter takes
+//!     one holder at a time, held while its ticks complete, released on drop
+//!     or by the lease watchdog past `LEASE_STALE_BOUND` so a waiter takes
 //!     over.
 
 use super::*;
@@ -959,7 +960,7 @@ fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
 fn one_holder_at_a_time_and_a_waiter_takes_the_freed_lease() {
     let _home = HomeSandbox::new();
 
-    // First instance wins the lease and holds it for life.
+    // First instance wins the lease and holds it.
     let a = FetchLease::new();
     assert!(a.acquire(), "first caller becomes the fetcher");
     assert!(
@@ -994,6 +995,245 @@ fn an_unreadable_lock_stands_down() {
     assert!(
         !lease.acquire(),
         "an unopenable lock file stands down rather than fetching"
+    );
+}
+
+const LEASE_STALE_BOUND: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[test]
+fn a_holder_whose_ticks_stop_drops_the_lease_and_a_waiter_takes_it() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let dropped = a.release_if_stale(t0 + 5 * 60 * 1000 + 1, LEASE_STALE_BOUND);
+    drop(capture);
+
+    assert!(dropped, "a stamp older than the bound drops the lease");
+    assert_ne!(
+        a.generation(),
+        generation,
+        "the drop moves the generation a resumed tick re-checks"
+    );
+    assert!(!a.fetches_here(), "the dropped holder no longer fetches");
+    assert!(
+        clauth_dir()
+            .expect("clauth dir")
+            .join(super::super::FETCH_LOCK_FILE)
+            .is_file(),
+        "the drop never unlinks the lock file"
+    );
+    let b = FetchLease::new();
+    assert!(b.acquire(), "a waiter takes the dropped lease");
+    let logged = lines.snapshot();
+    let pid = std::process::id().to_string();
+    assert_eq!(
+        logged.iter().filter(|l| l.contains(&pid)).count(),
+        1,
+        "one line names the holder's pid: {logged:?}"
+    );
+}
+
+#[test]
+fn a_holder_whose_last_tick_is_within_the_bound_keeps_the_lease() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+
+    assert!(
+        !a.release_if_stale(t0 + 5 * 60 * 1000, LEASE_STALE_BOUND),
+        "a stamp exactly at the bound keeps the lease"
+    );
+    assert_eq!(
+        a.generation(),
+        generation,
+        "a kept lease keeps its generation"
+    );
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "the waiter still stands down");
+}
+
+#[test]
+fn a_take_stamps_the_clock_so_a_fresh_holder_is_never_stale() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    assert!(
+        !a.release_if_stale(crate::usage::now_ms(), LEASE_STALE_BOUND),
+        "a holder that has run no tick yet is stamped at its take"
+    );
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "the waiter still stands down");
+}
+
+/// The bound the shipped watchdog judges on is five minutes: the tests around
+/// this one stamp a local copy, so a changed production constant would otherwise
+/// move only live behaviour.
+#[test]
+fn the_lease_stale_bound_is_the_shipped_five_minutes() {
+    assert_eq!(
+        super::LEASE_STALE_BOUND,
+        std::time::Duration::from_secs(300),
+        "the lease watchdog releases a holder five minutes after its last completed tick"
+    );
+}
+
+const LEASE_WATCHDOG_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+const LEASE_BOUND_MS: u64 = 5 * 60 * 1000;
+
+#[test]
+fn the_lease_watchdog_drops_a_holder_stalled_past_the_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let now = t0 + LEASE_BOUND_MS + 1;
+
+    lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        now - 10_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "a poll that ran its whole window past a stamp 5 min + 1 ms old frees the lease"
+    );
+}
+
+#[test]
+fn the_lease_watchdog_keeps_a_holder_whose_gap_a_suspend_explains() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+    // The poll began 1 s after the stamp and woke 6 min later: everything past
+    // its 10 s window is a suspend, so the tick thread had 1 s of running time.
+    let now = t0 + 6 * 60 * 1000 + 1_000;
+
+    lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0 + 1_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    assert_eq!(a.generation(), generation, "a suspend moves no generation");
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "a suspended holder keeps the lease");
+}
+
+#[test]
+fn a_suspend_before_the_last_tick_does_not_stretch_the_lease_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    // One hour asleep, then a tick completes on resume.
+    let woke = t0 + 60 * 60 * 1000;
+    let watch = lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0,
+        woke,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    a.stamp_tick(woke);
+    // The tick thread then stalls; a normal poll lands 5 min + 1 ms later.
+    let now = woke + LEASE_BOUND_MS + 1;
+
+    lease_watchdog_step(
+        &a,
+        watch,
+        now - 10_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "the hour asleep before the last tick buys the stall after it nothing"
+    );
+}
+
+/// The poll that holds a suspend also holds the first tick after the wake: the
+/// total charged to the stamp is only the wall time since it, so the stall
+/// after it is dropped one poll after its bound, not one suspend later.
+#[test]
+fn a_suspend_inside_the_poll_that_holds_the_wake_tick_does_not_stretch_the_lease_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    // One hour asleep; the poll wakes 10 s after the wake, and the first tick
+    // after it completed 4 s into those 10 s.
+    let woke = t0 + 60 * 60 * 1000;
+    let stamp = woke + 4_000;
+    a.stamp_tick(stamp);
+    let watch = lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0,
+        woke + 10_000,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    let generation = a.generation();
+
+    // The tick thread then wedges. A poll at exactly the bound keeps the lease.
+    let at_bound = stamp + LEASE_BOUND_MS;
+    let watch = lease_watchdog_step(
+        &a,
+        watch,
+        at_bound - 10_000,
+        at_bound,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    assert_eq!(
+        a.generation(),
+        generation,
+        "a stamp at the bound keeps the lease"
+    );
+
+    // Two polls later the stamp is 20 s + 1 ms past the bound, 6 s of it
+    // charged to the wake poll: the lease goes.
+    let late = at_bound + 20_001;
+    lease_watchdog_step(
+        &a,
+        watch,
+        late - 10_000,
+        late,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "the hour asleep inside the wake poll buys the stall after the stamp nothing"
     );
 }
 

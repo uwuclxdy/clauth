@@ -1495,7 +1495,7 @@ fn a_panicking_oauth_worker_strands_neither_slot() {
         );
     }
 
-    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None);
+    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None, None);
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -4959,6 +4959,7 @@ fn scan_sessions_with_streaks(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
         None,
+        None,
     );
 }
 
@@ -4981,6 +4982,7 @@ fn scan_sessions_skipped(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         skipped,
+        None,
         None,
     );
 }
@@ -5005,6 +5007,7 @@ fn scan_sessions_tp(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
         None,
     );
 }
@@ -8232,6 +8235,7 @@ fn a_scan_after_a_timed_out_flock_wait_records_no_refusal() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashSet::new())),
             Some(&flag),
+            None,
         );
     };
     append_and_tail(&home, "conv-f", &[spend_cap_row(120_000)]);
@@ -18631,7 +18635,12 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
     // Startup pass just ran, so the log is left alone on the ticks in between.
     let last_prune = AtomicU64::new(now);
     assert!(
-        !prune_histories_if_due(&last_prune, &config, now + HISTORY_PRUNE_INTERVAL_MS - 1),
+        !prune_histories_if_due(
+            &last_prune,
+            &config,
+            now + HISTORY_PRUNE_INTERVAL_MS - 1,
+            None
+        ),
         "a tick inside the cadence must not pay for a full read + rewrite"
     );
     assert_eq!(
@@ -18644,7 +18653,7 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
     // having restarted.
     let due_at = now + HISTORY_PRUNE_INTERVAL_MS;
     assert!(
-        prune_histories_if_due(&last_prune, &config, due_at),
+        prune_histories_if_due(&last_prune, &config, due_at, None),
         "the trim must run once the cadence has elapsed"
     );
     assert_eq!(
@@ -18655,7 +18664,7 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
 
     // The window is claimed, so the next tick is inside the cadence again.
     assert!(
-        !prune_histories_if_due(&last_prune, &config, due_at + 1),
+        !prune_histories_if_due(&last_prune, &config, due_at + 1, None),
         "the run must reset the clock, not re-trim every tick from here on"
     );
 }
@@ -19237,7 +19246,7 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -19289,7 +19298,7 @@ fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -19486,6 +19495,82 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
     );
     assert_eq!(outcome.status, super::FetchStatus::Fresh);
     assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// A fetch tick that lost the lease sends no request of any kind on the
+/// PROACTIVE rotation arm: the plain usage poll a live bail runs is a request
+/// too, so the spent-ticket bail serves the cache instead. The live arm's own
+/// fetch is pinned by `a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm`.
+#[test]
+fn a_spent_ticket_on_the_proactive_arm_sends_no_usage_poll() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-spent-proactive";
+    // A request of any kind is the failure, so the stub takes both a buggy
+    // poll and a buggy refresh before it exits.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"object":"list","data":[],"plan":{"tier":"max5"}}"#.to_string(),
+            )
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .expect("oauth credentials");
+        if let Some(token) = oauth.claude_ai_oauth.as_mut() {
+            // Inside the lead window (floor 15 min): the poll takes the
+            // PROACTIVE arm.
+            token.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+        }
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 300_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let lease = crate::daemon::FetchLease::new();
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(spent)),
+    );
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "a spent-ticket bail on the proactive arm sent a request: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
 }
 
 /// A NON-active flagged profile whose on-disk pair moved past the entry's token
@@ -26390,6 +26475,7 @@ fn a_wedged_flock_stalls_one_drain_batch_once_not_once_per_landing() {
         vec![token("a"), token("b"), token("c")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
 
@@ -26468,6 +26554,7 @@ fn a_brief_contention_then_a_later_uncontended_landing_both_land() {
         vec![token("a"), token("b")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
     peer.join().expect("peer");
@@ -26993,6 +27080,7 @@ fn a_slow_batch_spends_no_window_without_any_wait() {
         vec![token("a")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
     peer.join().unwrap();
@@ -27275,7 +27363,7 @@ fn a_wedged_flock_stalls_one_third_party_batch_once() {
     crate::usage::reset_request_slots();
     crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
     let timed_out = AtomicBool::new(false);
-    super::fetch_third_party_due_flagged(&state, entries, Some(&timed_out));
+    super::fetch_third_party_due_flagged(&state, entries, Some(&timed_out), None);
 
     assert_eq!(
         crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
@@ -27715,7 +27803,7 @@ fn a_wedged_flock_stalls_one_codex_batch_once() {
     let state = completion_order_state();
     crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
     let timed_out = AtomicBool::new(false);
-    super::codex_usage_tick_flagged(&state, Some(&timed_out));
+    super::codex_usage_tick_flagged(&state, Some(&timed_out), None);
 
     crate::usage::clear_codex_usage_url_override();
     let _ = server.join().expect("listener");
@@ -29403,7 +29491,10 @@ fn a_kick_holds_its_claim_until_its_pair_lands() {
                 "at-old",
                 Some("rt-old"),
                 None,
-                Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+                Some((
+                    &activity,
+                    (&std::sync::atomic::AtomicBool::new(false)).into(),
+                )),
                 crate::oauth::LockWait::NoWait,
             )
         })
@@ -29474,7 +29565,10 @@ fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+        Some((
+            &activity,
+            (&std::sync::atomic::AtomicBool::new(false)).into(),
+        )),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -30186,7 +30280,7 @@ fn a_verdict_only_retry_leaves_the_pairs_activity_mark_alone() {
         assert_eq!(entries.len(), 1, "fixture: one verdict-only retry");
         let key = entries[0].key();
         super::mark_fetch_activity(&state.activity, &key, held);
-        super::fetch_probe_due_flagged(&state, entries, None);
+        super::fetch_probe_due_flagged(&state, entries, None, None);
         assert_eq!(
             state
                 .activity
@@ -31850,54 +31944,6 @@ fn reset_info(five: f64, five_reset: Option<i64>) -> crate::usage::UsageInfo {
     }
 }
 
-/// Land `reading` of `name` through the landing section, `fresh` off the live
-/// API or a cached fallback, with the reading the store held before it at a 5h
-/// reset ten minutes ago, judged as [`reset_member`].
-fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
-    let pn = crate::profile::ProfileName::from(name);
-    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
-    store
-        .lock()
-        .unwrap()
-        .insert(name.to_string(), reset_info(60.0, Some(-600)));
-    let outcome = super::FetchOutcome {
-        name: pn.clone(),
-        info: Some(reading),
-        status: if fresh {
-            super::FetchStatus::Fresh
-        } else {
-            super::FetchStatus::Cached
-        },
-        rotated: None,
-        from_fetch: fresh,
-        from_headers: false,
-        refresh_failed: false,
-        login_gone: false,
-        plan_override: None,
-        retry_after: None,
-        oauth_identity: crate::usage::OAuthIdentity::default(),
-        sent_access_token: String::new(),
-        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
-        profile_wanted: false,
-        profile_attempt_at: None,
-        reanchored: false,
-    };
-    super::apply_outcome_flagged(
-        outcome,
-        &store,
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        REFRESH_INTERVAL_MS,
-        false,
-        false,
-        &Arc::new(RankedMutex::new(HashSet::new())),
-        &super::new_claude_resets_memo(),
-        None,
-        Some(&reset_member(name)),
-    );
-}
-
 /// `land_reading_after_a_reset` with a reading under every line that shows no
 /// live 5h window, so only the store's last reading names a reset.
 fn land_after_a_reset(name: &str, fresh: bool) {
@@ -33096,7 +33142,7 @@ fn a_held_lock_kick_under_a_state_flock_timeout_keeps_the_weekly_reset_retest() 
         &queue,
         REFRESH_INTERVAL_MS,
         Some(&tick_timed_out),
-        &AtomicBool::new(false),
+        (&AtomicBool::new(false)).into(),
     );
     drop(holder);
     let seen = server.join().expect("listener");
@@ -33293,6 +33339,10 @@ struct SilentEndpoint {
     gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     listener: Option<std::thread::JoinHandle<()>>,
     handlers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// A lease to release the watchdog's way on the first accepted connection:
+    /// the handler-side seam a test uses to spend a ticket while a worker is
+    /// out on the wire, at the one deterministic point a stalled fetch exposes.
+    release_on_accept: Arc<std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>>>,
 }
 
 /// How long a handler waits for the release before closing its socket anyway.
@@ -33313,11 +33363,14 @@ impl SilentEndpoint {
         let stop = Arc::new(AtomicBool::new(false));
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let handlers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release_on_accept: Arc<std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let listener = {
             let accepted = Arc::clone(&accepted);
             let stop = Arc::clone(&stop);
             let gate = Arc::clone(&gate);
             let handlers = Arc::clone(&handlers);
+            let release_on_accept = Arc::clone(&release_on_accept);
             std::thread::spawn(move || {
                 loop {
                     if stop.load(Ordering::SeqCst) {
@@ -33326,6 +33379,17 @@ impl SilentEndpoint {
                     match listener.accept() {
                         Ok((sock, _)) => {
                             accepted.fetch_add(1, Ordering::SeqCst);
+                            if let Some(lease) = release_on_accept.lock().unwrap().take() {
+                                assert!(
+                                    lease.release_if_stale(
+                                        crate::usage::now_ms()
+                                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis()
+                                                as u64,
+                                        crate::daemon::LEASE_STALE_BOUND,
+                                    ),
+                                    "the watchdog releases the holder"
+                                );
+                            }
                             let gate = Arc::clone(&gate);
                             let handle = std::thread::spawn(move || {
                                 let mut sock = sock;
@@ -33354,11 +33418,16 @@ impl SilentEndpoint {
             gate,
             listener: Some(listener),
             handlers,
+            release_on_accept,
         }
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release_lease_on_accept(&self, lease: Arc<crate::daemon::FetchLease>) {
+        *self.release_on_accept.lock().unwrap() = Some(lease);
     }
 }
 
@@ -33737,7 +33806,7 @@ fn a_hung_probe_worker_is_left_running_and_its_account_marked_failed() {
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
     let started = Instant::now();
-    super::fetch_probe_due_flagged(&state, entries, None);
+    super::fetch_probe_due_flagged(&state, entries, None, None);
     let took = started.elapsed();
 
     assert!(
@@ -33775,6 +33844,309 @@ fn a_hung_probe_worker_is_left_running_and_its_account_marked_failed() {
     assert!(
         due.is_empty(),
         "a due partition started a second probe beside the one still running"
+    );
+}
+
+/// A hung OAuth worker the drain leaves running past its deadline, whose tick
+/// lost the lease while it was out, records no Failed: the reap's strand
+/// re-checks the ticket before writing the status. The lease is released from
+/// the run closure's entry — the one deterministic point the fan-out's fake
+/// worker exposes — before it parks on the hung gate. Control: the same hung
+/// worker under a re-taken ticket is marked Failed.
+#[test]
+fn an_oauth_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["oauth-lease-late"]);
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    let state = completion_order_state();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    let releaser = Arc::clone(&state.fetch_lease);
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("oauth-lease-late")],
+        REFRESH_INTERVAL_MS,
+        None,
+        Some(ticket),
+        move |entry: TokenEntry| -> super::FetchOutcome {
+            if entry.name == "oauth-lease-late" {
+                assert!(
+                    releaser.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+                wait_on_hung_gate();
+            }
+            cached_outcome(&entry.name)
+        },
+    );
+
+    assert!(
+        state
+            .status
+            .lock()
+            .unwrap()
+            .get("oauth-lease-late")
+            .is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("oauth-lease-late")
+            .and_then(|a| a.fetch(FetchLeg::OAuth))
+            .is_none(),
+        "the hung account's fetch mark is still cleared"
+    );
+
+    // Control: the same hung worker under a re-taken ticket is marked Failed.
+    *HUNG_GATE.0.lock().unwrap() = true;
+    HUNG_GATE.1.notify_all();
+    wait_for_no_activity(&state, "oauth-lease-late");
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("oauth-lease-late")],
+        REFRESH_INTERVAL_MS,
+        None,
+        Some(ticket),
+        |entry: TokenEntry| -> super::FetchOutcome {
+            if entry.name == "oauth-lease-late" {
+                wait_on_hung_gate();
+            }
+            cached_outcome(&entry.name)
+        },
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("oauth-lease-late"),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// The lease [`lease_spending_hung_fetcher`] releases the watchdog's way before
+/// it parks on the hung gate: a `fn` fetcher cannot capture, so the test
+/// registers the lease here.
+static LEASE_TO_SPEND: std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>> =
+    std::sync::Mutex::new(None);
+
+fn lease_spending_hung_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    if matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("hung")
+    ) {
+        // A registered lease is released on entry; no registration (the test's
+        // control run) leaves the ticket live.
+        if let Some(lease) = LEASE_TO_SPEND.lock().unwrap().take() {
+            assert!(
+                lease.release_if_stale(
+                    crate::usage::now_ms()
+                        + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                    crate::daemon::LEASE_STALE_BOUND,
+                ),
+                "the watchdog releases the holder"
+            );
+        }
+        wait_on_hung_gate();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// The third-party arm of the strand re-check: a hung worker abandoned after
+/// the tick lost the lease records no Failed, and the fetch mark still clears.
+/// Control: under a re-taken ticket the late account is marked Failed.
+#[test]
+fn a_third_party_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    let mut state = hung_third_party_state(&[("tp-lease-late", HUNG_URL)]);
+    state.fetcher = lease_spending_hung_fetcher;
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("tp-lease-late", HUNG_URL)];
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    *LEASE_TO_SPEND.lock().unwrap() = Some(Arc::clone(&state.fetch_lease));
+    super::fetch_third_party_due_flagged(
+        &state,
+        vec![join_order_entry("tp-lease-late", HUNG_URL)],
+        None,
+        Some(ticket),
+    );
+
+    assert!(
+        state
+            .third_party_status
+            .lock()
+            .unwrap()
+            .get("tp-lease-late")
+            .is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("tp-lease-late")
+            .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+            .is_none(),
+        "the hung account's fetch mark is still cleared"
+    );
+
+    // Control: the same hung worker under a re-taken ticket is marked Failed.
+    *HUNG_GATE.0.lock().unwrap() = true;
+    HUNG_GATE.1.notify_all();
+    wait_for_no_activity(&state, "tp-lease-late");
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_third_party_due_flagged(
+        &state,
+        vec![join_order_entry("tp-lease-late", HUNG_URL)],
+        None,
+        Some(ticket),
+    );
+    assert_eq!(
+        state
+            .third_party_status
+            .lock()
+            .unwrap()
+            .get("tp-lease-late"),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// A hung codex poll the drain leaves running past its deadline, whose tick
+/// lost the lease while the poll was out on the wire, records no Failed: the
+/// reap's strand re-checks the ticket before writing the status. The release
+/// rides the loopback's first accepted connection — the one deterministic
+/// point a stalled fetch exposes. Control: the same hung poll under a
+/// re-taken ticket is marked Failed.
+#[test]
+fn a_codex_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "cx-lease-late";
+    let silent = SilentEndpoint::new();
+    crate::testutil::write_codex_roster(&[name]);
+    write_codex_account(name);
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    crate::usage::reset_request_slots();
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    silent.release_lease_on_accept(Arc::clone(&state.fetch_lease));
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+
+    assert!(
+        state.status.lock().unwrap().get(name).is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+
+    // Control: the same hung poll under a re-taken ticket is marked Failed.
+    drop(silent);
+    wait_for_no_activity(&state, name);
+    let silent = SilentEndpoint::new();
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// A hung probe the drain leaves running past its deadline, whose tick lost
+/// the lease while the probe was out on the wire, records no Failed: the
+/// reap's strand re-checks the ticket before writing the status. The release
+/// rides the loopback's first accepted connection. Control: the same hung
+/// probe under a re-taken ticket is marked Failed.
+#[test]
+fn a_probe_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "probe-lease-late";
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_state(name, 60_000, true);
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    assert_eq!(entries.len(), 1, "fixture: one due probe");
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    silent.release_lease_on_accept(Arc::clone(&state.fetch_lease));
+    super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+
+    assert!(
+        state.status.lock().unwrap().get(name).is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+
+    // Control: the same hung probe under a re-taken ticket is marked Failed.
+    drop(silent);
+    drop(_endpoints);
+    wait_for_no_activity(&state, name);
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
     );
 }
 
@@ -33919,7 +34291,7 @@ fn a_late_probe_withdraws_its_countdown_and_a_verdict_only_retry_keeps_the_pairs
 
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
-    super::fetch_probe_due_flagged(&state, vec![normal, retry], None);
+    super::fetch_probe_due_flagged(&state, vec![normal, retry], None, None);
     drop(capture);
 
     let next = state.next_refresh_per_profile.lock().unwrap();
@@ -33992,7 +34364,7 @@ fn an_abandoned_verdict_only_retry_keeps_the_pairs_fetch_mark() {
     crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
     crate::usage::reset_request_slots();
 
-    super::fetch_probe_due_flagged(&state, vec![retry], None);
+    super::fetch_probe_due_flagged(&state, vec![retry], None, None);
 
     assert_eq!(
         state
@@ -34042,6 +34414,7 @@ fn a_failed_probe_spawn_keeps_each_workers_verdict_only_flag() {
             retry,
             probe_entry_for("probe-normal", false),
         ],
+        None,
         None,
     );
     drop(arm);
@@ -35732,6 +36105,65 @@ impl Drop for ParkedResets {
     }
 }
 
+/// Land `reading` of `name` through the landing section, `fresh` off the live
+/// API or a cached fallback, with the reading the store held before it at a 5h
+/// reset ten minutes ago, judged as [`reset_member`].
+fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
+    land_reading_after_a_reset_under(name, reading, fresh, None);
+}
+
+/// [`land_reading_after_a_reset`] landing under a fetch tick's lease ticket.
+fn land_reading_after_a_reset_under(
+    name: &str,
+    reading: crate::usage::UsageInfo,
+    fresh: bool,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    let pn = crate::profile::ProfileName::from(name);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), reset_info(60.0, Some(-600)));
+    let outcome = super::FetchOutcome {
+        name: pn.clone(),
+        info: Some(reading),
+        status: if fresh {
+            super::FetchStatus::Fresh
+        } else {
+            super::FetchStatus::Cached
+        },
+        rotated: None,
+        from_fetch: fresh,
+        from_headers: false,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    super::apply_outcome_flagged(
+        outcome,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &super::new_claude_resets_memo(),
+        None,
+        lease,
+        Some(&reset_member(name)),
+    );
+}
+
 /// Wait out a left-running worker: its exit clears the account's activity row.
 fn wait_for_no_activity(state: &super::SchedulerState, name: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -35826,6 +36258,66 @@ fn a_hung_resets_read_is_left_running_and_its_late_answer_lands_nothing() {
     drop(endpoints);
 }
 
+/// A claude reset side read that lost the lease on the wire writes no
+/// `limit_resets.json`: the landing's flock hold re-checks the ticket before
+/// the cache write, and the hour stays unstamped for the next holder. The
+/// release rides the stub's answer — the same on-the-wire seam the codex
+/// post-fetch test uses. Control: the same read under a re-taken ticket
+/// writes the file.
+#[test]
+fn a_resets_read_under_a_spent_ticket_writes_no_limit_resets_file() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = save_unanchored_login("lr-lease", "lr-lease-tok");
+    crate::testutil::register_names(&["lr-lease"]);
+    let state = resets_state(vec![profile]);
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr-lease"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    let released = Arc::new(AtomicBool::new(false));
+    let lease = Arc::clone(&state.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let released = Arc::clone(&released);
+        let lease = Arc::clone(&lease);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ && !released.swap(true, Ordering::SeqCst) {
+                assert!(
+                    lease.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    super::claude_resets_tick_flagged(&state, crate::usage::now_ms(), None, None, Some(ticket));
+
+    assert!(
+        !file.exists(),
+        "a read that lost the lease on the wire writes no limit_resets file"
+    );
+
+    // Control: the same read under a re-taken ticket writes the file.
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::claude_resets_tick_flagged(&state, crate::usage::now_ms(), None, None, Some(ticket));
+    assert!(file.exists(), "control: a current ticket writes the file");
+    let _ = server.join().expect("listener");
+}
+
 /// While a read is left running its account gets no second one, whatever marks
 /// it due; the mark waits and fires once the read has exited.
 #[test]
@@ -35899,7 +36391,7 @@ fn a_left_running_resets_read_leaves_the_passes_one_read_to_the_next_account() {
     let t = 1_900_000_000_000;
 
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
     wait_for_reads(&stub, 1);
 
     state
@@ -35909,7 +36401,7 @@ fn a_left_running_resets_read_leaves_the_passes_one_read_to_the_next_account() {
         .due
         .insert("lrl1".to_string());
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
     wait_for_reads(&stub, 2);
     assert!(
         state
@@ -35963,7 +36455,7 @@ fn a_poll_left_running_holds_the_resets_read_unstamped() {
         .insert("lrp1".to_string());
 
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
     assert_eq!(
         stub.reads(),
         1,
@@ -35982,7 +36474,7 @@ fn a_poll_left_running_holds_the_resets_read_unstamped() {
 
     state.activity.lock().unwrap().remove("lrp1");
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
     assert_eq!(
         stub.reads(),
         2,
@@ -36016,7 +36508,7 @@ fn a_token_spend_holds_the_resets_read_unstamped() {
     super::mark_activity(&state.activity, &name, ProfileActivity::Refreshing);
 
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
     assert_eq!(stub.reads(), 0, "no read beside the spend");
     {
         let memo = state.claude_resets_memo.lock().unwrap();
@@ -36029,7 +36521,7 @@ fn a_token_spend_holds_the_resets_read_unstamped() {
 
     super::clear_activity(&state.activity, &name);
     crate::usage::reset_request_slots();
-    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1));
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
     assert_eq!(
         stub.reads(),
         1,
@@ -36158,4 +36650,2227 @@ fn a_resets_read_that_cannot_start_dates_the_hour_with_one_line() {
 
     assert_resets_attempt_dated(&state, "lrs1", t, &lines, &stub);
     drop(endpoints);
+}
+
+// ── a tick that resumes after its instance lost the lease applies nothing ────
+
+static LEASE_LOSS_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static LEASE_LOSS_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn lease_loss_fetcher(
+    _target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    LEASE_LOSS_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (lock, cvar) = &LEASE_LOSS_GATE;
+    let guard = lock.lock().unwrap();
+    let _released = cvar
+        .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| !*open)
+        .unwrap();
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// A scheduler state whose one third-party profile, `stalled`, is persisted
+/// to `config.toml` and registered, so the landing's section-1 identity
+/// compare matches and its cache write is not a no-op: a reading from
+/// `fetcher` lands unless a lease check refuses it.
+fn lease_loss_state(fetcher: ThirdPartyFetcher, url: &str) -> super::SchedulerState {
+    let state = third_party_state(fetcher);
+    let profile = crate::profile::Profile::new(
+        "stalled".to_string(),
+        Some(url.to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("persist the stalled profile");
+    crate::testutil::register_names(&["stalled"]);
+    state.config.lock().unwrap().profiles.push(profile);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("stalled", url)];
+    state
+}
+
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_lands_nothing() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *LEASE_LOSS_GATE.0.lock().unwrap() = false;
+    LEASE_LOSS_ENTERED.store(false, Ordering::SeqCst);
+
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (lock, cvar) = &LEASE_LOSS_GATE;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    let url = "https://stalled.lease-loss.example";
+    let state = lease_loss_state(lease_loss_fetcher, url);
+
+    std::thread::scope(|scope| {
+        let release = Release;
+        let ticking = scope.spawn(|| super::tick(&state));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !LEASE_LOSS_ENTERED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the tick never reached the fetch"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The tick is stalled inside the fetch; its instance loses the lease.
+        assert!(
+            state.fetch_lease.release_if_stale(
+                crate::usage::now_ms() + 10 * 60 * 1000,
+                Duration::from_secs(5 * 60)
+            ),
+            "the stalled holder drops the lease"
+        );
+        let waiter = crate::daemon::FetchLease::new();
+        assert!(waiter.acquire(), "a standby takes the dropped lease");
+
+        drop(release);
+        ticking.join().expect("the tick thread returns");
+    });
+
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("stalled"),
+        "a tick resumed after losing the lease writes no reading"
+    );
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("stalled"))
+            .expect("profile dir")
+            .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE)
+            .exists(),
+        "a tick resumed after losing the lease writes no cache"
+    );
+}
+
+/// Opens [`LEASE_LOSS_GATE`] on drop, so a failed assertion never leaves the
+/// stalled fetch parked.
+struct OpenLeaseLossGate;
+
+impl Drop for OpenLeaseLossGate {
+    fn drop(&mut self) {
+        let (lock, cvar) = &LEASE_LOSS_GATE;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+}
+
+/// Park the test thread until `entered` reads true: the tick under test has
+/// reached the request it stalls in.
+fn await_stall(entered: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never reached the stalled request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// [`lease_loss_state`] with the chain's one member `b` reading recovered after
+/// a switch-off: a tick that keeps the lease queues a relink onto it.
+fn recovery_lease_loss_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    let state = lease_loss_state(fetcher, "https://stalled.lease-loss.example");
+    {
+        let mut config = state.config.lock().unwrap();
+        config.state.fallback_chain = vec!["b".into()];
+        config.profiles.push(logged_in("b"));
+    }
+    let recovered = recoverable_store().lock().unwrap().clone();
+    *state.store.lock().unwrap() = recovered;
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Fresh);
+    state
+}
+
+/// The chain's one member reads recovered after a switch-off, so a tick that
+/// keeps the lease queues a relink onto it; the same tick resumed after its
+/// instance lost the lease must queue nothing.
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_queues_no_switch() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *LEASE_LOSS_GATE.0.lock().unwrap() = false;
+    LEASE_LOSS_ENTERED.store(false, Ordering::SeqCst);
+    // A tick that ran past its guards reaches the resets side read for the due
+    // account `b`; the stub answers it, so such a tick ends at the assertion.
+    let (base, _server) =
+        crate::testutil::serve_endpoints(4, |_, _| (200, CEDAR_EMBER_THREE_GRANTS.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let state = recovery_lease_loss_state(lease_loss_fetcher);
+
+    std::thread::scope(|scope| {
+        let open = OpenLeaseLossGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&LEASE_LOSS_ENTERED);
+        // The tick is stalled inside the fetch; its instance loses the lease.
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        );
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+
+    assert!(
+        state.pending_switch.lock().unwrap().is_empty(),
+        "a tick resumed after losing the lease queues no switch"
+    );
+}
+
+static ROTATION_STALL_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static ROTATION_STALL_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Opens [`ROTATION_STALL_GATE`] on drop.
+struct OpenRotationStallGate;
+
+impl Drop for OpenRotationStallGate {
+    fn drop(&mut self) {
+        let (lock, cvar) = &ROTATION_STALL_GATE;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+}
+
+/// The `/usage` poll stalls, then answers 401: a tick that kept the lease
+/// claims a rotation spend on that answer; the same tick resumed after its
+/// instance lost the lease must claim none and send no refresh token.
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_starts_no_rotation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-rotation";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+    let claimed = Arc::new(AtomicBool::new(false));
+    {
+        let claimed = Arc::clone(&claimed);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || claimed.store(true, Ordering::SeqCst)),
+        );
+    }
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        // The poll is stalled on the wire; its instance loses the lease.
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        );
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !claimed.load(Ordering::SeqCst),
+        "a tick resumed after losing the lease claims no rotation spend"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a tick resumed after losing the lease sends no refresh token: {seen:?}"
+    );
+}
+
+// ── every guard a lost lease reaches is bound on its own ─────────────────────
+
+/// Release `lease` the way the watchdog does for a holder whose last tick is
+/// past its bound.
+fn release_as_the_watchdog(lease: &crate::daemon::FetchLease) {
+    let bound = std::time::Duration::from_secs(5 * 60);
+    assert!(
+        lease.release_if_stale(crate::usage::now_ms() + 2 * bound.as_millis() as u64, bound),
+        "fixture control: the watchdog releases the holder"
+    );
+}
+
+/// A third-party fetcher that answers at once with an empty reading.
+fn lease_kept_fetcher(
+    _target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// The stalled fixture of the lands-nothing test, with the lease kept: the
+/// reading lands in the store and the cache. This is what makes the
+/// lands-nothing test's absences mean the lease, not the fixture.
+#[test]
+fn a_tick_that_keeps_the_lease_lands_the_stalled_third_party_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = lease_loss_state(lease_kept_fetcher, "https://stalled.lease-loss.example");
+
+    super::tick(&state);
+
+    assert!(
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("stalled"),
+        "a tick that keeps the lease writes the reading"
+    );
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("stalled"))
+            .expect("profile dir")
+            .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE)
+            .exists(),
+        "a tick that keeps the lease writes the cache"
+    );
+}
+
+/// The recovery fixture of the queues-no-switch test, with the lease kept: the
+/// relink onto `b` is queued.
+#[test]
+fn a_tick_that_keeps_the_lease_queues_the_recovery_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // The merged tick's resets side read resolves the usage endpoint on a pass
+    // with a due OAuth account (the recovered member `b`); the stub answers it
+    // so the tick completes.
+    let (base, server) =
+        crate::testutil::serve_endpoints(4, |_, _| (200, CEDAR_EMBER_THREE_GRANTS.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let state = recovery_lease_loss_state(lease_kept_fetcher);
+
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+
+    assert!(
+        state
+            .pending_switch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.target == "b"),
+        "a tick that keeps the lease queues the relink onto b"
+    );
+}
+
+/// The OAuth landing's own hold: a ticket spent before the landing starts must
+/// write no usage cache, whatever the check after the hold says.
+#[test]
+fn an_oauth_landing_under_a_spent_ticket_writes_no_usage_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let pn = crate::profile::ProfileName::from("a");
+    let lease = crate::daemon::FetchLease::new();
+
+    land_reading_after_a_reset_under(
+        "a",
+        reset_info(0.0, None),
+        true,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &pn,
+            crate::profile_cache::USAGE_CACHE_FILE
+        )
+        .is_none(),
+        "a landing under a spent ticket wrote the usage cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    land_reading_after_a_reset_under("a", reset_info(0.0, None), true, Some(current));
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &pn,
+            crate::profile_cache::USAGE_CACHE_FILE
+        )
+        .is_some(),
+        "control: the same landing under a current ticket writes the cache"
+    );
+}
+
+/// A landing that loses the lease after its last check still must not clear a
+/// credit refusal: the clear takes the state flock on its own and re-checks.
+#[test]
+fn an_oauth_landing_that_loses_the_lease_after_its_check_clears_no_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "c"]);
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+
+    record_refusal("a", 3 * 3_600_000);
+    let current = lease.acquire_ticket().expect("take the fetch lease");
+    land_reading_after_a_reset_under("a", reset_info(0.0, None), true, Some(current));
+    assert!(
+        refusal_on("a").is_none(),
+        "control: a landing that keeps the lease clears the refusal"
+    );
+
+    // A clear floors its member's record, so the lost-lease landing runs on a
+    // member the control left alone.
+    record_refusal("c", 3 * 3_600_000);
+    let ticket = lease.acquire_ticket().expect("hold the fetch lease");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::AfterLanding, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+    land_reading_after_a_reset_under("c", reset_info(0.0, None), true, Some(ticket));
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the landing reached the seam"
+    );
+    assert!(
+        refusal_on("c").is_some(),
+        "a landing that lost the lease cleared the credit refusal"
+    );
+}
+
+/// [`scan_sessions`] under a fetch tick's lease ticket.
+fn scan_sessions_leased(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
+        lease,
+    );
+}
+
+/// The batch that points a session at a member runs under the state flock, and
+/// checks the ticket there: a scan with a spent ticket writes no decision.
+#[test]
+fn a_session_scan_under_a_spent_ticket_points_no_session_at_a_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let config = session_config(&["a", "b"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let lease = crate::daemon::FetchLease::new();
+
+    scan_sessions_leased(
+        &config,
+        &store,
+        &status,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a scan under a spent ticket pointed the session at a member"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    scan_sessions_leased(&config, &store, &status, Some(current));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the same scan under a current ticket points the session at b"
+    );
+}
+
+/// The credit refusal a session's spend-cap 429 earns is a shared record: a
+/// scan with a spent ticket writes none, a current one records it on `a`.
+#[test]
+fn a_session_scan_under_a_spent_ticket_records_no_credit_refusal() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = credit_store(&["a", "b"], &["a", "b"]);
+    let status = all_fresh(&["a", "b"]);
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    let lease = crate::daemon::FetchLease::new();
+
+    scan_sessions_leased(
+        &config,
+        &store,
+        &status,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert!(
+        refusal_on("a").is_none(),
+        "a scan under a spent ticket recorded a credit refusal"
+    );
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    scan_sessions_leased(&config, &store, &status, Some(current));
+    assert!(
+        refusal_on("a").is_some(),
+        "control: the same 429 under a current ticket goes on record"
+    );
+}
+
+/// The recovery scan queues its relink under the `pending_switch` lock and
+/// checks the ticket there.
+#[test]
+fn a_recovery_scan_under_a_spent_ticket_queues_no_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lease = crate::daemon::FetchLease::new();
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+            "b".to_string(),
+            super::FetchStatus::Fresh,
+        )])));
+        let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        super::scan_recovery_leased(
+            &recovery_config(None, &["b"]),
+            &recoverable_store(),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            Some(ticket),
+        );
+        pending.lock().unwrap().clone()
+    };
+
+    assert!(
+        scan(crate::testutil::spent_lease_ticket(&lease)).is_empty(),
+        "a recovery scan under a spent ticket queued a switch"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert_eq!(
+        scan(current),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
+        "control: the same scan under a current ticket queues the relink onto b"
+    );
+}
+
+/// The re-stamp leg spends a refresh token: a tick that loses the lease just
+/// before it leaves the due sidecar alone.
+#[test]
+fn a_tick_that_loses_the_lease_before_the_rolling_leg_restamps_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-lost");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    super::tick(&state);
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the tick reached the seam"
+    );
+    assert_eq!(
+        sidecar_access_token("cl-tick-lost").as_deref(),
+        Some("cl-tick-lost-rolled"),
+        "a tick that lost the lease re-stamped the sidecar"
+    );
+}
+
+/// The codex standby leg spends a single-use refresh token: a tick that loses
+/// the lease just before it writes no attempt memo and sends no refresh.
+#[test]
+fn a_tick_that_loses_the_lease_before_the_standby_leg_refreshes_no_codex_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| {
+        (
+            200,
+            r#"{"id_token":"id.n","access_token":"at.n","refresh_token":"rt.new"}"#.to_string(),
+        )
+    });
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-lost");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the tick reached the seam"
+    );
+    let seen = handle.join().expect("join stub");
+    assert!(
+        seen.is_empty(),
+        "a tick that lost the lease sent a codex refresh: {seen:?}"
+    );
+    assert!(
+        !codex_attempt_memo_exists("cx-tick-lost"),
+        "a tick that lost the lease wrote the codex attempt memo"
+    );
+}
+
+/// The tps leg publishes the shared cache only while the ticket is current.
+#[test]
+fn a_tps_leg_under_a_spent_ticket_publishes_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let cache = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let lease = crate::daemon::FetchLease::new();
+    let now = crate::usage::now_ms();
+
+    super::tps_producer_tick_leased(now, Some(crate::testutil::spent_lease_ticket(&lease)));
+    assert!(
+        !cache.exists(),
+        "a tps leg under a spent ticket published the cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::tps_producer_tick_leased(now + 1_000, Some(current));
+    assert!(
+        cache.exists(),
+        "control: the same leg under a current ticket publishes the cache"
+    );
+}
+
+/// The scheduler thread stamps the lease clock after each tick it completed,
+/// never before: the watchdog ages a tick thread that stops completing.
+#[test]
+fn the_scheduler_thread_stamps_the_lease_after_a_completed_tick() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    assert!(state.fetch_lease.acquire(), "take the fetch lease");
+    state.fetch_lease.stamp_tick(1);
+    let mid_tick = Arc::new(AtomicU64::new(0));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let mid_tick = Arc::clone(&mid_tick);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            mid_tick.store(lease.last_tick_ms(), Ordering::SeqCst);
+        });
+    }
+    let before = crate::usage::now_ms();
+
+    super::tick_and_stamp(&state);
+
+    assert_eq!(
+        mid_tick.load(Ordering::SeqCst),
+        1,
+        "the stamp is not moved before the tick completes"
+    );
+    assert!(
+        state.fetch_lease.last_tick_ms() >= before,
+        "a completed tick stamps the lease clock"
+    );
+}
+
+/// Run one kick against a 401-then-200 `/v1/messages` and a token endpoint that
+/// answers a fresh pair, under a gate holding `lease`'s ticket. The token
+/// handler releases the lease first when `lose_at_token` is set, standing for a
+/// watchdog release while the refresh was on the wire. Returns the endpoint
+/// paths the kick reached and its result.
+fn kick_under_lease(
+    home: &crate::testutil::HomeSandbox,
+    name: &str,
+    lease: &Arc<crate::daemon::FetchLease>,
+    ticket: crate::daemon::LeaseTicket<'_>,
+    lose_at_token: bool,
+) -> (Vec<String>, crate::oauth::KickResult) {
+    let handler_lease = Arc::clone(lease);
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, i| {
+        if path.starts_with("/v1/messages") {
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else if path.starts_with("/v1/oauth/token") {
+            if lose_at_token {
+                release_as_the_watchdog(&handler_lease);
+            }
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    (server.join().expect("listener"), result)
+}
+
+/// A kick opens a window on the account: a fetch tick that already lost the
+/// lease sends none, and one that keeps it does.
+#[test]
+fn a_kick_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+    let (seen, result) = kick_under_lease(&home, "kick-spent", &lease, spent, false);
+    assert!(
+        seen.is_empty(),
+        "a kick under a spent ticket reached the wire: {seen:?}"
+    );
+    assert!(!result.opened, "a refused kick opens nothing");
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let (seen, _) = kick_under_lease(&home, "kick-current", &lease, current, false);
+    assert!(
+        seen.first().is_some_and(|p| p.starts_with("/v1/messages")),
+        "control: a kick under a current ticket sends its POST: {seen:?}"
+    );
+}
+
+/// A tick that loses the lease while its refresh is on the wire keeps the
+/// minted pair (it is already landed and rides back) but sends no retry kick.
+#[test]
+fn a_kick_whose_tick_loses_the_lease_during_the_refresh_sends_no_retry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let (seen, result) = kick_under_lease(&home, "kick-lost", &lease, ticket, true);
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "a tick that lost the lease sent the retry kick: {seen:?}"
+    );
+    assert!(
+        result.rotated.is_some(),
+        "the minted pair is kept and returned"
+    );
+    assert!(!result.opened, "no retry kick, so no window opened");
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let (seen, result) = kick_under_lease(&home, "kick-kept", &lease, current, false);
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        2,
+        "control: a tick that keeps the lease sends the retry kick: {seen:?}"
+    );
+    assert!(result.opened, "control: the retry kick opens the window");
+}
+
+// ── every last-line lease guard refuses a spent ticket ─────────────────────
+
+/// The kick's section-1 write: a 429 that comes back while the tick's lease is
+/// spent leaves no durable block. The block is a shared file the next holder
+/// reads as a live limiter verdict, so the stale tick writes neither it nor the
+/// memory copy that rides the same landing.
+#[test]
+fn a_kick_whose_429_arrives_after_the_lease_is_spent_writes_no_kick_block() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::AtomicBool;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["k"]);
+    let now_before = crate::usage::now_epoch_secs();
+    let reset = now_before + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, now_before + 383_473);
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let handler_lease = Arc::clone(&lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(8, move |path, i| {
+        if path.starts_with("/v1/messages") {
+            if i == 0 {
+                // The watchdog releases the lease while the 429 is on the wire.
+                release_as_the_watchdog(&handler_lease);
+            }
+            (429, limiter.clone(), String::new())
+        } else if path.starts_with("/api/oauth/") {
+            (200, Vec::new(), "{}".to_string())
+        } else {
+            (404, Vec::new(), "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("k")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "k".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(reset)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([ProfileName::from("k")])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let shutting_down = AtomicBool::new(false);
+    let hosts: HashSet<String> = HashSet::new();
+    let run = |entry: super::TokenEntry, ticket: crate::daemon::LeaseTicket<'_>| {
+        let _ = super::run_fetch_flagged(
+            &config,
+            entry,
+            &store,
+            &refetch,
+            &activity,
+            &streaks,
+            &blocks,
+            &weekly_reset_kicks,
+            &hosts,
+            &queue,
+            REFRESH_INTERVAL_MS,
+            None,
+            crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+        );
+    };
+    let block_path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("k"),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+    );
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    run(entry.clone(), ticket);
+    assert!(
+        block_path.as_ref().is_some_and(|p| !p.exists()),
+        "a kick that lost the lease on its 429 wrote kick_block.json"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    run(entry, current);
+    assert!(
+        block_path.as_ref().is_some_and(|p| p.exists()),
+        "control: a kick that kept the lease writes kick_block.json"
+    );
+    let _ = server.join().expect("listener");
+}
+
+/// The codex usage leg's loop-top check: a ticket spent before the first account
+/// polls sends no request at all.
+#[test]
+fn a_codex_poll_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-spent-request";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = crate::daemon::FetchLease::new();
+    let state = completion_order_state();
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        crate::usage::set_codex_usage_url_override(&base);
+        crate::usage::reset_request_slots();
+        super::codex_usage_tick_flagged(
+            &state,
+            None,
+            Some(crate::testutil::spent_lease_ticket(&lease)),
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) =
+        crate::testutil::serve_endpoints(1, |_path, _| (200, r#"{"plan_type":"pro"}"#.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    crate::usage::clear_codex_usage_url_override();
+    let seen = server.join().expect("listener");
+    assert!(
+        !seen.is_empty(),
+        "control: a poll under a current ticket sends its request"
+    );
+}
+
+/// The codex usage leg's post-fetch check: a poll that loses the lease while its
+/// request is on the wire stops before section 1's compare, so the account's
+/// reading is not applied by a tick the new holder has replaced.
+#[test]
+fn a_codex_poll_that_loses_the_lease_on_the_wire_stops_before_the_compare() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-stops-before-compare";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let handler_lease = Arc::clone(&lease);
+    let (base, server) = crate::testutil::serve_endpoints(2, move |_path, i| {
+        if i == 0 {
+            release_as_the_watchdog(&handler_lease);
+        }
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let reached = Arc::new(AtomicBool::new(false));
+    {
+        let reached = Arc::clone(&reached);
+        super::set_codex_compare_hook(name, move |_| {
+            reached.store(true, Ordering::SeqCst);
+        });
+    }
+    let state = completion_order_state();
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "a poll that lost the lease on the wire went on to the section-1 compare"
+    );
+
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "control: a poll that kept the lease reaches the compare"
+    );
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+}
+
+/// The codex usage leg's in-flock cache write: a ticket spent after the fetch
+/// and before the hold writes no `usage_cache.json` for the account.
+#[test]
+fn a_codex_poll_that_loses_the_lease_before_the_cache_write_writes_no_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-lost-before-cache";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let (base, server) =
+        crate::testutil::serve_endpoints(2, |_path, _| (200, r#"{"plan_type":"pro"}"#.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    {
+        let lease = Arc::clone(&lease);
+        super::set_codex_compare_hook(name, move |_| release_as_the_watchdog(&lease));
+    }
+    let state = completion_order_state();
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&pn, crate::profile_cache::USAGE_CACHE_FILE);
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    assert!(
+        cache_path.as_ref().is_some_and(|p| !p.exists()),
+        "a poll that lost the lease before the cache write wrote usage_cache.json"
+    );
+
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    assert!(
+        cache_path.as_ref().is_some_and(|p| p.exists()),
+        "control: a poll that kept the lease writes usage_cache.json"
+    );
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+}
+
+/// The codex walk's slot move: a ticket spent before the state-flock hold leaves
+/// the active slot where it was.
+#[test]
+fn a_codex_switch_under_a_spent_ticket_moves_no_active_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    let lease = crate::daemon::FetchLease::new();
+
+    super::apply_codex_switch_leased(
+        &state,
+        &codex,
+        REFRESH_INTERVAL_MS,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "a switch under a spent ticket moved the codex active slot"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::apply_codex_switch_leased(&state, &codex, REFRESH_INTERVAL_MS, Some(current));
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "control: a switch under a current ticket moves the slot onto the fresh member"
+    );
+}
+
+/// The codex walk's switch-off: a ticket spent before `CodexState::update`'s hold
+/// clears no active slot.
+#[test]
+fn a_codex_switch_off_under_a_spent_ticket_clears_no_active_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    let lease = crate::daemon::FetchLease::new();
+
+    super::apply_codex_switch_leased(
+        &state,
+        &codex,
+        REFRESH_INTERVAL_MS,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "a switch-off under a spent ticket cleared the codex active slot"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::apply_codex_switch_leased(&state, &codex, REFRESH_INTERVAL_MS, Some(current));
+    assert_eq!(
+        codex_active(),
+        None,
+        "control: a switch-off under a current ticket clears the slot"
+    );
+}
+
+/// The global chain scan's queue insert: with the active at its cap and a fresh
+/// sibling available, a ticket spent before the queue's own lock queues nothing.
+#[test]
+fn an_auto_switch_scan_under_a_spent_ticket_queues_no_switch() {
+    use super::{FetchStatus, PendingSwitch, StatusStore};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(10.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![logged_in("a"), logged_in("b")],
+    }));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    let lease = crate::daemon::FetchLease::new();
+
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::scan_auto_switch_leased(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+            Some(ticket),
+        );
+        pending.lock().unwrap().clone()
+    };
+
+    assert!(
+        scan(crate::testutil::spent_lease_ticket(&lease)).is_empty(),
+        "a scan under a spent ticket queued a switch"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        scan(current).iter().any(|d| d.target == "b"),
+        "control: a scan under a current ticket queues the switch onto b"
+    );
+}
+
+/// The global chain scan's switch-off: with wrap-off on and every member spent, a
+/// ticket spent before the queue's own lock queues no switch-off.
+#[test]
+fn an_auto_switch_off_under_a_spent_ticket_queues_no_switch_off() {
+    use super::{FetchStatus, StatusStore};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(100.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            switch_off_when_spent: true,
+            ..AppState::default()
+        },
+        profiles: vec![logged_in("a"), logged_in("b")],
+    }));
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    let lease = crate::daemon::FetchLease::new();
+
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::scan_auto_switch_leased(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+            Some(ticket),
+        );
+        *pending_off.lock().unwrap()
+    };
+
+    assert!(
+        !scan(crate::testutil::spent_lease_ticket(&lease)),
+        "a scan under a spent ticket queued a switch-off"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        scan(current),
+        "control: a scan under a current ticket queues the switch-off"
+    );
+}
+
+/// A fetch worker that starts after the tick lost the lease sends no `/usage`
+/// poll: the fan-out spawns `run_fetch_flagged` per entry, and the worker's own
+/// start is where a tick that lost the lease is caught.
+#[test]
+fn a_fetch_worker_that_starts_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = due_oauth_state();
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    let lease = crate::daemon::FetchLease::new();
+    let hosts: HashSet<String> = HashSet::new();
+    let run = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::run_fetch_flagged(
+            &state.config,
+            entry.clone(),
+            &state.store,
+            &state.refetch_queue,
+            &state.activity,
+            &state.poll_streaks,
+            &state.kick_blocks,
+            &state.weekly_reset_kicks,
+            &hosts,
+            &state.auto_start_queue,
+            REFRESH_INTERVAL_MS,
+            None,
+            crate::usage::SpendGate::new(&state.shutting_down, Some(ticket)),
+        )
+    };
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        let _ = run(crate::testutil::spent_lease_ticket(&lease));
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (200, r#"{"five_hour":{"utilization":0.1}}"#.to_string())
+        } else {
+            (200, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let _ = run(current);
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "control: a worker under a current ticket sends its /usage poll: {seen:?}"
+    );
+}
+
+/// The probe leg's entry check: a ticket spent before an entry is probed sends
+/// no request for it, so a stale tick spends no inference on the account.
+#[test]
+fn a_probe_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed-spent", 60_000, true);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    assert_eq!(entries.len(), 1, "fixture: one probe entry");
+    // The worker's slot re-check derives its ticket from the state's lease,
+    // so the test's ticket comes from the same lease.
+    let lease = Arc::clone(&state.fetch_lease);
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        super::fetch_probe_due_flagged(
+            &state,
+            entries.clone(),
+            None,
+            Some(crate::testutil::spent_lease_ticket(&lease)),
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(current));
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a probe under a current ticket sends its request"
+    );
+}
+
+/// The retention trim's per-profile check: a tick stalled in the loop past its
+/// watchdog release prunes no profile after the ticket is spent, so it cannot
+/// rename a history file over the new holder's in-flock append.
+#[test]
+fn a_history_prune_past_a_spent_ticket_prunes_no_later_profile() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let p1 = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ph1"));
+    let p2 = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ph2"));
+    crate::testutil::persist_profiles(&[p1.clone(), p2.clone()]);
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: vec![p1, p2],
+        }));
+    let now = crate::usage::now_ms();
+    let usage_line =
+        |ts: u64, name: &str| serde_json::json!({"ts": ts, "name": name, "usage": {}}).to_string();
+    let wallet_line = |ts: u64| {
+        serde_json::json!({"ts": ts, "label": "l", "amount": 1.0, "currency": "USD"}).to_string()
+    };
+    for name in ["ph1", "ph2"] {
+        let pn = crate::profile::ProfileName::from(name);
+        std::fs::write(
+            crate::profile::profile_history_path(&pn).expect("usage history path"),
+            format!("{}\n{}\n", usage_line(0, name), usage_line(now, name)),
+        )
+        .expect("write usage history");
+        std::fs::write(
+            crate::profile::profile_wallet_history_path(&pn).expect("wallet history path"),
+            format!("{}\n{}\n", wallet_line(0), wallet_line(now)),
+        )
+        .expect("write wallet history");
+    }
+    let lines = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .expect("read history")
+            .lines()
+            .count()
+    };
+    let usage_path = |name: &str| {
+        crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
+            .expect("usage history path")
+    };
+    let wallet_path = |name: &str| {
+        crate::profile::profile_wallet_history_path(&crate::profile::ProfileName::from(name))
+            .expect("wallet history path")
+    };
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let released = Arc::new(AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&lease);
+        let released = Arc::clone(&released);
+        super::at_tick_seam(super::TickSeam::AfterHistoryPrune, move || {
+            released.store(true, Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    assert!(
+        super::prune_histories_if_due(&AtomicU64::new(0), &config, now, Some(ticket)),
+        "fixture control: the trim is due"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "fixture control: the trim reached the seam between two profiles"
+    );
+    assert_eq!(
+        lines(&usage_path("ph1")),
+        1,
+        "the first profile's history is pruned before the release"
+    );
+    assert_eq!(
+        lines(&usage_path("ph2")),
+        2,
+        "a prune past the spent ticket trimmed a later profile's history"
+    );
+    assert_eq!(
+        lines(&wallet_path("ph2")),
+        2,
+        "a prune past the spent ticket trimmed a later profile's wallet history"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(super::prune_histories_if_due(
+        &AtomicU64::new(0),
+        &config,
+        now,
+        Some(current)
+    ));
+    assert_eq!(
+        lines(&usage_path("ph2")),
+        1,
+        "control: a prune under a current ticket trims the later profile"
+    );
+    assert_eq!(
+        lines(&wallet_path("ph2")),
+        1,
+        "control: a prune under a current ticket trims the later profile's wallet history"
+    );
+}
+
+/// The refresher's start wires the two workers from the state it built: the lease
+/// watchdog watches the SAME `FetchLease` the tick acquires from, and the tick
+/// thread's loop body is `tick_and_stamp`, so every completed tick stamps the
+/// clock the watchdog ages. Neither thread may outlive a test's sandbox, so the
+/// pin reads the pair the start hands them.
+#[test]
+fn the_refresher_starts_the_watchdog_on_the_states_lease_and_stamps_each_tick() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+
+    super::spawn_refresher(
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        // Pre-armed, so a thread the start ever does launch in-process breaks at
+        // its loop-top check instead of running past this sandbox.
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&lease),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
+    );
+
+    let (watchdog_lease, tick_body) = super::LAST_REFRESHER_START
+        .with(|slot| slot.borrow().clone())
+        .expect("a refresher start records the wiring it hands its workers");
+    assert!(
+        Arc::ptr_eq(&watchdog_lease, &lease),
+        "the lease watchdog must watch the same lease the state's tick acquires from"
+    );
+    assert!(
+        std::ptr::fn_addr_eq(
+            tick_body,
+            super::tick_and_stamp as fn(&super::SchedulerState)
+        ),
+        "the tick thread's loop body must stamp each completed tick"
+    );
+    assert!(
+        !std::ptr::fn_addr_eq(tick_body, super::tick as fn(&super::SchedulerState)),
+        "control: the loop body is not the unstamped tick"
+    );
+}
+
+// ── the re-taken tps producer ────────────────────────────────────────────────
+
+/// A tick that re-takes the lease re-joins the tps producer's files: the
+/// producer re-walks the shared speed ledger on the first leg under the new
+/// hold instead of keeping this process's pre-stand-down memory.
+#[test]
+fn a_retaking_tick_reloads_the_producers_files() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let before = crate::tps::ledger_walks::taken();
+    super::tick(&state);
+    // The watchdog releases the held lease; the next tick re-takes it.
+    assert!(
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    super::tick(&state);
+    assert_eq!(
+        crate::tps::ledger_walks::taken() - before,
+        2,
+        "a re-taken tick re-walked the ledger (once per tick)"
+    );
+}
+
+// ── the pre-claim credential path of a spent worker ──────────────────────────
+
+/// The tick stalls on /usage, the watchdog releases, the 401 lands: the
+/// carry leg sits before the spend claim, so a worker that lost the lease
+/// must lift no quarantine (the pre-claim credential path runs nothing).
+#[test]
+fn a_fetch_worker_whose_lease_was_spent_lifts_no_quarantine() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-carry";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    // The store moved past the entry's token, and the account stands quarantined.
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.set_auth_broken(&profile, true);
+        let p = cfg.profiles.iter_mut().find(|p| p.name == profile).unwrap();
+        p.credentials
+            .as_mut()
+            .unwrap()
+            .claude_ai_oauth
+            .as_mut()
+            .unwrap()
+            .refresh_token = Some("rt-moved".into());
+        crate::profile::save_profile(p).expect("save moved store");
+    }
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        assert!(state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        ));
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let _ = server.join().expect("listener");
+
+    let broken = state.config.lock().unwrap().is_auth_broken(&profile);
+    assert!(broken, "a worker that lost the lease lifted the quarantine");
+}
+
+/// The same fixture under a live ticket: the carry leg lifts the stale
+/// quarantine once the on-disk pair moved — the control that makes the
+/// spent-ticket test's assertion mean the lease.
+#[test]
+fn a_fetch_worker_under_a_live_ticket_lifts_the_quarantine() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-carry-live";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.set_auth_broken(&profile, true);
+        let p = cfg.profiles.iter_mut().find(|p| p.name == profile).unwrap();
+        p.credentials
+            .as_mut()
+            .unwrap()
+            .claude_ai_oauth
+            .as_mut()
+            .unwrap()
+            .refresh_token = Some("rt-moved".into());
+        crate::profile::save_profile(p).expect("save moved store");
+    }
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let _ = server.join().expect("listener");
+
+    let broken = state.config.lock().unwrap().is_auth_broken(&profile);
+    assert!(
+        !broken,
+        "control: a worker that kept the lease lifted the quarantine"
+    );
+}
+
+// ── the codex belt under a spent ticket ──────────────────────────────────────
+
+/// The standby leg's pre-claim belt write under a spent ticket.
+#[test]
+fn a_tick_that_lost_the_lease_writes_no_codex_belt() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-belt-lost");
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            release_as_the_watchdog(&lease);
+        });
+    }
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+    let _ = handle.join();
+    let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-lost"))
+        .expect("dir")
+        .join("auth.lkg.json");
+    assert!(
+        !belt.exists(),
+        "a tick that lost the lease wrote the codex belt"
+    );
+}
+
+/// The same pass under a live ticket writes the belt: the control that makes
+/// the spent-ticket test's assertion mean the lease.
+#[test]
+fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::testutil::write_codex_roster(&["cx-belt-kept"]);
+    crate::testutil::write_codex_store(
+        "cx-belt-kept",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 86_400),
+            "rt.old",
+        ),
+    );
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+    let _ = handle.join();
+    let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-kept"))
+        .expect("dir")
+        .join("auth.lkg.json");
+    assert!(belt.exists(), "control: a live tick wrote the codex belt");
+}
+
+/// The belt restore in a standby pass's pre-claim half: a store that read bad
+/// for 30 s is restored under a live ticket, and the same pass under a spent
+/// ticket restores nothing.
+#[test]
+fn a_tick_that_lost_the_lease_restores_no_codex_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cx-restore-lost");
+    crate::testutil::write_codex_roster(&["cx-restore-lost"]);
+    let body = crate::testutil::codex_auth_body(
+        &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 86_400),
+        "rt.good",
+    );
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("make the profile dir");
+    std::fs::write(dir.join("auth.lkg.json"), body.as_bytes()).expect("write the belt");
+    std::fs::write(dir.join("auth.json"), b"not json").expect("corrupt the store");
+
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let activity = crate::testutil::fresh_activity();
+    let rfc = chrono::Utc::now().to_rfc3339();
+    let first = crate::usage::now_ms() as i64;
+    let lease = crate::daemon::FetchLease::new();
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    crate::codex_auth::standby_tick(
+        first,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+    );
+    // The watchdog releases the lease between the two passes.
+    assert!(
+        lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    let spent = lease.ticket_at(ticket.generation());
+    assert!(!spent.is_current(), "the release spends the ticket");
+    crate::codex_auth::standby_tick(
+        first + 31_000,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(spent)),
+    );
+    let store = std::fs::read(dir.join("auth.json")).expect("read the store");
+    assert_eq!(
+        store,
+        b"not json".to_vec(),
+        "a tick that lost the lease restored the corrupt store"
+    );
+
+    // Control: the same second pass under a re-taken ticket restores it.
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    crate::codex_auth::standby_tick(
+        first + 31_000,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(current)),
+    );
+    let store = std::fs::read(dir.join("auth.json")).expect("read the store");
+    assert_eq!(
+        store,
+        body.into_bytes(),
+        "control: a live second pass restored the store"
+    );
+}
+
+// ── the slot-queued probe and kick re-read the ticket ────────────────────────
+
+/// Wait until the anthropic slot reservation advances past `first`: the
+/// request under test has reserved its own slot (past its entry check) and is
+/// waiting on the spacing.
+fn await_slot_advance(first: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .is_none_or(|v| v <= first)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the request never reserved its slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A probe whose request queued behind the host spacing slot while its tick
+/// lost the lease sends nothing: the ticket is re-read after the slot wait,
+/// before the POST, so a stale tick spends no inference beside the new
+/// holder's own.
+#[test]
+fn a_probe_queued_behind_the_slot_whose_lease_dies_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_request_slots();
+    let state = probe_state("probed-queued", 60_000, true);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    assert_eq!(entries.len(), 1, "fixture: one probe entry");
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    // Hold the first slot on this thread so the worker queues behind it.
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    let first = crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .expect("the reserved slot");
+
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+        });
+        // The worker has passed its spawn check once its slot reservation
+        // lands: this release is a watchdog release during the slot wait.
+        await_slot_advance(first);
+        assert!(
+            state.fetch_lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder"
+        );
+        ticking.join().expect("the leg returns");
+    });
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.is_empty(),
+        "a probe queued behind the slot sent its POST after the release: {seen:?}"
+    );
+
+    // Control: the same leg under a live ticket sends the request.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    let current = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(current));
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a probe under a current ticket sends its request"
+    );
+}
+
+/// A kick whose POST queued behind the host spacing slot while its tick lost
+/// the lease sends nothing and opens no window: the ticket is re-read after
+/// the slot wait, before the POST.
+#[test]
+fn a_kick_queued_behind_the_slot_whose_lease_dies_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_request_slots();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let name = crate::profile::ProfileName::from("kick-queued");
+    let config = crate::testutil::rotation_fixture_config(&name);
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, Vec::new(), "{}".to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    let first = crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .expect("the reserved slot");
+
+    let (seen, result) = std::thread::scope(|scope| {
+        let kicking = scope.spawn(|| {
+            crate::oauth::auto_start_kick(
+                &config,
+                &name,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((
+                    &activity,
+                    crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+                )),
+                crate::oauth::LockWait::NoWait,
+            )
+        });
+        await_slot_advance(first);
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder"
+        );
+        (
+            server.join().expect("listener"),
+            kicking.join().expect("the kick returns"),
+        )
+    });
+    assert!(
+        seen.is_empty(),
+        "a kick queued behind the slot sent its POST after the release: {seen:?}"
+    );
+    assert!(!result.opened, "a skipped kick opens no window");
+
+    // Control: the same kick under a live ticket sends the POST and opens.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, Vec::new(), "{}".to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &name,
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(current)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a kick under a current ticket sends its POST: {seen:?}"
+    );
+    assert!(result.opened, "control: the live kick opens the window");
+}
+
+/// A kick whose first POST answered 401 and whose lease the watchdog released
+/// during the paced recovery writes neither an adopted pair nor a quarantine:
+/// the new holder decides. The store moved past the entry's token, so a live
+/// ticket adopts it (the control proving the fixture writes).
+#[test]
+fn a_kick_whose_lease_died_before_its_rotation_writes_nothing() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let name = crate::profile::ProfileName::from("kick-lost-span");
+    let config = crate::testutil::rotation_fixture_config(&name);
+    // The store moved past the entry's token (a peer's advance), and the entry's
+    // token is on the spent record: a rotation past it ADOPTS the stored pair.
+    crate::oauth::record_spent(&name, "rt-old");
+    {
+        let mut moved = crate::profile::load_profile(&name).expect("load the fixture store");
+        let oauth = moved
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture's pair");
+        oauth.access_token = "at-moved".to_string();
+        oauth.refresh_token = Some("rt-moved".to_string());
+        crate::profile::save_profile(&moved).expect("save the moved store");
+        config.lock().unwrap().set_auth_broken(&name, true);
+    }
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = AtomicBool::new(false);
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let (kick_tx, kick_rx) = std::sync::mpsc::channel();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+        let _ = kick_tx.send(());
+        (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string())
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let result = std::thread::scope(|scope| {
+        let kicking = scope.spawn(|| {
+            crate::oauth::auto_start_kick(
+                &config,
+                &name,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((
+                    &activity,
+                    crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+                )),
+                crate::oauth::LockWait::NoWait,
+            )
+        });
+        kick_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first kick reaches the stub");
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder during the paced recovery"
+        );
+        kicking.join().expect("the kick returns")
+    });
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        result.rotated.is_none(),
+        "a stood-down kick carried an adopted pair back"
+    );
+    assert_eq!(
+        config
+            .lock()
+            .unwrap()
+            .find(&name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-old"),
+        "a stood-down kick adopted the newer disk pair"
+    );
+    assert!(
+        config.lock().unwrap().is_auth_broken(&name),
+        "a stood-down kick lifted the quarantine"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/oauth/token")),
+        "a stood-down kick spent its refresh: {seen:?}"
+    );
+
+    // Control: the same fixture under a current ticket adopts the stored pair
+    // and lifts the quarantine, so the assertions above mean the lease.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &name,
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(current)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    let _ = server.join().expect("listener");
+    assert_eq!(
+        result.rotated,
+        Some(("at-moved".to_string(), Some("rt-moved".to_string()))),
+        "control: a live-ticket kick adopts the moved store"
+    );
+    assert!(
+        !config.lock().unwrap().is_auth_broken(&name),
+        "control: the adopt lifts the quarantine"
+    );
+}
+
+// ── the codex spawn loop breaks, not returns ─────────────────────────────────
+
+/// The codex leg's spawn loop breaks (not returns) on a ticket spent between
+/// two spawns, so the first worker still reaches the drain and its late
+/// count: the re-take starts no second worker for that account.
+#[test]
+fn a_codex_leg_that_loses_the_lease_between_spawns_starts_no_second_worker_on_the_retake() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &silent.base);
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    let state = third_party_state(stub_ok_stats);
+    crate::testutil::write_codex_roster(&["cx-lost-a", "cx-lost-b"]);
+    for name in ["cx-lost-a", "cx-lost-b"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(
+                &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 60),
+                "rt.old",
+            ),
+        );
+    }
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        super::at_tick_seam(super::TickSeam::AfterCodexSpawn, move || {
+            release_as_the_watchdog(&lease);
+        });
+    }
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    // The first worker's poll gets out (it spawned before the release); wait
+    // for its connection, then assert no second worker followed it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while silent.accepted() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first worker never connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        silent.accepted(),
+        1,
+        "only the first account's worker got out"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("cx-lost-a")
+            .is_some_and(|s| s.late(FetchLeg::Codex)),
+        "the first worker is left running and counted late"
+    );
+
+    // The re-take: the late account gets no second worker, the not-yet-spawned
+    // account's first poll goes out.
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    assert_eq!(
+        silent.accepted(),
+        2,
+        "a second worker started for the late account on the re-take"
+    );
+}
+
+// ── the resets reap's log under a spent ticket ───────────────────────────────
+
+/// The resets reap logs a left-running read only under a live ticket, like
+/// the other reaps: a spent one still dates the attempt but stays silent.
+#[test]
+fn a_resets_reap_under_a_spent_ticket_logs_no_left_running() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh-lease", "lrh-lease-tok");
+    crate::testutil::register_names(&["lrh-lease"]);
+    let stub = ParkedResets::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let ticket = crate::testutil::spent_lease_ticket(&state.fetch_lease);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, 1_900_000_000_000, None, None, Some(ticket));
+    drop(capture);
+    wait_for_reads(&stub, 1);
+    let logged = lines.snapshot();
+    let named: Vec<&String> = logged
+        .iter()
+        .filter(|l| l.contains("'lrh-lease'"))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "a spent ticket logs no left-running line: {named:?}"
+    );
+    stub.release();
+    wait_for_no_activity(&state, "lrh-lease");
 }

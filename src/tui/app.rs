@@ -1849,7 +1849,12 @@ fn default_bare_item_source() -> Option<BareItemSource> {
 pub(crate) enum BareItemWrite {
     /// The bootstrap's relink of the active profile.
     BootRelink(ProfileName),
-    Switch(ProfileName),
+    /// A switch; `queued` is the pending-switch queue's origin, carried by the
+    /// held write and its resumed gate so a release still drops it.
+    Switch {
+        name: ProfileName,
+        queued: bool,
+    },
     SwitchOff,
     ClearSessionToken(ProfileName),
     /// The `switch to a rolling token` row's confirmed arm on the active
@@ -1901,7 +1906,7 @@ impl BareItemWrite {
                 crate::claude::BareItemWriter::SignOut
             }
             Self::BootRelink(_) => crate::claude::BareItemWriter::Relink,
-            Self::Switch(_)
+            Self::Switch { .. }
             | Self::UseRollingToken(_)
             | Self::ClearSessionToken(_)
             | Self::Rename
@@ -1919,7 +1924,7 @@ impl BareItemWrite {
     fn failed(&self) -> &'static str {
         match self {
             Self::BootRelink(_) | Self::ClearSessionToken(_) => "relink failed",
-            Self::Switch(_) | Self::UseRollingToken(_) => "switch failed",
+            Self::Switch { .. } | Self::UseRollingToken(_) => "switch failed",
             Self::SwitchOff => "switch-off failed",
             Self::Rename => "rename failed",
             Self::NewAccount => "create failed",
@@ -18295,6 +18300,9 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 /// worker and drained by `drain_switch_gates`.
 pub(crate) struct SwitchGateResult {
     name: ProfileName,
+    /// The switch was dispatched by the pending-switch queue, not by the user:
+    /// a release landing while its gate ran drops it at the drain.
+    queued: bool,
     gate: SwitchGate,
 }
 
@@ -18304,6 +18312,7 @@ impl SwitchGateResult {
     pub(crate) fn gated(name: ProfileName, gate: oauth::AuthGate) -> Self {
         Self {
             name,
+            queued: false,
             gate: SwitchGate::Gated {
                 gate,
                 settled: crate::claude::BareItemSettled::default(),
@@ -18330,6 +18339,20 @@ enum SwitchGate {
     Held(BareItemOutcome),
 }
 
+/// Switch the active profile to `name` on the user's word: the confirm's
+/// resolved switch, this wrapper's only caller. The user origin it marks is
+/// never dropped by a lease release.
+fn perform_switch(app: &mut App, name: &ProfileName) {
+    switch_to(app, name, false);
+}
+
+/// Execute a decision the scheduler queued: the same switch as the user's, but
+/// a release landing while its gate runs drops it at `drain_switch_gates`
+/// instead of moving the account.
+fn perform_queued_switch(app: &mut App, name: &ProfileName) {
+    switch_to(app, name, true);
+}
+
 /// Switch the active profile to `name`. The AUTH-1 pre-install gate
 /// (`ensure_installable`) may refresh the target's token over HTTP, so it runs
 /// off the UI thread; `drain_switch_gates` completes the relink when it
@@ -18341,8 +18364,10 @@ enum SwitchGate {
 /// takes the gate like any other target. The exemption is decided on the disk
 /// read (the memory copy can lag a peer's switch) and re-checked under the
 /// switch's state hold, so a peer write that would make the switch install the
-/// stored login sends it back through `spawn_switch_gate`.
-fn perform_switch(app: &mut App, name: &ProfileName) {
+/// stored login sends it back through `spawn_switch_gate`. `queued` rides the
+/// gate's request and answer, and a held bare-item write, so the drain and a
+/// resumed gate can tell the two origins apart.
+fn switch_to(app: &mut App, name: &ProfileName, queued: bool) {
     // The mirror also moves the in-memory active account to disk's.
     let disk = {
         let mut cfg = app.config();
@@ -18361,10 +18386,10 @@ fn perform_switch(app: &mut App, name: &ProfileName) {
     if disk_active.as_deref() == Some(name) && !crate::claude::live_login_saved_elsewhere(name) {
         #[cfg(test)]
         crate::testutil::switch_race_seam::run();
-        finalize_switch(app, name, None, false);
+        finalize_switch(app, name, None, false, queued);
         return;
     }
-    spawn_switch_gate(app, name.clone(), oauth::refresh_result);
+    spawn_switch_gate(app, name.clone(), oauth::refresh_result, queued);
 }
 
 /// Settle the bare item, then run `ensure_installable` for `name`, off the UI
@@ -18380,7 +18405,7 @@ fn perform_switch(app: &mut App, name: &ProfileName) {
 /// `cfg(test)` the gate runs synchronously — a detached worker would race the
 /// test's `HomeSandbox` (the gate persists `auth_broken` transitions to home
 /// paths).
-fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F)
+fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F, queued: bool)
 where
     F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
         + Send
@@ -18400,6 +18425,7 @@ where
         // a `Transient` answer.
         struct SwitchGateAnswerGuard {
             name: ProfileName,
+            queued: bool,
             sender: std::sync::mpsc::Sender<SwitchGateResult>,
             settling: bool,
             sent: bool,
@@ -18424,12 +18450,14 @@ where
                 };
                 let _ = self.sender.send(SwitchGateResult {
                     name: self.name.clone(),
+                    queued: self.queued,
                     gate,
                 });
             }
         }
         let mut answer = SwitchGateAnswerGuard {
             name: name.clone(),
+            queued,
             sender,
             settling: true,
             sent: false,
@@ -18452,7 +18480,7 @@ where
             },
             held => SwitchGate::Held(BareItemOutcome::Settled(held)),
         };
-        let _ = answer.sender.send(SwitchGateResult { name, gate });
+        let _ = answer.sender.send(SwitchGateResult { name, queued, gate });
         answer.sent = true;
     };
     if cfg!(test) {
@@ -18630,7 +18658,7 @@ fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> 
 /// Without a source there is no item to check.
 fn begin_bare_item_check(app: &mut App, write: &BareItemWrite) -> Option<BareItemCheck> {
     app.bare_item_source?;
-    if let BareItemWrite::Switch(name) = write {
+    if let BareItemWrite::Switch { name, .. } = write {
         mark_activity(&app.activity, name, ProfileActivity::Switching);
         return Some(BareItemCheck::Switch {
             activity: Arc::clone(&app.activity),
@@ -18689,7 +18717,7 @@ fn drain_bare_item_answers(app: &mut App) {
         let Ok(BareItemAnswer { write, outcome }) = app.bare_item_rx.try_recv() else {
             return;
         };
-        if let BareItemWrite::Switch(name) = &write {
+        if let BareItemWrite::Switch { name, .. } = &write {
             clear_activity(&app.activity, name);
         }
         if !app.exit_wait {
@@ -18768,7 +18796,9 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
                 app.refresh_unsaved_live_login();
             }
         }
-        BareItemWrite::Switch(name) => spawn_switch_gate(app, name, oauth::refresh_result),
+        BareItemWrite::Switch { name, queued } => {
+            spawn_switch_gate(app, name, oauth::refresh_result, queued);
+        }
         BareItemWrite::SwitchOff => perform_switch_off(app),
         BareItemWrite::ClearSessionToken(name) => perform_clear_session_token(app, &name),
         BareItemWrite::UseRollingToken(name) => start_rolling_switch(app, &name),
@@ -19049,8 +19079,15 @@ fn settle_after_save(
 /// before this runs. `gated` names whether the AUTH-1 gate ran for this
 /// switch: the worker path passes `true`, the exemption path `false`, and a
 /// `false` switch whose hold finds it would install the stored login is sent
-/// back through `spawn_switch_gate` instead.
-fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>, gated: bool) {
+/// back through `spawn_switch_gate` instead. `queued` rides that re-spawn so
+/// the queued origin survives it.
+fn finalize_switch(
+    app: &mut App,
+    name: &ProfileName,
+    placed: Option<[u8; 32]>,
+    gated: bool,
+    queued: bool,
+) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -19075,7 +19112,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName, placed: Option<[u8; 32]>, 
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
         Err(e) if !gated && e.downcast_ref::<crate::actions::GateNeeded>().is_some() => {
-            spawn_switch_gate(app, name.clone(), oauth::refresh_result);
+            spawn_switch_gate(app, name.clone(), oauth::refresh_result, queued);
         }
         Err(e) => match chain_held_skipped("switch", &e) {
             Some(skipped) => app.toast(ToastKind::Warning, skipped),
@@ -31128,6 +31165,12 @@ pub(crate) fn on_tick(app: &mut App) {
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for decision in auto_switch_targets {
+        // A decision queued under a ticket this instance no longer holds must
+        // not execute — the holder that took over decides. The decisions were
+        // drained above and drop here, so the record clears with the skip.
+        if !app.fetch_lease.fetches_here() {
+            break;
+        }
         // An exit wait starts no new write: a queued auto-switch would spawn a
         // gate (and could relink credentials) after the user quit. The
         // decisions were drained above and drop with the process.
@@ -31192,7 +31235,7 @@ pub(crate) fn on_tick(app: &mut App) {
         };
         app.toast(ToastKind::Warning, msg);
         app.set_tab_activity(Tab::Overview, ToastKind::Warning);
-        perform_switch(app, &name);
+        perform_queued_switch(app, &name);
     }
 
     drain_pending_switch_off(app);
@@ -32001,13 +32044,19 @@ fn drain_switch_gates(app: &mut App) {
     if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
-    while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
+    while let Ok(SwitchGateResult { name, queued, gate }) = app.switch_gates.try_recv() {
         clear_activity(&app.activity, &name);
+        // A decision the scheduler queued must not apply once this instance
+        // lost the lease while its gate ran — the holder that took over
+        // decides. A user's switch is their own call and lands either way.
+        if queued && !app.fetch_lease.fetches_here() {
+            continue;
+        }
         let (gate, settled) = match gate {
             SwitchGate::Gated { gate, settled } => (gate, settled),
             SwitchGate::Held(outcome) => {
                 if !app.exit_wait {
-                    land_bare_item_outcome(app, BareItemWrite::Switch(name), outcome);
+                    land_bare_item_outcome(app, BareItemWrite::Switch { name, queued }, outcome);
                 }
                 continue;
             }
@@ -32017,10 +32066,10 @@ fn drain_switch_gates(app: &mut App) {
             app.toast(ToastKind::Warning, notice);
         }
         match gate {
-            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed, true),
+            oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed, true, queued),
             oauth::AuthGate::Refreshed => {
                 app.refresh_tokens();
-                finalize_switch(app, &name, settled.placed, true);
+                finalize_switch(app, &name, settled.placed, true, queued);
             }
             oauth::AuthGate::Broken => app.toast(
                 ToastKind::Danger,
@@ -32059,6 +32108,12 @@ fn drain_pending_switch_off(app: &mut App) {
         .map(|mut g| std::mem::replace(&mut *g, false))
         .unwrap_or(false);
     if switch_off_pending {
+        // A switch-off queued under a ticket this instance no longer holds
+        // must not execute — the holder that took over decides. The flag was
+        // consumed above, so the record clears with the skip.
+        if !app.fetch_lease.fetches_here() {
+            return;
+        }
         perform_switch_off(app);
     }
 }

@@ -4760,3 +4760,22 @@ pub(crate) fn seq_of(line: &str) -> u64 {
     }
     panic!("no --seq in report line: {line}");
 }
+
+/// A fetch-lease ticket the watchdog already spent: `lease` is taken (the lock
+/// file lives under the sandboxed home, so the caller holds a `HomeSandbox`),
+/// then released the way the watchdog releases a holder whose last tick is
+/// older than its bound. A later `acquire_ticket` on `lease` takes it again,
+/// under a new generation.
+pub(crate) fn spent_lease_ticket(
+    lease: &crate::daemon::FetchLease,
+) -> crate::daemon::LeaseTicket<'_> {
+    let bound = std::time::Duration::from_secs(5 * 60);
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    assert!(ticket.is_current(), "a fresh ticket is current");
+    assert!(
+        lease.release_if_stale(crate::usage::now_ms() + 2 * bound.as_millis() as u64, bound),
+        "the watchdog releases the holder"
+    );
+    assert!(!ticket.is_current(), "the release spends the ticket");
+    ticket
+}

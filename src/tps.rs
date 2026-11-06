@@ -936,7 +936,22 @@ impl Producer {
     /// state. The timeline lands before anything that reflects it: while a
     /// save is pending no fold runs. The snapshot is output only, so it is
     /// published either way.
-    pub(crate) fn tick(&mut self, now_ms: u64) -> Snapshot {
+    ///
+    /// `lease` is the fetch tick's ticket, checked before every write this
+    /// pass makes (the owed-day list, the timeline, the speed ledger): the
+    /// tail pass can stall past the holder's watchdog release, and a pass that
+    /// resumes after it must not write over the files the new holder owns. The
+    /// pass still builds its snapshot; the caller decides whether to publish it.
+    ///
+    /// The check is not a lock: a release landing between a check and its write
+    /// still lets one stale tps file land. The days list self-heals on the next
+    /// pass, which re-derives a dropped owed day from the transcripts.
+    pub(crate) fn tick_leased(
+        &mut self,
+        now_ms: u64,
+        lease: Option<crate::daemon::LeaseTicket<'_>>,
+    ) -> Snapshot {
+        let current = || lease.is_none_or(crate::daemon::LeaseTicket::is_current);
         self.store_mtime = store_mtime_now();
         let cutoff = cutoff_ms(now_ms);
         let today = day_of_ms(now_ms);
@@ -957,7 +972,9 @@ impl Producer {
                 self.reload_timeline(dir, now_ms);
             }
             self.refresh_speed_ledger(dir, now_ms);
-            self.speed_ledger.claim(dir);
+            if current() {
+                self.speed_ledger.claim(dir);
+            }
         }
         // An owed-day list read back (at start, or once an unreadable one
         // reads): each past day it names, back to `OWED_DAYS_BACK`, is rebuilt
@@ -980,7 +997,7 @@ impl Producer {
             && self.folds_can_land()
             && dir
                 .as_deref()
-                .is_some_and(|dir| self.speed_ledger.saves_land(dir))
+                .is_some_and(|dir| current() && self.speed_ledger.saves_land(dir))
         {
             std::mem::take(&mut self.unbuilt)
         } else {
@@ -1033,14 +1050,14 @@ impl Producer {
         // A newly owed day lands in the list before the timeline save, so a
         // life dying between the two writes still leaves it owed.
         self.owed.extend(live.iter().cloned());
-        if let Some(dir) = dir.as_deref() {
+        if let Some(dir) = dir.as_deref().filter(|_| current()) {
             self.days_file.save(dir, &self.owed);
         }
         #[cfg(test)]
         if halt_seam::armed() {
             return Snapshot::default();
         }
-        let attribution_saved = self.save_timeline(dir.as_deref());
+        let attribution_saved = self.save_timeline(dir.as_deref().filter(|_| current()));
 
         let leaving: BTreeSet<String> = self
             .live_days
@@ -1083,7 +1100,7 @@ impl Producer {
         };
         // A fold derived from an entry no file holds would disagree with what
         // a restart re-derives from the saved timeline.
-        if attribution_saved {
+        if attribution_saved && current() {
             self.fold_days(&today, &yesterday, dir);
             // The fold may have landed held days: the snapshot holds what is
             // still held after it.
@@ -1093,8 +1110,37 @@ impl Producer {
                 .retain(|d, _| self.live_days.contains(d) || self.held_rate_peaks.contains_key(d));
         }
         // The days a landed fold dropped leave the list only now.
-        self.days_file.save(dir, &self.owed);
+        if current() {
+            self.days_file.save(dir, &self.owed);
+        }
         snap
+    }
+
+    /// [`Self::tick_leased`] outside a fetch tick: no lease ticket.
+    #[cfg(test)]
+    pub(crate) fn tick(&mut self, now_ms: u64) -> Snapshot {
+        self.tick_leased(now_ms, None)
+    }
+
+    /// Re-join the shared files after this process re-took the fetch lease:
+    /// while it stood down, another holder wrote `token_speed.json`,
+    /// `tps_attribution.json` and `tps_days.json`, and this life's copies
+    /// must not be saved back over them. Unsaved timeline entries are
+    /// dropped with the old copy — never written over the new holder's file;
+    /// a session's live rows restore through the re-observation below. A
+    /// timeline that cannot be read here keeps the old copy, which stays
+    /// unsaveable until a retry reload replaces it.
+    pub(crate) fn rejoin_files(&mut self, now_ms: u64) {
+        let Ok(dir) = crate::profile::clauth_dir() else {
+            return;
+        };
+        self.speed_ledger = crate::token_ledger::SpeedLedger::load(&dir);
+        self.reload_timeline(&dir, now_ms);
+        let (file, owed) = DaysFile::load(&dir);
+        self.days_file = file;
+        self.loaded_owed = owed;
+        self.ledger_ever = None;
+        self.ever_dirty = true;
     }
 
     /// True when a fold of a rebuilt day could land this tick: the speed
@@ -1128,6 +1174,10 @@ impl Producer {
     fn reload_timeline(&mut self, dir: &Path, now_ms: u64) {
         let fresh = Timeline::load(dir);
         if fresh.disk == DiskState::Unreadable {
+            // The kept copy is the old holder's: it must not be saved until a
+            // retry reads the file. Marking it unreadable is what makes
+            // `save_if_changed` refuse and the per-tick retry come back here.
+            self.timeline.disk = DiskState::Unreadable;
             return;
         }
         let sessions: HashSet<String> = self.timeline.by_session.keys().cloned().collect();

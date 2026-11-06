@@ -211,16 +211,21 @@ impl MessagesResponse {
 /// header set: the one request the kick and the probe both send. It waits its
 /// turn on the `api.anthropic.com` spacing slot `/usage` shares and calls
 /// `on_turn` once that wait is over, so a caller shows the request in flight
-/// only then. The `system` prefix stays: an OAuth token without it is refused
-/// as non-Claude-Code inference. The body is read only on a 401 or a 403, for
-/// what it refuses ([`forbidden_by`]), and never leaves this function.
+/// only then. `on_turn` doubles as the last ticket check: returning `false`
+/// skips the POST and answers `Ok(None)` — the request was never sent, so no
+/// caller records a verdict for it. The `system` prefix stays: an OAuth token
+/// without it is refused as non-Claude-Code inference. The body is read only
+/// on a 401 or a 403, for what it refuses ([`forbidden_by`]), and never
+/// leaves this function.
 pub(crate) fn send(
     url: &str,
     access_token: &str,
-    on_turn: impl FnOnce(),
-) -> Result<MessagesResponse, ureq::Error> {
+    on_turn: impl FnOnce() -> bool,
+) -> Result<Option<MessagesResponse>, ureq::Error> {
     await_request_slot(ANTHROPIC_ORIGIN);
-    on_turn();
+    if !on_turn() {
+        return Ok(None);
+    }
     let body = serde_json::json!({
         "model": MODEL,
         "max_tokens": 1,
@@ -264,11 +269,11 @@ pub(crate) fn send(
             .read_to_string()
             .map_or(Forbidden::Unrecognized, |body| forbidden_by(&body))
     });
-    Ok(MessagesResponse {
+    Ok(Some(MessagesResponse {
         status,
         headers,
         forbidden,
-    })
+    }))
 }
 
 /// What a 401's or a 403's body refuses. The organization when it names one of
@@ -349,14 +354,16 @@ pub(crate) enum ProbeAnswer {
 }
 
 /// Probe the account `access_token` belongs to, calling `on_turn` once the
-/// request leaves the spacing slot.
-pub(crate) fn probe(access_token: &str, on_turn: impl FnOnce()) -> ProbeAnswer {
+/// request leaves the spacing slot. `None` when `on_turn` refused: the
+/// request was never sent, which reads as no answer, never as a verdict a
+/// caller records.
+pub(crate) fn probe(access_token: &str, on_turn: impl FnOnce() -> bool) -> Option<ProbeAnswer> {
     match send(
         crate::oauth::messages_endpoint().as_ref(),
         access_token,
         on_turn,
     ) {
-        Ok(response) => answer_from(
+        Ok(Some(response)) => Some(answer_from(
             response.status,
             response.forbidden,
             response
@@ -364,8 +371,9 @@ pub(crate) fn probe(access_token: &str, on_turn: impl FnOnce()) -> ProbeAnswer {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
             now_epoch_secs(),
-        ),
-        Err(_) => ProbeAnswer::Failed,
+        )),
+        Ok(None) => None,
+        Err(_) => Some(ProbeAnswer::Failed),
     }
 }
 

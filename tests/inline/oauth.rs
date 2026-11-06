@@ -687,7 +687,7 @@ fn gate_refreshes_expiring_token_and_installs() {
         &handle,
         &crate::profile::ProfileName::from(name),
         refresher,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     crate::oauth::set_rotation_saved_hook(None);
     assert!(matches!(gate, AuthGate::Refreshed));
@@ -3078,7 +3078,7 @@ fn kick_emits_cc_message_wire_shape() {
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
-    let _ = kick_to(&url, "TESTTOKEN");
+    let _ = kick_to(&url, "TESTTOKEN", || true);
     let req = server.join().unwrap();
 
     assert!(
@@ -3213,7 +3213,7 @@ fn kick_429_surfaces_limiter_metadata() {
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
-    let err = kick_to(&url, "TESTTOKEN").expect_err("429 must error");
+    let err = kick_to(&url, "TESTTOKEN", || true).expect_err("429 must error");
     server.join().unwrap();
 
     let KickError::Status(429, Some(rl)) = err else {
@@ -4817,7 +4817,7 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
         &handle,
         &crate::profile::ProfileName::from(name),
         refresher,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     crate::oauth::set_rotation_saved_hook(None);
     assert!(matches!(gate, AuthGate::Refreshed));
@@ -4859,7 +4859,7 @@ fn rolling_gate_refuses_the_spend_when_stopping() {
         &handle,
         &crate::profile::ProfileName::from(name),
         |_rt: &str, _scopes: Option<&str>| panic!("a stopping gate never refreshes"),
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     assert!(matches!(gate, AuthGate::Stopping));
 }

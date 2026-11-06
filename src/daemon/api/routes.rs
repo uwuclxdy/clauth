@@ -1120,7 +1120,7 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             if live.shutting_down.load(Ordering::SeqCst) {
                 return Response::error(503, "daemon_stopping");
             }
-            Some((&live.activity, live.shutting_down.as_ref()))
+            Some((&live.activity, live.shutting_down.as_ref().into()))
         }
         // No daemon built this context, so no stop path can cut it.
         None => None,

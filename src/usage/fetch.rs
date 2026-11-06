@@ -1664,7 +1664,11 @@ pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> b
 /// the durable stamp and memo gate on the landing's identity rather than the
 /// worker's own writes.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct ProfileFetchDecision {
+pub(crate) struct ProfileFetchDecision<'a> {
+    /// The fetch tick's lease ticket, when the worker runs under one: the
+    /// ride-along's writes check it inside their state-flock hold, so a worker
+    /// that resumes after the tick lost the lease writes none of them.
+    pub(crate) lease: Option<crate::daemon::LeaseTicket<'a>>,
     /// [`decide_profile_fetch`] elected a `/profile` fetch.
     pub(crate) wanted: bool,
     /// The attempt instant the durable stamp + memo record, when `wanted`.
@@ -1723,7 +1727,7 @@ pub(crate) fn fetch_profile_plan(
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> Option<PlanInfo> {
     let now = now_ms();
     if !decide_profile_fetch(name, force_profile, now) {
@@ -1755,8 +1759,13 @@ pub(crate) fn fetch_profile_plan(
     // same hold: `forget_disk`, the disk seed of this body's plan, the anchor
     // write, then the `/profile` stamp re-written (its `forget_disk` removed it).
     let tier = raw_rate_limit_tier(&p);
+    let lease = decision.lease;
     let ride_along = crate::lock::with_state_lock(|held| {
-        if !crate::profile::stored_token_matches(name, &token) {
+        // A tick that lost the fetch lease leaves the identity, plan and tier
+        // writes to the new holder's own `/profile` read.
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current)
+            || !crate::profile::stored_token_matches(name, &token)
+        {
             return Ok(());
         }
         let uuid = p
@@ -1916,7 +1925,7 @@ pub(crate) fn fetch_raw(
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
         usage_endpoint().as_ref(),

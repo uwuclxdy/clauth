@@ -250,17 +250,17 @@ fn a_timed_out_tick_writes_no_credit_refusal_and_clears_none() {
     let timed_out = std::sync::atomic::AtomicBool::new(true);
     let flag_down = std::sync::atomic::AtomicBool::new(false);
     let refusal = refusal_at(2_000, "/p/a.jsonl");
-    write_credit_refusal_flagged(&name, &refusal, Some(&timed_out));
+    write_credit_refusal_flagged(&name, &refusal, Some(&timed_out), None);
     assert_eq!(credit_refusal(&name), None);
-    write_credit_refusal_flagged(&name, &refusal, Some(&flag_down));
+    write_credit_refusal_flagged(&name, &refusal, Some(&flag_down), None);
     assert_eq!(
         credit_refusal(&name),
         Some(refusal.clone()),
         "control: with the flag down the write lands"
     );
-    clear_credit_refusal_flagged(&name, 3_000, Some(&timed_out));
+    clear_credit_refusal_flagged(&name, 3_000, Some(&timed_out), None);
     assert_eq!(credit_refusal(&name), Some(refusal));
-    clear_credit_refusal_flagged(&name, 3_000, Some(&flag_down));
+    clear_credit_refusal_flagged(&name, 3_000, Some(&flag_down), None);
     assert_eq!(
         credit_refusal(&name),
         None,

@@ -23,6 +23,8 @@ mod status_json;
 mod tick;
 mod types;
 
+#[cfg(test)]
+pub(crate) use probe::LEASE_STALE_BOUND;
 /// The running daemon's pid sidecar reader, shared by the gateway hold writer
 /// in `crate::gateway`.
 pub(crate) use probe::holder_pid;
@@ -30,8 +32,8 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{
-    DaemonHealth, FetchLease, daemon_health, gateway_slot, probe_daemon, proxy_slots,
-    singleton_held,
+    DaemonHealth, FetchLease, LeaseTicket, daemon_health, gateway_slot, probe_daemon, proxy_slots,
+    singleton_held, spawn_lease_watchdog,
 };
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};
@@ -108,8 +110,8 @@ const PID_FILE: &str = "clauthd.pid";
 /// instance allowed to park on the singleton lock. See [`probe::Claim`].
 const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
-/// held for life by whichever instance (daemon or a TUI) is the current usage
-/// fetcher. See [`FetchLease`](probe::FetchLease).
+/// held by whichever instance (daemon or a TUI) is the current usage fetcher
+/// while its ticks keep completing. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// The daemon's log beside `status.json`: its stderr and stdout when the TUI
 /// starts it. The run loop caps it by this name.
@@ -123,11 +125,13 @@ const LOG_FILE: &str = "daemon.log";
 /// `KeepAlive{SuccessfulExit=false}` restart the daemon (boot()'s relink +
 /// atomic writes make restart safe).
 ///
-/// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
-/// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
-/// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
-/// did. TENSION: a legit switch's keychain shell-outs can block inside the
-/// `StateLock`, leaving only ~10s of slack. Twice now the count of those
+/// Tightened 60s→30s for the single-fetcher lease (#27): a main loop wedged alive
+/// would otherwise delay every other instance's fetch for as long as the process
+/// lives — the scheduler thread may still be completing ticks, so its lease
+/// watchdog cannot see this wedge — 30s frees the lease about as fast as the
+/// retired TUI freshness re-arm did. A wedged SCHEDULER thread is that watchdog's
+/// to break (SCOPE below). TENSION: a legit switch's keychain shell-outs can block
+/// inside the `StateLock`, leaving only ~10s of slack. Twice now the count of those
 /// shell-outs grew under this deadline (a read-modify-write made one mirror two
 /// calls; a first-login adopt makes one switch two mirrors), so the bound is no
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
@@ -142,10 +146,11 @@ const LOG_FILE: &str = "daemon.log";
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
-/// keeps the main loop ticking and the feed fresh, so it trips nothing and the
-/// lease is never freed — pre-existing (the retired probe keyed on the same
-/// main-loop freshness). Do not read this deadline as
-/// covering the fetch path itself.
+/// keeps the main loop ticking and the feed fresh, so it trips nothing here; the
+/// scheduler's own lease watchdog ([`probe::spawn_lease_watchdog`]) releases
+/// the lease once its tick has completed nothing for
+/// [`probe::LEASE_STALE_BOUND`]. Do not read this deadline as covering the
+/// fetch path itself.
 ///
 /// A SUSPENDED process (Modern Standby/S0ix, S3, a VM pause, SIGSTOP) freezes
 /// the loop but not the wall clock, so a freeze reads as a wedge on wall time
@@ -1753,6 +1758,11 @@ struct Daemon {
     claude_resets_memo: ClaudeResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
+    /// The fetch lease the scheduler tick holds: the main-loop drains read it
+    /// to tell whether this instance still fetches, so a queued switch or
+    /// switch-off does not execute once the watchdog released the lease (the
+    /// holder that took over decides).
+    fetch_lease: Arc<FetchLease>,
     /// Last-seen reload fingerprint — drives external-change reload. Set only
     /// by a successful reload (which re-read disk); a self-initiated write
     /// never moves it, so the next tick re-reads, rebuilds and logs.
@@ -1881,6 +1891,7 @@ impl Daemon {
             // spend already in flight saves. The TUI's quit path is the flag's
             // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
             last_reload_fp,
             last_reload_error: None,
             snapshot,
@@ -2028,12 +2039,13 @@ impl Daemon {
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
-            // lease for life, but if a TUI is already fetching, the daemon stands
-            // its refresher down and hydrates instead — the main loop still writes
-            // `status.json` every tick regardless of who fetches. A fresh lease per
-            // scheduler; the tick thread's clone keeps the flock held for the
-            // process lifetime.
-            Arc::new(FetchLease::new()),
+            // lease, but if a TUI is already fetching, the daemon stands its
+            // refresher down and hydrates instead — the main loop still writes
+            // `status.json` every tick regardless of who fetches. The daemon's
+            // own clone feeds the main-loop drains' stand-down check; the tick
+            // thread's clone keeps the flock held while its ticks complete, and
+            // its lease watchdog releases it when they stop.
+            Arc::clone(&self.fetch_lease),
             // The daemon has no display reader of its provider store
             // (`status.json` reads provider figures off disk), so its stand-down
             // hydration seeds the work list, never the display superset.
