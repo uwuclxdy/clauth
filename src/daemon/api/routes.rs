@@ -10,10 +10,11 @@
 //! identity) is refused here exactly as it is refused for the scheduler and
 //! the MCP tool, and the TUI stays the only place to resolve it.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -25,7 +26,7 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::oauth;
 use crate::oauth_login::{Malformed, percent_decode_bytes};
-use crate::profile::ConfigHandle;
+use crate::profile::{ConfigHandle, origin_entry_fault};
 
 use super::agent;
 use super::chain;
@@ -330,6 +331,19 @@ pub(crate) static ROUTES: &[Route] = &[
     },
 ];
 
+/// The methods a browser is told it may send, derived from [`ROUTES`] so a
+/// route added with a new method cannot leave the header stale. First-appearance
+/// order, one copy each: `GET, HEAD, POST, PUT, DELETE`.
+pub(crate) fn advertised_methods() -> String {
+    let mut methods: Vec<&str> = Vec::new();
+    for route in ROUTES {
+        if !methods.contains(&route.method) {
+            methods.push(route.method);
+        }
+    }
+    methods.join(", ")
+}
+
 /// Who a handler is answering, and what its path named.
 pub(crate) struct Caller<'a> {
     pub(crate) peer: SocketAddr,
@@ -407,6 +421,15 @@ pub(crate) struct ApiContext {
     /// Which device holds control of each pane: the terminal bridge records
     /// it, `GET /events` relays the contention it detects.
     pub(crate) terminal_holders: Arc<super::terminal::TerminalHolders>,
+    /// The `[serve] app_origins` texts already logged as skipped, one line per
+    /// distinct text per context (`note_skipped_origin`): the daemon's own.
+    pub(crate) skipped_origins: RankedMutex<BTreeSet<String>, rank::SkippedOrigins>,
+    /// The last `[serve] app_origins` list that read (`listed_origins`), the
+    /// fallback a failed or missing read answers from.
+    pub(crate) last_origins: RankedMutex<Option<Arc<[String]>>, rank::LastOrigins>,
+    /// The one-line-per-failure-span latch on [`listed_origins`]: re-arms on
+    /// the next read that succeeds.
+    pub(crate) origins_failed_noted: AtomicBool,
 }
 
 impl ApiContext {
@@ -439,6 +462,9 @@ impl ApiContext {
             #[cfg(unix)]
             bridge,
             terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
+            skipped_origins: RankedMutex::new(BTreeSet::new()),
+            last_origins: RankedMutex::new(None),
+            origins_failed_noted: AtomicBool::new(false),
         })
     }
 
@@ -544,6 +570,103 @@ const CONTROL_REQUIRED: &str = "this device is paired view-only; this needs a de
 /// The reason a device with a tier this build does not know gets everywhere.
 const TIER_UNKNOWN: &str = "this device was paired by a newer clauth with a tier this one does \
                             not know; run that clauth, or revoke the device and pair it again";
+/// The reason a bearer gets from a page whose origin the host does not list.
+const ORIGIN_NOT_ALLOWED: &str = "this page's origin is not in `[serve] app_origins` in \
+                                  profiles.toml on the host";
+
+/// `[serve] app_origins` as this request sees it: read fresh, so an edit
+/// applies to the next request, and only the entries that count. A
+/// `profiles.toml` that does not read — or that is missing while a list is
+/// held, as it is between a rename-aside save's rename and its recreate —
+/// answers from the last list that did, so an editor save cannot turn the
+/// gate off for a removed origin's cached preflight; with no list read yet
+/// the answer is empty, the behaviour of an empty list. The last list, the
+/// skip set and the failure latch live on the context, one daemon's own:
+/// each skip logs once per distinct text, and each failure span logs one line
+/// (the latch re-arms on the next read that succeeds), where the list read
+/// per request would otherwise write one line per request for the daemon's
+/// life.
+pub(crate) fn listed_origins(ctx: &ApiContext) -> Arc<[String]> {
+    let state = match crate::profile::read_app_state() {
+        Ok(Some(state)) => state,
+        // While a list is held, the file being gone is a failed read, not a
+        // good empty one, or a save that renames the file aside would drop the
+        // gate and overwrite the memory. With no list held the missing file is
+        // the first run: an empty list, silently.
+        Ok(None) => {
+            let kept = ctx
+                .last_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if kept.is_some() && !ctx.origins_failed_noted.swap(true, Ordering::AcqRel) {
+                logline!(
+                    "clauth api: profiles.toml is missing; the last [serve] app_origins \
+                     list stands until it reads"
+                );
+            }
+            return kept.unwrap_or_else(|| Arc::from(Vec::new()));
+        }
+        Err(e) => {
+            let kept = ctx
+                .last_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if !ctx.origins_failed_noted.swap(true, Ordering::AcqRel) {
+                logline!(
+                    "clauth api: profiles.toml does not read; {}: {}",
+                    if kept.is_some() {
+                        "the last [serve] app_origins list stands until it reads"
+                    } else {
+                        "no [serve] app_origins entry counts until it reads"
+                    },
+                    sanitize_for_log(&format!("{e:#}"))
+                );
+            }
+            return kept.unwrap_or_else(|| Arc::from(Vec::new()));
+        }
+    };
+    ctx.origins_failed_noted.store(false, Ordering::Release);
+    for value in &state.serve.app_origins.unreadable {
+        note_skipped_origin(ctx, value, "it is not a string in a list");
+    }
+    let mut listed = state.serve.app_origins.entries;
+    listed.retain(|entry| match origin_entry_fault(entry) {
+        Some(reason) => {
+            note_skipped_origin(ctx, entry, reason);
+            false
+        }
+        None => true,
+    });
+    let listed: Arc<[String]> = Arc::from(listed);
+    *ctx.last_origins
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&listed));
+    listed
+}
+
+/// One line per distinct text per context, whatever reads it how often.
+fn note_skipped_origin(ctx: &ApiContext, text: &str, reason: &str) {
+    let first = {
+        let mut noted = ctx
+            .skipped_origins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if noted.contains(text) {
+            false
+        } else {
+            noted.insert(text.to_string());
+            true
+        }
+    };
+    if first {
+        logline!(
+            "clauth api: skipping {:?} in [serve] app_origins: {reason}",
+            sanitize_for_log(text)
+        );
+    }
+}
 
 /// Resolve the route, authenticate, check the route's access, dispatch.
 ///
@@ -606,6 +729,17 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             };
         }
     };
+
+    // CORS reaches no write and no upgrade, so a removed origin whose page still
+    // holds a token and a cached preflight stops here. A device list refusal and
+    // an unpaired caller's 401 both come first.
+    if req.cross_origin.refused {
+        return Handled {
+            response: Response::refused(403, "origin_not_allowed", ORIGIN_NOT_ALLOWED),
+            device: Some(device.name),
+            hijack: None,
+        };
+    }
 
     // The one parametrized path, and the only route that can answer an
     // upgrade: `/panes/<id>/stream`. It sits outside the route table because a
@@ -702,7 +836,7 @@ pub(crate) struct HealthBody {
     responses(
         (status = 200, description = "the build's version and the feed schema", body = HealthBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -748,7 +882,7 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
         (status = 200, description = "the status feed", body = crate::daemon::status_json::StatusBody, headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 304, description = "the feed has not changed", headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the status body failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -931,7 +1065,7 @@ pub(crate) struct SwitchOk {
         (status = 200, description = "the switch landed; the profile left behind and the one now active", body = SwitchOk),
         (status = 400, description = "the body held no parseable profile (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`; retry shortly), or the daemon is stopping (`daemon_stopping`; retry once it is back)", body = ErrorBody),
@@ -1103,6 +1237,10 @@ pub(crate) struct PairOk {
 /// about the host's state from the answer. A body that holds no code at all is
 /// `400 bad_request` and costs no attempt: it is judged before the pairing is
 /// read. The token rides this one response and no log line.
+///
+/// Any `Content-Type` but `application/json` is `415`, judged before the body
+/// and on every config: a page can post `text/plain` with no preflight, and
+/// the browser hiding the answer would not stop the try being spent.
 #[utoipa::path(
     post,
     path = "/api/v1/pair",
@@ -1111,11 +1249,15 @@ pub(crate) struct PairOk {
         (status = 201, description = "the device is paired; the token rides this one response", body = PairOk),
         (status = 400, description = "the body held no code (`bad_request`)", body = ErrorBody),
         (status = 403, description = "the code did not pair a device (`pairing_refused`)", body = ErrorBody),
+        (status = 415, description = "the Content-Type is not application/json (`unsupported_media_type`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "pairing failed (`internal`)", body = ErrorBody)
     )
 )]
 fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    if !req.sends_json() {
+        return Response::error(415, "unsupported_media_type");
+    }
     let Some(code) = serde_json::from_slice::<PairBody>(&req.body)
         .ok()
         .and_then(|body| Code::normalize(&body.code))
@@ -1255,7 +1397,7 @@ pub(crate) fn openapi_document_bytes() -> Result<Vec<u8>, String> {
     responses(
         (status = 200, description = "the OpenAPI document for this API", body = serde_json::Value, content_type = "application/json"),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the document failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))

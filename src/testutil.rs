@@ -3586,6 +3586,9 @@ mod route_harness {
             // Routing does not depend on this; the connection loop owns it.
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            // What every client of these routes declares for its body.
+            content_type: crate::daemon::api::http::SoloHeader::One("application/json".to_string()),
         }
     }
 

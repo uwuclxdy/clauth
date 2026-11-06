@@ -62,6 +62,8 @@ fn call(ctx: &ApiContext, method: &str, path: &str) -> Response {
             body: Vec::new(),
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            content_type: Default::default(),
         },
         peer(),
     )

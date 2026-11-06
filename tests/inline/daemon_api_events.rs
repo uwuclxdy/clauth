@@ -235,6 +235,8 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         body: body.as_bytes().to_vec(),
         keep_alive: true,
         ws: Default::default(),
+        cross_origin: Default::default(),
+        content_type: Default::default(),
     }
 }
 

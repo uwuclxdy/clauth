@@ -64,15 +64,15 @@ fn empty_config() -> crate::profile::ConfigHandle {
 
 /// A context with [`TOKEN`] paired as the control device [`DEVICE`].
 fn ctx() -> std::sync::Arc<ApiContext> {
+    ctx_with(crate::daemon::api::panes::absent_probe())
+}
+
+/// The same, with the caller's pane probe in place of the absent one.
+fn ctx_with(herdr_probe: PaneProbe) -> std::sync::Arc<ApiContext> {
     crate::daemon::api::devices::seed_for_tests(DEVICE, Tier::Control, TOKEN)
         .expect("pair the fixture device");
     let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
-    ApiContext::for_tests(
-        empty_config(),
-        status_path,
-        None,
-        crate::daemon::api::panes::absent_probe(),
-    )
+    ApiContext::for_tests(empty_config(), status_path, None, herdr_probe)
 }
 
 /// The name the generated certificate is issued for, and the name the client
@@ -558,13 +558,18 @@ struct Fixture {
 
 /// `None` when openssl cannot produce a certificate here.
 fn fixture() -> Option<Fixture> {
+    fixture_with(crate::daemon::api::panes::absent_probe())
+}
+
+/// [`fixture`] with the caller's pane probe in its context.
+fn fixture_with(herdr_probe: PaneProbe) -> Option<Fixture> {
     let dir = tempfile::tempdir().expect("tempdir");
     let (paths, ca_crt) = generate_chain(dir.path()).expect("fixture")?;
     let server_tls = tls::server_config_from(&paths).expect("server config");
     let client_tls = client_config(&ca_crt)?;
 
     let home = HomeSandbox::new();
-    let ctx = ctx();
+    let ctx = ctx_with(herdr_probe);
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#.to_string();
     crate::profile::mkdir_700(&crate::profile::clauth_dir().unwrap()).expect("mkdir");
     std::fs::write(&ctx.status_path, &feed).expect("seed feed");
@@ -1621,6 +1626,8 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
             body: Vec::new(),
             keep_alive: false,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            content_type: Default::default(),
         },
         std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
     )
@@ -2303,6 +2310,7 @@ fn a_failed_pairing_closes_the_connection_and_a_devices_refusal_does_not() {
             pairing
                 .send(&format!(
                     "POST /api/v1/pair HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                     Content-Type: application/json\r\n\
                      Content-Length: {}\r\n\r\n{body}",
                     body.len()
                 ))
@@ -2442,6 +2450,7 @@ fn a_pairing_over_tls_hands_back_a_working_token_and_logs_no_secret() {
         session
             .send(&format!(
                 "POST /api/v1/pair HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Content-Type: application/json\r\n\
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
             ))
@@ -2643,6 +2652,1628 @@ fn a_pane_in_a_session_without_a_mod_pushes_once() {
         Ok(Trigger::Blocked {
             pane_id: "p1".to_string()
         })
+    );
+}
+
+// ── `[serve] app_origins`, driven over the wire ──────────────────────────────
+//
+// Every case below reads raw response bytes off a real connection.
+
+const LISTED: &str = "https://app.example.com";
+const UNLISTED: &str = "https://other.example.com";
+
+/// Write `profiles.toml` with this `[serve]` table body.
+fn set_serve(table: &str) {
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    std::fs::write(path, format!("profiles = []\n\n[serve]\n{table}\n"))
+        .expect("write profiles.toml");
+}
+
+fn list_origin(origin: &str) {
+    set_serve(&format!("app_origins = [\"{origin}\"]"));
+}
+
+/// One request on its own connection, answered by `serve_connection`.
+fn wire(f: &Fixture, request: &str) -> (String, String) {
+    wire_bytes(f, request.as_bytes())
+}
+
+fn wire_bytes(f: &Fixture, request: &[u8]) -> (String, String) {
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (stream, peer) = f.listener.accept().expect("accept");
+            serve_connection(stream, peer, &f.server_tls, &f.ctx, brisk_limits());
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session.stream.write_all(request).expect("send");
+        session.stream.flush().expect("flush");
+        let answer = session.recv().expect("recv");
+        // Ends a kept connection, so the server thread can join.
+        drop(session);
+        answer
+    })
+}
+
+/// A request with these extra header lines. It says nothing about the
+/// connection, which is what a browser's preflight does: HTTP/1.1 keeps it.
+fn raw(method: &str, path: &str, headers: &[String]) -> String {
+    let mut text = format!("{method} {path} HTTP/1.1\r\nHost: {SERVER_NAME}\r\n");
+    for header in headers {
+        text.push_str(header);
+        text.push_str("\r\n");
+    }
+    text.push_str("\r\n");
+    text
+}
+
+fn origin(value: &str) -> String {
+    format!("Origin: {value}")
+}
+
+fn bearer(token: &str) -> String {
+    format!("Authorization: Bearer {token}")
+}
+
+fn preflight_for(value: &str, path: &str, asked: &str) -> String {
+    raw(
+        "OPTIONS",
+        path,
+        &[
+            origin(value),
+            format!("Access-Control-Request-Method: {asked}"),
+            "Access-Control-Request-Headers: authorization".to_string(),
+        ],
+    )
+}
+
+/// The head's lines past the status line, sorted, so a pin binds the set and
+/// not the order `write_response` happens to emit.
+fn head_lines(head: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = head
+        .split("\r\n")
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+fn cors_lines(head: &str) -> Vec<&str> {
+    head_lines(head)
+        .into_iter()
+        .filter(|line| line.starts_with("Access-Control-") || line.starts_with("Vary:"))
+        .collect()
+}
+
+fn pair_code(name: &str) -> crate::daemon::api::pairing::Code {
+    let device = crate::daemon::api::devices::DeviceName::parse(name).expect("a device name");
+    crate::daemon::api::pairing::begin(&device, Tier::View, false)
+        .expect("begin pairing")
+        .code()
+        .clone()
+}
+
+fn pair_post(body: &str, headers: &[String]) -> String {
+    let mut all = vec![format!("Content-Length: {}", body.len())];
+    all.extend_from_slice(headers);
+    format!("{}{body}", raw("POST", "/api/v1/pair", &all))
+}
+
+const LISTED_ANSWER: [&str; 3] = [
+    "Access-Control-Allow-Origin: https://app.example.com",
+    "Access-Control-Expose-Headers: ETag",
+    "Vary: Origin",
+];
+
+/// CO-1, CO-2: a preflight is one fixed head on every path and method, so it
+/// reveals no route, and it earns no kept connection.
+#[test]
+fn a_preflight_is_one_fixed_head_on_every_path() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_preflight_is_one_fixed_head_on_every_path: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let expected = [
+        "Access-Control-Allow-Headers: Authorization, Content-Type, If-None-Match",
+        "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, DELETE",
+        "Access-Control-Allow-Origin: https://app.example.com",
+        "Access-Control-Max-Age: 7200",
+        "Cache-Control: no-store",
+        "Connection: close",
+        "Content-Length: 0",
+        "Content-Type: application/json",
+        "Vary: Origin",
+    ];
+    for (path, asked) in [
+        ("/api/v1/status", "GET"),
+        ("/api/v1/nope", "GET"),
+        ("/nope", "GET"),
+        ("/api/v1/switch", "POST"),
+        ("/api/v1/switch", "DELETE"),
+    ] {
+        let (head, body) = wire(&f, &preflight_for(LISTED, path, asked));
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{path}: {head}");
+        assert_eq!(head_lines(&head), expected, "{path} {asked}");
+        assert_eq!(body, "", "{path} {asked}");
+    }
+}
+
+/// CO-2: a preflight earns no connection, so a request pipelined behind it on
+/// the same connection is never read: one answer, then the socket ends.
+#[test]
+fn a_preflight_answers_once_and_closes_a_pipelined_request() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_preflight_answers_once_and_closes_a_pipelined_request: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (stream, peer) = f.listener.accept().expect("accept");
+            serve_connection(stream, peer, &f.server_tls, &f.ctx, brisk_limits());
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&format!(
+                "{}{}",
+                preflight_for(LISTED, "/api/v1/status", "GET"),
+                raw("GET", "/api/v1/status", &[bearer(TOKEN)])
+            ))
+            .expect("send pipeline");
+        let (head, body) = session.recv().expect("the preflight answer");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        assert_eq!(body, "");
+        assert!(
+            session.buf.is_empty(),
+            "a second answer started: {:?}",
+            String::from_utf8_lossy(&session.buf)
+        );
+        let mut chunk = [0u8; 512];
+        match session.stream.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(n) => panic!("the pipelined request was answered too: {n} bytes"),
+            Err(e) => panic!("reading past the preflight: {e}"),
+        }
+    });
+}
+
+/// The advertised methods are the route table's, so a route added with a new
+/// method cannot go unlisted. `HEAD` is the table's too. The header is read off
+/// the wire and compared to the table, so a stale head reds on either side.
+#[test]
+fn the_advertised_methods_are_the_route_tables() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED the_advertised_methods_are_the_route_tables: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let mut methods: Vec<&str> = crate::daemon::api::routes::ROUTES
+        .iter()
+        .map(|route| route.method)
+        .collect();
+    methods.sort_unstable();
+    methods.dedup();
+
+    let (head, _) = wire(&f, &preflight_for(LISTED, "/api/v1/status", "GET"));
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    let advertised = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Access-Control-Allow-Methods: "))
+        .expect("a preflight advertises its methods");
+    let mut from_head: Vec<&str> = advertised.split(", ").collect();
+    from_head.sort_unstable();
+    assert_eq!(from_head, methods, "{head}");
+}
+
+/// CO-3: an `OPTIONS` that is no preflight takes today's path.
+#[test]
+fn an_options_that_is_no_preflight_answers_as_before() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED an_options_that_is_no_preflight_answers_as_before: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let asked = "Access-Control-Request-Method: GET".to_string();
+    for headers in [
+        vec![origin(UNLISTED), asked.clone()],
+        vec![origin("null"), asked.clone()],
+        vec![asked.clone()],
+    ] {
+        let (head, _) = wire(&f, &raw("OPTIONS", "/api/v1/status", &headers));
+        assert!(head.starts_with("HTTP/1.1 401 "), "{headers:?}: {head}");
+        assert!(head.contains("WWW-Authenticate: Bearer\r\n"), "{head}");
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        assert_eq!(cors_lines(&head), ["Vary: Origin"], "{headers:?}");
+    }
+
+    // A listed origin that never asked for a method is an ordinary request.
+    let (head, _) = wire(&f, &raw("OPTIONS", "/api/v1/status", &[origin(LISTED)]));
+    assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+    assert_eq!(cors_lines(&head), LISTED_ANSWER);
+
+    // A paired caller still gets the method and the path judged.
+    let token = bearer(TOKEN);
+    let (head, _) = wire(
+        &f,
+        &raw(
+            "OPTIONS",
+            "/api/v1/status",
+            &[origin(LISTED), token.clone()],
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 405 "), "{head}");
+    let (head, _) = wire(
+        &f,
+        &raw("OPTIONS", "/api/v1/nope", &[origin(LISTED), token]),
+    );
+    assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
+}
+
+/// CO-4, CO-14: a page can read every answer class, stream and HEAD included,
+/// and no answer ever allows credentials or `*`.
+#[test]
+fn a_listed_origin_can_read_every_answer_class() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_listed_origin_can_read_every_answer_class: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    crate::daemon::api::devices::seed_for_tests("view", Tier::View, VIEW_TOKEN)
+        .expect("pair the view device");
+    let listed = origin(LISTED);
+    let control = bearer(TOKEN);
+    let view = bearer(VIEW_TOKEN);
+    let json = "Content-Type: application/json".to_string();
+
+    let etag = {
+        let (head, _) = wire(
+            &f,
+            &raw("GET", "/api/v1/status", &[listed.clone(), control.clone()]),
+        );
+        head.lines()
+            .find_map(|line| line.strip_prefix("ETag: "))
+            .expect("the status answer carries a tag")
+            .trim()
+            .to_owned()
+    };
+
+    // A chain edit already in flight holds the gate, so the route answers 409.
+    let _gate = f
+        .ctx
+        .switch_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let chain_body = r#"{"members":[]}"#;
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "200",
+            raw("GET", "/api/v1/status", &[listed.clone(), control.clone()]),
+        ),
+        (
+            "200",
+            raw("HEAD", "/api/v1/status", &[listed.clone(), control.clone()]),
+        ),
+        (
+            "304",
+            raw(
+                "GET",
+                "/api/v1/status",
+                &[
+                    listed.clone(),
+                    control.clone(),
+                    format!("If-None-Match: {etag}"),
+                ],
+            ),
+        ),
+        ("400", pair_post("{}", &[listed.clone(), json.clone()])),
+        (
+            "401",
+            raw("GET", "/api/v1/status", std::slice::from_ref(&listed)),
+        ),
+        (
+            "403",
+            format!(
+                "{}{{}}",
+                raw(
+                    "POST",
+                    "/api/v1/switch",
+                    &[
+                        listed.clone(),
+                        view,
+                        json.clone(),
+                        "Content-Length: 2".to_string()
+                    ],
+                )
+            ),
+        ),
+        (
+            "404",
+            raw("GET", "/api/v1/nope", &[listed.clone(), control.clone()]),
+        ),
+        (
+            "405",
+            raw(
+                "DELETE",
+                "/api/v1/status",
+                &[listed.clone(), control.clone()],
+            ),
+        ),
+        (
+            "200",
+            raw("HEAD", "/api/v1/events", &[listed.clone(), control.clone()]),
+        ),
+        (
+            "409",
+            format!(
+                "{}{chain_body}",
+                raw(
+                    "POST",
+                    "/api/v1/chain/order",
+                    &[
+                        listed.clone(),
+                        control.clone(),
+                        json.clone(),
+                        format!("Content-Length: {}", chain_body.len()),
+                    ],
+                )
+            ),
+        ),
+        (
+            "503",
+            raw(
+                "GET",
+                "/api/v1/panes/w1:p1/stream",
+                &[
+                    listed.clone(),
+                    control.clone(),
+                    "Connection: Upgrade".to_string(),
+                    "Upgrade: websocket".to_string(),
+                    "Sec-WebSocket-Version: 13".to_string(),
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+                ],
+            ),
+        ),
+    ];
+    for (status, request) in &cases {
+        let (head, _) = wire(&f, request);
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status} ")),
+            "wanted {status}: {head}"
+        );
+        assert_eq!(cors_lines(&head), LISTED_ANSWER, "{status}: {head}");
+    }
+
+    // The one answer carrying a token.
+    let code = pair_code("browser");
+    let body = serde_json::json!({ "code": code.to_string() }).to_string();
+    let (head, _) = wire(&f, &pair_post(&body, &[listed.clone(), json.clone()]));
+    assert!(head.starts_with("HTTP/1.1 201 "), "{head}");
+    assert_eq!(cors_lines(&head), LISTED_ANSWER);
+
+    // The stream writes its head through the other branch of `write_response`.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (stream, peer) = f.listener.accept().expect("accept");
+            let limits = Limits {
+                io_timeout: std::time::Duration::from_millis(200),
+                lifetime: std::time::Duration::from_secs(1),
+                max_requests: 100,
+            };
+            serve_connection(stream, peer, &f.server_tls, &f.ctx, limits);
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&raw(
+                "GET",
+                "/api/v1/events",
+                &[listed.clone(), control.clone()],
+            ))
+            .expect("send");
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = session.stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&all);
+        let head = text.split("\r\n\r\n").next().expect("a head");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(cors_lines(head), LISTED_ANSWER);
+    });
+}
+
+/// An empty list and an absent key add no byte to any answer.
+#[test]
+fn an_empty_list_changes_nothing() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED an_empty_list_changes_nothing: no openssl");
+        return;
+    };
+    let health = format!(
+        r#"{{"ok":true,"version":"{}","schema":{}}}"#,
+        env!("CARGO_PKG_VERSION"),
+        crate::daemon::SCHEMA_VERSION
+    );
+    let unauthorized = r#"{"ok":false,"error":"unauthorized"}"#;
+    let mut expected_200 = vec![
+        "Cache-Control: no-store".to_string(),
+        "Connection: close".to_string(),
+        format!("Content-Length: {}", health.len()),
+        "Content-Type: application/json".to_string(),
+    ];
+    expected_200.sort_unstable();
+    let mut expected_401 = vec![
+        "Cache-Control: no-store".to_string(),
+        "Connection: close".to_string(),
+        format!("Content-Length: {}", unauthorized.len()),
+        "Content-Type: application/json".to_string(),
+        "WWW-Authenticate: Bearer".to_string(),
+    ];
+    expected_401.sort_unstable();
+
+    for table in ["app_origins = []", ""] {
+        set_serve(table);
+        let (head, _) = wire(
+            &f,
+            &raw("GET", "/api/v1/status", &[origin(LISTED), bearer(TOKEN)]),
+        );
+        assert!(head.starts_with("HTTP/1.1 200 "), "{table:?}: {head}");
+        assert_eq!(cors_lines(&head), Vec::<&str>::new(), "{table:?}");
+
+        let (head, _) = wire(
+            &f,
+            &raw(
+                "GET",
+                "/api/v1/health",
+                &[
+                    origin(LISTED),
+                    bearer(TOKEN),
+                    "Connection: close".to_string(),
+                ],
+            ),
+        );
+        assert!(head.starts_with("HTTP/1.1 200 "), "{table:?}: {head}");
+        assert_eq!(head_lines(&head), expected_200, "{table:?}: {head}");
+        assert_eq!(cors_lines(&head), Vec::<&str>::new(), "{table:?}");
+
+        let (head, _) = wire(&f, &preflight_for(LISTED, "/api/v1/status", "GET"));
+        assert!(head.starts_with("HTTP/1.1 401 "), "{table:?}: {head}");
+        assert_eq!(head_lines(&head), expected_401, "{table:?}: {head}");
+        assert_eq!(cors_lines(&head), Vec::<&str>::new(), "{table:?}");
+    }
+}
+
+/// CO-13, CO-18: while the list is non-empty a bearer request from an unlisted
+/// origin stops before any handler, the terminal upgrade included, and a listed
+/// upgrade reaches the bridge with its origin on the `101` line.
+#[test]
+fn a_token_from_an_unlisted_origin_is_refused() {
+    let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&probed);
+    let probe: PaneProbe = Box::new(move |_, _| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        HerdrProbeOut::Ran(Some(HerdrOut {
+            success: true,
+            stdout: br#"{"result":{"snapshot":{"panes":[{"pane_id":"w1:p1","rect":{"width":80,"height":24}}]}}}"#
+                .to_vec(),
+            stderr: Vec::new(),
+        }))
+    });
+    let Some(f) = fixture_with(probe) else {
+        eprintln!("SKIPPED a_token_from_an_unlisted_origin_is_refused: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let token = bearer(TOKEN);
+
+    for value in [UNLISTED, "null"] {
+        let (head, body) = wire(
+            &f,
+            &raw("GET", "/api/v1/status", &[origin(value), token.clone()]),
+        );
+        assert!(head.starts_with("HTTP/1.1 403 "), "{value}: {head}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("an error body");
+        assert_eq!(error["error"], "origin_not_allowed", "{value}: {body}");
+        assert!(!body.contains("active_profile"), "{body}");
+        assert_eq!(cors_lines(&head), ["Vary: Origin"], "{value}");
+    }
+
+    // The upgrade: without the gate this reaches the pane lookup.
+    let upgrade = raw(
+        "GET",
+        "/api/v1/panes/w1:p1/stream",
+        &[
+            origin(UNLISTED),
+            token.clone(),
+            "Connection: Upgrade".to_string(),
+            "Upgrade: websocket".to_string(),
+            "Sec-WebSocket-Version: 13".to_string(),
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+        ],
+    );
+    let (head, body) = wire(&f, &upgrade);
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert!(body.contains("origin_not_allowed"), "{body}");
+    assert_eq!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refused upgrade never reached the pane probe"
+    );
+
+    // The same upgrade with a listed origin reaches the bridge, and its `101`
+    // line names the entry.
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let listed_upgrade = raw(
+        "GET",
+        "/api/v1/panes/w1:p1/stream",
+        &[
+            origin(LISTED),
+            token.clone(),
+            "Connection: Upgrade".to_string(),
+            "Upgrade: websocket".to_string(),
+            "Sec-WebSocket-Version: 13".to_string(),
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+        ],
+    );
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            let (stream, peer) = worker.listener.accept().expect("accept");
+            serve_connection(
+                stream,
+                peer,
+                &worker.server_tls,
+                &worker.ctx,
+                brisk_limits(),
+            );
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session.send(&listed_upgrade).expect("send upgrade");
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = session.stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&all);
+        assert!(
+            text.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+            "{text}"
+        );
+    });
+    assert_eq!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the listed upgrade probed the pane once"
+    );
+    let upgrades: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains(" -> 101"))
+        .collect();
+    assert_eq!(upgrades.len(), 1, "{upgrades:?}");
+    assert!(
+        upgrades[0].ends_with("origin=https://app.example.com"),
+        "{upgrades:?}"
+    );
+
+    // No `Origin` is a non-browser client, and it passes.
+    let (head, _) = wire(
+        &f,
+        &raw("GET", "/api/v1/status", std::slice::from_ref(&token)),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+
+    // An unpaired caller still gets its 401 first, so the gate says nothing.
+    let (head, _) = wire(&f, &raw("GET", "/api/v1/status", &[origin(UNLISTED)]));
+    assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+
+    // A change applies to the next request: read fresh, never cached.
+    list_origin(UNLISTED);
+    let (head, _) = wire(
+        &f,
+        &raw("GET", "/api/v1/status", &[origin(UNLISTED), token]),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_eq!(
+        cors_lines(&head),
+        [
+            "Access-Control-Allow-Origin: https://other.example.com",
+            "Access-Control-Expose-Headers: ETag",
+            "Vary: Origin",
+        ]
+    );
+}
+
+/// CO-5, CO-6: the match is byte-exact, and nothing the client sent reaches the
+/// response head.
+#[test]
+fn only_a_byte_exact_origin_matches() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED only_a_byte_exact_origin_matches: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    for value in [
+        "https://APP.example.com",
+        "https://app.example.com:443",
+        "https://app.example.com/",
+        "https://app.example.com.evil.net",
+        "https://evil.app.example.com",
+        "http://app.example.com",
+        "null",
+    ] {
+        let (head, _) = wire(&f, &preflight_for(value, "/api/v1/status", "GET"));
+        assert!(head.starts_with("HTTP/1.1 401 "), "{value}: {head}");
+        assert_eq!(cors_lines(&head), ["Vary: Origin"], "{value}");
+    }
+
+    // A doubled header reads as unlisted, even when one copy is listed.
+    let (head, _) = wire(
+        &f,
+        &raw(
+            "GET",
+            "/api/v1/status",
+            &[origin(LISTED), origin(UNLISTED), bearer(TOKEN)],
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+
+    // Two copies of the SAME listed value are no single origin either.
+    let (head, _) = wire(
+        &f,
+        &raw(
+            "GET",
+            "/api/v1/status",
+            &[origin(LISTED), origin(LISTED), bearer(TOKEN)],
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+
+    // A value that is not UTF-8 reads as unlisted too.
+    let mut request = format!(
+        "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+         Authorization: Bearer {TOKEN}\r\nOrigin: https://"
+    )
+    .into_bytes();
+    request.extend_from_slice(&[0xff, 0xfe]);
+    request.extend_from_slice(b"\r\n\r\n");
+    let (head, _) = wire_bytes(&f, &request);
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+}
+
+/// CO-7, CO-10: an entry counts only as `scheme://host[:port]`; anything else
+/// is skipped, the entries beside it keep working, and nothing is rewritten.
+#[test]
+fn a_bad_entry_is_skipped_and_never_widened() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_bad_entry_is_skipped_and_never_widened: no openssl");
+        return;
+    };
+    for entry in [
+        "*",
+        "null",
+        "https://*.example.com",
+        "https://bad.example.com/",
+        "https://bad.example.com/pwa",
+        "https://bad.example.com?x=1",
+        "https://bad.example.com#frag",
+        "https://user@bad.example.com",
+        "https://Bad.example.com",
+        "https://bad.example.com:443",
+        "http://bad.example.com:80",
+        "http://bad.example.com",
+        "http://localhost.evil.net",
+        "ftp://bad.example.com",
+        " https://bad.example.com",
+        "https://",
+    ] {
+        set_serve(&format!(
+            "app_origins = [{}, \"{LISTED}\"]",
+            serde_json::Value::String(entry.to_string())
+        ));
+        let (head, _) = wire(&f, &preflight_for(entry.trim(), "/api/v1/status", "GET"));
+        assert_eq!(cors_lines(&head), ["Vary: Origin"], "{entry:?}: {head}");
+        let (head, _) = wire(&f, &preflight_for(LISTED, "/api/v1/status", "GET"));
+        assert!(head.starts_with("HTTP/1.1 200 "), "{entry:?}: {head}");
+    }
+
+    for entry in [
+        "https://app.example.com:8443",
+        "http://localhost",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://[::1]:5173",
+        "https://[2001:db8::1]:8443",
+    ] {
+        list_origin(entry);
+        let (head, _) = wire(&f, &preflight_for(entry, "/api/v1/status", "GET"));
+        assert!(head.starts_with("HTTP/1.1 200 "), "{entry}: {head}");
+        assert!(
+            head.contains(&format!("Access-Control-Allow-Origin: {entry}\r\n")),
+            "{entry}: {head}"
+        );
+    }
+}
+
+/// CO-7: a wrong type on the hand-set key never stops clauth: the rest of the
+/// file loads, and a good string beside a bad element still counts.
+#[test]
+fn a_wrong_type_on_the_key_loads_the_rest_of_the_file() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_wrong_type_on_the_key_loads_the_rest_of_the_file: no openssl");
+        return;
+    };
+    for table in [
+        "app_origins = \"https://app.example.com\"\nsession_creation = true",
+        "app_origins = 7\nsession_creation = true",
+        "app_origins = { a = 1 }\nsession_creation = true",
+    ] {
+        set_serve(table);
+        let state = crate::profile::load_app_state().expect("the file still loads");
+        assert!(state.serve.session_creation, "{table}");
+        let (head, _) = wire(&f, &preflight_for(LISTED, "/api/v1/status", "GET"));
+        assert_eq!(cors_lines(&head), Vec::<&str>::new(), "{table}");
+    }
+
+    set_serve(&format!("app_origins = [7, \"{LISTED}\", true]"));
+    crate::profile::load_app_state().expect("the file still loads");
+    let (head, _) = wire(&f, &preflight_for(LISTED, "/api/v1/status", "GET"));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+}
+
+/// CO-12: a page cannot send `application/json` without passing a preflight,
+/// so requiring it stops a blind post from spending the code's tries.
+#[test]
+fn pairing_refuses_anything_but_json_before_spending_a_try() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED pairing_refuses_anything_but_json_before_spending_a_try: no openssl");
+        return;
+    };
+    let code = pair_code("browser");
+    let wrong = if code.to_string().starts_with('0') {
+        "1111-1111"
+    } else {
+        "0000-0000"
+    };
+    let body = serde_json::json!({ "code": wrong }).to_string();
+    // Both an absent list and a non-empty one: the check never reads it.
+    for listed in [None, Some(LISTED)] {
+        if let Some(entry) = listed {
+            list_origin(entry);
+        }
+        for (content_type, blind_origin) in [
+            (Some("text/plain"), None),
+            (Some("application/x-www-form-urlencoded"), None),
+            (Some("multipart/form-data; boundary=x"), None),
+            (Some("application/jsonp"), None),
+            (None, None),
+            // Every blind browser post carries an `Origin`, listed or not, so
+            // the refusal must hold under one: the check never reads the list.
+            (Some("text/plain"), Some(UNLISTED)),
+            (Some("text/plain"), Some(LISTED)),
+        ] {
+            let mut headers: Vec<String> = content_type
+                .iter()
+                .map(|value| format!("Content-Type: {value}"))
+                .collect();
+            if let Some(entry) = blind_origin {
+                headers.push(origin(entry));
+            }
+            // More posts than a code has tries.
+            for _ in 0..6 {
+                let (head, reply) = wire(&f, &pair_post(&body, &headers));
+                assert!(
+                    head.starts_with("HTTP/1.1 415 "),
+                    "{listed:?} {content_type:?} {blind_origin:?}: {head}"
+                );
+                let error: serde_json::Value = serde_json::from_str(&reply).expect("an error body");
+                assert_eq!(error["error"], "unsupported_media_type", "{reply}");
+            }
+        }
+    }
+
+    // The code survived all of that: no try was spent.
+    let right = serde_json::json!({ "code": code.to_string() }).to_string();
+    let json = "Content-Type: application/json".to_string();
+    let (head, _) = wire(&f, &pair_post(&right, std::slice::from_ref(&json)));
+    assert!(head.starts_with("HTTP/1.1 201 "), "{head}");
+
+    for (name, content_type) in [
+        ("second", "application/json; charset=utf-8"),
+        ("third", "Application/JSON"),
+    ] {
+        let code = pair_code(name);
+        let right = serde_json::json!({ "code": code.to_string() }).to_string();
+        let (head, _) = wire(
+            &f,
+            &pair_post(&right, &[format!("Content-Type: {content_type}")]),
+        );
+        assert!(head.starts_with("HTTP/1.1 201 "), "{content_type}: {head}");
+    }
+}
+
+/// The served document lists the two new refusals beside their routes.
+#[test]
+fn the_document_names_the_new_refusals() {
+    let doc = crate::daemon::api::routes::openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    let pair = &value["paths"]["/api/v1/pair"]["post"]["responses"];
+    assert!(pair.get("415").is_some(), "POST /pair documents its 415");
+    let status = value["paths"]["/api/v1/status"]["get"]["responses"]["403"]["description"]
+        .as_str()
+        .expect("GET /status documents a 403");
+    assert!(status.contains("origin_not_allowed"), "{status}");
+}
+
+/// CO-22: the audit line names a matched origin by its entry and any other
+/// present value by a fixed word, never the raw header. The entry reaches the
+/// line through the same bound the path and the device take.
+#[test]
+fn the_request_line_names_the_origin_in_fixed_forms() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED the_request_line_names_the_origin_in_fixed_forms: no openssl");
+        return;
+    };
+    let long = format!("https://{}", "a".repeat(400));
+    set_serve(&format!("app_origins = [\"{LISTED}\", \"{long}\"]"));
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let planted = "https://planted.example.com";
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..4 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        for mut headers in [
+            vec![origin(LISTED), bearer(TOKEN)],
+            vec![origin(planted), bearer(TOKEN)],
+            vec![bearer(TOKEN)],
+            vec![origin(&long), bearer(TOKEN)],
+        ] {
+            headers.push("Connection: close".to_string());
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session
+                .send(&raw("GET", "/api/v1/status", &headers))
+                .expect("send");
+            session.recv().expect("recv");
+        }
+    });
+    let requests: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("GET /api/v1/status"))
+        .collect();
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(
+        requests[0].contains("origin=https://app.example.com"),
+        "{requests:?}"
+    );
+    assert!(requests[1].contains("origin=unlisted"), "{requests:?}");
+    assert!(!requests[1].contains(planted), "{requests:?}");
+    assert!(!requests[2].contains("origin="), "{requests:?}");
+    assert!(requests[3].contains("origin=https://"), "{requests:?}");
+    assert!(!requests[3].contains(&long), "{requests:?}");
+    assert!(requests[3].ends_with("..."), "{requests:?}");
+}
+
+/// CO-23: a bad entry logs once per entry text however many requests read it,
+/// and the line names the entry.
+#[test]
+fn a_skipped_entry_logs_one_line() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_skipped_entry_logs_one_line: no openssl");
+        return;
+    };
+    let entry = "https://once-only.example.com/path";
+    set_serve(&format!("app_origins = [\"{entry}\", \"{LISTED}\"]"));
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..3 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        for _ in 0..3 {
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session
+                .send(&preflight_for(LISTED, "/api/v1/status", "GET"))
+                .expect("send");
+            session.recv().expect("recv");
+        }
+    });
+    let skipped: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains(entry))
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+}
+
+/// A write and a head from an unlisted origin stop at the gate like a read: no
+/// handler runs for either.
+#[test]
+fn a_write_and_a_head_from_an_unlisted_origin_are_refused() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_write_and_a_head_from_an_unlisted_origin_are_refused: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let token = bearer(TOKEN);
+    let body = r#"{"profile":"nobody"}"#;
+    let (head, reply) = wire(
+        &f,
+        &format!(
+            "{}{body}",
+            raw(
+                "POST",
+                "/api/v1/switch",
+                &[
+                    origin(UNLISTED),
+                    token.clone(),
+                    "Content-Type: application/json".to_string(),
+                    format!("Content-Length: {}", body.len()),
+                ],
+            )
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert!(reply.contains("origin_not_allowed"), "{reply}");
+    assert!(!reply.contains("profile_not_found"), "{reply}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+
+    let (head, _) = wire(
+        &f,
+        &raw("HEAD", "/api/v1/status", &[origin(UNLISTED), token]),
+    );
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert_eq!(cors_lines(&head), ["Vary: Origin"]);
+}
+
+/// A `profiles.toml` that stops reading answers from the last list that read:
+/// the gate stands for a removed origin's cached preflight, a repair applies to
+/// the next request, and each failure span logs one line that says which.
+///
+/// Every assertion sits outside the worker's scope, so a wrong answer reads as
+/// a red rather than a join the accept loop never releases.
+#[test]
+fn an_unreadable_file_keeps_the_last_list_and_latches_its_line() {
+    let Some(f) = fixture() else {
+        eprintln!(
+            "SKIPPED an_unreadable_file_keeps_the_last_list_and_latches_its_line: no openssl"
+        );
+        return;
+    };
+    list_origin(LISTED);
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let corrupt = "not toml [";
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let answers: Vec<(&'static str, String, String)> = std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..9 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        let exchange = |request: &str| -> (String, String) {
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session.send(request).expect("send");
+            let answer = session.recv().expect("recv");
+            drop(session);
+            answer
+        };
+        let get = |from: &str| {
+            raw(
+                "GET",
+                "/api/v1/status",
+                &[origin(from), bearer(TOKEN), "Connection: close".to_string()],
+            )
+        };
+        let mut answers: Vec<(&'static str, String, String)> = Vec::new();
+        let mut push = |label: &'static str, answer: (String, String)| {
+            answers.push((label, answer.0, answer.1));
+        };
+
+        // The good read the fallback remembers.
+        push(
+            "good preflight",
+            exchange(&preflight_for(LISTED, "/api/v1/status", "GET")),
+        );
+
+        // The file stops reading: the gate stands for an unlisted bearer, and
+        // the listed origin keeps its headers.
+        std::fs::write(&path, corrupt).expect("corrupt");
+        push("unlisted bearer", exchange(&get(UNLISTED)));
+        push("listed bearer", exchange(&get(LISTED)));
+        push(
+            "preflight while unreadable",
+            exchange(&preflight_for(LISTED, "/api/v1/status", "GET")),
+        );
+        push("unlisted again", exchange(&get(UNLISTED)));
+
+        // A repair with a changed list applies to the next request.
+        list_origin(UNLISTED);
+        push(
+            "repaired preflight",
+            exchange(&preflight_for(UNLISTED, "/api/v1/status", "GET")),
+        );
+        push("now-unlisted bearer", exchange(&get(LISTED)));
+
+        // A second failure logs a second line: the latch re-armed on the repair.
+        std::fs::write(&path, corrupt).expect("corrupt again");
+        push("second span", exchange(&get(LISTED)));
+        push("second span again", exchange(&get(LISTED)));
+        answers
+    });
+    let at = |name: &str| {
+        answers
+            .iter()
+            .find(|(label, ..)| *label == name)
+            .unwrap_or_else(|| panic!("missing answer {name}"))
+    };
+    let preflight_answer = [
+        "Access-Control-Allow-Headers: Authorization, Content-Type, If-None-Match",
+        "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, DELETE",
+        "Access-Control-Allow-Origin: https://app.example.com",
+        "Access-Control-Max-Age: 7200",
+        "Vary: Origin",
+    ];
+
+    let (_, head, _) = at("good preflight");
+    assert!(head.starts_with("HTTP/1.1 200 "), "good preflight: {head}");
+    assert_eq!(cors_lines(head), preflight_answer, "good preflight");
+
+    let (_, head, reply) = at("unlisted bearer");
+    assert!(head.starts_with("HTTP/1.1 403 "), "unlisted bearer: {head}");
+    assert!(
+        reply.contains("origin_not_allowed"),
+        "unlisted bearer: {reply}"
+    );
+    assert_eq!(cors_lines(head), ["Vary: Origin"], "unlisted bearer");
+
+    let (_, head, _) = at("listed bearer");
+    assert!(head.starts_with("HTTP/1.1 200 "), "listed bearer: {head}");
+    assert_eq!(cors_lines(head), LISTED_ANSWER, "listed bearer");
+
+    let (_, head, _) = at("preflight while unreadable");
+    assert!(head.starts_with("HTTP/1.1 200 "), "preflight: {head}");
+    assert_eq!(
+        cors_lines(head),
+        preflight_answer,
+        "preflight while unreadable"
+    );
+
+    let (_, head, _) = at("unlisted again");
+    assert!(head.starts_with("HTTP/1.1 403 "), "unlisted again: {head}");
+
+    let (_, head, _) = at("repaired preflight");
+    assert!(
+        head.starts_with("HTTP/1.1 200 "),
+        "repaired preflight: {head}"
+    );
+    assert!(
+        head.contains("Access-Control-Allow-Origin: https://other.example.com\r\n"),
+        "repaired preflight: {head}"
+    );
+
+    let (_, head, reply) = at("now-unlisted bearer");
+    assert!(head.starts_with("HTTP/1.1 403 "), "now-unlisted: {head}");
+    assert!(
+        reply.contains("origin_not_allowed"),
+        "now-unlisted: {reply}"
+    );
+
+    let (_, head, _) = at("second span");
+    assert!(head.starts_with("HTTP/1.1 403 "), "second span: {head}");
+    let (_, head, _) = at("second span again");
+    assert!(
+        head.starts_with("HTTP/1.1 403 "),
+        "second span again: {head}"
+    );
+
+    let failed: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("profiles.toml does not read"))
+        .collect();
+    assert_eq!(failed.len(), 2, "{failed:?}");
+    for line in &failed {
+        assert!(
+            line.starts_with(
+                "clauth api: profiles.toml does not read; the last [serve] app_origins list \
+                 stands until it reads: "
+            ),
+            "{line}"
+        );
+    }
+}
+
+/// A save that renames `profiles.toml` aside (a default editor save) leaves
+/// the file missing for its writes: the gate stands from the held list for
+/// the whole window, a bearer from an unlisted origin answers 403 and the
+/// listed origin keeps its headers, and a restored file with a changed list
+/// applies to the next request.
+#[test]
+fn a_missing_file_keeps_the_held_list_until_it_reads() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_missing_file_keeps_the_held_list_until_it_reads: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let answers: Vec<(&'static str, String, String)> = std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..5 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        let exchange = |request: &str| -> (String, String) {
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session.send(request).expect("send");
+            let answer = session.recv().expect("recv");
+            drop(session);
+            answer
+        };
+        let get = |from: &str| {
+            raw(
+                "GET",
+                "/api/v1/status",
+                &[origin(from), bearer(TOKEN), "Connection: close".to_string()],
+            )
+        };
+        let mut answers: Vec<(&'static str, String, String)> = Vec::new();
+        let mut push = |label: &'static str, answer: (String, String)| {
+            answers.push((label, answer.0, answer.1));
+        };
+
+        // The good read the fallback remembers.
+        push(
+            "good preflight",
+            exchange(&preflight_for(LISTED, "/api/v1/status", "GET")),
+        );
+
+        // The save's rename takes the file away: the gate stands from the
+        // held list.
+        std::fs::remove_file(&path).expect("remove");
+        push("unlisted bearer", exchange(&get(UNLISTED)));
+        push("listed bearer", exchange(&get(LISTED)));
+
+        // A restored file with a changed list applies to the next request.
+        list_origin(UNLISTED);
+        push(
+            "repaired preflight",
+            exchange(&preflight_for(UNLISTED, "/api/v1/status", "GET")),
+        );
+        push("now-unlisted bearer", exchange(&get(LISTED)));
+        answers
+    });
+    let at = |name: &str| {
+        answers
+            .iter()
+            .find(|(label, ..)| *label == name)
+            .unwrap_or_else(|| panic!("missing answer {name}"))
+    };
+    let preflight_answer = [
+        "Access-Control-Allow-Headers: Authorization, Content-Type, If-None-Match",
+        "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, DELETE",
+        "Access-Control-Allow-Origin: https://app.example.com",
+        "Access-Control-Max-Age: 7200",
+        "Vary: Origin",
+    ];
+
+    let (_, head, _) = at("good preflight");
+    assert!(head.starts_with("HTTP/1.1 200 "), "good preflight: {head}");
+    assert_eq!(cors_lines(head), preflight_answer, "good preflight");
+
+    let (_, head, reply) = at("unlisted bearer");
+    assert!(head.starts_with("HTTP/1.1 403 "), "unlisted bearer: {head}");
+    assert!(
+        reply.contains("origin_not_allowed"),
+        "unlisted bearer: {reply}"
+    );
+    assert_eq!(cors_lines(head), ["Vary: Origin"], "unlisted bearer");
+
+    let (_, head, _) = at("listed bearer");
+    assert!(head.starts_with("HTTP/1.1 200 "), "listed bearer: {head}");
+    assert_eq!(cors_lines(head), LISTED_ANSWER, "listed bearer");
+
+    let (_, head, _) = at("repaired preflight");
+    assert!(
+        head.starts_with("HTTP/1.1 200 "),
+        "repaired preflight: {head}"
+    );
+    assert!(
+        head.contains("Access-Control-Allow-Origin: https://other.example.com\r\n"),
+        "repaired preflight: {head}"
+    );
+
+    let (_, head, reply) = at("now-unlisted bearer");
+    assert!(head.starts_with("HTTP/1.1 403 "), "now-unlisted: {head}");
+    assert!(
+        reply.contains("origin_not_allowed"),
+        "now-unlisted: {reply}"
+    );
+
+    let missing: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("profiles.toml is missing"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(
+        missing[0].starts_with(
+            "clauth api: profiles.toml is missing; the last [serve] app_origins list stands \
+             until it reads"
+        ),
+        "{missing:?}"
+    );
+}
+
+/// A first read that fails has no list to fall back on: the answer is the
+/// empty list's, and the line says so, once however many requests fail.
+#[test]
+fn a_first_read_that_fails_lists_nothing_and_says_so() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_first_read_that_fails_lists_nothing_and_says_so: no openssl");
+        return;
+    };
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    std::fs::write(&path, "not toml [").expect("corrupt");
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let answers: Vec<(String, String)> = std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..2 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session
+                .send(&raw(
+                    "GET",
+                    "/api/v1/status",
+                    &[
+                        origin(LISTED),
+                        bearer(TOKEN),
+                        "Connection: close".to_string(),
+                    ],
+                ))
+                .expect("send");
+            answers.push(session.recv().expect("recv"));
+            // Ends a kept connection, so the server thread can join.
+            drop(session);
+        }
+        answers
+    });
+    for (head, _) in &answers {
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(cors_lines(head), Vec::<&str>::new());
+    }
+    let failed: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("profiles.toml does not read"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].starts_with(
+            "clauth api: profiles.toml does not read; no [serve] app_origins entry counts \
+             until it reads: "
+        ),
+        "{failed:?}"
+    );
+}
+
+/// CO-7: a non-string element beside strings logs its skip line once, and the
+/// strings beside it keep working.
+#[test]
+fn a_non_string_element_beside_strings_logs_one_skip_line() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_non_string_element_beside_strings_logs_one_skip_line: no openssl");
+        return;
+    };
+    set_serve("app_origins = [7, \"https://app.example.com\"]");
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    let answers: Vec<(String, String)> = std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            for _ in 0..2 {
+                let (stream, peer) = worker.listener.accept().expect("accept");
+                serve_connection(
+                    stream,
+                    peer,
+                    &worker.server_tls,
+                    &worker.ctx,
+                    brisk_limits(),
+                );
+            }
+        });
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+            session
+                .send(&preflight_for(LISTED, "/api/v1/status", "GET"))
+                .expect("send");
+            answers.push(session.recv().expect("recv"));
+            // Ends a kept connection, so the server thread can join.
+            drop(session);
+        }
+        answers
+    });
+    for (head, _) in &answers {
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    }
+    let skipped: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("clauth api: skipping"))
+        .collect();
+    assert_eq!(
+        skipped,
+        ["clauth api: skipping \"7\" in [serve] app_origins: it is not a string in a list"],
+        "{skipped:?}"
+    );
+}
+
+/// A GET that names a method is an ordinary request: the real answer, never
+/// the empty preflight head.
+#[test]
+fn a_get_naming_a_method_is_an_ordinary_request() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_get_naming_a_method_is_an_ordinary_request: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let (head, reply) = wire(
+        &f,
+        &raw(
+            "GET",
+            "/api/v1/status",
+            &[
+                origin(LISTED),
+                bearer(TOKEN),
+                "Access-Control-Request-Method: GET".to_string(),
+            ],
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(reply.contains("active_profile"), "{head} {reply}");
+    assert_eq!(cors_lines(&head), LISTED_ANSWER);
+    assert!(!head.contains("Access-Control-Allow-Methods"), "{head}");
+}
+
+/// The pairing redemption is exempt from the origin gate: an unlisted origin
+/// reaches the code and answers as the code does.
+#[test]
+fn a_pair_post_from_an_unlisted_origin_redeems_the_code() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_pair_post_from_an_unlisted_origin_redeems_the_code: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let (head, reply) = wire(
+        &f,
+        &pair_post(
+            r#"{"code":"0000-0000"}"#,
+            &[
+                origin(UNLISTED),
+                "Content-Type: application/json".to_string(),
+            ],
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert!(reply.contains("pairing_refused"), "{reply}");
+    assert!(!reply.contains("origin_not_allowed"), "{reply}");
+}
+
+/// With no key at all a present origin still logs the fixed word.
+#[test]
+fn an_absent_app_origins_key_logs_the_unlisted_word() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED an_absent_app_origins_key_logs_the_unlisted_word: no openssl");
+        return;
+    };
+    set_serve("");
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            let (stream, peer) = worker.listener.accept().expect("accept");
+            serve_connection(
+                stream,
+                peer,
+                &worker.server_tls,
+                &worker.ctx,
+                brisk_limits(),
+            );
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&raw(
+                "GET",
+                "/api/v1/status",
+                &[
+                    origin(LISTED),
+                    bearer(TOKEN),
+                    "Connection: close".to_string(),
+                ],
+            ))
+            .expect("send");
+        let (head, _) = session.recv().expect("recv");
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    });
+    let requests: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("GET /api/v1/status"))
+        .collect();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].ends_with("origin=unlisted"), "{requests:?}");
+}
+
+/// The refused line keeps the device that presented the token.
+#[test]
+fn a_refused_line_keeps_its_device_name() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_refused_line_keeps_its_device_name: no openssl");
+        return;
+    };
+    list_origin(LISTED);
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            let (stream, peer) = worker.listener.accept().expect("accept");
+            serve_connection(
+                stream,
+                peer,
+                &worker.server_tls,
+                &worker.ctx,
+                brisk_limits(),
+            );
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&raw(
+                "GET",
+                "/api/v1/status",
+                &[
+                    origin(UNLISTED),
+                    bearer(TOKEN),
+                    "Connection: close".to_string(),
+                ],
+            ))
+            .expect("send");
+        let (head, _) = session.recv().expect("recv");
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    });
+    let requests: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("GET /api/v1/status"))
+        .collect();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].contains(&format!(" {DEVICE} GET /api/v1/status")),
+        "{requests:?}"
+    );
+}
+
+/// The skip line takes the same bound every log line takes, a long entry
+/// included.
+#[test]
+fn a_long_bad_entry_logs_a_bounded_skip_line() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_long_bad_entry_logs_a_bounded_skip_line: no openssl");
+        return;
+    };
+    let long = format!("https://{}/", "a".repeat(5000));
+    set_serve(&format!("app_origins = [\"{long}\"]"));
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    std::thread::scope(|scope| {
+        let worker = &f;
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            let (stream, peer) = worker.listener.accept().expect("accept");
+            serve_connection(
+                stream,
+                peer,
+                &worker.server_tls,
+                &worker.ctx,
+                brisk_limits(),
+            );
+        });
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&preflight_for(LISTED, "/api/v1/status", "GET"))
+            .expect("send");
+        session.recv().expect("recv");
+    });
+    let skipped: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("clauth api: skipping"))
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].len() < 400, "{}", skipped[0].len());
+    assert!(!skipped[0].contains(&long), "{skipped:?}");
+    // The bound cuts the entry mid-line, before the reason: the truncation
+    // marker sits just inside the closing quote, and the reason survives whole.
+    assert!(skipped[0].contains("...\" in [serve]"), "{skipped:?}");
+    assert!(
+        skipped[0].ends_with("it has a path or a trailing slash"),
+        "{skipped:?}"
     );
 }
 

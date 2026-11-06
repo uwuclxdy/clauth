@@ -824,8 +824,8 @@ fn delete_legacy_if_holding(device: &Device) -> Result<LegacyDelete> {
 pub(crate) fn note_at_start() {
     match read_store() {
         Ok(store) if store.devices.is_empty() => logline!(
-            "clauth daemon: no device is paired yet, so every REST request but a pairing is \
-             refused; pair one with `clauth devices pair <name>`"
+            "clauth daemon: no device is paired yet, so every REST request but a pairing or a \
+             CORS preflight is refused; pair one with `clauth devices pair <name>`"
         ),
         Ok(_) => {}
         Err(e) => logline!(

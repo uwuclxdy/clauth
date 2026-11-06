@@ -194,7 +194,7 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
         (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach, at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
         (status = 400, description = "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -325,7 +325,7 @@ fn reach(
         (status = 200, description = "the last records whose lines end at or before the cursor, oldest first, each one Claude Code transcript record verbatim; at most 4 MiB of records unless the page's one record is larger", body = HistoryBody),
         (status = 400, description = "a limit outside 1..=500, or a before that is not a byte offset (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "no readable transcript of that id in the shared store or a live isolated store (`session_not_found`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),

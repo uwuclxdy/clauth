@@ -116,6 +116,7 @@ fn save_state(creation: bool) {
     let state = crate::profile::AppState {
         serve: crate::profile::ServeSettings {
             session_creation: creation,
+            ..Default::default()
         },
         profiles: vec!["acme".into()],
         ..Default::default()

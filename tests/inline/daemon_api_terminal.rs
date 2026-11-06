@@ -138,6 +138,8 @@ fn ws_request(method: &str, path: &str, bearer: &str) -> Request {
             key: Some(WS_KEY.to_string()),
             version: Some("13".to_string()),
         },
+        cross_origin: Default::default(),
+        content_type: Default::default(),
     }
 }
 

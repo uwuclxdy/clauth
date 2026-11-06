@@ -382,8 +382,8 @@ pub(crate) enum Command {
         /// another. TLS comes from this host's lego certificate: from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
-        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
-        /// device's token; see `clauth devices`.
+        /// ~/.clauth/tls.json. Every request but a pairing or a CORS preflight
+        /// needs a paired device's token; see `clauth devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
         /// flag is for: a client on another machine. It is the same exposure
@@ -430,11 +430,11 @@ pub(crate) enum Command {
     /// Pair, list, grant sessions to, and revoke the devices that may call the
     /// REST API
     ///
-    /// Every `clauth daemon --listen` request but a pairing authenticates as
-    /// one named device, and each device holds a tier fixed here, on this
-    /// machine: `view` reads the status feed, `control` may also switch
-    /// accounts and, with the `sessions` grant, create sessions through the API
-    /// while `[serve] session_creation` is on.
+    /// Every `clauth daemon --listen` request but a pairing or a CORS preflight
+    /// authenticates as one named device, and each device holds a tier fixed
+    /// here, on this machine: `view` reads the status feed, `control` may also
+    /// switch accounts and, with the `sessions` grant, create sessions through
+    /// the API while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
     #[command(args_conflicts_with_subcommands = true)]

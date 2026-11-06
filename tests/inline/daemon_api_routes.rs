@@ -681,12 +681,19 @@ fn auth_answers(access: Access) -> Vec<(u16, Vec<&'static str>)> {
         Access::None => Vec::new(),
         Access::View => vec![
             (401, vec!["unauthorized"]),
-            (403, vec!["device_tier_unknown"]),
+            (403, vec!["device_tier_unknown", "origin_not_allowed"]),
             (500, vec!["internal"]),
         ],
         Access::Control => vec![
             (401, vec!["unauthorized"]),
-            (403, vec!["device_tier_unknown", "control_required"]),
+            (
+                403,
+                vec![
+                    "device_tier_unknown",
+                    "control_required",
+                    "origin_not_allowed",
+                ],
+            ),
             (500, vec!["internal"]),
         ],
     }
@@ -2435,6 +2442,49 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut driven,
         &mut produced,
     );
+    let pair_untyped = call(
+        &ctx,
+        &Request {
+            content_type: super::super::http::SoloHeader::Absent,
+            ..req("POST", "/api/v1/pair", None, r#"{"code":"ABCD-2345"}"#)
+        },
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        415,
+        &pair_untyped,
+        &mut driven,
+        &mut produced,
+    );
+
+    // A refused origin stops ahead of the table, so every bearer row gives one
+    // answer.
+    for route in ROUTES
+        .iter()
+        .filter(|route| route.access != Access::None && route.method != "HEAD")
+    {
+        let refused = call(
+            &ctx,
+            &Request {
+                cross_origin: super::super::http::CrossOrigin {
+                    refused: true,
+                    ..Default::default()
+                },
+                ..req(route.method, &route_path(route), Some(TOKEN), "")
+            },
+        );
+        check_answer(
+            &doc,
+            route.method,
+            route.path,
+            403,
+            &refused,
+            &mut driven,
+            &mut produced,
+        );
+    }
 
     // The chain error answers: a malformed body, a non-permutation order, an
     // unknown threshold target, a non-member, and an out-of-band threshold.
@@ -3019,6 +3069,168 @@ fn pair_is_the_one_route_an_unpaired_caller_reaches() {
         call(&ctx, &req("GET", "/api/v1/pair", Some(TOKEN), "")).status,
         405
     );
+}
+
+/// Two `Content-Type` headers name no one media type, even when both copies
+/// are JSON, and the refusal comes off what the parser really hands the router.
+#[test]
+fn a_doubled_content_type_is_refused_before_the_code_is_read() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let body = r#"{"code":"ABCD-2345"}"#;
+    let wire = format!(
+        "POST /api/v1/pair HTTP/1.1\r\nContent-Type: application/json\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let parsed = super::super::http::RequestReader::new(wire.as_bytes(), deadline)
+        .next_request()
+        .ok()
+        .flatten()
+        .expect("the request parses");
+
+    let resp = call(&ctx, &parsed);
+
+    assert_eq!(resp.status, 415);
+    assert_eq!(
+        body_json(&resp)["error"],
+        serde_json::json!("unsupported_media_type")
+    );
+}
+
+/// A value of the wrong type reaches the log through the API's own read, once
+/// however many requests meet it, and through no other reader: hooks and the MCP
+/// server run `load_app_state` on every call.
+#[test]
+fn a_wrong_type_on_app_origins_logs_at_the_api_and_nowhere_else() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n[serve]\napp_origins = 73120\n").expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    crate::profile::load_app_state().expect("the file loads");
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+
+    assert!(listed_origins(&ctx).is_empty());
+    assert!(listed_origins(&ctx).is_empty());
+    let logged = lines.snapshot();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(
+        logged[0],
+        "clauth api: skipping \"73120\" in [serve] app_origins: it is not a string in a list"
+    );
+}
+
+/// A `profiles.toml` that does not read, with no list read yet, lists
+/// nothing: no header and no gate, so the routes answer as an empty list has
+/// them, and the line says no entry counts.
+#[test]
+fn a_profiles_file_that_does_not_read_lists_no_origin() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "not toml [").expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert!(listed_origins(&ctx).is_empty());
+    let failed: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("profiles.toml does not read"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].starts_with(
+            "clauth api: profiles.toml does not read; no [serve] app_origins entry counts \
+             until it reads: "
+        ),
+        "{failed:?}"
+    );
+}
+
+/// CO-7: what the fallback remembers is what passed the grammar: an entry
+/// skipped on the good read never counts again while the read fails.
+#[test]
+fn a_failed_read_answers_only_entries_that_passed_the_grammar() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\", \"not an origin\"]\n",
+    )
+    .expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+
+    std::fs::write(&path, "not toml [").expect("corrupt");
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+}
+
+/// CO-8: an emptied list is a good read like any other: it is remembered, so
+/// the last origin removed does not come back while a later read fails.
+#[test]
+fn a_read_of_an_emptied_list_is_remembered_as_empty() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\"]\n",
+    )
+    .expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+
+    std::fs::write(&path, "profiles = []\n[serve]\napp_origins = []\n").expect("emptied");
+    assert!(listed_origins(&ctx).is_empty());
+
+    std::fs::write(&path, "not toml [").expect("corrupt");
+    assert!(listed_origins(&ctx).is_empty());
+}
+
+/// A missing file with no list read yet is the first run: an empty list,
+/// silently, so a later good read just applies.
+#[test]
+fn a_missing_file_with_no_list_read_lists_nothing() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    std::fs::remove_file(&path).expect("the seeded save wrote one; remove it");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert!(listed_origins(&ctx).is_empty());
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\"]\n",
+    )
+    .expect("write");
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
 }
 
 /// CT-1: each control route answers 403 to a view device. Derived from the

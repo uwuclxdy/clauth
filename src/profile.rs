@@ -1019,15 +1019,145 @@ impl Default for HerdrSettings {
     }
 }
 
-/// The daemon's session-creation knob, persisted under `[serve]` in
-/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
-/// partial: a missing field fills from [`Default`] rather than erroring.
+/// The daemon's API knobs, persisted under `[serve]` in profiles.toml. Like
+/// [`HerdrSettings`], the table may be absent (defaults) or partial: a missing
+/// field fills from [`Default`] rather than erroring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ServeSettings {
     /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
     /// (default off). Each calling device also needs its own `sessions` grant.
     pub(crate) session_creation: bool,
+    /// The exact origins whose pages may read the API (default empty: no CORS
+    /// header and no origin gate).
+    #[serde(
+        deserialize_with = "tolerant_origins",
+        skip_serializing_if = "AppOrigins::is_empty"
+    )]
+    pub(crate) app_origins: AppOrigins,
+}
+
+/// `[serve] app_origins` as the file holds it. A hand edit of the wrong type
+/// must not stop every clauth command, so [`tolerant_origins`] keeps what is
+/// not a string in `unreadable` for the API to log: this runs on every
+/// `profiles.toml` read, hooks and the MCP server included, and a line from
+/// here would land on their stderr once per process.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AppOrigins {
+    /// Every string, verbatim, valid or not: a save never rewrites one.
+    pub(crate) entries: Vec<String>,
+    /// Each value that is no string in a list, as text.
+    #[serde(skip)]
+    pub(crate) unreadable: Vec<String>,
+}
+
+impl AppOrigins {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// `unreadable` is a note about one read and renders nothing, so a table
+/// holding only that stays default.
+impl PartialEq for AppOrigins {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for AppOrigins {}
+
+fn tolerant_origins<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AppOrigins, D::Error> {
+    let mut origins = AppOrigins::default();
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::Array(items) => {
+            for item in items {
+                match item {
+                    toml::Value::String(entry) => origins.entries.push(entry),
+                    other => origins.unreadable.push(other.to_string()),
+                }
+            }
+        }
+        other => origins.unreadable.push(other.to_string()),
+    }
+    Ok(origins)
+}
+
+/// Why `entry` cannot count as an origin, or `None` when it can: exactly
+/// `scheme://host[:port]`, the form a browser serializes, so anything else
+/// could only ever fail to match or be read as more than one site. `http` is
+/// loopback alone: a page there has no secure context, and on any other host a
+/// network peer can write its script.
+pub(crate) fn origin_entry_fault(entry: &str) -> Option<&'static str> {
+    if entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("it holds whitespace or a control character");
+    }
+    if entry.contains('*') {
+        return Some("it holds a wildcard");
+    }
+    let Some((scheme, authority)) = entry.split_once("://") else {
+        return Some("it is not scheme://host[:port]");
+    };
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return Some("its scheme is not https or http"),
+    };
+    if authority.contains('/') {
+        return Some("it has a path or a trailing slash");
+    }
+    if authority.contains(['?', '#']) {
+        return Some("it has a query or a fragment");
+    }
+    if authority.contains('@') {
+        return Some("it has userinfo");
+    }
+    let host_end = if authority.starts_with('[') {
+        authority.find(']').map_or(authority.len(), |at| at + 1)
+    } else {
+        authority.find(':').unwrap_or(authority.len())
+    };
+    let (host, port) = authority.split_at(host_end);
+    if !origin_host_is_lowercase_name(host) {
+        return Some("its host is empty, not lowercase, or malformed");
+    }
+    if !port.is_empty() {
+        let Some(digits) = port.strip_prefix(':') else {
+            return Some("it is not scheme://host[:port]");
+        };
+        if digits == default_port {
+            return Some("it names its scheme's default port");
+        }
+        let as_sent = digits.bytes().all(|b| b.is_ascii_digit())
+            && !digits.starts_with('0')
+            && digits.parse::<u16>().is_ok();
+        if !as_sent {
+            return Some("its port is not a number a browser would send");
+        }
+    }
+    if scheme == "http" && !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return Some("it is plain http on a host other than loopback");
+    }
+    None
+}
+
+/// A DNS name or a dotted address in lowercase, or a bracketed IPv6 address.
+fn origin_host_is_lowercase_name(host: &str) -> bool {
+    if host.chars().any(char::is_uppercase) {
+        return false;
+    }
+    if let Some(address) = host.strip_prefix('[') {
+        return address
+            .strip_suffix(']')
+            .is_some_and(|address| address.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+        })
 }
 
 /// The auto-updater knob, persisted under `[update]` in profiles.toml. Like
@@ -3172,9 +3302,15 @@ pub(crate) fn claude_roster_names() -> Result<Vec<ProfileName>> {
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {
+    Ok(read_app_state()?.unwrap_or_default())
+}
+
+/// `profiles.toml`, `None` when it is missing, so a caller that cares can tell
+/// a first run from a good read in one step.
+pub(crate) fn read_app_state() -> Result<Option<AppState>> {
     let path = app_state_path()?;
     if !path.exists() {
-        return Ok(AppState::default());
+        return Ok(None);
     }
     let mut state: AppState = read_toml_file(&path)?;
     state.refresh_interval_ms = state.refresh_interval_ms.max(MIN_REFRESH_INTERVAL_MS);
@@ -3197,7 +3333,7 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     if state.context_nudge_threshold_tokens.is_some() {
         state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
     }
-    Ok(state)
+    Ok(Some(state))
 }
 
 /// The fresh-read proof for [`save_app_state`]. Sealed inside this module: only

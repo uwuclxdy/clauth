@@ -856,6 +856,7 @@ fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
         },
         serve: ServeSettings {
             session_creation: true,
+            ..ServeSettings::default()
         },
         ..AppState::default()
     };
@@ -5029,6 +5030,164 @@ fn a_stray_serve_key_survives_while_the_table_renders_non_default() {
     assert!(
         after.contains(PRESERVED_KEYS_MARKER),
         "the carried key sits under the preserved-keys marker:\n{after}"
+    );
+}
+
+/// The boundary of an entry past the shapes a page can send: each near-miss
+/// names its own reason, and the forms a browser serializes all count.
+#[test]
+fn an_origin_entry_counts_only_as_a_browser_would_send_it() {
+    use crate::profile::origin_entry_fault as fault;
+
+    for (entry, reason) in [
+        (
+            "https://x.example.com:",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:+8443",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:08443",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:0",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:65536",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://[::1",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://[zz]:8443",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://[2001:DB8::1]",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://b\u{fc}cher.example.com",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        ("https://[::1]x", "it is not scheme://host[:port]"),
+        (
+            "https://a\u{a0}b.example.com",
+            "it holds whitespace or a control character",
+        ),
+        (
+            "https://a.example.com\r\nX: y",
+            "it holds whitespace or a control character",
+        ),
+        (
+            "http://[::2]:5173",
+            "it is plain http on a host other than loopback",
+        ),
+        (
+            "https://x.example.com/p",
+            "it has a path or a trailing slash",
+        ),
+        ("https://x.example.com?q", "it has a query or a fragment"),
+        ("https://u@x.example.com", "it has userinfo"),
+        ("https://*.example.com", "it holds a wildcard"),
+    ] {
+        assert_eq!(fault(entry), Some(reason), "{entry:?}");
+    }
+
+    for entry in [
+        "https://a_b.example.com",
+        "https://x.example.com:65535",
+        "https://[::1]",
+        "http://[::1]",
+        "http://127.0.0.1",
+    ] {
+        assert_eq!(fault(entry), None, "{entry:?}");
+    }
+}
+
+/// A hand-set list survives every other writer's save, in order and verbatim,
+/// an entry that does not count included, and names its key exactly once: a
+/// duplicate key would stop the file parsing.
+#[test]
+fn a_set_app_origins_list_survives_a_state_save() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+
+    // From memory alone, so no carry of the old file can stand in for the field.
+    let state = AppState {
+        serve: ServeSettings {
+            app_origins: crate::profile::AppOrigins {
+                entries: vec![
+                    "https://b.example.com".to_string(),
+                    "https://a.example.com/not-an-origin".to_string(),
+                ],
+                ..Default::default()
+            },
+            ..ServeSettings::default()
+        },
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save");
+    let want = [
+        "https://b.example.com".to_string(),
+        "https://a.example.com/not-an-origin".to_string(),
+    ];
+    assert_eq!(
+        load_app_state().expect("load").serve.app_origins.entries,
+        want
+    );
+
+    // A save over that file, the shape every other writer takes.
+    let state = load_app_state().expect("load");
+    save_app_state(&state).expect("save again");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(after.matches("app_origins").count(), 1, "{after}");
+    assert_eq!(
+        load_app_state().expect("load").serve.app_origins.entries,
+        want
+    );
+}
+
+/// A value of the wrong type stays on disk through a save, so the next read
+/// meets what the user typed rather than a key that silently vanished.
+#[test]
+fn a_wrong_type_on_app_origins_survives_a_state_save() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[serve]\napp_origins = \"https://x.example.com\"\n",
+    )
+    .expect("write");
+
+    let state = load_app_state().expect("load");
+    assert_eq!(
+        state.serve.app_origins.entries,
+        Vec::<String>::new(),
+        "a bare string lists nothing"
+    );
+    assert_eq!(
+        state.serve.app_origins.unreadable,
+        ["\"https://x.example.com\""]
+    );
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed
+            .get("serve")
+            .and_then(|serve| serve.get("app_origins")),
+        Some(&toml::Value::String("https://x.example.com".into())),
+        "{after}"
     );
 }
 

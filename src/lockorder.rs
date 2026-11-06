@@ -327,6 +327,17 @@ pub(crate) mod rank {
         /// then re-takes it to record what it gave up and pruned.
         #[cfg(target_os = "macos")]
         ItemReadGaveUp = 1903;
+        /// The `[serve] app_origins` texts already logged as skipped
+        /// (`daemon::api::routes::note_skipped_origin`). A true leaf: held for
+        /// one lookup and one insert, and the line it decides on is written
+        /// after the guard drops.
+        SkippedOrigins = 1904;
+        /// The last `[serve] app_origins` list that read
+        /// (`daemon::api::routes::listed_origins`), the fallback answered from
+        /// while a later read fails. A true leaf: held for one `Arc` clone or
+        /// one assignment, and the line it decides on is written after the
+        /// guard drops.
+        LastOrigins = 1905;
         /// The per-account `limit-reset` spend flock
         /// (`usage::limit_reset_pending::LimitResetLock`,
         /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend

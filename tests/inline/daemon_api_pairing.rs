@@ -47,6 +47,8 @@ fn post_pair(ctx: &ApiContext, body: &str) -> Response {
             body: body.as_bytes().to_vec(),
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            content_type: crate::daemon::api::http::SoloHeader::One("application/json".to_string()),
         },
         peer(),
     )
