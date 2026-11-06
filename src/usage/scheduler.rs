@@ -3365,6 +3365,49 @@ fn apply_outcome_flagged(
     Some(stamped)
 }
 
+/// Fold the 5h/7d readings Claude Code sessions recorded off their own replies
+/// (`~/.clauth/observed-usage/<profile>.json`, see [`super::observed`]) into
+/// the stored bodies they are newer than. Memory only, like
+/// [`mark_window_open`]: no status, cadence, streak or disk-cache write, so a
+/// rate-limited poll stays visibly `RateLimited`, keeps its backoff, and the
+/// next live body overwrites the store as usual. The files are read before the
+/// store lock is taken.
+fn apply_observed_usage(store: &UsageStore) {
+    let Some(dir) = super::observed::dir() else {
+        return;
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    let names: Vec<String> = match store.lock() {
+        Ok(s) => s.keys().cloned().collect(),
+        Err(_) => return,
+    };
+    let readings: Vec<(String, super::observed::Observed)> = names
+        .into_iter()
+        .filter_map(|name| super::observed::read(&dir, &name).map(|o| (name, o)))
+        .collect();
+    if readings.is_empty() {
+        return;
+    }
+    let now = now_epoch_secs();
+    let mut fresh = Vec::new();
+    if let Ok(mut s) = store.lock() {
+        for (name, observed) in &readings {
+            if let Some(info) = s.get_mut(name) {
+                if let Some(seen) = super::observed::usable_seen_at(info, observed, now) {
+                    fresh.push((name.as_str(), seen));
+                }
+                super::observed::overlay(info, observed, now);
+            }
+        }
+    }
+    // Noted after the store lock is released: the freshness map is a leaf.
+    for (name, seen) in fresh {
+        super::observed::note_fresh(name, seen);
+    }
+}
+
 /// Optimistically mark a just-kicked profile's 5h window open in the store. A
 /// 200 from the kick endpoint IS the window opening, but `/usage` can
 /// rate-limit for minutes afterwards — until a live body lands, the usage tab
@@ -6327,6 +6370,10 @@ pub(crate) fn tick(state: &SchedulerState) {
     // Orphan sweep: a forced name no leg scheduled keeps a stale Queued mark.
     clear_orphaned_forced(&state.activity, &forced, &scheduled);
 
+    // Readings sessions took off their own replies, folded in ahead of the
+    // scan so a `/usage` 429 does not blind it (see [`apply_observed_usage`]).
+    apply_observed_usage(&state.store);
+
     // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a
     // profile that crossed its threshold is switched immediately, without
     // waiting for the next scheduled fetch. Also checks recovery post-switch-off.
@@ -7240,6 +7287,10 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
             !state.is_idle()
         });
     }
+
+    // The hydrate above reloads the lease holder's disk cache, which a
+    // `/usage` 429 freezes; fold the observed readings back in on top.
+    apply_observed_usage(&state.store);
 }
 
 /// The store-refresh half of [`standdown_tick`], extracted store-narrow so the
@@ -7499,7 +7550,9 @@ pub(crate) fn decision_fresh_any(
         // the freshness gate guards that leg's status, never the OAuth leg's.
         decision_fresh(third_party_status, name)
     } else {
-        decision_fresh(status, name) || decision_fresh(third_party_status, name)
+        decision_fresh(status, name)
+            || decision_fresh(third_party_status, name)
+            || super::observed::is_fresh(name.as_str(), now_epoch_secs())
     }
 }
 
@@ -7585,6 +7638,7 @@ fn reading_is_actionable(
         Some(s) => {
             is_stuck_rate_limited(s, rate_limit_streak(streaks, name))
                 || matches!(s, FetchStatus::Fresh)
+                || super::observed::is_fresh(name.as_str(), now_epoch_secs())
         }
         // No OAuth entry (a pure third-party member never enters the OAuth leg):
         // fall back to the third-party reading so it isn't invisible to the scan.
