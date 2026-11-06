@@ -4485,8 +4485,8 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
             "the build must raise no logline line, got: {:?}",
             lines.snapshot()
         );
-        // cloudy 2026-10-22: one note per store the build could not create,
-        // each naming only its own consequence.
+        // One note per store the build could not create, each naming only its
+        // own consequence.
         assert_eq!(
             notes,
             [
@@ -4496,7 +4496,7 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
                 ),
                 (
                     "projects",
-                    "transcripts stay in its own tree and are lost when it ends",
+                    "transcripts stay in its own tree until it ends and ~/.claude can take them",
                 ),
                 (
                     "sessions",

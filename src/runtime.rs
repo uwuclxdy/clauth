@@ -10449,7 +10449,7 @@ pub(crate) const SHARED_STORES: &[(&str, &str)] = &[
     ),
     (
         "projects",
-        "transcripts stay in its own tree and are lost when it ends",
+        "transcripts stay in its own tree until it ends and ~/.claude can take them",
     ),
     (
         "sessions",
@@ -10476,8 +10476,8 @@ pub(crate) const SHARED_STORES: &[(&str, &str)] = &[
 /// takes; an existing tree entry is left as it is; a store that is unusable or
 /// cannot be created is skipped, so a start the base allowed is never refused
 /// by this fix. Each store it cannot create is returned as a note the caller
-/// surfaces (the foreground start prints it; the MCP delegate path stays
-/// silent).
+/// surfaces (`clauth start` prints it, `--bg` and `clauth resume` included;
+/// the MCP delegate path stays silent).
 fn ensure_store_links(claude_home: &Path, runtime: &Path, mode: LinkMode) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     if mode == LinkMode::Fake {
