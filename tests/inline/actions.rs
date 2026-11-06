@@ -6135,6 +6135,51 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// A comment written above an account in `profiles.toml` describes that
+/// account: after a rename it stays on the new name, never on a neighbour.
+#[test]
+fn a_rename_keeps_the_comment_above_the_account_in_both_lists() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in ["a", "b"] {
+        create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+            None,
+        )
+        .expect("create profile");
+    }
+    let path = home.home().join(".clauth").join("profiles.toml");
+    std::fs::write(
+        &path,
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"a\",\n  \"b\",\n]\n",
+    )
+    .expect("hand edit");
+    config.state = crate::profile::load_app_state().expect("load");
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile::ProfileName::from("z"),
+        &rotation_guard("a"),
+    )
+    .expect("rename");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"z\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"z\",\n  \"b\",\n]\n"
+    );
+}
+
 /// A profile held by a live `clauth start` session must not be renamed — the
 /// rename moves the whole profile directory, which holds the session's runtime
 /// tree, markers and env paths, and nothing rekeys the live-session registry

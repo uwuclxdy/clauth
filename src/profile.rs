@@ -2371,10 +2371,10 @@ struct ProfileConfig {
 /// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
 /// only. The record is deliberately UNMODELLED in [`ProfileConfig`]: a table
 /// `ProfileConfig` holds but `render_config_toml` never writes is dropped by
-/// the next rewrite, while a table neither holds rides every rewrite through
-/// the unmodelled-key carry. That is what keeps every pre-existing state file,
-/// fixture and `Profile` literal byte-identical — the runtime [`Profile`]
-/// gains no field.
+/// the next rewrite, while a table neither holds stays where it sits through
+/// every in-place `config.toml` write. That is what keeps every pre-existing
+/// state file and fixture byte-identical: the record reaches the runtime
+/// [`Profile`] only as its never-serialized `proxy` field.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 struct ProxyTable {
     #[serde(default)]
@@ -2468,7 +2468,7 @@ pub(crate) fn stored_proxy_claim(name: &ProfileName) -> ProxyClaim {
 /// account: what [`stored_proxy_claim`] reads as [`ProxyClaim::None`] because
 /// it cannot tell is [`ProxyClaim::Unclassifiable`] here. A missing file
 /// claims nothing, as [`load_profile`] reads it as an empty config: the
-/// record's one writer ([`write_proxy_record`]) replaces the file whole, so no
+/// record's one writer ([`write_proxy_record`]) edits the file in place, so no
 /// record exists without it.
 pub(crate) fn stored_proxy_claim_failing_closed(name: &ProfileName) -> ProxyClaim {
     match profile_config_path(name) {
@@ -2565,56 +2565,60 @@ pub(crate) fn stored_proxy_record(name: &ProfileName) -> Option<ProxyAccount> {
     stored_proxy_claim(name).into_record()
 }
 
-/// Write the `[proxy]` table into `name`'s rendered config.toml — the ONE
-/// write path for the record, and an unmodelled key from then on: every later
-/// rewrite carries it through the preserving carry, so no profile edit can
-/// drop it. An existing record is replaced (the re-bind login's re-mint).
+/// Write `name`'s proxy-account record into its `config.toml` in place — the
+/// ONE write path for the record. A file already holding a `proxy` table (a
+/// block table, an inline table, or dotted `proxy.*` keys) gets its `service`
+/// and `account` values replaced where they sit (a `service` or `account` that
+/// is itself a table is replaced by the value); a file without one gets the
+/// table appended after its last item; a profile with no file yet gets one
+/// holding the record. An existing record is replaced (the re-bind login's
+/// re-mint). A file that is not TOML refuses with the load's own parse error
+/// and is never written over; a file holding any CRLF line is written CRLF
+/// throughout.
 pub(crate) fn write_proxy_record(name: &ProfileName, record: &ProxyAccount) -> Result<()> {
     let path = profile_config_path(name)?;
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let raw = strip_proxy_table(&raw);
-    let table: toml::Table = [
-        (
-            "service".to_string(),
-            toml::Value::from(record.service.as_str()),
-        ),
-        (
-            "account".to_string(),
-            toml::Value::from(record.account.as_str()),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    let rendered = merge_carried_keys(raw, &[("proxy".to_string(), toml::Value::Table(table))]);
-    atomic_write_600(&path, &rendered).context("failed to write the proxy record")
-}
-
-/// Remove an existing `[proxy]` block — and a preserved-keys marker line that
-/// names nothing but it — so [`write_proxy_record`]'s carry can rewrite the
-/// table without duplicating a key, which is a hard parse error.
-fn strip_proxy_table(raw: &str) -> String {
-    let lines: Vec<&str> = raw.lines().collect();
-    let Some(start) = lines.iter().position(|line| line.trim() == "[proxy]") else {
-        return raw.to_string();
-    };
-    let mut drop_start = start;
-    if drop_start > 0 && lines[drop_start - 1].trim() == PRESERVED_KEYS_MARKER {
-        drop_start -= 1;
-    }
-    let end = lines[start + 1..]
-        .iter()
-        .position(|line| line.trim_start().starts_with('['))
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
-    let mut out = String::with_capacity(raw.len());
-    for (i, line) in lines.iter().enumerate() {
-        if i >= drop_start && i < end {
-            continue;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        // A missing file reads as empty: the append below writes one holding
+        // the record, so the create and the append stay one path.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {name}/config.toml"));
         }
-        out.push_str(line);
-        out.push('\n');
+    };
+    let lf = raw.replace("\r\n", "\n");
+    let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
+        // A file that is not TOML refuses with the load's own parse error;
+        // the bytes on disk are never written over.
+        return Err(ConfigParseRefusal::new(name.as_str(), &raw).into());
+    };
+    let service = toml::Value::from(record.service.as_str());
+    let account = toml::Value::from(record.account.as_str());
+    let set = |t: &mut dyn toml_edit::TableLike| {
+        set_state_entry(t, "service", &service);
+        set_state_entry(t, "account", &account);
+    };
+    let item = doc.get_mut("proxy");
+    let non_table = item.as_ref().is_some_and(|i| !i.is_table_like());
+    if let Some(table) = item.and_then(toml_edit::Item::as_table_like_mut) {
+        set(table);
+    } else {
+        // A `proxy` value that is no table cannot hold the record: removed
+        // with its comments kept, and the table appended, as a modelled table
+        // does over a value where it belongs.
+        if non_table {
+            remove_key_keeping_comments(&mut doc, "proxy", &[], "");
+        }
+        append_root_table(&mut doc, "proxy", set);
     }
-    out
+    let mut out = doc.to_string();
+    if raw.contains("\r\n") {
+        // Normalize before the expand, as the config save does: a multi-line
+        // string's own `\r\n` survives the parse, and a blanket expand writes
+        // a bare `\r` the file no longer parses.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    atomic_write_600(&path, out).context("failed to write the proxy record")
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -3960,549 +3964,655 @@ pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
     }
     let state = state.app_state();
     with_state_lock(|held| {
+        let path = app_state_path()?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        // The edit runs before anything is written, so a file the writer
+        // refuses leaves the marker record untouched too.
+        let edited = raw
+            .as_deref()
+            .map(|raw| edit_state_in_place(&path, raw, state))
+            .transpose()?;
         // The record first: a failed record write leaves the marker as it
         // was, and only a crash between the two writes leaves them apart.
         if state.active_moved {
-            let replaced = load_app_state()?.active_profile.as_ref().cloned();
+            let replaced = edited
+                .as_ref()
+                .and_then(|(_, disk)| disk.as_ref())
+                .and_then(|disk| disk.active_profile.as_ref().cloned());
             crate::claude::note_active_marker(
                 state.active_profile.as_ref(),
                 replaced.as_ref(),
                 held,
             )?;
         }
+        let out = match (raw, edited) {
+            (Some(raw), Some((out, _))) if out == raw => return Ok(()),
+            (_, Some((out, _))) => out,
+            (_, None) => toml::to_string_pretty(state).context("failed to render profiles.toml")?,
+        };
         mkdir_700(&clauth_dir()?)?;
-        let path = app_state_path()?;
-        let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
-        atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
-            .context("failed to write profiles.toml")
+        atomic_write_600(&path, out).context("failed to write profiles.toml")
     })
 }
 
-/// Re-attach onto a rendered `profiles.toml` every key the on-disk file holds
-/// that `AppState` does not model — the `profiles.toml` half of the rule
-/// `serialize_credentials_preserving_extra` states for the credential store:
-/// a rewrite over itself must keep what the model cannot hold.
+/// `profiles.toml` as it is on disk with `state` written into it in place:
+/// only the keys whose typed value moved are touched, so comments, key order,
+/// list layout and every key this clauth does not model stay as written (a
+/// newer clauth's keys included). Returns the edited bytes and the typed state
+/// the file held, `None` when it holds no readable state (an empty file).
 ///
-/// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
-/// on every save, and the writers that put them there are exactly the ones
-/// clauth must not overrule: a NEWER clauth whose keys this binary has not
-/// learned (an older install against a newer config silently erases them —
-/// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
-/// The carry is recursive: a future TOP-LEVEL key re-attaches whole, and a
-/// future sub-key inside a table the model DOES hold (`[update]`, `[herdr]`,
-/// `[serve]`) re-attaches inside that table's rendered block
-/// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
-/// the moment the model gains the table.
-///
-/// Three exclusions; the first two close each other's hole. "Modelled" is decided by
-/// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
-/// modelled key the new state just moved to a default (absent from the render,
-/// its `skip_serializing_if` omitted it) cannot come back from disk with its
-/// stale value — resurrection. But that round-trip erases a modelled key whose
-/// ON-DISK value is itself the skipped default (`show_pace = false` written
-/// by hand), so the second exclusion drops any key the RENDER already names —
-/// without it, a save that moves such a key off default emits it twice, and a
-/// duplicate top-level key is a hard parse error bricking the file. The third,
-/// [`carry_is_inert`] (per nested entry, [`nested_carry_if_inert`]), catches what
-/// the round-trip cannot see: a serde alias of a modelled key reads as
-/// unmodelled, and carried beside its field it duplicates that field. A carried
-/// key is one the model's round-trip never saw, the render does not write, and
-/// whose presence leaves what the file parses to unchanged.
-fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return rendered; // nothing on disk to preserve (first save)
-    };
-    let Ok(disk) = raw.parse::<toml::Table>() else {
-        return rendered; // unparseable: not ours to resurrect keys from
-    };
-    let Ok((modelled, modelled_nested)) = modelled_state_shape(&raw) else {
-        // The state did not parse, so which keys are modelled is UNKNOWN, and
-        // carrying everything would duplicate modelled keys already in the
-        // render — a duplicate top-level key is a hard parse error, bricking
-        // the file this save is supposed to keep loadable. Carry nothing.
-        return rendered;
-    };
-    // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
-        return rendered; // a render that does not parse: nothing safe to merge
-    };
-    let baseline = parsed_as::<AppState>(&rendered);
-    let rendered = nested_carry_if_inert::<AppState>(
-        rendered,
-        baseline.as_deref(),
-        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
-    );
-    let carried: Vec<(String, toml::Value)> = disk
-        .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| carry_is_inert::<AppState>(baseline.as_deref(), &rendered_table, k, v))
-        .collect();
-    if carried.is_empty() {
-        return rendered; // the common case: nothing unmodelled on disk
-    }
-    merge_carried_keys(rendered, &carried)
-}
-
-/// What a store's model recognizes, derived by round-tripping the file
-/// through its type: the top-level keys it holds, plus the sub-keys of every
-/// modelled table — the shape [`nested_unmodelled`] classifies unmodelled
-/// nested keys against.
-type ModelledShape = (
-    std::collections::BTreeSet<String>,
-    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-);
-
-/// What `AppState` holds, derived by round-tripping `raw` through the type:
-/// the top-level keys it recognizes, plus the sub-keys of every modelled
-/// table — the nested form of the same derivation, so a future sub-key inside
-/// a modelled table is recognized as unmodelled rather than silently deleted.
-/// Err on a file that does not parse as `AppState` — the caller must refuse to
-/// carry rather than guess.
-fn modelled_state_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
-    let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
-    toml::to_string_pretty(&state)
+/// Two shapes refuse and write nothing: a file that is not TOML (the load's
+/// own parse error, position only) and a modelled key clauth cannot read into
+/// its type ([`ConfigEditRefusal`], naming the key). Old and new are compared
+/// as typed values, so a spelling the model reads as the same value (a serde
+/// variant alias) stays as written until that setting changes.
+fn edit_state_in_place(
+    path: &Path,
+    raw: &str,
+    state: &AppState,
+) -> Result<(String, Option<AppState>)> {
+    let lf = raw.replace("\r\n", "\n");
+    let typed = toml::from_str::<AppState>(raw);
+    let parsed = lf
+        .parse::<toml_edit::DocumentMut>()
         .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|table| {
-            let nested = table
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_table()
-                        .map(|t| (k.clone(), t.keys().cloned().collect()))
-                })
-                .collect();
-            (table.keys().cloned().collect(), nested)
-        })
-        .ok_or(())
-}
-
-/// The sub-keys of `disk[k]` that neither the model nor the render holds, for
-/// every top-level key both sides hold as a table: the nested form of the
-/// unmodelled-key carry. A future sub-key inside a MODELLED table would
-/// otherwise be deleted by the next save. The top-level carry owns an
-/// unmodelled table whole, and the round-trip exclusion above owns a modelled
-/// key the new state moved to its default — this picks up exactly the gap:
-/// tables the render writes, sub-keys the model never learned.
-///
-/// A table the round-trip OMITTED (every modelled key in it parsed to its
-/// default — the round-trip skips a default table) is classified against the
-/// RENDER alone when the save writes it: the render's own keys are the
-/// duplicate guard, and a modelled key the render omits there is
-/// value-neutral to carry (it parsed to the same default the model holds).
-/// The alternative — deriving the recognized sets from a default render of
-/// the type — classifies nothing: `AppState`'s table fields all skip at their
-/// default, so a default render emits no table blocks at all.
-fn nested_unmodelled(
-    disk: &toml::Table,
-    modelled_nested: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    rendered: &toml::Table,
-) -> Vec<(String, String, toml::Value)> {
-    let mut out = Vec::new();
-    for (table, value) in disk {
-        let Some(disk_table) = value.as_table() else {
-            continue;
+        .zip(lf.parse::<toml::Table>().ok());
+    let Some((mut doc, literal)) = parsed else {
+        let position = match &typed {
+            Err(e) => crate::format::toml_parse_position(raw, e),
+            Ok(_) => None,
         };
-        let rendered_table = rendered.get(table.as_str()).and_then(toml::Value::as_table);
-        let known = modelled_nested.get(table.as_str());
-        if known.is_none() && rendered_table.is_none() {
-            continue; // neither side holds it: the top-level carry owns it whole
-        }
-        for (key, value) in disk_table {
-            if known.is_some_and(|k| k.contains(key.as_str())) {
-                continue; // the model holds it: the round-trip already decided
-            }
-            if rendered_table.is_some_and(|t| t.contains_key(key.as_str())) {
-                continue; // the render writes it: never carried beside its copy
-            }
-            out.push((table.clone(), key.clone(), value.clone()));
-        }
-    }
-    out
-}
-
-/// What `text` parses to as a `T`, re-rendered: the value the inert rule
-/// compares. Callers parse the render once per save and hand it down.
-fn parsed_as<T>(text: &str) -> Option<String>
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    toml::to_string(&toml::from_str::<T>(text).ok()?).ok()
-}
-
-/// Whether carrying `key = value` beside `rendered` leaves what the file parses
-/// to exactly as the render alone has it (`baseline`, the render's
-/// [`parsed_as`]): the last word on every top-level carry. The round-trip that
-/// decides "modelled" cannot see a serde alias: the alias parses into its
-/// field and re-emits under the
-/// field's own name, so the alias reads as unmodelled. Serde counts an alias
-/// and its field as ONE field, so carried beside the render's copy it is a
-/// duplicate field and the next load fails outright; carried where the render
-/// leaves the field at its skipped default, it turns the field back on. Any
-/// carry that breaks the parse or changes a parsed value is dropped; a
-/// genuinely unmodelled key parses the same with or without it and stays. A
-/// render that does not parse (`baseline` `None`) carries nothing.
-fn carry_is_inert<T>(
-    baseline: Option<&str>,
-    rendered: &toml::Table,
-    key: &str,
-    value: &toml::Value,
-) -> bool
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    let mut with = rendered.clone();
-    with.insert(key.to_string(), value.clone());
-    let parsed = toml::to_string(&with)
-        .ok()
-        .and_then(|text| parsed_as::<T>(&text));
-    matches!((baseline, parsed), (Some(a), Some(b)) if a == b)
-}
-
-/// The nested carry with [`carry_is_inert`]'s rule one level down, entry by
-/// entry: each `[table] key = value` is merged only when it alone leaves what
-/// the file parses to as the render has it (`baseline`), so one bad nested
-/// key never costs the genuine ones beside it.
-fn nested_carry_if_inert<T>(
-    rendered: String,
-    baseline: Option<&str>,
-    nested: &[(String, String, toml::Value)],
-) -> String
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    let Some(baseline) = baseline else {
-        return rendered;
+        return Err(ConfigParseRefusal::at(path.display(), position).into());
     };
-    let inert: Vec<(String, String, toml::Value)> = nested
-        .iter()
-        .filter(|entry| {
-            let one = merge_nested_carried_keys(rendered.clone(), std::slice::from_ref(*entry));
-            parsed_as::<T>(&one).is_some_and(|parsed| parsed == baseline)
+    let disk = match typed {
+        Ok(disk) => Some(disk),
+        Err(_) => {
+            if let Some(key) = unreadable_state_key(&doc, &literal) {
+                return Err(ConfigEditRefusal::new("profiles.toml", &key).into());
+            }
+            // No single key explains the failure: a file missing a required
+            // key (an empty one) holds no state to diff against, so every
+            // modelled key is written in.
+            None
+        }
+    };
+    let old = match &disk {
+        Some(disk) => state_table(disk)?,
+        None => toml::Table::new(),
+    };
+    let rendered = doc.to_string();
+    apply_state_edits(&mut doc, &old, &state_table(state)?, &literal);
+    let mut out = doc.to_string();
+    if out == rendered {
+        // The edit list changed nothing, so the file already holds this state:
+        // hand back its own bytes (a missing final newline, mixed line endings)
+        // and the save's raw comparison skips the write.
+        return Ok((raw.to_string(), disk));
+    }
+    if raw.contains("\r\n") {
+        // The config.toml writer's rule: normalize, then expand, so a CRLF
+        // file stays CRLF, inserted lines included.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    Ok((out, disk))
+}
+
+/// `state` as the typed table a save writes: the serializer's own view, so a
+/// key at its `skip_serializing_if` default is absent.
+fn state_table(state: &AppState) -> Result<toml::Table> {
+    match toml::Value::try_from(state).context("failed to render profiles.toml")? {
+        toml::Value::Table(t) => Ok(t),
+        _ => Err(anyhow::anyhow!("failed to render profiles.toml")),
+    }
+}
+
+/// `key = value` read alone as `AppState` (beside an empty `profiles` list the
+/// type requires), or `None` when the model cannot read it.
+fn read_state_key_alone(key: &str, value: &toml::Value) -> Option<AppState> {
+    let mut t = toml::Table::new();
+    t.insert("profiles".to_string(), toml::Value::Array(Vec::new()));
+    t.insert(key.to_string(), value.clone());
+    toml::Value::Table(t).try_into::<AppState>().ok()
+}
+
+/// Whether two values of `key` read as the same typed value: the comparison
+/// that keeps an alias spelling as written when the model reads it as the
+/// value the save holds.
+fn reads_the_same(key: &str, a: &toml::Value, b: &toml::Value) -> bool {
+    let view = |v| {
+        read_state_key_alone(key, v)
+            .and_then(|s| state_table(&s).ok())
+            .map(|mut t| t.remove(key))
+    };
+    match (view(a), view(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The first key, in file order, whose value `AppState` cannot read on its
+/// own: the key a shape refusal names.
+fn unreadable_state_key(doc: &toml_edit::DocumentMut, literal: &toml::Table) -> Option<String> {
+    doc.iter()
+        .map(|(key, _)| key)
+        .find(|key| {
+            literal
+                .get(*key)
+                .is_some_and(|v| read_state_key_alone(key, v).is_none())
         })
-        .cloned()
-        .collect();
-    if inert.is_empty() {
-        return rendered;
-    }
-    merge_nested_carried_keys(rendered, &inert)
+        .map(str::to_string)
 }
 
-/// Marker comment written above keys `AppState` does not model, so a hand-editor
-/// sees they were carried rather than authored by this save.
-const PRESERVED_KEYS_MARKER: &str =
-    "# keys preserved from the previous file; not modelled by this clauth:";
-
-/// Splice `carried` top-level keys into a rendered TOML document, preserving
-/// table-header scoping — the core of the `profiles.toml` carry. Appending everything as trailing text (the shape this
-/// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
-/// inside that table: into `[env]` it is a type error that bricks
-/// `load_profile`, into `[herdr]` it is silently dropped on the next load.
-///
-/// So scalars insert as top-level lines BEFORE the first table header of the
-/// render, tables append at the end (a `[key]` block is top-level wherever it
-/// sits, and its own sub-scope is its own), and within the carried set a
-/// table-valued key is emitted before any carried scalar follows it — the same
-/// trap one level down, from `BTreeMap`'s ordering of the carry itself.
-/// An unrenderable value drops rather than corrupting the document.
-/// A value that renders as one or more `[key]`-headed blocks: a table, or an
-/// array of tables (`[[key]]`). `is_table()` alone misses the array shape,
-/// which is a `Value::Array` whose elements are all tables.
-fn is_table_shaped(value: &toml::Value) -> bool {
-    value.is_table()
-        || value
-            .as_array()
-            .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v.is_table()))
-}
-
-pub(crate) fn merge_carried_keys(rendered: String, carried: &[(String, toml::Value)]) -> String {
-    let lines: Vec<&str> = rendered.lines().collect();
-    // First line that opens a table header — `render_config_toml` and the state
-    // render both emit top-level scalars before any table, so this is the
-    // insertion point for carried scalars.
-    let first_table = lines.iter().position(|l| l.trim_start().starts_with('['));
-    let scalar_cutoff = first_table.unwrap_or(lines.len());
-
-    let mut out = String::with_capacity(rendered.len() + 64);
-    let mut head: Vec<String> = Vec::new();
-    let mut tail: Vec<String> = Vec::new();
-    for (key, value) in carried {
-        let entry: toml::Table = [(key.clone(), value.clone())].into_iter().collect();
-        let Ok(block) = toml::to_string(&entry) else {
-            continue; // unrenderable: drop rather than corrupt
-        };
-        let block = block.trim_end().to_string();
-        // Table-shaped values (a table, or an array of tables — `[[key]]`)
-        // go to the tail; everything else is a top-level scalar for the head.
-        // An array of tables landing in `head` would swallow a later scalar
-        // into its last element, the same scoping trap one level down.
-        if is_table_shaped(value) {
-            tail.push(block);
-        } else {
-            head.push(block);
-        }
-    }
-    if head.is_empty() && tail.is_empty() {
-        return rendered; // nothing renderable; the render alone is the answer
-    }
-    // Scalars: before the first table header, with the marker naming them.
-    if !head.is_empty() {
-        head.insert(0, PRESERVED_KEYS_MARKER.to_string());
-    }
-    // Tables carry the marker only when no scalar block introduced one above —
-    // a marker already naming this save's carried keys, and the tail's blocks
-    // are no farther from it than the render's own trailing sections are.
-    if !tail.is_empty() && head.is_empty() {
-        tail.insert(0, PRESERVED_KEYS_MARKER.to_string());
-    }
-    for (i, line) in lines.iter().enumerate() {
-        if i == scalar_cutoff && !head.is_empty() {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str(&head.join("\n"));
-            out.push('\n');
-            if !line.trim().is_empty() {
-                out.push('\n');
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Cutoff past the last line (render had no table header): the loop above
-    // never reached the insert point, so the head lands after everything.
-    if scalar_cutoff >= lines.len() && !head.is_empty() {
-        if !out.is_empty() && !out.ends_with("\n\n") {
-            out.push('\n');
-        }
-        out.push_str(&head.join("\n"));
-        out.push('\n');
-    }
-    if !tail.is_empty() {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(&tail.join("\n"));
-        out.push('\n');
-    }
-    out
-}
-
-/// Re-attach onto a rendered document the sub-keys of a modelled table that
-/// the model dropped — the nested half of the unmodelled-key carry
-/// ([`nested_unmodelled`] finds them). For each carried `(table, key, value)`
-/// whose `[table]` block the render writes (a non-default `[update]`,
-/// `[herdr]`, `[serve]`, `[console]`), the entry re-attaches so a future
-/// nested key survives the save exactly like a future top-level one.
-///
-/// Two shapes, each scoped correctly against this toml crate's parser: a
-/// table-valued entry (a table, or an array of tables) rides a wrapper table
-/// so the serializer's own path tracking emits an absolute `[table.key.sub]`
-/// header (a bare `[sub]` would scope to the root, and the render's own
-/// `[table]` re-open would be a duplicate table definition); a scalar entry
-/// is a bare `key = literal`, scoped by the `[table]` block it splices into
-/// — a dotted `table.key = v` there would re-define the table and read as a
-/// duplicate (this crate parses it current-table-relative anyway). Both land
-/// inside the block they belong to, before the next top-level header. A
-/// `table` or `key` that is not a bare identifier, and a value the serializer
-/// cannot re-emit, is DROPPED rather than risk a mis-scoped header (the same
-/// drop-don't-corrupt rule as [`merge_carried_keys`]).
-fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::Value)]) -> String {
-    // Two piles per table: bare scalars scope to the enclosing `[table]`
-    // block, so they must precede any `[table.key]` header of the same table
-    // (a scalar after one would scope to `table.key`).
-    let mut scalars: std::collections::BTreeMap<&str, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut headers: std::collections::BTreeMap<&str, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (table, key, value) in nested {
-        if !is_bare_key(table) || !is_bare_key(key) {
-            continue; // a non-bare segment cannot re-attach: drop rather than corrupt
-        }
-        let block = if is_table_shaped(value) {
-            let mut inner = toml::Table::new();
-            inner.insert(key.clone(), value.clone());
-            let wrapper: toml::Table = [(table.clone(), toml::Value::Table(inner))]
-                .into_iter()
-                .collect();
-            let Ok(block) = toml::to_string(&wrapper) else {
-                continue; // unrenderable: drop rather than corrupt
-            };
-            headers
-                .entry(table.as_str())
-                .or_default()
-                .push(block.trim_end().to_string());
-            continue;
-        } else if value
-            .as_array()
-            .is_some_and(|a| a.iter().any(toml::Value::is_table))
+/// The per-key edit list of a state save: every top-level key whose typed
+/// value moved between `old` (the file) and `new` (the save), and nothing
+/// else. `literal` is the file's own untyped view, for the keys `old` omits.
+fn apply_state_edits(
+    doc: &mut toml_edit::DocumentMut,
+    old: &toml::Table,
+    new: &toml::Table,
+    literal: &toml::Table,
+) {
+    for (key, n) in new {
+        let o = old.get(key);
+        if o == Some(n)
+            || (o.is_none() && literal.get(key).is_some_and(|l| reads_the_same(key, l, n)))
         {
-            continue; // a mixed table array: no literal form to trust, drop
-        } else {
-            // `Display` is the TOML literal (quotes, escapes, `.0` floats);
-            // the bare key scopes to the enclosing `[table]` block.
-            format!("{key} = {value}")
-        };
-        scalars
-            .entry(table.as_str())
-            .or_default()
-            .push(block.trim_end().to_string());
-    }
-    if scalars.is_empty() && headers.is_empty() {
-        return rendered; // nothing to splice: the render alone is the answer
-    }
-    // One pending run per table: its scalars, then its header blocks.
-    fn pending_for(
-        table: &str,
-        scalars: &std::collections::BTreeMap<&str, Vec<String>>,
-        headers: &std::collections::BTreeMap<&str, Vec<String>>,
-    ) -> Vec<String> {
-        let mut run = scalars.get(table).cloned().unwrap_or_default();
-        if let Some(more) = headers.get(table) {
-            run.extend(more.iter().cloned());
-        }
-        run
-    }
-    let mut out = String::with_capacity(rendered.len() + 64);
-    // The top-level table the walk sits in; `None` above the first table
-    // header, inside a multi-line string, or after a dotted sub-header (its
-    // root has no splice-capable block). Placement IS the scoping for the
-    // bare scalar entries, and keeps the header entries beside the table they
-    // belong to rather than in one tail pile.
-    let mut scope: Option<&str> = None;
-    // The multi-line string (`"""` / `'''`) a value line opened. The render is
-    // always serializer output, so tracking the one open delimiter line-wise
-    // is bounded, and a `[`-leading line inside a literal is content, never a
-    // header — a false header there would fire the leave-block flush INSIDE
-    // the string, corrupting the modelled value.
-    let mut ml_string: Option<&'static str> = None;
-    for line in rendered.lines() {
-        if let Some(delim) = ml_string {
-            // A raw delimiter inside the literal is its close (escaped ones
-            // don't appear in serializer output); an even count is a whole
-            // `""""""`-style empty string, still inside.
-            if line.matches(delim).count() % 2 == 1 {
-                ml_string = None;
-            }
-            out.push_str(line);
-            out.push('\n');
             continue;
         }
-        if line.trim_start().starts_with('[') {
-            let name = line
-                .trim_start()
-                .trim_start_matches('[')
-                .split(']')
-                .next()
-                .unwrap_or("");
-            // A dotted sub-header scopes to `t.s`, never to a splice-capable
-            // `[t]` block — and a pending scalar landing after one would
-            // mis-scope to `t.s`, so it ends the region like any other
-            // header (`[[a.b]]` included; a single-segment `[[t]]` keeps its
-            // root splice-capable, where a trailing scalar legally scopes to
-            // the last element). The array shape is UNREACHABLE today, not a
-            // blessed input: no modelled table is an array — the round-trip's
-            // `as_table()` excludes array values from `modelled_nested`, so
-            // nothing classifies one — and this walk states that bound
-            // rather than handling it as a supported case.
-            let dotted = name.contains('.');
-            let root = name.split('.').next().unwrap_or("");
-            if let Some(cur) = scope
-                && (root != cur || dotted)
-                && (!scalars.get(cur).is_none_or(Vec::is_empty)
-                    || !headers.get(cur).is_none_or(Vec::is_empty))
-            {
-                // The block we are leaving still owes its carried sub-keys.
-                let pending = pending_for(cur, &scalars, &headers);
-                scalars.remove(cur);
-                headers.remove(cur);
-                if !out.is_empty() && !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push('\n');
-                out.push_str(PRESERVED_KEYS_MARKER);
-                out.push('\n');
-                out.push_str(&pending.join("\n"));
-                out.push('\n');
-                out.push('\n');
+        match n {
+            toml::Value::Table(n) => {
+                edit_state_table(doc, key, o.and_then(toml::Value::as_table), n, literal);
             }
-            scope = if dotted { None } else { Some(root) };
-        } else {
-            // A multi-line string OPENS only in assignment form: the
-            // serializer's openers sit at line end after `= ` (the closer
-            // rides the last content line). A delimiter run inside a
-            // single-line value — `key = "a'''"`, `'p"""q'`, both measured —
-            // must not open string state, or the following header vanishes
-            // into it and the carry re-attaches a duplicate table. One
-            // serializer shape this rule misses, unreachable through the
-            // models today (no free-form `Vec<String>` field renders through
-            // `toml::Value` display): an array element opening a multi-line
-            // string, `days = ["""` — if a model ever gains one, this rule
-            // needs the array-element form before that field ships.
-            let trimmed = line.trim_end();
-            if trimmed.ends_with("= \"\"\"") {
-                ml_string = Some("\"\"\"");
-            } else if trimmed.ends_with("= '''") {
-                ml_string = Some("'''");
+            n => set_root_state_value(doc, key, n),
+        }
+    }
+    for (key, o) in old {
+        if new.contains_key(key) {
+            continue;
+        }
+        match o.as_table() {
+            Some(o) if doc.get(key).is_some_and(toml_edit::Item::is_table_like) => {
+                let subkeys: Vec<&str> = o.keys().map(String::as_str).collect();
+                unset_table(doc, key, &subkeys, &[], "");
             }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // The last table block runs to EOF: flush whatever it still owes.
-    if let Some(cur) = scope
-        && (!scalars.get(cur).is_none_or(Vec::is_empty)
-            || !headers.get(cur).is_none_or(Vec::is_empty))
-    {
-        let pending = pending_for(cur, &scalars, &headers);
-        scalars.remove(cur);
-        headers.remove(cur);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(PRESERVED_KEYS_MARKER);
-        out.push('\n');
-        out.push_str(&pending.join("\n"));
-        out.push('\n');
-    }
-    // Tables the render never opened — a modelled table back at its default
-    // emits no block on that same save — have nothing to splice into:
-    // re-attach at EOF, scalars under a fresh bare `[table]` header,
-    // table-valued entries through their already-absolute `[table.key]`
-    // headers. EOF sits past every render block, so a fresh header cannot
-    // collide with one, and the carried keys are what re-create the table on
-    // the next load (its modelled keys read at their defaults from absence).
-    let mut rest: std::collections::BTreeSet<&str> = scalars.keys().copied().collect();
-    rest.extend(headers.keys().copied());
-    for table in rest {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(PRESERVED_KEYS_MARKER);
-        out.push('\n');
-        if let Some(pending) = scalars.get(table) {
-            out.push_str(&format!("[{table}]\n"));
-            out.push_str(&pending.join("\n"));
-            out.push('\n');
-        }
-        if let Some(blocks) = headers.get(table) {
-            out.push_str(&blocks.join("\n"));
-            out.push('\n');
+            _ => remove_key_keeping_comments(doc, key, &[], ""),
         }
     }
-    out
 }
 
-/// A key segment the carry ([`merge_nested_carried_keys`]) can re-attach: a
-/// bare TOML identifier, the charset the model's own fields serialize with.
-/// Anything else is dropped rather than risk a mis-scoped header.
-fn is_bare_key(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+/// A modelled table written into the file: edited subkey by subkey where the
+/// file already holds it in any table form (block, dotted or inline, the form
+/// kept), else appended as a new block table. A value where the table belongs
+/// (the scalar `theme = "full"` a pick turns into `[theme]`) is removed with
+/// its comments kept, and the table takes its place.
+fn edit_state_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    old: Option<&toml::Table>,
+    new: &toml::Table,
+    literal: &toml::Table,
+) {
+    if !doc.get(key).is_some_and(toml_edit::Item::is_table_like) {
+        if doc.contains_key(key) {
+            remove_key_keeping_comments(doc, key, &[], "");
+        }
+        append_root_table(doc, key, |t| {
+            for (sub, v) in new {
+                t.insert(sub, toml_edit::Item::Value(state_edit_value(v)));
+            }
+        });
+        return;
+    }
+    let literal = literal.get(key).and_then(toml::Value::as_table);
+    let alone = |sub: &str, v: &toml::Value| {
+        toml::Value::Table([(sub.to_string(), v.clone())].into_iter().collect())
+    };
+    for (sub, n) in new {
+        let o = old.and_then(|t| t.get(sub));
+        if o == Some(n)
+            || (old.is_none()
+                && literal
+                    .and_then(|t| t.get(sub))
+                    .is_some_and(|l| reads_the_same(key, &alone(sub, l), &alone(sub, n))))
+        {
+            continue;
+        }
+        if let Some(t) = doc
+            .get_mut(key)
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            set_state_entry(t, sub, n);
+        }
+    }
+    for sub in old.into_iter().flat_map(toml::Table::keys) {
+        if !new.contains_key(sub) {
+            remove_subkey_keeping_comments(doc, key, sub);
+        }
+    }
+}
+
+/// A modelled root value written into the file: in place where the file holds
+/// a value, through the root-section append where it holds none, and in place
+/// of a table where the file holds one there.
+fn set_root_state_value(doc: &mut toml_edit::DocumentMut, key: &str, value: &toml::Value) {
+    match doc.get(key) {
+        Some(item) if item.is_value() => set_state_entry(doc.as_table_mut(), key, value),
+        Some(_) => {
+            remove_key_keeping_comments(doc, key, &[], "");
+            append_root_value(doc, key, state_edit_value(value));
+        }
+        None => append_root_value(doc, key, state_edit_value(value)),
+    }
+}
+
+/// One entry of a table set to `value`: a list of names is edited element by
+/// element, any other value replaced keeping its decor, and an absent key
+/// inserted at the table's end.
+fn set_state_entry(t: &mut dyn toml_edit::TableLike, key: &str, value: &toml::Value) {
+    let names = value.as_array().and_then(|a| {
+        a.iter()
+            .map(toml::Value::as_str)
+            .collect::<Option<Vec<&str>>>()
+    });
+    match t.get_mut(key) {
+        Some(item) if item.is_value() => {
+            if let (Some(names), Some(arr)) = (names, item.as_array_mut())
+                && arr.iter().all(toml_edit::Value::is_str)
+            {
+                edit_name_list(arr, &names);
+                return;
+            }
+            set_value_preserving_decor(t, key, state_edit_value(value));
+        }
+        Some(_) => {
+            t.remove(key);
+            t.insert(key, toml_edit::Item::Value(state_edit_value(value)));
+        }
+        None => {
+            t.insert(key, toml_edit::Item::Value(state_edit_value(value)));
+        }
+    }
+}
+
+/// A typed value as the value the writer inserts: a list it creates is one
+/// line, a table inline (a block table is built by its own caller).
+fn state_edit_value(v: &toml::Value) -> toml_edit::Value {
+    match v {
+        toml::Value::String(s) => s.as_str().into(),
+        toml::Value::Integer(i) => (*i).into(),
+        toml::Value::Float(f) => (*f).into(),
+        toml::Value::Boolean(b) => (*b).into(),
+        toml::Value::Datetime(d) => (*d).into(),
+        toml::Value::Array(a) => toml_edit::Value::Array(a.iter().map(state_edit_value).collect()),
+        toml::Value::Table(t) => toml_edit::Value::InlineTable(
+            t.iter()
+                .map(|(k, v)| (k.as_str(), state_edit_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Which target slot a list edit fills: an element the two lists share in
+/// order, a name that moved in from another position, a new name replacing a
+/// removed one (taking its decor), or a new name with no removal to replace.
+#[derive(Clone, Copy)]
+enum ListSlot {
+    Kept,
+    Moved,
+    Paired(usize),
+    New,
+}
+
+/// Edit `arr` into `target` with the fewest element moves: the longest run the
+/// two share in order stays put with its decor, a name that moved carries its
+/// own comment to its new place, and a new name takes the list's own element
+/// layout (its own line in a multi-line list, a `, ` in a one-line one).
+///
+/// Within the gap between two kept elements, a name leaving the list (not
+/// moving elsewhere) and a name new to it pair off in order, the pair being one
+/// value replacement that keeps the removed element's whole decor; a comment
+/// above an unpaired removal moves onto the next element.
+fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
+    let cur: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if cur.iter().map(String::as_str).eq(target.iter().copied()) {
+        return;
+    }
+    // The whitespace closing a list with no trailing comma rides the last
+    // element's suffix; held as the list's trailing text, it stays at the end
+    // whichever element ends up last.
+    if !arr.trailing_comma()
+        && let Some(last) = arr.len().checked_sub(1)
+    {
+        let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+        let moved = arr.get_mut(last).and_then(|v| {
+            let suffix = decor_suffix(v.decor()).to_string();
+            (!suffix.is_empty() && suffix.trim().is_empty()).then(|| {
+                v.decor_mut().set_suffix("");
+                suffix
+            })
+        });
+        if let Some(suffix) = moved {
+            arr.set_trailing(format!("{suffix}{trailing}"));
+        }
+    }
+    let prefixes: Vec<String> = arr
+        .iter()
+        .map(|v| decor_prefix(v.decor()).to_string())
+        .collect();
+    let first_layout = prefixes.first().map(|p| layout_of(p)).unwrap_or_default();
+    let layout = prefixes
+        .iter()
+        .skip(1)
+        .next_back()
+        .or_else(|| prefixes.first().filter(|p| p.contains('\n')))
+        .map_or_else(|| " ".to_string(), |p| layout_of(p));
+
+    let (kept_cur, kept_target) = shared_run(&cur, target);
+    // Count each target name, then spend one per kept element and one per
+    // element that leaves its place: what remains is the names new to the list.
+    let mut moves: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for name in target {
+        *moves.entry(name).or_default() += 1;
+    }
+    for (i, name) in cur.iter().enumerate() {
+        if kept_cur[i] {
+            spend_one(&mut moves, name);
+        }
+    }
+    let mut moving = vec![false; cur.len()];
+    for i in (0..cur.len()).rev() {
+        if !kept_cur[i] && spend_one(&mut moves, &cur[i]) {
+            moving[i] = true;
+        }
+    }
+    let mut supply: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, name) in cur.iter().enumerate() {
+        if moving[i] {
+            *supply.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    let mut slots = vec![ListSlot::New; target.len()];
+    for (j, name) in target.iter().enumerate() {
+        if kept_target[j] {
+            slots[j] = ListSlot::Kept;
+        } else if spend_one(&mut supply, name) {
+            slots[j] = ListSlot::Moved;
+        }
+    }
+    // Pair, gap by gap between the elements both lists keep, a name leaving
+    // the list with a new name: the pair replaces one value in the same place.
+    let kept_at: Vec<usize> = (0..cur.len()).filter(|&i| kept_cur[i]).collect();
+    let target_at: Vec<usize> = (0..target.len()).filter(|&j| kept_target[j]).collect();
+    for gap in 0..=kept_at.len() {
+        let cur_lo = if gap == 0 { 0 } else { kept_at[gap - 1] + 1 };
+        let cur_hi = kept_at.get(gap).copied().unwrap_or(cur.len());
+        let target_lo = if gap == 0 { 0 } else { target_at[gap - 1] + 1 };
+        let target_hi = target_at.get(gap).copied().unwrap_or(target.len());
+        let leaving = (cur_lo..cur_hi).filter(|&i| !moving[i]);
+        let fresh: Vec<usize> = (target_lo..target_hi)
+            .filter(|&j| matches!(slots[j], ListSlot::New))
+            .collect();
+        for (i, j) in leaving.zip(fresh) {
+            slots[j] = ListSlot::Paired(i);
+        }
+    }
+    let mut pair_of = vec![None; cur.len()];
+    for (j, slot) in slots.iter().enumerate() {
+        if let ListSlot::Paired(i) = slot {
+            pair_of[*i] = Some(j);
+        }
+    }
+    // Remove every element the target does not keep, in reverse so the indexes
+    // stay the file's own. A paired removal keeps its decor for its
+    // replacement, a moved one for its new place, and only an unpaired one
+    // leaves its comment behind.
+    let mut moved_values: Vec<(String, toml_edit::Value)> = Vec::new();
+    let mut paired_values: Vec<Option<toml_edit::Value>> =
+        (0..target.len()).map(|_| None).collect();
+    for i in (0..cur.len()).rev() {
+        if kept_cur[i] {
+            continue;
+        }
+        if moving[i] {
+            moved_values.push((cur[i].clone(), remove_list_element(arr, i, false)));
+        } else if let Some(j) = pair_of[i] {
+            paired_values[j] = Some(remove_list_element(arr, i, false));
+        } else {
+            remove_list_element(arr, i, true);
+        }
+    }
+    for (j, name) in target.iter().enumerate() {
+        let slot = slots[j];
+        // An element appended after the list's last one takes over its
+        // same-line comment: the comment joins the appended element's prefix
+        // (the encoder's comma lands before it, keeping the comment on its
+        // element's line) and the closing newline moves to the list's
+        // trailing, so the close stays on its own line.
+        let pending = if !matches!(slot, ListSlot::Kept) && j == arr.len() {
+            take_last_same_line_comment(arr)
+        } else {
+            None
+        };
+        match slot {
+            ListSlot::Kept => {}
+            ListSlot::Moved => {
+                let value = moved_values
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .map(|p| moved_values.remove(p).1);
+                insert_list_element(arr, j, value, name, false, &layout, &first_layout);
+            }
+            ListSlot::Paired(_) => {
+                let value = paired_values[j]
+                    .take()
+                    .map(|removed| replacement_value(name, &removed));
+                insert_list_element(arr, j, value, name, true, &layout, &first_layout);
+            }
+            ListSlot::New => {
+                insert_list_element(arr, j, None, name, false, &layout, &first_layout);
+            }
+        }
+        if let Some(mut comment) = pending
+            && let Some(v) = arr.get_mut(j)
+        {
+            let existing = decor_prefix(v.decor()).to_string();
+            // A comment ends its line, so a prefix that does not start on a
+            // new line (a one-line list) needs one before the value, or the
+            // comment swallows it.
+            if !existing.starts_with('\n') {
+                comment.push('\n');
+            }
+            v.decor_mut().set_prefix(format!("{comment}{existing}"));
+        }
+    }
+}
+
+/// Move the same-line comment off the list's last element when an element is
+/// appended after it: the comment comes back as the text for the appended
+/// element's prefix (the encoder's comma lands before it) and its closing
+/// newline moves to the list's trailing, so the comment stays on its
+/// element's line. `None` when the last element's suffix holds no comment.
+fn take_last_same_line_comment(arr: &mut toml_edit::Array) -> Option<String> {
+    let last = arr.len().checked_sub(1)?;
+    let suffix = arr
+        .get(last)
+        .map(|v| decor_suffix(v.decor()).to_string())
+        .filter(|s| s.contains('#'))?;
+    let (comment, close) = match suffix.rfind('\n') {
+        Some(nl) => (suffix[..nl].to_string(), suffix[nl..].to_string()),
+        None => (suffix, String::new()),
+    };
+    if let Some(v) = arr.get_mut(last) {
+        v.decor_mut().set_suffix("");
+    }
+    let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+    arr.set_trailing(format!("{close}{trailing}"));
+    Some(comment)
+}
+
+/// Take one unit of `name`'s remaining count: `false` when none is left.
+fn spend_one(counts: &mut std::collections::HashMap<&str, usize>, name: &str) -> bool {
+    counts
+        .get_mut(name)
+        .is_some_and(|n| match n.checked_sub(1) {
+            Some(left) => {
+                *n = left;
+                true
+            }
+            None => false,
+        })
+}
+
+/// A new name wearing a removed element's decor: one value replaced by another
+/// in the same place.
+fn replacement_value(name: &str, removed: &toml_edit::Value) -> toml_edit::Value {
+    let mut v = toml_edit::Value::from(name);
+    v.decor_mut().set_prefix(decor_prefix(removed.decor()));
+    v.decor_mut().set_suffix(decor_suffix(removed.decor()));
+    v
+}
+
+/// Which elements of `cur` and `target` lie on a longest common subsequence:
+/// the elements a list edit leaves where they are.
+fn shared_run(cur: &[String], target: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let (n, m) = (cur.len(), target.len());
+    let mut len = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            len[i][j] = if cur[i] == target[j] {
+                len[i + 1][j + 1] + 1
+            } else {
+                len[i + 1][j].max(len[i][j + 1])
+            };
+        }
+    }
+    let mut kept_cur = vec![false; n];
+    let mut kept_target = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if cur[i] == target[j] {
+            kept_cur[i] = true;
+            kept_target[j] = true;
+            i += 1;
+            j += 1;
+        } else if len[i + 1][j] >= len[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    (kept_cur, kept_target)
+}
+
+/// Remove element `idx`. With `carry`, every comment the element holds moves
+/// to where the element sat: the block above it verbatim onto the element
+/// after it (or the list's end) and its same-line comment onto its own line
+/// at the list's element indent, leading newlines dropped so no blank line is
+/// left behind. Without, the comments leave with the element. An element
+/// taking first place takes the old first's layout.
+fn remove_list_element(arr: &mut toml_edit::Array, idx: usize, carry: bool) -> toml_edit::Value {
+    let removed = arr.remove(idx);
+    let lead = decor_prefix(removed.decor()).to_string();
+    let own = decor_suffix(removed.decor()).to_string();
+    let comment = {
+        let mut comment = lead
+            .rfind('\n')
+            .filter(|_| carry && lead.contains('#'))
+            .map(|nl| lead[..=nl].to_string())
+            .unwrap_or_default();
+        if carry && own.contains('#') {
+            let indent = layout_of(&lead);
+            let indent = if indent.is_empty() {
+                " "
+            } else {
+                indent.as_str()
+            };
+            let continuation = indent.trim_start_matches('\n');
+            for line in own.lines().map(str::trim).filter(|l| l.starts_with('#')) {
+                comment.push_str(if comment.is_empty() {
+                    indent
+                } else {
+                    continuation
+                });
+                comment.push_str(line);
+                comment.push('\n');
+            }
+        }
+        comment
+    };
+    if let Some(next) = arr.get_mut(idx) {
+        let existing = decor_prefix(next.decor()).to_string();
+        if !comment.is_empty() {
+            next.decor_mut()
+                .set_prefix(format!("{comment}{}", existing.trim_start_matches('\n')));
+        } else if idx == 0 {
+            next.decor_mut()
+                .set_prefix(format!("{}{}", layout_of(&lead), existing.trim_start()));
+        }
+    } else if !comment.is_empty() {
+        let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+        arr.set_trailing(format!("{comment}{}", trailing.trim_start_matches('\n')));
+    }
+    removed
+}
+
+/// Insert `name` at `idx`: a moved element keeps the comment above it, a
+/// replacement keeps the whole decor it carries, and any other element takes
+/// the list's layout for that place.
+fn insert_list_element(
+    arr: &mut toml_edit::Array,
+    idx: usize,
+    value: Option<toml_edit::Value>,
+    name: &str,
+    keep_decor: bool,
+    layout: &str,
+    first_layout: &str,
+) {
+    let own_comment = value
+        .as_ref()
+        .is_some_and(|v| decor_prefix(v.decor()).contains('#'));
+    let mut v = value.unwrap_or_else(|| {
+        let mut v = toml_edit::Value::from(name);
+        v.decor_mut().set_suffix("");
+        v
+    });
+    if !keep_decor && !own_comment {
+        v.decor_mut()
+            .set_prefix(if idx == 0 { first_layout } else { layout });
+    }
+    if idx == 0
+        && let Some(first) = arr.get_mut(0)
+        && decor_prefix(first.decor()) == first_layout
+    {
+        first.decor_mut().set_prefix(layout);
+    }
+    arr.insert_formatted(idx, v);
+}
+
+/// An element prefix's layout without its comments: the line break and indent
+/// before the value, or the space of a one-line list.
+fn layout_of(prefix: &str) -> String {
+    match prefix.rfind('\n') {
+        Some(nl) => format!("\n{}", &prefix[nl + 1..]),
+        None => prefix.to_string(),
+    }
+}
+
+fn decor_prefix(decor: &toml_edit::Decor) -> &str {
+    decor.prefix().and_then(|r| r.as_str()).unwrap_or("")
+}
+
+fn decor_suffix(decor: &toml_edit::Decor) -> &str {
+    decor.suffix().and_then(|r| r.as_str()).unwrap_or("")
 }
 
 /// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
@@ -4536,7 +4646,7 @@ pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Res
 /// Fresh read-modify-write of `profiles.toml` under the state flock: load the
 /// current state, apply `f` with the flock witness, save, and return the saved
 /// state. A closure that changes nothing writes nothing, so a no-op never
-/// re-renders a hand-edited file or moves every peer's reload fingerprint.
+/// touches the file or moves every peer's reload fingerprint.
 pub(crate) fn update_app_state(f: impl FnOnce(&mut AppState, &StateLockHeld)) -> Result<AppState> {
     with_state_lock(|held| {
         let mut state = load_fresh_state(held)?;
@@ -5943,23 +6053,24 @@ pub(crate) fn update_profile_config<T>(
     })
 }
 
-/// A save over a modelled key whose on-disk shape the writer does not edit: an
-/// inline table, a dotted or implicit table, a multi-line string, a multi-line
-/// array, a value of the wrong type, a table where a value belongs or a value
-/// where a table belongs, or the `kick_timer` alias beside `auto_start`.
-/// Nothing is written; the key is named and the file is left byte for byte. A
-/// distinct type so a caller can `downcast_ref` the refusal instead of matching
-/// its text.
+/// A save over a modelled key whose on-disk shape the writer does not edit.
+/// In a profile's `config.toml`: an inline table, a dotted or implicit table, a
+/// multi-line string, a multi-line array, a value of the wrong type, a table
+/// where a value belongs or a value where a table belongs, or the `kick_timer`
+/// alias beside `auto_start`. In `profiles.toml`, which edits every readable
+/// shape in place: a key its model cannot read. Nothing is written; the file
+/// and the key are named and the file is left byte for byte. A distinct type so
+/// a caller can `downcast_ref` the refusal instead of matching its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigEditRefusal {
-    profile: String,
+    file: String,
     key: String,
 }
 
 impl ConfigEditRefusal {
-    fn new(profile: &str, key: &str) -> Self {
+    fn new(file: impl Into<String>, key: &str) -> Self {
         Self {
-            profile: profile.to_string(),
+            file: file.into(),
             key: key.to_string(),
         }
     }
@@ -5975,18 +6086,18 @@ impl std::fmt::Display for ConfigEditRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}: config.toml has `{}` in a shape clauth cannot read; fix or remove that line, then try again",
-            self.profile, self.key
+            "{} has `{}` in a shape clauth cannot read; fix or remove that line, then try again",
+            self.file, self.key
         )
     }
 }
 
 impl std::error::Error for ConfigEditRefusal {}
 
-/// A save refused because `config.toml` does not parse as TOML. Its `Display`
-/// is the load's own `failed to parse <profile>/config.toml at line L, column
-/// C` text byte for byte; the position rides on the type so a caller can name
-/// it without matching the text.
+/// A save refused because the file (`config.toml` or `profiles.toml`) does not
+/// parse as TOML. Its `Display` is that file's load error, `failed to parse
+/// <label> at line L, column C`, byte for byte; the position rides on the type
+/// so a caller can name it without matching the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigParseRefusal {
     message: String,
@@ -5995,15 +6106,18 @@ pub(crate) struct ConfigParseRefusal {
 
 impl ConfigParseRefusal {
     fn new(profile: &str, raw: &str) -> Self {
-        let label = format!("{profile}/config.toml");
         let position = on_disk_profile_config(raw)
             .err()
             .and_then(|e| crate::format::toml_parse_position(raw, &e));
-        let message = match crate::format::parse_position(position) {
-            Some(pos) => format!("failed to parse {label} at {pos}"),
-            None => format!("failed to parse {label}"),
-        };
-        Self { message, position }
+        Self::at(format!("{profile}/config.toml"), position)
+    }
+
+    /// The refusal for the file the load names `label`.
+    fn at(label: impl std::fmt::Display, position: Option<crate::format::ParsePosition>) -> Self {
+        Self {
+            message: crate::format::parse_error(label, position).to_string(),
+            position,
+        }
     }
 
     /// The parse position the load named, for a caller wording its own message.
@@ -6089,7 +6203,7 @@ fn edit_existing_config_toml(
     let on_disk = on_disk_profile_config(raw);
     let canonical = canonical_profile_config(profile);
     if let Some(key) = non_plain_edit(&doc, on_disk.as_ref().ok(), &canonical) {
-        return Err(ConfigEditRefusal::new(profile.name.as_str(), key).into());
+        return Err(ConfigEditRefusal::new(format!("{}: config.toml", profile.name), key).into());
     }
     let on_disk = match on_disk {
         Ok(on_disk) => on_disk,
@@ -7388,13 +7502,44 @@ fn same_line_comment(item: &toml_edit::Item) -> String {
         .unwrap_or_default()
 }
 
+/// The comment lines inside a removed value, each trimmed onto its own line:
+/// the text before the value, every list element's prefix and suffix, the
+/// list's trailing text, and an inline table's trailing text. Empty when the
+/// value holds no comment, so a removal without one stays byte-identical.
+fn interior_comments(item: &toml_edit::Item) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let Some(value) = item.as_value() else {
+        return String::new();
+    };
+    parts.push(decor_prefix(value.decor()));
+    if let toml_edit::Value::Array(a) = value {
+        for v in a.iter() {
+            parts.push(decor_prefix(v.decor()));
+            parts.push(decor_suffix(v.decor()));
+            if let toml_edit::Value::InlineTable(t) = v {
+                parts.push(t.trailing().as_str().unwrap_or(""));
+            }
+        }
+        parts.push(a.trailing().as_str().unwrap_or(""));
+    } else if let toml_edit::Value::InlineTable(t) = value {
+        parts.push(t.trailing().as_str().unwrap_or(""));
+    }
+    parts
+        .iter()
+        .flat_map(|p| p.lines())
+        .map(str::trim)
+        .filter(|l| l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
 fn remove_key_keeping_comments(
     doc: &mut toml_edit::DocumentMut,
     key: &str,
     doc_blocks: &[String],
     example: &str,
 ) {
-    let (lead, same_line) = {
+    let (lead, same_line, interior) = {
         let table = doc.as_table();
         let Some((k, item)) = table.get_key_value(key) else {
             return;
@@ -7421,7 +7566,7 @@ fn remove_key_keeping_comments(
                 .unwrap_or("")
                 .to_string()
         };
-        (lead, same_line_comment(item))
+        (lead, same_line_comment(item), interior_comments(item))
     };
     let next = {
         let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
@@ -7435,6 +7580,7 @@ fn remove_key_keeping_comments(
     if ends_with_any_doc_block(&kept, doc_blocks) {
         kept.push_str(example);
     }
+    kept.push_str(&interior);
     kept.push_str(&same_line);
     if let Some(next_key) = next {
         prepend_prefix(doc, &next_key, &kept);
@@ -7556,23 +7702,60 @@ fn prepend_to_first_leaf(t: &mut toml_edit::Table, prefix: &str) {
 }
 
 fn remove_subkey_keeping_comments(doc: &mut toml_edit::DocumentMut, table_key: &str, subkey: &str) {
-    let lead = {
+    let (lead, inline_close) = {
         let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
             return;
         };
         let Some((k, item)) = t.get_key_value(subkey) else {
             return;
         };
-        let mut lead = k
+        let inline = doc
+            .get(table_key)
+            .is_some_and(toml_edit::Item::is_inline_table);
+        let comment_bearing = k
             .leaf_decor()
             .prefix()
             .and_then(|r| r.as_str())
-            .unwrap_or("")
-            .to_string();
-        lead.push_str(&same_line_comment(item));
-        lead
+            .is_some_and(|s| s.contains('#'))
+            || item
+                .as_value()
+                .and_then(|v| v.decor().suffix())
+                .and_then(|r| r.as_str())
+                .is_some_and(|s| s.contains('#'));
+        if inline && !comment_bearing {
+            // An inline table key keeps its own separator, so a removed key's
+            // whitespace prefix has nowhere to go. The whitespace that closed
+            // the table dies with its last key, so that one moves to the
+            // table's trailing instead of another key. A key whose own prefix
+            // or value suffix holds a comment is not this case: it takes the
+            // carry path below, which moves that comment onto the next key, or
+            // past the table from the last one.
+            let last = t.iter().last().is_some_and(|(last, _)| last == subkey);
+            let close = if last {
+                item.as_value()
+                    .and_then(|v| v.decor().suffix())
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            (String::new(), Some(close))
+        } else {
+            let mut lead = k
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            lead.push_str(&same_line_comment(item));
+            (lead, None)
+        }
     };
-    let next_sub = {
+    // The next subkey is the block-table carry target only; the inline path
+    // returns through its own close handling. Computed before the removal so
+    // the removed key still holds its place in the table.
+    let next_sub = if inline_close.is_none() {
         let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
             return;
         };
@@ -7581,12 +7764,26 @@ fn remove_subkey_keeping_comments(doc: &mut toml_edit::DocumentMut, table_key: &
             .position(|k| k == subkey)
             .and_then(|i| keys.get(i + 1))
             .cloned()
+    } else {
+        None
     };
     {
         let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
             return;
         };
         t.remove(subkey);
+    }
+    if let Some(close) = inline_close {
+        if !close.is_empty()
+            && let Some(t) = doc
+                .get_mut(table_key)
+                .and_then(toml_edit::Item::as_inline_table_mut)
+            && !t.trailing_comma()
+        {
+            let existing = t.trailing().as_str().unwrap_or("").to_string();
+            t.set_trailing(format!("{close}{existing}"));
+        }
+        return;
     }
     if let Some(ns) = next_sub {
         let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
@@ -7674,7 +7871,13 @@ fn set_table(
 /// drop the table only once it holds no key at all (an unknown subkey keeps
 /// it). The header's trailing comment and every comment inside stay, as lines,
 /// where the table was.
-fn unset_table(doc: &mut toml_edit::DocumentMut, key: &str, subkeys: &[&str], example: &str) {
+fn unset_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    subkeys: &[&str],
+    doc_blocks: &[String],
+    example: &str,
+) {
     for subkey in subkeys {
         remove_subkey_keeping_comments(doc, key, subkey);
     }
@@ -7683,7 +7886,7 @@ fn unset_table(doc: &mut toml_edit::DocumentMut, key: &str, subkeys: &[&str], ex
         .and_then(toml_edit::Item::as_table_like)
         .is_some_and(toml_edit::TableLike::is_empty)
     {
-        remove_key_keeping_comments(doc, key, &known_doc_blocks(key), example);
+        remove_key_keeping_comments(doc, key, doc_blocks, example);
     }
 }
 
@@ -7814,7 +8017,13 @@ fn edit_console(doc: &mut toml_edit::DocumentMut, od: &ConsoleConfig, ca: &Conso
             });
         }
     } else {
-        unset_table(doc, "console", &CONSOLE_FIELDS, CONSOLE_EXAMPLE);
+        unset_table(
+            doc,
+            "console",
+            &CONSOLE_FIELDS,
+            &known_doc_blocks("console"),
+            CONSOLE_EXAMPLE,
+        );
     }
 }
 
@@ -7823,7 +8032,13 @@ fn edit_models(doc: &mut toml_edit::DocumentMut, od: &ModelSettings, ca: &ModelS
         return;
     }
     if ca.is_empty() {
-        unset_table(doc, "models", &MODELS_FIELDS, MODELS_EXAMPLE);
+        unset_table(
+            doc,
+            "models",
+            &MODELS_FIELDS,
+            &known_doc_blocks("models"),
+            MODELS_EXAMPLE,
+        );
     } else if doc.contains_key("models") {
         edit_models_existing(doc, ca);
     } else {
@@ -7841,7 +8056,7 @@ fn edit_env(
     }
     if ca.is_empty() {
         let keys: Vec<&str> = od.keys().map(String::as_str).collect();
-        unset_table(doc, "env", &keys, ENV_EXAMPLE);
+        unset_table(doc, "env", &keys, &known_doc_blocks("env"), ENV_EXAMPLE);
     } else if doc.contains_key("env") {
         for k in od.keys() {
             if !ca.contains_key(k) {

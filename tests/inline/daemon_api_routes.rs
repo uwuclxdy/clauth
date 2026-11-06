@@ -2963,7 +2963,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o500))
             .expect("chmod clauth dir read-only");
         let answers: Vec<(&str, Response)> = [
-            ("/chain/order", r#"{"members":["beta","alpha","gamma"]}"#),
+            ("/chain/order", r#"{"members":["gamma","alpha","beta"]}"#),
             ("/chain/wrap-off", r#"{"wrap_off":true}"#),
         ]
         .into_iter()
