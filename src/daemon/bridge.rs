@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -310,8 +310,17 @@ struct Live {
     tailing: bool,
     /// File re-runs queued while a tail ran, keyed by file: `None` is the main
     /// file, `Some(agent_id)` a subagent's. The finishing tail drains the set
-    /// and runs each file's relay once (SB-11).
+    /// and runs each file's relay once, except while the instance is ending:
+    /// the end's final tail keeps them and drains them before the removal
+    /// (SB-11).
     rewake: HashSet<Option<String>>,
+    /// Set while the `end` event's final tail is in flight: a duplicate end
+    /// arriving before the removal answers 200 and touches nothing, so one end
+    /// owns the final tail, the removal and the end frames. An ending instance
+    /// takes no delivery: the mod stops polling before it posts `end`, so a
+    /// command queued during the final read would be acknowledged and never
+    /// run.
+    ending: bool,
     last_poll: Instant,
 }
 
@@ -341,6 +350,7 @@ impl Live {
             generation,
             tailing: true,
             rewake: HashSet::new(),
+            ending: false,
             last_poll: now,
         }
     }
@@ -641,33 +651,85 @@ impl Hub {
         self.close_silent(&mut inner, now);
 
         // `end` goes through the same reconcile path so a moved record closes
-        // the old instance before the sequence is judged (A#14), then removes
-        // and (through [`Hub::emit_instance_end`]) wakes the instance's parked
-        // poll and waits. An `end` for a pid whose instance this call just
-        // minted emits nothing: no `start` was ever broadcast for it.
+        // the old instance before the sequence is judged (A#14). The final
+        // transcript tail runs between the judge and the removal, with every
+        // read off the hub lock, so the rows no wake reached relay before the
+        // `end` status closes the stream's view. An `end` for a pid whose
+        // instance this call just minted emits nothing: no `start` was ever
+        // broadcast for it.
         if kind == "end" {
-            let had_instance = inner.instances.get(&peer_pid).is_some_and(|live| {
-                live.proc_start == resolved.proc_start && live.session_id == resolved.session_id
-            });
-            let (stale, created) = {
+            let generation = {
                 let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
-                (seq <= live.seq_high, created)
-            };
-            if stale {
-                // A refused event must not leave the instance it just minted
-                // (A#13): a fresh instance still holds its registration tail
-                // slot, so leaving it would wedge every later tail.
+                if seq <= live.seq_high {
+                    // A refused event must not leave the instance it just minted
+                    // (A#13): a fresh instance still holds its registration tail
+                    // slot, so leaving it would wedge every later tail.
+                    if created {
+                        inner.instances.remove(&peer_pid);
+                    }
+                    return (409, error_value("stale_sequence"));
+                }
+                // A first-contact end mints the instance this call owns: nothing
+                // to relay, nothing to emit, and the fresh instance still holds
+                // its registration tail slot, so remove it (A#13).
                 if created {
                     inner.instances.remove(&peer_pid);
+                    return (200, json!({ "ok": true }));
                 }
-                return (409, error_value("stale_sequence"));
-            }
-            if let Some(live) = inner.instances.remove(&peer_pid)
-                && had_instance
+                // A duplicate end while the first one still runs its final
+                // tail: the first end owns the removal and the end frames.
+                if live.ending {
+                    return (200, json!({ "ok": true }));
+                }
+                live.ending = true;
+                live.generation
+            };
+            drop(inner);
+
+            // The final tail: relay the main transcript and each subagent file
+            // the instance already holds a tail for, once more. The instance
+            // stays live through the reads and is removed only once they
+            // settle and no re-run is left, so every record of these reads
+            // lands before the end frame.
+            let mut queue = VecDeque::new();
             {
-                self.emit_instance_end(&live);
+                let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(guard) = self.end_wait_tail_slot(guard, peer_pid, generation) else {
+                    return (200, json!({ "ok": true }));
+                };
+                let live = guard
+                    .instances
+                    .get(&peer_pid)
+                    .unwrap_or_else(|| unreachable!("the slot wait saw the instance"));
+                queue.push_back(None);
+                queue.extend(live.subagent_files.keys().cloned().map(Some));
             }
-            return (200, json!({ "ok": true }));
+            loop {
+                self.drain_tail_queue(peer_pid, named, &mut queue);
+                let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(mut guard) = self.end_wait_tail_slot(guard, peer_pid, generation) else {
+                    return (200, json!({ "ok": true }));
+                };
+                let live = guard
+                    .instances
+                    .get(&peer_pid)
+                    .unwrap_or_else(|| unreachable!("the slot wait saw the instance"));
+                if live.rewake.is_empty() {
+                    let live = guard
+                        .instances
+                        .remove(&peer_pid)
+                        .unwrap_or_else(|| unreachable!("the slot wait saw the instance"));
+                    self.emit_instance_end(&live);
+                    return (200, json!({ "ok": true }));
+                }
+                queue = guard
+                    .instances
+                    .get_mut(&peer_pid)
+                    .unwrap_or_else(|| unreachable!("the slot wait saw the instance"))
+                    .rewake
+                    .drain()
+                    .collect();
+            }
         }
 
         let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
@@ -1066,22 +1128,62 @@ impl Hub {
 
     /// End a tail slot without a write-back or broadcast: clear `tailing` only
     /// while the instance at `peer_pid` still has `generation`, returning the
-    /// file re-runs queued while the tail ran (SB-11).
+    /// file re-runs queued while the tail ran. An ending instance keeps them
+    /// in `rewake` for its end's final tail to drain (SB-11).
     fn finish_tail(&self, peer_pid: u32, generation: u64) -> HashSet<Option<String>> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match inner.instances.get_mut(&peer_pid) {
             Some(live) if live.generation == generation => {
                 live.tailing = false;
-                std::mem::take(&mut live.rewake)
+                // The slot just freed: wake the end path's wait, which only
+                // removes the instance once no tail is running and no re-run
+                // is pending.
+                self.changed.notify_all();
+                if live.ending {
+                    HashSet::new()
+                } else {
+                    std::mem::take(&mut live.rewake)
+                }
             }
             _ => HashSet::new(),
+        }
+    }
+
+    /// Wait until the instance at `peer_pid` still has `generation` and no
+    /// tail holds its slot. The end path parks here while any tail runs and
+    /// re-checks `rewake` between drains, so the instance is removed only
+    /// with the slot free and no re-run pending, and its own reads settle
+    /// before its end frames. A re-run a tail took before the end began is
+    /// out of this wait's sight: one still unstarted at the removal relays
+    /// nothing. A close by another path (`close_silent`, a moved record, a
+    /// replaced instance) removes without that wait and still drops an
+    /// in-flight read's rows. Returns the guard to act under; `None` when the
+    /// instance was closed or replaced — whoever removed it already emitted
+    /// its end frames.
+    fn end_wait_tail_slot<'a>(
+        &self,
+        mut guard: MutexGuard<'a, Inner>,
+        peer_pid: u32,
+        generation: u64,
+    ) -> Option<MutexGuard<'a, Inner>> {
+        loop {
+            let live = guard.instances.get(&peer_pid)?;
+            if live.generation != generation {
+                return None;
+            }
+            if live.tailing {
+                guard = self.changed.wait(guard).unwrap_or_else(|p| p.into_inner());
+                continue;
+            }
+            return Some(guard);
         }
     }
 
     /// Write a tail back and broadcast its frames only while the instance at
     /// `peer_pid` still has `generation` — the check and the broadcasts share
     /// one lock hold, so a record can never follow its own instance's `end`
-    /// (SB-11). Returns the file re-runs queued while the tail ran.
+    /// (SB-11). Returns the file re-runs queued while the tail ran; an ending
+    /// instance keeps them in `rewake` for its end's final tail to drain.
     fn write_back_tail(
         &self,
         peer_pid: u32,
@@ -1094,7 +1196,14 @@ impl Hub {
             Some(live) if live.generation == generation => {
                 write_back(live);
                 live.tailing = false;
-                (true, std::mem::take(&mut live.rewake))
+                (
+                    true,
+                    if live.ending {
+                        HashSet::new()
+                    } else {
+                        std::mem::take(&mut live.rewake)
+                    },
+                )
             }
             _ => (false, HashSet::new()),
         };
@@ -1102,6 +1211,10 @@ impl Hub {
             for data in &frames {
                 self.broadcast("session.record", data.clone());
             }
+            // The slot just freed: wake the end path's wait, which only
+            // removes the instance once no tail is running and no re-run is
+            // pending.
+            self.changed.notify_all();
         }
         rewakes
     }
@@ -1375,7 +1488,7 @@ impl Hub {
         let matching: Vec<u32> = inner
             .instances
             .iter()
-            .filter(|(_, live)| live.session_id == session)
+            .filter(|(_, live)| live.session_id == session && !live.ending)
             .map(|(pid, _)| *pid)
             .collect();
         match matching.len() {
@@ -1414,7 +1527,7 @@ impl Hub {
         let matching: Vec<u32> = inner
             .instances
             .iter()
-            .filter(|(_, live)| live.session_id == session)
+            .filter(|(_, live)| live.session_id == session && !live.ending)
             .map(|(pid, _)| *pid)
             .collect();
         match matching.len() {

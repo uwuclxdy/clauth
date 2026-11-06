@@ -189,6 +189,450 @@ fn a_wake_relays_new_complete_rows_from_the_transcript() {
     );
 }
 
+/// The mod posts no wake for some rows, so a session can end on one no wake
+/// reached. The end relays it, before the `end` status closes the stream's
+/// view of the session.
+#[test]
+fn an_end_relays_the_rows_no_wake_reached() {
+    let sb = HomeSandbox::new();
+    let path = transcript_path(&sb, "s-one");
+    let before = line(&row("u0", "already there"));
+    append_raw(&path, &before);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    append_raw(&path, &line(&row("u1", "compacted")));
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "end"}),
+    );
+
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": null, "offset": before.len() as u64, "record": row("u1", "compacted")})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// The end's final read covers every file the instance already holds a tail
+/// for: the main transcript and each subagent file a wake has opened. A
+/// subagent file no wake ever named stays out, its rows the history route's,
+/// and every relayed record lands before the `end` frame.
+#[test]
+fn an_end_relays_the_rows_of_every_held_file() {
+    let sb = HomeSandbox::new();
+    let main = transcript_path(&sb, "s-one");
+    append_raw(&main, b"");
+    let woken = sb
+        .home()
+        .join(".claude/projects/-w-app/s-one/subagents/agent-a1.jsonl");
+    append_raw(&woken, b"");
+    let quiet = sb
+        .home()
+        .join(".claude/projects/-w-app/s-one/subagents/agent-a2.jsonl");
+    append_raw(&quiet, b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    // One wake opens a tail for a1; no wake ever names a2.
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "append", "uuid": "x", "agent_id": "a1"}),
+    );
+    assert_eq!(next(&sub, NONE), None);
+
+    append_raw(&main, &line(&row("u1", "main row")));
+    append_raw(&woken, &line(&row("a1", "sub row")));
+    append_raw(&quiet, &line(&row("a2", "quiet row")));
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "end"}),
+    );
+
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": null, "offset": 0, "record": row("u1", "main row")})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": "a1", "offset": 0, "record": row("a1", "sub row")})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(
+        next(&sub, NONE),
+        None,
+        "a file the hub never tailed relayed its rows"
+    );
+}
+
+/// A stale `end` (a replayed sequence) relays nothing and answers 409: the
+/// final tail must not run for an end the sequence judge refuses, and the
+/// instance survives for the next wake.
+#[test]
+fn a_stale_end_relays_nothing_and_the_instance_survives() {
+    let sb = HomeSandbox::new();
+    let path = transcript_path(&sb, "s-one");
+    append_raw(&path, b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+    let first = line(&row("u1", "before the stale end"));
+    append_raw(&path, &first);
+
+    let (status, _) = hub.event(
+        100,
+        serde_json::json!({"session": "s-one", "seq": 1, "kind": "end"})
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(status, 409, "the stale end was not refused");
+    assert_eq!(next(&sub, NONE), None, "a stale end relayed or emitted");
+
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "append", "uuid": "u1"}),
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": null, "offset": 0, "record": row("u1", "before the stale end")})
+        ))
+    );
+}
+
+/// An end arriving while a tail is already running waits it out and relays
+/// the rows the finished tail left behind: the removal never drops an
+/// in-flight read's rows, and the record still lands before the `end` frame.
+#[test]
+fn an_end_waiting_out_a_tail_relays_the_rows_after_it() {
+    let sb = HomeSandbox::new();
+    let path = transcript_path(&sb, "s-one");
+    append_raw(&path, b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    let first = line(&row("u1", "during the tail"));
+    append_raw(&path, &first);
+    let generation = hold_tail(&hub, 100);
+    let ended = post_end(&hub, 2);
+    // The end parks waiting for the slot; the finishing tail ends it. The
+    // bound below turns a never-woken end into a red, never a hang.
+    wait_for_ending(&hub, 100);
+    hub.finish_tail(100, generation);
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true }))),
+        "the end never answered"
+    );
+
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": null, "offset": 0, "record": row("u1", "during the tail")})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// Hold the tail slot as `relay_main` does while it reads, so an end parks in
+/// its final read until `finish_tail` frees it.
+fn hold_tail(hub: &Hub, pid: u32) -> u64 {
+    let mut inner = hub.inner.lock().unwrap();
+    let live = inner.instances.get_mut(&pid).unwrap();
+    live.tailing = true;
+    live.generation
+}
+
+/// Post an `end` from its own thread: it answers only once its final read ends.
+fn post_end(hub: &Arc<Hub>, seq: u64) -> std::sync::mpsc::Receiver<(u16, serde_json::Value)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hub = Arc::clone(hub);
+    std::thread::spawn(move || {
+        let body = serde_json::json!({"session": "s-one", "seq": seq, "kind": "end"});
+        let _ = tx.send(hub.event(100, body.to_string().as_bytes()));
+    });
+    rx
+}
+
+/// Wait until an `end` owns the instance's final read.
+fn wait_for_ending(hub: &Hub, pid: u32) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !hub
+        .inner
+        .lock()
+        .unwrap()
+        .instances
+        .get(&pid)
+        .is_some_and(|live| live.ending)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the end never reached its final read"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The mod stops polling before it posts its end, so a command queued during
+/// the final read would be acknowledged and never run: the session reads as
+/// gone, and a prompt falls back to herdr.
+#[test]
+fn a_command_during_the_final_read_finds_no_live_session() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+    );
+
+    let generation = hold_tail(&hub, 100);
+    let ended = post_end(&hub, 3);
+    wait_for_ending(&hub, 100);
+
+    assert!(matches!(
+        hub.deliver("s-one", serde_json::json!({"kind": "prompt", "text": "hi"})),
+        ModDelivery::NoMod
+    ));
+    assert!(matches!(
+        hub.answer(
+            "s-one",
+            "a1",
+            serde_json::json!({"kind": "answer", "ask": "a1", "decision": "deny"})
+        ),
+        AskOutcome::NoSession
+    ));
+
+    hub.finish_tail(100, generation);
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+}
+
+/// One end owns the final read, the removal and the end frames: a second end
+/// answers without waiting on the read, and the session ends once.
+#[test]
+fn a_second_end_during_the_final_read_answers_at_once() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    let generation = hold_tail(&hub, 100);
+    let first = post_end(&hub, 2);
+    wait_for_ending(&hub, 100);
+    let second = post_end(&hub, 3);
+    assert_eq!(
+        second.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true }))),
+        "the second end waited on the first end's read"
+    );
+
+    hub.finish_tail(100, generation);
+    assert_eq!(
+        first.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// A session at its final read, a tail in the slot and a re-run queued behind
+/// that tail, with an end parked on the slot.
+fn ending_with_a_queued_re_run(
+    hub: &Arc<Hub>,
+) -> (u64, std::sync::mpsc::Receiver<(u16, serde_json::Value)>) {
+    start(hub, 100, "s-one");
+    let generation = hold_tail(hub, 100);
+    let ended = post_end(hub, 2);
+    wait_for_ending(hub, 100);
+    hub.inner
+        .lock()
+        .unwrap()
+        .instances
+        .get_mut(&100)
+        .unwrap()
+        .rewake
+        .insert(None);
+    (generation, ended)
+}
+
+/// A re-run a finishing tail took could start after the end removed the
+/// instance, and its rows would be gone: the end keeps the re-runs of an
+/// ending instance for itself.
+#[test]
+fn a_tail_finishing_during_the_final_read_leaves_its_re_runs_to_the_end() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (generation, ended) = ending_with_a_queued_re_run(&hub);
+
+    assert_eq!(hub.finish_tail(100, generation), HashSet::new());
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+}
+
+/// The same for the path a real tail ends on: its write-back frees the slot,
+/// wakes the parked end and leaves the re-runs to it.
+#[test]
+fn a_tail_writing_back_during_the_final_read_leaves_its_re_runs_to_the_end() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (generation, ended) = ending_with_a_queued_re_run(&hub);
+
+    assert_eq!(
+        hub.write_back_tail(100, generation, Vec::new(), |_| {}),
+        HashSet::new()
+    );
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+}
+
+/// An end parked on the slot belongs to the instance it was posted for: a new
+/// session at the same pid survives it, and the old session ends once.
+#[test]
+fn an_end_leaves_the_session_that_replaced_its_instance() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+    hold_tail(&hub, 100);
+    let ended = post_end(&hub, 2);
+    wait_for_ending(&hub, 100);
+
+    t.lock().unwrap().insert(100, instance("s-one", "2"));
+    start(&hub, 100, "s-one");
+
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+    assert!(hub.inner.lock().unwrap().instances.contains_key(&100));
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT).map(|(event, _)| event),
+        Some("session.status".into())
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// A wake that bounced off the slot names a file the end's own queue does not
+/// hold: the end relays it from `rewake`, before the `end` frame.
+#[test]
+fn an_end_relays_a_re_run_left_to_it() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let agent = sb
+        .home()
+        .join(".claude/projects/-w-app/s-one/subagents/agent-a2.jsonl");
+    append_raw(&agent, b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+    append_raw(&agent, &line(&row("a2", "first seen")));
+
+    let generation = hold_tail(&hub, 100);
+    let ended = post_end(&hub, 2);
+    wait_for_ending(&hub, 100);
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "append", "uuid": "y", "agent_id": "a2"}),
+    );
+    hub.finish_tail(100, generation);
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": "a2", "offset": 0, "record": row("a2", "first seen")})
+        ))
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
 /// A record past 1 MiB relays as a stub naming its offset and size; the
 /// client reads it through the history route.
 #[test]
