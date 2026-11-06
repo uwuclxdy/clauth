@@ -24,14 +24,15 @@ use ratatui::text::Span;
 
 use crate::actions::{
     CaptureOwner, CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision,
-    capture_into_profile, capture_live_file_snapshot, capture_owner, capture_snapshot,
-    classify_env_key, clear_profile_api_key, clear_profile_credentials, create_blank_profile,
-    create_profile_from_login, delete_profile_taking_config, duplicate_profile,
-    edit_profile_effort, edit_profile_endpoint, edit_profile_env, edit_profile_model,
-    edit_profile_preset, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
-    reorder_profile, rotation_guard_for_mutation, set_chain_order, set_member_threshold,
-    set_wrap_off, snapshot_is_empty, switch_off, switch_profile_gated,
-    validate_foreign_harness_free, validate_name_chars, validate_profile_name,
+    RenamedButNotRelinked, capture_into_profile, capture_live_file_snapshot, capture_owner,
+    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
+    create_blank_profile, create_profile_from_login, delete_profile_taking_config,
+    duplicate_profile, edit_profile_effort, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    set_chain_order, set_member_threshold, set_wrap_off, snapshot_is_empty, switch_off,
+    switch_profile_gated, validate_foreign_harness_free, validate_name_chars,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -26198,10 +26199,11 @@ fn run_env_collision_choice(
     }
 }
 
-/// Rebind every name-keyed suspended field from the old name to the new one
-/// after an in-app rename, so a landing never sees the renamed account as gone
-/// and drops the suspended work. The Setup draft's own `editing_name` is
-/// rebound beside it in [`commit_rename`].
+/// Rebind the name-keyed suspended fields and the banked-reset reading from the
+/// old name to the new one after an in-app rename, so a landing never sees the
+/// renamed account as gone and drops the suspended work, and the account's chip
+/// keeps its reading. The Setup draft's own `editing_name` is rebound beside it
+/// in [`commit_rename`].
 fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) {
     if let Some(editor) = app.note_editor.as_mut()
         && editor.profile == *old
@@ -26218,6 +26220,16 @@ fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) 
     {
         stop.member = new.clone();
     }
+    if let Some(resets) = app.claude_resets.remove(old.as_str()) {
+        app.claude_resets.insert(new.to_string(), resets);
+    }
+}
+
+/// The warning a landed rename shows when the relink was refused: the relink's
+/// root cause is escaped for the toast slot.
+fn landed_rename_toast(renamed: &str, relink: &anyhow::Error) -> String {
+    let root = escape_control(&relink.root_cause().to_string());
+    format!("{renamed}, live login not relinked\n{root}")
 }
 
 fn commit_rename(app: &mut App) -> bool {
@@ -26258,20 +26270,38 @@ fn commit_rename(app: &mut App) -> bool {
         let mut cfg = app.config();
         rename_profile(&mut cfg, &old_pn, &new_pn, &rotation)
     });
+    let follow_new_name = |app: &mut App| {
+        app.refresh_tokens();
+        app.apply_forgets();
+        rebind_name_keyed_state(app, &old_pn, &new_pn);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.editing_name = Some(new.clone());
+            d.name = InputState::new(&new);
+            d.active = None;
+        }
+    };
+    // A stored roster name is not re-validated on load, so `old` can hold
+    // control bytes a hand edit put there.
+    let renamed = format!(
+        "renamed '{}' → '{}'",
+        escape_control(&old),
+        escape_control(&new)
+    );
     match result {
         Ok(()) => {
-            app.refresh_tokens();
-            app.apply_forgets();
-            rebind_name_keyed_state(app, &old_pn, &new_pn);
-            if let Some(d) = app.config_draft.as_mut() {
-                d.editing_name = Some(new.clone());
-                d.name = InputState::new(&new);
-                d.active = None;
-            }
-            app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
+            follow_new_name(app);
+            app.toast(ToastKind::Success, renamed);
             true
         }
         Err(e) => {
+            if let Some(landed) = e.downcast_ref::<RenamedButNotRelinked>() {
+                follow_new_name(app);
+                app.toast(
+                    ToastKind::Warning,
+                    landed_rename_toast(&renamed, &landed.relink),
+                );
+                return true;
+            }
             app.toast(
                 ToastKind::Danger,
                 format!("rename failed\n{}", escape_control(&error_toast_detail(&e))),

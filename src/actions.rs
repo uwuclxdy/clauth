@@ -119,6 +119,18 @@ fn validate_new_name(name: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+/// Whether any name in `names` folds onto `query` under the rule creation
+/// uses, with `exclude` sparing the account being renamed.
+fn folds_onto<'a>(
+    names: impl Iterator<Item = &'a str>,
+    query: &str,
+    exclude: Option<&str>,
+) -> bool {
+    names
+        .into_iter()
+        .any(|n| n.eq_ignore_ascii_case(query) && Some(n) != exclude)
+}
+
 /// The full gate for creating or renaming a profile on `harness`: the
 /// roster-free creation rules ([`validate_new_name`]), then the other
 /// harness's roster (refused by name), then this harness's own duplicate
@@ -146,10 +158,7 @@ pub(crate) fn validate_profile_name(
             .map(|n| n.as_str().to_string())
             .collect(),
     };
-    if own
-        .iter()
-        .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)
-    {
+    if folds_onto(own.iter().map(String::as_str), trimmed, exclude) {
         bail!("a profile named '{trimmed}' already exists");
     }
     Ok(())
@@ -2160,6 +2169,35 @@ pub(crate) fn rotation_guard_for_mutation(name: &ProfileName) -> Result<Rotation
     }
 }
 
+/// A rename whose record landed before the active account's relink failed:
+/// the account now goes by `new`, so a caller that downcasts this follows the
+/// new name instead of treating the rename as undone. `relink` is the source.
+#[derive(Debug)]
+pub(crate) struct RenamedButNotRelinked {
+    pub(crate) old: ProfileName,
+    pub(crate) new: ProfileName,
+    pub(crate) relink: anyhow::Error,
+}
+
+impl std::fmt::Display for RenamedButNotRelinked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A stored roster name is not re-validated on load, so a hand edit can
+        // leave a control byte in it.
+        let old = crate::format::escape_unless(self.old.as_str(), is_name_char);
+        let new = crate::format::escape_unless(self.new.as_str(), is_name_char);
+        write!(
+            f,
+            "renamed '{old}' to '{new}', but the live credentials were not relinked"
+        )
+    }
+}
+
+impl std::error::Error for RenamedButNotRelinked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.relink)
+    }
+}
+
 /// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `old`: a second
 /// acquisition at the same rank is a lock-order violation whichever profile it
 /// names, so `new` cannot carry one of its own.
@@ -2212,6 +2250,27 @@ pub(crate) fn rename_profile(
     with_state_lock(|held| {
         let old_dir = profile_dir(old)?;
         let new_dir = profile_dir(new)?;
+        // Read the fresh roster BEFORE the first write (`rename_profile_token`
+        // and the dir move): a read failure after the dir moved would strand a
+        // moved-but-unrecorded dir, so it must land while every step before the
+        // first fallible write is still reversible.
+        let mut state = load_fresh_state(held)?;
+        // The roster that decides is the one read under this hold: a peer
+        // rename or delete landing after the caller loaded its config leaves
+        // `old` gone (this run would move nothing and report success), or
+        // leaves `new` taken (both names would resolve to one account). Ahead of
+        // the directory check: a taken name's directory is that account's, never
+        // the orphan that check describes.
+        if !state.profiles.iter().any(|n| n == old) {
+            bail!("{}", profile_not_found_head(old.as_str()));
+        }
+        if folds_onto(
+            state.profiles.iter().map(|n| n.as_str()),
+            new.as_str(),
+            Some(old.as_str()),
+        ) {
+            bail!("a profile named '{new}' already exists");
+        }
         // The name validation above checked the RECORD; a directory can outlive
         // its record — a per-profile cache a stale-config fetch leg wrote after
         // the account was deleted re-creates the dir (the writer is gated now,
@@ -2240,11 +2299,6 @@ pub(crate) fn rename_profile(
                 );
             }
         }
-        // Read the fresh roster BEFORE the first write (`rename_profile_token`
-        // and the dir move): a read failure after the dir moved would strand a
-        // moved-but-unrecorded dir, so it must land while every step before the
-        // first fallible write is still reversible.
-        let mut state = load_fresh_state(held)?;
         // Before the first move: a failed store write leaves everything as it
         // was, and a retry after a later failure finds the token already moved.
         crate::gateway_tokens::rename_profile_token(
@@ -2278,8 +2332,10 @@ pub(crate) fn rename_profile(
         if was_active {
             // The record has landed, so a bare refusal here would read as a
             // failed rename, and its retry as `'old' not found`.
-            link_profile_credentials(new).with_context(|| {
-                format!("renamed '{old}' to '{new}', but the live credentials were not relinked")
+            link_profile_credentials(new).map_err(|relink| RenamedButNotRelinked {
+                old: old.clone(),
+                new: new.clone(),
+                relink,
             })?;
         }
         Ok(())

@@ -701,6 +701,7 @@ fn rename_takes_the_profile_then_the_new_name() {
     };
     assert_eq!((profile.as_str(), new_name.as_str()), ("acme", "work"));
 }
+
 #[test]
 fn delete_takes_yes_and_force_independently_in_any_order() {
     let Command::Delete {
@@ -6869,6 +6870,7 @@ fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
     let cases = [
         ("disable", cmd_disable("cx", true)),
         ("enable", cmd_enable("cx")),
+        ("rename", cmd_rename("cx", "work")),
         ("rolling-token", cmd_rolling_token("cx")),
         ("static-token", cmd_static_token("cx")),
         ("static-token", cmd_static_token_clear("cx", true)),
@@ -6887,6 +6889,66 @@ fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
 
     let cli = parse(&["disable", "cx", "--yes"]).expect("argv parses");
     assert_eq!(crate::exit_code(crate::dispatch(cli)), 2);
+}
+
+/// `cmd_rename` moves an inactive account's record and directory under the
+/// canonical old name, and a rename onto the canonical name itself writes
+/// nothing.
+#[test]
+fn cmd_rename_moves_the_record_and_a_same_name_rename_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::persist_profiles(&[
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("main")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("spare")),
+    ]);
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.active_profile = Some("main".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let state_path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    let epoch = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
+    crate::testutil::set_mtime(&state_path, epoch);
+
+    cmd_rename("SPARE", "spare").expect("a same-name rename is a no-op");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .profiles
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["main".to_string(), "spare".to_string()]
+    );
+    assert_eq!(
+        std::fs::metadata(&state_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        epoch,
+        "a same-name rename wrote the roster it promised to leave alone"
+    );
+
+    cmd_rename("SPARE", " work ").expect("rename spare to work");
+    let after = crate::profile::load_app_state().expect("reload");
+    assert_eq!(
+        after
+            .profiles
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["main".to_string(), "work".to_string()]
+    );
+    assert_eq!(
+        after.active_profile.as_ref().map(|n| n.as_str()),
+        Some("main")
+    );
+    let profiles = crate::profile::clauth_dir().expect("dir").join("profiles");
+    assert!(profiles.join("work").is_dir(), "the directory moved");
+    assert!(
+        !profiles.join("spare").exists(),
+        "nothing left at the old name"
+    );
 }
 
 /// A roster that fails to load is a runtime failure (exit 1) like `switch`'s,

@@ -4796,7 +4796,7 @@ fn the_daemon_logs_an_unaddressable_account_name_once_per_change() {
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
     let line = "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
-                prints for it fail; rename it on the TUI's Setup tab";
+                prints for it fail; rename it with `clauth rename -- -x <new-name>`";
 
     daemon.log_name_notices(None);
     assert_eq!(lines.snapshot(), vec![line.to_string()]);
@@ -4949,8 +4949,8 @@ fn the_daemon_logs_a_name_in_both_rosters_once() {
         lines.snapshot(),
         vec![
             "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
-             to this account; switch with `clauth switch list`, or rename it on the TUI's \
-             Setup tab"
+             to this account; switch with `clauth switch list`, or rename it with \
+             `clauth rename list <new-name>`"
                 .to_string()
         ],
         "a name both rosters hold logs once"

@@ -6740,6 +6740,8 @@ fn committing_a_rename_takes_its_guard_outside_the_config_lock() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("before".to_string(), None, None)]);
+    let state = app.config().state.clone();
+    crate::profile::save_app_state(&state).expect("persist the roster");
     app.profile_cursor.set(0);
     let mut draft = build_draft_existing(&app, &crate::profile::ProfileName::from("before"));
     draft.name = super::InputState::new("after");
@@ -30296,11 +30298,11 @@ fn an_unaddressable_account_name_warns_once_per_change() {
         lines.snapshot(),
         vec![
             "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
-             prints for it fail; rename it on the TUI's Setup tab"
+             prints for it fail; rename it with `clauth rename -- -x <new-name>`"
                 .to_string(),
             "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
-             to this account; switch with `clauth switch list`, or rename it on the TUI's \
-             Setup tab"
+             to this account; switch with `clauth switch list`, or rename it with \
+             `clauth rename list <new-name>`"
                 .to_string(),
         ]
     );
@@ -30542,7 +30544,7 @@ fn a_stored_lone_dash_is_not_noticed() {
         lines.snapshot(),
         vec![
             "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
-             prints for it fail; rename it on the TUI's Setup tab"
+             prints for it fail; rename it with `clauth rename -- -x <new-name>`"
                 .to_string()
         ]
     );
@@ -56551,6 +56553,157 @@ fn a_refused_rename_save_toasts_the_reason() {
             .iter()
             .map(|t| t.body.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+/// A rename of the active account whose relink is refused (a regular live file
+/// holding another login) has landed: the field follows the new name, so a
+/// retry does not hit `not found`, and the toast warns instead of calling the
+/// rename failed.
+#[cfg(unix)]
+#[test]
+fn a_landed_rename_whose_relink_is_refused_warns_and_follows_the_new_name() {
+    use crate::profile::{ClaudeCredentials, OAuthToken, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let creds = |access: &str| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.credentials = Some(creds("a-access"));
+    crate::profile::save_profile(&profile).expect("save a");
+    let mut app = app_with(vec![profile]);
+    app.config().state.active_profile = Some("a".into());
+    let state = app.config().state.clone();
+    crate::profile::save_app_state(&state).expect("persist the active pick");
+    let live = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, serde_json::to_vec(&creds("other-access")).unwrap()).unwrap();
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('2')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.config().find(&ProfileName::from("a2")).is_some(),
+        "precondition: the rename landed"
+    );
+    let on_disk = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        (
+            on_disk
+                .profiles
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>(),
+            on_disk.active_profile.as_ref().map(|n| n.as_str())
+        ),
+        (vec!["a2"], Some("a2")),
+        "the landed rename is on disk, active pick included"
+    );
+    let toasts: Vec<(super::ToastKind, String)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert!(
+        toasts.contains(&(
+            super::ToastKind::Warning,
+            "renamed 'a' → 'a2', live login not relinked\n\
+             refusing to replace .credentials.json: live file differs from profile 'a2'; \
+             resolve the divergence in the `clauth` TUI first"
+                .to_string()
+        )),
+        "{toasts:?}"
+    );
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .and_then(|d| d.editing_name.clone())
+            .as_deref(),
+        Some("a2"),
+        "the field still names the old account, so a retry reads `not found`"
+    );
+}
+
+/// A stored name a hand edit gave a control byte prints escaped in the rename
+/// toast, never as the raw byte.
+#[cfg(unix)]
+#[test]
+fn a_rename_toast_escapes_a_control_byte_in_the_old_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let old = "a\u{1b}x";
+    crate::testutil::register_names(&[old]);
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(old),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.name = InputState::new("b");
+    }
+    assert!(super::commit_rename(&mut app), "the rename landed");
+    let bodies: Vec<String> = app.toasts.iter().map(|t| t.body.clone()).collect();
+    assert!(
+        bodies.iter().any(|b| b == "renamed 'a\\u{1b}x' → 'b'"),
+        "{bodies:?}"
+    );
+}
+
+/// The landed-rename toast's own builder escapes the relink's root cause in
+/// the toast's `escape_default` form, so a control byte cannot ride into the
+/// slot.
+#[test]
+fn a_landed_rename_toast_escapes_the_relink_root_cause() {
+    let body = super::landed_rename_toast("renamed 'a' → 'b'", &anyhow::anyhow!("boom\x1b[31m"));
+    assert_eq!(
+        body,
+        "renamed 'a' → 'b', live login not relinked\nboom\\u{1b}[31m"
+    );
+}
+
+/// A rename carries the renamed account's banked-reset reading to the new
+/// name, so its chip does not blank until the next rebuild.
+#[cfg(unix)]
+#[test]
+fn a_rename_rebinds_the_banked_reset_reading_to_the_new_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    let reading = crate::usage::LimitResets {
+        usable: 3,
+        ..crate::usage::LimitResets::default()
+    };
+    app.claude_resets.insert("a".to_string(), reading);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.name = InputState::new("b");
+    }
+    assert!(super::commit_rename(&mut app), "the rename landed");
+    assert_eq!(
+        app.claude_resets.get("b").map(|r| r.usable),
+        Some(3),
+        "the banked-reset reading did not follow the rename"
+    );
+    assert!(
+        !app.claude_resets.contains_key("a"),
+        "the reading still hangs off the old name"
     );
 }
 

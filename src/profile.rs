@@ -4561,18 +4561,25 @@ impl NameNotice {
         })
     }
 
-    /// The remedy a CLI line ends with: a claude account is renamed on the
-    /// Setup tab; a codex account has no rename, so its only fix is deleting
-    /// it and logging in again under another name.
-    fn cli_remedy(&self) -> &'static str {
-        match self.harness {
-            Harness::Claude => "rename it on the TUI's Setup tab",
-            Harness::Codex => "delete it and log in again under another name",
+    /// The remedy a CLI line ends with, `name` already escaped: a claude
+    /// account gets the runnable `clauth rename` command, with `--` ahead of a
+    /// dash-led name so clap reads it as a value; a codex account has no
+    /// rename, so its only fix is deleting it and logging in again under
+    /// another name.
+    fn cli_remedy(&self, name: &str) -> String {
+        match (self.harness, self.hazard) {
+            (Harness::Claude, NameHazard::LeadingDash) => {
+                format!("rename it with `clauth rename -- {name} <new-name>`")
+            }
+            (Harness::Claude, NameHazard::Subcommand) => {
+                format!("rename it with `clauth rename {name} <new-name>`")
+            }
+            (Harness::Codex, _) => "delete it and log in again under another name".to_string(),
         }
     }
 
-    /// [`Self::cli_remedy`] as the toast's detail line spells it: the toast
-    /// stands inside the TUI, so it names the tab alone.
+    /// The remedy the toast's detail line ends with: the toast stands inside
+    /// the TUI, so a claude account is pointed at the Setup tab.
     fn toast_remedy(&self) -> &'static str {
         match self.harness {
             Harness::Claude => "rename it on the Setup tab",
@@ -4586,7 +4593,7 @@ impl NameNotice {
     /// the terminal or forge a line; a name of name chars is byte-identical.
     pub(crate) fn cli_line(&self) -> String {
         let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
-        let remedy = self.cli_remedy();
+        let remedy = self.cli_remedy(&name);
         match self.hazard {
             NameHazard::LeadingDash => format!(
                 "clauth: {name}: a name starting with '-' reads as a flag, so the commands \

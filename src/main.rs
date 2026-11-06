@@ -129,7 +129,7 @@ fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
 
 /// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
 /// with a [`UsageError`]. Shared by every claude-only profile-naming command:
-/// `disable`/`enable`/`rolling-token`/`static-token`, which pass their own
+/// `disable`/`enable`/`rename`/`rolling-token`/`static-token`, which pass their own
 /// `verb` so a codex name is refused as what it is (a real account on the
 /// harness this verb does not reach) and a name on neither roster lists the
 /// claude roster alone, the only one these verbs take. A roster that fails to
@@ -2415,19 +2415,25 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 /// No confirm gate, same as the Setup tab: nothing is removed. A name that
 /// `validate_new_name` now refuses can't be renamed back to, though.
 fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
-    use crate::harness::Harness;
-
     platform::init();
     let mut config = load_config()?;
     let old = resolve_or_bail(&config, name, "rename")?;
+    // A stored roster name is not re-validated on load, so a hand edit can
+    // leave a control byte in it; the lines below spell it escaped.
+    let old_shown = crate::format::escape_unless(old.as_str(), crate::actions::is_name_char);
 
     let new_name = new_name.trim();
     if new_name == old.as_str() {
-        outln!("clauth: '{old}' already has that name.");
+        outln!("clauth: '{old_shown}' already has that name.");
         return Ok(());
     }
-    actions::validate_profile_name(new_name, Harness::Claude, Some(old.as_str()))?;
+    actions::validate_profile_name(
+        new_name,
+        crate::harness::Harness::Claude,
+        Some(old.as_str()),
+    )?;
     let new = ProfileName::from(new_name);
+    let new_shown = crate::format::escape_unless(new.as_str(), crate::actions::is_name_char);
 
     // Renaming the active profile relinks the live slot, the same settle
     // `commit_rename` runs before its relink.
@@ -2438,12 +2444,16 @@ fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
             settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::Switch)?;
         // The settle's prompt can save an unplaced login under the name typed
         // here, so the check above may no longer hold.
-        actions::validate_profile_name(new_name, Harness::Claude, Some(old.as_str()))?;
+        actions::validate_profile_name(
+            new_name,
+            crate::harness::Harness::Claude,
+            Some(old.as_str()),
+        )?;
         placed
     };
     let rotation = actions::rotation_guard_for_mutation(&old)?;
     actions::rename_profile(&mut config, &old, &new, &rotation)?;
-    outln!("clauth: renamed '{old}' to '{new}'.");
+    outln!("clauth: renamed '{old_shown}' to '{new_shown}'.");
     Ok(())
 }
 

@@ -5905,7 +5905,7 @@ fn a_name_notice_escapes_bytes_a_name_cannot_hold() {
     assert_eq!(
         notice.cli_line(),
         "clauth: -\\u{001b}red: a name starting with '-' reads as a flag, so the commands clauth \
-         prints for it fail; rename it on the TUI's Setup tab"
+         prints for it fail; rename it with `clauth rename -- -\\u{001b}red <new-name>`"
     );
     assert_eq!(
         notice.toast_body(),
@@ -5915,7 +5915,8 @@ fn a_name_notice_escapes_bytes_a_name_cannot_hold() {
 }
 
 /// A notice's remedy clause follows its roster: a claude account is renamed
-/// on Setup, a codex account has no rename and is deleted and logged in again.
+/// (`clauth rename` on the CLI line, Setup in the toast), a codex account has
+/// no rename and is deleted and logged in again.
 /// Each surface's copy is pinned whole, so a clause cannot drift between them.
 #[test]
 fn a_name_notice_copy_picks_the_remedy_its_roster_has() {
@@ -5937,7 +5938,7 @@ fn a_name_notice_copy_picks_the_remedy_its_roster_has() {
     assert_eq!(
         claude("-x").cli_line(),
         "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
-         for it fail; rename it on the TUI's Setup tab"
+         for it fail; rename it with `clauth rename -- -x <new-name>`"
     );
     assert_eq!(
         claude("-x").toast_body(),
@@ -5956,7 +5957,8 @@ fn a_name_notice_copy_picks_the_remedy_its_roster_has() {
     assert_eq!(
         claude("list").cli_line(),
         "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch to \
-         this account; switch with `clauth switch list`, or rename it on the TUI's Setup tab"
+         this account; switch with `clauth switch list`, or rename it with \
+         `clauth rename list <new-name>`"
     );
     assert_eq!(
         claude("list").toast_body(),
@@ -6038,7 +6040,7 @@ fn load_notices_print_only_on_the_arming_thread() {
     assert_eq!(
         String::from_utf8_lossy(&after[before.len()..]),
         "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
-         for it fail; rename it on the TUI's Setup tab\n",
+         for it fail; rename it with `clauth rename -- -x <new-name>`\n",
         "the background load must not spend the arming thread's line"
     );
 }

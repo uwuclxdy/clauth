@@ -4811,6 +4811,103 @@ fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
     );
 }
 
+/// A rename of the ACTIVE profile whose relink is refused (a regular live file
+/// holding another login) has still landed: the error says so and the roster
+/// holds the new name.
+#[test]
+fn a_landed_rename_whose_relink_is_refused_says_so() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rl-old");
+    let new = crate::profile::ProfileName::from("rl-new");
+    let creds = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    crate::testutil::register_names(&["rl-old"]);
+    let mut profile = Profile::new("rl-old".to_string(), None, None);
+    profile.credentials = Some(creds("rl-old-access"));
+    save_profile(&profile).expect("save profile");
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&creds("someone-elses-access")).unwrap(),
+    )
+    .unwrap();
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["rl-old".into()],
+            active_profile: Some("rl-old".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("rl-old"))
+        .expect_err("the relink refuses the foreign live login");
+
+    assert_eq!(
+        err.to_string(),
+        "renamed 'rl-old' to 'rl-new', but the live credentials were not relinked"
+    );
+    let landed = err
+        .downcast_ref::<RenamedButNotRelinked>()
+        .expect("callers tell a landed rename apart by its type");
+    assert!(
+        landed
+            .relink
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "the relink refusal rides as the source: {}",
+        landed.relink
+    );
+    let source = std::error::Error::source(landed).expect("the relink refusal rides as the source");
+    assert!(
+        source
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "{source}"
+    );
+    assert_eq!(config.canonical_name("rl-new").as_deref(), Some("rl-new"));
+    let on_disk = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        (
+            on_disk
+                .profiles
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>(),
+            on_disk.active_profile.as_ref().map(|n| n.as_str())
+        ),
+        (vec!["rl-new"], Some("rl-new")),
+        "the landed rename is on disk, active pick included"
+    );
+}
+
+/// A stored name a hand edit gave a control byte prints escaped in the landed
+/// rename's own line, so the refusal cannot drive the terminal.
+#[test]
+fn a_landed_rename_error_escapes_a_control_byte_in_the_old_name() {
+    let landed = RenamedButNotRelinked {
+        old: crate::profile::ProfileName::from("a\u{1b}x"),
+        new: crate::profile::ProfileName::from("b"),
+        relink: anyhow::anyhow!("boom"),
+    };
+    assert_eq!(
+        landed.to_string(),
+        "renamed 'a\\u{001b}x' to 'b', but the live credentials were not relinked"
+    );
+}
+
 /// A reauth overwrite replaces the dead credential chain — the whole point of
 /// re-logging in — so it must lift the profile's `auth_broken` quarantine,
 /// exactly like the fresh-capture path (`capture_into_profile`) does. Left
@@ -22160,4 +22257,111 @@ fn an_account_that_left_the_roster_refuses_the_arm_typed() {
     );
     let after = crate::profile::load_profile(&name).expect("reload");
     assert!(!after.rolling_token, "no flag was ever written");
+}
+
+/// The roster a rename acts on is the one read under the flock. A racing rename
+/// took `rs-old` after the caller loaded its config, so this one refuses with
+/// the CLI's own not-found head instead of reporting a rename that moved nothing.
+#[test]
+fn a_rename_whose_old_name_left_the_fresh_roster_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rs-old");
+    let new = crate::profile::ProfileName::from("rs-new");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rs-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rs-taken".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rs-old"))
+        .expect_err("the fresh roster no longer holds the old name");
+
+    assert_eq!(err.to_string(), "profile 'rs-old' not found");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![crate::profile::ProfileName::from("rs-taken")]
+    );
+}
+
+/// A name the fresh roster holds under another case is taken: every resolution
+/// site folds, so landing it would leave one of the two unaddressable. The
+/// caller's own check ran on a config loaded before the racing rename landed.
+#[test]
+fn a_rename_onto_a_name_the_fresh_roster_holds_by_case_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rc-old");
+    let new = crate::profile::ProfileName::from("rc-new");
+    crate::testutil::register_names(&["rc-old"]);
+    save_profile(&Profile::new("rc-old".to_string(), None, None)).expect("save profile");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rc-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rc-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rc-old".into(), "RC-NEW".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rc-old"))
+        .expect_err("the fresh roster holds the new name under another case");
+
+    assert_eq!(err.to_string(), "a profile named 'rc-new' already exists");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![
+            crate::profile::ProfileName::from("rc-old"),
+            crate::profile::ProfileName::from("RC-NEW"),
+        ]
+    );
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A racing rename took the name and moved its directory there: that directory
+/// holds a live account, so the loser hears the name is taken and is never told
+/// to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_rename_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rw-old");
+    let new = crate::profile::ProfileName::from("rw-new");
+    crate::testutil::register_names(&["rw-old", "rw-new"]);
+    save_profile(&Profile::new("rw-old".to_string(), None, None)).expect("save old");
+    save_profile(&Profile::new("rw-new".to_string(), None, None)).expect("save winner");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rw-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rw-old".into(), "rw-new".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rw-old"))
+        .expect_err("the fresh roster holds the new name");
+
+    assert_eq!(err.to_string(), "a profile named 'rw-new' already exists");
+    assert!(
+        crate::profile::profile_dir(&new).unwrap().exists(),
+        "the winner's directory stays put"
+    );
 }
