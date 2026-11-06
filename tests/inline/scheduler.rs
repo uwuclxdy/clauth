@@ -34130,13 +34130,14 @@ fn resets_state(profiles: Vec<crate::profile::Profile>) -> super::SchedulerState
 const CEDAR_EMBER_READ: &str = "/api/oauth/usage?cedar_ember=1&skip_spend=1";
 
 /// Two banked grants usable now (`g-old`, `g-week`) and a third in cooldown;
-/// the server's next grant is `g-week`, which clears 5h and 7d and names no end.
+/// the server's next grant is `g-week`, which resets 5h and 7d and names no end.
 const CEDAR_EMBER_THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
 
 /// The reset side read runs once an hour per claude OAuth account and never
 /// for an api-key account; each read lands in that account's own
-/// `limit_resets.json` (the usable count, the next grant's windows and end,
-/// the read's own stamp) and leaves the plain usage cache untouched.
+/// `limit_resets.json` (the usable count, the banked total, the next grant's
+/// windows and end, the read's own stamp) and leaves the plain usage cache
+/// untouched.
 #[test]
 fn a_claude_reset_read_runs_once_an_hour_per_oauth_account() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34414,6 +34415,46 @@ fn tick_runs_the_claude_resets_side_read() {
     )
     .expect("path");
     assert!(file.exists(), "the read landed its file");
+}
+
+/// A read whose next grant the spend path would refuse lands an available
+/// count of 0. Two usable grants sit in the fixture; only `next_grant_id`
+/// moves between the three accounts, one read each.
+#[test]
+fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
+    let home = crate::testutil::HomeSandbox::new();
+    let none = save_unanchored_login("lr4n", "lr4n-tok");
+    let cooling = save_unanchored_login("lr4c", "lr4c-tok");
+    let usable = save_unanchored_login("lr4u", "lr4u-tok");
+    crate::testutil::register_names(&["lr4n", "lr4c", "lr4u"]);
+    let (base, server) = crate::testutil::serve_endpoints_by_request(4, |raw, _| {
+        let next = match crate::testutil::request_header(raw, "authorization").as_deref() {
+            Some("Bearer lr4n-tok") => r#""next_grant_id": null"#,
+            Some("Bearer lr4c-tok") => r#""next_grant_id": "g-cool""#,
+            _ => r#""next_grant_id": "g-week""#,
+        };
+        let body = CEDAR_EMBER_THREE_GRANTS.replacen(r#""next_grant_id": "g-week""#, next, 1);
+        (200, Vec::new(), body)
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![none, cooling, usable]);
+
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    for (name, want) in [("lr4n", 0), ("lr4c", 0), ("lr4u", 2)] {
+        let path = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(body["usable"], want, "{name}");
+        assert_eq!(body["banked"], 3, "{name}: every grant left, usable or not");
+    }
 }
 
 /// The leg's eligibility: an `auth_broken` account, a disabled account and a

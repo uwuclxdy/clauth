@@ -61,15 +61,36 @@ impl ResetStatus {
         self.grants.iter().find(|g| g.id == id)
     }
 
-    /// The account's banked resets usable now: the sum of `resets_left` over
-    /// grants the server marks usable. The scheduler's side read lands this
-    /// count in `limit_resets.json`. Saturated, as the codex arm clamps its
-    /// server count: a body whose grants sum past `u32::MAX` reads as maxed,
-    /// never wraps or panics.
+    /// The grant a spend would send now: the server's next grant, when the
+    /// server marks it usable now and its id fits the pattern Claude Code
+    /// sends. A fresh spend refuses when this is `None`.
+    pub(crate) fn spend_grant(&self) -> Option<&Grant> {
+        let grant = self.next_grant()?;
+        (grant.is_usable_now() && grant_id_is_sendable(&grant.id)).then_some(grant)
+    }
+
+    /// The account's banked resets a fresh spend can use now: the sum of
+    /// `resets_left` over grants the server marks usable, and 0 while the
+    /// server's next reset cannot be spent. The scheduler's side read lands
+    /// this count in `limit_resets.json`. Saturated, as the codex arm clamps
+    /// its server count: a body whose grants sum past `u32::MAX` reads as
+    /// maxed, never wraps or panics.
     pub(crate) fn usable_resets(&self) -> u32 {
+        if self.spend_grant().is_none() {
+            return 0;
+        }
         self.grants
             .iter()
             .filter(|g| g.usable_now)
+            .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
+    }
+
+    /// Every banked reset the last read found, usable or not: the sum of
+    /// `resets_left` over every grant, saturated. The Usage row counts the
+    /// spendable ones against this total, so a cooldown hides no banked reset.
+    pub(crate) fn banked_resets(&self) -> u32 {
+        self.grants
+            .iter()
             .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
     }
 }
@@ -327,8 +348,8 @@ fn join_windows(clears: &[String]) -> String {
     }
 }
 
-/// The `clears` phrase a grant's line and the prompt share: `nothing` when the
-/// server names no window.
+/// The window phrase a grant's `--list` row and the prompt share: `nothing`
+/// when the server names no window.
 fn clears_summary(clears: &[String]) -> String {
     if clears.is_empty() {
         "nothing".to_string()
@@ -349,6 +370,24 @@ fn grant_state(grant: &Grant) -> String {
             }
             Some(_) | None => "unavailable".to_string(),
         }
+    }
+}
+
+/// The tail a `--list` row carries after its windows: nothing on a grant the
+/// server marks usable now, `paused`, else the server's own reason — cleaned
+/// and capped, since this text reaches a terminal. Nothing when it gives none.
+fn row_state(grant: &Grant) -> Option<String> {
+    if grant.usable_now {
+        return None;
+    }
+    if grant.paused {
+        return Some("paused".to_string());
+    }
+    match grant.unavailable_reason.as_deref() {
+        Some(reason) if !shows_nothing(&terminal_safe(reason)) => {
+            Some(cap_drawn(&terminal_safe(reason), 40))
+        }
+        Some(_) | None => None,
     }
 }
 
@@ -429,11 +468,12 @@ fn not_at_limit_warning(name: &str, grant: &Grant) -> Option<String> {
 /// marked `*`.
 pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
     let next = status.next_grant();
+    let spendable = status.spend_grant();
     let mut lines = vec![match next {
         Some(_) => {
             let count = status.usable_resets();
             format!(
-                "clauth: '{name}' has {count} limit reset{} usable now.",
+                "clauth: '{name}' has {count} limit reset{} available.",
                 plural(count as usize)
             )
         }
@@ -448,21 +488,22 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .map(|e| format!(", ends {}", stamp(e)))
             .unwrap_or_default();
         let suffix = if marked { "  (used next)" } else { "" };
-        // A banked reset the server will not spend yet is still left, but it
-        // is not available: the rows must add up to the header's usable count.
-        let count_word = if grant.usable_now {
-            "available"
+        // The row counts only what a spend would use now: with no spendable
+        // next grant, the header says 0 and every row reads 0 too.
+        let count = if grant.usable_now && spendable.is_some() {
+            grant.resets_left
         } else {
-            "left"
+            0
         };
+        let tail = row_state(grant)
+            .map(|state| format!(", {state}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  {} {}: {} of {} {count_word}, clears {}, {}{ends}{suffix}",
+            "  {} {}: {count} of {} available, resets {}{tail}{ends}{suffix}",
             if marked { "*" } else { " " },
             grant.label(),
-            grant.resets_left,
             grant.resets_total,
             clears_summary(&grant.clears),
-            grant_state(grant),
         ));
     }
     lines
@@ -479,7 +520,7 @@ pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> S
         )
     };
     let mut prompt = format!(
-        "{head} It clears {} now and cannot be undone; {} of {} available on it.",
+        "{head} It resets {} now and cannot be undone; {} of {} available on it.",
         clears_summary(&grant.clears),
         grant.resets_left,
         grant.resets_total,
@@ -565,7 +606,7 @@ pub(crate) enum SpendOutcome {
     Reset,
     /// The grant was already spent.
     AlreadyUsed,
-    /// The account is not at a limit a reset clears.
+    /// The account is not at a limit a reset covers.
     NotLimited,
     /// The account's resets are cooling down.
     Cooldown,
@@ -621,7 +662,7 @@ pub(crate) fn spend_outcome_line(
         SpendOutcome::Reset => {
             let mut line = format!("clauth: used a limit reset on '{name}'");
             if !reply.cleared.is_empty() {
-                line.push_str(&format!(": cleared {}", join_windows(&reply.cleared)));
+                line.push_str(&format!(": reset {}", join_windows(&reply.cleared)));
             }
             if let Some(left) = reply.resets_left {
                 line.push_str(&format!(", {left} left"));
@@ -634,7 +675,7 @@ pub(crate) fn spend_outcome_line(
              --list` to see what is left"
         )),
         SpendOutcome::NotLimited => Err(format!(
-            "'{name}' is not at a limit that reset clears, so no reset was used"
+            "'{name}' is not at a limit that reset covers, so no reset was used"
         )),
         SpendOutcome::Cooldown => {
             let until = reply

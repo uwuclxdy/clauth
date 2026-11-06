@@ -7265,10 +7265,10 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
     assert_eq!(
         listed,
         [
-            "clauth: 'cl2' has 2 limit resets usable now.",
-            "    Old reset: 1 of 1 available, clears 5h, usable now",
-            "  * Weekly reset: 1 of 2 available, clears 5h and 7d, usable now  (used next)",
-            "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable (cooldown)",
+            "clauth: 'cl2' has 2 limit resets available.",
+            "    Old reset: 1 of 1 available, resets 5h",
+            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     let none = stdout_of(|| {
@@ -7326,7 +7326,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     });
     assert_eq!(
         asked,
-        "clauth: use the limit reset \"Weekly reset\" on 'cl2'? It clears 5h and 7d now and \
+        "clauth: use the limit reset \"Weekly reset\" on 'cl2'? It resets 5h and 7d now and \
          cannot be undone; 1 of 2 available on it."
     );
     assert_eq!(declined, ["clauth: aborted. no reset was used on 'cl2'."]);
@@ -7337,7 +7337,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     assert_eq!(
         used,
         [
-            "clauth: used a limit reset on 'cl2': cleared 5h and 7d, 0 left.",
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
             "clauth: the daemon shows the new usage at its next poll.",
         ]
     );
@@ -7630,6 +7630,12 @@ fn limit_reset_refuses_a_next_grant_it_cannot_spend() {
         ),
     ];
     for (body, want) in cases {
+        let status = usage::claude_reset::read_status(&body).expect("a cedar_ember block");
+        assert_eq!(
+            status.usable_resets(),
+            0,
+            "a next grant the spend refuses counts nothing"
+        );
         let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
         let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
             .expect_err("refused before the spend");

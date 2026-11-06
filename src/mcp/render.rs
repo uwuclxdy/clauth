@@ -1095,12 +1095,12 @@ fn profile_line(row: &Value) -> String {
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
     }
-    if let Some(banked) = row.get("limit_resets").and_then(Value::as_u64)
-        && banked > 0
+    if let Some(available) = row.get("limit_resets").and_then(Value::as_u64)
+        && available > 0
     {
         out.push_str(&format!(
-            "; {banked} limit reset{} banked",
-            plural(banked as usize)
+            "; {available} limit reset{} available",
+            plural(available as usize)
         ));
     }
     // One snapshot per call, the Overview live column's per-account slice.

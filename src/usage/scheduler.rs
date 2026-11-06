@@ -7603,13 +7603,13 @@ pub(crate) fn claude_resets_tick(state: &SchedulerState, timed_out: Option<&Atom
 /// Each claude OAuth account the poll would poll gets one GET of the side
 /// read an hour, and once more inside the hour when a fresh landing marked it
 /// due (a window crossed to 100%). A successful read lands the usable count,
-/// the next grant's windows and end, and the read's stamp in the account's
-/// own `limit_resets.json`; a 401 or any failure writes nothing and still
-/// stamps the memo, so a broken account is not re-read every tick (the codex
-/// leg's rule). Each read runs on its own worker, and one still out at the tick
-/// fetch deadline, or one that never ran, counts as a failure: it is left
-/// running, its late answer lands nothing, and its account gets no second read
-/// until it exits.
+/// the banked total, the next grant's windows and end, and the read's stamp
+/// in the account's own `limit_resets.json`; a 401 or any failure writes
+/// nothing and still stamps the memo, so a broken account is not re-read every
+/// tick (the codex leg's rule). Each read runs on its own worker, and one
+/// still out at the tick fetch deadline, or one that never ran, counts as a
+/// failure: it is left running, its late answer lands nothing, and its
+/// account gets no second read until it exits.
 #[cfg(test)]
 pub(crate) fn claude_resets_tick_at(state: &SchedulerState, now: u64) {
     claude_resets_tick_flagged(state, now, None, None);
@@ -7880,6 +7880,7 @@ fn claude_resets_tick_flagged(
             let next = status.next_grant();
             let reading = LimitResets {
                 usable: status.usable_resets(),
+                banked: Some(status.banked_resets()),
                 clears: next.map(|g| g.clears().to_vec()).unwrap_or_default(),
                 ends_at: next.and_then(|g| g.ends_at().map(str::to_string)),
                 fetched_at: Some(crate::usage::now_ms()),

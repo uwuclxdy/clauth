@@ -2315,8 +2315,9 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
 }
 
 /// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
-/// scheduler's hourly side read) as the leg writes it: the usable count, the
-/// next grant's raw window names and end, and the read's own epoch-ms stamp.
+/// scheduler's hourly side read) with no banked total, as an older reading
+/// stores it: the usable count, the next grant's raw window names and end,
+/// and the read's own epoch-ms stamp.
 pub(crate) fn write_claude_limit_resets(
     name: &str,
     usable: u32,
@@ -2334,6 +2335,29 @@ pub(crate) fn write_claude_limit_resets(
         "usable": usable,
         "clears": clears,
         "ends_at": ends_at,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
+}
+
+/// [`write_claude_limit_resets`] for a reading that carries the banked total.
+pub(crate) fn write_claude_limit_resets_banked(
+    name: &str,
+    usable: u32,
+    banked: u32,
+    clears: &[&str],
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "banked": banked,
+        "clears": clears,
         "fetched_at": fetched_at,
     });
     std::fs::write(&path, body.to_string()).expect("write limit_resets.json");

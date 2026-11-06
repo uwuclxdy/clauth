@@ -744,16 +744,22 @@ fn build_usage_lines(
 /// read missed a slot.
 const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
-/// The claude pane's `resets` row off the hourly side read: `N available`, the
-/// windows the next grant clears, its end as the local month/day, and the
+/// The claude pane's `resets` row off the hourly side read: `N available`, or
+/// `N of M available` against the banked total when the reading carries one;
+/// the windows the next grant resets, its end as the local month/day, and the
 /// reading's age once it passes 75 min. Each `· …` part drops when its field
-/// is absent; no usable reset draws no row. A row past `inner_w` ends on `…`,
-/// so a cut date never reads as a different date.
+/// is absent; a zero count draws no row unless the reading carries a banked
+/// total above zero. A row past `inner_w` ends on `…`, so a cut date never
+/// reads as a different date.
 fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Option<Line<'static>> {
-    if resets.usable == 0 {
+    let banked = resets.banked;
+    if resets.usable == 0 && banked.unwrap_or(0) == 0 {
         return None;
     }
-    let mut parts = vec![format!("{} available", resets.usable)];
+    let mut parts = vec![match banked {
+        Some(total) => format!("{} of {total} available", resets.usable),
+        None => format!("{} available", resets.usable),
+    }];
     if !resets.clears.is_empty() {
         let labels = resets
             .clears
@@ -761,7 +767,7 @@ fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Optio
             .map(|w| crate::usage::claude_reset::window_label(w))
             .collect::<Vec<_>>()
             .join(", ");
-        parts.push(format!("clears {labels}"));
+        parts.push(format!("resets {labels}"));
     }
     if let Some(ends) = local_day(&resets.ends_at) {
         parts.push(format!("until {ends}"));

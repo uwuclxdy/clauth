@@ -38,17 +38,17 @@ fn the_real_no_grant_body_lists_its_ineligible_reason() {
     assert!(status(NO_GRANT).next_grant().is_none());
 }
 
-/// The count is the resets left on grants usable now; the grant the server
+/// The count is the resets a spend can use now; the grant the server
 /// names next is marked; a limit name clauth has no label for is shown as sent.
 #[test]
 fn a_grant_list_marks_the_servers_next_grant() {
     assert_eq!(
         describe_grants("cl1", &status(THREE_GRANTS)),
         [
-            "clauth: 'cl1' has 2 limit resets usable now.",
-            "    Old reset: 1 of 1 available, clears 5h, usable now",
-            "  * Weekly reset: 1 of 2 available, clears 5h and 7d, usable now  (used next)",
-            "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable (cooldown)",
+            "clauth: 'cl1' has 2 limit resets available.",
+            "    Old reset: 1 of 1 available, resets 5h",
+            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     assert_eq!(
@@ -67,8 +67,7 @@ fn a_grant_with_an_end_names_it_after_its_state() {
     );
     let lines = describe_grants("cl1", &status(&body));
     assert!(
-        lines[2]
-            .starts_with("  * Weekly reset: 1 of 2 available, clears 5h and 7d, usable now, ends "),
+        lines[2].starts_with("  * Weekly reset: 1 of 2 available, resets 5h and 7d, ends "),
         "{}",
         lines[2]
     );
@@ -101,7 +100,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     let grant = at_limit.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &at_limit, grant),
-        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
          and cannot be undone; 1 of 2 available on it."
     );
 
@@ -117,7 +116,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     let grant = early.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &early, grant),
-        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+        "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
          and cannot be undone; 1 of 2 available on it. 'cl1' still has 60% of its 7d left.",
         "short of a limit, the warning names the cleared window the reset throws the most \
          headroom away on"
@@ -128,7 +127,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     let grant = untitled.next_grant().expect("a next grant");
     assert_eq!(
         spend_prompt("cl1", &untitled, grant),
-        "clauth: use a limit reset on 'cl1'? It clears 5h and 7d now and cannot be undone; \
+        "clauth: use a limit reset on 'cl1'? It resets 5h and 7d now and cannot be undone; \
          1 of 2 available on it."
     );
 }
@@ -144,7 +143,7 @@ fn the_prompt_names_the_weekly_reset_it_leaves_in_place() {
     let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
     assert!(
         prompt.starts_with(
-            "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It clears 5h and 7d now \
+            "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
              and cannot be undone; 1 of 2 available on it. The weekly reset stays "
         ),
         "{prompt}"
@@ -195,7 +194,7 @@ fn every_spend_result_maps_to_its_own_line() {
     let cases: [(&str, Result<String, String>); 9] = [
         (
             r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour","seven_day"],"weekly_resets_at":null,"cooldown_until":null}"#,
-            Ok("clauth: used a limit reset on 'cl1': cleared 5h and 7d, 0 left.".to_string()),
+            Ok("clauth: used a limit reset on 'cl1': reset 5h and 7d, 0 left.".to_string()),
         ),
         (
             r#"{"result":"reset","reason":null,"resets_left":null,"cleared":[],"weekly_resets_at":null,"cooldown_until":null}"#,
@@ -211,7 +210,7 @@ fn every_spend_result_maps_to_its_own_line() {
         ),
         (
             r#"{"result":"not_limited","reason":"not_limited","resets_left":1,"cleared":[]}"#,
-            Err("'cl1' is not at a limit that reset clears, so no reset was used".to_string()),
+            Err("'cl1' is not at a limit that reset covers, so no reset was used".to_string()),
         ),
         (
             r#"{"result":"cooldown","reason":"cooldown","resets_left":1,"cleared":[],"cooldown_until":null}"#,
@@ -368,7 +367,8 @@ fn a_request_id_fits_the_servers_pattern_and_is_fresh() {
 }
 
 /// With no grant named next, `--list` still shows every grant the server
-/// sent, under the none-available header.
+/// sent, under the none-available header, and counts none of them: the spend
+/// path refuses this account with that same sentence.
 #[test]
 fn a_grant_list_with_no_next_grant_still_lists_every_grant() {
     let body = THREE_GRANTS.replacen(
@@ -380,11 +380,79 @@ fn a_grant_list_with_no_next_grant_still_lists_every_grant() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    Old reset: 1 of 1 available, clears 5h, usable now",
-            "    Weekly reset: 1 of 2 available, clears 5h and 7d, usable now",
-            "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable (cooldown)",
+            "    Old reset: 0 of 1 available, resets 5h",
+            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
+    assert_eq!(status(&body).usable_resets(), 0);
+}
+
+/// A next id naming no listed grant is no next grant: the spend path refuses,
+/// and the count reads 0 whatever grants beside it are usable.
+#[test]
+fn a_next_grant_id_naming_no_listed_grant_counts_nothing() {
+    let body = THREE_GRANTS.replacen(
+        r#""next_grant_id": "g-week""#,
+        r#""next_grant_id": "g-gone""#,
+        1,
+    );
+    assert_eq!(
+        describe_grants("cl1", &status(&body)),
+        [
+            "clauth: no limit resets available on 'cl1'.",
+            "    Old reset: 0 of 1 available, resets 5h",
+            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+        ]
+    );
+    assert_eq!(status(&body).usable_resets(), 0);
+}
+
+/// The server spends only its next grant, so a next grant in cooldown refuses
+/// the spend whatever else is usable: the count reads 0 and no row counts
+/// one, the same answer the spend path gives.
+#[test]
+fn a_next_grant_the_server_will_not_spend_counts_nothing() {
+    let body = THREE_GRANTS.replacen(
+        r#""next_grant_id": "g-week""#,
+        r#""next_grant_id": "g-cool""#,
+        1,
+    );
+    assert_eq!(
+        describe_grants("cl1", &status(&body)),
+        [
+            "clauth: 'cl1' has 0 limit resets available.",
+            "    Old reset: 0 of 1 available, resets 5h",
+            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
+            "  * limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown  \
+             (used next)",
+        ]
+    );
+    assert_eq!(status(&body).usable_resets(), 0);
+}
+
+/// A next grant whose id clauth refuses to send refuses the spend too, though
+/// the server marks it usable.
+#[test]
+fn a_next_grant_clauth_will_not_send_counts_nothing() {
+    let body = THREE_GRANTS
+        .replacen(r#""id": "g-week""#, r#""id": "G WEEK""#, 1)
+        .replacen(
+            r#""next_grant_id": "g-week""#,
+            r#""next_grant_id": "G WEEK""#,
+            1,
+        );
+    assert_eq!(
+        describe_grants("cl1", &status(&body)),
+        [
+            "clauth: 'cl1' has 0 limit resets available.",
+            "    Old reset: 0 of 1 available, resets 5h",
+            "  * Weekly reset: 0 of 2 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+        ]
+    );
+    assert_eq!(status(&body).usable_resets(), 0);
 }
 
 /// A reset read whose block is null or absent reads as no grant, never as a
@@ -520,7 +588,7 @@ fn a_blank_server_reason_reads_as_no_reason() {
         describe_grants("cl1", &status),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    limit reset: 1 of 1 left, clears 5h and seven_day_blue, unavailable",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue",
         ]
     );
     assert_eq!(
@@ -578,8 +646,8 @@ fn a_blank_stamp_reads_as_no_stamp() {
     assert_eq!(
         describe_grants("cl1", &status),
         [
-            "clauth: 'cl1' has 1 limit reset usable now.",
-            "  * limit reset: 1 of 1 available, clears 5h, usable now  (used next)",
+            "clauth: 'cl1' has 1 limit reset available.",
+            "  * limit reset: 1 of 1 available, resets 5h  (used next)",
         ]
     );
 
@@ -711,11 +779,13 @@ fn usable_resets_saturates_instead_of_overflowing() {
             grant("g2", u32::MAX, true),
             grant("g3", u32::MAX, false),
         ],
+        next_grant_id: Some("g1".to_string()),
         ..ResetStatus::default()
     };
     assert_eq!(status.usable_resets(), u32::MAX);
     let just_one = ResetStatus {
         grants: vec![grant("g1", u32::MAX, true)],
+        next_grant_id: Some("g1".to_string()),
         ..ResetStatus::default()
     };
     assert_eq!(
@@ -723,6 +793,44 @@ fn usable_resets_saturates_instead_of_overflowing() {
         u32::MAX,
         "one maxed grant is maxed"
     );
+}
+
+/// The banked total is every grant's resets left, usable or not, and it
+/// saturates: the Usage row's denominator must count a cooling grant and never
+/// wrap.
+#[test]
+fn banked_resets_counts_unusable_grants_and_saturates() {
+    let grant = |id: &str, left: u32, usable_now: bool| Grant {
+        id: id.to_string(),
+        label: String::new(),
+        resets_total: left,
+        resets_left: left,
+        ends_at: None,
+        clears: vec![],
+        paused: false,
+        usable_now,
+        percent_used: std::collections::HashMap::new(),
+        unavailable_reason: None,
+    };
+    let status = ResetStatus {
+        grants: vec![
+            grant("g1", 1, true),
+            grant("g2", 2, false),
+            grant("g3", 3, false),
+        ],
+        ..ResetStatus::default()
+    };
+    assert_eq!(
+        status.banked_resets(),
+        6,
+        "a grant in cooldown still counts"
+    );
+
+    let maxed = ResetStatus {
+        grants: vec![grant("g1", u32::MAX, true), grant("g2", 1, false)],
+        ..ResetStatus::default()
+    };
+    assert_eq!(maxed.banked_resets(), u32::MAX, "the sum saturates");
 }
 
 /// `--list`'s count line reads the same saturated count the side read lands:
@@ -753,6 +861,6 @@ fn the_list_count_line_saturates_like_the_side_read() {
     };
     assert_eq!(
         describe_grants("cl1", &status)[0],
-        "clauth: 'cl1' has 4294967295 limit resets usable now."
+        "clauth: 'cl1' has 4294967295 limit resets available."
     );
 }

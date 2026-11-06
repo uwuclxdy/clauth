@@ -5987,11 +5987,38 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     assert_eq!(
         claude_resets_rows(&detail),
         [format!(
-            "resets 1 available · clears 5h, 7d · until {}",
+            "resets 1 available · resets 5h, 7d · until {}",
             local_day(ends)
         )],
         "{detail:?}"
     );
+}
+
+/// A reading that carries the banked total says how many of them a spend can
+/// use now, and keeps the row at 0 so a cooldown hides no banked reset.
+#[test]
+fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets_banked("cl1", 2, 3, &["five_hour"], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2 of 3 available · resets 5h"],
+        "{detail:?}"
+    );
+
+    crate::testutil::write_claude_limit_resets_banked("cl1", 0, 3, &[], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 0 of 3 available"],
+        "{detail:?}"
+    );
+
+    crate::testutil::write_claude_limit_resets_banked("cl1", 0, 0, &[], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert!(claude_resets_rows(&detail).is_empty(), "{detail:?}");
 }
 
 /// A reading older than 75 min (a missed hourly read) says its age.
@@ -6009,12 +6036,13 @@ fn a_stale_claude_resets_reading_says_its_age() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 available · clears 5h · read 3h ago"],
+        ["resets 2 available · resets 5h · read 3h ago"],
         "{detail:?}"
     );
 }
 
-/// No usable reset, or no reading at all: no `resets` row on a claude pane.
+/// No usable reset on a reading that carries no banked total, or no reading at
+/// all: no `resets` row on a claude pane.
 #[test]
 fn a_claude_pane_without_a_usable_reset_has_no_resets_row() {
     for usable in [Some(0), None] {
@@ -6347,7 +6375,7 @@ fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 available · clears 5h"],
+        ["resets 1 available · resets 5h"],
         "{detail:?}"
     );
 }
@@ -6453,11 +6481,11 @@ fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
 
     assert_eq!(
         row_at(&app, 55),
-        "resets 1 available · clears 5h, 7d · until Nov …"
+        "resets 1 available · resets 5h, 7d · until Nov …"
     );
     assert_eq!(
         row_at(&app, 56),
-        "resets 1 available · clears 5h, 7d · until Nov 26",
+        "resets 1 available · resets 5h, 7d · until Nov 26",
         "42 cells in a 42-cell budget fit"
     );
 }
