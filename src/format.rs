@@ -608,6 +608,13 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the `clauth` TUI";
 
+/// `message` without its closing `; {RESOLVE_IN_TUI} first` pointer, for a
+/// surface where that pointer leads nowhere or is said elsewhere. `None` on a
+/// message that does not close with it, which each caller answers its own way.
+pub(crate) fn without_resolve_pointer(message: &str) -> Option<&str> {
+    message.strip_suffix(&format!("; {RESOLVE_IN_TUI} first"))
+}
+
 /// The one spelling for a stored login that exists but cannot be read.
 pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
 

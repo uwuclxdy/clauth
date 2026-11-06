@@ -79,7 +79,8 @@ pub(crate) fn validate_new_name_chars(name: &str) -> Result<&str> {
 /// [`validate_profile_name`] a creation flow can take alone when it
 /// deliberately tolerates an own-roster collision (the capture-name prompt
 /// routes that case into capture-into-existing) but must still refuse to
-/// shadow the other harness, which no flow can adopt across.
+/// shadow the other harness, which no flow can adopt across. `rename_profile`
+/// takes it alone under its hold, its own-roster check being the fresh one.
 pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
     let foreign = match harness {
         Harness::Claude => Harness::Codex,
@@ -2255,12 +2256,13 @@ pub(crate) fn rename_profile(
         // moved-but-unrecorded dir, so it must land while every step before the
         // first fallible write is still reversible.
         let mut state = load_fresh_state(held)?;
-        // The roster that decides is the one read under this hold: a peer
+        // The rosters that decide are the ones read under this hold: a peer
         // rename or delete landing after the caller loaded its config leaves
         // `old` gone (this run would move nothing and report success), or
-        // leaves `new` taken (both names would resolve to one account). Ahead of
-        // the directory check: a taken name's directory is that account's, never
-        // the orphan that check describes.
+        // leaves `new` taken (both names would resolve to one account), a codex
+        // create included (its directory holds a single-use login). Ahead of
+        // the directory check: a taken name's directory is that account's,
+        // never the orphan that check describes.
         if !state.profiles.iter().any(|n| n == old) {
             bail!("{}", profile_not_found_head(old.as_str()));
         }
@@ -2271,6 +2273,25 @@ pub(crate) fn rename_profile(
         ) {
             bail!("a profile named '{new}' already exists");
         }
+        validate_foreign_harness_free(new.as_str(), Harness::Claude)?;
+        // A case-only rename (`d3` -> `D3`) resolves to ONE directory on a
+        // case-insensitive filesystem (the macOS default), so same-inode pairs
+        // are exempt.
+        let same_dir = crate::canonical::identity(&old_dir)
+            .ok()
+            .zip(crate::canonical::identity(&new_dir).ok())
+            .is_some_and(|(a, b)| a == b);
+        // A codex create's directory holds its single-use login, so it is no
+        // orphan, and with `old_dir` gone the retry below must not adopt it:
+        // `symlink_metadata` alone counts a dangling link as held, where
+        // `exists` follows it and reads one as absent.
+        if !same_dir && std::fs::symlink_metadata(new_dir.join("auth.json")).is_ok() {
+            bail!(
+                "'{new}' has a directory at {} holding a codex login with no account \
+                 behind it, keep the directory and pick another name",
+                new_dir.display()
+            );
+        }
         // The name validation above checked the RECORD; a directory can outlive
         // its record — a per-profile cache a stale-config fetch leg wrote after
         // the account was deleted re-creates the dir (the writer is gated now,
@@ -2278,26 +2299,18 @@ pub(crate) fn rename_profile(
         // fails ENOTEMPTY, which reads as an internal failure; refuse here with
         // the actionable shape instead. Gated on `old_dir` existing: that is
         // the only branch that renames, so it is the only one ENOTEMPTY can
-        // fire in — and with `old` absent, `new` present is the OTHER half of a
-        // rename this process (or a dead one) moved the dir for but never
-        // recorded: a SIGKILL or a failing save between the move and
-        // `save_app_state` below. That directory holds this profile's own
-        // content, so its retry must complete the record rename (the pre-gate
-        // recovery), never send the operator to delete it. A case-only rename
-        // (`d3` -> `D3`) resolves to ONE directory on a case-insensitive
-        // filesystem (the macOS default), so same-inode pairs are exempt.
-        if old_dir.exists() && new_dir.exists() {
-            let same_dir = crate::canonical::identity(&old_dir)
-                .ok()
-                .zip(crate::canonical::identity(&new_dir).ok())
-                .is_some_and(|(a, b)| a == b);
-            if !same_dir {
-                bail!(
-                    "'{new}' already has a directory at {} with no account behind it, \
-                     delete the directory or pick another name",
-                    new_dir.display()
-                );
-            }
+        // fire in — and with `old` absent, a `new` directory past the codex
+        // refusal reads as the OTHER half of a rename this process (or a dead
+        // one) moved the dir for but never recorded: a SIGKILL or a failing
+        // save between the move and `save_app_state` below. That directory is
+        // taken for this profile's own content, so its retry must complete the
+        // record rename, never send the operator to delete it.
+        if old_dir.exists() && new_dir.exists() && !same_dir {
+            bail!(
+                "'{new}' already has a directory at {} with no account behind it, \
+                 delete the directory or pick another name",
+                new_dir.display()
+            );
         }
         // Before the first move: a failed store write leaves everything as it
         // was, and a retry after a later failure finds the token already moved.
@@ -4752,10 +4765,7 @@ fn rollback_first_account_create(
     // refusal is unmasked, and the two real actions replace the pointer in the
     // outer message. A link failure that is NOT the guard (a publish error)
     // keeps its original chain untouched.
-    match link_err
-        .to_string()
-        .strip_suffix(&format!("; {} first", crate::format::RESOLVE_IN_TUI))
-    {
+    match crate::format::without_resolve_pointer(&link_err.to_string()) {
         Some(trimmed) => anyhow::anyhow!(trimmed.to_string()).context(outer),
         None => link_err.context(outer),
     }

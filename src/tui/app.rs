@@ -26220,16 +26220,30 @@ fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) 
     {
         stop.member = new.clone();
     }
+    if let Some(notice) = app.divergence_pending.as_mut()
+        && notice.active == old.as_str()
+    {
+        notice.active = new.to_string();
+    }
+    if let Some(notice) = app.divergence_pending.as_mut()
+        && notice.sibling.as_ref() == Some(old)
+    {
+        notice.sibling = Some(new.clone());
+    }
     if let Some(resets) = app.claude_resets.remove(old.as_str()) {
         app.claude_resets.insert(new.to_string(), resets);
     }
 }
 
 /// The warning a landed rename shows when the relink was refused: the relink's
-/// root cause is escaped for the toast slot.
+/// root cause, escaped for the toast slot, less its pointer to the `clauth`
+/// TUI: this is that TUI, and its divergence banner names the key wherever a
+/// prompt is due (a logged-out live file, or one its own account stores, raises
+/// none: it holds nothing to save).
 fn landed_rename_toast(renamed: &str, relink: &anyhow::Error) -> String {
-    let root = escape_control(&relink.root_cause().to_string());
-    format!("{renamed}, live login not relinked\n{root}")
+    let root = relink.root_cause().to_string();
+    let cause = escape_control(crate::format::without_resolve_pointer(&root).unwrap_or(&root));
+    format!("{renamed}, live login not relinked\n{cause}")
 }
 
 fn commit_rename(app: &mut App) -> bool {

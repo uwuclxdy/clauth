@@ -56563,37 +56563,9 @@ fn a_refused_rename_save_toasts_the_reason() {
 #[cfg(unix)]
 #[test]
 fn a_landed_rename_whose_relink_is_refused_warns_and_follows_the_new_name() {
-    use crate::profile::{ClaudeCredentials, OAuthToken, ProfileName};
+    use crate::profile::ProfileName;
     let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["a"]);
-    let creds = |access: &str| ClaudeCredentials {
-        claude_ai_oauth: Some(OAuthToken {
-            access_token: access.to_string(),
-            refresh_token: Some(format!("{access}-refresh")),
-            expires_at: None,
-            scopes: None,
-            subscription_type: None,
-            ..OAuthToken::default_extra()
-        }),
-    };
-    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
-    profile.credentials = Some(creds("a-access"));
-    crate::profile::save_profile(&profile).expect("save a");
-    let mut app = app_with(vec![profile]);
-    app.config().state.active_profile = Some("a".into());
-    let state = app.config().state.clone();
-    crate::profile::save_app_state(&state).expect("persist the active pick");
-    let live = crate::profile::claude_dir()
-        .unwrap()
-        .join(".credentials.json");
-    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-    std::fs::write(&live, serde_json::to_vec(&creds("other-access")).unwrap()).unwrap();
-    app.tab = Tab::Setup;
-    app.profile_cursor.set(0);
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, key(KeyCode::Char('2')));
-    super::handle_key(&mut app, key(KeyCode::Enter));
+    let app = rename_a_to_a2_over_another_login();
 
     assert!(
         app.config().find(&ProfileName::from("a2")).is_some(),
@@ -56621,8 +56593,7 @@ fn a_landed_rename_whose_relink_is_refused_warns_and_follows_the_new_name() {
         toasts.contains(&(
             super::ToastKind::Warning,
             "renamed 'a' → 'a2', live login not relinked\n\
-             refusing to replace .credentials.json: live file differs from profile 'a2'; \
-             resolve the divergence in the `clauth` TUI first"
+             refusing to replace .credentials.json: live file differs from profile 'a2'"
                 .to_string()
         )),
         "{toasts:?}"
@@ -56635,6 +56606,187 @@ fn a_landed_rename_whose_relink_is_refused_warns_and_follows_the_new_name() {
         Some("a2"),
         "the field still names the old account, so a retry reads `not found`"
     );
+}
+
+/// The warning's cause fits the toast's three rows at the widest budget, so a
+/// short name's toast shows no cut mark there.
+#[cfg(unix)]
+#[test]
+fn a_refused_relink_toast_on_short_names_shows_its_whole_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rename_a_to_a2_over_another_login();
+    let toast = app
+        .toasts
+        .iter()
+        .find(|t| t.kind == super::ToastKind::Warning)
+        .expect("the warning toast");
+
+    let rows: Vec<String> = crate::tui::render::toasts::toast_rows(toast, 57)
+        .iter()
+        .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+
+    assert_eq!(
+        rows,
+        [
+            "renamed 'a' → 'a2', live login not relinked",
+            "refusing to replace .credentials.json: live file differs",
+            "from profile 'a2'",
+        ]
+    );
+}
+
+/// The toast leaves the remedy to the divergence banner: the next poll raises
+/// it under the new name, and `d` opens the resolver from the Setup form the
+/// rename left open.
+#[cfg(unix)]
+#[test]
+fn a_refused_relink_raises_the_banner_whose_key_opens_the_resolver() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rename_a_to_a2_over_another_login();
+    assert!(
+        app.config_draft.is_some(),
+        "precondition: the Setup form is still open"
+    );
+
+    app.last_divergence_check = None;
+    super::poll_credentials_divergence(&mut app);
+    super::update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().map(|b| b.message.clone()),
+        Some(format!(
+            "live login no longer matches 'a2' · press {} to resolve",
+            crate::tui::render::prose::key("d")
+        ))
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::Divergence(_))),
+        "`d` opens the resolver the banner names"
+    );
+}
+
+/// A notice raised before the rename moves with the account, so neither the
+/// banner nor its key names an account that no longer exists.
+#[cfg(unix)]
+#[test]
+fn a_rename_carries_the_banner_already_up_to_the_new_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_a_over_another_login();
+    app.last_divergence_check = None;
+    super::poll_credentials_divergence(&mut app);
+    assert_eq!(
+        app.divergence_pending.as_ref().map(|n| n.active.as_str()),
+        Some("a"),
+        "precondition: the banner is up before the rename"
+    );
+
+    rename_to_a2(&mut app);
+    super::update_banner(&mut app);
+
+    assert_eq!(
+        app.banner.as_ref().map(|b| b.message.clone()),
+        Some(format!(
+            "live login no longer matches 'a2' · press {} to resolve",
+            crate::tui::render::prose::key("d")
+        ))
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(super::Modal::Divergence(form)) if form.active == "a2"
+        ),
+        "`d` opens the resolver for the new name"
+    );
+}
+
+/// A rename of the account that owns the live login moves the name the banner
+/// shows: the poll's memo keeps a notice while the login is unchanged, so
+/// nothing else would correct it. A rename of neither name moves nothing.
+#[test]
+fn a_rename_of_the_login_owner_carries_the_name_the_banner_shows() {
+    use crate::profile::ProfileName;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(&ProfileName::from(
+        "a",
+    ))]);
+    app.divergence_pending = Some(super::DivergenceNotice {
+        active: "a".to_string(),
+        sibling: Some(ProfileName::from("b")),
+        fingerprint: None,
+    });
+    let names = |app: &super::App| {
+        app.divergence_pending
+            .as_ref()
+            .map(|n| (n.active.clone(), n.sibling.clone()))
+    };
+
+    super::rebind_name_keyed_state(&mut app, &ProfileName::from("z"), &ProfileName::from("y"));
+    assert_eq!(
+        names(&app),
+        Some(("a".to_string(), Some(ProfileName::from("b"))))
+    );
+
+    super::rebind_name_keyed_state(&mut app, &ProfileName::from("b"), &ProfileName::from("c"));
+    assert_eq!(
+        names(&app),
+        Some(("a".to_string(), Some(ProfileName::from("c"))))
+    );
+}
+
+/// Renames the active account `a` to `a2` through the Setup field while the
+/// live file holds another login, so the rename lands and its relink is
+/// refused. The caller holds the `HomeSandbox`.
+#[cfg(unix)]
+fn rename_a_to_a2_over_another_login() -> super::App {
+    let mut app = active_a_over_another_login();
+    rename_to_a2(&mut app);
+    app
+}
+
+/// Types `a2` into the Setup name field of [`active_a_over_another_login`]'s
+/// account and commits it.
+#[cfg(unix)]
+fn rename_to_a2(app: &mut super::App) {
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Char('2')));
+    super::handle_key(app, key(KeyCode::Enter));
+}
+
+/// An App on the Setup tab whose active account `a` has a stored login while
+/// the live file holds another. The caller holds the `HomeSandbox`.
+#[cfg(unix)]
+fn active_a_over_another_login() -> super::App {
+    use crate::profile::{ClaudeCredentials, OAuthToken, ProfileName};
+    crate::testutil::register_names(&["a"]);
+    let creds = |access: &str| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.credentials = Some(creds("a-access"));
+    crate::profile::save_profile(&profile).expect("save a");
+    let mut app = app_with(vec![profile]);
+    app.config().state.active_profile = Some("a".into());
+    let state = app.config().state.clone();
+    crate::profile::save_app_state(&state).expect("persist the active pick");
+    let live = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, serde_json::to_vec(&creds("other-access")).unwrap()).unwrap();
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    app
 }
 
 /// A stored name a hand edit gave a control byte prints escaped in the rename

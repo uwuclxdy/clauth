@@ -1755,6 +1755,10 @@ fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
         "an own-roster collision is this flavor's business to allow"
     );
     assert!(validate_foreign_harness_free("cx", Harness::Claude).is_err());
+    assert!(
+        validate_foreign_harness_free("CX", Harness::Claude).is_err(),
+        "names fold case across the rosters, so `CX` is the codex `cx`"
+    );
 }
 
 // ── codex CRUD: switch + delete against codex-profiles.toml ────────────────
@@ -22363,5 +22367,169 @@ fn a_rename_onto_a_name_a_racing_rename_took_never_calls_its_directory_an_orphan
     assert!(
         crate::profile::profile_dir(&new).unwrap().exists(),
         "the winner's directory stays put"
+    );
+}
+
+/// A codex create took the name and wrote its store: that directory holds a
+/// single-use login, so the rename hears the name is a codex account and is
+/// never told to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_codex_create_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cw-old");
+    let new = crate::profile::ProfileName::from("cw-new");
+    crate::testutil::register_names(&["cw-old"]);
+    save_profile(&Profile::new("cw-old".to_string(), None, None)).expect("save old");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["cw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cw-old".to_string(), None, None)],
+    };
+    let store = crate::profile::profile_dir(&new).unwrap().join("auth.json");
+    let written = store.clone();
+    crate::gateway_tokens::set_pre_hold_hook(
+        "cw-old",
+        std::sync::Arc::new(move || {
+            crate::testutil::write_codex_roster(&["cw-new"]);
+            std::fs::create_dir_all(written.parent().unwrap()).expect("create the codex directory");
+            std::fs::write(&written, "{}").expect("write the codex store");
+        }),
+    );
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("cw-old"))
+        .expect_err("the codex roster holds the new name");
+
+    assert_eq!(
+        err.to_string(),
+        "'cw-new' is a codex profile. Profile names span both harnesses, so pick another"
+    );
+    assert!(store.exists(), "the codex store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A codex capture whose roster save failed left the only copy of its
+/// single-use login in a directory no account claims: the rename keeps its
+/// hands off and never advises deleting it.
+#[test]
+fn a_rename_onto_a_codex_store_no_account_claims_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cs-old");
+    let new = crate::profile::ProfileName::from("cs-new");
+    crate::testutil::register_names(&["cs-old"]);
+    save_profile(&Profile::new("cs-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cs-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cs-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cs-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A dangling `auth.json` link still marks a codex store: the name is refused
+/// the same way, never read as an empty orphan.
+#[cfg(unix)]
+#[test]
+fn a_rename_onto_a_dangling_codex_store_link_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cl-old");
+    let new = crate::profile::ProfileName::from("cl-new");
+    crate::testutil::register_names(&["cl-old"]);
+    save_profile(&Profile::new("cl-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cl-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cl-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::os::unix::fs::symlink(new_dir.join("gone"), new_dir.join("auth.json"))
+        .expect("link the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cl-old"))
+        .expect_err("the directory holds a codex store's link");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cl-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+}
+
+/// A record whose directory is gone is no half-done rename of a codex store:
+/// that path's retry would hand the store to a claude account, whose delete
+/// then destroys the only copy of the login.
+#[test]
+fn a_rename_of_a_record_with_no_directory_never_adopts_a_codex_store() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cd-old");
+    let new = crate::profile::ProfileName::from("cd-new");
+    crate::testutil::register_names(&["cd-old"]);
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cd-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cd-old".to_string(), None, None)],
+    };
+    assert!(
+        !crate::profile::profile_dir(&old).unwrap().exists(),
+        "precondition: the record has no directory"
+    );
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cd-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cd-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("reload state")
+            .profiles
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
+        ["cd-old"],
+        "the record keeps its name"
     );
 }
