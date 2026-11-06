@@ -5138,6 +5138,46 @@ fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>)
     // exists to prevent — eroding by one stamp per revisit, on the chain churn
     // the feature is for.
     let displaced = crate::profile_cache::effective_write_time(store);
+    // A swap's stamp without its receipt is the documented best-effort: the
+    // readers fall back to the raw mtime.
+    stamp_store_displacing(member, store, memoized, displaced).map(|_receipt_landed| ())
+}
+
+/// Stamp a store clauth just rewrote without touching its login (the MCP login
+/// sync's `mcpOAuth` write), so every reader asking when the login was last
+/// written still reads `login_written`: the store's
+/// [`crate::profile_cache::effective_write_time`] taken before the write.
+/// Without it the watchdog drain reads the rewrite as the newer login and
+/// relinks a session over the fresher pair Claude Code saved in its own file.
+///
+/// # Errors
+/// The stamp failed, or it landed without its receipt (the receipt is the only
+/// thing keeping the readers off the bare mtime), so the caller can say so.
+pub(crate) fn stamp_rewritten_store(
+    member: &ProfileName,
+    store: &Path,
+    login_written: Option<SystemTime>,
+) -> Result<()> {
+    if stamp_store_displacing(member, store, None, login_written)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "no touch receipt was recorded for {} (its account left the roster, the receipt \
+             write failed, or the filesystem truncates modification times)",
+            store.display()
+        )
+    }
+}
+
+/// [`stamp_store`]'s stamp and receipt, with the write time it displaces given.
+/// `Ok(true)` when the receipt landed; `Ok(false)` when the stamp did without
+/// it, whether withheld (a filesystem that truncates the mtime) or not written.
+fn stamp_store_displacing(
+    member: &ProfileName,
+    store: &Path,
+    memoized: Option<SystemTime>,
+    displaced: Option<SystemTime>,
+) -> Result<bool> {
     let file = OpenOptions::new()
         .write(true)
         .open(store)
@@ -5152,15 +5192,14 @@ fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>)
             .and_then(|m| m.modified().ok())
             .map(as_stored)
     };
-    let asked = SystemTime::now();
-    stamp(asked)?;
     // A receipt is only sound where the filesystem kept the EXACT value asked
     // for. Where the mtime truncates, a genuine write landing in the same tick
     // aliases onto the stamp, and a receipt resolving a real write back to
     // `displaced` inverts both decisions — worse than no receipt at all. Read
     // from the first stamp only: `memoized + 1s` below is already tick-aligned,
     // so it round-trips exactly even on the filesystem this guards against.
-    let exact = landed() == Some(asked);
+    let exact = file_keeps_exact_mtime(&file)
+        .with_context(|| format!("failed to touch {}", store.display()))?;
     // The clock is normally enough, because only EQUALITY hides the swap. The one
     // way `now` lands on `memoized` is a coarse-granularity filesystem truncating
     // it back onto a store written in the same second, so check what actually
@@ -5172,10 +5211,29 @@ fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>)
     {
         stamp(memoized + Duration::from_secs(1))?;
     }
-    if exact && let Some(stamped) = landed() {
-        crate::profile_cache::write_touch_receipt(member, store, stamped, displaced);
-    }
-    Ok(())
+    let receipt = exact
+        && landed().is_some_and(|stamped| {
+            crate::profile_cache::write_touch_receipt(member, store, stamped, displaced)
+        });
+    Ok(receipt)
+}
+
+/// Stamp `file` with the clock and say whether the filesystem kept that exact
+/// value: what a touch receipt needs ([`stamp_store_displacing`]), asked of a
+/// file before a write that needs one ([`crate::claude::sync_mcp_into_stores`]
+/// asks its staged copy). An unreadable mtime reads as not kept.
+///
+/// # Errors
+/// The stamp itself failed.
+pub(crate) fn file_keeps_exact_mtime(file: &File) -> std::io::Result<bool> {
+    let asked = SystemTime::now();
+    file.set_times(std::fs::FileTimes::new().set_modified(asked))?;
+    Ok(file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(as_stored)
+        == Some(asked))
 }
 
 /// Test-only mtime-granularity override for [`touch_store`]'s read-back. Every
@@ -10895,8 +10953,9 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
 /// of `budget` ([`crate::lock::with_keychain_budget`]), so a peer's flock hold
 /// spends none of the window `leg`'s `security` calls share. The swap's item
 /// write and sign-out, the convergence's sign-out, the seed's write and
-/// sign-out and the seed's retry all run through here, so the order has one
-/// home a linux test drives. The carry stays at each caller: the swap picks
+/// sign-out, the seed's retry and the copied-bearer re-point all run through
+/// here, so the order has one home a linux test drives. The carry stays at
+/// each caller: the swap picks
 /// its leg off the incoming store after it, and each site logs a failed carry
 /// in its own words. A source scan (`no_item_leg_folds_in_a_carry_or_a_flock`)
 /// reds a call here that names the carry, `with_state_lock` or the row
@@ -10912,7 +10971,7 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the production callers are the macOS swap, convergence and seed Keychain legs; a linux test drives this function directly"
+        reason = "the production callers are the macOS swap, convergence, seed and copied-bearer re-point Keychain legs; a linux test drives this function directly"
     )
 )]
 fn owned_keychain_leg<T>(
@@ -10938,7 +10997,7 @@ fn owned_keychain_leg<T>(
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the only caller is the macOS copied-bearer re-point"
+        reason = "only the macOS Keychain legs read `profile`, `session` and `background`"
     )
 )]
 pub(crate) struct LiveRuntime {
@@ -10954,13 +11013,6 @@ pub(crate) struct LiveRuntime {
 /// tally uses (`current_member` first, then `start_profile`), which is also
 /// the member recorded; its tree must exist. Items of sessions that are not
 /// live are the orphan GC's, never this.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the only caller is the macOS copied-bearer re-point"
-    )
-)]
 pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
     let mut out: Vec<LiveRuntime> = Vec::new();
     for row in crate::live_sessions::list() {
@@ -11419,16 +11471,132 @@ fn revoked_bearer_queued(member: &ProfileName, revoked: &str) -> bool {
     })
 }
 
-/// Sessions whose item the stale-copy sweep failed to read for a reason other
-/// than a locked keychain: an access dialog denied or left unanswered, a read
-/// that ran out of time, an item that does not parse. The sweep never reads
-/// them again while they live, as the re-point drain gives such a session up,
-/// since a read of an item Claude Code created can raise a dialog on every
-/// attempt. Keyed by session id and the row's `started_at`: an id repeats when
-/// a later start recycles its pid, and that new session inherits nothing.
+/// Sessions whose item a daemon-side reader (the stale-copy sweep, the MCP
+/// login sync) failed to read for a reason other than a locked keychain: an
+/// access dialog denied or left unanswered, a read that ran out of time, an
+/// item that does not parse. Neither reader reads them again while they live,
+/// as the re-point drain gives such a session up, since a read of an item
+/// Claude Code created can raise a dialog on every attempt; one set, so once
+/// one reader has given a session up the other reads it no more either. Two
+/// passes that overlap on a session neither had given up yet can each raise a
+/// dialog: each works on its own copy of the set. Keyed by
+/// session id and the row's `started_at`: an id repeats when a later start
+/// recycles its pid, and that new session inherits nothing. Held only around a
+/// copy or a merge ([`with_gave_up_released`]), never across a read.
 #[cfg(target_os = "macos")]
-static STALE_SWEEP_GAVE_UP: std::sync::Mutex<BTreeSet<(String, u64)>> =
-    std::sync::Mutex::new(BTreeSet::new());
+static ITEM_READ_GAVE_UP: std::sync::LazyLock<GaveUpSet> =
+    std::sync::LazyLock::new(|| crate::lockorder::RankedMutex::new(BTreeSet::new()));
+
+/// [`ITEM_READ_GAVE_UP`]'s type.
+#[cfg(target_os = "macos")]
+type GaveUpSet =
+    crate::lockorder::RankedMutex<BTreeSet<(String, u64)>, crate::lockorder::rank::ItemReadGaveUp>;
+
+/// Run `read` over a copy of `shared` (each reader passes
+/// [`ITEM_READ_GAVE_UP`]) with the set released, so no reader holds it across
+/// its `security` reads and neither waits out the other's, then fold what
+/// `read` changed back in ([`released_pass`]).
+#[cfg(target_os = "macos")]
+fn with_gave_up_released<T>(
+    shared: &GaveUpSet,
+    read: impl FnOnce(&mut BTreeSet<(String, u64)>) -> T,
+) -> T {
+    released_pass(
+        || {
+            shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        },
+        read,
+    )
+}
+
+/// The sequence behind [`with_gave_up_released`], over any holder of the shared
+/// set (`take` locks it): copy the set, drop the guard, run `read` over the
+/// copy, take the set again and merge the pass in ([`merge_item_read_gave_up`]).
+/// Platform-generic so a test drives the whole sequence, merge included.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only callers outside tests are the macOS item readers"
+    )
+)]
+fn released_pass<T, G>(
+    take: impl Fn() -> G,
+    read: impl FnOnce(&mut BTreeSet<(String, u64)>) -> T,
+) -> T
+where
+    G: std::ops::DerefMut<Target = BTreeSet<(String, u64)>>,
+{
+    let before = BTreeSet::clone(&take());
+    let mut after = before.clone();
+    let out = read(&mut after);
+    merge_item_read_gave_up(&mut take(), &before, &after);
+    out
+}
+
+/// Fold one reader's pass into the shared give-up set `shared`: `before` is the
+/// copy the pass started from, `after` what it left. The keys it gave up go
+/// in, the keys it pruned go out, and every change the other reader made
+/// meanwhile stays. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only callers outside tests are the macOS item readers"
+    )
+)]
+pub(crate) fn merge_item_read_gave_up(
+    shared: &mut BTreeSet<(String, u64)>,
+    before: &BTreeSet<(String, u64)>,
+    after: &BTreeSet<(String, u64)>,
+) {
+    shared.retain(|key| after.contains(key) || !before.contains(key));
+    shared.extend(after.difference(before).cloned());
+}
+
+/// What one read of a live session's per-session Keychain item found.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "built outside tests only by the macOS item read")
+)]
+#[derive(Debug)]
+pub(crate) enum LiveItemRead {
+    /// The session has no item.
+    Absent,
+    /// The keychain is locked: the item may hold anything, and the next pass
+    /// retries it.
+    Locked,
+    Item(serde_json::Value),
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS stale-copy sweep")
+)]
+impl LiveItemRead {
+    /// The item, if this read got one.
+    fn into_item(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Item(item) => Some(item),
+            Self::Absent | Self::Locked => None,
+        }
+    }
+}
+
+/// One daemon-side read of `live`'s per-session item for a reader keyed into
+/// [`ITEM_READ_GAVE_UP`]: a locked keychain is the transient the next pass
+/// retries; any other failure is the `Err` that gives the session up.
+#[cfg(target_os = "macos")]
+fn read_live_item(live: &LiveRuntime) -> Result<LiveItemRead> {
+    match crate::keychain::read_config_dir_item(&live.runtime) {
+        Ok(Some(item)) => Ok(LiveItemRead::Item(item)),
+        Ok(None) => Ok(LiveItemRead::Absent),
+        Err(e) if crate::keychain::failed_on_locked_keychain(&e) => Ok(LiveItemRead::Locked),
+        Err(e) => Err(e),
+    }
+}
 
 /// Queue the stale copies no stamp will name for [`repoint_copied_bearers`].
 ///
@@ -11456,18 +11624,15 @@ pub(crate) fn sweep_stale_copied_bearers() {
         {
             return;
         }
-        let mut gave_up = STALE_SWEEP_GAVE_UP
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sweep_stale_copied_bearers_with(
-            &live_session_runtime_dirs(),
-            crate::usage::now_ms() as i64,
-            &mut gave_up,
-            |live| match crate::keychain::read_config_dir_item(&live.runtime) {
-                Err(e) if crate::keychain::failed_on_locked_keychain(&e) => Ok(None),
-                read => read,
-            },
-        );
+        let sessions = live_session_runtime_dirs();
+        with_gave_up_released(&ITEM_READ_GAVE_UP, |gave_up| {
+            sweep_stale_copied_bearers_with(
+                &sessions,
+                crate::usage::now_ms() as i64,
+                gave_up,
+                |live| read_live_item(live).map(LiveItemRead::into_item),
+            );
+        });
     }
 }
 
@@ -11582,6 +11747,414 @@ pub(crate) fn sweep_stale_copied_bearers_detached() {
     if spawned.is_err() {
         IN_FLIGHT.store(false, O::Release);
     }
+}
+
+/// How often the daemon's MCP login sync runs at most. On macOS each pass
+/// reads every live session's per-session Keychain item (a `security`
+/// subprocess apiece), so it does not run on every one-second tick; a login
+/// made in one session reaches every account's store no running session links
+/// within this window.
+const MCP_SYNC_INTERVAL_MS: u64 = 15_000;
+
+/// The MCP login sync's attempt limiter: one pass per
+/// [`MCP_SYNC_INTERVAL_MS`] from the pass STARTING, never two in flight, and
+/// a pass that panics frees its claim on unwind.
+static MCP_SYNC_THROTTLE: crate::plugin_host::HealThrottle =
+    crate::plugin_host::HealThrottle::with_floor(MCP_SYNC_INTERVAL_MS);
+
+/// The live credential files the MCP login sync reads as sources (and never
+/// writes): each live session's `<runtime>/.credentials.json`, the
+/// `.credentials.json` of each tree in `job_trees` (an unfinished Claude Code
+/// background job's, registry row or not) and the global
+/// `~/.claude/.credentials.json`. A symlink into a store is read through,
+/// except, with `preserve_non_login_keys` off, one resolving to a
+/// `session-token.json` or `session-token.static.json`: the sync reads those
+/// files neither directly nor through a link then. The read skips anything
+/// absent or unparseable.
+fn mcp_sync_live_files(live: &[LiveRuntime], job_trees: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = live
+        .iter()
+        .map(|l| &l.runtime)
+        .chain(job_trees)
+        .map(|tree| tree.join(".credentials.json"))
+        .collect();
+    if let Ok(global) = crate::claude::claude_credentials_path() {
+        files.push(global);
+    }
+    if !crate::claude::preserve_non_login_keys() {
+        files.retain(|file| {
+            !crate::canonical::identity(file).is_ok_and(|target| {
+                target.file_name().is_some_and(|name| {
+                    name == "session-token.json" || name == "session-token.static.json"
+                })
+            })
+        });
+    }
+    files
+}
+
+/// The credential stores a running session reads through its link right now,
+/// each in its [`crate::canonical::identity`] spelling: the target of each live
+/// `clauth start` session's `<runtime>/.credentials.json`
+/// ([`live_session_runtime_dirs`]), of the `.credentials.json` of each tree an
+/// unfinished Claude Code background job names (a job keeps reading its tree
+/// after its launcher exits, registry row or not), and of
+/// `~/.claude/.credentials.json` when `plain_runs`, the caller's answer to
+/// whether a plain `claude` session runs ([`plain_claude_session_runs`],
+/// process start times: a `ps` or PowerShell spawn off linux, so asked once
+/// per pass and never inside a state-flock hold; this set is file reads
+/// alone, and is read again inside each store's hold). Claude Code writes such a store through
+/// the link without clauth's state flock, so the MCP login sync and the
+/// hand-off fan-out read it and never write it. Decided by where each link
+/// resolves. A live session on a symlink tree whose file is no longer a link
+/// (Claude Code saved its own file over it) holds both of its member's login
+/// stores until the watchdog drains that file into the store and relinks: a
+/// write landing before the drain would be copied over, and the next pass
+/// would read the loss as a sign-out. A live session on a copy tree holds
+/// both of its member's login stores the same way: its
+/// watchdog mirrors its own file against the store by raw mtimes, with no link
+/// to resolve. A tree is taken for a copy tree when its shared entries are
+/// copies or disagree ([`link_mode_of`]), or when it shares none and this host
+/// cannot symlink ([`profile_uses_fake_transport`]).
+///
+/// `None` when the job store cannot be read, or a job is caught mid-create:
+/// a job whose tree is unknown can link any store, so the caller writes none.
+/// `None` too when the live-session registry does not list whole (it cannot
+/// be opened, or an entry fails to yield), for the same reason. A row file
+/// that does not parse is skipped, as every registry reader skips it: nothing
+/// removes such a file, so reading it as unknown would stop every write for
+/// good.
+pub(crate) fn stores_running_sessions_link(plain_runs: bool) -> Option<BTreeSet<PathBuf>> {
+    if !crate::live_sessions::registry_lists_whole() {
+        return None;
+    }
+    let jobs = crate::claude_jobs::job_trees();
+    let (unfinished, short) = jobs.unfinished_jobs()?;
+    if short || jobs.global_mid_create_store().is_some() {
+        return None;
+    }
+    let job_trees = unfinished.into_iter().map(|(_, tree)| tree).chain(
+        jobs.scoped_mid_create_stores()
+            .into_iter()
+            .map(|(tree, _)| tree.to_path_buf()),
+    );
+    let live = live_session_runtime_dirs();
+    let mut linked: BTreeSet<PathBuf> = live
+        .iter()
+        .map(|live| live.runtime.clone())
+        .chain(job_trees)
+        .filter_map(|tree| link_target(&tree.join(".credentials.json")))
+        .collect();
+    let mut host_copies: Option<bool> = None;
+    for session in &live {
+        let copy_tree = match link_mode_of(Some(&session.runtime)) {
+            LinkProbe::Real => false,
+            LinkProbe::Fake | LinkProbe::Mixed => true,
+            LinkProbe::NothingShared => *host_copies
+                .get_or_insert_with(|| profile_uses_fake_transport(session.profile.as_str())),
+        };
+        // Claude Code saved its own file over the link: the watchdog drains
+        // it into the member's store and relinks, so a write there before the
+        // drain would be copied over.
+        let drain_pending = session
+            .runtime
+            .join(".credentials.json")
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_file());
+        if !copy_tree && !drain_pending {
+            continue;
+        }
+        let Ok(dir) = profile_dir(&session.profile) else {
+            return None;
+        };
+        linked.extend(
+            ["credentials.json", "session-token.json"]
+                .iter()
+                .filter_map(|store| crate::canonical::identity(dir.join(store)).ok()),
+        );
+    }
+    if plain_runs
+        && let Ok(global) = crate::claude::claude_credentials_path()
+        && let Some(target) = link_target(&global)
+    {
+        linked.insert(target);
+    }
+    Some(linked)
+}
+
+/// Where `file` resolves when it is a symlink; `None` for a regular file, an
+/// absent one, or a link whose target is gone.
+fn link_target(file: &Path) -> Option<PathBuf> {
+    if !file.symlink_metadata().ok()?.file_type().is_symlink() {
+        return None;
+    }
+    crate::canonical::identity(file).ok()
+}
+
+/// Whether a `claude` session clauth did not start runs on `~/.claude`: a
+/// record in `~/.claude/sessions` whose process still runs and that no
+/// running session's registry row names (a `clauth start` session's record
+/// lands there too where the runtime tree links `sessions/` to it). A record that does not
+/// parse counts while its pid runs, and a sessions dir that cannot be listed
+/// counts as one, so an unknown never lets a linked store be written.
+pub(crate) fn plain_claude_session_runs() -> bool {
+    let Ok(dir) = crate::profile::claude_dir().map(|dir| dir.join("sessions")) else {
+        return false;
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    // Only rows whose session still runs: a crashed session's row the GC has not
+    // pruned names a pid a later plain `claude` may hold, and that session must
+    // not read as clauth's.
+    let started: HashSet<u32> = crate::live_sessions::list()
+        .iter()
+        .filter(|row| row.marker_is_held())
+        .flat_map(|row| [Some(row.pid), row.claude_pid])
+        .flatten()
+        .collect();
+    entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        // 0 and anything past `i32::MAX` name no single process.
+        if pid == 0 || pid > i32::MAX.unsigned_abs() || started.contains(&pid) {
+            return false;
+        }
+        match crate::session_record::session_record(&dir, pid) {
+            Some(record) => record_process_runs(&record),
+            None => crate::daemon::gateway::process_start_time(pid).is_some(),
+        }
+    })
+}
+
+/// Whether the process a Claude Code session record names still runs: its pid
+/// is a live process and, on linux, where the record's `procStart` spells the
+/// same start field this reads, that process started when the record says. A
+/// record with no `procStart` counts while its pid lives.
+fn record_process_runs(record: &crate::session_record::SessionRecord) -> bool {
+    let Some(start) = crate::daemon::gateway::process_start_time(record.pid) else {
+        return false;
+    };
+    !cfg!(target_os = "linux") || record.proc_start.is_empty() || record.proc_start == start
+}
+
+/// The daemon tick's hook for the MCP login sync: at most one pass per
+/// [`MCP_SYNC_INTERVAL_MS`], never two at once ([`MCP_SYNC_THROTTLE`]), on a
+/// detached thread so the pass spends neither the tick's budget nor its
+/// watchdog window. `enabled` is `sync_mcp_logins` as the tick's config reads
+/// it: off, the tick neither claims the throttle nor starts a thread. Runs on
+/// every platform (the item reads inside are macOS-only); a no-op in test
+/// builds, which must never reach the real stores or Keychain.
+pub(crate) fn sync_mcp_logins_detached(enabled: bool) {
+    if cfg!(test) {
+        return;
+    }
+    // A failed spawn drops the claim, and the next tick past the floor tries
+    // again.
+    let _ = spawn_mcp_sync_pass(
+        enabled,
+        || MCP_SYNC_THROTTLE.claim(crate::usage::now_ms()),
+        sync_mcp_logins_once,
+    );
+}
+
+/// Start `pass` on a thread of its own holding the claim `claim` takes, when
+/// `enabled` and the claim is granted; `claim` is never called while the sync
+/// is off. The thread's handle, or `None` when nothing started.
+fn spawn_mcp_sync_pass(
+    enabled: bool,
+    claim: impl FnOnce() -> Option<crate::plugin_host::HealClaim<'static>>,
+    pass: impl FnOnce() + Send + 'static,
+) -> Option<JoinHandle<()>> {
+    if !enabled {
+        return None;
+    }
+    let claim = claim()?;
+    thread::Builder::new()
+        .name("clauth-mcp-sync".into())
+        .spawn(move || {
+            let _claim = claim;
+            pass();
+        })
+        .ok()
+}
+
+/// One MCP login sync pass: collect `mcpOAuth` from every account's carrier
+/// store, every account's parked MCP logins, every live session's
+/// `.credentials.json` and the global one ([`mcp_sync_live_files`]) and, on
+/// macOS, every live session's per-session Keychain item
+/// ([`mcp_sync_item_sources`]), and bring every carrier store up to them by
+/// the same-login and sign-out rules ([`crate::claude::sync_mcp_pass`], the
+/// daemon's full pass). Only the stores no
+/// running session links are written ([`stores_running_sessions_link`]): the
+/// parked files, the live files, the items and a linked store are sources, so
+/// a running session takes a new login at its next switch and a store it links
+/// takes it once the session ends or moves off it. Off with `sync_mcp_logins`.
+pub(crate) fn sync_mcp_logins_once() {
+    if !crate::claude::sync_mcp_logins() {
+        return;
+    }
+    sync_mcp_logins_into(&crate::claude::mcp_carrier_store_paths(), mcp_sync_sources);
+}
+
+/// The sync pass over `store_paths`: `collect` gathers the sources, and the
+/// full pass brings every one of the stores no running session links up to
+/// them ([`crate::claude::sync_mcp_pass`]). With no store to write
+/// nothing is collected: every source read (a `security` call per live
+/// session on macOS) would be for no write.
+fn sync_mcp_logins_into(
+    store_paths: &[PathBuf],
+    collect: impl FnOnce(&[PathBuf]) -> Vec<crate::mcp_sync::Source>,
+) {
+    if store_paths.is_empty() {
+        return;
+    }
+    let sources = collect(store_paths);
+    let stores = crate::claude::sync_mcp_pass(store_paths, &sources, true);
+    if let Some(line) = crate::claude::mcp_sync_line(
+        crate::logline::role(crate::logline::stamped()),
+        "the daemon's sync",
+        &stores,
+    ) {
+        logline!("{line}");
+    }
+}
+
+/// Every source of the MCP login sync, read and never written: the parked
+/// logins, `store_paths` themselves, the live credential files
+/// ([`mcp_sync_live_files`]) and, on macOS, the live sessions' items.
+fn mcp_sync_sources(store_paths: &[PathBuf]) -> Vec<crate::mcp_sync::Source> {
+    let mut sources = crate::claude::read_mcp_sources(&crate::claude::mcp_parked_login_paths());
+    sources.extend(crate::claude::read_mcp_sources(store_paths));
+    // A registry that does not read whole may hide a running session whose
+    // own file holds a copy: the pass then counts a source that did not read.
+    // The live dirs below come from a second listing, which skips an entry
+    // the OS fails to yield: such a failure on that listing alone goes unseen.
+    if !crate::live_sessions::registry_reads_whole() {
+        sources.push(crate::mcp_sync::Source {
+            key: Some("live:".to_string()),
+            value: None,
+        });
+    }
+    let live = live_session_runtime_dirs();
+    // A job list that does not read whole may hide a job tree holding a copy:
+    // the pass then counts a source that did not read.
+    let (job_trees, jobs_read) = match crate::claude_jobs::job_trees().unfinished_jobs() {
+        Some((unfinished, short)) => (
+            unfinished.into_iter().map(|(_, tree)| tree).collect(),
+            !short,
+        ),
+        None => (Vec::new(), false),
+    };
+    if !jobs_read {
+        sources.push(crate::mcp_sync::Source {
+            key: Some("jobs:".to_string()),
+            value: None,
+        });
+    }
+    // A live `.credentials.json` Claude Code has turned into a regular file
+    // holds a login made inside that running session, and writing it would
+    // race Claude Code's own refresh of the same file.
+    sources.extend(crate::claude::read_mcp_sources(&mcp_sync_live_files(
+        &live, &job_trees,
+    )));
+    #[cfg(target_os = "macos")]
+    mcp_sync_item_sources(&live, &mut sources);
+    sources
+}
+
+/// macOS: read every live session's per-session Keychain item into `sources`,
+/// whether or not clauth owns it (Claude Code creates the item itself on an
+/// MCP sign-in, and that fresh login must count). Items are read, never
+/// written: a write would race Claude Code's own saves of the item. A session
+/// whose read fails on anything but a locked keychain joins
+/// [`ITEM_READ_GAVE_UP`] ([`mcp_sync_item_sources_with`]).
+#[cfg(target_os = "macos")]
+fn mcp_sync_item_sources(live: &[LiveRuntime], sources: &mut Vec<crate::mcp_sync::Source>) {
+    if !crate::keychain::enabled() {
+        return;
+    }
+    sources.extend(with_gave_up_released(&ITEM_READ_GAVE_UP, |gave_up| {
+        mcp_sync_item_sources_with(live, gave_up, read_live_item)
+    }));
+}
+
+/// The items of `sessions`, each read through `read_item` at most once. A
+/// session with no item is no source. A locked keychain, a session given up
+/// and a session whose row does not read are each a source that did not read
+/// (its record kept, no sign-out seen, no tombstone ended through it): its
+/// item may hold anything, and the swap hand-off reads it directly. A locked
+/// one is retried next pass; an `Err` gives the session up. `gave_up` holds
+/// the `(session id, started_at)` of the sessions given up: it is pruned to
+/// the keys `sessions` hold now first, so a dead incarnation of a recycled id
+/// leaves with it, and a session in it is never read. A session whose row does
+/// not read this pass keeps every entry under its id, as the stale-copy sweep
+/// prunes, so one failed row read never costs a second dialog.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller outside tests is the macOS MCP login sync"
+    )
+)]
+pub(crate) fn mcp_sync_item_sources_with(
+    sessions: &[LiveRuntime],
+    gave_up: &mut BTreeSet<(String, u64)>,
+    mut read_item: impl FnMut(&LiveRuntime) -> Result<LiveItemRead>,
+) -> Vec<crate::mcp_sync::Source> {
+    let mut keyed: Vec<(&LiveRuntime, (String, u64))> = Vec::new();
+    let mut unread: Vec<&str> = Vec::new();
+    for live in sessions {
+        match crate::live_sessions::get(&live.session) {
+            Some(row) => keyed.push((live, (live.session.clone(), row.started_at))),
+            None => unread.push(&live.session),
+        }
+    }
+    gave_up.retain(|key| {
+        keyed.iter().any(|(_, live_key)| live_key == key) || unread.contains(&key.0.as_str())
+    });
+    let not_read = |live: &LiveRuntime| crate::mcp_sync::Source {
+        key: Some(crate::mcp_sync::item_key(&live.runtime)),
+        value: None,
+    };
+    let mut items: Vec<crate::mcp_sync::Source> = sessions
+        .iter()
+        .filter(|live| unread.contains(&live.session.as_str()))
+        .map(not_read)
+        .collect();
+    for (live, key) in keyed {
+        if gave_up.contains(&key) {
+            items.push(not_read(live));
+            continue;
+        }
+        match read_item(live) {
+            Ok(LiveItemRead::Item(item)) => items.push(crate::mcp_sync::Source {
+                key: Some(crate::mcp_sync::item_key(&live.runtime)),
+                value: Some(item),
+            }),
+            Ok(LiveItemRead::Locked) => items.push(not_read(live)),
+            Ok(LiveItemRead::Absent) => {}
+            Err(e) => {
+                items.push(not_read(live));
+                gave_up.insert(key);
+                logline!(
+                    "{}: could not read session {}'s per-session Keychain item for its MCP \
+                     server logins: {e:#}. Not reading it again",
+                    crate::logline::role(crate::logline::stamped()),
+                    live.session
+                );
+            }
+        }
+    }
+    items
 }
 
 /// Which Keychain arm a session start takes, derived from the install source
@@ -12595,10 +13168,12 @@ fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
 ///     install source, only a strictly fresher copy per server winning, then
 ///     relink onto it. F's login is written nowhere, and no key that
 ///     authenticates or names an account crosses: F can be a stale row's copy
-///     of another account. A store copy newer than F's is never replaced, and
-///     only a strictly fresher one from F lands — its expiry later than the
-///     store's, or present where the store has none — since peer sessions write
-///     the store through their links.
+///     of another account. A copy from F that can authenticate replaces a
+///     signed-out one in the store and a signed-out one from F never lands;
+///     otherwise a store copy newer than F's is never replaced, and only a
+///     strictly fresher one from F lands — its expiry later than the store's,
+///     or present where the store has none — since peer sessions write the
+///     store through their links.
 ///  4. NO STORE HOLDS IT: F's non-blank refresh token is neither C's current
 ///     login nor in C's spent record — refuse, writing nothing and keeping F
 ///     byte for byte.

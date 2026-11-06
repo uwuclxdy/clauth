@@ -2419,6 +2419,53 @@ fn a_touch_receipt_only_resolves_the_store_it_names() {
     );
 }
 
+/// One MCP login sync pass rewrites both of a profile's stores, so the receipt
+/// file holds one receipt per store: stamping one never replaces the other's.
+/// A file an older clauth wrote, holding one receipt, still resolves its store.
+#[test]
+fn a_touch_receipt_for_one_store_keeps_the_other_stores_receipt() {
+    let _home = HomeSandbox::new();
+    let name = "receipt-pair";
+    let profile = crate::profile::ProfileName::from(name);
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("access", "refresh"));
+    let cred_path = profile_subpath(&profile, "credentials.json").expect("cred path");
+    let sidecar = profile_subpath(&profile, "session-token.json").expect("sidecar path");
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    let now = std::time::SystemTime::now();
+    let cred_written = now - std::time::Duration::from_secs(300);
+    let sidecar_written = now - std::time::Duration::from_secs(200);
+    crate::testutil::set_mtime(&cred_path, now);
+    crate::testutil::set_mtime(&sidecar, now);
+    crate::profile_cache::write_touch_receipt(&profile, &cred_path, now, Some(cred_written));
+    crate::profile_cache::write_touch_receipt(&profile, &sidecar, now, Some(sidecar_written));
+
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(cred_written),
+        "the first store's receipt survives the second store's stamp",
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&sidecar),
+        Some(sidecar_written),
+    );
+
+    let receipt_file =
+        profile_subpath(&profile, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path");
+    std::fs::write(
+        &receipt_file,
+        serde_json::json!({ "store": "credentials.json", "stamped": now, "prev": cred_written })
+            .to_string(),
+    )
+    .expect("an older clauth's receipt");
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(cred_written),
+        "a single receipt an older clauth wrote still resolves its store",
+    );
+}
+
 /// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
 /// credential's granted scopes on refresh). Order must survive and an empty set
 /// must read as `None` so the refresh path falls back instead of sending `""`.
@@ -9919,4 +9966,26 @@ fn the_probe_keys_toggle_their_template_examples_in_place() {
     profile.usage_probe_interval_ms = 90_000;
     save_profile_config(&profile).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), template);
+}
+
+// `sync_mcp_logins` defaults ON with the same serde contract as
+// `preserve_non_login_keys`: absent reads on, an explicit off round-trips.
+#[test]
+fn sync_mcp_logins_defaults_true_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(state.sync_mcp_logins);
+    assert!(AppState::default().sync_mcp_logins);
+    let off = AppState {
+        sync_mcp_logins: false,
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&off).expect("render");
+    assert!(rendered.contains("sync_mcp_logins = false"), "{rendered}");
+    assert!(
+        !toml::from_str::<AppState>(&rendered)
+            .expect("reparse")
+            .sync_mcp_logins
+    );
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render");
+    assert!(!rendered_on.contains("sync_mcp_logins"), "{rendered_on}");
 }

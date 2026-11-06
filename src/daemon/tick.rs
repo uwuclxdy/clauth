@@ -116,6 +116,16 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+        // Keep MCP server logins in step across every account's store.
+        // Throttled and detached inside, so it never spends this tick's window;
+        // its toggle off the config this tick's reload refreshed, a poisoned
+        // config mutex reading on like the file's default.
+        let sync_mcp = self
+            .config
+            .lock()
+            .map(|c| c.state.sync_mcp_logins)
+            .unwrap_or(true);
+        crate::runtime::sync_mcp_logins_detached(sync_mcp);
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every

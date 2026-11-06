@@ -1186,6 +1186,23 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) preserve_non_login_keys: bool,
+    /// Keep every account's MCP-server logins (`mcpOAuth`) in step: an MCP
+    /// login belongs to no Claude account, so a fresh one made on any account
+    /// or inside any live session is copied to every account's credential
+    /// store that holds a Claude login or MCP logins (an account with no such
+    /// store gets none), where that store holds a copy of the same login or
+    /// none (`claude::sync_mcp_pass`; an account's own separately made login
+    /// is kept, and a login signed out of is removed everywhere); a running
+    /// session takes it at its next switch. With it on, a switch's carry keeps
+    /// the incoming account's own logins too. The daemon
+    /// does it on its tick and a swap's hand-off does it at once, neither into
+    /// a store a running session reads through its link. Default ON; off leaves
+    /// each account with its own copies (the carries' usable-first rule still
+    /// applies). Read off disk where it is used (`claude::sync_mcp_logins`),
+    /// where an unreadable file counts as on; the daemon tick gates the pass
+    /// off the config it reloads.
+    #[serde(default = "default_sync_mcp_logins", skip_serializing_if = "is_true")]
+    pub(crate) sync_mcp_logins: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -1476,6 +1493,10 @@ fn default_preserve_non_login_keys() -> bool {
     true
 }
 
+fn default_sync_mcp_logins() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -1585,6 +1606,7 @@ impl Default for AppState {
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
             preserve_non_login_keys: default_preserve_non_login_keys(),
+            sync_mcp_logins: default_sync_mcp_logins(),
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,

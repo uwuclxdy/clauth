@@ -563,7 +563,7 @@ impl Timeline {
 /// Move an unparseable producer file `dir/name` aside to
 /// `name.corrupt-<epoch_ms>` (0600), so the next save never writes over it.
 /// False when the rename failed.
-fn move_aside(dir: &Path, name: &str) -> bool {
+pub(crate) fn move_aside(dir: &Path, name: &str) -> bool {
     let aside = dir.join(format!("{name}.corrupt-{}", crate::usage::now_ms()));
     if std::fs::rename(dir.join(name), &aside).is_err() {
         return false;

@@ -320,6 +320,13 @@ pub(crate) mod rank {
         /// acquisition is one bookkeeping step, and the warning line it decides
         /// on is written after the guard drops.
         TerminalHolders = 1902;
+        /// The sessions whose per-session Keychain item a daemon-side reader
+        /// gave up on (`runtime::ITEM_READ_GAVE_UP`), shared by the stale-copy
+        /// sweep and the MCP login sync. A true leaf: each reader copies the
+        /// set out, releases it, runs its `security` reads with nothing held,
+        /// then re-takes it to record what it gave up and pruned.
+        #[cfg(target_os = "macos")]
+        ItemReadGaveUp = 1903;
         /// The per-account `limit-reset` spend flock
         /// (`usage::limit_reset_pending::LimitResetLock`,
         /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend

@@ -10480,7 +10480,7 @@ const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
 /// so a hold only the clock releases would sit on the operator's fix for up to
 /// six hours. Every hold this long therefore records a
 /// [`crate::claude::credential_fingerprint`] of the profile, and a change to
-/// any of the three files — the operator's fix, or clauth's own successful
+/// the login any of the three files holds — the operator's fix, or clauth's own successful
 /// rotation of the chain, either of which is exactly a reason to re-judge —
 /// releases the hold on the next scan: the gate runs right after the write,
 /// not six hours later. A self-release re-runs one gate and, if the verdict
@@ -10496,7 +10496,7 @@ const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
 /// under a clock step too.
 pub(super) struct RetryHold {
     not_before: u64,
-    watched: Option<[Option<(std::time::SystemTime, u64)>; 3]>,
+    watched: Option<[Option<u64>; 3]>,
 }
 
 /// Pacing for the re-stamp scan: an in-memory throttle only — the durable

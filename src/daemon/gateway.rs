@@ -2568,6 +2568,10 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
 /// the TLS listener's FQDN lookup already runs.
 #[cfg(windows)]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    // A daemon started without a console would otherwise give each lookup a
+    // visible window of its own.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -2577,6 +2581,7 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     let ticks = String::from_utf8(output.stdout).ok()?;

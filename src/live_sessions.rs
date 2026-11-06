@@ -712,11 +712,53 @@ fn live_rows_in(registry: Option<crate::runtime::DirListing>) -> Option<Vec<Live
 /// tally's stricter reading is [`read_registry_tally`]. Whether the registry
 /// could be listed at all is [`registry_listing`]'s answer.
 fn read_registry(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
-    crate::runtime::fold_entries(
-        entries,
-        |entry| read_row(&entry.path()),
-        crate::runtime::EntryFailure::Skip,
-    )
+    crate::runtime::fold_entries(entries, read_row_entry, crate::runtime::EntryFailure::Skip)
+}
+
+/// The row an entry of the registry holds. A staging sibling a row write
+/// leaves while it renames into place (or a crashed writer left behind) is no
+/// row: every reader of the registry skips it alike.
+fn read_row_entry(entry: &std::fs::DirEntry) -> Option<LiveSession> {
+    if crate::watchdog::is_staging(&entry.file_name()) {
+        return None;
+    }
+    read_row(&entry.path())
+}
+
+/// Whether the registry lists whole: it can be located and opened, and every
+/// entry the OS yields. An absent registry lists whole (empty). Unparseable
+/// row files are not looked at here; [`read_registry`] skips them.
+pub(crate) fn registry_lists_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |_| Some(()),
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some()
+}
+
+/// Whether every row the registry holds reads: it lists whole
+/// ([`registry_lists_whole`]) and each row file parses, staging siblings
+/// skipped as every reader skips them ([`read_row_entry`]). A reader that only
+/// observes (the MCP login sync's sources) treats a `false` as a session it
+/// may have missed, so it never concludes from that pass that no session
+/// holds something.
+pub(crate) fn registry_reads_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |entry| {
+                    (!crate::watchdog::is_staging(&entry.file_name()))
+                        .then(|| read_row_entry(entry).is_some())
+                },
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some_and(|rows| rows.into_iter().all(|read| read))
 }
 
 /// [`read_registry`] as the fleet total counts it: an entry the OS fails to
@@ -727,7 +769,7 @@ fn read_registry(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>
 fn read_registry_tally(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
     crate::runtime::fold_entries(
         entries,
-        |entry| read_row(&entry.path()),
+        read_row_entry,
         crate::runtime::EntryFailure::Unknown,
     )
 }
@@ -761,7 +803,7 @@ pub(crate) fn rows_in(dir: &Path) -> Vec<(LiveSession, Option<std::time::SystemT
     entries
         .flatten()
         .filter_map(|entry| {
-            let row = read_row(&entry.path())?;
+            let row = read_row_entry(&entry)?;
             let mtime = entry.metadata().and_then(|meta| meta.modified()).ok();
             Some((row, mtime))
         })

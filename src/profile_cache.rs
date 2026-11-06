@@ -535,18 +535,21 @@ pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
 
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
 
-/// A store mtime clauth moved without writing the store.
+/// A store mtime clauth moved without writing the store's login.
 ///
 /// The per-session swap executor must move the mtime of the store it repoints to
 /// — Claude Code re-reads credentials only when that value changes, so an
 /// mtime-preserving repoint is a silent no-op — but every OTHER reader of that
-/// mtime is asking when the bytes were last WRITTEN, and answers a bare stamp as
-/// "just now". This is what separates the two.
+/// mtime is asking when the login was last WRITTEN, and answers a bare stamp as
+/// "just now". The MCP login sync's write is the other such move: it rewrites
+/// the store's `mcpOAuth` and leaves the login as it was. This is what separates
+/// them from a login write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TouchReceipt {
     /// File name of the stamped store. A profile can hold both a
-    /// `credentials.json` and a `session-token.json` and only ever one of them
-    /// is stamped, so a receipt for one must not resolve the other.
+    /// `credentials.json` and a `session-token.json`, and one sync pass writes
+    /// both, so the receipt file holds one receipt per store: a receipt for one
+    /// never resolves the other, and a stamp of one never replaces the other's.
     store: String,
     /// The mtime the stamp actually landed on, read back rather than predicted —
     /// a coarse filesystem truncates the value asked for. A store whose mtime has
@@ -559,30 +562,48 @@ pub(crate) struct TouchReceipt {
 
 /// Record that `name`'s `store` carries a bare stamp. Best-effort like every
 /// other per-profile cache — a receipt that never lands leaves the readers on the
-/// raw mtime, which is the pre-receipt answer rather than a worse one.
+/// raw mtime, which is the pre-receipt answer rather than a worse one. Returns
+/// whether the receipt landed, for a caller that says so when it did not.
 pub(crate) fn write_touch_receipt(
     name: &ProfileName,
     store: &Path,
     stamped: SystemTime,
     prev: Option<SystemTime>,
-) {
+) -> bool {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
-        return;
+        return false;
     };
     debug_assert!(
         crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
         "the receipt is read back from the store's own directory, so it has to be written there",
     );
-    write_profile_cache_for(
-        Harness::Claude,
-        name,
-        TOUCH_RECEIPT_FILE,
-        &TouchReceipt {
-            store: file.to_string(),
-            stamped,
-            prev,
-        },
-    );
+    let mut receipts = read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE));
+    receipts.retain(|receipt| receipt.store != file);
+    receipts.push(TouchReceipt {
+        store: file.to_string(),
+        stamped,
+        prev,
+    });
+    write_profile_cache_reported_for(Harness::Claude, name, TOUCH_RECEIPT_FILE, &receipts)
+}
+
+/// The receipts in `receipt_file`, one per store: a file an older clauth wrote
+/// holds a single receipt, read as one. An absent, unreadable or unparseable file
+/// holds none.
+///
+/// The list form is not readable by an older clauth, which reads it as no
+/// receipt and falls back to the store's mtime, and whose single-receipt write
+/// replaces the file and drops the other store's receipt. While older and newer
+/// clauths share one machine that costs, at worst, one stray session reload or
+/// one store kept over a session's own file, until every clauth on the machine
+/// runs this version.
+fn read_touch_receipts(receipt_file: &Path) -> Vec<TouchReceipt> {
+    let Ok(text) = std::fs::read_to_string(receipt_file) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<TouchReceipt>>(&text)
+        .or_else(|_| serde_json::from_str::<TouchReceipt>(&text).map(|receipt| vec![receipt]))
+        .unwrap_or_default()
 }
 
 /// When `store`'s bytes were last written: its mtime, unless a [`TouchReceipt`]
@@ -603,10 +624,9 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
         return Some(mtime);
     };
-    std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
-        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+    read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE))
+        .into_iter()
+        .find(|receipt| receipt.store == file && mtime == receipt.stamped)
         .map_or(Some(mtime), |receipt| receipt.prev)
 }
 
