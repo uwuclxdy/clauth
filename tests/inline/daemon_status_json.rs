@@ -119,6 +119,8 @@ fn build_status_top_level_shape_and_active() {
             // Additive: the banked usage-limit reset count clauth last read,
             // `null` with no reading.
             "limit_resets",
+            // Additive: when that count was read, `null` with no reading.
+            "limit_resets_read_at",
             "name",
             "next_refresh_at",
             "provider",
@@ -2209,6 +2211,7 @@ fn status_body_matches_legacy_json_bytes() {
                 }),
                 credit_capped: false,
                 limit_resets: Some(3),
+                limit_resets_read_at: Some("2026-09-12T23:40:00+00:00".to_string()),
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2235,6 +2238,7 @@ fn status_body_matches_legacy_json_bytes() {
                 extra_usage: None,
                 credit_capped: false,
                 limit_resets: None,
+                limit_resets_read_at: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2264,6 +2268,7 @@ fn status_body_matches_legacy_json_bytes() {
                 extra_usage: None,
                 credit_capped: false,
                 limit_resets: None,
+                limit_resets_read_at: None,
             },
         ],
     };
@@ -2282,18 +2287,21 @@ fn status_body_matches_legacy_json_bytes() {
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
-        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3,"#,
+        r#""limit_resets_read_at":"2026-09-12T23:40:00+00:00"},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""limit_resets_read_at":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
-        r#""extra_usage":null,"credit_capped":false,"limit_resets":null}]}"#,
+        r#""extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""limit_resets_read_at":null}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -3975,9 +3983,154 @@ fn an_entry_from_an_older_daemon_reads_with_no_banked_resets() {
     };
     let mut v = status_value(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array_mut().unwrap();
-    profiles[0].as_object_mut().unwrap().remove("limit_resets");
+    let entry = profiles[0].as_object_mut().unwrap();
+    entry.remove("limit_resets");
+    entry.remove("limit_resets_read_at");
 
     let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
     assert_eq!(entries[0].limit_resets, None);
+    assert_eq!(entries[0].limit_resets_read_at, None);
     assert_eq!(entries[0].name.as_str(), "work");
+}
+
+/// A claude count is dated by its own read, never the entry's `fetched_at`,
+/// which dates the usage cache: `limit_resets_read_at` is the reading's stamp
+/// in the feed's `+00:00` form, a zero count dated like any other. No reading,
+/// or a reading with no stamp or one past the clock, publishes `null`.
+#[test]
+fn a_claude_entry_dates_its_banked_resets_by_their_own_read() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("banked"),
+            oauth_profile("spent"),
+            oauth_profile("unread"),
+            oauth_profile("unstamped"),
+            oauth_profile("ahead"),
+        ],
+    };
+    crate::testutil::register_names(&["banked", "spent", "unread", "unstamped", "ahead"]);
+    let ahead_of_the_clock = crate::usage::now_ms() + 3 * 3_600_000;
+    crate::testutil::write_claude_limit_resets("ahead", 1, &[], None, ahead_of_the_clock);
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    crate::testutil::write_claude_limit_resets(
+        "banked",
+        3,
+        &["five_hour"],
+        None,
+        1_790_000_000_500,
+    );
+    crate::testutil::write_claude_limit_resets("spent", 0, &[], None, 1_790_000_060_000);
+    let unstamped = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("unstamped"),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(unstamped.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(&unstamped, r#"{"usable":2}"#).expect("write limit_resets.json");
+
+    let v = status_value(&config, 300_000, None, false);
+    let row = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    assert_eq!(
+        row("banked")["limit_resets_read_at"],
+        "2026-09-21T14:13:20+00:00"
+    );
+    assert_eq!(
+        row("spent")["limit_resets_read_at"],
+        "2026-09-21T14:14:20+00:00"
+    );
+    assert_eq!(
+        row("unread").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "nothing read publishes a present null"
+    );
+    assert_eq!(row("unstamped")["limit_resets"], 2);
+    assert_eq!(
+        row("unstamped").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "a reading with no stamp keeps its count and dates nothing"
+    );
+    assert_eq!(row("ahead")["limit_resets"], 1);
+    assert_eq!(
+        row("ahead").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "a stamp past the clock keeps its count and dates nothing"
+    );
+}
+
+/// A codex count rides the usage cache, so its read is the entry's own
+/// `fetched_at`; a read zero is dated too, and a cache with no count dates
+/// nothing. The caches are dated in the past, so a stamp taken at build time
+/// cannot pass for the poll's.
+#[test]
+fn a_codex_entry_dates_its_banked_resets_by_its_poll() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["held", "spent", "plain"]);
+    let cache = |usable: Option<u32>| crate::usage::UsageInfo {
+        limit_resets: usable.map(|usable| crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(2)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("spent"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(0)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("plain"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(None),
+    );
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    let polled = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    for name in ["held", "spent"] {
+        let path = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .expect("usage cache path");
+        crate::testutil::set_mtime(&path, polled);
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    assert!(row("held")["fetched_at"].is_string(), "the poll dated it");
+    let dated = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("held")["limit_resets_read_at"], dated);
+    assert_eq!(row("held")["fetched_at"], dated);
+    assert_eq!(
+        row("spent")["limit_resets_read_at"],
+        dated,
+        "a read zero is dated like any other"
+    );
+    assert_eq!(
+        row("plain").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "no count dates nothing"
+    );
 }

@@ -216,10 +216,18 @@ fn anchored_account(name: &ProfileName) -> Option<crate::profile::AccountId> {
 }
 
 /// The banked usage-limit reset count of `name`'s claude `limit_resets.json`,
-/// `None` with no readable reading. A roster row and the status feed both read
-/// it here, so neither can answer differently about the same file.
+/// `None` with no readable reading. A roster row reads it here and the status
+/// feed through [`claude_limit_resets_reading`], so neither can answer
+/// differently about the same file.
 pub(crate) fn claude_limit_resets(name: &ProfileName) -> Option<u32> {
-    load_profile_cache::<crate::usage::LimitResets>(name, LIMIT_RESETS_FILE).map(|r| r.usable)
+    claude_limit_resets_reading(name).map(|r| r.usable)
+}
+
+/// The whole reading behind [`claude_limit_resets`], loaded once so a caller
+/// publishing both the count and its read stamp cannot pair a new count with
+/// an old date.
+pub(crate) fn claude_limit_resets_reading(name: &ProfileName) -> Option<crate::usage::LimitResets> {
+    load_profile_cache::<crate::usage::LimitResets>(name, LIMIT_RESETS_FILE)
 }
 
 /// The credit refusal on record for `name`, if any: the one gate every reader

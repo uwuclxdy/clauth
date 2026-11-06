@@ -4694,6 +4694,10 @@ fn profile_entry_requires_only_what_every_supported_daemon_sends() {
         documents("ProfileEntry", "limit_resets"),
         "ProfileEntry documents limit_resets"
     );
+    assert!(
+        documents("ProfileEntry", "limit_resets_read_at"),
+        "ProfileEntry documents limit_resets_read_at"
+    );
 }
 
 /// The API's account view carries the banked count each account's last read

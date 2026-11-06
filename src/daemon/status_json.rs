@@ -305,6 +305,14 @@ pub(crate) struct ProfileEntry {
     /// body lacks it.
     #[serde(default)]
     pub(crate) limit_resets: Option<u32>,
+    /// When that count was read, in the feed's `+00:00` form: a claude
+    /// account's off `limit_resets.json`'s own read stamp, a codex account's
+    /// off the usage cache's poll (`fetched_at`). `null` with no reading, or a
+    /// claude reading with no stamp or one stamped in the future. A claude
+    /// entry's `fetched_at`/`stale` date only the usage cache, so they never
+    /// stand in for this. Never required: an older daemon's body lacks it.
+    #[serde(default)]
+    pub(crate) limit_resets_read_at: Option<String>,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -633,6 +641,9 @@ pub(crate) fn build_profile_entries(
                     percent: e.utilization,
                 });
             let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
+            // One load for the count and its stamp: a second read could pair a
+            // new count with an old date.
+            let banked_resets = crate::profile_cache::claude_limit_resets_reading(name);
 
             ProfileEntry {
                 name: name.clone(),
@@ -667,7 +678,12 @@ pub(crate) fn build_profile_entries(
                 spend,
                 extra_usage,
                 credit_capped,
-                limit_resets: crate::profile_cache::claude_limit_resets(name),
+                limit_resets: banked_resets.as_ref().map(|r| r.usable),
+                limit_resets_read_at: banked_resets
+                    .as_ref()
+                    .and_then(|r| r.fetched_at)
+                    .filter(|at| *at <= now_ms())
+                    .map(ms_to_iso),
             }
         })
         .collect()
@@ -695,6 +711,10 @@ pub(crate) fn build_codex_entries(
         .map(|name| {
             let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
             let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            let banked_resets = cached
+                .as_ref()
+                .and_then(|u| u.limit_resets.as_ref())
+                .map(|r| r.usable);
             ProfileEntry {
                 name: name.clone(),
                 active: active.is_some_and(|a| a == name),
@@ -751,10 +771,10 @@ pub(crate) fn build_codex_entries(
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
-                limit_resets: cached
-                    .as_ref()
-                    .and_then(|u| u.limit_resets.as_ref())
-                    .map(|r| r.usable),
+                limit_resets: banked_resets,
+                // A codex count rides the usage cache, so the time that file
+                // landed dates it, as it dates the entry; no count dates nothing.
+                limit_resets_read_at: banked_resets.and(mtime_ms).map(ms_to_iso),
             }
         })
         .collect()
