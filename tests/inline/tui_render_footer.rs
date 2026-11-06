@@ -2467,23 +2467,83 @@ fn the_save_cue_names_the_save_before_the_action_before_the_pool() {
     check_cue(&app, "alpha", 80);
 }
 
-/// While the exit wait holds on a running profile delete, the cue names the
-/// profile being deleted, as the cue builder words it for that name.
+/// While the exit wait holds on a running profile delete, the cue says
+/// `deleting` and names the profile, never `saving`: the words are written out
+/// so a cue builder that drops the verb cannot agree with itself. 35 columns is
+/// the narrowest row that still holds this name uncut.
 #[test]
 fn the_save_cue_names_the_profile_a_running_delete_removes() {
     let _home = crate::testutil::HomeSandbox::new();
 
-    for w in [80, 34] {
+    for w in [80, 35] {
         let mut app = bare_app();
         app.tab = Tab::Setup;
         app.deleting = Some(crate::profile::ProfileName::from("gone"));
         app.exit_wait = true;
-        let expected = format!(
-            " {SAVE_CUE_LEADER}{}",
-            prose::plain(&save_cue("gone", w - 2))
+        assert_eq!(
+            cue_row(&app, w),
+            " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now",
+            "whole row at {w}"
         );
-        assert_eq!(cue_row(&app, w), expected, "whole row at {w}");
     }
+}
+
+/// The verb comes from the arm that named the row: a write ranked above the
+/// delete says `saving` beside it, and the switch ranked below it waits its turn.
+#[test]
+fn the_save_cue_takes_its_verb_from_the_arm_that_named_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.deleting = Some(crate::profile::ProfileName::from("gone"));
+    app.rolling_switch = Some(crate::profile::ProfileName::from("arm"));
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
+    app.services.shunt_action.running = true;
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(PoolMutationKind::Remove);
+    app.exit_wait = true;
+    check_cue(&app, "bind", 80);
+
+    app.services.shunt_save = None;
+    check_cue(&app, "shunt", 80);
+
+    app.services.shunt_action.running = false;
+    check_cue(&app, "alpha", 80);
+
+    app.pool_mutation_row = None;
+    app.pool_mutation_kind = None;
+    assert_eq!(
+        cue_row(&app, 80),
+        " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
+
+    app.deleting = None;
+    check_cue(&app, "arm", 80);
+}
+
+/// `deleting` takes two cells more than `saving`, and the name pays for them:
+/// the inset row's width less the 2-cell leader and the 27 cells of copy leaves
+/// 3 cells at 34 columns and 4 at 35. The copy stays whole either way.
+#[test]
+fn a_running_deletes_cue_cuts_the_name_for_its_longer_verb() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.deleting = Some(crate::profile::ProfileName::from("gone"));
+    app.exit_wait = true;
+    assert_eq!(
+        cue_row(&app, 34),
+        " i deleting gon\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
+    assert_eq!(
+        cue_row(&app, 35),
+        " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
 }
 
 /// While the exit wait holds on a running rolling-token switch, the cue
@@ -2499,7 +2559,7 @@ fn the_save_cue_names_the_account_a_rolling_switch_arms() {
         app.exit_wait = true;
         let expected = format!(
             " {SAVE_CUE_LEADER}{}",
-            prose::plain(&save_cue("arm", w - 2))
+            prose::plain(&save_cue("saving", "arm", w - 2))
         );
         assert_eq!(cue_row(&app, w), expected, "whole row at {w}");
     }

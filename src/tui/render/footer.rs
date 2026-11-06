@@ -139,7 +139,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // quit held on a checking field/`+ add` save — on every tab, and `x` cannot
     // dismiss it. It outranks any stored alert.
     if app.exit_wait || app.loss_pending == Some(LossWarningTarget::Quit) {
-        let msg = save_cue(&saving_row_name(app), area.width);
+        let (verb, row) = save_cue_row(app);
+        let msg = save_cue(verb, &row, area.width);
         draw_alert(frame, area, SAVE_CUE_LEADER, theme::info(), &msg);
         return;
     }
@@ -1146,17 +1147,19 @@ fn inset_x(area: Rect, pad: u16) -> Rect {
     }
 }
 
-/// The row a running write is about, as the card labels it: a field's label, a
-/// `+ add` kind word, an entry's displayed name, `token`, `client tokens`,
-/// `shunt` for a `shunt_action` job, a pool account's name, the profile being
-/// deleted, the account a rolling-token switch is arming, or the account
-/// spending a refresh token. The save cue names this while the exit waits or a
-/// quit is held; the priority order matches the exit wait's own write
-/// predicate (save, then action, then pool, then the delete, then the rolling
-/// switch, then the spend).
-fn saving_row_name(app: &App) -> String {
+/// The verb and row of the save cue: `deleting` when the profile delete named
+/// the row, else `saving`. The row is the one a running write is about, as the
+/// card labels it: a field's label, a `+ add` kind word, an entry's displayed
+/// name, `token`, `client tokens`, `shunt` for a `shunt_action` job, a pool
+/// account's name, the profile being deleted, the account a rolling-token
+/// switch is arming, or the account spending a refresh token. The save cue
+/// names this while the exit waits or a quit is held; the priority order
+/// matches the exit wait's own write predicate (save, then action, then pool,
+/// then the delete, then the rolling switch, then the spend).
+fn save_cue_row(app: &App) -> (&'static str, String) {
+    const SAVING: &str = "saving";
     if let Some(save) = &app.services.shunt_save {
-        return match &save.key {
+        let row = match &save.key {
             ShuntSaveKey::Field(key) => escape_control(&field_label(key)),
             ShuntSaveKey::SaveAdd(kind) => kind.word().to_string(),
             ShuntSaveKey::Remove(key) => entry_display_name(app, key),
@@ -1164,23 +1167,27 @@ fn saving_row_name(app: &App) -> String {
             ShuntSaveKey::AddToken => "token".to_string(),
             ShuntSaveKey::RequireTokens => "client tokens".to_string(),
         };
+        return (SAVING, row);
     }
     if app.services.shunt_action.running {
-        return "shunt".to_string();
+        return (SAVING, "shunt".to_string());
     }
     if app.pool_mutation_kind == Some(PoolMutationKind::Remove)
         && let Some((_, name)) = &app.pool_mutation_row
     {
-        return escape_control(name.as_str());
+        return (SAVING, escape_control(name.as_str()));
     }
     if let Some(name) = &app.deleting {
-        return escape_control(name.as_str());
+        return ("deleting", escape_control(name.as_str()));
     }
     if let Some(name) = &app.rolling_switch {
-        return escape_control(name.as_str());
+        return (SAVING, escape_control(name.as_str()));
     }
-    crate::usage::spending_account(&app.activity)
-        .map_or_else(String::new, |name| escape_control(&name))
+    (
+        SAVING,
+        crate::usage::spending_account(&app.activity)
+            .map_or_else(String::new, |name| escape_control(&name)),
+    )
 }
 
 /// An entry's displayed name, as the remove row labels it: the name/id for an
@@ -1206,14 +1213,14 @@ fn entry_display_name(app: &App, key: &ShuntEntryKey) -> String {
 /// can't drift apart.
 const SAVE_CUE_LEADER: &str = "i ";
 
-/// The save cue's message: `saving {row}… · ⌃c ⌃c quit now`, the row name cut
+/// The save cue's message: `{verb} {row}… · ⌃c ⌃c quit now`, the row name cut
 /// (grapheme-safe, one `…`) so the leader and `· ⌃c ⌃c quit now` stay whole
 /// down to the width floor. The `⌃c ⌃c` run is one key span. One closure holds
 /// the copy, measured with an empty name to set the name's budget and rendered
 /// with the cut name, so the measurement and the message cannot drift.
-fn save_cue(row: &str, width: u16) -> String {
+fn save_cue(verb: &str, row: &str, width: u16) -> String {
     let key = prose::key("\u{2303}c \u{2303}c");
-    let cue = |name: &str| format!("saving {name}\u{2026} · {key} quit now");
+    let cue = |name: &str| format!("{verb} {name}\u{2026} · {key} quit now");
     let fixed = grapheme_cells(SAVE_CUE_LEADER) + grapheme_cells(&prose::plain(&cue("")));
     let budget = (width as usize).saturating_sub(fixed);
     let mut name = prefix_in_cells(row, budget).0;

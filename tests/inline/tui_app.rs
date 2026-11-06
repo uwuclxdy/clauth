@@ -58289,6 +58289,182 @@ fn space_never_arms_a_claude_accounts_delete_or_disable() {
     }
 }
 
+/// Walks the open claude card's detail focus down to its delete row. A claude
+/// card runs longer than `b3_focus_detail_row`'s walk.
+fn focus_claude_delete_row(app: &mut App) {
+    let mut steps = 0;
+    while !b3_row_holds(&render_rows(app), &["❯", "delete", "account"]) {
+        assert!(steps < 30, "no detail row reads `delete account`");
+        b3_press(app, KeyCode::Down, 1);
+        steps += 1;
+    }
+}
+
+/// The delete row of the account whose delete runs stops offering a press: the
+/// spinner takes the caret slot and the label says the delete is running. Its
+/// selector row carries the spinner too; the other account's row does not.
+#[test]
+fn a_running_delete_marks_its_own_setup_rows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    focus_claude_delete_row(&mut app);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(renders(&app, "press again to delete"), "armed first");
+    let label_column = |rows: &[String], label: &str| {
+        rows.iter()
+            .find_map(|row| Some(row[..row.find(label)?].chars().count()))
+    };
+    let armed_column = label_column(&render_rows(&app), "press again to delete");
+
+    app.deleting = Some(crate::profile::ProfileName::from("acct-one"));
+    app.tick_count = 0;
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["⠋", "deleting…"]), "{rows:#?}");
+    assert!(!renders(&app, "press again to delete"), "{rows:#?}");
+    assert_eq!(
+        label_column(&rows, "deleting…"),
+        armed_column,
+        "the spinner takes the caret's slot: {rows:#?}"
+    );
+    let list = b3_setup_list(&app);
+    assert!(b3_row_holds(&list, &["⠋", "acct-one"]), "{list:#?}");
+    assert!(!b3_row_holds(&list, &["⠋", "acct-two"]), "{list:#?}");
+
+    app.tick_count = 1;
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["⠙", "deleting…"]), "{rows:#?}");
+    let list = b3_setup_list(&app);
+    assert!(b3_row_holds(&list, &["⠙", "acct-one"]), "{list:#?}");
+}
+
+/// The mark follows the account, never the selection: with another account's
+/// delete running, the open card keeps its own delete row.
+#[test]
+fn a_running_delete_leaves_another_accounts_card_alone() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    focus_claude_delete_row(&mut app);
+
+    app.deleting = Some(crate::profile::ProfileName::from("acct-two"));
+    app.tick_count = 0;
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["❯", "delete", "account"]),
+        "{rows:#?}"
+    );
+    assert!(!renders(&app, "deleting…"), "{rows:#?}");
+    let list = b3_setup_list(&app);
+    assert!(b3_row_holds(&list, &["⠋", "acct-two"]), "{list:#?}");
+    assert!(!b3_row_holds(&list, &["⠋", "acct-one"]), "{list:#?}");
+}
+
+/// The worker removes the account before its result reaches the next tick, so
+/// the selection can land on a neighbour while the deleted account's draft is
+/// still open: that card names another account, so neither the spinner nor the
+/// deleted account's arm reaches it.
+#[test]
+fn a_finished_removal_leaves_the_neighbours_card_unmarked() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    focus_claude_delete_row(&mut app);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(renders(&app, "press again to delete"), "armed first");
+    app.deleting = Some(crate::profile::ProfileName::from("acct-one"));
+    app.tick_count = 0;
+
+    app.config().profiles.retain(|p| p.name != "acct-one");
+
+    let rows = render_rows(&app);
+    assert!(!renders(&app, "deleting…"), "{rows:#?}");
+    assert!(!renders(&app, "press again to delete"), "{rows:#?}");
+    assert!(b3_row_holds(&rows, &["delete", "account"]), "{rows:#?}");
+}
+
+/// A rename typed while the delete runs changes no stored identity, so the
+/// delete row and the selector row keep their spinners.
+#[test]
+fn a_rename_typed_mid_delete_keeps_the_running_delete_marks() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    app.deleting = Some(crate::profile::ProfileName::from("acct-one"));
+    app.tick_count = 0;
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["name", "acct-onex"]), "{rows:#?}");
+    assert!(b3_row_holds(&rows, &["⠋", "deleting…"]), "{rows:#?}");
+    let list = b3_setup_list(&app);
+    assert!(b3_row_holds(&list, &["⠋", "acct-one"]), "{list:#?}");
+}
+
+/// Leaving the detail closes its draft while the delete runs on: the preview of
+/// that account still reads as deleting, and a cursor moved to another account
+/// leaves the marks on the account being deleted.
+#[test]
+fn a_running_delete_marks_the_draftless_preview_of_its_account() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    focus_claude_delete_row(&mut app);
+    app.deleting = Some(crate::profile::ProfileName::from("acct-one"));
+    app.tick_count = 0;
+    b3_press(&mut app, KeyCode::Esc, 1);
+    assert!(app.config_draft.is_none(), "the preview holds no draft");
+
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["⠋", "deleting…"]), "{rows:#?}");
+    assert!(!b3_row_holds(&rows, &["delete", "account"]), "{rows:#?}");
+
+    b3_press(&mut app, KeyCode::Down, 1);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["delete", "account"]), "{rows:#?}");
+    assert!(!renders(&app, "deleting…"), "{rows:#?}");
+    let list = b3_setup_list(&app);
+    assert!(b3_row_holds(&list, &["⠋", "acct-one"]), "{list:#?}");
+    assert!(!b3_row_holds(&list, &["⠋", "acct-two"]), "{list:#?}");
+}
+
+/// Both Setup spinners wear the accent, and the delete row's label keeps the
+/// row's danger bold.
+#[test]
+fn a_running_deletes_setup_marks_wear_their_styles() {
+    use ratatui::style::Modifier;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    app.deleting = Some(crate::profile::ProfileName::from("acct-one"));
+    app.tick_count = 0;
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let column_of = |needle: &str| {
+        rows.iter().enumerate().find_map(|(y, row)| {
+            let byte = row.find(needle)?;
+            Some((row[..byte].chars().count() as u16, y as u16))
+        })
+    };
+
+    let (x, y) = column_of("⠋ deleting…").expect("the delete row renders its spinner");
+    let spinner = &buf[(x, y)];
+    assert_eq!(spinner.fg, crate::tui::theme::accent_color());
+    let label = &buf[(x + 2, y)];
+    assert_eq!(label.fg, crate::tui::theme::danger_color());
+    assert!(label.modifier.contains(Modifier::BOLD));
+
+    let (x, y) = column_of("⠋ acct-one").expect("the selector row renders its spinner");
+    assert_eq!(buf[(x, y)].fg, crate::tui::theme::accent_color());
+}
+
 #[test]
 fn space_never_arms_a_codex_accounts_delete() {
     let home = crate::testutil::HomeSandbox::new();

@@ -811,6 +811,78 @@ fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
 
 // ── overview row state cues ──────────────────────────────────────────────
 
+/// A running delete's spinner takes the marker slot over every other mark on
+/// that row, in the pool row's accent, and only on the account being deleted.
+#[test]
+fn a_running_delete_takes_the_marker_slot_on_its_own_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::usage::{PlanInfo, PlanTier};
+    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
+        tier: PlanTier::Free,
+        plan_display_name: None,
+        subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
+        email: None,
+    });
+    let (b, b_readings) = profile("b", 10.0, 10.0, 3600);
+    let (mut config, readings) =
+        config_with(vec![(a, a_readings), (b, b_readings)], Some("a"), vec![]);
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("a"));
+    app.tick_count = 0;
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(
+        text.split_whitespace().take(2).eq(["⠋", "a"]),
+        "the spinner leads the name: {text:?}"
+    );
+    assert!(!text.contains('⊖'), "the top rung yields: {text:?}");
+    assert!(!text.contains('×'), "the broken mark yields: {text:?}");
+    let marker = line.spans.iter().find(|s| s.content == "⠋").unwrap();
+    assert_eq!(marker.style.fg, theme::accent().fg);
+
+    app.tick_count = 1;
+    let next = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
+    assert!(
+        next.split_whitespace().take(2).eq(["⠙", "a"]),
+        "the spinner advances with the tick: {next:?}"
+    );
+
+    let other = line_text(&render_overview_row(
+        &app, 1, &widths, false, false, &readings,
+    ));
+    assert!(
+        other.split_whitespace().next() == Some("b"),
+        "the account no delete runs on keeps its plain row: {other:?}"
+    );
+}
+
+/// A disabled row flattens the delete's spinner to dim like every other mark on
+/// that row, and the glyph stays.
+#[test]
+fn a_running_delete_on_a_disabled_row_dims_its_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("a"));
+    app.tick_count = 0;
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let marker = line.spans.iter().find(|s| s.content == "⠋").unwrap();
+    assert_eq!(marker.style.fg, theme::dim().fg);
+}
+
 /// Marker column: a broken login (×) outranks both the bell (!) and the
 /// active mark (✻) — usage alerts are moot until re-login.
 #[test]

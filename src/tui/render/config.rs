@@ -178,7 +178,13 @@ fn setup_selector_row(
             } else {
                 name_color(cfg.is_active(&p.name))
             };
-            picker_row(selected, focused, p.name.to_string(), ns, width)
+            let mark = (app.deleting.as_ref() == Some(&p.name)).then(|| {
+                Span::styled(
+                    format!("{} ", spinner_frame(app.tick_count)),
+                    theme::accent(),
+                )
+            });
+            marked_picker_row(selected, focused, mark, p.name.to_string(), ns, width)
         }
         MainItemKind::Codex(i) => {
             let Some(row) = app.codex_rows.get(i) else {
@@ -217,6 +223,9 @@ fn dead_credential_mark(style: Style) -> Span<'static> {
 struct Snap {
     title: String,
     name: String,
+    /// The spinner frame the delete row shows while this card's account is the
+    /// one being deleted.
+    delete_frame: Option<&'static str>,
     /// The saved (typed) base URL — what the base-url row shows at rest, even
     /// while a keyless URL is hidden behind the login.
     base_url: String,
@@ -387,6 +396,7 @@ impl Snap {
         Snap {
             title: title.to_string(),
             name: String::new(),
+            delete_frame: None,
             base_url: String::new(),
             base_url_derived: String::new(),
             base_url_unused: false,
@@ -505,6 +515,10 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 } else {
                     String::new()
                 },
+                // The stored name, never the draft's typed buffer, so a rename
+                // typed mid-delete keeps the mark.
+                delete_frame: (app.deleting.as_ref() == Some(&p.name))
+                    .then(|| spinner_frame(app.tick_count)),
                 base_url: text(&saved_url),
                 base_url_derived: text(&p.base_url),
                 base_url_unused: saved_url.is_some() && p.base_url.is_none(),
@@ -1083,7 +1097,11 @@ fn draw_settings_rows(
         _ => app.config_draft.as_ref(),
     };
     let editing = draft.and_then(|d| d.active);
-    let armed_action = draft.and_then(|d| d.armed_action);
+    // An arm belongs to the draft's account: the worker's removal can leave the
+    // draft open on a neighbour's card until the result drains.
+    let armed_action = draft
+        .filter(|d| d.editing_name.as_deref() == Some(snap.title.as_str()))
+        .and_then(|d| d.armed_action);
 
     // The endpoint-shaped typing reads the derived URL (the draft buffer live,
     // else the profile's routing URL), never the saved value the base-url row
@@ -1809,10 +1827,13 @@ fn detail_row(
             selected,
         ),
         ConfigRow::Delete => {
-            let label = if armed_action == Some(ConfigRow::Delete) {
-                "press again to delete".to_string()
-            } else {
-                "delete account".to_string()
+            let (arrow, label) = match snap.delete_frame {
+                Some(frame) => (
+                    Span::styled(format!("{frame} "), theme::accent()),
+                    "deleting\u{2026}",
+                ),
+                None if armed_action == Some(ConfigRow::Delete) => (arrow, "press again to delete"),
+                None => (arrow, "delete account"),
             };
             Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }

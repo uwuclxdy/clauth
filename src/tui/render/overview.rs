@@ -1324,17 +1324,24 @@ fn render_overview_row(
     // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
     // mark/`▲` still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
-    // Marker precedence: canceled subscription or organization refusal (⊖) >
-    // broken login (×) > token danger (⊘) > bell (!) > active (✻ / its working
-    // frame / ⏣ / ⥋) > peak hours (▲). A refused service is dead-first (the org
-    // refuses every request, matching the Fallback ladder where `OrgRefused` and
-    // `Canceled` outrank `AuthBroken`); a dead login makes usage alerts moot
-    // until re-login; a dead / mis-filled long-lived token signs sessions out on
-    // the next switch, so it outranks a bell. The active mark
+    // Marker precedence: a running delete (its spinner) > canceled subscription
+    // or organization refusal (⊖) > broken login (×) > token danger (⊘) > bell
+    // (!) > active (✻ / its working frame / ⏣ / ⥋) > peak hours (▲). A refused
+    // service is dead-first (the org refuses every request, matching the
+    // Fallback ladder where `OrgRefused` and `Canceled` outrank `AuthBroken`);
+    // a dead login makes usage alerts moot until re-login; a dead / mis-filled
+    // long-lived token signs sessions out on the next switch, so it outranks a
+    // bell. The active mark
     // outranks the peak marker — naming which account a bare `claude`
     // authenticates as beats a schedule the Usage tab's pricing row already names.
     let auth_broken = cfg.is_auth_broken(&profile.name);
-    if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
+    if app.deleting.as_ref() == Some(&profile.name) {
+        spans.push(Span::styled(
+            spinner_frame(app.tick_count),
+            hue(theme::accent()),
+        ));
+        spans.push(Span::raw(" "));
+    } else if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if auth_broken {
