@@ -108,10 +108,17 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
   return { fetches, events, lastAsk: () => lastAsk, poll, wait, answer }
 }
 
-function installBoilerplate(on: On, env: Record<string, string> = { HOME: '/home/u' }) {
+function installBoilerplate(
+  on: On,
+  env: Record<string, string> = { HOME: '/home/u' },
+  session: { down: boolean } = { down: false },
+) {
   const clock = mock.clock(on)
   mock.env(on, env)
-  on('session.id', ($, e, next) => ({ value: 'sid-1' }))
+  on('session.id', ($, e, next) => {
+    if (session.down) throw new Error('session down')
+    return { value: 'sid-1' }
+  })
   on('session.start', ($, e, next) => ({ cwd: e.cwd }))
   on('session.end', ($, e, next) => ({ sessionId: e.sessionId }))
   on('turn.start', ($, e, next) => ({ turnId: e.turnId }))
@@ -122,8 +129,13 @@ function installBoilerplate(on: On, env: Record<string, string> = { HOME: '/home
   return { clock }
 }
 
-function setup(on: On, env: Record<string, string> = { HOME: '/home/u' }, hold = true) {
-  const { clock } = installBoilerplate(on, env)
+function setup(
+  on: On,
+  env: Record<string, string> = { HOME: '/home/u' },
+  hold = true,
+  session?: { down: boolean },
+) {
+  const { clock } = installBoilerplate(on, env, session)
   const bridge = installBridge(on, clock, hold)
   return { clock, bridge }
 }
@@ -240,9 +252,9 @@ function classicBottoms(on: On): void {
 // The organization's policy plugin as Claude Code seats it for Team and
 // Enterprise and on a machine with managed settings (`cc-plugin-sec-default`,
 // outermost): every classic event, and the attachment, hook-context and
-// compaction rows, go on past the person's plugins, as that plugin sends them.
-// Each hook logs the links it passed over, which a session reports to the
-// person as skipped hooks.
+// compaction rows, a Skill's tool messages and a managed plugin's notes, go on
+// past the person's plugins, as that plugin sends them. Each hook logs the
+// links it passed over, which a session reports to the person as skipped hooks.
 const POLICY: Plugin = {
   name: 'policy',
   tier: 'prepend',
@@ -254,7 +266,7 @@ const POLICY: Plugin = {
       }
       return settled
     })
-    on('session.append', { door: ['attachment', 'hook-context', 'compaction'] }, async ($, e, next) => {
+    on('session.append', { door: ['attachment', 'hook-context', 'compaction', 'tool-message', 'note'] }, async ($, e, next) => {
       const settled = await next.to(e, 'append')
       for (const link of next.trace) {
         if (link.outcome === 'skipped') await $.ui.log(`${link.plugin}: ${next.event} skipped`)
@@ -275,7 +287,7 @@ function installSkipLog(on: On): string[] {
 }
 
 // A row at a door the policy plugin keeps from the person's plugins.
-function reservedRow(door: 'attachment' | 'hook-context' | 'compaction', uuid: string) {
+function reservedRow(door: 'attachment' | 'hook-context' | 'compaction' | 'tool-message' | 'note', uuid: string) {
   return {
     message: {
       type: 'attachment' as const,
@@ -1707,8 +1719,8 @@ test('P8: the window is per scope, not per module', async ($, on) => {
   expect(runs).toHaveLength(3)
 })
 
-// The windows belong to a session: a new one (a `/clear`, a resume) starts
-// with every window open, so its first call is checked.
+// The windows belong to a session: a fresh load starts with every window
+// open, so its first call is checked.
 test('P9: a session start opens every window', async ($, on) => {
   const { clock } = setup(on)
   toolBottom(on)
@@ -1795,14 +1807,80 @@ test('P14: a subagent agent-spawn call does not bypass its window', async ($, on
   expect(runs).toHaveLength(1)
 })
 
+// A `/clear` ends the conversation and no `session.start` follows it, so the
+// end opens the windows: the next conversation's first calls are checked.
+test('P15: a session end opens every window', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
+  await clock.advance(1_000)
+  await $.session.end({ reason: 'clear', sessionId: 'sid-1', resume: { id: 'sid-1' } })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(4)
+})
+
+// A fire that cannot name its session runs nothing, so it leaves the window
+// open for the next call.
+test('P16: a fire that cannot read its session id spends no window', async ($, on) => {
+  const session = { down: false }
+  setup(on, { HOME: '/home/u' }, true, session)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  session.down = true
+  expect((await $.tool.call(toolCall())).context).toBeUndefined()
+  expect(runs).toHaveLength(0)
+
+  session.down = false
+  expect((await $.tool.call(toolCall())).context).toEqual(['note'])
+  expect(runs).toHaveLength(1)
+})
+
 test('Q1: a hook failing after next still answers what the hooks beneath did', async ($, on) => {
   on('clock.now', () => { throw new Error('clock down') })
-  toolBottom(on, { value: { result: 'kept' } })
+  on('session.id', ($, e, next) => ({ value: 'sid-1' }))
+  let bottomRuns = 0
+  on('tool.call', ($, e, next) => {
+    bottomRuns += 1
+    return { result: 'kept' }
+  })
   const runs = installNoteCommand(on, { stdout: '' })
   const out = await $.tool.call(toolCall())
   expect(out.result).toBe('kept')
   expect(out.context).toBeUndefined()
   expect(runs).toHaveLength(0)
+  expect(bottomRuns).toBe(1)
+})
+
+// A plugin above the mod's hooks, logging how each link beneath it settled.
+const TRACER: Plugin = {
+  name: 'tracer',
+  tier: 'prepend',
+  register(on) {
+    on('tool.call', async ($, e, next) => {
+      const settled = await next(e)
+      for (const link of next.trace) await $.ui.log(`${link.plugin}: ${link.outcome}`)
+      return settled
+    })
+  },
+}
+
+// Without its own `.catch` a failure after `next` is a failed hook, which the
+// engine records against the plugin; the result stands either way.
+test('Q2: a failure after next lands in the note hook own catch', { plugins: [TRACER] }, async ($, on) => {
+  on('clock.now', () => { throw new Error('clock down') })
+  on('session.id', ($, e, next) => ({ value: 'sid-1' }))
+  toolBottom(on, { value: { result: 'kept' } })
+  const lines = installSkipLog(on)
+  installNoteCommand(on, { stdout: '' })
+  await $.tool.call(toolCall())
+  expect(lines).toContain('clauth: caught')
 })
 
 // --- under the organization's policy plugin (group S) ---
@@ -1822,6 +1900,8 @@ test('S1: no hook of the mod is passed over by the policy plugin', { plugins: [P
   await $.session.append(reservedRow('attachment', 'r1'))
   await $.session.append(reservedRow('hook-context', 'r2'))
   await $.session.append(reservedRow('compaction', 'r3'))
+  await $.session.append(reservedRow('tool-message', 'r4'))
+  await $.session.append(reservedRow('note', 'r5'))
   await $.tool.call(toolCall())
   await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: 'ok', tool_use_id: 'tu-1' })
   await $.tool.call(toolCall('a1'))

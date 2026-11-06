@@ -37,10 +37,10 @@ const NOTE_COMMAND = ['clauth', 'hook-profile-changed-note'] as const
 // policy plugin (`cc-plugin-sec-default`, outermost for Team and Enterprise
 // and on a machine with managed settings), attachment, hook-context and
 // compaction rows, a Skill's tool messages and a managed plugin's notes go on
-// past the person's plugins, and a hook that matches them is reported skipped
-// to the session. `door` is pinned, so a hook narrowed to these doors is never
-// in the chain for the others. The daemon tails the transcript file on each
-// wake, so a row left out here reaches the phone with the next one.
+// past the person's plugins. `door` is pinned, so a hook narrowed to these
+// doors is never in the chain for the others. The daemon tails the transcript
+// file on each wake, so a row left out here reaches the phone with the next
+// wake or at the session's end.
 const APPEND_DOORS = ['prompt', 'command', 'response', 'tool-result', 'delivery', 'notice', 'queue'] as const
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
@@ -78,7 +78,7 @@ let pendingPrompt: { text: string } | null = null
 let helds = new Map<string, HeldEntry>()
 let interruptedTurn: string | null = null
 let askCounter = 0
-// The last cadence run per scope, keyed by session and agent id.
+// The last cadence run per scope, keyed by agent id, the main thread's key empty.
 let lastNoteAt = new Map<string, number>()
 
 const bodyBytes = (body: string): number => encoder.encode(body).length
@@ -488,7 +488,8 @@ type NoteScope = {
 
 // The window one fire belongs to: a subagent's calls never spend the main
 // thread's window or another subagent's. The session's own windows start
-// over at each `session.start`, so the loop alone names the scope.
+// over at each `session.start` and at `session.end` (a `/clear` ends the
+// conversation with no `session.start`), so the loop alone names the scope.
 function noteWindowKey(agentId: string | undefined): string {
   return agentId ?? ''
 }
@@ -559,6 +560,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    lastNoteAt.clear()
     if (!inert) {
       stopPollLoop()
       // Await the `end` post alone (the engine's own short bound caps it), so
@@ -618,6 +620,9 @@ export const register: Register = on => {
     // PostToolUse fired for an answered call alone: a refusal or an error
     // carries no note and spends no window.
     if (settled.deny !== undefined || settled.isError === true) return settled
+    // A fire that cannot name its session runs nothing, so it must not spend
+    // the window it would have run in: the read comes before the stamp.
+    const sid = await $.session.id()
     // A main-scope agent-spawn call is what the headroom nudge is computed
     // on, and a skipped fire never replays it, so it runs the command
     // whatever the window says and leaves the window where it stood.
@@ -637,7 +642,7 @@ export const register: Register = on => {
       lastNoteAt.set(key, now)
     }
     const note = await runNote($, {
-      session_id: await $.session.id(),
+      session_id: sid,
       tool_name: e.tool,
       ...(e.agentId !== undefined ? { agent_id: e.agentId } : {}),
     })
