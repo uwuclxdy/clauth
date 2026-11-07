@@ -20,8 +20,10 @@
 //! ```
 //!
 //! `used_percentage` is 0-100; `resets_at` and `seen_at` are epoch seconds.
-//! A figure is a floor as of `seen_at`: usage inside one window never goes
-//! down.
+//! `seen_at` is when the reply that carried the figure arrived (the session's
+//! last assistant entry), never when a status line repainted it: an idle
+//! session repaints its last reply's figures for as long as it stays open. A
+//! figure is a floor as of `seen_at`: usage inside one window never goes down.
 //!
 //! When many sessions share an account, `/usage` answers 429 for long
 //! stretches and the store keeps the last body, while those sessions keep
@@ -125,55 +127,50 @@ impl Reading {
     }
 }
 
-/// An unchanged window is re-written at most this often, only to advance its
-/// `seen_at`.
-const CONFIRM_EVERY_SECS: i64 = 30;
-
 /// The window to store after `incoming`, or `None` when the stored one stands
-/// unchanged. Same rules as [`fold_window`]: within one window the higher
-/// figure wins, a later reset starts a new window, an earlier one is an old
-/// reply and is ignored.
+/// unchanged. `seen_at` is when the reply that carried `incoming` arrived, not
+/// when it was read: a status line repaints its last reply's figures long after
+/// that reply, and a repaint is no newer a reading. Same rules as
+/// [`fold_window`]: a later reset starts a new window, an earlier one is an old
+/// reply and is ignored, and within one window the record keeps the highest
+/// figure and the latest reply (usage never goes down inside a window, so the
+/// highest figure is true as of the latest reply).
 fn next_window(
     stored: Option<ObservedWindow>,
     incoming: Reading,
-    now: i64,
+    seen_at: i64,
 ) -> Option<ObservedWindow> {
-    let fresh = |r: Reading| ObservedWindow {
-        used_percentage: r.used_percentage,
-        resets_at: r.resets_at,
-        seen_at: now,
+    let fresh = ObservedWindow {
+        used_percentage: incoming.used_percentage,
+        resets_at: incoming.resets_at,
+        seen_at,
     };
     let Some(stored) = stored else {
-        return Some(fresh(incoming));
+        return Some(fresh);
     };
     let gap = incoming.resets_at - stored.resets_at;
     if gap > SAME_WINDOW_SECS {
-        Some(fresh(incoming))
-    } else if gap < -SAME_WINDOW_SECS {
-        None
-    } else if incoming.used_percentage > stored.used_percentage {
-        Some(ObservedWindow {
-            used_percentage: incoming.used_percentage,
-            resets_at: stored.resets_at,
-            seen_at: now,
-        })
-    } else if now - stored.seen_at >= CONFIRM_EVERY_SECS {
-        Some(ObservedWindow {
-            seen_at: now,
-            ..stored
-        })
-    } else {
-        None
+        return Some(fresh);
     }
+    if gap < -SAME_WINDOW_SECS {
+        return None;
+    }
+    let next = ObservedWindow {
+        used_percentage: incoming.used_percentage.max(stored.used_percentage),
+        resets_at: stored.resets_at,
+        seen_at: seen_at.max(stored.seen_at),
+    };
+    (next != stored).then_some(next)
 }
 
-/// Fold one input's windows into `existing`. `None` when nothing changed
-/// enough to be worth a write.
+/// Fold one input's windows, read off a reply that arrived at `seen_at`, into
+/// `existing`. `None` when nothing changed.
 pub(crate) fn fold_record(
     existing: Option<Observed>,
     profile: &str,
     five_hour: Option<Reading>,
     seven_day: Option<Reading>,
+    seen_at: i64,
     now: i64,
 ) -> Option<Observed> {
     let mut record = existing.unwrap_or_else(|| Observed {
@@ -189,7 +186,7 @@ pub(crate) fn fold_record(
         (&mut record.windows.seven_day, seven_day),
     ] {
         if let Some(incoming) = incoming
-            && let Some(next) = next_window(*slot, incoming, now)
+            && let Some(next) = next_window(*slot, incoming, seen_at)
         {
             *slot = Some(next);
             changed = true;
@@ -209,12 +206,14 @@ pub(crate) fn record(
     profile: &str,
     five_hour: Option<Reading>,
     seven_day: Option<Reading>,
+    seen_at: i64,
     now: i64,
 ) -> std::io::Result<()> {
     if !file_name_safe(profile) {
         return Ok(());
     }
-    let Some(next) = fold_record(read(dir, profile), profile, five_hour, seven_day, now) else {
+    let existing = read(dir, profile);
+    let Some(next) = fold_record(existing, profile, five_hour, seven_day, seen_at, now) else {
         return Ok(());
     };
     std::fs::create_dir_all(dir)?;
@@ -661,9 +660,16 @@ mod tests {
     }
 
     #[test]
-    fn should_create_a_record_from_the_first_reading() {
-        let r =
-            fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
+    fn should_create_a_record_stamped_with_the_reply_time() {
+        let r = fold_record(
+            None,
+            "p",
+            None,
+            Some(reading(35.0, WEEK_RESET)),
+            NOW - 60,
+            NOW,
+        )
+        .expect("a record");
         assert_eq!(r.profile.as_deref(), Some("p"));
         assert_eq!(r.updated_at, NOW);
         assert_eq!(
@@ -671,7 +677,7 @@ mod tests {
             Some(ObservedWindow {
                 used_percentage: 35.0,
                 resets_at: WEEK_RESET,
-                seen_at: NOW
+                seen_at: NOW - 60
             })
         );
         let back = parse(&serde_json::to_vec(&r).expect("serializes")).expect("round trips");
@@ -679,33 +685,72 @@ mod tests {
     }
 
     #[test]
-    fn should_never_lower_a_recorded_window() {
-        let r =
-            fold_record(None, "p", None, Some(reading(40.0, WEEK_RESET)), NOW).expect("a record");
+    fn should_never_lower_a_recorded_window_or_its_reply_time() {
+        let r = fold_record(None, "p", None, Some(reading(40.0, WEEK_RESET)), NOW, NOW)
+            .expect("a record");
+        // an idle session repaints a day-old reply: neither figure nor time moves
+        let stale = Some(reading(35.0, WEEK_RESET));
         assert_eq!(
-            fold_record(
-                Some(r.clone()),
-                "p",
-                None,
-                Some(reading(35.0, WEEK_RESET)),
-                NOW + 1
-            ),
+            fold_record(Some(r.clone()), "p", None, stale, NOW - 86_400, NOW + 1),
             None
         );
-        let up = fold_record(Some(r), "p", None, Some(reading(41.0, WEEK_RESET)), NOW + 1)
-            .expect("raised");
-        assert_eq!(up.windows.seven_day.map(|w| w.used_percentage), Some(41.0));
+        let up = fold_record(
+            Some(r),
+            "p",
+            None,
+            Some(reading(41.0, WEEK_RESET)),
+            NOW + 5,
+            NOW + 5,
+        )
+        .expect("raised");
+        assert_eq!(
+            up.windows.seven_day.map(|w| (w.used_percentage, w.seen_at)),
+            Some((41.0, NOW + 5))
+        );
+    }
+
+    #[test]
+    fn should_keep_the_highest_figure_with_the_latest_reply() {
+        let r = fold_record(None, "p", None, Some(reading(50.0, WEEK_RESET)), NOW, NOW)
+            .expect("a record");
+        // a later reply that reads lower (another meter, or a stale attribution)
+        // only advances the time the floor is known to hold
+        let later = fold_record(
+            Some(r),
+            "p",
+            None,
+            Some(reading(45.0, WEEK_RESET)),
+            NOW + 10,
+            NOW + 10,
+        )
+        .expect("advanced");
+        assert_eq!(
+            later
+                .windows
+                .seven_day
+                .map(|w| (w.used_percentage, w.seen_at)),
+            Some((50.0, NOW + 10))
+        );
+    }
+
+    #[test]
+    fn should_not_rewrite_a_repaint_of_the_same_reply() {
+        let r = fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW, NOW)
+            .expect("a record");
+        let same = Some(reading(35.0, WEEK_RESET));
+        assert_eq!(fold_record(Some(r), "p", None, same, NOW, NOW + 300), None);
     }
 
     #[test]
     fn should_record_a_new_window_and_ignore_an_older_one() {
-        let r =
-            fold_record(None, "p", Some(reading(90.0, NOW + 100)), None, NOW).expect("a record");
+        let r = fold_record(None, "p", Some(reading(90.0, NOW + 100)), None, NOW, NOW)
+            .expect("a record");
         let next = fold_record(
             Some(r),
             "p",
             Some(reading(3.0, NOW + 18_000)),
             None,
+            NOW + 200,
             NOW + 200,
         )
         .expect("a new window");
@@ -715,47 +760,25 @@ mod tests {
                 .map(|w| (w.used_percentage, w.resets_at)),
             Some((3.0, NOW + 18_000))
         );
+        let old = Some(reading(95.0, NOW + 100));
         assert_eq!(
-            fold_record(
-                Some(next),
-                "p",
-                Some(reading(95.0, NOW + 100)),
-                None,
-                NOW + 300
-            ),
+            fold_record(Some(next), "p", old, None, NOW + 300, NOW + 300),
             None
         );
-    }
-
-    #[test]
-    fn should_confirm_an_unchanged_window_every_thirty_seconds() {
-        let r =
-            fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
-        assert_eq!(
-            fold_record(
-                Some(r.clone()),
-                "p",
-                None,
-                Some(reading(35.0, WEEK_RESET)),
-                NOW + 29
-            ),
-            None
-        );
-        let later = fold_record(
-            Some(r),
-            "p",
-            None,
-            Some(reading(35.0, WEEK_RESET)),
-            NOW + 30,
-        )
-        .expect("confirmed");
-        assert_eq!(later.windows.seven_day.map(|w| w.seen_at), Some(NOW + 30));
     }
 
     #[test]
     fn should_write_and_reread_a_record_on_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
-        record(dir.path(), "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("writes");
+        record(
+            dir.path(),
+            "p",
+            None,
+            Some(reading(35.0, WEEK_RESET)),
+            NOW,
+            NOW,
+        )
+        .expect("writes");
         let got = read(dir.path(), "p").expect("reads back");
         assert_eq!(got.windows.seven_day.map(|w| w.used_percentage), Some(35.0));
         record(
@@ -763,6 +786,7 @@ mod tests {
             "../evil",
             None,
             Some(reading(1.0, WEEK_RESET)),
+            NOW,
             NOW,
         )
         .expect("refused quietly");
