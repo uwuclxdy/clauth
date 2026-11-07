@@ -288,6 +288,7 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
   token_speed.json         # the per-day speed ledger behind the token-speed surfaces, written by the producer alone (0600); one that does not parse is renamed token_speed.json.corrupt-<epoch_ms> (0600) before the next save, and one clauth cannot read, or one a newer clauth wrote, is never saved over
   tps_attribution.json     # which account each session's replies ran on, for the speed history (0600); one that does not parse is renamed tps_attribution.json.corrupt-<epoch_ms> (0600) before the next save, and one clauth cannot read, or one a newer clauth wrote, is never saved over
   tps_days.json            # the producer's list of speed days not yet in token_speed.json (0600); one that does not parse is renamed tps_days.json.corrupt-<epoch_ms> (0600) before the next save, and one clauth cannot read, or one a newer clauth wrote, is never saved over
+  chrome/chrome-native-host # a copy of a finished session's Claude in Chrome launcher (0700; `.bat` on Windows); when clauth's cleanup retires a runtime tree, a browser manifest naming that tree's launcher is pointed here
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   clauthd.pid              # the running daemon's process id
   gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
