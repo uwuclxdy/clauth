@@ -210,6 +210,7 @@ pub(crate) struct HomeSandbox {
     prev_claude_pid: Option<std::ffi::OsString>,
     prev_codex_home: Option<std::ffi::OsString>,
     prev_operator_codex_home: Option<std::ffi::OsString>,
+    prev_appdata: Option<std::ffi::OsString>,
     prev_ssl_cert_file: Option<std::ffi::OsString>,
     prev_ssl_cert_dir: Option<std::ffi::OsString>,
 }
@@ -280,6 +281,13 @@ impl HomeSandbox {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CLAUDE_PID");
         }
+        // A Windows browser manifest's dir reads this before the home, so it
+        // would name the real profile.
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("APPDATA");
+        }
         // The two codex homes this process reads, cleared for the same reason:
         // a suite run from inside a `clauth start` codex session inherits a
         // session `CODEX_HOME` and a carried operator home, and both outrank
@@ -313,6 +321,7 @@ impl HomeSandbox {
             prev_claude_pid,
             prev_codex_home,
             prev_operator_codex_home,
+            prev_appdata,
             prev_ssl_cert_file,
             prev_ssl_cert_dir,
         }
@@ -401,6 +410,10 @@ impl Drop for HomeSandbox {
         match self.prev_operator_codex_home.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUTH_OPERATOR_CODEX_HOME", prev) },
             None => unsafe { std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME") },
+        }
+        match self.prev_appdata.take() {
+            Some(prev) => unsafe { std::env::set_var("APPDATA", prev) },
+            None => unsafe { std::env::remove_var("APPDATA") },
         }
         // A non-panicking miss ran the whole teardown above; panic LAST naming
         // the count and the bound. The unwind then drops the guard (poisoning

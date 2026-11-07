@@ -81,8 +81,8 @@ use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, clauth_dir,
-    home_dir, profile_dir, profile_subpath,
+    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write_600, atomic_write_600_with,
+    claude_dir, clauth_dir, home_dir, profile_dir, profile_subpath,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3258,20 +3258,235 @@ fn stats_cache_is_behind(global: &Path, date: i64) -> bool {
     }
 }
 
+/// The file naming a browser's native host, the same in every dir of
+/// [`browser_manifest_dirs`].
+const BROWSER_MANIFEST_NAME: &str = "com.anthropic.claude_code_browser_extension.json";
+
+/// The launcher Claude Code writes for that host, the one file a manifest may
+/// be handed to.
+const BROWSER_LAUNCHER_NAME: &str = if cfg!(windows) {
+    "chrome-native-host.bat"
+} else {
+    "chrome-native-host"
+};
+
+/// Where Claude Code keeps [`BROWSER_MANIFEST_NAME`] on this platform (2.1.319's
+/// table). Windows keeps one dir for every browser, and the registry keys naming
+/// its manifest stay right whatever the manifest says: `appdata` is the
+/// `%APPDATA%` the caller read, `None` when unset.
+fn browser_manifest_dirs(home: &Path, appdata: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        let base = appdata
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| home.join("AppData").join("Local"), PathBuf::from);
+        return vec![base.join("Claude Code").join("ChromeNativeHost")];
+    }
+    let (base, browsers): (PathBuf, &[&str]) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library").join("Application Support"),
+            &[
+                "Google/Chrome",
+                "BraveSoftware/Brave-Browser",
+                "Arc/User Data",
+                "Chromium",
+                "Microsoft Edge",
+                "Vivaldi",
+                "com.operasoftware.Opera",
+            ],
+        )
+    } else {
+        (
+            home.join(".config"),
+            &[
+                "google-chrome",
+                "BraveSoftware/Brave-Browser",
+                "chromium",
+                "microsoft-edge",
+                "vivaldi",
+                "opera",
+            ],
+        )
+    };
+    browsers
+        .iter()
+        .map(|browser| base.join(browser).join("NativeMessagingHosts"))
+        .collect()
+}
+
+/// Which spellings of a manifest's `path` name the dying tree.
+#[derive(Clone, Copy)]
+enum TreeScope {
+    /// Any spelling that resolves inside the tree, a link to it included.
+    Resolved,
+    /// Only a spelling lexically under the tree's own path: a link root's
+    /// target outlives the link, so a manifest naming the target stays put.
+    Lexical,
+}
+
+/// Hand every browser manifest naming the launcher inside `tree` to a copy
+/// clauth owns, before the tree goes: Claude Code 2.1.319 rewrites a manifest
+/// only in a later `--chrome` session (measured 2026-11-06), and until then a
+/// browser would exec a dead path. Only a path naming [`BROWSER_LAUNCHER_NAME`]
+/// counts, so a manifest naming any other tree file (`<tree>/.credentials.json`
+/// for one) copies no secret out to a stable place. The launcher is the dying
+/// wrapper's own bytes, and only bytes holding `--chrome-native-host` land:
+/// 2.1.319's one payload execs the claude binary with no config dir (measured
+/// 2026-11-06), so it serves any session. Best effort per item, inside the
+/// removal's state flock hold: nothing here keeps a tree from retiring, a FIFO
+/// included.
+fn repoint_browser_manifests(tree: &Path, scope: TreeScope) {
+    use std::io::Write as _;
+    let (Ok(home), Ok(clauth)) = (home_dir(), clauth_dir()) else {
+        return;
+    };
+    let tree_id = match scope {
+        TreeScope::Resolved => crate::canonical::identity(tree).ok(),
+        TreeScope::Lexical => None,
+    };
+    // Any ancestor counts: a path whose wrapper is already gone, or whose
+    // `chrome` entry links out of the tree, still dies with the tree. A `..`
+    // would make those ancestors say nothing about where the path lands, and a
+    // relative path would resolve against this process's cwd, not the browser's:
+    // each is left alone.
+    let lies_inside = |named: &Path| {
+        named.is_absolute()
+            && !named
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            && named.ancestors().any(|ancestor| {
+                ancestor == tree
+                    || tree_id.as_ref().is_some_and(|id| {
+                        crate::canonical::identity(ancestor).is_ok_and(|real| real.starts_with(id))
+                    })
+            })
+    };
+    let land_launcher = |named: &Path, stable: &Path| {
+        // A launcher that is itself a link is no launcher: reading it would
+        // copy whatever it names (a `.credentials.json` in the tree) out. Only
+        // this last component is checked; a linked `chrome` dir still counts,
+        // as `lies_inside` says.
+        if crate::sessions::is_symlink(named) {
+            return stable.is_file();
+        }
+        // An empty or over-cap wrapper is no launcher, and neither is a file
+        // without the flag Claude Code's wrapper execs, so neither replaces one.
+        let Some(wrapper) = read_regular_capped(named, RECORD_READ_CAP)
+            .ok()
+            .flatten()
+            .filter(|bytes| {
+                (bytes.len() as u64) < RECORD_READ_CAP
+                    && std::str::from_utf8(bytes)
+                        .is_ok_and(|text| text.contains("--chrome-native-host"))
+            })
+        else {
+            return stable.is_file();
+        };
+        let written = atomic_write_600_with(stable, |f| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            }
+            f.write_all(&wrapper)
+        });
+        match &written {
+            Ok(()) => true,
+            Err(e) => {
+                logline!(
+                    "clauth: cannot write the browser launcher {}: {e}",
+                    stable.display()
+                );
+                // A launcher an earlier retire wrote stands and serves this
+                // manifest too.
+                stable.is_file()
+            }
+        }
+    };
+    let mut launcher_ready = false;
+    let appdata = std::env::var_os("APPDATA");
+    for dir in browser_manifest_dirs(&home, appdata.as_deref()) {
+        let manifest = dir.join(BROWSER_MANIFEST_NAME);
+        // A manifest keeps keys clauth does not model, so it stays a `Value`.
+        let Some(mut body) = read_regular_capped(&manifest, RECORD_READ_CAP)
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        let Some(named) = body
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        let is_launcher =
+            named.file_name().and_then(std::ffi::OsStr::to_str) == Some(BROWSER_LAUNCHER_NAME);
+        if !is_launcher || !lies_inside(&named) {
+            continue;
+        }
+        let stable = clauth.join("chrome").join(BROWSER_LAUNCHER_NAME);
+        let rendered = serde_json::to_value(&stable).and_then(|path| {
+            body["path"] = path;
+            serde_json::to_vec_pretty(&body)
+        });
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                logline!(
+                    "clauth: cannot repoint browser manifest {}: {e}",
+                    manifest.display()
+                );
+                continue;
+            }
+        };
+        if !launcher_ready {
+            launcher_ready = land_launcher(&named, &stable);
+            if !launcher_ready {
+                logline!(
+                    "clauth: left browser manifest {} naming a retiring tree: no launcher to hand it to",
+                    manifest.display()
+                );
+                continue;
+            }
+        }
+        // Through a link to the file it names, and at its own mode: a browser
+        // dir is no tree of clauth's, so its files take no 0600 rule.
+        let written = crate::canonical::identity(&manifest).and_then(|target| {
+            let mode = std::fs::metadata(&target)?.permissions();
+            crate::profile::atomic_write_with(&target, |f| {
+                f.set_permissions(mode)?;
+                f.write_all(&rendered)
+            })
+        });
+        if let Err(e) = written {
+            logline!(
+                "clauth: cannot repoint browser manifest {}: {e}",
+                manifest.display()
+            );
+        }
+    }
+}
+
 /// Retire a dead runtime tree from its live name, inside the removal's state
 /// flock hold. A tree whose root is itself a link (an operator's symlink, a
 /// Windows junction) holds nothing of its own: the link alone is removed, and
-/// nothing behind it is renamed or walked. Any other tree may hold the only
-/// copy of what its session wrote (an isolated tree's whole store; a shared
-/// tree's entries `~/.claude` lacked at its build, or a copy host's tail past
-/// its last mirror tick), so it is renamed to its rescue tombstone, O(1), and
-/// returned for [`rescue_tombstone`] once the hold drops. A failed rename
-/// keeps the tree where it is for a later sweep.
+/// nothing behind it is renamed or walked. A manifest spelled through the link
+/// dies with it, so it is handed off first; one naming the target, which lives
+/// on, stays. Any other tree may hold the only copy of what its session wrote
+/// (an isolated tree's whole store; a shared tree's entries `~/.claude` lacked
+/// at its build, or a copy host's tail past its last mirror tick), so it is
+/// renamed to its rescue tombstone, O(1), and returned for [`rescue_tombstone`]
+/// once the hold drops. A failed rename keeps the tree where it is for a later
+/// sweep.
 fn retire_tree(runtime: &Path) -> Option<PathBuf> {
     if crate::sessions::is_symlink(runtime) {
+        repoint_browser_manifests(runtime, TreeScope::Lexical);
         unlink_link(runtime, "linked runtime tree");
         return None;
     }
+    repoint_browser_manifests(runtime, TreeScope::Resolved);
     let tombstone = tombstone_path(runtime);
     #[cfg(test)]
     let renamed = if RETIRE_RENAME_REFUSED.with(std::cell::Cell::get) {
@@ -7673,8 +7888,9 @@ impl ProfileRuntime {
             //
             // A dead tree can hold the only copy of its session's transcripts
             // and sidecars (a recycled `<pid>-<seq>` lands on one no sweep has
-            // rescued yet), so it is renamed to its rescue tombstone — O(1), the
-            // one step this hold pays — and rescued once the hold drops, as GC
+            // rescued yet), so it hands off any browser manifest naming it, then
+            // is renamed to its rescue tombstone — O(1) — and rescued once the
+            // hold drops, as GC
             // does ([`retire_tree`]). A failed rename (a kept tombstone already
             // holds the name, an open handle on Windows) keeps the tree and
             // builds over it, never a wipe: the build is additive, and the
@@ -7933,6 +8149,7 @@ impl ProfileRuntime {
     fn retire_own_tree(&self, mirrored: bool) -> Option<PathBuf> {
         let runtime = &self.swap.runtime;
         let tombstone = if mirrored && !crate::sessions::is_symlink(runtime) {
+            repoint_browser_manifests(runtime, TreeScope::Resolved);
             let _ = std::fs::remove_dir_all(runtime);
             None
         } else {

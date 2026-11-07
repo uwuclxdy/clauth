@@ -5,9 +5,11 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 use crate::live_sessions::Launcher;
+#[cfg(windows)]
+use crate::testutil::EnvPin;
 use crate::testutil::{
-    HomeSandbox, hold_rotation_lock, respawn_flags_naming, set_mtime, write_claude_job,
-    write_claude_job_flags, write_claude_job_in,
+    HomeSandbox, UnwritableDir, hold_rotation_lock, respawn_flags_naming, set_mtime,
+    write_claude_job, write_claude_job_flags, write_claude_job_in,
 };
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
@@ -25189,4 +25191,977 @@ fn both_keychain_item_readers_share_one_give_up_set() {
             "`{reader}` reads through `ITEM_READ_GAVE_UP`"
         );
     }
+}
+
+/// The launcher's file name Claude Code writes on the platform under test.
+const CHROME_LAUNCHER_NAME: &str = if cfg!(windows) {
+    "chrome-native-host.bat"
+} else {
+    "chrome-native-host"
+};
+
+/// A browser's manifest file name, the same in every browser dir.
+const CHROME_MANIFEST_NAME: &str = "com.anthropic.claude_code_browser_extension.json";
+
+/// The manifest dirs Claude Code writes for two browsers on the platform under
+/// test (Windows keeps one dir for every browser, under the home while a
+/// `HomeSandbox` holds `APPDATA` unset).
+fn chrome_manifest_dirs(home: &Path) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        vec![
+            home.join("AppData")
+                .join("Local")
+                .join("Claude Code")
+                .join("ChromeNativeHost"),
+        ]
+    } else if cfg!(target_os = "macos") {
+        let support = home.join("Library").join("Application Support");
+        vec![
+            support
+                .join("Google")
+                .join("Chrome")
+                .join("NativeMessagingHosts"),
+            support.join("Chromium").join("NativeMessagingHosts"),
+        ]
+    } else {
+        let config = home.join(".config");
+        vec![
+            config.join("google-chrome").join("NativeMessagingHosts"),
+            config.join("chromium").join("NativeMessagingHosts"),
+        ]
+    }
+}
+
+/// A manifest in Claude Code's own shape (2.1.319), naming `launcher`.
+fn chrome_manifest_body(launcher: &Path) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "name": "com.anthropic.claude_code_browser_extension",
+        "description": "Claude Code Browser Extension Native Host",
+        "path": launcher.to_str().expect("utf-8 path"),
+        "type": "stdio",
+        "allowed_origins": ["chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/"],
+    }))
+    .expect("serialize")
+}
+
+fn plant_chrome_manifest(dir: &Path, body: &str) -> PathBuf {
+    fs::create_dir_all(dir).expect("mkdir");
+    let manifest = dir.join(CHROME_MANIFEST_NAME);
+    fs::write(&manifest, body).expect("write manifest");
+    manifest
+}
+
+/// A dead session tree holding the launcher Claude Code wrote into it. A fixture
+/// a guard must refuse still holds `--chrome-native-host`, or the wrapper filter
+/// answers for that guard.
+fn dead_tree_with_chrome_launcher(content: &str) -> (PathBuf, PathBuf) {
+    let tree = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-0");
+    let chrome = tree.join("chrome");
+    fs::create_dir_all(&chrome).expect("mkdir");
+    let launcher = chrome.join(CHROME_LAUNCHER_NAME);
+    fs::write(&launcher, content).expect("write launcher");
+    (tree, launcher)
+}
+
+fn stable_chrome_launcher() -> PathBuf {
+    crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("chrome")
+        .join(CHROME_LAUNCHER_NAME)
+}
+
+#[test]
+fn a_retired_tree_hands_its_browser_manifests_to_a_stable_launcher() {
+    let home = HomeSandbox::new();
+    let content = "#!/bin/sh\nexec /opt/claude --chrome-native-host\n";
+    let (tree, launcher) = dead_tree_with_chrome_launcher(content);
+    let manifests: Vec<PathBuf> = chrome_manifest_dirs(home.home())
+        .iter()
+        .map(|dir| plant_chrome_manifest(dir, &chrome_manifest_body(&launcher)))
+        .collect();
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let stable = stable_chrome_launcher();
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(content),
+        "the launcher a browser now runs holds the dying tree's exec line"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&stable).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "owner-only and still executable");
+    }
+    let expected: serde_json::Value =
+        serde_json::from_str(&chrome_manifest_body(&stable)).expect("expected body");
+    for manifest in &manifests {
+        let got: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest).expect("read manifest"))
+                .expect("parse manifest");
+        assert_eq!(got, expected, "only `path` moved in {}", manifest.display());
+    }
+}
+
+#[test]
+fn a_manifest_naming_another_tree_is_left_byte_identical() {
+    let home = HomeSandbox::new();
+    let (tree, _) = dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude\n");
+    let live = tree
+        .with_file_name("runtime-4243-0")
+        .join("chrome")
+        .join(CHROME_LAUNCHER_NAME);
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    fs::write(&live, "#!/bin/sh\nexec /opt/live --chrome-native-host\n")
+        .expect("write the live launcher");
+    let body = chrome_manifest_body(&live);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert!(
+        !stable_chrome_launcher().exists(),
+        "nothing needed a stable launcher, so none was written"
+    );
+}
+
+#[test]
+fn a_manifest_is_never_repointed_at_a_launcher_nothing_wrote() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    fs::remove_file(&launcher).expect("remove the launcher");
+    let body = chrome_manifest_body(&launcher);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert!(!stable_chrome_launcher().exists());
+}
+
+/// A manifest the retire cannot hand over is named in the log: the case this
+/// function knows it failed leaves a trace, not a dangling manifest alone.
+#[test]
+fn a_manifest_left_naming_a_retiring_tree_is_said_in_the_log() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    fs::remove_file(&launcher).expect("remove the launcher");
+    let body = chrome_manifest_body(&launcher);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: left browser manifest {} naming a retiring tree: no launcher to hand it to",
+            manifest.display()
+        )]
+    );
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+}
+
+#[test]
+fn a_tree_with_no_launcher_left_still_hands_over_to_an_existing_one() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    fs::remove_file(&launcher).expect("remove the launcher");
+    let stable = stable_chrome_launcher();
+    let kept = "#!/bin/sh\nexec /opt/earlier --chrome-native-host\n";
+    fs::create_dir_all(stable.parent().expect("parent")).expect("mkdir");
+    fs::write(&stable, kept).expect("write stable");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(kept));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// A wrapper that never lands is no reason to keep a later manifest from the
+/// launcher a readable wrapper in the same retire lands. One dir each, since
+/// Windows keeps a single manifest dir and has no second manifest to try.
+#[cfg(not(windows))]
+#[test]
+fn a_missing_wrapper_does_not_bar_a_later_manifest_in_the_same_retire() {
+    let home = HomeSandbox::new();
+    let content = "#!/bin/sh\nexec /opt/claude --chrome-native-host\n";
+    let (tree, launcher) = dead_tree_with_chrome_launcher(content);
+    let missing = tree.join("gone").join(CHROME_LAUNCHER_NAME);
+    let dirs = chrome_manifest_dirs(home.home());
+    let stayed_body = chrome_manifest_body(&missing);
+    let stayed = plant_chrome_manifest(&dirs[0], &stayed_body);
+    let moved = plant_chrome_manifest(&dirs[1], &chrome_manifest_body(&launcher));
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&stayed).ok().as_deref(),
+        Some(&*stayed_body),
+        "a launcher that never landed leaves its manifest where it was"
+    );
+    let stable = stable_chrome_launcher();
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(content));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&moved).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+#[test]
+fn a_later_retire_replaces_the_stable_launcher_with_its_own_bytes() {
+    let home = HomeSandbox::new();
+    let newer = "#!/bin/sh\nexec /opt/newer --chrome-native-host\n";
+    let (tree, launcher) = dead_tree_with_chrome_launcher(newer);
+    let stable = stable_chrome_launcher();
+    fs::create_dir_all(stable.parent().expect("parent")).expect("mkdir");
+    fs::write(&stable, "#!/bin/sh\nexec /opt/older --chrome-native-host\n").expect("write stable");
+    plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(newer));
+}
+
+#[test]
+fn a_torn_manifest_is_left_alone_and_the_tree_still_retires() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let path = serde_json::to_string(launcher.to_str().expect("utf-8 path")).expect("encode");
+    let torn = format!("{{\"path\":{}", path.trim_end_matches('"'));
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &torn);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*torn));
+    assert!(!tree.exists(), "the tree left its live name");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_manifest_spelling_the_tree_through_a_link_still_counts() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let alias = home.home().join("alias");
+    std::os::unix::fs::symlink(tree.parent().expect("parent"), &alias).expect("symlink");
+    let spelled = alias
+        .join(tree.file_name().expect("name"))
+        .join("chrome")
+        .join(launcher.file_name().expect("name"));
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&spelled),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable_chrome_launcher().to_str().expect("utf-8 path")
+    );
+}
+
+/// A manifest spelled through a link that lands inside the tree names the same
+/// dying wrapper: the spelling's own ancestor resolves below the tree root, so
+/// resolving it — not matching that root alone — is what counts.
+#[cfg(unix)]
+#[test]
+fn a_manifest_spelled_through_a_link_into_the_tree_still_moves() {
+    let home = HomeSandbox::new();
+    let (tree, _) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let alias = home.home().join("alias-chrome");
+    std::os::unix::fs::symlink(tree.join("chrome"), &alias).expect("symlink");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&alias.join(CHROME_LAUNCHER_NAME)),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable_chrome_launcher().to_str().expect("utf-8 path"),
+        "the manifest lands on the stable launcher"
+    );
+    assert!(
+        stable_chrome_launcher().is_file(),
+        "the wrapper was copied out"
+    );
+}
+
+/// A launcher that is itself a link is no launcher: reading through it would
+/// carry the file it names (a tree's own `.credentials.json`) out to a stable
+/// place.
+#[cfg(unix)]
+#[test]
+fn a_linked_launcher_is_never_copied_out_of_the_tree() {
+    let home = HomeSandbox::new();
+    let tree = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-0");
+    let chrome = tree.join("chrome");
+    fs::create_dir_all(&chrome).expect("mkdir");
+    let credential = tree.join(".credentials.json");
+    fs::write(&credential, "refresh-token --chrome-native-host").expect("write credential");
+    let launcher = chrome.join(CHROME_LAUNCHER_NAME);
+    std::os::unix::fs::symlink(&credential, &launcher).expect("symlink the launcher");
+    let body = chrome_manifest_body(&launcher);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&manifest).ok().as_deref(),
+        Some(&*body),
+        "a launcher nothing read leaves its manifest where it was"
+    );
+    assert!(
+        !crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("chrome")
+            .exists(),
+        "no stable launcher was written"
+    );
+}
+
+/// A linked launcher is passed over, not a reason to strand its manifest: a
+/// launcher an earlier retire wrote stands and serves it, its bytes untouched.
+#[cfg(unix)]
+#[test]
+fn a_linked_launcher_still_hands_over_to_a_standing_launcher() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    fs::remove_file(&launcher).expect("remove the launcher");
+    let credential = tree.join(".credentials.json");
+    fs::write(&credential, "refresh-token --chrome-native-host").expect("write credential");
+    std::os::unix::fs::symlink(&credential, &launcher).expect("symlink the launcher");
+    let stable = stable_chrome_launcher();
+    let kept = "#!/bin/sh\nexec /opt/earlier --chrome-native-host\n";
+    fs::create_dir_all(stable.parent().expect("parent")).expect("mkdir");
+    fs::write(&stable, kept).expect("write stable");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(kept));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// Only the launcher's own name is checked for a link: a tree's `chrome` entry
+/// links out to `~/.claude/chrome` on a linking host, and the launcher behind
+/// that link is the session's real one, so it is handed over.
+#[cfg(unix)]
+#[test]
+fn a_linked_chrome_dir_still_hands_over_its_launcher() {
+    let home = HomeSandbox::new();
+    let content = "#!/bin/sh\nexec /opt/claude --chrome-native-host\n";
+    let tree = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-0");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    let shared = home.home().join(".claude").join("chrome");
+    fs::create_dir_all(&shared).expect("mkdir shared");
+    fs::write(shared.join(CHROME_LAUNCHER_NAME), content).expect("write launcher");
+    std::os::unix::fs::symlink(&shared, tree.join("chrome")).expect("symlink chrome");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&tree.join("chrome").join(CHROME_LAUNCHER_NAME)),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let stable = stable_chrome_launcher();
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(content));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// A browser dir is no tree of clauth's: a manifest that is a link keeps its
+/// link, and the repoint lands in the file it names.
+#[cfg(unix)]
+#[test]
+fn a_manifest_link_keeps_its_link_and_its_target_gets_the_new_path() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let target = home.home().join("manifest-target.json");
+    fs::write(&target, chrome_manifest_body(&launcher)).expect("write the target");
+    let dir = &chrome_manifest_dirs(home.home())[0];
+    fs::create_dir_all(dir).expect("mkdir");
+    let manifest = dir.join(CHROME_MANIFEST_NAME);
+    std::os::unix::fs::symlink(&target, &manifest).expect("symlink the manifest");
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert!(
+        fs::symlink_metadata(&manifest)
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the manifest is still a link"
+    );
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable_chrome_launcher().to_str().expect("utf-8 path"),
+        "the file the link names holds the new path"
+    );
+}
+
+/// A copy host's shared session removes its tree outright after a clean final
+/// tick. That tick also copies the wrapper out to `~/.claude`, so the manifest
+/// must name clauth's own launcher, never that copy.
+#[test]
+fn a_copy_host_teardown_hands_its_browser_manifest_to_a_stable_launcher() {
+    let home = HomeSandbox::new();
+    let _fake = ForcedFakeLinkMode::new();
+    fake_claude_home(home.home());
+    let profile = configured_profile("copy-host");
+    let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+        .expect("acquire");
+    let tree = rt.config_dir().to_path_buf();
+    let content = "#!/bin/sh\nexec /opt/copy-host --chrome-native-host\n";
+    let launcher = tree.join("chrome").join(CHROME_LAUNCHER_NAME);
+    fs::create_dir_all(launcher.parent().expect("parent")).expect("mkdir");
+    fs::write(&launcher, content).expect("write launcher");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    drop(rt);
+
+    assert!(!tree.exists(), "the clean teardown removed the tree");
+    let stable = stable_chrome_launcher();
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(content));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// The stable launcher `~/.clauth/chrome` holds, written with `content`.
+fn write_stable_launcher(content: &str) -> PathBuf {
+    let stable = stable_chrome_launcher();
+    fs::create_dir_all(stable.parent().expect("parent")).expect("mkdir");
+    fs::write(&stable, content).expect("write stable launcher");
+    stable
+}
+
+/// Only the launcher's own file name may be copied out of a dying tree: a
+/// manifest naming any other file would carry that file out of the profile,
+/// where `clauth delete` never reaches it.
+#[test]
+fn a_manifest_naming_a_credential_file_is_left_byte_identical() {
+    let home = HomeSandbox::new();
+    let tree = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-0");
+    fs::create_dir_all(&tree).expect("mkdir");
+    let credential = tree.join(".credentials.json");
+    fs::write(&credential, "refresh-token --chrome-native-host").expect("write credential");
+    let body = chrome_manifest_body(&credential);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    let chrome = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("chrome");
+    assert!(
+        !chrome.exists(),
+        "nothing at all was copied out of the tree"
+    );
+}
+
+/// A regular file named the launcher but holding none of its flag is no
+/// launcher: its bytes never reach the stable copy and its manifest stays put.
+#[test]
+fn a_regular_file_named_the_launcher_without_its_flag_copies_nothing_out() {
+    let home = HomeSandbox::new();
+    let (tree, _) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let notes = tree.join("projects").join("notes");
+    fs::create_dir_all(&notes).expect("mkdir");
+    let junk = notes.join(CHROME_LAUNCHER_NAME);
+    fs::write(&junk, "sk-not-a-launcher-at-all").expect("write junk");
+    let body = chrome_manifest_body(&junk);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert!(
+        !stable_chrome_launcher().exists(),
+        "nothing at all was copied out to the stable launcher"
+    );
+}
+
+/// A wrapper of zero bytes is a crash between create and write, not a launcher:
+/// it must never replace a working stable launcher, though the manifest still
+/// follows the launcher already there.
+#[test]
+fn an_empty_wrapper_never_replaces_a_working_stable_launcher() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(kept),
+        "an empty wrapper never replaces a working launcher"
+    );
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable.to_str().expect("utf-8 path"),
+        "the manifest still moves to the launcher that stands"
+    );
+}
+
+/// A wrapper past `RECORD_READ_CAP` is truncated by the read, so only the cap
+/// comparison keeps those bytes from replacing a working stable launcher.
+#[test]
+fn an_over_cap_wrapper_never_replaces_a_working_stable_launcher() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    let mut over_cap = b"--chrome-native-host\n".to_vec();
+    over_cap.resize(RECORD_READ_CAP as usize + 1, b'#');
+    fs::write(&launcher, over_cap).expect("write over-cap wrapper");
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(kept),
+        "an over-cap wrapper never replaces a working launcher"
+    );
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// A wrapper torn before the flag is no launcher either: it lost the `exec` that
+/// names the binary, so it never replaces a working stable launcher, and the
+/// manifest follows the launcher that stands.
+#[test]
+fn a_torn_wrapper_never_replaces_a_working_stable_launcher() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("#!/bin/sh\n# Chrome na");
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(kept),
+        "a torn wrapper never replaces a working launcher"
+    );
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// A FIFO is neither a launcher nor a manifest: the retire reads neither one
+/// blocking, and the tree still goes. The bound is the test's own, so a read
+/// that does block reds here instead of wedging the run.
+#[cfg(unix)]
+#[test]
+fn a_fifo_manifest_and_a_fifo_wrapper_never_block_a_retire() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("");
+    fs::remove_file(&launcher).expect("remove the launcher");
+    crate::testutil::mkfifo(&launcher);
+    let dirs = chrome_manifest_dirs(home.home());
+    fs::create_dir_all(&dirs[0]).expect("mkdir");
+    crate::testutil::mkfifo(&dirs[0].join(CHROME_MANIFEST_NAME));
+    let body = chrome_manifest_body(&launcher);
+    let manifest = plant_chrome_manifest(&dirs[1], &body);
+    let thread_lines = crate::logline::LogLines::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let retiring = tree.clone();
+    std::thread::spawn(move || {
+        let _capture = thread_lines.capture_here();
+        let _ = tx.send(retire_tree(&retiring).is_some());
+    });
+
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the retire never blocked on a fifo"),
+        "the tree retired"
+    );
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert!(
+        !stable_chrome_launcher().exists(),
+        "a fifo is not a launcher to copy out"
+    );
+}
+
+/// A stable launcher a write cannot replace still serves the manifest: the
+/// write fails, and the launcher an earlier retire left is the one it names.
+#[test]
+fn a_failed_stable_write_hands_the_manifest_to_the_launcher_already_there() {
+    let home = HomeSandbox::new();
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let _unwritable = UnwritableDir::new(stable.parent().expect("parent"));
+    let (tree, launcher) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/newer --chrome-native-host\n");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(kept),
+        "the unwritable dir keeps the launcher from the earlier retire"
+    );
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// The browser dir is no tree of clauth's, so a manifest the user tightened
+/// keeps its own mode across the rewrite.
+#[cfg(unix)]
+#[test]
+fn a_repointed_manifest_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    let (tree, launcher) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o640)).expect("chmod 640");
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let mode = fs::metadata(&manifest).expect("stat").permissions().mode();
+    assert_eq!(mode & 0o777, 0o640, "the manifest keeps its own mode");
+}
+
+/// A `..` makes an ancestor say nothing about where the path lands, so a path
+/// holding one is left alone even when it resolves back inside the tree.
+#[test]
+fn a_manifest_path_through_dotdot_is_left_byte_identical() {
+    let home = HomeSandbox::new();
+    let (tree, _) =
+        dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude --chrome-native-host\n");
+    fs::create_dir_all(tree.join("sub")).expect("mkdir sub");
+    let spelled = tree
+        .join("sub")
+        .join("..")
+        .join("chrome")
+        .join(CHROME_LAUNCHER_NAME);
+    let body = chrome_manifest_body(&spelled);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert!(
+        !stable_chrome_launcher().exists(),
+        "a dotted path names no launcher to copy"
+    );
+}
+
+/// A relative `path` resolves against the browser's cwd, never the retiring
+/// tree's, so it is left alone before any ancestor is compared. The tree is
+/// spelled relative too: that is the only spelling a relative path could match.
+#[test]
+fn a_relative_manifest_path_is_left_byte_identical() {
+    let home = HomeSandbox::new();
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let spelled = Path::new("runtime")
+        .join("chrome")
+        .join(CHROME_LAUNCHER_NAME);
+    let body = chrome_manifest_body(&spelled);
+    let manifest = plant_chrome_manifest(&chrome_manifest_dirs(home.home())[0], &body);
+
+    repoint_browser_manifests(Path::new("runtime"), TreeScope::Resolved);
+
+    assert_eq!(fs::read_to_string(&manifest).ok().as_deref(), Some(&*body));
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(kept));
+}
+
+/// The tree's own spelling still identifies a path whose tree is gone and whose
+/// wrapper cannot be read; the stable launcher standing in takes the manifest.
+#[test]
+fn a_manifest_naming_a_gone_tree_still_moves_to_the_stable_launcher() {
+    let home = HomeSandbox::new();
+    let (tree, launcher) = dead_tree_with_chrome_launcher("#!/bin/sh\nexec /opt/claude\n");
+    let kept = "#!/bin/sh\nexec /opt/kept --chrome-native-host\n";
+    let stable = write_stable_launcher(kept);
+    let manifest = plant_chrome_manifest(
+        &chrome_manifest_dirs(home.home())[0],
+        &chrome_manifest_body(&launcher),
+    );
+    fs::remove_dir_all(&tree).expect("remove the tree and its chrome dir");
+
+    let _ = retire_tree(&tree);
+
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable.to_str().expect("utf-8 path"),
+        "the tree's spelling identifies the path"
+    );
+    assert_eq!(
+        fs::read_to_string(&stable).ok().as_deref(),
+        Some(kept),
+        "the unreadable wrapper leaves the launcher already there"
+    );
+}
+
+/// A tree whose root is a link holds nothing of its own: the link alone is
+/// removed and what it points at is untouched. A manifest spelled through the
+/// link dies with it and is repointed; one naming the target, which lives on,
+/// stays where it is.
+#[cfg(unix)]
+#[test]
+fn a_linked_tree_repoints_only_the_manifests_spelled_through_the_link() {
+    let home = HomeSandbox::new();
+    let target = home.home().join("linked-tree");
+    let chrome = target.join("chrome");
+    fs::create_dir_all(&chrome).expect("mkdir");
+    fs::write(
+        chrome.join(CHROME_LAUNCHER_NAME),
+        "#!/bin/sh\nexec /opt/claude --chrome-native-host\n",
+    )
+    .expect("write wrapper");
+    let tree = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-0");
+    fs::create_dir_all(tree.parent().expect("parent")).expect("mkdir");
+    std::os::unix::fs::symlink(&target, &tree).expect("symlink the tree root");
+    let dirs = chrome_manifest_dirs(home.home());
+    let through_link = plant_chrome_manifest(
+        &dirs[0],
+        &chrome_manifest_body(&tree.join("chrome").join(CHROME_LAUNCHER_NAME)),
+    );
+    let kept_body = chrome_manifest_body(&chrome.join(CHROME_LAUNCHER_NAME));
+    let kept = plant_chrome_manifest(&dirs[1], &kept_body);
+
+    assert!(retire_tree(&tree).is_none(), "a link root owes no rescue");
+
+    assert!(fs::symlink_metadata(&tree).is_err(), "the link is gone");
+    assert!(target.exists(), "what the link pointed at is untouched");
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&through_link).expect("read")).expect("parse");
+    assert_eq!(
+        got["path"],
+        stable_chrome_launcher().to_str().expect("utf-8 path"),
+        "a manifest spelled through the link dies with it"
+    );
+    assert_eq!(
+        fs::read_to_string(&kept).ok().as_deref(),
+        Some(&*kept_body),
+        "a manifest naming the target, which lives on, stays where it is"
+    );
+}
+
+/// Every manifest dir Claude Code writes, per platform (2.1.319's table),
+/// written out here rather than built from another const so a dropped or
+/// respelled row in `browser_manifest_dirs` reds.
+#[test]
+fn browser_manifest_dirs_holds_claude_codes_whole_table() {
+    let home = HomeSandbox::new();
+    let home = home.home();
+    let expected: Vec<PathBuf> = if cfg!(windows) {
+        vec![
+            home.join("AppData")
+                .join("Local")
+                .join("Claude Code")
+                .join("ChromeNativeHost"),
+        ]
+    } else if cfg!(target_os = "macos") {
+        let support = home.join("Library").join("Application Support");
+        vec![
+            support
+                .join("Google")
+                .join("Chrome")
+                .join("NativeMessagingHosts"),
+            support
+                .join("BraveSoftware")
+                .join("Brave-Browser")
+                .join("NativeMessagingHosts"),
+            support
+                .join("Arc")
+                .join("User Data")
+                .join("NativeMessagingHosts"),
+            support.join("Chromium").join("NativeMessagingHosts"),
+            support.join("Microsoft Edge").join("NativeMessagingHosts"),
+            support.join("Vivaldi").join("NativeMessagingHosts"),
+            support
+                .join("com.operasoftware.Opera")
+                .join("NativeMessagingHosts"),
+        ]
+    } else {
+        let config = home.join(".config");
+        vec![
+            config.join("google-chrome").join("NativeMessagingHosts"),
+            config
+                .join("BraveSoftware")
+                .join("Brave-Browser")
+                .join("NativeMessagingHosts"),
+            config.join("chromium").join("NativeMessagingHosts"),
+            config.join("microsoft-edge").join("NativeMessagingHosts"),
+            config.join("vivaldi").join("NativeMessagingHosts"),
+            config.join("opera").join("NativeMessagingHosts"),
+        ]
+    };
+
+    assert_eq!(browser_manifest_dirs(home, None), expected);
+}
+
+/// Every dir Claude Code writes takes a manifest, not the two a linux test
+/// happens to plant: a loop that skips one reds here.
+#[test]
+fn every_manifest_dir_claude_code_writes_is_repointed() {
+    let home = HomeSandbox::new();
+    let content = "#!/bin/sh\nexec /opt/claude --chrome-native-host\n";
+    let (tree, launcher) = dead_tree_with_chrome_launcher(content);
+    let manifests: Vec<PathBuf> = browser_manifest_dirs(home.home(), None)
+        .iter()
+        .map(|dir| plant_chrome_manifest(dir, &chrome_manifest_body(&launcher)))
+        .collect();
+    assert!(!manifests.is_empty(), "Claude Code writes a manifest dir");
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let stable = stable_chrome_launcher();
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(content));
+    for manifest in &manifests {
+        let got: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest).expect("read")).expect("parse");
+        assert_eq!(
+            got["path"],
+            stable.to_str().expect("utf-8 path"),
+            "{} was not repointed",
+            manifest.display()
+        );
+    }
+}
+
+/// `%APPDATA%` decides the one Windows manifest dir, and an unset value falls
+/// back under the home. Never run on linux; the windows cross-lint compiles it.
+#[cfg(windows)]
+#[test]
+fn appdata_chooses_the_windows_manifest_dir() {
+    let home = HomeSandbox::new();
+    let roaming = Path::new(r"C:\Users\user\AppData\Roaming");
+    assert_eq!(
+        browser_manifest_dirs(home.home(), Some(std::ffi::OsStr::new(roaming))),
+        vec![roaming.join("Claude Code").join("ChromeNativeHost")]
+    );
+    assert_eq!(
+        browser_manifest_dirs(home.home(), None),
+        vec![
+            home.home()
+                .join("AppData")
+                .join("Local")
+                .join("Claude Code")
+                .join("ChromeNativeHost")
+        ]
+    );
+    assert_eq!(
+        browser_manifest_dirs(home.home(), Some(std::ffi::OsStr::new(""))),
+        vec![
+            home.home()
+                .join("AppData")
+                .join("Local")
+                .join("Claude Code")
+                .join("ChromeNativeHost")
+        ],
+        "an empty %APPDATA% falls back under the home"
+    );
+}
+
+/// The production `%APPDATA%` read is what a retire follows: the pin feeds the
+/// real read, not the helper. Never run on linux; the windows cross-lint
+/// compiles it.
+#[cfg(windows)]
+#[test]
+fn appdata_decides_the_manifest_dir_a_retire_repoints() {
+    let home = HomeSandbox::new();
+    let roaming = home.home().join("Roaming");
+    fs::create_dir_all(&roaming).expect("mkdir");
+    let _pin = EnvPin::new(&home, &[("APPDATA", Some(roaming.as_os_str()))]);
+    let content = "#!/bin/sh\nexec /opt/claude --chrome-native-host\n";
+    let (tree, launcher) = dead_tree_with_chrome_launcher(content);
+    let manifest = plant_chrome_manifest(
+        &roaming.join("Claude Code").join("ChromeNativeHost"),
+        &chrome_manifest_body(&launcher),
+    );
+
+    assert!(retire_tree(&tree).is_some(), "the tree retired");
+
+    let stable = stable_chrome_launcher();
+    assert_eq!(fs::read_to_string(&stable).ok().as_deref(), Some(content));
+    let got: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
+    assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
 }
