@@ -7852,6 +7852,15 @@ fn tree_store(tree: &std::path::Path) -> Option<std::path::PathBuf> {
     std::fs::canonicalize(tree.join(".credentials.json")).ok()
 }
 
+/// Whether `sid`'s row names `member` as the session's current member. A swap
+/// moves the link before it writes the row, and `run_switch` and the rotation
+/// gate decide off the row, so a wait ahead of either holds this beside the
+/// link. The gate reads `launch_store`, which that same row write sets here.
+#[cfg(target_os = "linux")]
+fn row_names_member(sid: &str, member: &str) -> bool {
+    crate::live_sessions::get(sid).is_some_and(|row| row.current_member.as_deref() == Some(member))
+}
+
 /// A `--with-fallback` background launch hands its session on
 /// instead of ending it. Once the launcher exits, the row of the tree a job
 /// names stays, with its chain opt-in and launch account; only the launcher's
@@ -8140,7 +8149,9 @@ fn session_moved_round_three_accounts(
         crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
         let store = member_store_of(member);
         tick_until(&mut first, "moved the session", |d| {
-            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+            tree_store(&tree).as_ref() == Some(&store)
+                && daemon_holds_session(d, &sid, member)
+                && row_names_member(&sid, member)
         });
     }
     drop(first);
@@ -9577,10 +9588,7 @@ fn an_adopted_with_fallback_session_moves_along_the_chain() {
     let wfs_store = member_store_of("wfs");
     tick_until(&mut daemon, "moved the session onto wfs", |d| {
         tree_store(&tree).as_ref() == Some(&wfs_store)
-            && crate::live_sessions::get(&sid)
-                .and_then(|row| row.current_member)
-                .as_deref()
-                == Some("wfs")
+            && row_names_member(&sid, "wfs")
             && daemon_holds_session(d, &sid, "wfs")
     });
     assert!(
@@ -9627,11 +9635,7 @@ fn an_adoption_holds_the_member_the_session_last_moved_onto() {
         .expect("intent back onto wfl");
     let wfl_store = member_store_of("wfl");
     tick_until(&mut daemon, "moved the session back onto wfl", |_| {
-        tree_store(&tree).as_ref() == Some(&wfl_store)
-            && crate::live_sessions::get(&sid)
-                .and_then(|row| row.current_member)
-                .as_deref()
-                == Some("wfl")
+        tree_store(&tree).as_ref() == Some(&wfl_store) && row_names_member(&sid, "wfl")
     });
 }
 
@@ -10049,7 +10053,9 @@ fn an_adopted_session_blocks_a_macos_rotation_of_its_account_while_its_job_runs(
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut daemon, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     let wfs = crate::profile::ProfileName::from("wfs");
 
@@ -10379,7 +10385,9 @@ fn a_handed_off_session_keeps_every_account_it_ran_on_live() {
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut first, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
     let wfl_store = member_store_of("wfl");
@@ -10427,7 +10435,9 @@ fn a_held_marker_of_a_visited_account_refuses_the_adoption_cleanly() {
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut first, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
     let wfl_store = member_store_of("wfl");
@@ -10499,7 +10509,9 @@ fn a_refused_adoption_rolls_back_the_markers_it_claimed_first() {
         crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
         let store = member_store_of(member);
         tick_until(&mut first, "moved the session", |d| {
-            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+            tree_store(&tree).as_ref() == Some(&store)
+                && daemon_holds_session(d, &sid, member)
+                && row_names_member(&sid, member)
         });
     }
     drop(first);
