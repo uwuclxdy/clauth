@@ -185,12 +185,12 @@ fn record(input: &[u8]) {
     ) else {
         return;
     };
-    if let Some(dir) = observed::dir() {
-        if let Err(e) = observed::record(&dir, &profile, five_hour, seven_day, seen_at, now) {
-            crate::logline::to_logfile(format_args!(
-                "clauth statusline: could not record observed usage for {profile}: {e}"
-            ));
-        }
+    if let Some(dir) = observed::dir()
+        && let Err(e) = observed::record(&dir, &profile, five_hour, seven_day, seen_at, now)
+    {
+        crate::logline::to_logfile(format_args!(
+            "clauth statusline: could not record observed usage for {profile}: {e}"
+        ));
     }
 }
 
