@@ -732,10 +732,10 @@ pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
 /// One provider-neutral banked limit-reset reading. A codex poll fills
 /// `usable` alone (its body names no windows, no end and no `banked`); the
-/// claude scheduler's hourly side read fills every field, reads `usable` as 0
-/// while the server's next reset cannot be spent, and counts every grant in
-/// `banked`. The enclosing `None` means the harness carried no reading, never
-/// that the count was zero.
+/// claude scheduler's hourly side read and the CLI's post-spend refresh fill
+/// every field, read `usable` as 0 while the server's next reset cannot be
+/// spent, and count every grant in `banked`. The enclosing `None` means the
+/// harness carried no reading, never that the count was zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct LimitResets {
     pub(crate) usable: u32,
@@ -748,7 +748,7 @@ pub(crate) struct LimitResets {
     pub(crate) clears: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ends_at: Option<String>,
-    /// Epoch ms of the read that produced this reading, the side read's own
+    /// Epoch ms of the read that produced this reading, the reading's own
     /// stamp. `None` on a codex reading (its poll stamps the surrounding
     /// [`UsageInfo`] instead), so codex cache bytes do not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]

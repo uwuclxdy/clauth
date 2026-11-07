@@ -5080,7 +5080,8 @@ fn refresh_codex_rows(app: &mut App) -> bool {
 }
 
 /// The claude accounts' banked-reset readings, off each profile's own
-/// `limit_resets.json` (the scheduler's hourly side read), keyed by name.
+/// `limit_resets.json` (the scheduler's hourly side read or the CLI's
+/// post-spend refresh), keyed by name.
 /// Loaded where [`codex_rows`] loads its caches — construction and the
 /// per-tick reload — so a pane reads one snapshot per second, never per frame.
 /// Takes the names, not the config, so the loader itself never reads the
@@ -5941,9 +5942,9 @@ pub(crate) struct App {
     /// equal to the rows the Overview draws.
     pub(crate) codex_rows: Vec<CodexRow>,
     /// The claude accounts' banked-reset readings, off each profile's own
-    /// `limit_resets.json` (the scheduler's hourly side read). Cached beside
-    /// `codex_rows` with the same contract: reloaded on the per-tick poll,
-    /// never read per frame.
+    /// `limit_resets.json` (the scheduler's hourly side read or the CLI's
+    /// post-spend refresh). Cached beside `codex_rows` with the same contract:
+    /// reloaded on the per-tick poll, never read per frame.
     pub(crate) claude_resets: HashMap<String, crate::usage::LimitResets>,
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.

@@ -617,8 +617,8 @@ fn build_usage_lines(
     // The banked-reset row sits right under the plan row, ahead of the
     // pricing and status rows: the account's resets read as part of its
     // facts (the codex pane keeps the same row in its own place). The
-    // file's presence is the predicate, as it is on the Overview chip: the
-    // leg writes `limit_resets.json` only for profiles with a claude OAuth
+    // file's presence is the predicate, as it is on the Overview chip:
+    // `limit_resets.json` is written only under a profile with a claude OAuth
     // pair (a hybrid with a pair included), so a pane without a reading
     // draws no row.
     if let Some(resets) = app.claude_resets.get(profile.name.as_str())
@@ -744,8 +744,9 @@ fn build_usage_lines(
 /// read missed a slot.
 const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
-/// The claude pane's `resets` row off the hourly side read: `N available`, or
-/// `N of M available` against the banked total when the reading carries one;
+/// The claude pane's `resets` row off the account's limit-reset reading (the
+/// scheduler's hourly side read or the CLI's post-spend refresh): `N available`,
+/// or `N of M available` against the banked total when the reading carries one;
 /// the windows the next grant resets, its end as the local month/day, and the
 /// reading's age once it passes 75 min. Each `· …` part drops when its field
 /// is absent; a zero count draws no row unless the reading carries a banked

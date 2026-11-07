@@ -864,3 +864,132 @@ fn the_list_count_line_saturates_like_the_side_read() {
         "clauth: 'cl1' has 4294967295 limit resets available."
     );
 }
+
+/// Only a reply that actually took a reset off the count moves it: the spend
+/// landed, or the grant was already gone. Every refusal, open outcome and
+/// unrecognized result spends nothing, so the post-spend refresh re-reads
+/// only on the first two.
+#[test]
+fn only_a_landed_or_already_used_reply_moves_the_count() {
+    for (json, want) in [
+        (r#"{"result":"reset","reason":null}"#, true),
+        (r#"{"result":"already_used","reason":"already_used"}"#, true),
+        (r#"{"result":"not_limited","reason":"not_limited"}"#, false),
+        (r#"{"result":"cooldown","reason":"cooldown"}"#, false),
+        (r#"{"result":"ineligible","reason":"tier"}"#, false),
+        (
+            r#"{"result":"unavailable","reason":"not_next_grant"}"#,
+            false,
+        ),
+        (r#"{"result":"reset","reason":"reset_unconfirmed"}"#, false),
+        (
+            r#"{"result":"unavailable","reason":"stamp_indeterminate"}"#,
+            false,
+        ),
+        (r#"{"result":"boom","reason":null}"#, false),
+    ] {
+        assert_eq!(spend_moved_the_count(&reply(json)), want, "{json}");
+    }
+}
+
+/// The reading the hourly side read and the post-spend refresh both land: the
+/// usable count, the banked total, the next grant's raw window names and end,
+/// and the read's own stamp, so a spend's re-read writes exactly what the
+/// hourly read would have.
+#[test]
+fn a_status_lands_the_reading_the_side_read_and_the_refresh_share() {
+    let before = crate::usage::now_ms();
+    let reading = status_reading(&status(THREE_GRANTS));
+    let after = crate::usage::now_ms();
+    assert_eq!(reading.usable, 2);
+    assert_eq!(reading.banked, Some(3), "every grant in the body, one each");
+    assert_eq!(reading.clears, ["five_hour", "seven_day"]);
+    assert_eq!(reading.ends_at, None, "the next grant has no end");
+    let stamp = reading.fetched_at.expect("the read's own stamp");
+    assert!(
+        (before..=after).contains(&stamp),
+        "{before} <= {stamp} <= {after}"
+    );
+
+    let ended = THREE_GRANTS.replacen(
+        r#""ends_at": null, "clears": ["five_hour", "seven_day"]"#,
+        r#""ends_at": "2026-10-30T16:00:00+00:00", "clears": ["five_hour", "seven_day"]"#,
+        1,
+    );
+    let reading = status_reading(&status(&ended));
+    assert_eq!(
+        reading.ends_at.as_deref(),
+        Some("2026-10-30T16:00:00+00:00"),
+        "the next grant's end, raw server spelling"
+    );
+
+    let none_next = THREE_GRANTS.replacen(
+        r#""next_grant_id": "g-week""#,
+        r#""next_grant_id": null"#,
+        1,
+    );
+    let reading = status_reading(&status(&none_next));
+    assert_eq!(reading.usable, 0, "no next grant, nothing a spend can use");
+    assert!(reading.clears.is_empty(), "no next grant, no windows");
+    assert_eq!(reading.ends_at, None);
+}
+
+/// The failed-re-read line names the read's failure and only what the refresh
+/// did with the stored count under the gate: dropped, left alone by the
+/// login gate or a state flock, kept as newer than the spend (the next test),
+/// or (with the drop-failure line after it) not removed.
+#[test]
+fn the_refresh_read_failure_line_says_what_became_of_the_stored_count() {
+    let err = ResetCallError::Status(503);
+    assert_eq!(
+        refresh_read_failure("cl2", &err, RefreshDrop::Dropped),
+        "clauth: 'cl2': the limit reset read after the spend failed (Anthropic answered with \
+         HTTP 503); the stored count was dropped"
+    );
+    assert_eq!(
+        refresh_read_failure("cl2", &err, RefreshDrop::LoginChanged),
+        "clauth: 'cl2': the limit reset read after the spend failed (Anthropic answered with \
+         HTTP 503); the stored login changed or could not be read, so nothing was touched"
+    );
+    assert_eq!(
+        refresh_read_failure("cl2", &err, RefreshDrop::LockTimedOut),
+        "clauth: 'cl2': the limit reset read after the spend failed (Anthropic answered with \
+         HTTP 503); the state lock was unavailable, so nothing was touched"
+    );
+    assert_eq!(
+        refresh_read_failure("cl2", &err, RefreshDrop::Failed),
+        "clauth: 'cl2': the limit reset read after the spend failed (Anthropic answered with \
+         HTTP 503)"
+    );
+}
+
+/// A stored count read at or after this run's send was kept, and the line
+/// says so.
+#[test]
+fn the_refresh_read_failure_line_keeps_a_newer_stored_count() {
+    let err = ResetCallError::Status(503);
+    assert_eq!(
+        refresh_read_failure("cl2", &err, RefreshDrop::KeptNewer),
+        "clauth: 'cl2': the limit reset read after the spend failed (Anthropic answered with \
+         HTTP 503); the stored count is newer than the spend, so it stays"
+    );
+}
+
+/// The two lines for a store that did not land: a write that failed, and a
+/// state flock the refresh could not take.
+#[test]
+fn the_refresh_store_failure_lines_name_what_was_not_stored() {
+    assert_eq!(
+        refresh_store_failure("cl2"),
+        "clauth: 'cl2': the limit reset count read after the spend was not stored"
+    );
+    assert_eq!(
+        refresh_lock_failure("cl2"),
+        "clauth: 'cl2': the state lock was unavailable, so the limit reset count read after the \
+         spend was not stored"
+    );
+    assert_eq!(
+        refresh_drop_failure("cl2"),
+        "clauth: 'cl2': could not remove the stored limit reset count"
+    );
+}

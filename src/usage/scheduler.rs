@@ -3364,19 +3364,24 @@ fn apply_outcome_flagged(
             .is_some_and(|(prev, info)| weekly_reset_pending(prev, info, now_epoch_secs()));
 
     // The banked-reset side read's fast path: a fresh body whose window
-    // crossed to 100% since the previous reading marks the name due in this
+    // crossed to 100% since the previous reading, or whose use fell while the
+    // previous window's reset still lies ahead, marks the name due in this
     // scheduler's memo, so the same tick's later leg reads the resets once
-    // inside the hour. The previous reading is the landing's own `prev`
-    // clone — the store's entry taken before the identity compare — so a
-    // moved-login landing on a name the store still holds can mark due too,
-    // buying one read with the current token. An absent prev means the store
-    // held no reading for the name (a first landing): it fires nothing, and
-    // the hourly read covers it. A body that stays at 100% fires nothing. No
+    // inside the hour. The fall is a reset spent from outside the side read's
+    // own hour (Claude Code, or a spend whose re-read failed); a fall past or
+    // without a reset stamp is the reset itself, not a spend, and fires
+    // nothing. The previous reading is the landing's own `prev` clone — the
+    // store's entry taken before the identity compare — so a moved-login
+    // landing on a name the store still holds can mark due too, buying one
+    // read with the current token. An absent prev means the store held no
+    // reading for the name (a first landing): it fires nothing, and the
+    // hourly read covers it. A body that stays at 100% fires nothing. No
     // `auto_start` gate (unlike the weekly mark above): the resets matter on
     // every OAuth account the poll reads.
     if is_fresh
         && let Some(info) = merged.as_ref()
-        && window_crossed_full(prev.as_ref(), info)
+        && (window_crossed_full(prev.as_ref(), info)
+            || window_fell_before_its_reset(prev.as_ref(), info, now_epoch_secs()))
         && let Ok(mut guard) = claude_resets_memo.lock()
     {
         guard.due.insert(outcome.name.to_string());
@@ -3724,8 +3729,8 @@ pub(crate) fn clear_codex_compare_hooks_for_test() {
 /// cache). The future arm maps to the mtime too: a stamp in the future proves
 /// the clock moved, not that the read is fresh, and the mtime is the honest
 /// remaining clock. A missing body (no cache, or one that does not parse)
-/// dates nothing. Shared by the startup seeds and the codex row list, so the
-/// rule lives once.
+/// dates nothing. Shared by the startup seeds, the codex row list and the
+/// feed's codex entries, so the rule lives once.
 pub(crate) fn usage_cache_clock_of(name: &ProfileName, body: Option<&UsageInfo>) -> Option<u64> {
     let body = body?;
     body.fetched_at
@@ -7486,8 +7491,8 @@ const CLAUDE_RESETS_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 /// Per-scheduler cadence memo for the claude banked-reset side read: epoch ms
 /// of each account's last read attempt (the tick's `now`), plus the names a
-/// fresh landing marked due for a window that crossed to 100%. A plain struct
-/// built empty, as `weekly_reset_kicks` is a plain set.
+/// fresh landing marked due for a window that crossed to 100% or fell before
+/// its reset. A plain struct built empty, as `weekly_reset_kicks` is a plain set.
 pub(crate) struct ClaudeResetsMemo {
     last_read_at: HashMap<String, u64>,
     due: HashSet<String>,
@@ -7540,6 +7545,37 @@ fn window_crossed_full(prev: Option<&UsageInfo>, fresh: &UsageInfo) -> bool {
         .collect();
     fresh.windows().into_iter().any(|(label, w)| {
         w.utilization >= 100.0 && previous.get(label).is_some_and(|before| *before < 100.0)
+    })
+}
+
+/// Whether any usage window's utilization fell between `prev` and `fresh`
+/// while the PREVIOUS window's own reset still lies ahead of `now_secs`: the
+/// signal of a reset spent outside the side read's own hour (Claude Code, or
+/// a spend whose re-read failed), so it brings the side read forward once,
+/// inside the hour, like a crossing to 100%. A window absent in `prev` is not
+/// a fall: nothing is known about what it read before. A fall whose previous
+/// window's reset already passed, or names no reset to parse, is the reset
+/// itself, not a spend. Matched by label, like [`window_crossed_full`], and
+/// judged on the previous window's stamp: a spend moves the fresh window's
+/// `resets_at`, so only the previous reading still bounds the fall.
+fn window_fell_before_its_reset(
+    prev: Option<&UsageInfo>,
+    fresh: &UsageInfo,
+    now_secs: i64,
+) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    let previous: HashMap<&str, &UsageWindow> = prev.windows().into_iter().collect();
+    fresh.windows().into_iter().any(|(label, w)| {
+        previous.get(label).is_some_and(|before| {
+            w.utilization < before.utilization
+                && before
+                    .resets_at
+                    .as_deref()
+                    .and_then(iso_to_epoch_secs)
+                    .is_some_and(|resets_at| now_secs < resets_at)
+        })
     })
 }
 
@@ -7602,9 +7638,9 @@ pub(crate) fn claude_resets_tick(state: &SchedulerState, timed_out: Option<&Atom
 ///
 /// Each claude OAuth account the poll would poll gets one GET of the side
 /// read an hour, and once more inside the hour when a fresh landing marked it
-/// due (a window crossed to 100%). A successful read lands the usable count,
-/// the banked total, the next grant's windows and end, and the read's stamp
-/// in the account's own `limit_resets.json`; a 401 or any failure writes
+/// due (a window crossed to 100% or fell before its reset). A successful read
+/// lands the usable count, the banked total, the next grant's windows and end,
+/// and the read's stamp in the account's own `limit_resets.json`; a 401 or any failure writes
 /// nothing and still stamps the memo, so a broken account is not re-read every
 /// tick (the codex leg's rule). Each read runs on its own worker, and one
 /// still out at the tick fetch deadline, or one that never ran, counts as a
@@ -7629,7 +7665,7 @@ fn claude_resets_tick_flagged(
 ) {
     // Snapshot each eligible account's token under the status and config
     // locks, along with the names the memo holds no hour for. Config is a
-    // contended lock and a crossing landing takes the memo, so neither is held
+    // contended lock and a due-marking landing takes the memo, so neither is held
     // across the seed's file reads: the names come out under the locks, the
     // files are read with none held, and the apply runs under the epoch guard
     // and the memo. The epochs are captured after the config guard drops,
@@ -7779,7 +7815,7 @@ fn claude_resets_tick_flagged(
             })
             .collect();
         // A due mark leads, then the account whose hour ran out first: a tick
-        // reads one account, and a crossing landing's read must not wait
+        // reads one account, and a due-marked landing's read must not wait
         // behind the hourly ones.
         let hour_of = |name: &ProfileName| memo.last_read_at.get(name.as_str()).copied();
         due.sort_by(|a, b| {
@@ -7877,14 +7913,7 @@ fn claude_resets_tick_flagged(
         // between this check and the write lands the old count; a re-login on
         // disk still fails the identity compare below.
         if let Ok(status) = read {
-            let next = status.next_grant();
-            let reading = LimitResets {
-                usable: status.usable_resets(),
-                banked: Some(status.banked_resets()),
-                clears: next.map(|g| g.clears().to_vec()).unwrap_or_default(),
-                ends_at: next.and_then(|g| g.ends_at().map(str::to_string)),
-                fetched_at: Some(crate::usage::now_ms()),
-            };
+            let reading = claude_reset::status_reading(&status);
             // A login another process installed (a CLI `clauth login`) moves
             // no epoch here, so the write and the stamp are gated on the
             // stored identity under the state flock: a readable moved login

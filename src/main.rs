@@ -85,7 +85,7 @@ use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::format::{grapheme_cells, pad_cells};
-use crate::out::{errln, out, outln};
+use crate::out::{errln, errln_or_drop, out, outln, outln_or_drop};
 use crate::profile::{AppConfig, Profile, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
@@ -3238,9 +3238,10 @@ fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
 ///
 /// On success stdout's first line is the one-line summary, readable as it
 /// stands, unless a name both rosters hold prints its collision note ahead of
-/// it; every failure is the returned error. Reads the store as it stands:
-/// a stale token is reported, never refreshed from here, because the store has
-/// one writer and it is not this command.
+/// it; every failure is the returned error, or `FailureReported` for an
+/// already-used grant, whose line prints before the re-read. Reads the store
+/// as it stands: a stale token is reported, never refreshed from here, because
+/// the store has one writer and it is not this command.
 fn limit_reset_with(
     name: &str,
     list: bool,
@@ -3405,6 +3406,10 @@ fn limit_reset_claude(
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
+    // The identity the spend runs under, captured beside the token it sends:
+    // the post-spend refresh lands its re-read only while the stored login is
+    // still this one.
+    let identity = usage::spawn_oauth_identity(canonical, access_token);
     // The spend path serializes on the account's limit-reset lock before the
     // first request, so a second run waits and re-decides on what this one
     // leaves behind; `--list` spends nothing and never takes it.
@@ -3476,6 +3481,7 @@ fn limit_reset_claude(
             (org_uuid, grant.id.clone(), request_id, sent_at_ms)
         }
     };
+    let this_send_at_ms = crate::usage::now_ms();
     let reply = reset::spend_reset_at(
         &reset::spend_url(&urls.claude_origin, &org_uuid),
         access_token,
@@ -3484,21 +3490,140 @@ fn limit_reset_claude(
     );
     let settled = reset::post_settles(re_send, &reply, reset::spend_settled);
     if settled && let Err(e) = pending::clear(&pending_path) {
-        errln!(
+        errln_or_drop!(
             "clauth: could not remove {} after the reset settled: {e}",
             pending_path.display()
         );
     }
-    let summary = match reply {
-        Ok(reply) => reset::spend_outcome_line(canonical, &reply, sent_at_ms)
-            .map_err(|e| anyhow::anyhow!(e))?,
-        Err(e) => {
-            return Err(anyhow::anyhow!(reset::spend_failure(
-                canonical, &e, sent_at_ms, re_send
-            )));
+    // The spend lock is a true leaf (`lockorder`'s `LimitResetSpend`), so it
+    // drops before the refresh, whose state-flock hold is a ranked lock.
+    drop(_spend_lock);
+    // A settled record is gone by here, or still re-sendable when its clear
+    // failed, so the outcome prints before the re-read: a run killed during the
+    // refresh must still have said what it spent. An already-used answer is the
+    // one error outcome that still moved the count: it prints before the
+    // re-read too, and reports through `FailureReported` after it, which
+    // `exit_code` exits without a second line. Every other error outcome
+    // prints after, from `main`'s report of the return.
+    match &reply {
+        Ok(reply) => {
+            let outcome = reset::spend_outcome_line(canonical, reply, sent_at_ms);
+            if let Ok(summary) = &outcome {
+                outln_or_drop!("{summary}");
+                outln_or_drop!("clauth: the daemon shows the new usage at its next poll.");
+            }
+            if reset::spend_moved_the_count(reply) {
+                if let Err(text) = &outcome {
+                    errln_or_drop!("Error: {text}");
+                }
+                refresh_claude_limit_resets(
+                    canonical,
+                    &urls.claude_origin,
+                    access_token,
+                    &identity,
+                    this_send_at_ms,
+                );
+                if outcome.is_err() {
+                    return Err(anyhow::Error::new(FailureReported));
+                }
+                Ok(())
+            } else {
+                outcome.map_err(|e| anyhow::anyhow!(e))?;
+                Ok(())
+            }
         }
-    };
-    outln!("{summary}");
-    outln!("clauth: the daemon shows the new usage at its next poll.");
-    Ok(())
+        Err(e) => Err(anyhow::anyhow!(reset::spend_failure(
+            canonical, e, sent_at_ms, re_send
+        ))),
+    }
+}
+
+/// The post-spend refresh: after a settled spend that moved the count, the
+/// CLI re-reads the account's resets itself and lands what the server says in
+/// the account's `limit_resets.json` under the state flock, so no surface
+/// keeps showing the spent count until the hourly side read. The write and
+/// the delete share the scheduler's side-read gate: a moved or unreadable
+/// login lands nothing and deletes nothing, and a stored count read at or
+/// after this run's send (`sent_at_ms`) stays, since a side read that
+/// already saw that send is the best count clauth holds; a count with no
+/// stamp counts as older and goes. Every failure of the refresh (the re-read,
+/// the store, the drop, the state flock) is named on stderr, one line per
+/// failure, while the spend's outcome line and exit stay what they were. The
+/// caller releases the spend lock first: it is a true leaf (`lockorder`'s
+/// `LimitResetSpend`), and the flock hold below is a ranked lock.
+fn refresh_claude_limit_resets(
+    canonical: &ProfileName,
+    origin: &str,
+    access_token: &str,
+    identity: &usage::OAuthIdentity,
+    sent_at_ms: u64,
+) {
+    match usage::claude_reset::read_status_at(&usage::claude_reset::read_url(origin), access_token)
+    {
+        Ok(status) => {
+            let reading = usage::claude_reset::status_reading(&status);
+            // `None` when the gate kept the reading off a login that moved or
+            // could not be read; otherwise whether the write landed.
+            let stored = crate::lock::with_state_lock(|_held| {
+                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
+                if unreadable || usage::oauth_changed(identity, &disk) {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    crate::profile_cache::write_profile_cache_reported_for(
+                        crate::harness::Harness::Claude,
+                        canonical,
+                        crate::profile_cache::LIMIT_RESETS_FILE,
+                        &reading,
+                    ),
+                ))
+            });
+            match stored {
+                Ok(None) | Ok(Some(true)) => {}
+                Ok(Some(false)) => {
+                    errln!("{}", usage::claude_reset::refresh_store_failure(canonical));
+                }
+                Err(_) => {
+                    errln!("{}", usage::claude_reset::refresh_lock_failure(canonical));
+                }
+            }
+        }
+        Err(e) => {
+            let drop = match crate::lock::with_state_lock(|_held| {
+                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
+                if unreadable || usage::oauth_changed(identity, &disk) {
+                    return Ok(usage::claude_reset::RefreshDrop::LoginChanged);
+                }
+                let kept = crate::profile_cache::load_profile_cache::<usage::LimitResets>(
+                    canonical,
+                    crate::profile_cache::LIMIT_RESETS_FILE,
+                )
+                .and_then(|r| r.fetched_at)
+                .is_some_and(|at| at >= sent_at_ms);
+                if kept {
+                    return Ok(usage::claude_reset::RefreshDrop::KeptNewer);
+                }
+                Ok(
+                    if crate::profile_cache::remove_profile_cache_reported(
+                        canonical,
+                        crate::profile_cache::LIMIT_RESETS_FILE,
+                    ) {
+                        usage::claude_reset::RefreshDrop::Dropped
+                    } else {
+                        usage::claude_reset::RefreshDrop::Failed
+                    },
+                )
+            }) {
+                Ok(drop) => drop,
+                Err(_) => usage::claude_reset::RefreshDrop::LockTimedOut,
+            };
+            errln!(
+                "{}",
+                usage::claude_reset::refresh_read_failure(canonical, &e, drop)
+            );
+            if drop == usage::claude_reset::RefreshDrop::Failed {
+                errln!("{}", usage::claude_reset::refresh_drop_failure(canonical));
+            }
+        }
+    }
 }

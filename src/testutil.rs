@@ -2315,9 +2315,9 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
 }
 
 /// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
-/// scheduler's hourly side read) with no banked total, as an older reading
-/// stores it: the usable count, the next grant's raw window names and end,
-/// and the read's own epoch-ms stamp.
+/// scheduler's hourly side read or the CLI's post-spend refresh) with no banked
+/// total, as an older reading stores it: the usable count, the next grant's raw
+/// window names and end, and the read's own epoch-ms stamp.
 pub(crate) fn write_claude_limit_resets(
     name: &str,
     usable: u32,

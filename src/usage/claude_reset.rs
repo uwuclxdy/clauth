@@ -22,7 +22,7 @@ use super::codex_reset::{
     trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
-use super::fetch::AuthClient;
+use super::fetch::{AuthClient, LimitResets};
 use crate::format::{local_stamp, plural, shows_nothing, terminal_safe};
 
 /// The reset inventory read: the poll's `/usage` path plus the two query flags
@@ -71,10 +71,10 @@ impl ResetStatus {
 
     /// The account's banked resets a fresh spend can use now: the sum of
     /// `resets_left` over grants the server marks usable, and 0 while the
-    /// server's next reset cannot be spent. The scheduler's side read lands
-    /// this count in `limit_resets.json`. Saturated, as the codex arm clamps
-    /// its server count: a body whose grants sum past `u32::MAX` reads as
-    /// maxed, never wraps or panics.
+    /// server's next reset cannot be spent. The scheduler's side read and the
+    /// CLI's post-spend refresh land this count in `limit_resets.json`.
+    /// Saturated, as the codex arm clamps its server count: a body whose
+    /// grants sum past `u32::MAX` reads as maxed, never wraps or panics.
     pub(crate) fn usable_resets(&self) -> u32 {
         if self.spend_grant().is_none() {
             return 0;
@@ -196,6 +196,22 @@ pub(crate) fn read_status_at(url: &str, access_token: &str) -> Result<ResetStatu
         .call(),
     )
     .map(CedarEmberBody::into_status)
+}
+
+/// The reading a banked-reset status lands on disk: the usable count, the
+/// banked total, the next grant's raw window names and end, and the read's own
+/// epoch-ms stamp. The scheduler's hourly side read and the CLI's post-spend
+/// refresh share it, so a spend's re-read lands exactly what the hourly read
+/// would have.
+pub(crate) fn status_reading(status: &ResetStatus) -> LimitResets {
+    let next = status.next_grant();
+    LimitResets {
+        usable: status.usable_resets(),
+        banked: Some(status.banked_resets()),
+        clears: next.map(|g| g.clears().to_vec()).unwrap_or_default(),
+        ends_at: next.and_then(|g| g.ends_at().map(str::to_string)),
+        fetched_at: Some(super::now_ms()),
+    }
 }
 
 /// The profile reply's org id, the only field the spend needs.
@@ -586,6 +602,68 @@ pub(crate) fn org_failure(name: &str, err: &ResetCallError) -> String {
     shared_read_failure(name, err, &CLAUDE_ORG_VOICE)
 }
 
+/// What the post-spend refresh did with the stored count after its re-read
+/// failed, decided under the state flock so the line it prints says only what
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshDrop {
+    /// The delete landed under the state flock.
+    Dropped,
+    /// The stored count was read at or after this run's send, so the delete
+    /// was skipped: a side read that already saw the spend is the best count
+    /// clauth holds.
+    KeptNewer,
+    /// The gate refused: the stored login changed or could not be read.
+    LoginChanged,
+    /// The state flock could not be taken; nothing was attempted.
+    LockTimedOut,
+    /// The delete was attempted and did not land.
+    Failed,
+}
+
+/// The stderr line for the post-spend re-read's failure: the spend already
+/// landed, so the line names what the re-read hit and what became of the
+/// stored count, never that no reset was used.
+pub(crate) fn refresh_read_failure(name: &str, err: &ResetCallError, drop: RefreshDrop) -> String {
+    let why = match err {
+        ResetCallError::Unauthorized => "Anthropic rejected the stored access token".to_string(),
+        ResetCallError::Status(status) => format!("Anthropic answered with HTTP {status}"),
+        ResetCallError::Transport => "could not reach Anthropic".to_string(),
+        ResetCallError::Parse => "Anthropic answered in a shape clauth does not read".to_string(),
+    };
+    let after = match drop {
+        RefreshDrop::Dropped => "; the stored count was dropped",
+        RefreshDrop::KeptNewer => "; the stored count is newer than the spend, so it stays",
+        RefreshDrop::LoginChanged => {
+            "; the stored login changed or could not be read, so nothing was touched"
+        }
+        RefreshDrop::LockTimedOut => "; the state lock was unavailable, so nothing was touched",
+        RefreshDrop::Failed => "",
+    };
+    format!("clauth: '{name}': the limit reset read after the spend failed ({why}){after}")
+}
+
+/// The stderr line for a failed drop of the stored count after a failed
+/// re-read: one more line, and the run's exit stays what it was.
+pub(crate) fn refresh_drop_failure(name: &str) -> String {
+    format!("clauth: '{name}': could not remove the stored limit reset count")
+}
+
+/// The stderr line for a re-read the refresh could not store: the write leg's
+/// gate admitted it and the cache write did not land.
+pub(crate) fn refresh_store_failure(name: &str) -> String {
+    format!("clauth: '{name}': the limit reset count read after the spend was not stored")
+}
+
+/// The stderr line for a state flock the refresh could not take: nothing was
+/// stored, and the count stays what it was until the hourly side read.
+pub(crate) fn refresh_lock_failure(name: &str) -> String {
+    format!(
+        "clauth: '{name}': the state lock was unavailable, so the limit reset count read after \
+         the spend was not stored"
+    )
+}
+
 /// A failed POST. A fresh send's 401 proves nothing was spent and any other 4xx
 /// spent nothing; every other failure leaves the outcome open, and the shared
 /// line points at the re-run the pending record makes safe. A re-send's
@@ -647,6 +725,17 @@ pub(crate) fn spend_settled(reply: &SpendReply) -> bool {
     !matches!(
         reply.outcome(),
         SpendOutcome::Unconfirmed(_) | SpendOutcome::Unknown(_)
+    )
+}
+
+/// Whether a reply means a reset actually came off the account's count: the
+/// spend landed, or the grant was already gone. Narrower than
+/// [`spend_settled`], which is also true for refusals that spent nothing;
+/// the CLI's post-spend refresh re-reads only on this predicate.
+pub(crate) fn spend_moved_the_count(reply: &SpendReply) -> bool {
+    matches!(
+        reply.outcome(),
+        SpendOutcome::Reset | SpendOutcome::AlreadyUsed
     )
 }
 

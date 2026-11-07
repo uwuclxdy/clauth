@@ -20,8 +20,8 @@ pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
 pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// Filename of the claude banked-reset side read's cache, relative to the
-/// per-profile dir. Written by the scheduler's hourly side read alone; the
-/// plain poll never touches it.
+/// per-profile dir. Written by the scheduler's hourly side read and the CLI's
+/// post-spend refresh; the plain poll never touches it.
 pub(crate) const LIMIT_RESETS_FILE: &str = "limit_resets.json";
 
 /// The account uuid this profile's login last authenticated as (a bare JSON
@@ -777,13 +777,24 @@ fn write_profile_cache_reported<T: Serialize>(name: &ProfileName, file: &str, va
 /// intended post-state, and every other removal error is logged (never surfaced
 /// as a failure) — a stale cache is worse than the log line that names it.
 pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
+    let _ = remove_profile_cache_reported(name, file);
+}
+
+/// [`remove_profile_cache`] that reports whether the file is gone: `true`
+/// when it was removed, was already absent, or the profile dir cannot be
+/// resolved; `false` only on a removal error, which it also logs. A caller
+/// whose surface must show the count is gone prints its own line on `false`.
+pub(crate) fn remove_profile_cache_reported(name: &ProfileName, file: &str) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
-        return;
+        return true;
     };
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+            false
+        }
     }
 }
 

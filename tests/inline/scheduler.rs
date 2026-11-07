@@ -34525,12 +34525,31 @@ fn land_windows(
     seven_day: Option<f64>,
     scoped: Option<(&str, f64)>,
 ) {
+    land_windows_resetting(
+        state,
+        name,
+        token,
+        seven_day,
+        scoped,
+        Some("2999-01-01T00:00:00+00:00"),
+    );
+}
+
+/// [`land_windows`] whose 7d window names `resets_at`.
+fn land_windows_resetting(
+    state: &super::SchedulerState,
+    name: &str,
+    token: &str,
+    seven_day: Option<f64>,
+    scoped: Option<(&str, f64)>,
+    resets_at: Option<&str>,
+) {
     use super::{FetchOutcome, FetchStatus, apply_outcome_to};
     let profile = crate::profile::ProfileName::from(name);
     let usage = crate::usage::UsageInfo {
         seven_day: seven_day.map(|util| crate::usage::UsageWindow {
             utilization: util,
-            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            resets_at: resets_at.map(str::to_string),
         }),
         weekly_scoped: scoped
             .map(|(label, util)| {
@@ -34615,6 +34634,139 @@ fn a_seven_day_or_scoped_window_reaching_full_marks_the_account_due() {
         reads.load(Ordering::SeqCst),
         3,
         "the per-model scoped crossing reads once, inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window's use falling before its reset means a reset was spent, from
+/// Claude Code or by a clauth run whose own re-read failed: the count is
+/// stale, so the read comes forward inside the hour, once per fall. Its use
+/// holding or rising after that reads nothing.
+#[test]
+fn a_window_falling_before_its_reset_marks_the_account_due() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5w", "lr5w-tok");
+    crate::testutil::register_names(&["lr5w"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr5w", "lr5w-tok", Some(90.0), None);
+    land_windows(&state, "lr5w", "lr5w-tok", Some(10.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the fall reads once, inside the hour"
+    );
+
+    land_windows(&state, "lr5w", "lr5w-tok", Some(10.0), None);
+    land_windows(&state, "lr5w", "lr5w-tok", Some(20.0), None);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "no fall, no read before the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window that fell because its reset passed, or names no reset to judge by,
+/// spends nothing: only the hourly read runs.
+#[test]
+fn a_window_falling_past_or_without_its_reset_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5p", "lr5p-tok");
+    crate::testutil::register_names(&["lr5p"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    let passed = Some("2000-01-01T00:00:00+00:00");
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(90.0), None, passed);
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(10.0), None, passed);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "its reset had passed");
+
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(90.0), None, None);
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(10.0), None, None);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "no reset to judge by");
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window that reset on time opens a new one whose reset lies ahead: the
+/// fall is judged by the reset the PREVIOUS reading named, which had passed,
+/// so it reads nothing, whatever the fresh reading's reset says.
+#[test]
+fn a_window_that_reset_on_time_into_a_new_one_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5n", "lr5n-tok");
+    crate::testutil::register_names(&["lr5n"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    let passed = Some("2000-01-01T00:00:00+00:00");
+    let ahead = Some("2100-01-01T00:00:00+00:00");
+    land_windows_resetting(&state, "lr5n", "lr5n-tok", Some(90.0), None, passed);
+    land_windows_resetting(&state, "lr5n", "lr5n-tok", Some(10.0), None, ahead);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the previous reset had passed"
     );
 
     drop(endpoints);

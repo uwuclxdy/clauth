@@ -7305,7 +7305,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
     let spent = r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour","seven_day"],"weekly_resets_at":null,"cooldown_until":null}"#;
-    let (addr, handle) = crate::testutil::serve_endpoints_raw(6, move |path, _i| {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(7, move |path, _i| {
         if path.starts_with("/api/oauth/usage") {
             (200, CEDAR_EMBER_THREE_GRANTS.to_string())
         } else if path == "/api/oauth/profile" {
@@ -7350,7 +7350,8 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
             RESET_PROFILE,
             RESET_READ,
             RESET_PROFILE,
-            RESET_SPEND
+            RESET_SPEND,
+            RESET_READ
         ],
         "the prompt comes after both reads, the spend after the yes, sent once"
     );
@@ -7805,7 +7806,7 @@ fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
     let (urls, handle) = claude_spend_stub(
-        7,
+        8,
         |i| {
             if i < 3 {
                 CEDAR_EMBER_THREE_GRANTS.to_string()
@@ -7847,7 +7848,8 @@ fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
             RESET_SPEND,
             RESET_READ,
             RESET_PROFILE,
-            RESET_SPEND
+            RESET_SPEND,
+            RESET_READ
         ]
     );
     let spends = bodies_of(&seen, RESET_SPEND);
@@ -7856,6 +7858,548 @@ fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
         spends[0], spends[1],
         "the re-run re-sends the first request byte for byte"
     );
+}
+
+/// `cl2`'s stored banked-reset reading off disk.
+fn stored_limit_resets() -> Option<usage::LimitResets> {
+    crate::profile_cache::load_profile_cache::<usage::LimitResets>(
+        &crate::profile::ProfileName::from("cl2"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+    )
+}
+
+/// A spent count must not wait for the hourly read: after the spend the CLI
+/// reads the status again and lands what the server says, never its own
+/// subtraction. The reading on disk says 9 and the first read 2 usable; the
+/// re-read answers a body whose two `resets_total: 1` / `resets_left: 1`
+/// grants rise to 3 (the unusable one still adds nothing), so the usable
+/// count is g-old's 3 plus g-week's 1 = 4, and only the re-read's figure
+/// passes. The fixture's next grant is `g-week`, clearing both windows with
+/// no end.
+#[test]
+fn limit_reset_lands_the_count_the_server_reads_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets(
+        "cl2",
+        9,
+        &["seven_day_blue"],
+        Some("2099-01-01"),
+        1,
+    );
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |i| {
+            if i == 0 {
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            } else {
+                CEDAR_EMBER_THREE_GRANTS.replace(
+                    r#""resets_total": 1, "resets_left": 1,"#,
+                    r#""resets_total": 3, "resets_left": 3,"#,
+                )
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    let before = crate::usage::now_ms();
+    let used = stdout_of(|| {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    });
+    let after = crate::usage::now_ms();
+
+    assert_eq!(
+        used,
+        [
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
+            "clauth: the daemon shows the new usage at its next poll.",
+        ]
+    );
+    let reading = stored_limit_resets().expect("a reading on disk");
+    assert_eq!(
+        reading.usable, 4,
+        "the re-read's count (3 + 1), never the first read's 2"
+    );
+    assert_eq!(reading.clears, ["five_hour", "seven_day"]);
+    assert_eq!(reading.ends_at, None, "the next grant has no end");
+    let stamp = reading.fetched_at.expect("the read's own stamp");
+    assert!(
+        (before..=after).contains(&stamp),
+        "{before} <= {stamp} <= {after}"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+        "one read after the spend, and only after it"
+    );
+}
+
+/// A spend the server took with a re-read that fails leaves no surface
+/// showing the spent count: the reading goes and the spend still succeeds.
+#[test]
+fn limit_reset_drops_the_reading_when_the_read_after_a_claude_spend_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 2, &["five_hour"], None, 1);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (503, "busy".to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        .expect("the spend succeeded, whatever the re-read did");
+
+    assert!(
+        !pending_path("cl2", "limit_resets.json").exists(),
+        "no surface keeps showing the spent count"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+        "the re-read is not retried"
+    );
+}
+
+/// The record is gone once a spend settles, so a run killed during the re-read
+/// must already have said what it spent: a re-run with no such line and no
+/// record spends the next grant. The stub copies stdout at the re-read itself.
+#[test]
+fn limit_reset_prints_a_claude_spends_outcome_before_the_read_after_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let out = crate::out::OutCapture::new();
+    let at_reread = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let (urls, handle) = {
+        let out = out.clone();
+        let at_reread = std::sync::Arc::clone(&at_reread);
+        claude_spend_stub(
+            5,
+            move |i| {
+                if i > 0 {
+                    *at_reread.lock().expect("the stub's slot") = Some(out.snapshot());
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            },
+            |_| (200, CLAUDE_SPENT.to_string()),
+        )
+    };
+
+    {
+        let _guard = out.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    }
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+    let printed = at_reread
+        .lock()
+        .expect("the stub's slot")
+        .take()
+        .expect("the stub saw the re-read");
+    assert_eq!(
+        String::from_utf8(printed)
+            .expect("utf-8 stdout")
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
+            "clauth: the daemon shows the new usage at its next poll.",
+        ],
+        "stdout as it stood when the re-read reached the server"
+    );
+}
+
+/// A stdout reader that left (`clauth limit-reset cl2 --yes | head -1`) must
+/// not take the re-read with it: the spend settled, so the run goes on, lands
+/// the count and exits as it would have. Only the re-read's figure passes.
+#[test]
+fn limit_reset_lands_the_count_when_stdouts_reader_left_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 9, &[], None, 1);
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    let out = crate::out::OutCapture::reader_gone();
+    {
+        let _guard = out.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    }
+
+    assert!(out.snapshot().is_empty(), "nobody read those lines");
+    assert_eq!(stored_limit_resets().expect("a reading").usable, 2);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+}
+
+/// An `already_used` answer leaves no record either, so it is said before the
+/// re-read like a success: a run killed there has already told the user. It
+/// is said once, and the run still exits 1. The stub copies stderr at the
+/// re-read itself.
+#[test]
+fn limit_reset_prints_an_already_used_answer_before_the_read_after_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let stderr = crate::out::ErrCapture::new();
+    let at_reread = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let (urls, handle) = {
+        let stderr = stderr.clone();
+        let at_reread = std::sync::Arc::clone(&at_reread);
+        claude_spend_stub(
+            5,
+            move |i| {
+                if i > 0 {
+                    *at_reread.lock().expect("the stub's slot") = Some(stderr.snapshot());
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            },
+            |_| {
+                (
+                    200,
+                    r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#
+                        .to_string(),
+                )
+            },
+        )
+    };
+
+    let out = crate::out::OutCapture::new();
+    let result = {
+        let _out = out.capture_here();
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    };
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+    let err = result.expect_err("already used");
+    assert!(
+        err.downcast_ref::<FailureReported>().is_some(),
+        "main prints no second line: {err:?}"
+    );
+    let want = "Error: that limit reset on 'cl2' was already used; run `clauth limit-reset cl2 \
+                --list` to see what is left\n";
+    let printed = at_reread
+        .lock()
+        .expect("the stub's slot")
+        .take()
+        .expect("the stub saw the re-read");
+    assert_eq!(String::from_utf8(printed).expect("utf-8 stderr"), want);
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8 stderr"),
+        want,
+        "said once"
+    );
+    assert!(out.snapshot().is_empty(), "nothing on stdout");
+}
+
+/// A refusal that moved no count (here: not at a limit) runs no re-read, so
+/// it prints nothing early: the run returns it and `main` says it, once.
+#[test]
+fn limit_reset_returns_a_refusal_that_moved_no_count_and_prints_nothing_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| {
+            (
+                200,
+                r#"{"result":"not_limited","reason":"not_limited","resets_left":1,"cleared":[]}"#
+                    .to_string(),
+            )
+        },
+    );
+
+    let out = crate::out::OutCapture::new();
+    let stderr = crate::out::ErrCapture::new();
+    let result = {
+        let _out = out.capture_here();
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    };
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND],
+        "no re-read after a refusal"
+    );
+    let err = result.expect_err("not at a limit");
+    assert!(
+        err.downcast_ref::<FailureReported>().is_none(),
+        "main must print it: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "'cl2' is not at a limit that reset covers, so no reset was used"
+    );
+    assert!(
+        stderr.snapshot().is_empty(),
+        "nothing on stderr before main"
+    );
+    assert!(out.snapshot().is_empty(), "nothing on stdout");
+}
+
+/// A failed re-read deletes only a reading older than the spend: one stamped
+/// after it came from a side read that already saw the spend, and is the best
+/// count clauth holds.
+#[test]
+fn limit_reset_keeps_a_reading_newer_than_the_spend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let newer = crate::usage::now_ms() + 3_600_000;
+    crate::testutil::write_claude_limit_resets("cl2", 7, &["five_hour"], None, newer);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (503, "busy".to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        .expect("the spend succeeded, whatever the re-read did");
+
+    let reading = stored_limit_resets().expect("the newer reading stays");
+    assert_eq!((reading.usable, reading.fetched_at), (7, Some(newer)));
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+}
+
+/// On a re-send the spend is this run's send: a reading taken after a first
+/// send that never landed predates it, so a failed re-read deletes that reading
+/// rather than keeping a count one too high.
+#[test]
+fn limit_reset_drops_a_reading_older_than_the_resend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(8, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 6 {
+                (503, "busy".to_string())
+            } else {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else if i == 2 {
+            (503, "busy".to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    crate::testutil::write_claude_limit_resets(
+        "cl2",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+
+    let stderr = crate::out::ErrCapture::new();
+    {
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send spent");
+    }
+
+    assert!(
+        stored_limit_resets().is_none(),
+        "a reading older than this run's send is gone"
+    );
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8"),
+        "clauth: 'cl2': the limit reset read after the spend failed \
+         (Anthropic answered with HTTP 503); the stored count was dropped\n",
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+        ],
+    );
+}
+
+/// A re-send answered `already_used` means the first send landed, so the
+/// count moved although this run exits with an error.
+#[test]
+fn limit_reset_lands_the_count_after_a_resend_the_first_send_already_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 9, &[], None, 1);
+    let (urls, handle) = claude_spend_stub(
+        8,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |i| {
+            if i == 2 {
+                (503, "busy".to_string())
+            } else {
+                (
+                    200,
+                    r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#
+                        .to_string(),
+                )
+            }
+        },
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    assert_eq!(
+        stored_limit_resets().expect("untouched").usable,
+        9,
+        "a lost spend changes nothing"
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("already used");
+
+    assert_eq!(stored_limit_resets().expect("a reading").usable, 2);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ
+        ]
+    );
+}
+
+/// A spend that took nothing, or whose outcome is open, reads nothing more
+/// and leaves the reading's bytes alone.
+#[test]
+fn limit_reset_leaves_the_reading_alone_when_a_claude_spend_took_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 2, &["five_hour"], None, 1);
+    let file = pending_path("cl2", "limit_resets.json");
+    let bytes = std::fs::read(&file).expect("the seeded reading");
+
+    for (status, body) in [
+        (
+            200,
+            r#"{"result":"not_limited","reason":"not_limited","resets_left":1,"cleared":[]}"#,
+        ),
+        (
+            200,
+            r#"{"result":"reset","reason":"reset_unconfirmed","resets_left":null,"cleared":[]}"#,
+        ),
+        (503, "busy"),
+    ] {
+        let (urls, handle) = claude_spend_stub(
+            4,
+            |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+            move |_| (status, body.to_string()),
+        );
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err(body);
+
+        assert_eq!(std::fs::read(&file).expect("the reading"), bytes, "{body}");
+        let seen = handle.join().expect("join stub");
+        assert_eq!(
+            request_lines(&seen),
+            [RESET_READ, RESET_PROFILE, RESET_SPEND],
+            "{body}"
+        );
+        // An open outcome leaves its record, which the next case must not re-send.
+        let record = pending_path("cl2", CLAUDE_PENDING);
+        if record.exists() {
+            std::fs::remove_file(&record).expect("drop the record");
+        }
+    }
+}
+
+/// A login that moved while the spend ran owns the file now: the old login's
+/// figure never lands on it, and a failed read never deletes it. The stub
+/// swaps the stored login as the re-read arrives.
+#[test]
+fn limit_reset_keeps_the_reading_of_a_login_that_moved_during_a_claude_spend() {
+    for (status, body) in [(200, CEDAR_EMBER_THREE_GRANTS), (503, "busy")] {
+        let _home = crate::testutil::HomeSandbox::new();
+        seed_claude_reset_profiles();
+        crate::testutil::write_claude_limit_resets("cl2", 7, &["five_hour"], None, 1);
+        let file = pending_path("cl2", "limit_resets.json");
+        let bytes = std::fs::read(&file).expect("the seeded reading");
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    return (200, CEDAR_EMBER_THREE_GRANTS.to_string());
+                }
+                let name = crate::profile::ProfileName::from("cl2");
+                let mut profile = crate::profile::load_profile(&name).expect("load cl2");
+                profile.credentials = Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at.other".into(),
+                        refresh_token: Some("rt.other".into()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                });
+                crate::profile::save_profile(&profile).expect("save cl2");
+                (status, body.to_string())
+            } else if path == "/api/oauth/profile" {
+                (200, RESET_PROFILE_BODY.to_string())
+            } else {
+                (200, CLAUDE_SPENT.to_string())
+            }
+        });
+        let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+
+        assert_eq!(
+            std::fs::read(&file).expect("the reading"),
+            bytes,
+            "{status}"
+        );
+        handle.join().expect("join stub");
+    }
 }
 
 /// A record younger than 600 s is what the next spend sends, whatever grant
@@ -7874,7 +8418,7 @@ fn limit_reset_sends_a_fresh_claude_record_instead_of_the_next_grant() {
         }),
     );
     let (urls, handle) = claude_spend_stub(
-        4,
+        5,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
@@ -7907,7 +8451,7 @@ fn limit_reset_drops_a_stale_claude_record() {
         }),
     );
     let (urls, handle) = claude_spend_stub(
-        4,
+        5,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
@@ -7929,7 +8473,7 @@ fn limit_reset_keeps_no_claude_record_past_a_refusal() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
     let (urls, handle) = claude_spend_stub(
-        7,
+        8,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |i| {
             if i == 2 {
@@ -7959,7 +8503,7 @@ fn limit_reset_records_a_claude_spend_before_sending_it() {
     let at_send = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let seen_at_send = std::sync::Arc::clone(&at_send);
     let (urls, handle) = claude_spend_stub(
-        4,
+        5,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         move |_| {
             *seen_at_send.lock().expect("lock") =
@@ -8598,7 +9142,7 @@ fn limit_reset_reports_a_failed_clear_after_a_settled_claude_reply() {
     ));
     let guard_seen = std::sync::Arc::clone(&guard);
     let (urls, handle) = claude_spend_stub(
-        3,
+        4,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         move |_| {
             *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
@@ -8629,6 +9173,50 @@ fn limit_reset_reports_a_failed_clear_after_a_settled_claude_reply() {
     drop(guard);
 }
 
+/// A refresh write that does not land prints one stderr line naming what was
+/// not stored, and the spend's success output and exit stay.
+#[cfg(unix)]
+#[test]
+fn limit_reset_reports_the_count_it_could_not_store_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::testutil::UnwritableDir>,
+    ));
+    let guard_seen = std::sync::Arc::clone(&guard);
+    let (urls, handle) = claude_spend_stub(
+        5,
+        move |i| {
+            if i == 3 {
+                // The re-read lands; the store under the state flock is what
+                // the fault hits, after the pending record has cleared.
+                *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
+                    pending_path("cl2", CLAUDE_PENDING)
+                        .parent()
+                        .expect("profile dir"),
+                ));
+            }
+            CEDAR_EMBER_THREE_GRANTS.to_string()
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let err_cap = crate::out::ErrCapture::new();
+    let err_guard = err_cap.capture_here();
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    });
+    drop(err_guard);
+    handle.join().expect("join stub");
+    let stderr = String::from_utf8(err_cap.snapshot()).expect("utf-8 stderr");
+    assert_eq!(
+        stderr, "clauth: 'cl2': the limit reset count read after the spend was not stored\n",
+        "the run prints exactly the failed landing, never a line claiming a store"
+    );
+    assert_eq!(out.len(), 2, "the success output is unchanged: {out:?}");
+    assert!(stored_limit_resets().is_none(), "the reading did not land");
+    drop(guard);
+}
+
 /// A record stamped more than 600 s in the future reads stale: it is removed
 /// and the normal fresh spend runs.
 #[test]
@@ -8645,7 +9233,7 @@ fn limit_reset_drops_a_future_stamped_claude_record() {
         }),
     );
     let (urls, handle) = claude_spend_stub(
-        3,
+        4,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
@@ -8690,7 +9278,7 @@ fn limit_reset_waits_for_another_claude_run_on_the_same_account() {
     let released = Arc::new(AtomicBool::new(false));
     let early = Arc::new(AtomicBool::new(false));
     let (urls, handle) = claude_spend_stub(
-        4,
+        5,
         {
             let released = Arc::clone(&released);
             let early = Arc::clone(&early);
@@ -8719,7 +9307,7 @@ fn limit_reset_waits_for_another_claude_run_on_the_same_account() {
     outcome.expect("the waiting run spends once the lock is free");
     assert_eq!(
         request_lines(&seen),
-        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ]
     );
 }
 
@@ -8806,7 +9394,7 @@ fn limit_reset_drops_a_claude_record_with_an_unsendable_grant_id() {
         }),
     );
     let (urls, handle) = claude_spend_stub(
-        3,
+        4,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
@@ -8833,7 +9421,7 @@ fn limit_reset_drops_a_claude_record_with_an_unsendable_request_id() {
         }),
     );
     let (urls, handle) = claude_spend_stub(
-        3,
+        4,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
@@ -10484,7 +11072,7 @@ fn limit_reset_prints_one_waiting_line_while_the_lock_is_held() {
     let released = Arc::new(AtomicBool::new(false));
     let early = Arc::new(AtomicBool::new(false));
     let (urls, handle) = claude_spend_stub(
-        3,
+        4,
         {
             let released = Arc::clone(&released);
             let early = Arc::clone(&early);
@@ -10523,7 +11111,7 @@ fn limit_reset_prints_one_waiting_line_while_the_lock_is_held() {
     );
     assert_eq!(
         request_lines(&seen),
-        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ]
     );
 }
 
@@ -10547,7 +11135,7 @@ fn limit_reset_resends_the_claude_record_another_run_left_while_it_waited() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
     let (urls, handle) = claude_spend_stub(
-        4,
+        5,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
