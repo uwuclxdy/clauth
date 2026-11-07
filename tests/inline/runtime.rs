@@ -4496,7 +4496,7 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
                 ),
                 (
                     "projects",
-                    "transcripts stay in its own tree until it ends and ~/.claude can take them",
+                    "transcripts stay in its own tree until ~/.claude can take them and no job still holds that tree",
                 ),
                 (
                     "sessions",

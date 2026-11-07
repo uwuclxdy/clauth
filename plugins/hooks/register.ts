@@ -696,7 +696,9 @@ export const register: Register = on => {
         next.signal,
       )
       if (outcome.type === 'answers') {
-        return { result: { answers: outcome.answers } }
+        // The engine's output-shape check refuses a result without the
+        // tool's own `questions` (measured 2026-11-06, 2.1.319).
+        return { result: { questions: e.questions, answers: outcome.answers } }
       }
       return next(e)
     },

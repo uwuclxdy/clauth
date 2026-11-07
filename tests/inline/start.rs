@@ -879,7 +879,8 @@ fn start_prints_one_line_per_store_it_cannot_create() {
             ),
             format!(
                 "clauth: could not create {}: {refused}; this session's transcripts \
-                 stay in its own tree until it ends and ~/.claude can take them\n",
+                 stay in its own tree until ~/.claude can take them and no job still holds \
+                 that tree\n",
                 claude.join("projects").display()
             ),
             format!(

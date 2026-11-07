@@ -302,7 +302,15 @@ function reservedRow(door: 'attachment' | 'hook-context' | 'compaction' | 'tool-
 
 const ASK = { decision: 'ask' as const }
 const QUESTION = [
-  { question: 'Which lib?', header: 'Lib', options: [{ label: 'date-fns', description: '' }], multiSelect: false },
+  {
+    question: 'Which lib?',
+    header: 'Lib',
+    options: [
+      { label: 'date-fns', description: '' },
+      { label: 'dayjs', description: '' },
+    ],
+    multiSelect: false,
+  },
 ]
 
 // The permission row's whole tree, as the terminal's table draws it; the
@@ -720,7 +728,17 @@ test('C1q-nl: a multi-line question collapses to its first line with an ellipsis
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   const p = $.tool.call({
     tool: 'AskUserQuestion',
-    questions: [{ question: 'First line\nsecond line', header: 'H', options: [{ label: 'x', description: '' }], multiSelect: false }],
+    questions: [
+      {
+        question: 'First line\nsecond line',
+        header: 'H',
+        options: [
+          { label: 'x', description: '' },
+          { label: 'y', description: '' },
+        ],
+        multiSelect: false,
+      },
+    ],
   })
   await clock.settle()
   const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
@@ -743,7 +761,7 @@ test('C2: AskUserQuestion held answers from the phone without next', async ($, o
   await clock.settle()
   bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' } })
   await clock.advance(PARK_MS)
-  expect(await p).toEqual({ result: { answers: { 'Which lib?': 'date-fns' } } })
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
   expect(nextRan).toBe(false)
 })
 
@@ -794,7 +812,7 @@ test('C2d: a phone answer before d wins; the later d press does nothing', async 
   const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
   bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' } })
   await clock.advance(PARK_MS)
-  expect(await p).toEqual({ result: { answers: { 'Which lib?': 'date-fns' } } })
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
   expect(nextRan).toBe(false)
   await expect(ui.press({ key: 'answer-here' })).rejects.toThrow()
   expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)

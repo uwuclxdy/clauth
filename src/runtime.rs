@@ -10449,7 +10449,7 @@ pub(crate) const SHARED_STORES: &[(&str, &str)] = &[
     ),
     (
         "projects",
-        "transcripts stay in its own tree until it ends and ~/.claude can take them",
+        "transcripts stay in its own tree until ~/.claude can take them and no job still holds that tree",
     ),
     (
         "sessions",
