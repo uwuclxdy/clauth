@@ -317,6 +317,22 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     // the roster is labelled a session-start snapshot with a live-refresh pointer.
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
     assert!(out.contains("call `profiles`"));
+    // the block says it is filtered, so a disabled row in `profiles` never
+    // reads as an account added since.
+    for auth in [
+        SessionAuth::Global,
+        SessionAuth::IsolatedRuntime("work".to_string()),
+        SessionAuth::IsolatedCustom,
+    ] {
+        let block = instructions_block(&profiles, &auth, crate::runtime::LinkProbe::NothingShared);
+        assert!(
+            block.contains(
+                "Profiles, most headroom first (session-start snapshot, disabled accounts left \
+out; call `profiles` for live usage and anything added since):\n"
+            ),
+            "the header names the omission in every tier: {block}",
+        );
+    }
 
     // the tool router survives, because it is the ONLY clauth text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is

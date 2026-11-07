@@ -600,8 +600,8 @@ state).\n\n",
         switch_router_clause(auth),
     ));
     out.push_str(
-        "Profiles, most headroom first (session-start snapshot; call `profiles` for live usage \
-and anything added since):\n",
+        "Profiles, most headroom first (session-start snapshot, disabled accounts left out; call \
+`profiles` for live usage and anything added since):\n",
     );
     out.push_str(&roster_lines(profiles, auth));
     out

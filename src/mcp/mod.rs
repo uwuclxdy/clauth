@@ -6623,9 +6623,20 @@ fn build_instructions() -> String {
             Call `profiles` for live usage figures."
             .to_string();
     };
+    let auth = crate::which::session_auth();
+    let runtime_name = match &auth {
+        crate::which::SessionAuth::IsolatedRuntime(name) => Some(name.as_str()),
+        crate::which::SessionAuth::Global | crate::which::SessionAuth::IsolatedCustom => None,
+    };
+    // A disabled account leaves this roster unless the block still reads its row:
+    // the active account's identity line and marker, and the shared runtime's own
+    // account, which the identity line names.
     let snapshots: Vec<ProfileSnapshot> = config
         .profiles
         .iter()
+        .filter(|p| {
+            !p.is_disabled() || config.is_active(&p.name) || runtime_name == Some(p.name.as_str())
+        })
         .map(|p| ProfileSnapshot {
             name: p.name.to_string(),
             active: config.is_active(&p.name),
@@ -6636,7 +6647,6 @@ fn build_instructions() -> String {
         })
         .collect();
 
-    let auth = crate::which::session_auth();
     let probe = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
     render::instructions_block(&snapshots, &auth, probe)
 }

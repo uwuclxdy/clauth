@@ -1376,6 +1376,117 @@ fn the_roster_ranks_a_credit_capped_account_last_while_its_gate_is_on() {
     }
 }
 
+/// Saves a roster of blank accounts: `disabled` ones flagged, `active` global.
+fn save_roster(names: &[&str], disabled: &[&str], active: Option<&str>) {
+    for n in names {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
+        p.disabled = disabled.contains(n);
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        active_profile: active.map(Into::into),
+        ..Default::default()
+    })
+    .expect("save state");
+}
+
+/// The session-start roster, which a model reads as the accounts it can pick
+/// from, leaves a disabled account out.
+#[test]
+fn the_roster_leaves_out_a_disabled_account() {
+    let _home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-on"));
+    let block = build_instructions();
+    assert!(
+        block.contains("- acct-on (global active, this session) [anthropic"),
+        "the enabled account stays on the roster: {block}"
+    );
+    assert!(
+        !block.contains("acct-off"),
+        "the disabled account is off the block: {block}"
+    );
+}
+
+/// Dropping a disabled active account would take the block's identity line
+/// with it, the first thing a global session reads about what it spends.
+#[test]
+fn the_roster_keeps_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("global active: `acct-off`"),
+        "the identity line survives: {block}"
+    );
+    assert!(
+        block.contains("acct-off (global active, this session)"),
+        "the roster keeps the account behind this session: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
+/// A runtime session's identity line names the global account too, and a
+/// custom config dir marks it on the roster: neither loses a disabled one.
+#[test]
+fn the_roster_keeps_a_disabled_active_account_in_the_other_session_tiers() {
+    let home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-off"));
+    let runtime = home.home().join(".clauth/profiles/acct-on").join("runtime");
+    let dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-on` (anthropic) · global active: `acct-off`"),
+        "the runtime identity line names the global account: {block}"
+    );
+    drop(dir);
+    let custom = home.home().join("custom-config");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &custom);
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active)"),
+        "a custom dir still marks the global account: {block}"
+    );
+}
+
+/// A shared `clauth start` runtime keeps the row and provider of the account
+/// its dir names, whatever that account's flag says: the identity line reads
+/// that row.
+#[test]
+fn the_roster_keeps_the_disabled_account_a_runtime_dir_names() {
+    let home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-on"),
+    );
+    let runtime = home
+        .home()
+        .join(".clauth/profiles/acct-off")
+        .join("runtime");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-off` (anthropic)"),
+        "the identity line keeps its provider: {block}"
+    );
+    assert!(
+        block.contains("acct-off (this session)"),
+        "the roster keeps this session's own account: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
 /// An own-endpoint account never spends its usage credits, so its spent cap
 /// must not demote it to `Capped` — the RANK is what the credit gate governs.
 /// The in-test control first pins the same fixture WITHOUT the endpoint as
