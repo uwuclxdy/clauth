@@ -3717,7 +3717,10 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
 
     // A bar is 10 interior cells in brackets, always trailed by its percentage —
     // specific enough that no pill or chip elsewhere in the frame can match it.
+    // Past the 122-cell layout (126 columns) the bars take a share of the
+    // panel's slack, so there a bar holds at least its 10 cells.
     let bar = regex::Regex::new(r"\[[^\[\]]{10}\] +\d+%").expect("valid pattern");
+    let grown_bar = regex::Regex::new(r"\[[^\[\]]{10,}\] +\d+%").expect("valid pattern");
     let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
 
     // Pre-column behavior as a function of TERMINAL width, per NAME LENGTH. The
@@ -3769,6 +3772,7 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
             let frame = dump(&app, width, 20);
             let bars = usize::from(width >= *first_bar) + usize::from(width >= *seven_bar);
             let resets = usize::from(width >= *first_reset) + usize::from(width >= *seven_reset);
+            let bar = if width > 126 { &grown_bar } else { &bar };
             assert_eq!(
                 (
                     bar.find_iter(&frame).count(),
@@ -3968,19 +3972,26 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
     }
 }
 
-/// Desktop pin: past the clamp the name column stops absorbing the panel's
-/// spare width — the columns keep their cap-width layout and the band centres,
-/// so the 26-cell ASCII name clips to its 22-cell column (`…`) while the type
-/// cell stays on the same terminal cell as every other row. The expected row
-/// is hand-derived from the layout at the 122-cell cap plus the centring pad.
+/// Desktop pin: past the 122-cell layout the name column stops absorbing the
+/// panel's spare width — it keeps its laid-out 22 cells while the slack goes to
+/// the bars and the gaps, so the 26-cell ASCII name clips to its column (`…`)
+/// while the type cell stays on the same terminal cell as every other row.
+///
+/// The expected row is hand-derived. The layout at 122 is name 22, kind 16,
+/// 5h 26, 7d 27, live 4, t/s 4, gap 3 (narrow 1), timer 5: a 121-cell row. At
+/// 160 columns the list is 156 wide, so the slack is 35: the bars' collective
+/// third is 11, the 5h taking 5 (a 15-cell bar, a 31-cell column) and the 7d
+/// the odd cell (6, a 16-cell bar, a 33-cell column), and the other 24 spread
+/// over the 5 gaps at 4 each with the leftmost four a cell more (gaps 8,
+/// narrow 6). Fill is round-to-nearest: 12% of 15 -> 2, 8% of 16 -> 1.
 #[test]
 fn the_overview_name_column_clips_to_its_capped_column_at_160() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
-    // Select on the row content after the band's centring pad, never a
-    // left-flush prefix: past the clamp every row carries the pad.
+    // Select on the row content after the border's padding, never a fixed
+    // left-flush prefix.
     let got: Vec<String> = rows
         .iter()
         .filter(|r| {
@@ -3993,25 +4004,27 @@ fn the_overview_name_column_clips_to_its_capped_column_at_160() {
     assert_eq!(
         got,
         vec![
-            "│                  ❯   abcdefghijklmnopqrstu…   —                     [█░░░░░░░░░] 12%             [█░░░░░░░░░]  8%                                            │",
+            "│ ❯   abcdefghijklmnopqrstu…        —                          [██░░░░░░░░░░░░░] 12%                  [█░░░░░░░░░░░░░░░]  8%                                   │",
         ],
         "name column ascii row at 160 cols"
     );
 }
 
-/// Desktop pin: the CJK and emoji names render whole inside the capped name
+/// Desktop pin: the CJK and emoji names render whole inside the 22-cell name
 /// column, and the type cell lands on the same terminal cell in the CJK, emoji
 /// and ASCII rows — one cell-measured column layout shared by every row, the
-/// band's centring pad included. The expected rows are hand-derived from the
-/// layout at the 122-cell cap plus the centring pad.
+/// widened gaps included. The expected rows are hand-derived the way
+/// [`the_overview_name_column_clips_to_its_capped_column_at_160`] derives its
+/// own (15- and 16-cell bars, gaps 8, narrow 6): 49% of 15 -> 7, 30% of 16 ->
+/// 5 (4.8 rounds up), 63% of 15 -> 9, 40% of 16 -> 6 filled cells.
 #[test]
 fn the_overview_name_column_desktop_rows_measure_by_cells() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
-    // Select on the row content after the band's centring pad, never a
-    // left-flush prefix: past the clamp every row carries the pad.
+    // Select on the row content after the border's padding, never a fixed
+    // left-flush prefix.
     let got: Vec<String> = rows
         .iter()
         .filter(|r| {
@@ -4026,8 +4039,8 @@ fn the_overview_name_column_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            "│                    ✻ cjk-日 本 語 ア カ ウ ン ト      —                     [█████░░░░░] 49%             [███░░░░░░░] 30%                                            │",
-            "│                      emoji-🧭 ⚠️ -account       —                     [██████░░░░] 63%             [████░░░░░░] 40%                                            │",
+            "│   ✻ cjk-日 本 語 ア カ ウ ン ト           —                          [███████░░░░░░░░] 49%                  [█████░░░░░░░░░░░] 30%                                   │",
+            "│     emoji-🧭 ⚠️ -account            —                          [█████████░░░░░░] 63%                  [██████░░░░░░░░░░] 40%                                   │",
         ],
         "name column wide rows at 160 cols"
     );
