@@ -169,8 +169,8 @@ enum ChainIneligible {
     NoSecondMember,
     /// The daemon singleton's lock exists but cannot be tested.
     DaemonUnchecked,
-    /// Only the daemon's decision leg writes `intended_member`, so with no
-    /// daemon the flag is inert.
+    /// Only the daemon's decision leg moves a session along the chain, so
+    /// with no daemon the flag is inert.
     NoDaemon,
     /// The host structurally cannot execute a per-session credential swap.
     Transport(crate::runtime::SwapUnsupported),
