@@ -12,10 +12,12 @@
 //!
 //! - the config's `active_profile` VALUE (content, not mtime — a rewrite that
 //!   keeps the name is not news);
-//! - the ACTIVE profile's usage-cache mtime, KEYED on the profile it was read
-//!   from and read from whichever cache that profile's OWN fetch leg writes
-//!   (`crate::profile_json::usage_cache_file_for`). Two profiles' caches are
-//!   different files, so across a profile change the two mtimes are not
+//! - the ACTIVE profile's usage-cache write stamp, KEYED on the profile it was
+//!   read from and read from whichever cache that profile's OWN fetch leg
+//!   writes (`crate::profile_json::usage_cache_file_for`): the file's mtime,
+//!   plus the write instant a proxy copy records, since that copy's mtime is
+//!   its stalest figure's read and a rewrite can keep it. Two profiles' caches
+//!   are different files, so across a profile change the two stamps are not
 //!   comparable and there is no usage-cache event to report;
 //! - `~/.claude/.credentials.json`'s mtime, read FOLLOWING symlinks: that
 //!   reads the bytes' write time, which moves on both a rotation rewrite and a
@@ -72,8 +74,19 @@ struct DigestSample {
     active_profile: Option<String>,
     /// The usage cache of `active_profile` at sample time — that field is its
     /// key, and two profiles' caches are different files.
-    usage_cache_mtime: Option<SystemTime>,
+    usage_cache: Option<CacheStamp>,
     credentials_mtime: Option<SystemTime>,
+}
+
+/// When a usage cache was last written, as far as the disk tells: its mtime,
+/// and the write instant (epoch ms) a proxy copy records. A proxy copy lands
+/// dated to its stalest figure, so a rewrite that keeps that figure keeps the
+/// mtime and moves only the recorded instant; every other cache's mtime is
+/// its write and it records none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheStamp {
+    mtime: SystemTime,
+    written_at: Option<u64>,
 }
 
 /// What moved between two samples, restricted to the watched set. Each field
@@ -94,8 +107,8 @@ impl DigestDelta {
     }
 
     /// The `since_your_last_call` object: one key per observable that carries
-    /// news, `true` for the two whose only news is "it moved" (an mtime is not
-    /// a figure a reader acts on, so it stays out).
+    /// news, `true` for the two whose only news is "it moved" (a write stamp
+    /// is not a figure a reader acts on, so it stays out).
     pub(super) fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         if let Some((from, to)) = &self.active_profile {
@@ -118,7 +131,7 @@ impl DigestSample {
     /// The watched-set delta from `self` (the stored baseline) to `next` (the
     /// fresh sample). Pure: the caller decides what to store.
     fn delta(&self, next: &DigestSample, watched: WatchSet) -> DigestDelta {
-        // Across a profile change the two cache mtimes belong to different
+        // Across a profile change the two cache stamps belong to different
         // files, so there is no refresh to report — including when the profile
         // change itself is unwatched, where reporting the incomparable pair
         // would put a false lesser event in its place.
@@ -128,7 +141,7 @@ impl DigestSample {
                 .then(|| (self.active_profile.clone(), next.active_profile.clone())),
             usage_cache: watched.usage_cache
                 && same_profile
-                && self.usage_cache_mtime != next.usage_cache_mtime,
+                && self.usage_cache != next.usage_cache,
             credentials: watched.credentials && self.credentials_mtime != next.credentials_mtime,
         }
     }
@@ -155,21 +168,23 @@ fn sample_digest() -> DigestSample {
     // refreshed. Resolving the profile costs one config read per sample, which
     // the state-wait loop pays 5x a second — the same order as the
     // `profiles.toml` read above it, and the price of naming the right file.
-    let usage_cache_mtime = active
-        .as_ref()
-        .and_then(|name| {
-            crate::profile_cache::profile_cache_path(
-                name,
-                crate::profile_json::usage_cache_file_for(name),
-            )
-        })
-        .and_then(|path| file_mtime(&path));
+    // A third-party cache adds one read and parse of that small file for the
+    // write instant a proxy copy records.
+    let usage_cache = active.as_ref().and_then(|name| {
+        let file = crate::profile_json::usage_cache_file_for(name);
+        let mtime = file_mtime(&crate::profile_cache::profile_cache_path(name, file)?)?;
+        let written_at = (file == crate::profile_cache::THIRD_PARTY_CACHE_FILE)
+            .then(|| crate::profile_cache::load_third_party_copy(name))
+            .flatten()
+            .and_then(|copy| copy.written_at);
+        Some(CacheStamp { mtime, written_at })
+    });
     let credentials_mtime = crate::claude::claude_credentials_path()
         .ok()
         .and_then(|path| file_mtime(&path));
     DigestSample {
         active_profile: active.map(|n| n.to_string()),
-        usage_cache_mtime,
+        usage_cache,
         credentials_mtime,
     }
 }
@@ -238,10 +253,10 @@ impl DigestTracker {
                 // the old profile's file it would read as a refresh on the next
                 // call, which is the false report this consume step exists to
                 // avoid. Nothing comparable survives the profile move anyway.
-                slot.usage_cache_mtime = sample.usage_cache_mtime;
+                slot.usage_cache = sample.usage_cache;
             }
             if delta.usage_cache {
-                slot.usage_cache_mtime = sample.usage_cache_mtime;
+                slot.usage_cache = sample.usage_cache;
             }
             if delta.credentials {
                 slot.credentials_mtime = sample.credentials_mtime;

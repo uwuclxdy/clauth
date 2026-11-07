@@ -2537,6 +2537,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.
@@ -10149,4 +10151,141 @@ fn sync_mcp_logins_defaults_true_and_an_explicit_off_survives_a_round_trip() {
     );
     let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render");
     assert!(!rendered_on.contains("sync_mcp_logins"), "{rendered_on}");
+}
+
+/// The fail-closed claim of a profile whose `config.toml` is each of `lines`
+/// over a `broken =` line, so the text fails to parse.
+fn claims_of_unparsed_configs(lines: &[&str]) -> Vec<(String, ProxyClaim)> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let text = format!("{line}\nbroken =\n");
+            assert!(
+                text.parse::<toml::Table>().is_err(),
+                "fixture control: {line:?}'s config fails to parse"
+            );
+            let name = ProfileName::from(format!("unparsed-{i}").as_str());
+            let path = profile_subpath(&name, "config.toml").expect("config path");
+            std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir");
+            std::fs::write(&path, text).expect("write config.toml");
+            (
+                (*line).to_string(),
+                stored_proxy_claim_failing_closed(&name),
+            )
+        })
+        .collect()
+}
+
+/// A `config.toml` that fails to parse is unclassifiable whenever its text
+/// holds `proxy` or a backslash, the only two ways a TOML key can name
+/// `proxy`, wherever they stand: no reading of a text that does not parse can
+/// vouch that a comment or a string value stays one once the text is repaired.
+#[test]
+fn a_config_that_fails_to_parse_and_may_name_the_proxy_key_is_unclassifiable() {
+    let _home = HomeSandbox::new();
+    let backslash = char::from(0x5c_u8);
+    let escaped = format!("\"prox{backslash}u0079\" = 1");
+    let lines = [
+        "\"proxy\" = 1",
+        "'proxy' = 1",
+        escaped.as_str(),
+        "proxy.service = \"stub\"",
+        "a.\"proxy\" = 1",
+        "proxy = { service = \"stub\", account = \"acct-1\" }",
+        "a = { proxy = 1 }",
+        "a = { b = [1, 2], proxy = 1 }",
+        "[ proxy ]",
+        "[proxy] # note",
+        "[[proxy]]",
+        "note = \"\"\"\nproxy = \"stub\"\n\"\"\"",
+        "x = { a = 1 } proxy = 2",
+        "x = { a = 1, b = 2 } proxy = 3",
+        "x = 1 proxy = 2",
+        "x = \"a\" proxy = 1",
+        "x = 'a' proxy = 1",
+        "x = \"a=b\" proxy = 1",
+        "x = [1] proxy = 2",
+        "x = [1, 2], proxy = 3",
+        "x = [{ a = 1 }, proxy = 2]",
+        "a{b=1}.proxy = 2",
+        "x = { } proxy = 2",
+        "a = { b = 1,\n c = 2, proxy = 3 }",
+        "x = \"unterminated\nb = 1, proxy = 2",
+        "a = \"proxy\" = 1",
+        "a = \"proxy\".b = 1",
+        "x = \"a\" \"proxy\" = 1",
+        "x = { a = 1 } \"proxy\" = 2",
+        "x = 1, \"proxy\" = 2",
+        "x = 1 [\"proxy\"]",
+        "x = [\"a\" \"proxy\"]",
+        "x = [{ a = 1 }, \"proxy\" = 2]",
+        "x = \"\"\"a\"\"\" proxy = 1",
+        "x = \"a, proxy = 1",
+        "[a = \"proxy\"]",
+        "x = [1, { a = 1 }, proxy]",
+        "x = [a = 1, \"proxy\"]",
+        "x = [a = 1, 'proxy']",
+        "x = \"proxy\"\u{feff}= 1",
+        "x = 'proxy'\u{200b}= 1",
+        "# proxy note",
+        "note = \"proxy\"",
+        "path = \"C:\\\\Users\\\\x\"",
+        "# C:\\path",
+        "tags = [\"a\", \"proxy\"]",
+        "a = { note = \"proxy\" }",
+        "note = 'proxy'",
+        "x = { a = 1 } # proxy",
+        "\u{e9} = \"proxy\"",
+        "x = [1, { a = 1 }, \"proxy\"]",
+        "a = { b = 1, # proxy",
+        "k = \"C:\\foo\"",
+        "k = 'C:\\path'",
+        "x = 1\r# proxy",
+        "note = \"\"\"proxy\"\"\"",
+        "note = '''C:\\path'''",
+        "note = \"\"\"proxy",
+        "x = \"a\\\"proxy\"",
+        "x = { a = [\"proxy\"], b = 'proxy' }",
+        "[a] x = \"proxy\"",
+        "x = 1 y = \"proxy\"",
+    ];
+    let claims = claims_of_unparsed_configs(&lines);
+    assert_eq!(
+        claims,
+        lines
+            .iter()
+            .map(|line| ((*line).to_string(), ProxyClaim::Unclassifiable))
+            .collect::<Vec<_>>(),
+        "(config line, fail-closed claim) per shape"
+    );
+}
+
+/// A `config.toml` that fails to parse with neither `proxy` nor a backslash in
+/// its text claims no proxy account, a differently cased or split key
+/// included: a TOML key compares byte for byte.
+#[test]
+fn a_config_that_fails_to_parse_naming_no_proxy_claims_none() {
+    let _home = HomeSandbox::new();
+    let lines = [
+        "Proxy = 1",
+        "PROXY = 1",
+        "a.pro.xy = 1",
+        "\u{440}r\u{43e}\u{445}\u{443} = 1",
+        "note = \"C:/Users\"",
+        "=",
+        "",
+        "#",
+        "x = [\n  1,\n]",
+        "rolling_token = [unterminated",
+    ];
+    let claims = claims_of_unparsed_configs(&lines);
+    assert_eq!(
+        claims,
+        lines
+            .iter()
+            .map(|line| ((*line).to_string(), ProxyClaim::None))
+            .collect::<Vec<_>>(),
+        "(config line, fail-closed claim) per shape"
+    );
 }

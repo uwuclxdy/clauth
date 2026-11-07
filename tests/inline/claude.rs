@@ -7601,7 +7601,9 @@ fn the_off_loop_settle_defers_to_a_detached_lookup_then_settles_off_its_answer()
     assert_eq!(
         settled,
         BareItemSettle::Settled(BareItemSettled {
-            notice: Some("saved the Keychain login Claude Code wrote into b".to_string()),
+            notice: Some(crate::claude::BareItemNotice::Saved(
+                "saved the Keychain login Claude Code wrote into b".to_string()
+            )),
             saved_into: Some(ProfileName::from("b")),
             placed: None,
         })
@@ -7847,7 +7849,9 @@ fn the_off_loop_settle_looks_an_uncached_holder_up_before_it_asks() {
     assert_eq!(
         settled,
         BareItemSettle::Settled(BareItemSettled {
-            notice: Some("saved the Keychain login Claude Code wrote into b".to_string()),
+            notice: Some(crate::claude::BareItemNotice::Saved(
+                "saved the Keychain login Claude Code wrote into b".to_string()
+            )),
             saved_into: Some(ProfileName::from("b")),
             placed: None,
         })
@@ -9025,4 +9029,460 @@ fn mcp_store_sync_stands_down_for_a_staged_rotation() {
     fs::remove_file(&staged).expect("unstage");
     let changed = sync_mcp_into_stores(&[store_of("mithra")], &[fresh]);
     assert_eq!(changed.len(), 1, "the next pass retries it");
+}
+
+/// The start-time arming re-checks the profile it re-reads under the
+/// rotation guard: a `[proxy]` record landing after the pre-guard read, while
+/// the leg waits for the guard, stops the stamp. A plain account the same leg
+/// arms with nothing landing is stamped.
+#[test]
+fn a_proxy_record_landing_before_the_guard_stops_the_start_time_stamp() {
+    let _home = HomeSandbox::new();
+    let plain = save_rolling_profile("arm-plain");
+    let proxied = save_rolling_profile("arm-proxied");
+    let sidecar_holds_chain = |name: &crate::profile::ProfileName| {
+        let sidecar = crate::profile::profile_subpath(name, "session-token.json").expect("path");
+        fs::read_to_string(sidecar)
+            .ok()
+            .map(|s| s.contains(&format!("at-{name}")))
+    };
+
+    arm_rolling_from_disk_synced(&plain, || {});
+    let mut landed = false;
+    arm_rolling_from_disk_synced(&proxied, || {
+        crate::profile::write_proxy_record(
+            &proxied,
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+        landed = true;
+    });
+
+    assert_eq!(
+        (
+            landed,
+            crate::profile::load_profile(&proxied)
+                .expect("reload")
+                .proxy
+                .is_some(),
+            sidecar_holds_chain(&plain),
+            sidecar_holds_chain(&proxied),
+        ),
+        (true, true, Some(true), None),
+        "(the record landed before the guard, it reads back, the plain sidecar holding its \
+         chain, the proxied one)"
+    );
+}
+
+/// Save a `rolling_token` profile `name` whose stored chain (`at-<name>`,
+/// `rt-<name>`) is comfortably live and classifies as rolling, so the
+/// start-time arming's pre-filter lets it through.
+fn save_rolling_profile(name: &str) -> crate::profile::ProfileName {
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::usage::now_ms() as i64 + 10 * 3_600_000),
+            scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&profile).expect("save");
+    crate::profile::ProfileName::from(name)
+}
+
+fn write_stub_proxy_record(name: &crate::profile::ProfileName) {
+    crate::profile::write_proxy_record(
+        name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the record");
+}
+
+/// Empty proxy account `name`'s `[proxy]` account (`acct-1`, the account every
+/// proxy fixture records), leaving a table clauth cannot read; returns the
+/// `config.toml` path the refusals name.
+pub(crate) fn break_proxy_record(name: &str) -> std::path::PathBuf {
+    let path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+            .expect("config path");
+    let text = fs::read_to_string(&path).expect("read config");
+    let edited = text.replace("account = \"acct-1\"", "account = \"\"");
+    assert_ne!(
+        edited, text,
+        "fixture control: the record's account was emptied"
+    );
+    fs::write(&path, edited).expect("write config");
+    path
+}
+
+/// A `config.toml` no reading can classify as holding a `[proxy]` table or
+/// not, which the lock-free claim read takes for a plain account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unclassifiable {
+    /// A directory in the file's place: a read error on every platform.
+    Directory,
+    /// A `[proxy] # note` header over a text that fails to parse.
+    NotedProxyHeader,
+}
+
+impl Unclassifiable {
+    pub(crate) const BOTH: [Self; 2] = [Self::Directory, Self::NotedProxyHeader];
+
+    /// Pose this shape as profile `name`'s `config.toml`.
+    pub(crate) fn pose(self, name: &str) {
+        let pn = crate::profile::ProfileName::from(name);
+        let path = crate::profile::profile_subpath(&pn, "config.toml").expect("config path");
+        fs::create_dir_all(path.parent().expect("the profile dir")).expect("mkdir the profile");
+        if path.is_dir() {
+            fs::remove_dir(&path).expect("remove the posed directory");
+        }
+        match self {
+            Self::Directory => {
+                if path.exists() {
+                    fs::remove_file(&path).expect("remove config.toml");
+                }
+                fs::create_dir(&path).expect("a directory in its place");
+            }
+            Self::NotedProxyHeader => {
+                let text = "[proxy] # note\nservice = \"stub\"\naccount = \"acct-1\"\nbroken =\n";
+                assert!(
+                    text.parse::<toml::Table>().is_err(),
+                    "fixture control: the text fails to parse"
+                );
+                fs::write(&path, text).expect("write config.toml");
+            }
+        }
+        assert_eq!(
+            crate::profile::stored_proxy_claim(&pn),
+            crate::profile::ProxyClaim::None,
+            "fixture control: the lock-free read takes {self:?} for a plain account"
+        );
+    }
+}
+
+/// The start-time arming stops a proxy account at its pre-guard read, its
+/// `[proxy]` table readable or not: the seam past the pre-filter, right before
+/// the rotation guard, never runs for it, while it runs for a plain account of
+/// the same shape.
+#[test]
+fn a_proxy_account_never_reaches_the_start_time_armings_guard() {
+    let _home = HomeSandbox::new();
+    let plain = save_rolling_profile("guard-plain");
+    let proxied = save_rolling_profile("guard-proxied");
+    let unreadable = save_rolling_profile("guard-unreadable");
+    write_stub_proxy_record(&proxied);
+    write_stub_proxy_record(&unreadable);
+    break_proxy_record(unreadable.as_str());
+    let shape = |name: &crate::profile::ProfileName| {
+        let loaded = crate::profile::load_profile(name).expect("load");
+        (
+            loaded.proxy.is_some(),
+            loaded.has_unreadable_proxy_record,
+            loaded.rolling_token,
+        )
+    };
+    assert_eq!(
+        (shape(&plain), shape(&proxied), shape(&unreadable)),
+        (
+            (false, false, true),
+            (true, false, true),
+            (false, true, true)
+        ),
+        "fixture control: (a readable proxy claim, an unreadable one, the rolling flag) for \
+         plain, proxied, unreadable"
+    );
+
+    let mut reached = (false, false, false);
+    arm_rolling_from_disk_synced(&plain, || reached.0 = true);
+    arm_rolling_from_disk_synced(&proxied, || reached.1 = true);
+    arm_rolling_from_disk_synced(&unreadable, || reached.2 = true);
+
+    assert_eq!(
+        reached,
+        (true, false, false),
+        "the seam before the rotation guard reached by: plain, proxied, unreadable"
+    );
+}
+
+/// A `[proxy]` record landing while the start-time arming waits for the
+/// rotation guard stops it before anything of the account moves: a stage left
+/// beside the store stays on disk byte for byte, and so does the stored pair.
+/// A plain account of the same shape lands its stage. Each stage's base is
+/// fp("rt-old"), hand-computed: the first 8 bytes of its SHA-256, hex; each
+/// carries its own pair, since a store refuses a chain another store holds.
+#[test]
+fn a_proxy_record_landing_before_the_guard_leaves_the_stage_and_the_pair() {
+    let _home = HomeSandbox::new();
+    let staged = |name: &str| {
+        let pn = crate::profile::ProfileName::from(name);
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = true;
+        profile.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-old".to_string(),
+                refresh_token: Some("rt-old".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        save_profile(&profile).expect("save");
+        let dir = crate::profile::profile_dir(&pn).expect("dir");
+        fs::write(
+            dir.join("credentials.json.staged"),
+            format!(
+                r#"{{"base":"068bfce5d78d07ac","base_access":"at-old",
+                    "creds":{{"claudeAiOauth":{{"accessToken":"at-mid-{name}",
+                    "refreshToken":"rt-mid-{name}","expiresAt":4102444800000,
+                    "subscriptionType":"max"}}}}}}"#
+            ),
+        )
+        .expect("write the stage");
+        fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+        (pn, dir)
+    };
+    let (plain, plain_dir) = staged("stage-plain");
+    let (proxied, proxied_dir) = staged("stage-proxied");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![plain.clone(), proxied.clone()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let files = |dir: &std::path::Path| {
+        (
+            fs::read(dir.join("credentials.json.staged")).ok(),
+            fs::read(dir.join("credentials.json")).ok(),
+        )
+    };
+    let before = files(&proxied_dir);
+
+    arm_rolling_from_disk_synced(&plain, || {});
+    arm_rolling_from_disk_synced(&proxied, || write_stub_proxy_record(&proxied));
+
+    let plain_store: ClaudeCredentials =
+        crate::profile::read_json_file(&plain_dir.join("credentials.json")).expect("read store");
+    assert_eq!(
+        (
+            before.0.is_some() && before.1.is_some(),
+            plain_store.refresh_token(),
+            plain_dir.join("credentials.json.staged").exists(),
+            crate::profile::load_profile(&proxied)
+                .expect("reload")
+                .proxy
+                .is_some(),
+            files(&proxied_dir) == before,
+        ),
+        (true, Some("rt-mid-stage-plain"), false, true, true),
+        "(the proxied stage and store were there, the plain store's refresh token, a plain \
+         stage left, the record reads back, the proxied stage and store kept byte for byte)"
+    );
+}
+
+/// A `[proxy]` table clauth cannot read, landing while the start-time arming
+/// waits for the rotation guard, stops it as a readable record does: the
+/// stage, the store and the session-token sidecar stay byte for byte. The
+/// stage's base is fp("rt-old"), hand-computed: the first 8 bytes of its
+/// SHA-256, hex.
+#[test]
+fn an_unreadable_proxy_record_landing_before_the_guard_leaves_the_stage_and_the_pair() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("stage-unreadable");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&profile).expect("save");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+            "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+    )
+    .expect("write the stage");
+    fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let files = || {
+        [
+            "credentials.json.staged",
+            "credentials.json",
+            "session-token.json",
+        ]
+        .map(|file| fs::read(dir.join(file)).ok())
+    };
+    let before = files();
+
+    arm_rolling_from_disk_synced(&name, || {
+        write_stub_proxy_record(&name);
+        break_proxy_record(name.as_str());
+    });
+
+    let loaded = crate::profile::load_profile(&name).expect("reload");
+    assert_eq!(
+        (
+            before[0].is_some() && before[1].is_some(),
+            loaded.proxy.is_some(),
+            loaded.has_unreadable_proxy_record,
+            files() == before,
+        ),
+        (true, false, true, true),
+        "(the stage and store were there, a readable claim, an unreadable one, the stage, \
+         store and sidecar kept byte for byte)"
+    );
+}
+
+/// A proxy claim landing after the install gate's lock-free claim read and
+/// before the heal takes the state flock stops the heal, whether it is a
+/// readable record or a config no reading can classify: the mis-filled
+/// sidecar and the preserved mint stay byte for byte and nothing is
+/// quarantined.
+#[test]
+fn a_proxy_claim_landing_before_the_heals_hold_heals_no_sidecar() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let land = |name: &str| match name {
+        "heal-record" => write_stub_proxy_record(&crate::profile::ProfileName::from(name)),
+        "heal-directory" => Unclassifiable::Directory.pose(name),
+        _ => Unclassifiable::NotedProxyHeader.pose(name),
+    };
+    let outcomes: Vec<_> = ["heal-record", "heal-directory", "heal-header"]
+        .into_iter()
+        .map(|name| {
+            let pn = crate::profile::ProfileName::from(name);
+            let dir = crate::profile::profile_dir(&pn).expect("dir");
+            fs::create_dir_all(&dir).expect("mkdir");
+            write_session_token(&pn, "sk-ant-oat01-genuine-mint-value-1234567890", now)
+                .expect("mint");
+            stamp_rolling_token(
+                &pn,
+                &OAuthToken {
+                    access_token: "at-fed".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(now + 3_600_000),
+                    scopes: None,
+                    subscription_type: Some("max".into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                },
+            )
+            .expect("feed preserves mint");
+            fs::write(
+                dir.join("session-token.json"),
+                serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+            )
+            .expect("misfill");
+            let files = || {
+                ["session-token.json", "session-token.static.json"]
+                    .map(|file| fs::read(dir.join(file)).ok())
+            };
+            let before = files();
+            assert_eq!(
+                (
+                    session_token_status(&pn),
+                    before[1].is_some(),
+                    crate::profile::stored_proxy_claim_failing_closed(&pn),
+                ),
+                (
+                    Some(SessionTokenStatus::NotLongLived),
+                    true,
+                    crate::profile::ProxyClaim::None
+                ),
+                "fixture control: {name} is a mis-fill beside a preserved mint, and the gate's \
+                 read before the heal claims nothing"
+            );
+            let outcome = heal_misfilled_sidecar_synced(&pn, || land(name)).expect("heal");
+            (
+                name,
+                outcome,
+                files() == before,
+                dir.join("quarantine").exists(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        ["heal-record", "heal-directory", "heal-header"]
+            .map(|name| (name, HealOutcome::ProxyClaimed, true, false))
+            .to_vec(),
+        "(account, heal outcome, sidecar and mint kept byte for byte, a quarantine made)"
+    );
+}
+
+/// A proxy claim landing after a caller's lock-free claim read and before the
+/// stamp takes the state flock stops the stamp, whether it is a readable
+/// record or a config no reading can classify: the sidecar stays byte for
+/// byte and no mint is preserved. With no claim landing the stamp writes.
+#[test]
+fn a_proxy_claim_landing_before_the_stamps_hold_stamps_no_sidecar() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let chain = OAuthToken {
+        access_token: "at-chain".to_string(),
+        refresh_token: None,
+        expires_at: Some(now + 3_600_000),
+        scopes: None,
+        subscription_type: Some("max".into()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    let outcomes: Vec<_> = [
+        "stamp-record",
+        "stamp-directory",
+        "stamp-header",
+        "stamp-plain",
+    ]
+    .into_iter()
+    .map(|name| {
+        let pn = crate::profile::ProfileName::from(name);
+        let dir = crate::profile::profile_dir(&pn).expect("dir");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_session_token(&pn, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+        let files = || {
+            ["session-token.json", "session-token.static.json"]
+                .map(|file| fs::read(dir.join(file)).ok())
+        };
+        let before = files();
+        let stamped = stamp_rolling_token_synced(&pn, &chain, || match name {
+            "stamp-record" => write_stub_proxy_record(&pn),
+            "stamp-directory" => Unclassifiable::Directory.pose(name),
+            "stamp-header" => Unclassifiable::NotedProxyHeader.pose(name),
+            _ => {}
+        })
+        .map_err(|e| e.to_string());
+        (name, stamped, files() == before)
+    })
+    .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            ("stamp-record", Ok(()), true),
+            ("stamp-directory", Ok(()), true),
+            ("stamp-header", Ok(()), true),
+            ("stamp-plain", Ok(()), false),
+        ],
+        "(account, the stamp's answer, sidecar and preserved mint kept byte for byte)"
+    );
 }

@@ -424,6 +424,13 @@ impl ThirdPartyEntry {
                 crate::usage::hash_field(&mut hasher, b"generic");
                 crate::usage::hash_field(&mut hasher, base_url.as_bytes());
             }
+            crate::providers::ThirdPartyTarget::Proxy {
+                service, account, ..
+            } => {
+                crate::usage::hash_field(&mut hasher, b"proxy");
+                crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
+                crate::usage::hash_field(&mut hasher, account.as_bytes());
+            }
         }
         let digest = hasher.finalize();
         let mut head = [0u8; 8];
@@ -441,6 +448,9 @@ impl ThirdPartyEntry {
                 provider: crate::providers::Provider::Alibaba,
                 ..
             } => None,
+            // The proxy read authenticates with clauth's admin token: the
+            // profile's key never rides it.
+            crate::providers::ThirdPartyTarget::Proxy { .. } => None,
             crate::providers::ThirdPartyTarget::Known { .. }
             | crate::providers::ThirdPartyTarget::Generic { .. } => {
                 crate::usage::inference_key_fingerprint(Some(&self.api_key), None)
@@ -1811,6 +1821,7 @@ fn fetch_with_rotation<'g>(
             crate::oauth::mark_auth_broken(config, name, true);
             return bail_unrotated(&mut profile_fetch);
         }
+        crate::oauth::SendRule::NeverSpent => return bail_unrotated(&mut profile_fetch),
         crate::oauth::SendRule::Skip => {
             return bail_unrotated(&mut profile_fetch).with_refresh_failed();
         }
@@ -3584,6 +3595,11 @@ fn apply_outcome_flagged(
     // land only on a match too (F11) — while the disk writes below still happen
     // only when there is something to write.
     let mut durable_stamp = false;
+    // The opt-in above came off the in-memory config, which a `[proxy]` record
+    // landing mid-fetch leaves behind: the mark is confirmed against the record
+    // on disk, in the hold its writers take, and only on the rare outcome that
+    // would arm it; a config.toml that cannot say it holds none arms nothing.
+    let mut weekly_mark = false;
     let has_disk_write = ((is_fresh || plan_refresh.is_some())
         && (merged.is_some() || cold_fill.is_some()))
         || outcome.profile_wanted;
@@ -3594,6 +3610,10 @@ fn apply_outcome_flagged(
             }
             let (disk, unreadable) = crate::usage::read_oauth_for_compare(&outcome.name);
             let ok = !unreadable && !crate::usage::oauth_changed(&outcome.oauth_identity, &disk);
+            weekly_mark = ok
+                && weekly_pending
+                && crate::profile::stored_proxy_claim_failing_closed(&outcome.name)
+                    == crate::profile::ProxyClaim::None;
             if ok && has_disk_write {
                 if (is_fresh || plan_refresh.is_some())
                     && let Some(info) = merged.as_ref().or(cold_fill.as_ref())
@@ -3668,7 +3688,7 @@ fn apply_outcome_flagged(
                 }
             }
         }
-        if weekly_pending && let Ok(mut pending) = weekly_reset_kicks.lock() {
+        if weekly_mark && let Ok(mut pending) = weekly_reset_kicks.lock() {
             pending.insert(outcome.name.clone());
         }
     }
@@ -3853,7 +3873,9 @@ pub(crate) fn reseed_keeping_cadence(
 /// freshness off it imported that re-age into the LIVE store, which the feed
 /// then publishes verbatim, R8/#74); an undatable body falls back to the mtime,
 /// as does the third-party leg, whose cache has no writer that is not a fetch
-/// outcome.
+/// outcome (its stamp then moves to the write instant,
+/// [`crate::profile_cache::ThirdPartyCopy::written_ms`]: a proxy copy's
+/// mtime carries its stalest figure's date).
 fn load_cache_seed<T>(
     name: &ProfileName,
     interval_ms: u64,
@@ -3863,12 +3885,19 @@ fn load_cache_seed<T>(
 ) -> Option<(T, u64, FetchStatus)> {
     let clock = clock_fn(name)?;
     let value = load_fn(name)?;
-    let status = if now.saturating_sub(clock) < interval_ms {
+    Some((value, clock, status_at(clock, now, interval_ms)))
+}
+
+/// The status a reading dated `clock` earns at `now`: `Fresh` while it is
+/// younger than one interval (still in the fetch window), `Cached` after. The
+/// one rule for a dated reading, whether a startup seed reads it off disk or
+/// a proxy hands over a reading its own figures date in the past.
+fn status_at(clock: u64, now: u64, interval_ms: u64) -> FetchStatus {
+    if now.saturating_sub(clock) < interval_ms {
         FetchStatus::Fresh
     } else {
         FetchStatus::Cached
-    };
-    Some((value, clock, status))
+    }
 }
 
 /// Test seam for the codex landing's section-1 compare: a hook, keyed by
@@ -4053,11 +4082,13 @@ pub(crate) fn try_seed_cache(
 /// Each of `seed_names` with a `third_party_cache.json` gets its reading seeded
 /// straight from disk so the UI shows last-known numbers instantly. Only a name
 /// the fetch leg schedules (`work`, [`collect_third_party_entries`]) also gets a
-/// status (`Fresh` when younger than one interval, `Cached` when older) and a
-/// `last_fetched` stamp at the cache mtime (that file's only writer is a fetch
-/// outcome, so its mtime IS its read time): a status claims a poll outcome, and
-/// nothing polls a disabled or keyless name. A profile with no cache is left
-/// unstamped, so the scheduler fetches it fresh.
+/// status off the cache mtime (`Fresh` when younger than one interval, `Cached`
+/// when older; that file's only writer is a fetch outcome, which dates a proxy
+/// copy by its stalest figure), or off a proxy copy's chain date when it
+/// carries one, and a `last_fetched` stamp at the instant the copy was
+/// written ([`crate::profile_cache::ThirdPartyCopy::written_ms`]): a status
+/// claims a poll outcome, and nothing polls a disabled or keyless name. A profile with no
+/// cache is left unstamped, so the scheduler fetches it fresh.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
     status: &ThirdPartyStatusStore,
@@ -4095,13 +4126,25 @@ pub(crate) fn seed_third_party_name(
 ) {
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::ThirdParty);
     let mtime_of = |n: &ProfileName| profile_cache_mtime_ms(n, THIRD_PARTY_CACHE_FILE);
-    let Some((stats, mtime, fetch_status)) =
-        load_cache_seed(name, interval_ms, now, mtime_of, |n| {
-            load_profile_cache::<ThirdPartyStats>(n, THIRD_PARTY_CACHE_FILE)
-        })
-    else {
+    let Some((copy, mtime, mtime_status)) = load_cache_seed(
+        name,
+        interval_ms,
+        now,
+        mtime_of,
+        crate::profile_cache::load_third_party_copy,
+    ) else {
         return;
     };
+    // The status claims what the walk may act on: a proxy copy's chain windows
+    // date it, the way the leg that wrote it judged it, never the stalest
+    // display figure its mtime carries. A chain dated ahead of the clock is
+    // undated, so `Cached`: the clock moved, the read is no newer.
+    let fetch_status = copy.chain_read_at.map_or(mtime_status, |chain| {
+        now.checked_sub(chain)
+            .map_or(FetchStatus::Cached, |_| status_at(chain, now, interval_ms))
+    });
+    let written = scheduled.then(|| copy.written_ms(mtime, now));
+    let stats = copy.stats;
     #[cfg(test)]
     run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::ThirdParty), name);
     let Some(_guard) =
@@ -4117,14 +4160,14 @@ pub(crate) fn seed_third_party_name(
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), stats);
     }
-    if !scheduled {
+    let Some(written) = written else {
         return;
-    }
+    };
     // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(
             FetchLeg::ThirdParty.key(name.clone()),
-            FetchStamp::at(EpochMs::from_millis(mtime)),
+            FetchStamp::at(EpochMs::from_millis(written)),
         );
         if let Ok(mut st) = status.lock() {
             st.insert(name.to_string(), fetch_status);
@@ -4217,7 +4260,9 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
     if !third_party_pollable(p) {
         return None;
     }
-    let target = if let Some(provider) = p.provider {
+    let target = if let Some(target) = proxy_target_for(p) {
+        target
+    } else if let Some(provider) = p.provider {
         // The console credential rides the target because one provider's usage
         // surface can't read the api key at all (Alibaba); the others carry
         // `None` and never look.
@@ -4244,6 +4289,43 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
         // under the caller's Config lock in places, and acquiring the epoch
         // (rank 160) there would invert Config (400) → Epoch.
         epoch_at_spawn: 0,
+    })
+}
+
+/// The proxy arm's target for `p`, keyed on the REGISTRY: the profile's
+/// `base_url` must be the registered bind of the service its `[proxy]` record
+/// names, and the admin token and account id the read needs come from that
+/// registry and the record. A registry clauth cannot read, a service with no
+/// row, or a `base_url` that stopped matching leaves the profile to today's
+/// generic arm.
+fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::ThirdPartyTarget> {
+    // Pure pre-gate: a non-loopback endpoint is the generic arm's business and
+    // must never cost a registry or config read — the entry constructor runs
+    // over EVERY profile on each build of the entry list (boot, a reload, a
+    // switch, a TUI cursor move), and a home-touching read here reaches for a
+    // home its callers may not hold.
+    let port = crate::proxy::loopback_port(p.base_url.as_deref()?)?;
+    let registry = crate::proxy::Registry::load().ok()?;
+    registry.holder(port)?;
+    // The record rides the profile's config.toml as an unmodelled key, and the
+    // runtime Profile holds it as it loaded (`Profile::proxy`, the cache
+    // selector's read). This arm reads it fresh, the lock-free way
+    // (`profile::stored_proxy_record`), past the bind check above, so only a
+    // profile on a registered proxy bind pays the read.
+    let record = crate::profile::stored_proxy_record(&p.name)?;
+    let row = registry.get(&record.service)?;
+    if row.port != port
+        || !p
+            .base_url
+            .as_deref()
+            .is_some_and(|url| crate::proxy::is_loopback_url_on(url, row.port))
+    {
+        return None;
+    }
+    Some(crate::providers::ThirdPartyTarget::Proxy {
+        service: record.service.clone(),
+        account: record.account.clone(),
+        base_url: format!("http://{}", crate::proxy::bind(row.port)),
     })
 }
 
@@ -4474,7 +4556,7 @@ pub(crate) fn oauth_cache_leg_admits(p: &crate::profile::Profile) -> bool {
 /// this is the hoisted form of their membership rule, held to them by
 /// `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes` rather
 /// than by a shared call. The OAuth leg ([`collect_tokens`]) admits every
-/// enabled profile carrying a login pair; the third-party leg
+/// enabled profile with a [`usage_poll_pair`]; the third-party leg
 /// ([`collect_third_party_entries`]) admits every enabled profile its one entry
 /// constructor builds an entry for; the probe leg ([`collect_probe_seeds`])
 /// every enabled profile [`usage_probe_admits`]. All three skip a disabled
@@ -4506,13 +4588,19 @@ pub(crate) fn polled_third_party_names(config: &crate::profile::AppConfig) -> Ha
 /// disabled-ness on top of that.
 ///
 /// Disabled-ness is deliberately not part of it, exactly as there: a separate
-/// axis, and every work list filters it itself.
+/// axis, and every work list filters it itself. A pair clauth never uses
+/// ([`crate::profile::Profile::spends_oauth_chain`]: a proxy account's) is
+/// none here, so the OAuth leg never polls it.
 pub(crate) fn usage_poll_pair(p: &crate::profile::Profile) -> Option<&crate::profile::OAuthToken> {
+    if !p.spends_oauth_chain() {
+        return None;
+    }
     p.credentials.as_ref()?.claude_ai_oauth.as_ref()
 }
 
-/// Whether `p` is an OAuth account with no pair stored, the shape `/usage`
-/// cannot read: a setup-token account, or one holding no login at all.
+/// Whether `p` is an OAuth account with no pair `/usage` reads
+/// ([`usage_poll_pair`]): a setup-token account, one holding no login at all,
+/// or a proxy account the load read as an OAuth login.
 pub(crate) fn oauth_without_pair(p: &crate::profile::Profile) -> bool {
     p.is_oauth() && usage_poll_pair(p).is_none()
 }
@@ -4521,10 +4609,12 @@ pub(crate) fn oauth_without_pair(p: &crate::profile::Profile) -> bool {
 /// on an [`oauth_without_pair`] account with a setup token stored, the one
 /// thing the probe sends. The Setup tab shows the probe rows on the same
 /// accounts, so a switch set by hand where no token is stored admits nothing:
-/// the account reads unmeasured, and no row exists to switch it off.
+/// the account reads unmeasured, and no row exists to switch it off. A proxy
+/// account ([`crate::profile::Profile::spends_oauth_chain`]) has no Claude
+/// Code login, so its probe sends nothing whatever the switch says.
 /// Disabled-ness is left out, as in the other legs' rules.
 pub(crate) fn usage_probe_admits(p: &crate::profile::Profile) -> bool {
-    p.usage_probe && oauth_without_pair(p) && p.has_long_lived_sidecar
+    p.usage_probe && p.spends_oauth_chain() && oauth_without_pair(p) && p.has_long_lived_sidecar
 }
 
 /// The accounts the probe read under `before` that it no longer reads under
@@ -4621,8 +4711,8 @@ pub(crate) fn build_token_entries(seeds: Vec<TokenSeed>) -> Vec<TokenEntry> {
 }
 
 /// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
-/// Skips api-key/credential-less profiles (no `claudeAiOauth`) and disabled
-/// ones (`AppConfig::enabled_profiles`) — a disabled profile must never enter
+/// Skips api-key/credential-less profiles (no `claudeAiOauth`), proxy accounts
+/// ([`usage_poll_pair`]) and disabled ones (`AppConfig::enabled_profiles`) — a disabled profile must never enter
 /// the scheduler's per-profile work list (no poll, no rotate, no auto-start
 /// kick). Snapshots the persisted quarantine flag so the poll partition can
 /// widen a flagged profile's cadence without a config lock. Shared by the TUI
@@ -4637,7 +4727,7 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
 }
 
 /// Profile names to SEED from on-disk usage caches at startup / standby: every
-/// OAuth-credentialed profile and every one the usage probe admits, **disabled
+/// profile holding a [`usage_poll_pair`] and every one the usage probe admits, **disabled
 /// ones included**. The startup seed is a
 /// DISPLAY concern (last-known tier / windows for the UI), so it is deliberately
 /// WIDER than [`collect_tokens`]'s work-list — a disabled profile is seeded so
@@ -5196,7 +5286,7 @@ fn drain_oauth_completions(
                     .find(|p| p.name.as_str() == outcome.name.as_str());
                 (
                     c.is_active(&outcome.name),
-                    profile.is_some_and(|p| p.auto_start),
+                    profile.is_some_and(|p| p.has_effective_auto_start()),
                     crate::fallback::reset_member_of(&c, &outcome.name),
                 )
             })
@@ -5227,6 +5317,41 @@ fn drain_oauth_completions(
     }
 }
 
+/// Write a dated proxy reading's copy for `name` and answer the status the
+/// walk reads for it. Both dates are clamped to now: a stamp in the future
+/// proves the clock moved, not that the read is newer. The copy's mtime is the
+/// reading's stalest figure, the one age every surface shows
+/// ([`crate::profile_json::cache_age_secs`], the status feed's `stale`/`age`);
+/// its chain windows' own date rides inside the copy, where every freshness
+/// decision about the chain reads it (this status, the seed, the start walk,
+/// the daemon's bell and window push), so a stale display figure never holds
+/// one back. Without a chain window the status reads the stalest figure, the
+/// date the copy's mtime carries. Both come off the reading in hand, never
+/// the file: a write that fails still judges the reading this leg read. The
+/// write instant rides inside the copy too: the mtime no longer carries it,
+/// and the seed restarts the leg's poll clock from it. The copy lands already
+/// dated, in the one write, so a write that fails leaves the old copy as it
+/// was.
+fn write_dated_copy(
+    name: &ProfileName,
+    stats: &ThirdPartyStats,
+    dates: crate::proxy_account::ReadDates,
+    interval_ms: u64,
+) -> FetchStatus {
+    let now = std::time::SystemTime::now();
+    let chain = dates.chain.map(|chain| epoch_ms_of(chain.min(now)));
+    let stalest = dates.stalest.min(now);
+    crate::profile_cache::write_third_party_copy(name, stats, chain, epoch_ms_of(now), stalest);
+    let clock = chain.unwrap_or_else(|| epoch_ms_of(stalest));
+    status_at(clock, epoch_ms_of(now), interval_ms)
+}
+
+/// `at` as epoch milliseconds, `0` before the epoch.
+fn epoch_ms_of(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Fetch a pre-partitioned set of due third-party entries and apply outcomes to
 /// the third-party stores. Partitioning + countdown publishing happen in `tick`
 /// so both legs share one publish window; this leg only fetches.
@@ -5247,6 +5372,9 @@ struct ThirdPartyOutcome {
     epoch_at_spawn: u64,
     is_generic: bool,
     result: Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError>,
+    /// A proxy reading's dates ([`crate::proxy_account::ReadDate`]), `None`
+    /// for any other reading.
+    dates: Option<crate::proxy_account::ReadDates>,
 }
 
 /// [`fetch_third_party_due`] with the tick's `timed_out` flag: once any landing
@@ -5307,7 +5435,9 @@ fn fetch_third_party_due_flagged(
                 exit.watch_request_slots();
                 await_request_slot(&host);
                 mark_fetch_activity(&exit.activity, &exit.ticket.key, ProfileActivity::Fetching);
+                let read_date = crate::proxy_account::ReadDate::capture_here();
                 let result = fetcher(&entry.target, &entry.api_key, hint.as_deref());
+                let dates = read_date.take();
                 // A drain that stopped waiting on this worker drops this send;
                 // harmless. A panicking worker never reaches here.
                 let _ = tx.send((
@@ -5320,6 +5450,7 @@ fn fetch_third_party_due_flagged(
                         epoch_at_spawn,
                         is_generic,
                         result,
+                        dates,
                     },
                 ));
                 drop(exit);
@@ -5349,12 +5480,14 @@ fn fetch_third_party_due_flagged(
             epoch_at_spawn,
             is_generic,
             result,
+            dates,
         } = outcome;
         match result {
             Ok(stats) => {
                 clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
                 // Section 1: under the flock, the disk writes gate on the spawn
                 // identity still matching the stored one.
+                let mut status = FetchStatus::Fresh;
                 let Some(matched) = third_party_section1(&name, identity, timed_out, lease, || {
                     // A live body retires the dead-credential record: the surfaces
                     // that read it have no other way to learn the session came back.
@@ -5365,7 +5498,21 @@ fn fetch_third_party_due_flagged(
                     } else {
                         crate::profile_cache::clear_usage_verdict(&name);
                     }
-                    write_profile_cache_for(Harness::Claude, &name, THIRD_PARTY_CACHE_FILE, &stats);
+                    // A proxy reading is as old as its stalest figure, whenever
+                    // clauth fetched it: the copy is dated by that, so every age
+                    // read off the cache says so, while the walk's freshness
+                    // keys on its chain windows.
+                    match dates {
+                        Some(dates) => {
+                            status = write_dated_copy(&name, &stats, dates, interval_ms);
+                        }
+                        None => write_profile_cache_for(
+                            Harness::Claude,
+                            &name,
+                            THIRD_PARTY_CACHE_FILE,
+                            &stats,
+                        ),
+                    }
                     // The balance series rides the same write point as the stats
                     // cache — one landing fetch, one set of readings — and the
                     // fallback legs write none (a cached copy is not a reading).
@@ -5386,7 +5533,7 @@ fn fetch_third_party_due_flagged(
                         store.insert(name.to_string(), stats);
                     }
                     if let Ok(mut st) = state.third_party_status.lock() {
-                        st.insert(name.to_string(), FetchStatus::Fresh);
+                        st.insert(name.to_string(), status);
                     }
                     update_third_party_broken(
                         &state.third_party_broken,
@@ -5399,6 +5546,7 @@ fn fetch_third_party_due_flagged(
                         fingerprint,
                     );
                 }
+                // A landed body ends any 429 run, whatever its date.
                 update_third_party_streak(&state.third_party_streaks, &name, FetchStatus::Fresh);
                 stamp_last_fetched(
                     &state.last_fetched,
@@ -8829,8 +8977,8 @@ fn apply_codex_switch_leased(
 /// product so the UI stays current:
 ///   * re-seed the usage / third-party stores from the disk caches the daemon
 ///     keeps fresh ([`try_seed_cache`] stamps status Fresh/Cached off the cache
-///     mtime, and `last_fetched` AT the mtime — so the countdowns below track
-///     the daemon's real cadence);
+///     clock, and `last_fetched` at the instant the daemon fetched — so the
+///     countdowns below track the daemon's real cadence);
 ///   * republish countdowns from those stamps (partition is reused for its
 ///     timing math only; the due list is deliberately discarded — nothing
 ///     fetches here);
@@ -11049,6 +11197,10 @@ fn clear_orphaned_forced(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6.rs"]
+mod proxy_p6_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]

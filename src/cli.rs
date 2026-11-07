@@ -735,6 +735,16 @@ pub(crate) struct LoginArgs {
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
+    /// Register the profile on a clauth proxy instead of logging in to any
+    /// provider directly. Runs the proxy's login flow (its page opens, paste
+    /// accepted), then stores the proxy-local inference key as the profile's
+    /// api key. The upstream credential stays in the proxy's own state dir.
+    #[arg(
+        long,
+        value_name = "SERVICE",
+        conflicts_with_all = ["base_url", "api_key", "setup_token", "codex", "browser"]
+    )]
+    pub(crate) proxy: Option<String>,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
@@ -753,6 +763,7 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--setup-token",
     "--codex",
     "--browser",
+    "--proxy",
     "--yes",
     "-y",
     "--model",

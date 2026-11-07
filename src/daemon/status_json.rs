@@ -20,14 +20,11 @@ use utoipa::ToSchema;
 use super::gateway::{GatewaySlot, slot_or_record};
 use super::proxies::ProxySlot;
 use crate::profile::{AppConfig, Profile, ProfileName};
-use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
-};
+use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{
-    OauthAge, Window, oauth_age, provider_label, published_windows_with_label,
+    OauthAge, Window, oauth_age, provider_label, published_profile_windows_with_label,
     publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file, usage_windows,
 };
-use crate::providers::ThirdPartyStats;
 use crate::usage::{
     FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
     selected_next_refresh, windows_maxed,
@@ -248,6 +245,14 @@ pub(crate) struct ProfileEntry {
     /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
     /// treating it as current truth.
     pub(crate) stale: bool,
+    /// `stale` as the 5h bell and the window push judge it, carried in-memory
+    /// only: the same arms, except that a proxy copy's age arm reads when its
+    /// chain windows were read
+    /// ([`crate::profile_cache::ThirdPartyCopy::chain_read_at`]), so a stale
+    /// display figure beside a fresh chain window silences neither alert.
+    /// Never published: `stale` keeps meaning the stalest figure's age.
+    #[serde(skip)]
+    pub(crate) alert_stale: bool,
     /// ISO-8601 UTC stamp of when the published figures were last fetched
     /// (OAuth: the body's `fetched_at`; third-party: the cache write; codex:
     /// the body's `fetched_at`, or the cache write where that stamp is missing
@@ -256,7 +261,9 @@ pub(crate) struct ProfileEntry {
     #[schema(required = true)]
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
-    /// pending (a spent skipped account, or no cache).
+    /// pending: a never-cached profile, a single-shot reading whose derived
+    /// stamp is past, a spent account skipped under `refresh_spent_accounts`
+    /// off, or a keyless proxy profile the third-party leg serves.
     #[schema(required = true)]
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
@@ -427,8 +434,15 @@ pub(crate) fn build_profile_entries(
             } else {
                 load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
             };
+            // The third-party copy, loaded once for the clocks, the
+            // availability dot and the alerts' age arm below.
+            let third_party_copy = if p.usage_cache_is_third_party() {
+                crate::profile_cache::load_third_party_copy(name)
+            } else {
+                None
+            };
 
-            // The clock both mtime derivations below read. A DATED OAuth body
+            // The clocks the two derivations below read. A DATED OAuth body
             // dates off its own `fetched_at` stamp — the same age contract
             // (`oauth_age`) every other surface reads — because a plan-only
             // cache rewrite (`apply_outcome`'s `plan_refresh` write, the
@@ -439,18 +453,36 @@ pub(crate) fn build_profile_entries(
             // trust, so the mtime is the only clock left (known-movable; the
             // account it describes carries no fetch to date), as does a
             // third-party cache: that file's only writer is a fetch outcome.
-            let derived_clock_ms = if p.usage_cache_is_third_party() {
-                mtime_ms
+            // A proxy copy dates its file back to its stalest figure, so the
+            // two clocks split there, the way the startup seed splits them:
+            // its status reads its chain windows' date when it carries one,
+            // and its next refresh the write instant it records. The status
+            // clock is read as an age, `None` inside for a chain dated ahead
+            // of the clock: undated, as the seed reads it.
+            let (status_age_ms, next_clock_ms) = if p.usage_cache_is_third_party() {
+                match (third_party_copy.as_ref(), mtime_ms) {
+                    (Some(copy), Some(mtime)) => (
+                        Some(
+                            copy.chain_read_at
+                                .map_or(Some(now.saturating_sub(mtime)), |chain| {
+                                    now.checked_sub(chain)
+                                }),
+                        ),
+                        Some(copy.written_ms(mtime, now)),
+                    ),
+                    _ => (mtime_ms.map(|at| Some(now.saturating_sub(at))), mtime_ms),
+                }
             } else {
-                match oauth_age(oauth_usage.as_ref(), now) {
+                let clock = match oauth_age(oauth_usage.as_ref(), now) {
                     OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
                     OauthAge::Absent | OauthAge::Undated => mtime_ms,
-                }
+                };
+                (clock.map(|at| Some(now.saturating_sub(at))), clock)
             };
 
             // fetch_status: the live stores when a daemon is running, else
-            // derive from the last real fetch's recency (Fresh within one
-            // interval, else Cached) off `derived_clock_ms`. A name in NEITHER
+            // derive it off `status_age_ms` (Fresh within one interval,
+            // else Cached; an undated chain is never Fresh). A name in NEITHER
             // live store (a just-started daemon, the single-shot
             // `status --json`) falls back to that derivation rather than
             // reading as never-fetched; null = no cache at all.
@@ -465,8 +497,8 @@ pub(crate) fn build_profile_entries(
             // stale cache published `Fresh` — a dead session reading as live,
             // which is the outcome this status exists to prevent.
             let derived_status = || {
-                derived_clock_ms.map(|at| {
-                    if now.saturating_sub(at) < interval_ms {
+                status_age_ms.map(|age| {
+                    if age.is_some_and(|age| age < interval_ms) {
                         "Fresh"
                     } else {
                         "Cached"
@@ -523,7 +555,7 @@ pub(crate) fn build_profile_entries(
             // other. That predicate also pins the constant below: the `&&`
             // reaches it only where `usage_cache_file` resolves to that file.
             let derived_next = || {
-                derived_clock_ms.and_then(|at| {
+                next_clock_ms.and_then(|at| {
                     let stamp = at.saturating_add(interval_ms);
                     (stamp > now).then_some(stamp)
                 })
@@ -532,7 +564,13 @@ pub(crate) fn build_profile_entries(
                 && oauth_usage
                     .as_ref()
                     .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
-            let next_refresh_ms: Option<u64> = if spent_skipped {
+            // A proxy account no fetch leg admits (a keyless one fails the
+            // third-party leg's credential test, and the OAuth leg never polls
+            // a stored pair beside its record, readable or not) has no refresh
+            // pending from the moment it left the last leg, whatever its
+            // copy's clock or a countdown left from before says.
+            let never_polled = !p.spends_oauth_chain() && !crate::usage::any_fetch_leg_admits(p);
+            let next_refresh_ms: Option<u64> = if spent_skipped || never_polled {
                 None
             } else {
                 match live {
@@ -562,9 +600,10 @@ pub(crate) fn build_profile_entries(
             // feed's `stale`, the TUI cue and the MCP payloads cannot answer
             // differently about the same file. `fetch_status` and
             // `next_refresh_at` above are a separate question (the last fetch
-            // OUTCOME, not the reading's age) and read `derived_clock_ms`. The
-            // third-party leg dates off that mtime too, its only writer being
-            // a fetch outcome. An OAuth body with no stamp or a future one is
+            // OUTCOME, not the reading's age) and read the two clocks above.
+            // A third-party age is its cache's mtime, which a proxy copy dates
+            // to its stalest figure, so a shown age is never younger than that
+            // figure. An OAuth body with no stamp or a future one is
             // stale with no age published: its figures stay visible, and
             // nothing claims to date them.
             let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
@@ -589,7 +628,20 @@ pub(crate) fn build_profile_entries(
                 )
             };
             let age_stale = !spent_skipped && past_threshold;
-            let stale = match live {
+            // The alerts judge a proxy copy by its chain windows, the figures
+            // they ring on; every other profile by the same age as `stale`. A
+            // chain dated ahead of the clock is undated, so stale, as an
+            // undated OAuth body is.
+            let alert_age_stale = match third_party_copy.as_ref().and_then(|c| c.chain_read_at) {
+                Some(chain) => {
+                    !spent_skipped
+                        && now
+                            .checked_sub(chain)
+                            .is_none_or(|age| age > stale_after_ms(interval_ms))
+                }
+                None => age_stale,
+            };
+            let stuck = match live {
                 Some(sig) => match sig.status.get(name.as_str()).copied() {
                     Some(s) => is_stuck_rate_limited(
                         s,
@@ -610,7 +662,9 @@ pub(crate) fn build_profile_entries(
                         }),
                 },
                 None => false,
-            } || age_stale;
+            };
+            let stale = stuck || age_stale;
+            let alert_stale = stuck || alert_age_stale;
 
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
@@ -621,16 +675,10 @@ pub(crate) fn build_profile_entries(
             // `is_third_party` it published a null dot for every generic api-key
             // endpoint while `fetched_at` beside it dated that account's provider
             // cache: one object, two answers about the same file.
-            let third_party = if p.usage_cache_is_third_party() {
-                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE).map(|s| {
-                    ThirdPartyAvailability {
-                        available: s.is_available,
-                    }
-                })
-            } else {
-                None
-            };
-            let (windows, long_window_label) = published_windows_with_label(name);
+            let third_party = third_party_copy.map(|copy| ThirdPartyAvailability {
+                available: copy.stats.is_available,
+            });
+            let (windows, long_window_label) = published_profile_windows_with_label(p);
             // The credit cap: the block the cache already loaded carries
             // (`oauth_usage`), published as `{enabled, percent}` — never a
             // dollar amount, and `percent` stays `null` when the wire sent
@@ -669,6 +717,7 @@ pub(crate) fn build_profile_entries(
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
+                alert_stale,
                 fetched_at: age_source_ms.map(ms_to_iso),
                 next_refresh_at: next_refresh_ms.map(ms_to_iso),
                 auto_start: p.auto_start,
@@ -765,6 +814,7 @@ pub(crate) fn build_codex_entries(
                     .to_string()
                 }),
                 stale: false,
+                alert_stale: false,
                 fetched_at: clock_ms.map(ms_to_iso),
                 next_refresh_at: clock_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,

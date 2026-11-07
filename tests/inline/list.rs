@@ -1992,3 +1992,59 @@ fn a_halfwidth_katakana_name_keeps_the_plan_column_aligned() {
         "the PROFILE column sizes and pads by the cells the buffer draws, got:\n{table}"
     );
 }
+
+/// The ` (keyless)` suffix marks exactly the accounts the delegate refuses as
+/// keyless: a keyless proxy account on its bind (`pb`, as `clauth login <name>
+/// --proxy <service>` creates it, key cleared) gets it, the keyed proxy
+/// account beside it (`pk`) does not, and the keyless third-party control
+/// (`z.ai`) keeps it.
+#[test]
+fn list_table_marks_a_keyless_proxy_account_on_its_bind() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "z.ai".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    ))
+    .expect("save z.ai");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["z.ai".into()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+    let config = crate::profile::load_config().expect("reload");
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai           -        -  https://api.z.ai/api/anthropic (keyless)",
+            "  pb       generic        -        -  http://127.0.0.1:9141 (keyless)",
+            "  pk       generic        -        -  http://127.0.0.1:9141",
+        ],
+    );
+}

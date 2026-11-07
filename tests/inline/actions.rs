@@ -3910,6 +3910,55 @@ fn capture_refuses_a_login_whose_account_an_existing_profile_holds() {
     );
 }
 
+/// `clauth capture b` over a login whose account a proxy account holds refuses
+/// through its proxy and writes nothing: no id lands in its `config.toml`, as
+/// the TUI's save goes through the same claim guard.
+#[test]
+fn capture_into_an_id_matched_proxy_owner_refuses_and_mints_no_id() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let b = ProfileName::from("b");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    };
+    crate::profile::write_proxy_record(&b, &record).expect("write the proxy record");
+    config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name == b)
+        .expect("b")
+        .proxy = Some(record);
+    let toml = crate::profile::profile_subpath(&b, "config.toml").expect("config path");
+    let before = std::fs::read(&toml).expect("read config");
+    assert!(
+        matches!(live_capture_owner(&config), CaptureOwner::LooksLike(_)),
+        "fixture control: the login reads as b's"
+    );
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'b' is an account on proxy \"stub\": log in to it again with `clauth login b --proxy \
+         stub`, or delete it with `clauth delete b` first"
+    );
+    assert!(
+        std::fs::read(&toml).expect("read config") == before,
+        "no id lands in the proxy account's config.toml"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
 /// Two profiles anchored to the login's account id: neither is named as the
 /// owner, so no capture saves into one of them (the account may be another
 /// org's); the capture falls back to the token tier alone.
@@ -7485,6 +7534,65 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
+/// A proxy claim landing after the log out picked the login arm, readable or
+/// not, blanks the key and keeps the stored chain: the claim is read under the
+/// hold that writes. The plain account beside them loses its login and keeps
+/// its key.
+#[test]
+fn a_proxy_claim_landing_after_the_log_out_picked_its_arm_keeps_the_stored_chain() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let names = ["landed-record", "landed-unreadable", "landed-plain"];
+    for name in names {
+        let mut profile = crate::profile::Profile::new(
+            name.to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        profile.credentials = Some(oauth_creds(&format!("at-{name}")));
+        save_profile(&profile).expect("save");
+    }
+    crate::testutil::register_names(&names);
+    let mut stale = crate::profile::load_config().expect("the caller's read");
+    for name in ["landed-record", "landed-unreadable"] {
+        crate::profile::write_proxy_record(
+            &ProfileName::from(name),
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+    }
+    crate::claude::tests::break_proxy_record("landed-unreadable");
+
+    let outcomes: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let name_of = ProfileName::from(name);
+            let store = crate::profile::profile_subpath(&name_of, "credentials.json").unwrap();
+            let stored = std::fs::read(&store).unwrap();
+            let answer = clear_profile_credentials(&mut stale, &name_of).map_err(|e| e.to_string());
+            (
+                name,
+                answer,
+                std::fs::read(&store).ok() == Some(stored),
+                load_profile(&name_of).unwrap().api_key,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            ("landed-record", Ok(()), true, None),
+            ("landed-unreadable", Ok(()), true, None),
+            ("landed-plain", Ok(()), false, Some("clp_key".to_string())),
+        ],
+        "(account, the log out's answer, store kept byte for byte, api key)"
+    );
+}
+
 /// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
 /// stored tokens through `overwrite_captured_profile` — the documented recovery
 /// for a revoked login — and must clear its auth-broken flag so the recovered
@@ -10689,6 +10797,132 @@ fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
             .is_some(),
         "the refused rename moved nothing"
     );
+}
+
+/// Every path under `dir` with its bytes, a directory holding none.
+fn tree_bytes(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    let mut entries = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .expect("read the dir")
+                    .map(|entry| entry.expect("read the entry").path()),
+            );
+            entries.push((path, None));
+        } else {
+            let bytes = std::fs::read(&path).expect("read the file");
+            entries.push((path, Some(bytes)));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// A proxy claim landing after the shared delete's lock-free read refuses in
+/// the hold the removal runs under, with that claim's own sentence: the stored
+/// chain, the profile's every other byte, the roster, the active mark and the
+/// live link stay as the landing left them.
+#[test]
+fn a_proxy_claim_landing_after_the_deletes_read_refuses_in_its_hold() {
+    use crate::claude::tests::{Unclassifiable, break_proxy_record};
+    use crate::profile::{ProfileName, ProxyAccount};
+    type Land = fn(&ProfileName);
+    fn record(name: &ProfileName) {
+        let account = ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        };
+        crate::profile::write_proxy_record(name, &account).expect("write the record");
+    }
+    fn table(name: &ProfileName) {
+        record(name);
+        break_proxy_record(name.as_str());
+    }
+    fn directory(name: &ProfileName) {
+        Unclassifiable::Directory.pose(name.as_str());
+    }
+    fn noted_header(name: &ProfileName) {
+        Unclassifiable::NotedProxyHeader.pose(name.as_str());
+    }
+    let unclassifiable = "can't read the config of 'work', so clauth can't tell whether it is \
+                          an account on a proxy; fix its config.toml, then delete it again";
+
+    // `None`: the sentence naming the record's path, which the sandbox picks.
+    let cases: [(Option<&str>, Land); 4] = [
+        (
+            Some(
+                "'work' is an account on proxy \"stub\": delete it with `clauth delete work`, \
+                 which also deletes it on the proxy",
+            ),
+            record,
+        ),
+        (None, table),
+        (Some(unclassifiable), directory),
+        (Some(unclassifiable), noted_header),
+    ];
+    for (refusal, land) in cases {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("work");
+        let work = crate::testutil::oauth_profile("work", "rt-work");
+        crate::testutil::persist_profiles(std::slice::from_ref(&work));
+        let mut config = crate::profile::load_config().expect("load the config");
+        config.state.active_profile = Some(name.clone());
+        crate::profile::save_app_state(&config.state).expect("persist the active mark");
+        crate::claude::link_profile_credentials(&name).expect("link the live slot");
+
+        let dir = crate::profile::profile_dir(&name).expect("profile dir");
+        let store = dir.join("credentials.json");
+        let stored = std::fs::read(&store).expect("the stored chain");
+        let roster_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml");
+        let roster = std::fs::read(&roster_path).expect("the roster");
+        let live = crate::claude::claude_credentials_path().expect("live slot");
+        let live_login = std::fs::read(&live).expect("the live login");
+
+        let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&landed);
+        let (landing, tree) = (name.clone(), dir.clone());
+        crate::gateway_tokens::set_pre_hold_hook(
+            "work",
+            std::sync::Arc::new(move || {
+                land(&landing);
+                *seen.lock().expect("lock") = tree_bytes(&tree);
+            }),
+        );
+
+        let refused = delete(&mut config, "work");
+
+        let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+        let refusal = refusal.map_or_else(
+            || {
+                format!(
+                    "profile 'work' has a [proxy] table in {path:?} that clauth cannot read, so \
+                     its account on the proxy cannot be deleted; nothing was deleted. Give the \
+                     table a valid `service` and `account`, or remove it to delete the profile \
+                     alone"
+                )
+            },
+            str::to_string,
+        );
+        assert_eq!(refused, Err(refusal));
+        let landed = landed.lock().expect("lock").clone();
+        assert_eq!(
+            (
+                !landed.is_empty(),
+                tree_bytes(&dir) == landed,
+                std::fs::read(&store).expect("the stored chain") == stored,
+                std::fs::read(&roster_path).expect("the roster") == roster,
+                config.find(&name).is_some(),
+                std::fs::read(&live).ok() == Some(live_login),
+            ),
+            (true, true, true, true, true, true),
+            "(the landing ran, the profile dir, the store, the roster on disk, in memory, the \
+             live login)"
+        );
+    }
 }
 
 fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
@@ -17622,7 +17856,8 @@ fn the_detaching_capture_never_reads_as_an_older_clauths_switch() {
         login_snapshot("a-again", None),
         true,
     )
-    .expect("detaching capture of a");
+    .expect("detaching capture of a")
+    .expect("a is no proxy account");
     assert_eq!(live_endpoint().as_deref(), Some("user"));
 }
 
@@ -17944,7 +18179,8 @@ fn a_detaching_capture_after_an_older_clauths_cover_never_leaves_its_value_as_th
         login_snapshot("b-again", None),
         true,
     )
-    .expect("detaching capture of b");
+    .expect("detaching capture of b")
+    .expect("b is no proxy account");
     config = crate::profile::load_config().expect("re-read");
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
@@ -18943,11 +19179,11 @@ fn a_duplicate_of_a_source_missing_from_memory_names_it() {
     assert_eq!(err.to_string(), "profile 'a' not found");
 }
 
-/// `save_new_profile(` is called only by the four creates, once each: a
+/// `save_new_profile(` is called only by the five creates, once each: a
 /// whole-profile write of a caller-held profile anywhere else reds here. A call
 /// spelled through a `use .. as` alias is the known residual.
 #[test]
-fn every_save_new_profile_call_is_one_of_the_four_creates() {
+fn every_save_new_profile_call_is_one_of_the_five_creates() {
     fn enclosing_fn(before: &str) -> Option<&str> {
         before.lines().rev().find_map(|line| {
             let (qualifiers, rest) = line.trim_start().split_once("fn ")?;
@@ -18994,6 +19230,7 @@ fn every_save_new_profile_call_is_one_of_the_four_creates() {
             "capture_into_profile",
             "create_blank_profile",
             "create_profile_from_login",
+            "create_proxy_profile",
             "duplicate_profile",
         ]
         .map(|f| ("actions.rs".to_string(), f.to_string()))
@@ -19564,7 +19801,7 @@ fn every_save_app_state_call_under_src_is_a_known_site() {
     assert_eq!(
         sites,
         std::collections::BTreeMap::from([
-            ("actions.rs".to_string(), 14),
+            ("actions.rs".to_string(), 15),
             ("profile.rs".to_string(), 2),
             ("testutil.rs".to_string(), 3),
         ]),
@@ -20315,7 +20552,7 @@ fn leftover_login_refusal(name: &str) -> String {
 #[test]
 fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
     type Create = fn(&mut AppConfig) -> Result<()>;
-    let creates: [(&str, Create); 4] = [
+    let creates: [(&str, Create); 5] = [
         ("blank", |config| {
             create_blank_profile(
                 config,
@@ -20346,6 +20583,19 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 None,
                 oauth_pair("minted"),
                 None,
+                None,
+            )
+        }),
+        ("proxy", |config| {
+            create_proxy_profile(
+                config,
+                "left".to_string(),
+                crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-left".to_string(),
+                },
+                "http://127.0.0.1:9141".to_string(),
+                "clp_left-key".to_string(),
                 None,
             )
         }),

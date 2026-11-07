@@ -84,7 +84,7 @@ impl std::fmt::Display for InvalidService {
 impl std::error::Error for InvalidService {}
 
 /// A service named on the command line: a bad one is a usage error.
-fn service_arg(raw: &str) -> Result<Service> {
+pub(crate) fn service_arg(raw: &str) -> Result<Service> {
     Service::parse(raw).map_err(|e| crate::usage_error(e.to_string()))
 }
 
@@ -282,7 +282,7 @@ impl Registry {
     }
 
     /// The service whose row holds `port`.
-    fn holder(&self, port: u16) -> Option<&Service> {
+    pub(crate) fn holder(&self, port: u16) -> Option<&Service> {
         self.rows
             .iter()
             .find(|(_, row)| row.port == port)
@@ -494,6 +494,38 @@ pub(crate) const SPOKEN_MAJOR: u64 = 1;
 /// later minor is checked as far as this one, and the rest is reported as
 /// skipped.
 pub(crate) const SPOKEN_MINOR: u64 = 1;
+
+/// The control-route prefix every contract v1 route sits under. Shared by the
+/// checker (`proxy_check.rs`) and the client (`proxy_account.rs`), which must
+/// never drift onto different paths.
+pub(crate) const CONTROL: &str = "/clauth/v1";
+
+/// The port a loopback `http://` URL carries — the pure half of
+/// [`is_loopback_url_on`], for a caller that must ask the REGISTRY which
+/// service holds the port before it may read a single file.
+pub(crate) fn loopback_port(url: &str) -> Option<u16> {
+    let rest = url
+        .to_ascii_lowercase()
+        .strip_prefix("http://")?
+        .to_string();
+    let (host, port) = rest.trim_end_matches('/').rsplit_once(':')?;
+    let on_loopback = ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|loopback| host.eq_ignore_ascii_case(loopback));
+    // `u16::from_str` also takes a leading `+`.
+    (on_loopback && port.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| port.parse().ok())
+        .flatten()
+}
+
+/// Whether `url` is `http://` on a loopback host (`127.0.0.1`, `localhost`,
+/// `[::1]`) and `port`, with nothing after but an optional trailing slash.
+/// The one "is this profile's base_url this proxy's bind" test: the usage arm
+/// keys a profile onto a proxy through it, and so does the checker's
+/// key-on-bind pick.
+pub(crate) fn is_loopback_url_on(url: &str, port: u16) -> bool {
+    loopback_port(url) == Some(port)
+}
 
 /// How long `<binary> manifest` may run before clauth stops it. Measured
 /// 2026-09-29 on the core's fixture proxy under bun (`bun

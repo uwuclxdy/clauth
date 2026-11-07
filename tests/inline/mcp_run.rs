@@ -9693,6 +9693,73 @@ fn a_mid_run_401_invalid_names_the_key_dead_and_the_fix() {
     );
 }
 
+/// The whole failure reply after a 401 invalid key, byte for byte, on an
+/// account with no proxy claim: its fix is the api-key re-capture.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_reply_on_a_non_proxy_account_is_pinned_by_equality() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-401-4",
+        Some(42),
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(
+        envelope["result"].as_str(),
+        Some(
+            "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+             provider refused this run (401) naming the api key invalid; clauth dropped this \
+             account's cached balance — `profiles` shows no figure for 'work' until the key is \
+             re-captured (`clauth login work --api-key`). pick the run back up with \
+             `session_id: \"<session_id>\"`"
+        )
+    );
+}
+
+/// A proxy account's key is the proxy's to mint, so the same 401 reply on one
+/// names the re-capture through its proxy, the one login clauth takes for it;
+/// the rest of the reply is the non-proxy one's.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_reply_on_a_proxy_account_names_the_login_through_its_proxy() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let service = crate::proxy::Service::parse("stub").unwrap();
+    let outcome = super::classify_run_with(
+        super::Isolation::Shared,
+        None,
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "px",
+        "sess-401-5",
+        Some(42),
+        Some(&service),
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(
+        envelope["result"].as_str(),
+        Some(
+            "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+             provider refused this run (401) naming the api key invalid; clauth dropped this \
+             account's cached balance — `profiles` shows no figure for 'px' until the key is \
+             re-captured (`clauth login px --proxy stub`). pick the run back up with \
+             `session_id: \"<session_id>\"`"
+        )
+    );
+}
+
 /// The arm is scoped to a profile the third-party fetch leg credentials with a
 /// key at all: an OAuth profile's 401 is a different disease with its own
 /// arms, so no fingerprint means no clause and no invalidation.
@@ -13775,4 +13842,287 @@ fn a_background_preflight_strips_the_routing_a_peer_switch_stamped_after_its_con
     assert_the_peer_switched();
     assert_eq!(result.is_error, Some(true));
     assert_eq!(result_text(&result), handler_refusal_text(REFUSES_NO_MODEL));
+}
+
+/// The proxy account `px` (proxy `stub`) for the two tests below, created the
+/// way `clauth login px --proxy stub` creates it.
+#[cfg(unix)]
+fn create_px_proxy_account() {
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "px".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        "clp_px-key".to_string(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+}
+
+/// A delegate run on proxy account `px` that dies on a 401 invalid key,
+/// through the real spawn path (`run_delegate` + `FakeClaude`'s scripted
+/// failure), names the login through its proxy.
+#[cfg(unix)]
+#[test]
+fn a_delegates_401_on_a_proxy_account_names_the_login_through_its_proxy() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    create_px_proxy_account();
+    let mut fake = FakeClaude::new(&home);
+    fake.set_scripted_failure("401 Authentication Fails, Your api_key is invalid", "1");
+    let result = run_delegate(DelegateOpts {
+        profile: "px",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    let reason = match &result {
+        Ok(envelope) => envelope["result"]
+            .as_str()
+            .unwrap_or("<no result>")
+            .to_owned(),
+        Err(e) => format!("<refused> {e}"),
+    };
+    assert_eq!(
+        reason,
+        "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+         provider refused this run (401) naming the api key invalid; clauth dropped this \
+         account's cached balance — `profiles` shows no figure for 'px' until the key is \
+         re-captured (`clauth login px --proxy stub`). pick the run back up with \
+         `session_id: \"<session_id>\"`"
+    );
+}
+
+/// The next delegate to proxy account `px` after a 401 proved its key dead
+/// is refused before the spawn, naming the login through its proxy.
+#[cfg(unix)]
+#[test]
+fn the_preflight_refusal_on_a_dead_keyed_proxy_account_names_the_login_through_its_proxy() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    create_px_proxy_account();
+    let name = crate::profile::ProfileName::from("px");
+    let profile = crate::profile::load_profile(&name).expect("load");
+    assert!(
+        profile.proxy.is_some(),
+        "fixture control: the runtime proxy claim"
+    );
+    crate::profile_cache::write_dead_key(
+        &name,
+        crate::usage::profile_key_fingerprint(&profile).expect("a keyed profile"),
+    );
+    // An admitted run (a regression) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "px",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("api key rejected: px (run `clauth login px --proxy stub`)".to_string())
+    );
+}
+
+/// A delegate to a keyless proxy account the pre-flight's keyless arm reads
+/// (a recognised provider's endpoint) is refused before the spawn, naming the
+/// login through its proxy.
+#[cfg(unix)]
+#[test]
+fn the_preflight_refusal_on_a_keyless_proxy_account_names_the_login_through_its_proxy() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "pk".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-2".to_string(),
+        },
+        "https://api.deepseek.com/anthropic".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let profile =
+        crate::profile::load_profile(&crate::profile::ProfileName::from("pk")).expect("load");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            profile.is_third_party(),
+            crate::claude::has_inference_auth(&profile),
+        ),
+        (true, true, false),
+        "fixture control: (the runtime proxy claim, a recognised provider, an auth source)"
+    );
+    // An admitted run (a regression) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "pk",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("profile has no api key: pk (run `clauth login pk --proxy stub`)".to_string())
+    );
+}
+
+/// A delegate to a keyless proxy account on its proxy's loopback bind (the
+/// shape `clauth login <name> --proxy <service>` creates, its key cleared
+/// since) is refused before the spawn, naming the login through its proxy:
+/// it cannot pay, so it never spawns a run that dies on auth.
+#[cfg(unix)]
+#[test]
+fn a_delegate_to_a_keyless_proxy_account_on_its_bind_is_refused_before_the_spawn() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "pb".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-3".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let profile =
+        crate::profile::load_profile(&crate::profile::ProfileName::from("pb")).expect("load");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            crate::claude::has_inference_auth(&profile),
+        ),
+        (true, false),
+        "fixture control: (the runtime proxy claim, an auth source)"
+    );
+    // An admitted run (the defect) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "pb",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("profile has no api key: pb (run `clauth login pb --proxy stub`)".to_string())
+    );
+}
+
+/// A keyless proxy account holding a stored OAuth pair loads as that OAuth
+/// login (the load boundary drops its bind), so a delegate to it runs on the
+/// login and is never refused for the key it does not need.
+#[cfg(unix)]
+#[test]
+fn a_delegate_to_a_keyless_proxy_account_the_load_reads_as_oauth_is_not_refused_for_a_key() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "po".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-4".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let name = crate::profile::ProfileName::from("po");
+    let mut stored = crate::profile::load_profile(&name).expect("load");
+    stored.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-po".to_string(),
+            refresh_token: Some("rt-po".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&stored).expect("save the pair");
+    let profile = crate::profile::load_profile(&name).expect("reload");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            profile.base_url.clone(),
+            crate::claude::has_inference_auth(&profile),
+            profile.refresh_token().is_some(),
+        ),
+        (true, None, false, true),
+        "fixture control: (the runtime proxy claim, the bind, an auth source, a stored pair)"
+    );
+    // An admitted run spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "po",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Ok("<admitted>".to_string())
+    );
 }

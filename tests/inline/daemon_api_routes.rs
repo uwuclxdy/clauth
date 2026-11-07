@@ -4559,6 +4559,73 @@ fn a_refused_switch_reflects_the_authored_sentence() {
     );
 }
 
+/// A switch away from `alpha`, whose `config.toml` turned unclassifiable after
+/// the daemon loaded it (a directory in its place, a `[proxy] # note` header
+/// that fails to parse), while Claude Code holds a login of its own beside
+/// alpha's stored one, answers 409 with the sentence that says why: alpha's
+/// store, the live login and the active account as they were.
+#[test]
+fn a_switch_away_from_an_unclassifiable_account_reflects_the_refusal() {
+    use crate::claude::tests::Unclassifiable;
+    let outcomes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            let _home = HomeSandbox::new();
+            let config = seeded_config();
+            crate::testutil::write_live_creds(&crate::testutil::creds("cc-own"));
+            shape.pose("alpha");
+            let store = crate::profile::profile_subpath(
+                &crate::profile::ProfileName::from("alpha"),
+                "credentials.json",
+            )
+            .unwrap();
+            let stored = std::fs::read(&store).unwrap();
+            let live_path = crate::claude::claude_credentials_path().unwrap();
+            let live = std::fs::read(&live_path).unwrap();
+            let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+            let resp = call(
+                &ctx,
+                &req(
+                    "POST",
+                    "/api/v1/switch",
+                    Some(TOKEN),
+                    r#"{"profile":"beta"}"#,
+                ),
+            );
+            let body = body_json(&resp);
+            (
+                resp.status,
+                body["error"].clone(),
+                body["reason"].clone(),
+                std::fs::read(&store).unwrap() == stored,
+                std::fs::read(&live_path).unwrap() == live,
+                crate::profile::load_app_state().unwrap().active_profile,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                409,
+                serde_json::json!("switch_refused"),
+                serde_json::json!(
+                    "can't read the config of 'alpha', so clauth can't tell whether Claude \
+                     Code's current login belongs in it; fix its config.toml, then switch again"
+                ),
+                true,
+                true,
+                Some(crate::profile::ProfileName::from("alpha")),
+            );
+            2
+        ],
+        "(status, error, reason, alpha's store kept, the live login kept, disk's active) for a \
+         directory and a noted header"
+    );
+}
+
 /// A config snapshot a tick old must not misfile a genuine refusal as an
 /// unexpected failure. `ensure_switch_target_ok` re-reads the roster off disk
 /// under the state flock precisely because the daemon holds a handle a

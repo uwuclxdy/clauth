@@ -865,7 +865,9 @@ impl super::Daemon {
                 // Apply so the dropped login's reading does not survive in the
                 // daemon's stores.
                 self.apply_forgets();
-                logline!("clauth daemon: switch-off failed: {e}");
+                if !crate::actions::switch_off_hold_said(&e) {
+                    logline!("clauth daemon: switch-off failed: {e}");
+                }
             }
         }
     }

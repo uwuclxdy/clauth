@@ -2226,6 +2226,139 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
     );
 }
 
+/// A keyless proxy account (its key cleared on the setup tab) keeps its last
+/// figures, and its fix hint names the re-login that mints a new key, never
+/// the setup tab: the user never holds a proxy account's key.
+#[test]
+fn a_keyless_proxy_accounts_hint_names_the_re_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("px");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    ))
+    .expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let px = crate::profile::load_profile(&name).expect("load profile");
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "px",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        status_text(&status_lines(&px, &header, 120, &readings)),
+        "status    [ no key ]\n└ no api key set, run `clauth login px --proxy stub`"
+    );
+}
+
+/// The empty body shares the status hint's words: a keyless proxy account with
+/// no figures names its re-login there, with its own name and recorded
+/// service, and a keyless endpoint with no record keeps the setup-tab fix in
+/// both places, byte for byte.
+#[test]
+fn the_keyless_fix_reads_alike_in_the_empty_body_and_the_status_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("relay");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "relay".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    ))
+    .expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("zcode").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let relay = crate::profile::load_profile(&name).expect("load profile");
+    let mut generic = crate::testutil::blank_profile(&crate::profile::ProfileName::from("g"));
+    generic.base_url = Some("https://example.com".to_string());
+    let body = |profile: &crate::profile::Profile| -> Vec<String> {
+        build_tp_rows(
+            profile,
+            120,
+            &ReadingsSnapshot::default(),
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect()
+    };
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let empty_stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    let readings = snap_with_stats(
+        snap_with_stats(ReadingsSnapshot::default(), "g", empty_stats.clone()),
+        "relay",
+        empty_stats,
+    );
+
+    assert_eq!(
+        (body(&relay), body(&generic)),
+        (
+            vec!["no api key set, run `clauth login relay --proxy zcode`".to_string()],
+            vec!["no api key set, add one on the setup tab".to_string()]
+        ),
+        "(proxy, non-proxy) empty body"
+    );
+    assert_eq!(
+        status_text(&status_lines(&generic, &header, 120, &readings)),
+        "status    [ no key ]\n└ no api key set, add one on the setup tab",
+        "the non-proxy status hint"
+    );
+}
+
 /// The `[ no key ]` pill is a third-party state — an OAuth profile never
 /// renders it, keyless or not.
 #[test]
@@ -3891,7 +4024,7 @@ fn kick_hint_diverges_on_auto_start() {
 #[test]
 fn auth_broken_hint_names_the_profile() {
     assert_eq!(
-        diag_fix(UsageDiag::AuthBroken, "kerry"),
+        diag_fix(UsageDiag::AuthBroken { proxy: None }, "kerry"),
         format!(
             "re-login with {}",
             crate::tui::render::prose::cmd("clauth login kerry")
@@ -5380,7 +5513,11 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let rail = rail_hint_lines(&diag_fix(UsageDiag::AuthBroken, "kerry"), 60, false);
+    let rail = rail_hint_lines(
+        &diag_fix(UsageDiag::AuthBroken { proxy: None }, "kerry"),
+        60,
+        false,
+    );
     assert_prose_part(
         &lines_buffer(rail, 60),
         "re-login with clauth login kerry",
@@ -6487,5 +6624,345 @@ fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
         row_at(&app, 56),
         "resets 1 available · resets 5h, 7d · until Nov 26",
         "42 cells in a 42-cell budget fit"
+    );
+}
+
+/// A quarantined proxy account's status block sends it to the login through
+/// its proxy, the one login clauth takes for it; the same account with no
+/// proxy record keeps the re-login fix, byte for byte.
+#[test]
+fn a_quarantined_proxy_accounts_status_names_the_login_through_its_proxy() {
+    let rows = |proxy: bool| -> Vec<String> {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("px"));
+        profile.proxy = proxy.then(|| crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        let header = HeaderState {
+            diag: DiagFlags {
+                auth_broken: true,
+                ..DiagFlags::default()
+            },
+            ..idle_header()
+        };
+        status_lines(&profile, &header, 120, &ReadingsSnapshot::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    };
+    assert_eq!(
+        (rows(true), rows(false)),
+        (
+            vec![
+                "status    [ auth broken ]".to_string(),
+                "└ log in again with clauth login px --proxy stub".to_string(),
+            ],
+            vec![
+                "status    [ auth broken ]".to_string(),
+                "└ re-login with clauth login px".to_string(),
+            ],
+        ),
+        "(the proxy account's status rows, the plain account's)"
+    );
+}
+
+/// A keyless proxy account holding a stored pair loads as an OAuth login no
+/// leg polls; its empty Usage body names the login through its proxy, while a
+/// plain account holding nothing keeps the setup-tab line.
+#[test]
+fn a_keyless_proxy_account_holding_a_pair_names_its_login_in_the_empty_body() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let name = ProfileName::from("px");
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    );
+    px.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-px".to_string(),
+            refresh_token: Some("rt-px".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&px).expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let px = crate::profile::load_profile(&name).expect("load profile");
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.is_oauth(),
+            px.access_token(),
+            px.usage_cache_is_third_party(),
+        ),
+        (true, true, Some("at-px"), false),
+        "fixture control: (the proxy record, an OAuth body, the stored pair, a third-party body)"
+    );
+    let rows = |profile: crate::profile::Profile| -> Vec<String> {
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![profile.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![profile],
+        });
+        app.profile_cursor.set(0);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let proxy_row = format!(
+        "│   no api key set, run `clauth login px --proxy stub`{}│",
+        " ".repeat(25)
+    );
+    let plain_row = format!(
+        "│   not logged in, use + login on the setup tab{}│",
+        " ".repeat(32)
+    );
+
+    let proxy_rows = rows(px);
+    let plain_rows = rows(crate::testutil::blank_profile(&ProfileName::from("oau")));
+    assert_eq!(
+        (
+            proxy_rows.contains(&proxy_row),
+            plain_rows.contains(&plain_row)
+        ),
+        (true, true),
+        "(the proxy account's empty body row, the plain account's): {proxy_rows:#?} {plain_rows:#?}"
+    );
+}
+
+/// A stored OAuth pair for `name`, the access token `at-<name>`.
+fn stored_pair(name: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// Keyless proxy account `px` of proxy `stub` holding a stored pair, saved
+/// and loaded back from disk, with `auto_start` as given and its record's
+/// `account` set to `account` (an empty one is a table clauth cannot read).
+fn keyless_proxy_account_holding_a_pair(
+    auto_start: bool,
+    account: &str,
+) -> crate::profile::Profile {
+    let name = crate::profile::ProfileName::from("px");
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    );
+    px.auto_start = auto_start;
+    px.credentials = Some(stored_pair("px"));
+    crate::profile::save_profile(&px).expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let path = crate::profile::profile_subpath(&name, "config.toml").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let edited = text.replace("account = \"acct-1\"", &format!("account = \"{account}\""));
+    assert_eq!(
+        edited == text,
+        account == "acct-1",
+        "fixture control: the record's account is {account:?}"
+    );
+    std::fs::write(&path, edited).unwrap();
+    crate::profile::load_profile(&name).expect("load profile")
+}
+
+/// `draw_usage_detail`'s rows for `profile` alone, on a `width`x24 frame with
+/// no readings.
+fn usage_detail_rows(profile: crate::profile::Profile, width: u16) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::App;
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// A profile holding a stored pair whose `[proxy]` table clauth cannot read
+/// loads as an OAuth login no leg polls and every login refuses; its empty
+/// Usage body says to fix the table, while a plain account holding nothing
+/// keeps the setup-tab line.
+#[test]
+fn an_unreadable_proxy_record_holding_a_pair_names_the_table_in_the_empty_body() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let px = keyless_proxy_account_holding_a_pair(false, "");
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.has_unreadable_proxy_record,
+            px.is_oauth(),
+            px.access_token(),
+        ),
+        (false, true, true, Some("at-px")),
+        "fixture control: (a readable proxy record, an unreadable one, an OAuth body, the \
+         stored pair)"
+    );
+    let unreadable_row = format!(
+        "│   can't read its [proxy] table, fix it in config.toml{}│",
+        " ".repeat(24)
+    );
+    let plain_row = format!(
+        "│   not logged in, use + login on the setup tab{}│",
+        " ".repeat(32)
+    );
+
+    let px_rows = usage_detail_rows(px, 80);
+    let plain_rows = usage_detail_rows(
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("oau")),
+        80,
+    );
+    assert_eq!(
+        (
+            px_rows.contains(&unreadable_row),
+            plain_rows.contains(&plain_row)
+        ),
+        (true, true),
+        "(the unreadable record's empty body row, the plain account's): {px_rows:#?} \
+         {plain_rows:#?}"
+    );
+}
+
+/// A proxy account with `auto_start` on holding a stored pair shows no
+/// auto-start countdown on its plan row, since no kick spends its chain; a
+/// plain OAuth account with `auto_start` on shows it.
+#[test]
+fn a_proxy_account_shows_no_auto_start_countdown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oa"]);
+    let px = keyless_proxy_account_holding_a_pair(true, "acct-1");
+    let mut oa = crate::profile::Profile::new("oa".to_string(), None, None);
+    oa.auto_start = true;
+    oa.credentials = Some(stored_pair("oa"));
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.auto_start,
+            px.access_token(),
+            oa.auto_start,
+            oa.access_token()
+        ),
+        (true, true, Some("at-px"), true, Some("at-oa")),
+        "fixture control: (px's proxy record, its auto_start, its pair, oa's auto_start, its \
+         pair)"
+    );
+    let px_plan_row = format!("│ plan      —{}│", " ".repeat(76));
+    let oa_plan_row = format!("│ plan      —{}usage auto-start due now │", " ".repeat(51));
+
+    let px_rows = usage_detail_rows(px, 90);
+    let oa_rows = usage_detail_rows(oa, 90);
+    assert_eq!(
+        (
+            px_rows.contains(&px_plan_row),
+            px_rows.iter().any(|row| row.contains("usage auto-start")),
+            oa_rows.contains(&oa_plan_row)
+        ),
+        (true, false, true),
+        "(px's bare plan row, any countdown on px, oa's countdown row): {px_rows:#?} \
+         {oa_rows:#?}"
+    );
+}
+
+/// A proxy account holding a setup-token sidecar beside its stored pair, its
+/// `[proxy]` table readable or not, gets its own empty-body line, never the
+/// sidecar line naming `+ login`, which refuses it; a plain account holding
+/// the same sidecar keeps the sidecar line.
+#[test]
+fn a_proxy_account_holding_a_sidecar_never_reads_the_relogin_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let with_sidecar = |mut profile: crate::profile::Profile| {
+        profile.has_long_lived_sidecar = true;
+        profile
+    };
+    let readable = with_sidecar(keyless_proxy_account_holding_a_pair(false, "acct-1"));
+    let readable_shape = (
+        readable.proxy.is_some(),
+        readable.has_unreadable_proxy_record,
+        readable.is_oauth(),
+    );
+    let readable_rows = usage_detail_rows(readable, 80);
+    let unreadable = with_sidecar(keyless_proxy_account_holding_a_pair(false, ""));
+    let unreadable_shape = (
+        unreadable.proxy.is_some(),
+        unreadable.has_unreadable_proxy_record,
+        unreadable.is_oauth(),
+    );
+    let unreadable_rows = usage_detail_rows(unreadable, 80);
+    let plain_rows = usage_detail_rows(
+        with_sidecar(crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("oau"),
+        )),
+        120,
+    );
+    assert_eq!(
+        (readable_shape, unreadable_shape),
+        ((true, false, true), (false, true, true)),
+        "fixture control: (a readable proxy record, an unreadable one, an OAuth body) for each"
+    );
+    let readable_row = format!(
+        "│   no api key set, run `clauth login px --proxy stub`{}│",
+        " ".repeat(25)
+    );
+    let unreadable_row = format!(
+        "│   can't read its [proxy] table, fix it in config.toml{}│",
+        " ".repeat(24)
+    );
+    let plain_row = format!(
+        "│   can't read usage, log in the same account with + login on the setup tab, or turn \
+         on its usage probe{}│",
+        " ".repeat(16)
+    );
+
+    assert_eq!(
+        (
+            readable_rows.contains(&readable_row),
+            unreadable_rows.contains(&unreadable_row),
+            plain_rows.contains(&plain_row),
+        ),
+        (true, true, true),
+        "(the readable proxy account's empty body row, the unreadable record's, the plain \
+         account's): {readable_rows:#?} {unreadable_rows:#?} {plain_rows:#?}"
     );
 }

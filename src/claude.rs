@@ -340,7 +340,9 @@ fn validate_credential_chars(value: &str, noun: &str) -> Result<()> {
 
 /// Write `name`'s `session-token.json` from a validated mint, stamping the
 /// assumed one-year expiry. 0600 like every credential file. Returns the
-/// stamped epoch-ms expiry for the caller's summary line.
+/// stamped epoch-ms expiry for the caller's summary line. A proxy account is
+/// refused under the flock, writing nothing
+/// ([`crate::actions::refuse_relogin_off_proxy`]).
 pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) -> Result<i64> {
     let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
     let sidecar = ClaudeCredentials {
@@ -356,6 +358,7 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
     let plan = with_state_lock(|_held| {
+        crate::actions::refuse_relogin_off_proxy(name)?;
         let plan = setup_token_plan(name, Some(token));
         // A re-mint relinks nothing, so a live file Claude Code wrote beside
         // the mint this replaces stops matching any store; saved first, the
@@ -388,9 +391,24 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
 /// preserved at `session-token.static.json` ([`preserve_static_mint`]) so
 /// switching back to the static token — or a terminally dead chain — can restore Sonnet-cap
 /// service instead of signing sessions out.
+///
+/// A chain whose recorded grant reads as a mint is refused first, before the
+/// hold and whatever the account claims. Past that refusal, an account with a
+/// proxy claim gets no stamp and no error: every caller's next step is the one
+/// a chain clauth never spends takes.
 pub(crate) fn stamp_rolling_token(
     name: &ProfileName,
     chain: &crate::profile::OAuthToken,
+) -> Result<()> {
+    stamp_rolling_token_synced(name, chain, || {})
+}
+
+/// [`stamp_rolling_token`] running `pre_hold` just before it takes the state
+/// flock, the window a proxy record can land in.
+fn stamp_rolling_token_synced(
+    name: &ProfileName,
+    chain: &crate::profile::OAuthToken,
+    pre_hold: impl FnOnce(),
 ) -> Result<()> {
     let rolled = rolling_projection(chain);
     // [`sidecar_kind_of`]'s totality is enforced HERE, at the only writer of
@@ -412,7 +430,15 @@ pub(crate) fn stamp_rolling_token(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize rolling session token")?;
     let path = profile_dir(name)?.join("session-token.json");
+    pre_hold();
     with_state_lock(|_held| {
+        // The proxy record's writers take this flock, so a read under it
+        // cannot miss one that landed before the stamp.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            return Ok(());
+        }
         // While the sidecar still holds the bearer this stamp replaces, a live
         // file Claude Code wrote beside that bearer (a `/design-login`) is still
         // recognisably this account's; after the stamp no sync matches it again.
@@ -563,7 +589,8 @@ fn preserve_static_mint(name: &ProfileName) -> Result<()> {
 /// read it back into the backup) leaves a window where a concurrent rotation
 /// roll replaces the mint with an hours-horizon token that then gets
 /// snapshotted as "the mint", which a later restore would then install as a
-/// dead credential. Returns the stamped expiry like [`write_session_token`].
+/// dead credential. Returns the stamped expiry like [`write_session_token`],
+/// and refuses a proxy account the same way.
 pub(crate) fn write_session_token_with_backup(
     name: &ProfileName,
     token: &str,
@@ -583,6 +610,7 @@ pub(crate) fn write_session_token_with_backup(
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
     let plan = with_state_lock(|_held| {
+        crate::actions::refuse_relogin_off_proxy(name)?;
         let plan = setup_token_plan(name, Some(token));
         // As in `write_session_token`: what the live file holds beside the
         // bearer this replaces is saved before it stops matching.
@@ -621,16 +649,39 @@ pub(crate) enum HealOutcome {
     /// absent, expired, or not a mint at all ([`live_backup_bytes`] logged
     /// which). The split stays disengaged until an operator re-captures.
     NoLiveBackup,
+    /// Read under the lock, `config.toml` claims or may claim a proxy account
+    /// ([`crate::profile::stored_proxy_claim_failing_closed`]): its sidecar is
+    /// never written, so nothing was healed.
+    ProxyClaimed,
 }
 
 /// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine
 /// the evidence (the profile's own `quarantine/` dir), restore the preserved
 /// static mint over it.
 pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> {
+    heal_misfilled_sidecar_synced(name, || {})
+}
+
+/// The injected closure runs immediately before the state flock is taken — a
+/// sync point for the regression test that lands a proxy record after the
+/// caller's lock-free claim read, so "the hold's read decides" is pinned by
+/// construction. Production passes a no-op.
+fn heal_misfilled_sidecar_synced(
+    name: &ProfileName,
+    pre_hold: impl FnOnce(),
+) -> Result<HealOutcome> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
+    pre_hold();
     let (outcome, plan) = with_state_lock(|_held| {
+        // The proxy record's writers take this flock, so a claim read here
+        // cannot miss one landing after the caller's own read.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            return Ok((HealOutcome::ProxyClaimed, ForgetPlan::default()));
+        }
         if !matches!(
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
@@ -750,7 +801,7 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
             return;
         }
     };
-    if !profile.rolling_token {
+    if !profile.rolling_token || !profile.spends_oauth_chain() {
         return;
     }
     let now = crate::usage::now_ms() as i64;
@@ -798,6 +849,18 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
             return;
         }
     };
+    // A `[proxy]` record that landed while this thread parked stops the leg
+    // before anything of the account moves: a waiting stage stays a stage.
+    match crate::profile::load_profile(name) {
+        Ok(fresh) if fresh.spends_oauth_chain() => {}
+        Ok(_) => return,
+        Err(e) => {
+            crate::logline::logline!(
+                "clauth: start-time rolling-token arming for '{name}' skipped (post-guard profile re-read failed: {e:#})"
+            );
+            return;
+        }
+    }
     // The stamp below reads the stored chain: a staged pair lands first.
     if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
         crate::logline::logline!(
@@ -826,8 +889,9 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
     // and release — all while this thread parks. Stamping from the pre-guard
     // routing would land a fresh rolling bearer on the profile the operator
     // just cleared, with the flag now off so nothing ever re-stamps it: a
-    // dies-in-hours credential with no exit.
-    if !fresh.rolling_token {
+    // dies-in-hours credential with no exit. The record is checked again: its
+    // writer takes no rotation guard, so it can land during the landing.
+    if !fresh.rolling_token || !fresh.spends_oauth_chain() {
         return;
     }
     let Some(oauth) = fresh
@@ -1803,8 +1867,11 @@ pub(crate) fn keychain_mirror_source_for_config_dir(
 /// hold, so a store write landing between them cannot be reverted. The file
 /// drain's CLA-SPLIT guard carries over unchanged: a differing item over a
 /// static session token is a session-side re-login, never adopted over the
-/// token. An unparseable item carries nothing and heals instead: the swap's
-/// write replaces the truncated bytes rather than skipping inertly.
+/// token. So does the file drain's proxy skip: a proxy account's store never
+/// takes the item's login, which raises the not-saved warning once per login
+/// ([`crate::runtime::keeps_login_off_proxy_store`]). An unparseable item
+/// carries nothing and heals instead: the swap's write replaces the truncated
+/// bytes rather than skipping inertly.
 ///
 /// The read (a `security` subprocess) runs OUTSIDE the state flock.
 ///
@@ -1842,6 +1909,9 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
     crate::lock::with_state_lock(|held| {
         let store_bytes = std::fs::read(store).ok();
         if store_bytes.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        if crate::runtime::keeps_login_off_proxy_store(Some(config_dir), store, &parsed) {
             return Ok(());
         }
         // Another account's store holds the item's chain: it is saved, and a
@@ -2008,6 +2078,9 @@ pub(crate) enum BareItemCarry {
     /// no refresh token to carry): the item may hold the account's only live
     /// login.
     Refused,
+    /// The owner is a proxy account ([`adopt_skips_proxy_account`]), whose
+    /// login is its proxy's: nothing is written.
+    ProxyAccount,
 }
 
 /// [`BareItemLogin`] for `item` over `stores`, `(profile, store value)` pairs
@@ -2304,13 +2377,13 @@ fn bare_item_uncached_holder(
 /// login replaced since `stores` was read, leaves the profile uncached; a
 /// [`BareItemLookupPending`] stops the walk and passes through for the
 /// caller to retry. Answers each cached profile with the
-/// [`crate::profile::ProfileId`] it held as its anchor was cached, for
-/// [`bare_item_owner_account`].
+/// [`crate::profile::ProfileId`] it held as its anchor was cached (`None` for
+/// a proxy account, never claimed), for [`bare_item_owner_account`].
 fn bare_item_fill_anchors(
     stores: &[(ProfileName, serde_json::Value)],
     anchors: &mut [(ProfileName, Option<crate::profile::AccountId>)],
     probe: &mut impl FnMut(&str) -> Result<crate::profile::AccountId>,
-) -> Result<Vec<(ProfileName, crate::profile::ProfileId)>> {
+) -> Result<Vec<(ProfileName, Option<crate::profile::ProfileId>)>> {
     let mut filled = Vec::new();
     for (name, store) in stores {
         let Some(access) = login_access_token(store) else {
@@ -2342,15 +2415,16 @@ fn bare_item_fill_anchors(
 /// identity anchor under the state flock, and only while `access` is still
 /// one of `name`'s stored logins: a re-login since the lookup must never
 /// inherit the old login's account. The same hold claims `name`'s
-/// [`crate::profile::ProfileId`], so the anchor and the account a carry lands
-/// by are one profile's even if `name` is recreated before the carry. `None`
-/// when it wrote nothing, a failed claim and a refused or timed-out flock
-/// wait included.
+/// [`crate::profile::ProfileId`] ([`claim_unless_proxy_account`]: a proxy
+/// account caches its anchor alone, `Some(None)`), so the anchor and the
+/// account a carry lands by are one profile's even if `name` is recreated
+/// before the carry. `None` when it wrote nothing, a failed claim and a
+/// refused or timed-out flock wait included.
 fn cache_looked_up_anchor(
     name: &ProfileName,
     access: &str,
     id: &str,
-) -> Option<crate::profile::ProfileId> {
+) -> Option<Option<crate::profile::ProfileId>> {
     with_state_lock(|held| {
         let still_held = bare_item_stores(std::slice::from_ref(name))
             .iter()
@@ -2358,7 +2432,7 @@ fn cache_looked_up_anchor(
         if !still_held {
             return Ok(None);
         }
-        let account = crate::profile::claim_profile_id(name)?;
+        let account = claim_unless_proxy_account(name)?;
         crate::usage::reconcile_identity_anchor_to_held(name, id, held);
         Ok(Some(account))
     })
@@ -2369,7 +2443,8 @@ fn cache_looked_up_anchor(
 /// The [`crate::profile::ProfileId`] a carry into `owner` lands by: the one
 /// `owner` held when the fill cached its anchor, since the fill's later
 /// lookups give a delete and recreate time to land; else the one it holds
-/// now, since no lookup ran after its anchor was read.
+/// now, since no lookup ran after its anchor was read. `None` for a proxy
+/// account ([`claim_unless_proxy_account`]).
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -2379,11 +2454,11 @@ fn cache_looked_up_anchor(
 )]
 fn bare_item_owner_account(
     owner: &ProfileName,
-    filled: &[(ProfileName, crate::profile::ProfileId)],
-) -> Result<crate::profile::ProfileId> {
+    filled: &[(ProfileName, Option<crate::profile::ProfileId>)],
+) -> Result<Option<crate::profile::ProfileId>> {
     match filled.iter().find(|(name, _)| name == owner) {
         Some((_, account)) => Ok(account.clone()),
-        None => crate::profile::claim_profile_id(owner),
+        None => claim_unless_proxy_account(owner),
     }
 }
 
@@ -2471,8 +2546,9 @@ pub(crate) fn bare_item_may_be_replaced(
 
 /// Save the bare item's login into `owner`'s `credentials.json` under one
 /// state-flock hold, only while `owner` still holds `account`, the
-/// [`crate::profile::ProfileId`] claimed when the owner was named: the
-/// bare-item twin of [`carry_session_item_into`]'s store side, its gates in
+/// [`crate::profile::ProfileId`] claimed when the owner was named (`None`: a
+/// proxy account then, never claimed, so a name no longer one was re-created
+/// since): the bare-item twin of [`carry_session_item_into`]'s store side, its gates in
 /// its order (an equal login, [`item_login_outranks_store`], the spent
 /// record), behind the stand-down every other writer of that file keeps for
 /// a rotation staged (`credentials.json.staged`) or pending (`.pending`)
@@ -2490,7 +2566,7 @@ pub(crate) fn bare_item_may_be_replaced(
 )]
 pub(crate) fn carry_bare_item_login_into(
     owner: &ProfileName,
-    account: &crate::profile::ProfileId,
+    account: Option<&crate::profile::ProfileId>,
     item: &serde_json::Value,
 ) -> Result<BareItemCarry> {
     let Ok(parsed) = serde_json::from_value::<ClaudeCredentials>(item.clone()) else {
@@ -2501,6 +2577,12 @@ pub(crate) fn carry_bare_item_login_into(
     }
     let store = &profile_dir(owner)?.join("credentials.json");
     with_state_lock(|held| {
+        if adopt_skips_proxy_account(owner) {
+            return Ok(BareItemCarry::ProxyAccount);
+        }
+        let Some(account) = account else {
+            anyhow::bail!("profile '{owner}' no longer exists");
+        };
         crate::profile::require_profile_id(owner, account, held)?;
         if crate::profile::rotation_staged_beside(store)
             || store
@@ -2601,9 +2683,35 @@ impl BareItemWriter {
 )]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BareItemSettled {
-    pub(crate) notice: Option<String>,
+    pub(crate) notice: Option<BareItemNotice>,
     pub(crate) saved_into: Option<ProfileName>,
     pub(crate) placed: Option<[u8; 32]>,
+}
+
+/// The line a settle leaves the user, typed by what its carry did so a
+/// surface can head a skipped save; it displays as the sentence alone.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemNotice {
+    /// The carry saved the item's login into its owner.
+    Saved(String),
+    /// The owner is a proxy account, so the login was not saved
+    /// ([`unsaved_bare_item_warning`]).
+    NotSaved(String),
+}
+
+impl std::fmt::Display for BareItemNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Saved(line) | Self::NotSaved(line) => f.write_str(line),
+        }
+    }
 }
 
 /// What [`settle_bare_item_before_write`] decided: the writer may go on, or
@@ -2840,16 +2948,28 @@ pub(crate) fn settle_bare_item_before_write(
         }
     };
     let carried = bare_item_owner_account(owner, &filled)
-        .and_then(|account| carry_bare_item_login_into(owner, &account, item))
+        .and_then(|account| carry_bare_item_login_into(owner, account.as_ref(), item))
         .with_context(|| format!("saving the macOS Keychain login into {owner}"))?;
     match carried {
         BareItemCarry::Saved => settled(BareItemSettled {
-            notice: Some(bare_item_saved_line(owner.as_str())),
+            notice: Some(BareItemNotice::Saved(bare_item_saved_line(owner.as_str()))),
             saved_into: Some(owner.clone()),
             placed: None,
         }),
         BareItemCarry::Kept => settled(BareItemSettled {
             notice: None,
+            saved_into: None,
+            placed: Some(key),
+        }),
+        // As a session's carry skips a proxy store: the writer replaces the
+        // item, and the login is not saved.
+        BareItemCarry::ProxyAccount => settled(BareItemSettled {
+            notice: unsaved_bare_item_warning(
+                owner,
+                crate::profile::active_profile_name().as_ref(),
+                UnsavedLogin::bare_item(&id, item),
+            )
+            .map(BareItemNotice::NotSaved),
             saved_into: None,
             placed: Some(key),
         }),
@@ -2950,20 +3070,69 @@ pub(crate) fn save_bare_item_into(
     item: &serde_json::Value,
     writer: BareItemWriter,
 ) -> Result<Option<[u8; 32]>> {
-    let carried = carry_bare_item_login_into(owner, account, item)
+    crate::actions::refuse_relogin_off_proxy(owner)?;
+    let carried = carry_bare_item_login_into(owner, Some(account), item)
         .with_context(|| format!("saving the macOS Keychain login into {owner}"))?;
     match carried {
         BareItemCarry::Saved => Ok(None),
         BareItemCarry::Kept => Ok(bare_item_login_key(item)),
+        // Re-created as a proxy account since the check above.
+        BareItemCarry::ProxyAccount => crate::actions::refuse_relogin_off_proxy(owner)
+            .and(Err(bare_item_owner_refusal(owner, writer))),
         BareItemCarry::Refused => Err(bare_item_owner_refusal(owner, writer)),
     }
 }
 
+/// [`save_bare_item_into`] by the claim [`claim_bare_item_owner`] answered for
+/// `owner`: no claim (a proxy account when the save named it) refuses with
+/// the re-login refusal, or, once the name is no proxy account, as a save
+/// into a name re-created since.
+pub(crate) fn save_bare_item_into_claimed(
+    owner: &ProfileName,
+    account: Option<&crate::profile::ProfileId>,
+    item: &serde_json::Value,
+    writer: BareItemWriter,
+) -> Result<Option<[u8; 32]>> {
+    match account {
+        Some(account) => save_bare_item_into(owner, account, item, writer),
+        None => {
+            crate::actions::refuse_relogin_off_proxy(owner)?;
+            Err(bare_item_owner_unclaimed(owner))
+        }
+    }
+}
+
+/// The refusal of a save into `owner` with no claim, once `owner` is no proxy
+/// account: the name was re-created since the save named it, as
+/// [`crate::profile::require_profile_id`] refuses one.
+pub(crate) fn bare_item_owner_unclaimed(owner: &ProfileName) -> anyhow::Error {
+    anyhow::anyhow!("profile '{owner}' no longer exists")
+        .context(format!("saving the macOS Keychain login into {owner}"))
+}
+
 /// The [`crate::profile::ProfileId`] a bare-item save into `owner` lands by,
-/// claimed as the save names `owner`, before any wait.
-pub(crate) fn claim_bare_item_owner(owner: &ProfileName) -> Result<crate::profile::ProfileId> {
-    crate::profile::claim_profile_id(owner)
+/// claimed as the save names `owner`, before any wait. A proxy account is
+/// never claimed, since a claim may mint an id into its `config.toml`: it
+/// answers `None`, and a save into it is refused
+/// ([`save_bare_item_into_claimed`]).
+pub(crate) fn claim_bare_item_owner(
+    owner: &ProfileName,
+) -> Result<Option<crate::profile::ProfileId>> {
+    claim_unless_proxy_account(owner)
         .with_context(|| format!("saving the macOS Keychain login into {owner}"))
+}
+
+/// `name`'s [`crate::profile::ProfileId`], claimed under one state-flock hold
+/// unless `name` is a proxy account ([`adopt_skips_proxy_account`]), which
+/// answers `None`: a claim may mint an id into its `config.toml`. Every
+/// bare-item claim goes through here.
+fn claim_unless_proxy_account(name: &ProfileName) -> Result<Option<crate::profile::ProfileId>> {
+    with_state_lock(|_held| {
+        if adopt_skips_proxy_account(name) {
+            return Ok(None);
+        }
+        crate::profile::claim_profile_id(name).map(Some)
+    })
 }
 
 /// The [`crate::usage::identity_key`] of the item's access token: which
@@ -3285,11 +3454,19 @@ pub(crate) fn correct_bare_item(
         }
     };
     let carried = bare_item_owner_account(&owner, &filled)
-        .and_then(|account| carry_bare_item_login_into(&owner, &account, item))
+        .and_then(|account| carry_bare_item_login_into(&owner, account.as_ref(), item))
         .with_context(|| format!("saving the macOS Keychain login into {owner}"));
     match (carried, adopt) {
         (Err(e), _) => leave(&format!("{e:#}")),
         (Ok(BareItemCarry::Refused), _) => leave(&bare_item_owner_busy_line(owner.as_str())),
+        // As a session's carry skips a proxy store: the item stays where
+        // Claude Code left it, and nothing is restored over it.
+        (Ok(BareItemCarry::ProxyAccount), _) => {
+            match unsaved_bare_item_warning(&owner, active, UnsavedLogin::bare_item(&id, item)) {
+                Some(warning) => leave(&warning),
+                None => suppress_bare_item_probe(&key),
+            }
+        }
         (Ok(BareItemCarry::Saved), true) => {
             logline!(
                 "{role}: the macOS Keychain holds {owner}'s own login, refreshed by Claude Code; \
@@ -5888,7 +6065,9 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
 /// collision prompt (`'X' is already set by …`). These are the keys clauth
 /// derives from a profile's endpoint, model-tier and effort fields; a custom
 /// env entry equal to one of them would override the field's value in
-/// `settings.json`. `None` when the key is not clauth-managed.
+/// `settings.json`, unless it is an `ANTHROPIC_AUTH_TOKEN` entry a proxy
+/// account's slot key leaves out ([`session_env`]). `None` when the key is not
+/// clauth-managed.
 pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
     Some(match key {
         "ANTHROPIC_BASE_URL" => "the base url field",
@@ -6925,9 +7104,11 @@ pub(crate) fn has_usable_api_key(profile: &Profile) -> bool {
 /// the spawned `claude`: a usable api key (minted per request via the
 /// `apiKeyHelper` it writes) or a profile `env` entry carrying
 /// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` (it clears the former from the
-/// settings env block, then applies `profile.env` LAST, so an explicit entry is
-/// what the spawned process sees). The delegate and fan-out guards refuse a
-/// recognised third-party profile this returns `false` for.
+/// settings env block, then applies [`session_env`] LAST, so an explicit entry
+/// is what the spawned process sees, unless a proxy account's usable key
+/// leaves it out). The delegate and fan-out guards refuse a profile whose
+/// inference needs a key this returns `false` for
+/// ([`crate::profile::Profile::is_keyless`]).
 ///
 /// Deliberately NOT [`crate::usage::third_party_credentialed`], the usage
 /// fetch predicate: that one treats Alibaba's console session as a credential,
@@ -6962,8 +7143,9 @@ pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
 /// Never keyed on a RECOGNISED provider: whether clauth has a usage integration
 /// for a host says nothing about whether inference works against it, and most
 /// endpoints in use resolve to `provider: None`. The keyless refusal is a
-/// different question and keeps its own `is_third_party` scope — an
-/// unrecognised endpoint may be a local model that needs no key at all.
+/// different question and keeps its own scope
+/// ([`crate::profile::Profile::is_keyless`]) — an unrecognised endpoint may be
+/// a local model that needs no key at all.
 pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
     profile
         .routing_endpoint()
@@ -6991,6 +7173,8 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// new profile's env is applied when clauth wrote its value: back to the
 /// user's saved value, or removed when the user had none. A value clauth did
 /// not write stays. A sibling's build reads the record, never retires it.
+/// An `[env]` inference entry [`session_env`] leaves out, either one on a
+/// proxy account holding a slot key, counts as a key `profile` lacks.
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
@@ -7009,6 +7193,24 @@ pub(crate) fn build_claude_settings_json(
     prev_env_keys: &[String],
 ) -> Result<String> {
     Ok(build_settings(base, profile, prev_env_keys, None)?.content)
+}
+
+/// The `[env]` a session on `profile` carries. A proxy account, its `[proxy]`
+/// table readable or not, holding a usable slot key leaves out
+/// `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` whatever their value; both
+/// stay in its `config.toml`. `claude` 2.1.319 sends an env key and the
+/// `apiKeyHelper` key in different headers, and a proxy answers 401 when the
+/// two differ (measured 2026-11-07). The slot key reaches the session through
+/// the helper alone, never as a raw value in a settings file.
+fn session_env(profile: &Profile) -> std::borrow::Cow<'_, BTreeMap<String, String>> {
+    if !profile.spends_oauth_chain() && has_usable_api_key(profile) {
+        let mut env = profile.env.clone();
+        env.remove("ANTHROPIC_API_KEY");
+        env.remove("ANTHROPIC_AUTH_TOKEN");
+        std::borrow::Cow::Owned(env)
+    } else {
+        std::borrow::Cow::Borrowed(&profile.env)
+    }
 }
 
 /// [`build_claude_settings_json`]'s body. `live` is `Some` when the build lands
@@ -7034,7 +7236,8 @@ fn build_settings(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
-    let record = settle_custom_env(env, &profile.env, prev_env_keys, live)?;
+    let session_env = session_env(profile);
+    let record = settle_custom_env(env, &session_env, prev_env_keys, live)?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -7082,8 +7285,9 @@ fn build_settings(
         effective_effort(profile).into(),
     );
 
-    // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key.
-    for (k, v) in &profile.env {
+    // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key,
+    // but for the two a proxy account's slot key leaves out (`session_env`).
+    for (k, v) in session_env.iter() {
         env.insert(k.clone(), v.clone().into());
     }
 
@@ -7237,10 +7441,175 @@ fn active_unreadable_store_is_linked(config: &AppConfig) -> Result<bool> {
     Ok(paths_equivalent(&live, &store))
 }
 
+/// Whether `active` is a proxy account, whose login is its proxy's: no
+/// login Claude Code's own `/login` wrote is ever saved into it — not by the
+/// first-login adopt, not by a switch away (the reconciled switch drops it),
+/// and not by a `clauth start` session's drain or its macOS Keychain carry
+/// (which read the same claim off the store's `config.toml`,
+/// [`crate::profile::proxy_claim_beside_failing_closed`]). A `[proxy]` table
+/// clauth cannot read counts alike, and so does a `config.toml` that cannot
+/// say whether it holds one ([`crate::profile::stored_proxy_claim_failing_closed`]),
+/// though a manual switch away from that one refuses rather than drop the
+/// login ([`crate::actions::refuse_switch_off_unclassifiable`]).
+/// A skip writes nothing; the adopt and the drain raise
+/// [`unsaved_proxy_login_warning`].
+pub(crate) fn adopt_skips_proxy_account(active: &ProfileName) -> bool {
+    proxy_claim_skipping_adopt(active).is_some()
+}
+
+/// The claim [`adopt_skips_proxy_account`] skips `active` on, `None` for an
+/// account a Claude Code login may be saved into.
+pub(crate) fn proxy_claim_skipping_adopt(
+    active: &ProfileName,
+) -> Option<crate::profile::ProxyClaim> {
+    Some(crate::profile::stored_proxy_claim_failing_closed(active))
+        .filter(|claim| *claim != crate::profile::ProxyClaim::None)
+}
+
+/// Which login a not-saved warning is about: the account Claude Code says it
+/// signed in as (`oauthAccount.accountUuid` in the `.claude.json` beside the
+/// login), and the access-token fingerprint.
+#[derive(Debug, Clone)]
+pub(crate) struct UnsavedLogin {
+    account: Option<crate::profile::AccountId>,
+    token: Option<u64>,
+}
+
+impl UnsavedLogin {
+    /// The live login in `~/.claude`, against the home `.claude.json`.
+    pub(crate) fn live() -> Self {
+        Self {
+            account: crate::claude_json::home_oauth_account_uuid(),
+            token: live_creds_fingerprint(),
+        }
+    }
+
+    /// The macOS bare Keychain item's login, against the account `/profile`
+    /// named for it.
+    fn bare_item(account: &crate::profile::AccountId, item: &serde_json::Value) -> Self {
+        let creds = serde_json::from_value::<ClaudeCredentials>(item.clone()).ok();
+        Self {
+            account: Some(account.clone()),
+            token: creds_fingerprint(creds.as_ref()),
+        }
+    }
+
+    /// `creds`, a login in the session config dir `config_dir`, against that
+    /// dir's own `.claude.json`.
+    pub(crate) fn in_config_dir(config_dir: &Path, creds: &ClaudeCredentials) -> Self {
+        Self {
+            account: crate::claude_json::oauth_account_uuid_in(&config_dir.join(".claude.json")),
+            token: creds_fingerprint(Some(creds)),
+        }
+    }
+
+    /// One login when both sides read an account and it is the same one, so a
+    /// token refresh is no new login; where either side reads no account, the
+    /// fingerprints decide, and a refresh there reads as a new login.
+    fn same_login(&self, other: &Self) -> bool {
+        match (&self.account, &other.account) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.token == other.token,
+        }
+    }
+}
+
+/// The account and login ([`UnsavedLogin`]) a line in this process last went
+/// out for.
+type LoginMemo = std::sync::Mutex<Option<(ProfileName, UnsavedLogin)>>;
+
+/// The last not-saved warning's [`LoginMemo`].
+static UNSAVED_PROXY_LOGIN_WARNED: LoginMemo = std::sync::Mutex::new(None);
+
+/// The last held switch-off's [`LoginMemo`], apart from the not-saved
+/// warning's: the poll has usually warned about the same login by the time
+/// the chain is spent.
+static SWITCH_OFF_HOLD_SAID: LoginMemo = std::sync::Mutex::new(None);
+
+/// The not-saved warning for `login` on `active`, which the adopt skipped on
+/// `claim` ([`proxy_claim_skipping_adopt`]): `Some` once per distinct login
+/// per process, `None` while the login it last went out for still sits there.
+/// The adopt and drain sites run on every poll, reconcile, switch and watchdog
+/// tick, so this memo is what keeps the warning to one line or toast.
+pub(crate) fn unsaved_proxy_login_warning(
+    active: &ProfileName,
+    claim: &crate::profile::ProxyClaim,
+    login: UnsavedLogin,
+) -> Option<String> {
+    use crate::profile::ProxyClaim;
+    first_unsaved_proxy_login(active, login).then(|| match claim {
+        // The config may name no proxy at all: only what is known is said.
+        ProxyClaim::Unclassifiable => format!(
+            "Claude Code signed in while '{active}' was active, but clauth can't read its \
+             config, so it did not save that login into '{active}'. Fix its config.toml, or run \
+             `clauth login <name>` with a new name to keep it"
+        ),
+        ProxyClaim::None | ProxyClaim::Account(_) | ProxyClaim::Unreadable => format!(
+            "Claude Code signed in while proxy account '{active}' was active; clauth did not \
+             save that login into '{active}'. To keep it as an account, run `clauth login <name>` \
+             with a new name"
+        ),
+    })
+}
+
+/// The not-saved warning for the macOS bare Keychain item's `login`, owned by
+/// proxy account `owner`, under [`unsaved_proxy_login_warning`]'s memo: its
+/// own sentence while `owner` is the active account, else one that names no
+/// active account.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn unsaved_bare_item_warning(
+    owner: &ProfileName,
+    active: Option<&ProfileName>,
+    login: UnsavedLogin,
+) -> Option<String> {
+    if active == Some(owner) {
+        let claim = crate::profile::stored_proxy_claim_failing_closed(owner);
+        return unsaved_proxy_login_warning(owner, &claim, login);
+    }
+    first_unsaved_proxy_login(owner, login).then(|| {
+        format!(
+            "Claude Code's Keychain login for proxy account '{owner}' was not saved into \
+             '{owner}'. To keep it as an account, run `clauth login <name>` with a new name"
+        )
+    })
+}
+
+/// Whether `login` on proxy account `name` is not the one the last not-saved
+/// warning went out for; either way it becomes that one.
+fn first_unsaved_proxy_login(name: &ProfileName, login: UnsavedLogin) -> bool {
+    first_for_login(&UNSAVED_PROXY_LOGIN_WARNED, name, login)
+}
+
+/// Whether the held switch-off's line for `login` on `name` has yet to go out;
+/// either way it becomes the one that did.
+pub(crate) fn first_switch_off_hold(name: &ProfileName, login: UnsavedLogin) -> bool {
+    first_for_login(&SWITCH_OFF_HOLD_SAID, name, login)
+}
+
+/// Whether `login` on `name` is not the one `memo` holds; either way it
+/// becomes that one.
+fn first_for_login(memo: &LoginMemo, name: &ProfileName, login: UnsavedLogin) -> bool {
+    let mut last = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = last
+        .as_ref()
+        .is_some_and(|(prior_name, prior)| prior_name == name && prior.same_login(&login));
+    *last = Some((name.clone(), login));
+    !seen
+}
+
 /// Save live `.credentials.json` into the active profile. No-op on divergence
 /// (would silently overwrite stored identity); divergence is resolved via
 /// `force_snapshot_active_credentials` after user confirmation. First-login
-/// on a credential-less profile is adopted instead.
+/// on a credential-less profile is adopted instead, except on a proxy account
+/// ([`adopt_skips_proxy_account`]), which logs the not-saved warning.
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|held| {
         let Some(active) = config.state.active_profile.as_ref().cloned() else {
@@ -7255,8 +7624,13 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
             return Ok(());
         }
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
-            if is_first_login(&active)? {
-                adopt_first_login(config, &active)?;
+            if is_first_login(&active)?
+                && let Some(claim) = adopt_first_login(config, &active)?
+                && let Some(warning) =
+                    unsaved_proxy_login_warning(&active, &claim, UnsavedLogin::live())
+            {
+                let prefix = crate::logline::role(crate::logline::stamped());
+                logline!("{prefix}: {warning}");
             }
             return Ok(());
         }
@@ -7275,7 +7649,15 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 /// genuine Claude Code login from BOTH the live file and the Keychain, having
 /// captured it into neither. Refusing costs an adopt; the alternative costs the
 /// login.
-pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) -> Result<()> {
+///
+/// An account with a proxy claim adopts nothing and writes nothing: the answer
+/// is that claim ([`proxy_claim_skipping_adopt`]), read under this hold, for
+/// the caller's [`unsaved_proxy_login_warning`]. The proxy record's writers
+/// take this flock, so a lock-free read before the call cannot stand in for it.
+pub(crate) fn adopt_first_login(
+    config: &mut AppConfig,
+    active: &ProfileName,
+) -> Result<Option<crate::profile::ProxyClaim>> {
     with_state_lock(|held| {
         // Re-verified under the same hold the snapshot sink runs in: the
         // startup cascade checks the predicate unlocked, and a switch landing
@@ -7284,12 +7666,16 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) ->
             is_first_login(active)?,
             "refusing to adopt for '{active}': the live login is no longer a first login"
         );
+        if let Some(claim) = proxy_claim_skipping_adopt(active) {
+            return Ok(Some(claim));
+        }
         snapshot_active_credentials_unchecked(config, active, held, true)?;
         anyhow::ensure!(
             install_source_path(active)?.exists(),
             "refusing to relink '{active}': the live login was not captured into it"
         );
-        force_link_profile_credentials(active)
+        force_link_profile_credentials(active)?;
+        Ok(None)
     })
 }
 
@@ -7517,7 +7903,7 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
 
 #[cfg(test)]
 #[path = "../tests/inline/claude.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "../tests/inline/claude_bare_item.rs"]

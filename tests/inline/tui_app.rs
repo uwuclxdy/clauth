@@ -6918,6 +6918,60 @@ fn perform_delete_without_live_session_deletes_immediately() {
     );
 }
 
+/// A TUI delete of an account whose `config.toml` cannot say whether it is an
+/// account on a proxy (a directory in its place, a `[proxy] # note` header
+/// that fails to parse) toasts the refusal under the delete's failure head and
+/// keeps the account and every file of it.
+#[test]
+fn a_tui_delete_of_an_account_whose_config_cannot_be_classified_is_refused() {
+    use super::perform_delete;
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{Profile, ProfileName};
+    let outcomes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            let _home = crate::testutil::HomeSandbox::new();
+            let mut app = app_with(vec![Profile::new("quiet".to_string(), None, None)]);
+            let name = ProfileName::from("quiet");
+            shape.pose("quiet");
+            let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+            std::fs::write(&store, b"{}").expect("a store beside it");
+
+            perform_delete(&mut app, &name);
+            drain_delete(&mut app);
+
+            (
+                toast_bodies_of(&app, super::ToastKind::Danger),
+                app.config().find(&name).is_some(),
+                std::fs::read(&store).ok(),
+                crate::profile::profile_subpath(&name, "config.toml")
+                    .unwrap()
+                    .exists(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                vec![
+                    "delete failed\ncan't read the config of 'quiet', so clauth can't tell \
+                     whether it is an account on a proxy; fix its config.toml, then delete it \
+                     again"
+                        .to_string()
+                ],
+                true,
+                Some(b"{}".to_vec()),
+                true
+            );
+            2
+        ],
+        "(the danger toasts, the account kept, its store, its config.toml) for a directory and \
+         a noted header"
+    );
+}
+
 /// A TUI delete refused because a runtime tree's supervisor outlives its stop
 /// names no CLI flag: the TUI has no `--force` to offer.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -14508,6 +14562,138 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
     )
     .expect("parse profiles.toml");
     assert!(reloaded.auto_start_queue, "the toggle persists to disk");
+}
+
+/// A proxy account is never an auto-start queue member, so its carried
+/// `auto_start = true` opts nothing in: space on the queue row stays the
+/// inert no-op it is with no opted-in account, in memory and on disk.
+#[test]
+fn auto_start_queue_space_noops_when_only_a_proxy_account_opts_in() {
+    use crate::profile::{AppConfig, AppState, Profile, ProxyAccount};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new("px".to_string(), None, None);
+    px.auto_start = true;
+    px.proxy = Some(ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-px".to_string(),
+    });
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![px],
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+        .unwrap();
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.auto_start_queue,
+        "space no-ops while only a proxy account has auto-start on"
+    );
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    if path.exists() {
+        let reloaded: AppState =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read profiles.toml"))
+                .expect("parse profiles.toml");
+        assert!(!reloaded.auto_start_queue, "nothing armed on disk");
+    }
+}
+
+/// The `auto-start queue` row, drawn through the real renderer and keyed
+/// through the real Config router, reads only an effective opt-in, over three
+/// shapes: an account with `auto_start` and a `[proxy]` table clauth cannot
+/// read, alone, leaves the row faint and space inert; a proxy account with
+/// `auto_start` beside a plain account with it off does the same; the same
+/// proxy account beside a plain account with it on makes the row live and
+/// space turns the queue on. The queue's members skip the unreadable-table
+/// account beside an opted-in plain one too.
+#[test]
+fn the_queue_row_ignores_every_proxy_shapes_auto_start() {
+    use crate::profile::{AppConfig, AppState, Profile, ProxyAccount};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let faint = crate::tui::theme::faint().fg.unwrap();
+    let label: Vec<String> = "auto-start queue".chars().map(String::from).collect();
+    let row_faint = |app: &App| -> bool {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 60)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..buf.area.height {
+            let row: Vec<ratatui::buffer::Cell> =
+                (0..buf.area.width).map(|x| buf[(x, y)].clone()).collect();
+            if let Some(start) = row
+                .windows(label.len())
+                .position(|w| w.iter().zip(&label).all(|(c, l)| c.symbol() == l))
+            {
+                return row[start..start + label.len()]
+                    .iter()
+                    .all(|c| c.fg == faint);
+            }
+        }
+        panic!("no queue row");
+    };
+    let shape = |profiles: Vec<Profile>| -> (bool, bool) {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles,
+        });
+        app.tab = Tab::Config;
+        let dim = row_faint(&app);
+        app.global_config_cursor = GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+            .unwrap();
+        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+        let on = app.config().state.auto_start_queue;
+        (dim, on)
+    };
+    let mk = |name: &str, auto: bool, proxy: bool, unreadable: bool| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.auto_start = auto;
+        if proxy {
+            p.proxy = Some(ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct".to_string(),
+            });
+        }
+        p.has_unreadable_proxy_record = unreadable;
+        p
+    };
+    let got = (
+        shape(vec![mk("pu", true, false, true)]),
+        shape(vec![
+            mk("px", true, true, false),
+            mk("plain", false, false, false),
+        ]),
+        shape(vec![
+            mk("px", true, true, false),
+            mk("plain", true, false, false),
+        ]),
+    );
+    let with_token = |mut p: Profile| {
+        p.credentials = Some(split_creds(&format!("at-{}", p.name), Some("rt")));
+        p
+    };
+    let mut queued = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            with_token(mk("pu", true, false, true)),
+            with_token(mk("plain", true, false, false)),
+        ],
+    };
+    queued.state.auto_start_queue = true;
+    let members = crate::usage::auto_start_queue_members(&queued, &[], |_| false, |_| false);
+    assert_eq!(
+        (got, members),
+        (
+            ((true, false), (true, false), (false, true)),
+            vec![crate::profile::ProfileName::from("plain")]
+        ),
+        "((row faint, queue on after space) for: unreadable alone, proxy + plain off, proxy + \
+         plain on), the queue members beside an unreadable-table account"
+    );
 }
 
 // ── non-login keys (preserve_non_login_keys) ─────────────────────────────────
@@ -22790,6 +22976,8 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -62396,6 +62584,9 @@ enum FakeSettle {
     Panic,
     /// A settle held at its gate, then settled.
     Gated(Gate),
+    /// The real settle of the fake item, its `/profile` lookup answering this
+    /// account id.
+    Real(&'static str),
 }
 
 /// A worker's hold point: it tells the test it got there, then waits until
@@ -62465,7 +62656,7 @@ fn fake_settle(
         Some(FakeSettle::Ask(unplaced)) => crate::claude::BareItemSettle::NeedsChoice(unplaced),
         Some(FakeSettle::Noticed { notice, saved_into }) => {
             crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled {
-                notice: Some(notice.to_string()),
+                notice: Some(crate::claude::BareItemNotice::Saved(notice.to_string())),
                 saved_into: Some(saved_into),
                 placed: None,
             })
@@ -62476,6 +62667,11 @@ fn fake_settle(
         }
         Some(FakeSettle::Settled) | None => {
             crate::claude::BareItemSettle::Settled(crate::claude::BareItemSettled::default())
+        }
+        Some(FakeSettle::Real(account)) => {
+            return crate::claude::settle_bare_item_before_write(&unsaved_item(), writer, |_| {
+                Ok(crate::profile::AccountId::from(account))
+            });
         }
     })
 }
@@ -63585,6 +63781,353 @@ fn an_owner_pick_on_an_account_recreated_while_asked_saves_nothing() {
              longer exists"
                 .to_string()
         ]
+    );
+}
+
+/// A pick of an owner that became a proxy account while the picker was open
+/// is refused at the press with the re-login toast: its store keeps its own
+/// login and the held write does not run.
+#[test]
+fn an_owner_pick_on_a_proxy_account_is_refused_at_the_press() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    let before = stored_refresh("spare");
+    crate::profile::write_proxy_record(
+        &ProfileName::from("spare"),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-spare".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            stored_refresh("spare") == before,
+            active_on_disk(),
+            toast_pairs(&app)
+                .into_iter()
+                .filter(|(kind, _)| *kind == super::ToastKind::Danger)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            true,
+            Some(ProfileName::from("work")),
+            vec![proxy_relogin_toast("spare")]
+        ),
+        "(spare's store kept, the active account, the danger toasts)"
+    );
+}
+
+/// Make `name` an account on proxy "stub".
+fn make_stub_proxy_account(name: &str) {
+    crate::profile::write_proxy_record(
+        &ProfileName::from(name),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: format!("acct-{name}"),
+        },
+    )
+    .expect("write the proxy record");
+}
+
+/// `name`'s `config.toml` bytes.
+fn config_bytes(name: &str) -> Vec<u8> {
+    std::fs::read(crate::profile::profile_subpath(&ProfileName::from(name), "config.toml").unwrap())
+        .unwrap()
+}
+
+/// Whether `name`'s `config.toml` holds a top-level `id`.
+fn config_has_id(name: &str) -> bool {
+    String::from_utf8(config_bytes(name))
+        .unwrap()
+        .parse::<toml::Table>()
+        .unwrap()
+        .contains_key("id")
+}
+
+/// `s` whose one owner is proxy account `spare` claims nothing, so no id
+/// lands in its `config.toml`, and is refused with the re-login toast; the
+/// held sign-out does not run.
+#[test]
+fn a_save_into_a_proxy_owner_claims_nothing_and_is_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owner(ProfileName::from(
+        "spare",
+    )));
+    let before = config_bytes("spare");
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            config_bytes("spare") == before,
+            stored_refresh("spare").as_deref(),
+            active_on_disk(),
+            toast_pairs(&app)
+                .into_iter()
+                .filter(|(kind, _)| *kind == super::ToastKind::Danger)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            true,
+            Some("rt-spare"),
+            Some(ProfileName::from("work")),
+            vec![proxy_relogin_toast("spare")]
+        ),
+        "(spare's config.toml kept, spare's login, the active account, the danger toasts)"
+    );
+}
+
+/// `s` over owners `work` and proxy account `spare` claims `work` before the
+/// question, as ever, but never `spare`: no id lands in its `config.toml`,
+/// and its pick is refused at the press.
+#[test]
+fn an_owners_question_never_claims_its_proxy_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    let before = config_bytes("spare");
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    let asked = (
+        matches!(app.modals.last(), Some(super::Modal::BareItemOwner(_))),
+        config_has_id("work"),
+        config_bytes("spare") == before,
+    );
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            asked,
+            config_bytes("spare") == before,
+            active_on_disk(),
+            toast_pairs(&app)
+                .into_iter()
+                .filter(|(kind, _)| *kind == super::ToastKind::Danger)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            (true, true, true),
+            true,
+            Some(ProfileName::from("work")),
+            vec![proxy_relogin_toast("spare")]
+        ),
+        "((asked, work claimed, spare's config.toml kept), then spare's config.toml kept, the \
+         active account, the danger toasts)"
+    );
+}
+
+/// A pick of an owner that was a proxy account when the question opened, and
+/// is none by the press, lands nothing: no account was claimed for it, so the
+/// save refuses as one into a name re-created since, and the held sign-out
+/// does not run.
+#[test]
+fn an_owner_pick_on_a_name_no_longer_a_proxy_account_saves_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    *FAKE_SAVE.lock().unwrap() = Some(crate::claude::BareItemSave::Owners(
+        ProfileName::from("work"),
+        ProfileName::from("spare"),
+    ));
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Char('s')));
+    land_bare_item_answers(&mut app);
+    let mut config = String::from_utf8(config_bytes("spare"))
+        .unwrap()
+        .parse::<toml::Table>()
+        .unwrap();
+    config.remove("proxy");
+    std::fs::write(
+        crate::profile::profile_subpath(&ProfileName::from("spare"), "config.toml").unwrap(),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            stored_refresh("spare").as_deref(),
+            active_on_disk(),
+            toast_bodies_of(&app, super::ToastKind::Danger),
+        ),
+        (
+            Some("rt-spare"),
+            Some(ProfileName::from("work")),
+            vec![
+                "switch-off failed\nsaving the macOS Keychain login into spare: profile 'spare' \
+                 no longer exists"
+                    .to_string()
+            ]
+        ),
+        "(spare's login, the active account, the danger toasts)"
+    );
+}
+
+/// The Warning toast a settle raises for the bare item's login of proxy
+/// account `spare` while it is not the active account, its commands marked
+/// as every toast marks them.
+fn spare_bare_item_not_saved_toast() -> (super::ToastKind, String) {
+    use crate::tui::render::prose::cmd;
+    (
+        super::ToastKind::Warning,
+        format!(
+            "login not saved\nClaude Code's Keychain login for proxy account 'spare' was not \
+             saved into 'spare'. To keep it as an account, run {} with a new name",
+            cmd("clauth login <name>")
+        ),
+    )
+}
+
+/// Cache `id` as `name`'s account id, as a `/profile` read does.
+fn cache_account_id(name: &str, id: &str) {
+    std::fs::write(
+        crate::profile::profile_subpath(
+            &ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .unwrap(),
+        serde_json::to_vec(&crate::profile::AccountId::from(id)).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A sign-out whose settle skips saving the bare item's login into proxy
+/// account `spare` heads its Warning toast `login not saved`, and the
+/// sign-out runs.
+#[test]
+fn a_sign_out_settle_skipping_a_proxy_owner_toasts_login_not_saved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    cache_account_id("spare", "uuid-spare-sign-out");
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Real("uuid-spare-sign-out")]
+        .into_iter()
+        .collect();
+    super::perform_switch_off(&mut app);
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            toast_pairs(&app)
+                .into_iter()
+                .filter(|(kind, _)| *kind == super::ToastKind::Warning)
+                .collect::<Vec<_>>(),
+            active_on_disk(),
+        ),
+        (
+            vec![
+                spare_bare_item_not_saved_toast(),
+                (
+                    super::ToastKind::Warning,
+                    "all accounts spent\nswitched off to halt usage".to_string()
+                )
+            ],
+            None
+        ),
+        "(the warning toasts, the active account)"
+    );
+}
+
+/// A switch whose settle skips saving the bare item's login into proxy
+/// account `spare` heads its Warning toast `login not saved`.
+#[test]
+fn a_switch_settle_skipping_a_proxy_owner_toasts_login_not_saved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        stored_oauth_profile("healthy", far_future()),
+        stored_oauth_profile("spare", far_future()),
+    ]);
+    make_stub_proxy_account("spare");
+    cache_account_id("spare", "uuid-spare-switch");
+    install_fake_source(&mut app, vec![FakeSettle::Real("uuid-spare-switch")]);
+    super::spawn_switch_gate(
+        &mut app,
+        ProfileName::from("healthy"),
+        |_, _| panic!("a healthy target must not spend a refresh"),
+        false,
+    );
+    super::drain_switch_gates(&mut app);
+    assert_eq!(
+        toast_pairs(&app)
+            .into_iter()
+            .filter(|(kind, _)| *kind == super::ToastKind::Warning)
+            .collect::<Vec<_>>(),
+        vec![spare_bare_item_not_saved_toast()]
+    );
+}
+
+/// The startup relink, whose settle skips saving the bare item's login into
+/// proxy account `spare`, heads a Warning toast `login not saved`: the relink
+/// replaces the item on its worker, so the toast is all the user hears of it.
+#[test]
+fn a_startup_relink_settle_skipping_a_proxy_owner_toasts_login_not_saved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    cache_account_id("spare", "uuid-spare-boot-relink");
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Real("uuid-spare-boot-relink")]
+        .into_iter()
+        .collect();
+    app.spawn_bootstrap();
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        toast_pairs(&app)
+            .into_iter()
+            .filter(|(kind, _)| *kind == super::ToastKind::Warning)
+            .collect::<Vec<_>>(),
+        vec![spare_bare_item_not_saved_toast()]
+    );
+}
+
+/// Deleting the active account, whose settle skips saving the bare item's
+/// login into proxy account `spare`, heads a Warning toast `login not saved`,
+/// and the delete runs.
+#[test]
+fn an_active_delete_settle_skipping_a_proxy_owner_toasts_login_not_saved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    make_stub_proxy_account("spare");
+    cache_account_id("spare", "uuid-spare-active-delete");
+    *FAKE_SETTLES.lock().unwrap() = [FakeSettle::Real("uuid-spare-active-delete")]
+        .into_iter()
+        .collect();
+    super::finish_delete(&mut app, &ProfileName::from("work"), false);
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+    land_bare_item_answers(&mut app);
+    assert_eq!(
+        (
+            toast_pairs(&app)
+                .into_iter()
+                .filter(|(kind, _)| *kind == super::ToastKind::Warning)
+                .collect::<Vec<_>>(),
+            has_profile(&app, "work"),
+        ),
+        (vec![spare_bare_item_not_saved_toast()], false),
+        "(the warning toasts, work kept)"
     );
 }
 
@@ -69262,4 +69805,2383 @@ fn a_failed_switch_still_reports_the_misfill_quarantine() {
     let danger = toast_bodies_of(&app, super::ToastKind::Danger);
     assert_eq!(danger.len(), 1, "{danger:?}");
     assert!(danger[0].starts_with("switch failed\n"), "{danger:?}");
+}
+
+/// A rolling switch on an account that became a proxy account after the app
+/// read it refuses in the pre-arm half, ahead of its mis-fill pre-clear: the
+/// sidecar stays where it is, no flag lands, and the toast carries the
+/// token-mode sentence.
+#[test]
+fn a_rolling_switch_on_a_proxy_account_refuses_before_its_misfill_pre_clear() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(c5b_expiring_chain());
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut app = app_with(vec![acct]);
+    app.rolling_switch_refresher = c5b_failing_refresher;
+    seed_session_token("acct", Some("rotating"));
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &name));
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let sidecar = crate::profile::profile_subpath(&name, "session-token.json").unwrap();
+    let before = std::fs::read(&sidecar).expect("the mis-filled sidecar");
+
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    run_config_row(&mut app, ConfigRow::RollingTokenSwitch);
+    super::join_test_workers();
+    super::drain_rolling_switch(&mut app);
+
+    assert_eq!(
+        (
+            toast_bodies_of(&app, super::ToastKind::Danger),
+            std::fs::read(&sidecar).ok() == Some(before),
+            crate::profile::load_profile(&name)
+                .expect("reload")
+                .rolling_token,
+        ),
+        (
+            vec![
+                "switch failed\n'acct' is an account on proxy \"stub\": it signs in through its \
+                 proxy and has no Claude Code login to roll or restore"
+                    .to_string()
+            ],
+            true,
+            false,
+        ),
+        "(the danger toasts, the sidecar kept, the flag)"
+    );
+}
+
+// ── a re-login of a proxy account off its proxy ────────────────
+
+/// `profiles` saved and registered, each holding a proxy record on proxy
+/// "stub", in an app built from them.
+fn proxy_accounts_app(profiles: Vec<crate::profile::Profile>) -> App {
+    for p in &profiles {
+        crate::profile::save_profile(p).expect("save profile");
+        crate::profile::write_proxy_record(
+            &p.name,
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: format!("acct-{}", p.name),
+            },
+        )
+        .expect("write the proxy record");
+    }
+    let names: Vec<String> = profiles.iter().map(|p| p.name.to_string()).collect();
+    crate::testutil::register_names(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    app_with(profiles)
+}
+
+/// The toast a re-login of `name` (an account on proxy "stub") off its proxy
+/// raises: the re-login refusal under `login failed`, its commands
+/// marked as every toast marks them.
+fn proxy_relogin_toast(name: &str) -> (super::ToastKind, String) {
+    use crate::tui::render::prose::cmd;
+    (
+        super::ToastKind::Danger,
+        format!(
+            "login failed\n'{name}' is an account on proxy \"stub\": log in to it again with {}, \
+             or delete it with {} first",
+            cmd(&format!("clauth login {name} --proxy stub")),
+            cmd(&format!("clauth delete {name}"))
+        ),
+    )
+}
+
+fn toast_pairs(app: &App) -> Vec<(super::ToastKind, String)> {
+    app.toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect()
+}
+
+/// The `log in` row on a proxy account is refused before any of its three
+/// flows starts (api-key re-entry, browser mint, Alibaba console): the toast
+/// and nothing else, no login modal, no re-entry chain, no session. A login
+/// left in flight parks the browser flows on their in-progress guard, so a
+/// row that got past the refusal opens no browser here either.
+#[test]
+fn the_login_row_of_a_proxy_account_is_refused_before_any_flow() {
+    use super::{ConfigRow, LoginRowFlow, Modal, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let keyed = Profile::new(
+        "pk".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    let mut oauth = Profile::new("po".to_string(), None, None);
+    oauth.credentials = Some(login_creds("rt-po"));
+    let console = Profile::new(
+        "pa".to_string(),
+        Some("https://coding-intl.dashscope.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-pa".to_string()),
+    );
+    let mut app = proxy_accounts_app(vec![keyed, oauth, console]);
+
+    let mut seen = Vec::new();
+    for name in ["pk", "po", "pa"] {
+        app.toasts.clear();
+        app.login_generation = 1;
+        app.login = Some(login_session("other", true, 1));
+        let flow = super::login_row_flow(&app, Some(name));
+        app.config_draft = Some(build_draft_existing(&app, &ProfileName::from(name)));
+        run_config_row(&mut app, ConfigRow::Login);
+        seen.push((
+            name,
+            flow,
+            toast_pairs(&app),
+            app.modals.iter().any(|m| matches!(m, Modal::Login)),
+            app.config_draft.as_ref().is_some_and(|d| d.relogin_chain),
+            app.login.as_ref().map(|s| s.name.clone()),
+        ));
+    }
+
+    let console_flow = LoginRowFlow::Console {
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1",
+    };
+    let refused = |name: &'static str, flow| {
+        (
+            name,
+            flow,
+            vec![proxy_relogin_toast(name)],
+            false,
+            false,
+            Some("other".to_string()),
+        )
+    };
+    assert_eq!(
+        seen,
+        vec![
+            refused("pk", LoginRowFlow::ApiKey),
+            refused("po", LoginRowFlow::OauthMint),
+            refused("pa", console_flow),
+        ],
+        "(name, the row's flow, toasts, login modal, re-entry chain, the login in flight)"
+    );
+}
+
+/// A live login captured under a proxy account's name is refused before the
+/// overwrite confirm: the toast, the name prompt still open, nothing written.
+#[test]
+fn a_capture_named_after_a_proxy_account_is_refused_before_its_confirm() {
+    use super::Modal;
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = proxy_accounts_app(vec![Profile::new(
+        "pk".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    )]);
+    let config = std::fs::read(
+        crate::profile::profile_subpath(&ProfileName::from("pk"), "config.toml").unwrap(),
+    )
+    .unwrap();
+    app.modals.push(Modal::CaptureName(super::CaptureNameForm {
+        snapshot: Box::new(crate::actions::CaptureSnapshot {
+            credentials: Some(login_creds("rt-live")),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        }),
+        input: InputState::new("pk"),
+        from_divergence: None,
+    }));
+
+    super::handle_capture_name_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            matches!(app.modals.last(), Some(Modal::CaptureName(_))),
+            app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+            std::fs::read(
+                crate::profile::profile_subpath(&ProfileName::from("pk"), "config.toml").unwrap()
+            )
+            .unwrap()
+                == config
+        ),
+        (vec![proxy_relogin_toast("pk")], true, false, true),
+        "(toasts, name prompt still open, a confirm opened, config.toml kept)"
+    );
+}
+
+/// Saving a diverged live login into a proxy account is refused before its
+/// confirm, from both doors: the divergence resolver's switch to the login's
+/// owner, and the "save elsewhere" picker. Claude Code's own login already
+/// ran, so the capture is what is refused; the live login stays where it is.
+#[test]
+fn a_diverged_login_saved_into_a_proxy_account_is_refused_before_its_confirm() {
+    use super::{DivergenceForm, DivergenceTargetForm, Modal};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new("px".to_string(), None, None);
+    px.credentials = Some(creds_ra("rt-px", "at-px"));
+    let mut app = proxy_accounts_app(vec![px]);
+    write_live_creds(&creds_ra("rt-px", "at-px"));
+
+    app.open_modal(Modal::Divergence(DivergenceForm {
+        active: "work".to_string(),
+        sibling: Some(ProfileName::from("px")),
+        long_lived: false,
+        seen: super::live_creds_fingerprint(),
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let owner = (
+        toast_pairs(&app),
+        app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+    );
+
+    app.toasts.clear();
+    app.modals.clear();
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "work".to_string(),
+        seen: super::live_creds_fingerprint(),
+        targets: vec!["px".to_string()],
+        cursor: 1,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let picked = (
+        toast_pairs(&app),
+        app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+    );
+
+    assert_eq!(
+        (owner, picked),
+        (
+            (vec![proxy_relogin_toast("px")], false),
+            (vec![proxy_relogin_toast("px")], false)
+        ),
+        "((toasts, a confirm opened) after the owner switch, after the picker)"
+    );
+}
+
+// ── Claude Code's own login on an active proxy account ─────────
+
+/// The active proxy account `px` (an account on proxy "stub") holding
+/// `credentials`, saved and registered, in an app built from it.
+fn active_proxy_app(
+    credentials: Option<crate::profile::ClaudeCredentials>,
+    default_divergence: Option<crate::profile::DivergenceChoice>,
+) -> App {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let mut px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    px.credentials = credentials;
+    crate::profile::save_profile(&px).expect("save profile");
+    crate::profile::write_proxy_record(
+        &px.name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let state = AppState {
+        active_profile: Some(ProfileName::from("px")),
+        profiles: vec![ProfileName::from("px")],
+        default_divergence,
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist app state");
+    crate::testutil::register_names(&["px"]);
+    App::new(AppConfig {
+        state,
+        profiles: vec![px],
+    })
+}
+
+/// `px`'s stored file `file`, `None` when absent.
+fn px_file(file: &str) -> Option<Vec<u8>> {
+    std::fs::read(
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("px"), file).unwrap(),
+    )
+    .ok()
+}
+
+/// The live `~/.claude/.credentials.json` bytes.
+fn live_bytes() -> Vec<u8> {
+    std::fs::read(crate::claude::claude_credentials_path().unwrap()).unwrap()
+}
+
+/// The 1Hz poll never adopts Claude Code's own login into an active proxy
+/// account: `px` stores nothing and the live file stays. Its warning toast
+/// goes out once per distinct live login: two polls over one login raise one,
+/// a new login raises a second.
+#[test]
+fn the_poll_never_adopts_a_login_into_a_proxy_account_and_warns_once_per_login() {
+    use crate::tui::render::prose::cmd;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_proxy_app(None, None);
+    let config = px_file("config.toml");
+
+    crate::testutil::write_live_creds(&creds_ra("rt-r18-poll-1", "at-r18-poll-1"));
+    force_poll(&mut app);
+    force_poll(&mut app);
+    let after_one = app.toasts.len();
+    crate::testutil::write_live_creds(&creds_ra("rt-r18-poll-2", "at-r18-poll-2"));
+    let live = live_bytes();
+    force_poll(&mut app);
+    force_poll(&mut app);
+
+    let warning = (
+        super::ToastKind::Warning,
+        format!(
+            "login not saved\nClaude Code signed in while proxy account 'px' was active; clauth \
+             did not save that login into 'px'. To keep it as an account, run {} with a new name",
+            cmd("clauth login <name>")
+        ),
+    );
+    assert_eq!(
+        (
+            after_one,
+            toast_pairs(&app),
+            app.divergence_pending.is_none(),
+            px_file("credentials.json"),
+            px_file("config.toml") == config,
+            live_bytes() == live,
+        ),
+        (1, vec![warning.clone(), warning], true, None, true, true),
+        "(toasts after login 1, toasts, no banner, px's credentials.json, config.toml kept, \
+         live file kept)"
+    );
+}
+
+/// A log out of a proxy account blanks the api key it runs on, the shape every
+/// proxy account logs out through, and leaves a stored OAuth chain alone: a
+/// proxy account's chain is never deleted.
+#[test]
+fn a_log_out_of_a_proxy_account_keeps_its_stored_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_proxy_app(Some(creds_ra("rt-px", "at-px")), None);
+    let store = px_file("credentials.json").expect("the chain is stored");
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("px".to_string()),
+    );
+
+    assert_eq!(
+        (
+            px_file("credentials.json"),
+            crate::profile::read_profile(&crate::profile::ProfileName::from("px"))
+                .unwrap()
+                .api_key,
+            toast_pairs(&app),
+        ),
+        (
+            Some(store),
+            None,
+            vec![(super::ToastKind::Success, "logged out of 'px'".to_string())],
+        ),
+        "(store, api key, toasts)"
+    );
+}
+
+/// Plain account `work`, active, beside `other`, both on disk (work storing
+/// `work_login`), `live` in `~/.claude`, and the TUI over the config loaded
+/// before work's `config.toml` turned `shape`.
+fn work_app_then_unclassifiable(
+    shape: crate::claude::tests::Unclassifiable,
+    work_login: Option<crate::profile::ClaudeCredentials>,
+    live: Option<&crate::profile::ClaudeCredentials>,
+) -> App {
+    work_app_beside_then_unclassifiable(shape, work_login, live, None)
+}
+
+/// [`work_app_then_unclassifiable`] with other's access token expiring at
+/// `other_expires_at`.
+fn work_app_beside_then_unclassifiable(
+    shape: crate::claude::tests::Unclassifiable,
+    work_login: Option<crate::profile::ClaudeCredentials>,
+    live: Option<&crate::profile::ClaudeCredentials>,
+    other_expires_at: Option<i64>,
+) -> App {
+    use crate::profile::{AppState, Profile, ProfileName};
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = work_login;
+    crate::profile::save_profile(&work).expect("save work");
+    let mut other = Profile::new("other".to_string(), None, None);
+    let mut other_login = creds_ra("rt-other", "at-other");
+    if let Some(oauth) = other_login.claude_ai_oauth.as_mut() {
+        oauth.expires_at = other_expires_at;
+    }
+    other.credentials = Some(other_login);
+    crate::profile::save_profile(&other).expect("save other");
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("other")],
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    match live {
+        Some(live) => crate::testutil::write_live_creds(live),
+        None => crate::claude::force_link_profile_credentials(&ProfileName::from("work"))
+            .expect("link work"),
+    }
+    let config = crate::profile::load_config().expect("load the config");
+    shape.pose("work");
+    App::new(config)
+}
+
+/// The divergence `Overwrite` on `work`, whose `config.toml` turned
+/// unclassifiable after the TUI loaded it, refuses with a `login failed`
+/// toast: `work` may be an account on a proxy, so Claude Code's login stays
+/// out of its store and in `~/.claude`.
+#[test]
+fn a_divergence_overwrite_on_an_unclassifiable_account_saves_nothing() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{DivergenceChoice, ProfileName};
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(
+            shape,
+            Some(creds_ra("rt-work", "at-work")),
+            Some(&creds_ra("rt-cc-work", "at-cc-work")),
+        );
+        let store = crate::profile::profile_subpath(&ProfileName::from("work"), "credentials.json")
+            .unwrap();
+        let stored = std::fs::read(&store).unwrap();
+        let live = live_bytes();
+
+        super::run_divergence_choice(
+            &mut app,
+            "work",
+            DivergenceChoice::Overwrite,
+            super::live_creds_fingerprint(),
+        );
+
+        outcomes.push((
+            std::fs::read(&store).unwrap() == stored,
+            live_bytes() == live,
+            toast_pairs(&app),
+        ));
+    }
+    let refused = (
+        true,
+        true,
+        vec![(
+            super::ToastKind::Danger,
+            "login failed\ncan't read the config of 'work', so clauth can't tell whether Claude \
+             Code's current login belongs in it; fix its config.toml, then save the login again"
+                .to_string(),
+        )],
+    );
+    assert_eq!(
+        outcomes,
+        vec![refused.clone(), refused],
+        "(store kept, live login kept, toasts) per shape"
+    );
+}
+
+/// The refusal guards a capture alone: a live login `other` already stores
+/// lands nothing in `work`, so an `Overwrite` on the unclassifiable `work`
+/// keeps answering `nothing saved` and relinks.
+#[test]
+fn a_divergence_overwrite_over_a_login_another_account_stores_is_not_refused() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{ChainHeldElsewhere, DivergenceChoice, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = work_app_then_unclassifiable(
+        Unclassifiable::NotedProxyHeader,
+        Some(creds_ra("rt-work", "at-work")),
+        Some(&creds_ra("rt-other", "at-other")),
+    );
+
+    super::run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::Overwrite,
+        super::live_creds_fingerprint(),
+    );
+
+    assert_eq!(
+        toast_pairs(&app),
+        vec![(
+            super::ToastKind::Warning,
+            format!(
+                "nothing saved\n{}",
+                ChainHeldElsewhere {
+                    owner: ProfileName::from("other")
+                }
+            ),
+        )]
+    );
+}
+
+/// A `default_divergence = overwrite` the refusal would stop stays the banner
+/// on an unclassifiable account, as on a proxy account: acting on it would
+/// raise the refusal on every poll.
+#[test]
+fn an_overwrite_default_on_an_unclassifiable_account_stays_the_banner() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{DivergenceChoice, ProfileName};
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(
+            shape,
+            Some(creds_ra("rt-work", "at-work")),
+            Some(&creds_ra("rt-cc-work", "at-cc-work")),
+        );
+        app.config().state.default_divergence = Some(DivergenceChoice::Overwrite);
+        let store = crate::profile::profile_subpath(&ProfileName::from("work"), "credentials.json")
+            .unwrap();
+        let stored = std::fs::read(&store).unwrap();
+
+        let banner = super::divergence_resolves_to_banner(&app, "work");
+        super::resolve_or_note_divergence(&mut app, "work");
+
+        outcomes.push((
+            banner,
+            std::fs::read(&store).unwrap() == stored,
+            app.divergence_pending.is_some(),
+            toast_pairs(&app),
+        ));
+    }
+    let banner = (true, true, true, Vec::new());
+    assert_eq!(
+        outcomes,
+        vec![banner.clone(), banner],
+        "(resolves to the banner, store kept, banner up, toasts) per shape"
+    );
+}
+
+/// The whole chain spent over the unclassifiable `work` holding a first login
+/// holds the switch-off: the login stays in `~/.claude`, `work` stays active,
+/// and the `switch-off failed` toast goes out once per login however often the
+/// scheduler raises the switch-off, the poll's own not-saved warning
+/// beforehand included.
+#[test]
+fn a_spent_chain_holds_the_switch_off_over_an_unclassifiable_first_login() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let mut outcomes = Vec::new();
+    for (i, shape) in Unclassifiable::BOTH.into_iter().enumerate() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(
+            shape,
+            None,
+            Some(&creds_ra(
+                &format!("rt-hold-off-{i}"),
+                &format!("at-hold-off-{i}"),
+            )),
+        );
+        let store = crate::profile::profile_subpath(&ProfileName::from("work"), "credentials.json")
+            .unwrap();
+        let live = live_bytes();
+
+        force_poll(&mut app);
+        super::perform_switch_off(&mut app);
+        super::perform_switch_off(&mut app);
+
+        outcomes.push((
+            store.exists(),
+            live_bytes() == live,
+            crate::profile::load_app_state()
+                .unwrap()
+                .active_profile
+                .map(|name| name.to_string()),
+            toast_bodies_of(&app, super::ToastKind::Danger),
+        ));
+    }
+    let held = (
+        false,
+        true,
+        Some("work".to_string()),
+        vec![
+            "switch-off failed\ncan't read the config of 'work', so clauth can't tell whether \
+             Claude Code's current login belongs in it; fix its config.toml, and clauth switches \
+             off at its next check"
+                .to_string(),
+        ],
+    );
+    assert_eq!(
+        outcomes,
+        vec![held.clone(), held],
+        "(store exists, live login kept, active, danger toasts) per shape"
+    );
+}
+
+/// The hold guards an unsaved login alone: over a login `work` stores, a spent
+/// chain switches the unclassifiable `work` off as on any account.
+#[test]
+fn a_spent_chain_switches_an_unclassifiable_account_off_over_a_saved_login() {
+    use crate::claude::tests::Unclassifiable;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = work_app_then_unclassifiable(
+        Unclassifiable::NotedProxyHeader,
+        Some(creds_ra("rt-work", "at-work")),
+        None,
+    );
+
+    super::perform_switch_off(&mut app);
+
+    assert_eq!(
+        (
+            crate::profile::load_app_state().unwrap().active_profile,
+            toast_pairs(&app),
+        ),
+        (
+            None,
+            vec![(
+                super::ToastKind::Warning,
+                "all accounts spent\nswitched off to halt usage".to_string()
+            )],
+        )
+    );
+}
+
+/// A config turning unclassifiable after the `Overwrite`'s pre-check and
+/// before its hold refuses in the hold, under the same `login failed` head:
+/// Claude Code's login stays out of the store and in `~/.claude`.
+#[test]
+fn a_config_turning_unclassifiable_under_a_divergence_overwrite_saves_nothing() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{DivergenceChoice, ProfileName};
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(
+            shape,
+            Some(creds_ra("rt-work", "at-work")),
+            Some(&creds_ra("rt-cc-work", "at-cc-work")),
+        );
+        let name = ProfileName::from("work");
+        // No file claims nothing, so the pre-check passes.
+        let config = crate::profile::profile_subpath(&name, "config.toml").unwrap();
+        if config.is_dir() {
+            std::fs::remove_dir(&config).unwrap();
+        } else {
+            std::fs::remove_file(&config).unwrap();
+        }
+        let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+        let stored = std::fs::read(&store).unwrap();
+        let live = live_bytes();
+        crate::testutil::switch_race_seam::plant(move || shape.pose("work"));
+
+        super::run_divergence_choice(
+            &mut app,
+            "work",
+            DivergenceChoice::Overwrite,
+            super::live_creds_fingerprint(),
+        );
+
+        crate::testutil::switch_race_seam::assert_empty();
+        outcomes.push((
+            std::fs::read(&store).unwrap() == stored,
+            live_bytes() == live,
+            toast_pairs(&app),
+        ));
+    }
+    let refused = (
+        true,
+        true,
+        vec![(
+            super::ToastKind::Danger,
+            "login failed\ncan't read the config of 'work', so clauth can't tell whether Claude \
+             Code's current login belongs in it; fix its config.toml, then save the login again"
+                .to_string(),
+        )],
+    );
+    assert_eq!(
+        outcomes,
+        vec![refused.clone(), refused],
+        "(store kept, live login kept, toasts) per shape"
+    );
+}
+
+/// The `Overwrite` on an unclassifiable account refuses before the bare-item
+/// gate: the seam sitting just ahead of the gate never runs.
+#[test]
+fn a_divergence_overwrite_on_an_unclassifiable_account_refuses_before_the_bare_item_gate() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::DivergenceChoice;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = work_app_then_unclassifiable(
+        Unclassifiable::NotedProxyHeader,
+        Some(creds_ra("rt-work", "at-work")),
+        Some(&creds_ra("rt-cc-work", "at-cc-work")),
+    );
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = reached.clone();
+    crate::testutil::switch_race_seam::plant(move || seen.set(true));
+
+    super::run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::Overwrite,
+        super::live_creds_fingerprint(),
+    );
+
+    let toasts = toast_bodies_of(&app, super::ToastKind::Danger).len();
+    let at_the_gate = reached.get();
+    crate::testutil::switch_race_seam::run();
+    assert_eq!(
+        (at_the_gate, toasts),
+        (false, 1),
+        "(reached the gate, danger toasts)"
+    );
+}
+
+/// The startup one-shot swallows a held switch-off, so it spends no once-per-
+/// login line: the next drain still says it.
+#[test]
+fn a_held_switch_off_the_startup_one_shot_swallowed_still_goes_out() {
+    use crate::claude::tests::Unclassifiable;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = work_app_then_unclassifiable(
+        Unclassifiable::NotedProxyHeader,
+        None,
+        Some(&creds_ra("rt-hold-swallowed", "at-hold-swallowed")),
+    );
+
+    let swallowed = crate::actions::switch_off_locked(&mut app.config());
+    super::perform_switch_off(&mut app);
+
+    assert_eq!(
+        (
+            swallowed.is_err(),
+            toast_bodies_of(&app, super::ToastKind::Danger).len()
+        ),
+        (true, 1),
+        "(the one-shot's switch-off refused, danger toasts)"
+    );
+}
+
+/// A TUI switch away from `work`, whose `config.toml` turned unclassifiable
+/// after the TUI loaded it (a directory in its place, a `[proxy] # note`
+/// header that fails to parse), while Claude Code holds a login clauth has not
+/// saved (diverged from work's store, or a first login) raises no divergence
+/// prompt and refuses with a `switch failed` toast: work's files, the live
+/// login and the active account as they were. Over work's own saved login the
+/// switch lands.
+#[test]
+fn a_tui_switch_away_from_an_unclassifiable_account_refuses_over_an_unsaved_login() {
+    use super::Modal;
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let work_files = || -> Vec<Option<Vec<u8>>> {
+        ["credentials.json", "config.toml"]
+            .iter()
+            .map(|file| {
+                std::fs::read(
+                    crate::profile::profile_subpath(&ProfileName::from("work"), file).unwrap(),
+                )
+                .ok()
+            })
+            .collect()
+    };
+    let stored = || Some(creds_ra("rt-work", "at-work"));
+    let cc = || Some(creds_ra("rt-cc-work", "at-cc-work"));
+    // A saved login over a directory never reaches the refusal: the switch's
+    // own snapshot fails reading `config.toml` first.
+    let runs = [
+        (Unclassifiable::Directory, stored(), cc()),
+        (Unclassifiable::Directory, None, cc()),
+        (Unclassifiable::NotedProxyHeader, stored(), cc()),
+        (Unclassifiable::NotedProxyHeader, None, cc()),
+        (Unclassifiable::NotedProxyHeader, stored(), None),
+    ];
+    let mut outcomes = Vec::new();
+    for (shape, work_login, live) in runs {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(shape, work_login, live.as_ref());
+        let tree = work_files();
+        let live_now = live_bytes();
+
+        super::perform_switch(&mut app, &ProfileName::from("other"));
+        drain_switch_gates(&mut app);
+
+        outcomes.push((
+            toast_bodies_of(&app, super::ToastKind::Danger),
+            app.modals
+                .iter()
+                .any(|modal| matches!(modal, Modal::Divergence(_))),
+            work_files() == tree,
+            live_bytes() == live_now,
+            crate::profile::load_app_state()
+                .unwrap()
+                .active_profile
+                .map(|name| name.to_string()),
+        ));
+    }
+
+    let refused = (
+        vec![
+            "switch failed\ncan't read the config of 'work', so clauth can't tell whether Claude \
+             Code's current login belongs in it; fix its config.toml, then switch again"
+                .to_string(),
+        ],
+        false,
+        true,
+        true,
+        Some("work".to_string()),
+    );
+    let switched = (
+        Vec::<String>::new(),
+        false,
+        true,
+        false,
+        Some("other".to_string()),
+    );
+    assert_eq!(
+        outcomes,
+        vec![
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused,
+            switched
+        ],
+        "(danger toasts, a divergence prompt open, work's files kept, the live login kept, \
+         disk's active) over a diverged and a first login for a directory and a noted header, \
+         then a saved login for a noted header"
+    );
+}
+
+/// A TUI switch away from `work`, whose `config.toml` cannot be classified,
+/// over a login clauth has not saved refuses before the AUTH-1 gate could
+/// refresh the target's expired login: the gate's refresh, aimed at a
+/// listener that answers nothing, sends nothing.
+#[test]
+fn a_tui_switch_away_from_an_unclassifiable_account_refuses_before_the_gate() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        for work_login in [Some(creds_ra("rt-work", "at-work")), None] {
+            let home = crate::testutil::HomeSandbox::new();
+            let (listener, base) = crate::testutil::deaf_listener();
+            let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+            let mut app = work_app_beside_then_unclassifiable(
+                shape,
+                work_login,
+                Some(&creds_ra("rt-cc-work", "at-cc-work")),
+                Some(1),
+            );
+
+            super::perform_switch(&mut app, &ProfileName::from("other"));
+            drain_switch_gates(&mut app);
+
+            outcomes.push((
+                toast_bodies_of(&app, super::ToastKind::Danger),
+                matches!(
+                    listener.accept(),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                ),
+            ));
+        }
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                vec![
+                    "switch failed\ncan't read the config of 'work', so clauth can't tell whether \
+                     Claude Code's current login belongs in it; fix its config.toml, then switch \
+                     again"
+                        .to_string()
+                ],
+                true
+            );
+            4
+        ],
+        "(danger toasts, nothing sent) over a diverged and a first login, for a directory and a \
+         noted header"
+    );
+}
+
+/// The 1Hz poll's skipped adopt of a first login on `work`, whose
+/// `config.toml` turned unclassifiable, heads its Warning toast `login not
+/// saved` with the warning that says what is true; a `[proxy]` table that
+/// does not read keeps the proxy account's.
+#[test]
+fn the_poll_says_clauth_cannot_read_an_unclassifiable_config() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::tui::render::prose::cmd;
+    let mut outcomes = Vec::new();
+    // Each run's logins are its own, so the once-per-login memo a previous
+    // run left never silences one.
+    for (run, shape) in [
+        Some(Unclassifiable::Directory),
+        Some(Unclassifiable::NotedProxyHeader),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = work_app_then_unclassifiable(
+            Unclassifiable::Directory,
+            None,
+            Some(&creds_ra(
+                &format!("rt-cc-poll-{run}-1"),
+                &format!("at-cc-poll-{run}-1"),
+            )),
+        );
+        let config_path = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from("work"),
+            "config.toml",
+        )
+        .unwrap();
+        std::fs::remove_dir(&config_path).expect("remove the posed directory");
+        match shape {
+            Some(shape) => shape.pose("work"),
+            None => std::fs::write(
+                &config_path,
+                "[proxy]\nservice = \"stub\"\naccount = \"\"\n",
+            )
+            .expect("a table that does not read"),
+        }
+        app.toasts.clear();
+        crate::testutil::write_live_creds(&creds_ra(
+            &format!("rt-cc-poll-{run}-2"),
+            &format!("at-cc-poll-{run}-2"),
+        ));
+        let live = live_bytes();
+        force_poll(&mut app);
+        force_poll(&mut app);
+        outcomes.push((
+            toast_pairs(&app),
+            crate::profile::profile_subpath(
+                &crate::profile::ProfileName::from("work"),
+                "credentials.json",
+            )
+            .unwrap()
+            .exists(),
+            live_bytes() == live,
+        ));
+    }
+
+    let warned = |sentence: String| {
+        (
+            vec![(
+                super::ToastKind::Warning,
+                format!("login not saved\n{sentence}"),
+            )],
+            false,
+            true,
+        )
+    };
+    let login = cmd("clauth login <name>");
+    assert_eq!(
+        outcomes,
+        vec![
+            warned(format!(
+                "Claude Code signed in while 'work' was active, but clauth can't read its \
+                 config, so it did not save that login into 'work'. Fix its config.toml, or run \
+                 {login} with a new name to keep it"
+            )),
+            warned(format!(
+                "Claude Code signed in while 'work' was active, but clauth can't read its \
+                 config, so it did not save that login into 'work'. Fix its config.toml, or run \
+                 {login} with a new name to keep it"
+            )),
+            warned(format!(
+                "Claude Code signed in while proxy account 'work' was active; clauth did not \
+                 save that login into 'work'. To keep it as an account, run {login} with a new \
+                 name"
+            )),
+        ],
+        "(toasts over two polls, work's credentials.json, the live login kept) for a directory, \
+         a noted header and a table that does not read"
+    );
+}
+
+/// The divergence resolver's "overwrite" pick on an active proxy account is a
+/// re-login off its proxy: refused with the re-login toast, nothing written.
+#[test]
+fn the_divergence_overwrite_pick_on_a_proxy_account_is_refused() {
+    use super::{DivergenceForm, Modal};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_proxy_app(Some(creds_ra("rt-r18-px", "at-r18-px")), None);
+    crate::testutil::write_live_creds(&creds_ra("rt-r18-live", "at-r18-live"));
+    let (stored, live) = (px_file("credentials.json"), live_bytes());
+
+    app.open_modal(Modal::Divergence(DivergenceForm {
+        active: "px".to_string(),
+        sibling: None,
+        long_lived: false,
+        seen: super::live_creds_fingerprint(),
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            px_file("credentials.json") == stored,
+            live_bytes() == live,
+        ),
+        (vec![proxy_relogin_toast("px")], true, true),
+        "(toasts, px's credentials.json kept, live file kept)"
+    );
+}
+
+/// A configured `Overwrite` default never acts on an active proxy account:
+/// the poll leaves the banner, raises no toast (neither a capture nor the
+/// refusal once a second), and writes nothing.
+#[test]
+fn an_overwrite_default_on_a_proxy_account_leaves_the_banner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_proxy_app(
+        Some(creds_ra("rt-r18-dpx", "at-r18-dpx")),
+        Some(crate::profile::DivergenceChoice::Overwrite),
+    );
+    crate::testutil::write_live_creds(&creds_ra("rt-r18-dlive", "at-r18-dlive"));
+    let (stored, live) = (px_file("credentials.json"), live_bytes());
+
+    force_poll(&mut app);
+    force_poll(&mut app);
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            app.divergence_pending.as_ref().map(|p| p.active.clone()),
+            px_file("credentials.json") == stored,
+            live_bytes() == live,
+        ),
+        (vec![], Some("px".to_string()), true, true),
+        "(toasts, the banner's account, px's credentials.json kept, live file kept)"
+    );
+}
+
+/// A browser re-login whose name was deleted and re-created as a proxy
+/// account between its start and its apply is refused at the apply, with
+/// the re-login toast, writing nothing into the new account.
+#[test]
+fn a_relogin_applied_onto_a_name_recreated_as_a_proxy_account_is_refused() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let plain = Profile::new("px".to_string(), None, None);
+    crate::profile::save_profile(&plain).expect("save profile");
+    crate::testutil::register_names(&["px"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("px")],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![plain],
+    });
+    app.login = Some(login_session("px", false, 1));
+
+    std::fs::remove_dir_all(crate::profile::profile_dir(&ProfileName::from("px")).unwrap())
+        .unwrap();
+    let recreated = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    crate::profile::save_profile(&recreated).expect("save the re-created profile");
+    crate::profile::write_proxy_record(
+        &recreated.name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let config = px_file("config.toml");
+
+    let session = app.login.take().expect("the login in flight");
+    super::apply_login(&mut app, session, login_outcome("rt-r18-apply", None));
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            app.modals
+                .iter()
+                .any(|m| matches!(m, super::Modal::Confirm(_))),
+            px_file("credentials.json"),
+            px_file("config.toml") == config,
+        ),
+        (vec![proxy_relogin_toast("px")], false, None, true),
+        "(toasts, a confirm opened, px's credentials.json, config.toml kept)"
+    );
+}
+
+/// `name`'s profile dir replaced on disk by a proxy account (on proxy "stub")
+/// at `base_url`, as `clauth delete` then `clauth login --proxy` leave it
+/// while a TUI still holds the old profile.
+fn recreate_as_proxy_account(name: &str, base_url: &str) {
+    use crate::profile::{Profile, ProfileName};
+    std::fs::remove_dir_all(crate::profile::profile_dir(&ProfileName::from(name)).unwrap())
+        .unwrap();
+    let recreated = Profile::new(
+        name.to_string(),
+        Some(base_url.to_string()),
+        Some("clp_key".to_string()),
+    );
+    crate::profile::save_profile(&recreated).expect("save the re-created profile");
+    crate::profile::write_proxy_record(
+        &recreated.name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+}
+
+/// A browser re-login's overwrite confirm, pressed after its name was deleted
+/// and re-created as a proxy account while the confirm stood open, is refused
+/// at the press with the re-login toast, writing nothing.
+#[test]
+fn an_overwrite_confirmed_onto_a_name_recreated_as_a_proxy_account_is_refused() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut plain = Profile::new("px".to_string(), None, None);
+    plain.credentials = Some(creds_ra("rt-r19-held", "at-r19-held"));
+    crate::profile::save_profile(&plain).expect("save profile");
+    crate::testutil::register_names(&["px"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("px")],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![plain],
+    });
+    app.login = Some(login_session("px", false, 1));
+    let session = app.login.take().expect("the login in flight");
+    super::apply_login(&mut app, session, login_outcome("rt-r19-confirm", None));
+    let opened = app
+        .modals
+        .iter()
+        .any(|m| matches!(m, super::Modal::Confirm(_)));
+
+    recreate_as_proxy_account("px", "http://127.0.0.1:9141");
+    let config = px_file("config.toml");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        (
+            opened,
+            toast_pairs(&app),
+            px_file("credentials.json"),
+            px_file("config.toml") == config,
+        ),
+        (true, vec![proxy_relogin_toast("px")], None, true),
+        "(the confirm opened, toasts, px's credentials.json, config.toml kept)"
+    );
+}
+
+/// An Alibaba console login applied onto a name deleted and re-created as a
+/// proxy account at the same Model Studio endpoint during its browser round
+/// trip is refused with the re-login toast, storing no session.
+#[test]
+fn a_console_login_applied_onto_a_name_recreated_as_a_proxy_account_is_refused() {
+    use crate::profile::{AppConfig, AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url = Some(base.to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(base);
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "old".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&qwen).expect("save the profile");
+    crate::testutil::register_names(&["qwen"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("qwen")],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    });
+
+    let session = login_session("qwen", false, 1);
+    recreate_as_proxy_account("qwen", base);
+    let config_path =
+        crate::profile::profile_subpath(&ProfileName::from("qwen"), "config.toml").unwrap();
+    let config = std::fs::read(&config_path).unwrap();
+    super::apply_console_login(&mut app, session, console_outcome("rt-r19-console"));
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            std::fs::read(&config_path).unwrap() == config
+        ),
+        (vec![proxy_relogin_toast("qwen")], true),
+        "(toasts, config.toml kept)"
+    );
+}
+
+/// The poll's proxy skip clears a banner an earlier poll raised: Claude Code's
+/// mid-write file on px reads as neither a first login nor a shell and flags
+/// the banner, and the completed login the next poll reads is skipped with the
+/// banner gone.
+#[test]
+fn the_polls_proxy_skip_clears_a_banner_a_mid_write_poll_raised() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = active_proxy_app(None, None);
+    let live = crate::claude::claude_credentials_path().unwrap();
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, br#"{"claudeAiOauth":{"accessToken":"at-r19-mid"#).unwrap();
+    force_poll(&mut app);
+    let mid_write = app.divergence_pending.as_ref().map(|p| p.active.clone());
+
+    crate::testutil::write_live_creds(&creds_ra("rt-r19-banner", "at-r19-banner"));
+    force_poll(&mut app);
+
+    assert_eq!(
+        (
+            mid_write,
+            app.divergence_pending.as_ref().map(|p| p.active.clone())
+        ),
+        (Some("px".to_string()), None),
+        "(the banner after the mid-write poll, after the completed login's poll)"
+    );
+}
+
+/// An App with `work` active and `px` beside it, each holding a stored login
+/// (px's is `px_login`), over the live login `live`.
+fn work_and_px_app(
+    px_login: crate::profile::ClaudeCredentials,
+    live: &crate::profile::ClaudeCredentials,
+) -> App {
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-r20-work"));
+    save_profile(&work).expect("save work");
+    let mut px = Profile::new("px".to_string(), None, None);
+    px.credentials = Some(px_login);
+    save_profile(&px).expect("save px");
+    crate::testutil::register_names(&["work", "px"]);
+    write_live_creds(live);
+    App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into(), "px".into()],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![work, px],
+    })
+}
+
+/// What an adopt confirm pressed onto `px` left: the toasts, px's stored
+/// login, whether px's config.toml and the live file kept their bytes, and
+/// the active account.
+type AdoptPress = (
+    Vec<(super::ToastKind, String)>,
+    Option<Vec<u8>>,
+    bool,
+    bool,
+    Option<ProfileName>,
+);
+
+/// Re-create `px` as a proxy account under an adopt confirm standing open
+/// onto it, press it, and read the [`AdoptPress`].
+fn adopt_press_onto_recreated_px(app: &mut App) -> AdoptPress {
+    recreate_as_proxy_account("px", "http://127.0.0.1:9141");
+    let config = px_file("config.toml");
+    let live = live_bytes();
+    super::handle_key(app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    (
+        toast_pairs(app),
+        px_file("credentials.json"),
+        px_file("config.toml") == config,
+        live_bytes() == live,
+        app.config().state.active_profile.clone(),
+    )
+}
+
+/// The "save into" picker's adopt confirm, pressed after its target was
+/// deleted and re-created as a proxy account while the confirm stood open, is
+/// refused at the press with the re-login toast: px takes no login, the live
+/// file stays, and `work` stays active.
+#[test]
+fn a_picker_adopt_confirmed_onto_a_name_recreated_as_a_proxy_account_is_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = work_and_px_app(
+        login_creds("rt-r20-px"),
+        &creds_ra("rt-r20-fresh", "at-r20-fresh"),
+    );
+    super::run_divergence_choice(
+        &mut app,
+        "work",
+        crate::profile::DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let opened = matches!(
+        app.modals.last(),
+        Some(super::Modal::Confirm(c))
+            if matches!(&c.on_confirm, super::ConfirmAction::AdoptDivergence(_, n, _, _) if n == "px")
+    );
+
+    let pressed = adopt_press_onto_recreated_px(&mut app);
+
+    assert_eq!(
+        (opened, pressed),
+        (
+            true,
+            (
+                vec![proxy_relogin_toast("px")],
+                None,
+                true,
+                true,
+                Some(ProfileName::from("work"))
+            )
+        ),
+        "(the adopt confirm opened, (toasts, px's credentials.json, px's config.toml kept, \
+         live file kept, the active account))"
+    );
+}
+
+/// The resolver's "switch to its owner" confirm, pressed after the owner was
+/// deleted and re-created as a proxy account while the confirm stood open, is
+/// refused at the press the same way.
+#[test]
+fn an_owner_adopt_confirmed_onto_a_name_recreated_as_a_proxy_account_is_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let owned = creds_ra("rt-r20-owned", "at-r20-owned");
+    let mut app = work_and_px_app(owned.clone(), &owned);
+    force_poll(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('d')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let opened = matches!(
+        app.modals.last(),
+        Some(super::Modal::Confirm(c))
+            if matches!(&c.on_confirm, super::ConfirmAction::AdoptDivergence(_, n, _, _) if n == "px")
+    );
+
+    let pressed = adopt_press_onto_recreated_px(&mut app);
+
+    assert_eq!(
+        (opened, pressed),
+        (
+            true,
+            (
+                vec![proxy_relogin_toast("px")],
+                None,
+                true,
+                true,
+                Some(ProfileName::from("work"))
+            )
+        ),
+        "(the adopt confirm opened, (toasts, px's credentials.json, px's config.toml kept, \
+         live file kept, the active account))"
+    );
+}
+
+/// A divergence capture's overwrite confirm onto `px`, pressed while `px` is
+/// deleted and re-created as a proxy account after the press's first look at
+/// it and before its first write (the press parked in its first flock wait),
+/// is refused with the re-login toast and writes nothing: `work` stays active
+/// in memory and on disk, the live file stays, and px keeps the re-created
+/// account's config.
+#[test]
+fn a_divergence_overwrite_pressed_while_its_name_is_recreated_as_a_proxy_account_writes_nothing() {
+    const PROXY_CONFIG: &str = "base_url = \"http://127.0.0.1:9141\"\napi_key = \"clp_key\"\n\n\
+                                [proxy]\nservice = \"stub\"\naccount = \"acct-px\"\n";
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = creds_ra("rt-r21-live", "at-r21-live");
+    let mut app = work_and_px_app(login_creds("rt-r21-px"), &live);
+    crate::profile::save_app_state(&app.config().state).expect("persist app state");
+    let state_path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let state = std::fs::read(&state_path).unwrap();
+    let live_before = live_bytes();
+    let px_dir = crate::profile::profile_dir(&ProfileName::from("px")).unwrap();
+    let account = crate::profile::claim_profile_id(&ProfileName::from("px")).unwrap();
+    let action = super::ConfirmAction::CaptureOverwrite(
+        Box::new(crate::actions::CaptureSnapshot {
+            credentials: Some(live),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        }),
+        "px".to_string(),
+        account,
+        Some("work".to_string()),
+    );
+
+    let park = crate::lock::flock_wait_park::arm();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            park.parked
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the press parks in its first flock wait");
+            // Plain file writes: the parked press holds the in-process half of
+            // the state lock, so `save_profile` would wait on it forever.
+            std::fs::remove_dir_all(&px_dir).unwrap();
+            std::fs::create_dir_all(&px_dir).unwrap();
+            std::fs::write(px_dir.join("config.toml"), PROXY_CONFIG).unwrap();
+            park.release.send(()).expect("release the press");
+        });
+        super::run_confirm_action(&mut app, action);
+    });
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            px_file("credentials.json"),
+            px_file("config.toml").map(|b| String::from_utf8(b).unwrap()),
+            live_bytes() == live_before,
+            app.config().state.active_profile.clone(),
+            std::fs::read(&state_path).unwrap() == state,
+        ),
+        (
+            vec![proxy_relogin_toast("px")],
+            None,
+            Some(PROXY_CONFIG.to_string()),
+            true,
+            Some(ProfileName::from("work")),
+            true
+        ),
+        "(toasts, px's credentials.json, px's config.toml, live file kept, the active \
+         account, profiles.toml kept)"
+    );
+}
+
+/// A divergence capture's overwrite confirm onto plain `px` lands: the active
+/// marker cleared inside the overwrite's hold sends it down its
+/// link-and-activate arm, so px takes the diverged login and becomes active
+/// in memory and on disk (the success side of the test above).
+#[test]
+fn a_divergence_overwrite_onto_a_plain_account_saves_the_login_and_activates_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = creds_ra("rt-r21-diverged", "at-r21-diverged");
+    let mut app = work_and_px_app(login_creds("rt-r21-px-old"), &live);
+    crate::profile::save_app_state(&app.config().state).expect("persist app state");
+    let account = crate::profile::claim_profile_id(&ProfileName::from("px")).unwrap();
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: Some(live),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
+            }),
+            "px".to_string(),
+            account,
+            Some("work".to_string()),
+        ),
+    );
+
+    let px = ProfileName::from("px");
+    let (stored, active) = {
+        let cfg = app.config();
+        (
+            cfg.find(&px)
+                .and_then(|p| p.refresh_token().map(str::to_string)),
+            cfg.state.active_profile.clone(),
+        )
+    };
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            stored,
+            active,
+            crate::profile::load_app_state()
+                .expect("read the saved state")
+                .active_profile,
+        ),
+        (
+            vec![(
+                super::ToastKind::Success,
+                "overwrote 'px' with the captured login".to_string()
+            )],
+            Some("rt-r21-diverged".to_string()),
+            Some(px.clone()),
+            Some(px)
+        ),
+        "(toasts, px's stored refresh token, the active account, the saved active account)"
+    );
+}
+
+/// A divergence capture's overwrite confirm onto `px`, pressed after another
+/// clauth deleted `px` and this TUI reloaded its roster (the confirm stays
+/// open across a reload), fails on the vanished name and writes nothing:
+/// `work` stays active in memory and on disk, `profiles.toml` and the live
+/// file stay, and no px dir comes back.
+#[test]
+fn a_divergence_overwrite_onto_a_name_deleted_meanwhile_keeps_the_active_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = creds_ra("rt-r22-live", "at-r22-live");
+    let mut app = work_and_px_app(login_creds("rt-r22-px"), &live);
+    crate::profile::save_app_state(&app.config().state).expect("persist app state");
+    app.reload_if_state_changed();
+    let account = crate::profile::claim_profile_id(&ProfileName::from("px")).unwrap();
+    // Another clauth's `clauth delete px`: the dir and the roster row go.
+    let px_dir = crate::profile::profile_dir(&ProfileName::from("px")).unwrap();
+    std::fs::remove_dir_all(&px_dir).unwrap();
+    let mut on_disk = crate::profile::load_app_state().expect("read state");
+    on_disk.profiles.retain(|p| p.as_str() != "px");
+    crate::profile::save_app_state(&on_disk).expect("save state without px");
+    assert!(app.reload_if_state_changed(), "the TUI reloads the roster");
+    assert!(app.config().find(&ProfileName::from("px")).is_none());
+    let state_path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let state = std::fs::read(&state_path).unwrap();
+    let live_before = live_bytes();
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: Some(live),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
+            }),
+            "px".to_string(),
+            account,
+            Some("work".to_string()),
+        ),
+    );
+
+    assert_eq!(
+        (
+            toast_pairs(&app),
+            app.config().state.active_profile.clone(),
+            crate::profile::load_app_state()
+                .expect("read the saved state")
+                .active_profile,
+            std::fs::read(&state_path).unwrap() == state,
+            live_bytes() == live_before,
+            px_dir.exists(),
+        ),
+        (
+            vec![(
+                super::ToastKind::Danger,
+                "overwrite failed\nprofile 'px' vanished before overwrite".to_string()
+            )],
+            Some(ProfileName::from("work")),
+            Some(ProfileName::from("work")),
+            true,
+            true,
+            false
+        ),
+        "(toasts, the active account, the saved active account, profiles.toml kept, live file \
+         kept, px dir absent)"
+    );
+}
+
+/// The claim a TUI login, console login, save or overwrite starts with, run
+/// on a name re-created as an id-less proxy account after the caller's
+/// lock-free look, is refused with the re-login toast under the hold the
+/// claim writes under, and mints no `id` into the account's `config.toml`.
+#[test]
+fn a_claim_onto_a_name_recreated_as_a_proxy_account_is_refused_and_mints_no_id() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let plain = Profile::new("px".to_string(), None, None);
+    crate::profile::save_profile(&plain).expect("save profile");
+    crate::testutil::register_names(&["px"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("px")],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![plain],
+    });
+    recreate_as_proxy_account("px", "http://127.0.0.1:9141");
+    let config = px_file("config.toml").expect("px's config.toml");
+    assert!(
+        !String::from_utf8_lossy(&config)
+            .lines()
+            .any(|line| line.starts_with("id ")),
+        "fixture control: px's config.toml holds no id"
+    );
+
+    let claimed = super::claim_or_toast(&mut app, "px", "save failed");
+
+    assert_eq!(
+        (
+            claimed,
+            toast_pairs(&app),
+            px_file("config.toml") == Some(config),
+        ),
+        (None, vec![proxy_relogin_toast("px")], true),
+        "(the claim, toasts, px's config.toml kept)"
+    );
+}
+
+/// `rotate access token` on a proxy account holding a stored OAuth chain arms
+/// no rotation: clauth never spends that chain, so the account has no tokens
+/// to rotate.
+#[test]
+fn rotate_on_a_proxy_account_with_a_stored_chain_arms_no_rotation() {
+    use crate::profile::{ClaudeCredentials, OAuthToken, Profile, ProfileName, ProxyAccount};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    px.proxy = Some(ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-px".to_string(),
+    });
+    px.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-px".to_string(),
+            refresh_token: Some("rt-px".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    let mut app = app_with(vec![px]);
+
+    super::rotate_account(&mut app, &ProfileName::from("px"));
+
+    assert_eq!(
+        (toast_pairs(&app), app.modals.len()),
+        (
+            vec![(
+                super::ToastKind::Info,
+                "'px' has no tokens to rotate".to_string()
+            )],
+            0
+        ),
+        "(toasts, modals open)"
+    );
+}
+
+/// A proxy account, its `[proxy]` table readable or not, gets no
+/// clear-session-token row whatever long-lived piece it holds: it signs in
+/// through its proxy, so it has no Claude Code login to clear, the refusal
+/// `clauth static-token --clear` makes for it. A plain account holding the
+/// same sidecar keeps the row.
+#[test]
+fn config_rows_offer_no_clear_session_token_row_on_a_proxy_account() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let account = |name: &str, proxy: bool, unreadable: bool| {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+        profile.rolling_token = true;
+        if proxy {
+            profile.proxy = Some(crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            });
+        }
+        profile.has_unreadable_proxy_record = unreadable;
+        crate::profile::save_profile(&profile).expect("save profile");
+        seed_session_token(name, None);
+        profile
+    };
+    let offers_the_row = |profile: Profile| {
+        let mut app = app_with(vec![profile]);
+        app.profile_cursor.set(0);
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken)
+    };
+
+    assert_eq!(
+        (
+            offers_the_row(account("plain", false, false)),
+            offers_the_row(account("px", true, false)),
+            offers_the_row(account("pu", false, true)),
+        ),
+        (true, false, false),
+        "(a plain account, a proxy account, an unreadable proxy record) offers the row"
+    );
+}
+
+/// A proxy account, its `[proxy]` table readable or not, gets neither the
+/// auto-start row nor the usage-probe rows nested under it, though it holds a
+/// stored pair, a setup token and the probe switch, and its auto-start toggle
+/// refuses with the oauth-only toast and saves nothing: clauth never kicks or
+/// probes for it. A plain setup-token account of the same shape gets all three
+/// rows and toggles.
+#[test]
+fn a_proxy_account_gets_no_auto_start_rows_and_its_toggle_saves_nothing() {
+    use super::{ConfigRow, ToastKind, config_rows};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["plain", "px", "pu"]);
+    let account = |name: &str, proxy: bool, unreadable: bool| {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        if proxy || unreadable {
+            profile.credentials = Some(split_creds(
+                &format!("stored-oauth-{name}"),
+                Some(&format!("stored-refresh-{name}")),
+            ));
+        }
+        profile.usage_probe = true;
+        profile.has_long_lived_sidecar = true;
+        if proxy {
+            profile.proxy = Some(crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            });
+        }
+        profile.has_unreadable_proxy_record = unreadable;
+        crate::profile::save_profile(&profile).expect("save profile");
+        profile
+    };
+    let rows_and_toggle = |profile: Profile| {
+        let name = profile.name.clone();
+        let mut app = app_with(vec![profile]);
+        app.profile_cursor.set(0);
+        let rows: Vec<ConfigRow> = config_rows(&app)
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    ConfigRow::AutoStart | ConfigRow::UsageProbe | ConfigRow::UsageProbeInterval
+                )
+            })
+            .collect();
+        super::toggle_auto_start(&mut app, &name);
+        let in_memory = app.config().find(&name).map(|p| p.auto_start);
+        let on_disk = crate::profile::load_profile(&ProfileName::from(name.as_str()))
+            .expect("reload")
+            .auto_start;
+        (rows, toast_pairs(&app), in_memory, on_disk)
+    };
+    let refused = || {
+        (
+            Vec::new(),
+            vec![(
+                ToastKind::Warning,
+                "auto-start only works on oauth accounts".to_string(),
+            )],
+            Some(false),
+            false,
+        )
+    };
+
+    assert_eq!(
+        (
+            rows_and_toggle(account("plain", false, false)),
+            rows_and_toggle(account("px", true, false)),
+            rows_and_toggle(account("pu", false, true)),
+        ),
+        (
+            (
+                vec![
+                    ConfigRow::AutoStart,
+                    ConfigRow::UsageProbe,
+                    ConfigRow::UsageProbeInterval
+                ],
+                Vec::new(),
+                Some(true),
+                true,
+            ),
+            refused(),
+            refused(),
+        ),
+        "(auto-start and probe rows, toasts, the in-memory flag, the flag on disk) after the \
+         toggle, for a plain account, a proxy account, an unreadable proxy record"
+    );
+}
+
+/// The clear-session-token confirm re-checks the profile it re-reads under
+/// the rotation guard: an account that became a proxy account after its row
+/// rendered keeps its sidecar byte for byte, and the clear's failure toast
+/// carries the refusal `clauth static-token --clear` makes for it.
+#[test]
+fn the_session_token_clear_refuses_an_account_that_became_a_proxy_account() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, config_rows, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("work");
+    let mut profile = Profile::new("work".to_string(), None, None);
+    profile.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+    seed_session_token("work", None);
+    let sidecar = crate::profile::profile_subpath(&name, "session-token.json").expect("path");
+    let before = std::fs::read(&sidecar).expect("sidecar");
+    let mut app = app_with(vec![profile]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &name));
+    let offered = config_rows(&app).contains(&ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    let armed = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.armed_action == Some(ConfigRow::ClearSessionToken));
+
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the record");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert_eq!(
+        (
+            offered,
+            armed,
+            std::fs::read(&sidecar).ok() == Some(before),
+            toast_pairs(&app),
+        ),
+        (
+            true,
+            true,
+            true,
+            vec![(
+                ToastKind::Danger,
+                "clear failed\n'work' is an account on proxy \"stub\": it signs in through its \
+                 proxy and has no Claude Code login to roll or restore"
+                    .to_string()
+            )]
+        ),
+        "(the row offered, the first press armed it, the sidecar kept, toasts)"
+    );
+}
+
+/// The clear-session-token confirm refuses an account that became a proxy
+/// account after its row rendered before anything of it moves: a stage left
+/// beside its store stays on disk byte for byte, as do the stored pair and the
+/// sidecar, and the toast carries the refusal. The stage's base is
+/// fp("rt-old"), hand-computed: the first 8 bytes of its SHA-256, hex.
+#[test]
+fn the_session_token_clear_refuses_a_new_proxy_account_before_its_stage_lands() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("staged");
+    let mut acct = Profile::new("staged".to_string(), None, None);
+    acct.credentials = Some(split_creds("at-old", Some("rt-old")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["staged"]);
+    seed_session_token("staged", None);
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let files = || {
+        [
+            "credentials.json.staged",
+            "credentials.json",
+            "session-token.json",
+        ]
+        .map(|file| std::fs::read(dir.join(file)).ok())
+    };
+    let before = files();
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &name));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the record");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert_eq!(
+        (
+            before.iter().all(Option::is_some),
+            files() == before,
+            toast_pairs(&app),
+        ),
+        (
+            true,
+            true,
+            vec![(
+                ToastKind::Danger,
+                "clear failed\n'staged' is an account on proxy \"stub\": it signs in through its \
+                 proxy and has no Claude Code login to roll or restore"
+                    .to_string()
+            )]
+        ),
+        "(the stage, store and sidecar were there, each kept byte for byte, toasts)"
+    );
+}
+
+/// The clear-session-token confirm refuses a `[proxy]` table clauth cannot
+/// read that landed after the row rendered, as it refuses a readable record:
+/// the stage, the store and the sidecar stay byte for byte, and the toast
+/// carries the unreadable-table refusal. The stage's base is fp("rt-old"),
+/// hand-computed: the first 8 bytes of its SHA-256, hex.
+#[test]
+fn the_session_token_clear_refuses_an_unreadable_proxy_record_before_its_stage_lands() {
+    use super::{ConfigRow, ToastKind, build_draft_existing, run_config_row};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("staged-u");
+    let mut acct = Profile::new("staged-u".to_string(), None, None);
+    acct.credentials = Some(split_creds("at-old", Some("rt-old")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    crate::testutil::register_names(&["staged-u"]);
+    seed_session_token("staged-u", None);
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let files = || {
+        [
+            "credentials.json.staged",
+            "credentials.json",
+            "session-token.json",
+        ]
+        .map(|file| std::fs::read(dir.join(file)).ok())
+    };
+    let before = files();
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor.set(0);
+    app.config_draft = Some(build_draft_existing(&app, &name));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the record");
+    let config = crate::claude::tests::break_proxy_record("staged-u");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert_eq!(
+        (
+            before.iter().all(Option::is_some),
+            files() == before,
+            toast_pairs(&app),
+        ),
+        (
+            true,
+            true,
+            vec![(
+                ToastKind::Danger,
+                format!(
+                    "clear failed\nprofile 'staged-u' has a [proxy] table in {config:?} that \
+                     clauth cannot read; nothing was changed. Give the table a valid `service` \
+                     and `account`, then log in again"
+                )
+            )]
+        ),
+        "(the stage, store and sidecar were there, each kept byte for byte, toasts)"
+    );
+}
+
+/// The active proxy account `px`, keyed, over a `credentials.json` that does
+/// not parse, in an app built from it; with the store's path.
+fn torn_proxy_app() -> (App, std::path::PathBuf) {
+    use crate::profile::{Profile, ProfileName};
+    let (_, store) = torn_store_profile(Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    ));
+    let name = ProfileName::from("px");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    crate::testutil::register_names(&["px"]);
+    let app = app_with(vec![crate::profile::load_profile(&name).unwrap()]);
+    (app, store)
+}
+
+/// What the log-out confirm over `name`, the app's first account, says.
+fn log_out_detail(app: &mut App, name: &str) -> Option<String> {
+    app.profile_cursor.set(0);
+    app.config_draft = Some(super::build_draft_existing(
+        app,
+        &crate::profile::ProfileName::from(name),
+    ));
+    super::run_config_row(app, super::ConfigRow::DeleteCreds);
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.detail.clone(),
+        other => panic!("expected a confirm modal, got {other:?}"),
+    }
+}
+
+/// A proxy account's log-out confirm says what the log out does, whatever the
+/// account stores: it blanks the key, and neither the chain nor a torn store
+/// goes.
+#[test]
+fn a_proxy_accounts_log_out_confirm_names_the_key_blank() {
+    let over_a_chain = {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = active_proxy_app(Some(creds_ra("rt-px", "at-px")), None);
+        log_out_detail(&mut app, "px")
+    };
+    let over_a_torn_store = {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, _) = torn_proxy_app();
+        log_out_detail(&mut app, "px")
+    };
+
+    let key_blank =
+        Some("blanks the api key; keeps the base url, model, and env. re-login any time.".into());
+    assert_eq!(
+        (over_a_chain, over_a_torn_store),
+        (key_blank.clone(), key_blank),
+        "(over a chain, over a torn store)"
+    );
+}
+
+/// A proxy account's log-out row shows while it has a key to blank and goes
+/// with the key: a stored chain or a torn store stays on disk and keeps nothing
+/// to log out of, its `[proxy]` table readable or not. The row takes the claim
+/// off the loaded profile: the `config.toml` is gone when it last reads.
+#[test]
+fn a_proxy_accounts_log_out_row_goes_with_its_key() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::{Profile, ProfileName, ProxyAccount};
+    let walk = |chain: bool, readable_record: bool| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("px");
+        let mut px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        px.credentials = chain.then(|| creds_ra("rt-px", "at-px"));
+        crate::profile::save_profile(&px).unwrap();
+        let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+        if !chain {
+            std::fs::write(&store, "{ torn").unwrap();
+        }
+        crate::profile::write_proxy_record(
+            &name,
+            &ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .unwrap();
+        if !readable_record {
+            crate::claude::tests::break_proxy_record("px");
+        }
+        crate::testutil::register_names(&["px"]);
+        let stored = std::fs::read(&store).unwrap();
+        let mut app = app_with(vec![crate::profile::load_profile(&name).unwrap()]);
+        app.config_draft = None;
+        app.profile_cursor.set(0);
+        let keyed = config_rows(&app).contains(&ConfigRow::DeleteCreds);
+
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::BlankCredentials("px".to_string()),
+        );
+
+        std::fs::remove_file(crate::profile::profile_subpath(&name, "config.toml").unwrap())
+            .unwrap();
+        (
+            keyed,
+            config_rows(&app).contains(&ConfigRow::DeleteCreds),
+            std::fs::read(&store).unwrap() == stored,
+            toast_pairs(&app),
+        )
+    };
+
+    let went = || {
+        (
+            true,
+            false,
+            true,
+            vec![(super::ToastKind::Success, "logged out of 'px'".to_string())],
+        )
+    };
+    assert_eq!(
+        [
+            walk(true, true),
+            walk(false, true),
+            walk(true, false),
+            walk(false, false),
+        ],
+        [went(), went(), went(), went()],
+        "(shows keyed, shows keyless, store kept, toasts) per shape"
+    );
+}
+
+/// A log out of a proxy account leaves a torn `credentials.json` too: bytes
+/// that no longer parse are still the chain, and they may be repaired by hand.
+#[test]
+fn a_log_out_of_a_proxy_account_keeps_a_torn_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, store) = torn_proxy_app();
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("px".to_string()),
+    );
+
+    assert_eq!(
+        (
+            std::fs::read(&store).ok(),
+            crate::profile::read_profile(&crate::profile::ProfileName::from("px"))
+                .unwrap()
+                .api_key,
+            toast_pairs(&app),
+        ),
+        (
+            Some(b"{ torn".to_vec()),
+            None,
+            vec![(super::ToastKind::Success, "logged out of 'px'".to_string())],
+        ),
+        "(store, api key, toasts)"
+    );
+}
+
+/// A log out of an account whose `config.toml` turned unclassifiable fails
+/// under the head `log out failed` on the load every write of the account
+/// starts with: its store, config and live link stay as they were.
+#[test]
+fn a_log_out_of_an_unclassifiable_account_changes_nothing() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app =
+            work_app_then_unclassifiable(shape, Some(creds_ra("rt-work", "at-work")), None);
+        let name = ProfileName::from("work");
+        let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+        let config = crate::profile::profile_subpath(&name, "config.toml").unwrap();
+        let stored = std::fs::read(&store).unwrap();
+        let posed = std::fs::read(&config).ok();
+
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::BlankCredentials("work".to_string()),
+        );
+
+        let toasts = toast_pairs(&app);
+        outcomes.push((
+            std::fs::read(&store).unwrap() == stored,
+            std::fs::read(&config).ok() == posed,
+            live_bytes() == stored,
+            crate::profile::load_app_state().unwrap().active_profile,
+            toasts.len(),
+            toasts.first().is_some_and(|(kind, body)| {
+                *kind == super::ToastKind::Danger && body.starts_with("log out failed\n")
+            }),
+        ));
+    }
+    let refused = (true, true, true, Some(ProfileName::from("work")), 1, true);
+    assert_eq!(
+        outcomes,
+        vec![refused.clone(), refused],
+        "(store kept, config kept, live link kept, active on disk, toasts, `log out failed` \
+         head) per shape"
+    );
+}
+
+/// A proxy claim landing after the poll's lock-free read and before the
+/// adopt's hold saves nothing: `work` stores no login, Claude Code's stays
+/// live, and the poll answers with the not-saved warning, once per login. With
+/// no claim landing the login is saved.
+#[test]
+fn a_proxy_claim_landing_before_the_adopts_hold_saves_nothing() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::{AppState, Profile, ProfileName};
+    use crate::tui::render::prose::cmd;
+    let name = ProfileName::from("work");
+    let outcomes: Vec<_> = ["record", "directory", "header", "plain"]
+        .into_iter()
+        .map(|row| {
+            let _home = crate::testutil::HomeSandbox::new();
+            crate::profile::save_profile(&Profile::new("work".to_string(), None, None))
+                .expect("save work");
+            crate::profile::save_app_state(&AppState {
+                active_profile: Some(name.clone()),
+                profiles: vec![name.clone()],
+                preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+                ..AppState::default()
+            })
+            .expect("persist app state");
+            let mut app = App::new(crate::profile::load_config().expect("load the config"));
+            crate::testutil::write_live_creds(&creds_ra(
+                &format!("rt-adopt-{row}"),
+                &format!("at-adopt-{row}"),
+            ));
+            let live = live_bytes();
+            let landing = name.clone();
+            crate::testutil::switch_race_seam::plant(move || match row {
+                "record" => crate::profile::write_proxy_record(
+                    &landing,
+                    &crate::profile::ProxyAccount {
+                        service: crate::proxy::Service::parse("stub").unwrap(),
+                        account: "acct-1".to_string(),
+                    },
+                )
+                .expect("write the proxy record"),
+                "directory" => Unclassifiable::Directory.pose("work"),
+                "header" => Unclassifiable::NotedProxyHeader.pose("work"),
+                _ => {}
+            });
+
+            force_poll(&mut app);
+            force_poll(&mut app);
+
+            crate::testutil::switch_race_seam::assert_empty();
+            (
+                row,
+                crate::profile::profile_subpath(&name, "credentials.json")
+                    .unwrap()
+                    .exists(),
+                live_bytes() == live,
+                toast_pairs(&app),
+            )
+        })
+        .collect();
+
+    let login = cmd("clauth login <name>");
+    let on_a_proxy = format!(
+        "login not saved\nClaude Code signed in while proxy account 'work' was active; clauth \
+         did not save that login into 'work'. To keep it as an account, run {login} with a new \
+         name"
+    );
+    let unclassifiable = format!(
+        "login not saved\nClaude Code signed in while 'work' was active, but clauth can't read \
+         its config, so it did not save that login into 'work'. Fix its config.toml, or run \
+         {login} with a new name to keep it"
+    );
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                "record",
+                false,
+                true,
+                vec![(super::ToastKind::Warning, on_a_proxy)],
+            ),
+            (
+                "directory",
+                false,
+                true,
+                vec![(super::ToastKind::Warning, unclassifiable.clone())],
+            ),
+            (
+                "header",
+                false,
+                true,
+                vec![(super::ToastKind::Warning, unclassifiable)],
+            ),
+            (
+                "plain",
+                true,
+                false,
+                vec![(
+                    super::ToastKind::Success,
+                    "saved login into 'work'".to_string(),
+                )],
+            ),
+        ],
+        "(row, a store exists, the live file untouched, toasts)"
+    );
+}
+
+/// Saving Claude Code's login into an owner whose `config.toml` turned
+/// unclassifiable says so, by the capture's own sentence: nothing lands in the
+/// owner and the active account stays.
+#[test]
+fn a_save_into_an_unclassifiable_owner_refuses_with_the_capture_sentence() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, snapshot) = app_with_a_relogged();
+        let account = crate::testutil::profile_id("x");
+        shape.pose("x");
+        let store =
+            crate::profile::profile_subpath(&ProfileName::from("x"), "credentials.json").unwrap();
+        let stored = std::fs::read(&store).unwrap();
+
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::AdoptDivergence(
+                Box::new(snapshot),
+                "x".to_string(),
+                account,
+                "a".to_string(),
+            ),
+        );
+
+        outcomes.push((
+            std::fs::read(&store).unwrap() == stored,
+            crate::profile::load_app_state().unwrap().active_profile,
+            toast_pairs(&app),
+        ));
+    }
+    let refused = (
+        true,
+        Some(ProfileName::from("a")),
+        vec![(
+            super::ToastKind::Danger,
+            "save failed\ncan't read the config of 'x', so clauth can't tell whether Claude \
+             Code's current login belongs in it; fix its config.toml, then save the login again"
+                .to_string(),
+        )],
+    );
+    assert_eq!(
+        outcomes,
+        vec![refused.clone(), refused],
+        "(store kept, active on disk, toasts) per shape"
+    );
 }

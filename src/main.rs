@@ -54,6 +54,7 @@ mod profile_json;
 mod profile_notes;
 mod providers;
 mod proxy;
+mod proxy_account;
 mod proxy_check;
 mod proxy_list;
 mod push;
@@ -202,6 +203,45 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
+/// A run that failed, then a signal read during its cleanup ended it (a proxy
+/// login's failure, during the cancel of its flow or the delete of the
+/// account it had just created; the signal may have arrived before the
+/// cleanup, pending from the failed step, and been read during it).
+/// [`exit_code`] still prints the failure, the reason the run stopped, and
+/// answers `128 + signal`. It reads as the failure: its text, and the
+/// failure's causes beneath it.
+#[derive(Debug)]
+pub(crate) struct InterruptedAfter {
+    pub(crate) error: anyhow::Error,
+    pub(crate) signal: i32,
+}
+
+impl std::fmt::Display for InterruptedAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for InterruptedAfter {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// A run that ended because its stdout reader left, after cleaning up what it
+/// had open (a proxy login cancelling its flow). [`exit_code`] answers 0 with
+/// no line, `out`'s rule for a reader that left.
+#[derive(Debug)]
+pub(crate) struct ReaderLeft;
+
+impl std::fmt::Display for ReaderLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout's reader left")
+    }
+}
+
+impl std::error::Error for ReaderLeft {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
@@ -209,12 +249,25 @@ fn usage_error(msg: impl Into<String>) -> anyhow::Error {
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
 /// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
-/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
-/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
-/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
-/// said what happened on stderr — so the message surface is unchanged now that
-/// `main` maps the code itself.
+/// `128 + signal` for an [`Interrupted`] or [`InterruptedAfter`] run, 0 for a
+/// [`ReaderLeft`] one, 1 for any other failure. Prints the error exactly as
+/// anyhow's `Result` `Termination` did (`Error: {:?}`) — an
+/// [`InterruptedAfter`] its failure — except the [`HelpRendered`],
+/// [`Interrupted`] and [`ReaderLeft`] arms, whose commands already said what
+/// happened on stderr or have no reader left — so the message surface is
+/// unchanged now that `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
+    // Through `errln!`, so a test's stderr capture takes the line too.
+    let mut line = Vec::new();
+    let code = exit_code_to(result, &mut line);
+    if let Some(line) = line.strip_suffix(b"\n") {
+        errln!("{}", String::from_utf8_lossy(line));
+    }
+    code
+}
+
+/// [`exit_code`] printing its line to `stderr`, so a test reads the line.
+pub(crate) fn exit_code_to(result: Result<()>, stderr: &mut impl std::io::Write) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -224,13 +277,23 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            if e.downcast_ref::<ReaderLeft>().is_some() {
+                return 0;
+            }
             if e.downcast_ref::<FailureReported>().is_some() {
                 return 1;
             }
-            // `errln!`, so a reader that walked away from `2>&1 | head` still
-            // gets this code rather than the 101 `eprintln!` panicked with.
-            errln!("Error: {e:?}");
-            if e.downcast_ref::<UsageError>().is_some() {
+            let (e, signal) = match e.downcast::<InterruptedAfter>() {
+                Ok(cut) => (cut.error, Some(cut.signal)),
+                Err(e) => (e, None),
+            };
+            // `errln!`'s own writer, so a reader that walked away from
+            // `2>&1 | head` still gets this code rather than the 101
+            // `eprintln!` panicked with.
+            out::write_chunk(stderr, format_args!("Error: {e:?}"), true, "stderr");
+            if let Some(signal) = signal {
+                128 + signal
+            } else if e.downcast_ref::<UsageError>().is_some() {
                 2
             } else {
                 1
@@ -1350,7 +1413,12 @@ fn feed_paste_piped(
 /// preamble, so the OAuth login and the Alibaba console capture cannot drift
 /// into two spellings of it again.
 fn print_browser_fallback(url: &str) {
-    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+    outln!("{}", browser_fallback(url));
+}
+
+/// [`print_browser_fallback`]'s lines, for a login that prints them itself.
+fn browser_fallback(url: &str) -> String {
+    format!("\nBrowser didn't open? Use the url below to sign in\n{url}\n")
 }
 
 /// Run an OAuth login (preamble, the links, minted tokens, login summary,
@@ -1456,7 +1524,10 @@ fn settle_bare_item_for_cli(
 /// the write lands. Neither path switches to the profile (`clauth <name>` does
 /// that). `--model` is persisted onto the account the login claimed, after the
 /// capture. Once the login claims its account, everything it reuses or writes
-/// reads that account fresh; the config read on entry only routes.
+/// reads that account fresh; the config read on entry only routes. An existing
+/// proxy account is refused before any arm runs, and again where each arm
+/// lands, changing nothing: it re-logs in through its proxy
+/// ([`actions::refuse_relogin_off_proxy`]).
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -1466,6 +1537,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         } else {
             actions::codex_login_capture(&args.profile)
         };
+    }
+    if let Some(service) = args.proxy.as_deref() {
+        return cmd_login_proxy(&args, service);
     }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
@@ -1477,6 +1551,11 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         }
     });
     let reauth = matches!(route, LoginRoute::Reauth(_));
+    if reauth {
+        // Ahead of every arm below, each of which may prompt or open a
+        // browser before it writes.
+        actions::refuse_relogin_off_proxy(&target)?;
+    }
     let is_api = args.is_api_mode();
 
     // CLA-SPLIT capture flow: `--setup-token` writes the profile's
@@ -1620,6 +1699,656 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
+/// `clauth login <name> --proxy <service>` — register `name` as an account of
+/// an ENABLED proxy and log in through the proxy's own flow: the flow's page
+/// opens (the fallback URL prints below it, whole), a TTY can paste a code
+/// through the paste door while the poll waits the flow out to its
+/// `expires_at` (first door wins), and SIGINT or SIGTERM cancels the flow and
+/// exits `128 + signal`.
+///
+/// Success creates profile `<name>` with `base_url` = the proxy's bind and the
+/// returned inference key as its api key, plus the `[proxy]` record the
+/// delete/settings/usage arms key off; a login whose key never reached clauth
+/// mints one for the account, and one whose save fails deletes the account
+/// the proxy just created ([`proxy_account::refuse_unsaved_account`]). A
+/// login the proxy completes onto an account another profile holds is refused,
+/// minting, deleting and saving nothing ([`proxy_account::held_account`]). An
+/// existing name that already holds a proxy record for the SAME service
+/// re-authenticates in place — the re-bind flow,
+/// keeping every other field and its stored key (minting a key only when it
+/// stores none or one carrying a dead-key verdict, and setting the model when
+/// `--model` names one); a re-bind
+/// the proxy completes onto another account id is refused, changing nothing.
+/// An existing name without a record, with one clauth cannot read, or with
+/// one on another service, is refused before any request, since converting a live account's credential shape silently is the
+/// overwrite the confirm gate exists for. The upstream credential never
+/// crosses: the `done` body is read for the account id and the inference key
+/// alone.
+fn cmd_login_proxy(args: &LoginArgs, raw_service: &str) -> Result<()> {
+    match login_proxy(args, raw_service) {
+        Ok(captured) => {
+            outln!("{captured}");
+            Ok(())
+        }
+        Err(e) => Err(match e.downcast::<proxy_account::LoginInterrupted>() {
+            // The login settled the flow before it returned; the interrupt's
+            // text is the line saying how it ended on the proxy, and
+            // [`exit_code`] answers the shell's `128 + signal` after it. A
+            // signal on a start that opened no flow, or a second signal,
+            // arrives as a bare [`Interrupted`] instead.
+            Ok(interrupted) => {
+                errln!("{interrupted}");
+                Interrupted(interrupted.signal()).into()
+            }
+            Err(e) => e,
+        }),
+    }
+}
+
+/// [`cmd_login_proxy`] before anything is reported: the success line comes
+/// back to print, and an interrupt as [`proxy_account::LoginInterrupted`],
+/// its flow cancel already run.
+fn login_proxy(args: &LoginArgs, raw_service: &str) -> Result<String> {
+    let service = proxy::service_arg(raw_service)?;
+    let row = proxy::Registry::load()?
+        .get(&service)
+        .cloned()
+        .ok_or_else(|| proxy::not_registered(&service))?;
+    anyhow::ensure!(
+        row.enabled,
+        "proxy {:?} is disabled; run `clauth proxy enable {service}` first",
+        service.as_str()
+    );
+
+    let mut config = load_config()?;
+    let route = login_route(&config, &args.profile);
+    let (target, rebind) = match &route {
+        LoginRoute::New(fresh) => {
+            actions::validate_profile_name(fresh, crate::harness::Harness::Claude, None)?;
+            let fresh = ProfileName::from(fresh.clone());
+            // Before the flow opens, as `capture_new_profile` refuses: the
+            // create would only refuse after the proxy made the account.
+            actions::refuse_leftover_login(&fresh)?;
+            (fresh, None)
+        }
+        LoginRoute::Reauth(existing) => {
+            let name = ProfileName::from(existing.clone());
+            match crate::profile::stored_proxy_claim(&name) {
+                crate::profile::ProxyClaim::Account(rec) if rec.service == service => {
+                    (name, Some(rec.account))
+                }
+                crate::profile::ProxyClaim::Account(rec) => anyhow::bail!(
+                    "'{existing}' is already a proxy account on {:?}; log in to proxy \
+                     {:?} under another name",
+                    rec.service.as_str(),
+                    service.as_str()
+                ),
+                // A table clauth cannot read still names an account on some
+                // proxy: "not a proxy account" would send the user to a second
+                // one under a new name, orphaning the first.
+                // `stored_proxy_claim` never answers `Unclassifiable`; the
+                // `None` below writes nothing either.
+                crate::profile::ProxyClaim::Unreadable
+                | crate::profile::ProxyClaim::Unclassifiable => {
+                    return Err(actions::unreadable_proxy_login(&name));
+                }
+                crate::profile::ProxyClaim::None => anyhow::bail!(
+                    "'{existing}' exists and is not a proxy account; `--proxy` registers a \
+                     proxy profile under a new name"
+                ),
+            }
+        }
+    };
+
+    let key_stored = || {
+        crate::profile::stored_endpoint_identity(&target)
+            .and_then(|stored| {
+                crate::usage::inference_key_fingerprint(
+                    stored.api_key.as_deref(),
+                    crate::profile::inference_env_token(&stored.env).as_deref(),
+                )
+            })
+            .is_some_and(|key| !crate::profile_cache::dead_key_matches(&target, key))
+    };
+    let holder = |account: &str| {
+        actions::proxy_account_holder(
+            &crate::profile::claude_roster_names().ok()?,
+            &crate::profile::ProxyAccount {
+                service: service.clone(),
+                account: account.to_string(),
+            },
+        )
+    };
+
+    // Before the flow opens, so a signal from the start on finds its handler
+    // and cancels the flow instead of killing clauth with it left polling.
+    let mut interrupted = login_interrupt()?;
+    let control = proxy_account::Control::connect(&service)?;
+    let mut flow = proxy_account::start_login(&control, rebind.as_deref(), &mut *interrupted)?;
+    let url = control.printable_url(&flow.start().url);
+    print_while_open(
+        &mut flow,
+        &mut *interrupted,
+        format_args!("{}", proxy_login_opening_line(&service, &target, &url)),
+        true,
+    )?;
+    print_while_open(
+        &mut flow,
+        &mut *interrupted,
+        format_args!("{}", browser_fallback(&url)),
+        true,
+    )?;
+    let _ = crate::platform::open_url(&flow.start().url);
+    // Every exit from here until the flow reads `done` cancels it on the
+    // proxy, and every exit from here on drops `paste`, which ends a prompt
+    // line it leaves open.
+    let modes = flow.start().modes.clone();
+    let paste = PromptDoor {
+        door: open_paste_door(&modes, &mut |prompt| {
+            print_while_open(&mut flow, &mut *interrupted, prompt, false)
+        })?,
+        closed: false,
+    };
+    let outcome = flow.await_done(proxy_account::AwaitLogin {
+        paste: &paste.door,
+        interrupted: &mut *interrupted,
+        wait: &|d| std::thread::sleep(d),
+        say: &login_stderr,
+        profile: target.as_str(),
+        key_stored: &key_stored,
+        holder: &holder,
+    })?;
+    let record = crate::profile::ProxyAccount {
+        service: service.clone(),
+        account: outcome.account.clone(),
+    };
+    match &route {
+        LoginRoute::New(_) => {
+            if let Some(holder) = holder(&outcome.account) {
+                return Err(proxy_account::held_account(
+                    &control,
+                    &target,
+                    &outcome.account,
+                    &holder,
+                ));
+            }
+            let Some(key) = outcome.inference_key.as_ref() else {
+                return Err(proxy_account::keyless(&service));
+            };
+            #[cfg(test)]
+            run_before_save_door();
+            if let Err(error) = actions::create_proxy_profile(
+                &mut config,
+                target.to_string(),
+                record,
+                format!("http://{}", proxy::bind(row.port)),
+                key.expose().to_string(),
+                args.model.clone(),
+            ) {
+                if let Some(held) = error.downcast_ref::<proxy_account::AccountHeld>() {
+                    return Err(proxy_account::held_account(
+                        &control,
+                        &target,
+                        &outcome.account,
+                        &held.holder,
+                    ));
+                }
+                return Err(proxy_account::refuse_unsaved_account(
+                    &control,
+                    &outcome.account,
+                    error,
+                    &mut *interrupted,
+                ));
+            }
+        }
+        LoginRoute::Reauth(_) => {
+            if let Some(own) = rebind.as_deref()
+                && own != outcome.account
+            {
+                anyhow::bail!(
+                    "proxy {:?} logged '{target}' in as account {:?}, not its own account \
+                     {:?}; nothing was changed. Run `clauth proxy check {service}` for details",
+                    service.as_str(),
+                    control.printable(&outcome.account),
+                    control.printable(own)
+                );
+            }
+            let key = outcome
+                .inference_key
+                .as_ref()
+                .map(|key| key.expose().to_string());
+            // On a reauth `--model` is an explicit override; without it the
+            // profile's existing model settings survive.
+            let model = args.model.as_deref();
+            #[cfg(test)]
+            run_before_save_door();
+            if actions::update_proxy_login(&mut config, &target, &record, key, model)?
+                == actions::ProxyRelogin::Keyless
+            {
+                // The key the flow kept on the profile's word was cleared
+                // before the save: a re-bind of a keyless profile mints one.
+                let key = proxy_account::mint_rebound_key(
+                    &control,
+                    &outcome.account,
+                    target.as_str(),
+                    &mut *interrupted,
+                )?;
+                actions::update_proxy_login(
+                    &mut config,
+                    &target,
+                    &record,
+                    Some(key.expose().to_string()),
+                    model,
+                )?;
+            }
+        }
+    }
+    let captured =
+        proxy_login_captured_line(&service, &target, &control.printable(&outcome.account));
+    Ok(paste.close_before(captured))
+}
+
+/// The proxy login's paste door and the prompt line it printed. A reader still
+/// waiting on the prompt holds its sender, so the line is still open on the
+/// terminal (the browser door won); a line the reader read ended it, and a
+/// closed door printed no prompt. Whatever the login prints next starts on a
+/// line of its own: the success line through [`Self::close_before`], every
+/// other exit's line once this drops, ahead of it.
+struct PromptDoor {
+    door: std::sync::mpsc::Receiver<String>,
+    closed: bool,
+}
+
+impl PromptDoor {
+    fn is_open(&self) -> bool {
+        matches!(
+            self.door.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        )
+    }
+
+    /// `line`, starting on a line of its own when the prompt's is still open.
+    fn close_before(mut self, line: String) -> String {
+        self.closed = true;
+        if self.is_open() {
+            format!("\n{line}")
+        } else {
+            line
+        }
+    }
+}
+
+impl Drop for PromptDoor {
+    fn drop(&mut self) {
+        if !self.closed && self.is_open() {
+            end_prompt_line();
+        }
+    }
+}
+
+/// End the paste prompt's open line, through the login's own stdout writer:
+/// it runs as the login returns, ahead of its line on stderr and its exit
+/// code, and `outln!` would end the run there at exit 0 once stdout's reader
+/// left. A newline that cannot land changes nothing the run reports, so its
+/// outcome is dropped, a write error included: a panic in this drop would
+/// take the line and the code with it.
+fn end_prompt_line() {
+    let _ = with_login_stdout(|mut stdout| {
+        crate::out::write_chunk_result(&mut stdout, format_args!(""), true)
+    });
+}
+
+/// One stdout chunk of a proxy login whose flow is still open. `outln!` ends
+/// the run at exit 0 once stdout's reader leaves, and that exit runs no
+/// destructor, so it would leave the proxy polling upstream for a login nobody
+/// finishes: a reader that left here cancels the flow first, and the run then
+/// ends at 0 through [`ReaderLeft`]. Any other write error panics as `outln!`
+/// does, and the unwind's drop cancels the flow.
+fn print_while_open(
+    flow: &mut proxy_account::LoginFlow<'_>,
+    interrupted: &mut dyn FnMut() -> Option<i32>,
+    chunk: std::fmt::Arguments<'_>,
+    newline: bool,
+) -> Result<()> {
+    match login_stdout(chunk, newline) {
+        crate::out::Wrote::Yes => Ok(()),
+        crate::out::Wrote::ReaderGone => {
+            flow.cancel(interrupted)?;
+            Err(ReaderLeft.into())
+        }
+    }
+}
+
+/// Stdout for [`print_while_open`].
+fn login_stdout(chunk: std::fmt::Arguments<'_>, newline: bool) -> crate::out::Wrote {
+    with_login_stdout(|mut stdout| crate::out::write_chunk(&mut stdout, chunk, newline, "stdout"))
+}
+
+/// `write` run on the stdout a proxy login prints to.
+#[cfg(not(test))]
+fn with_login_stdout<T>(write: impl FnOnce(&mut dyn std::io::Write) -> T) -> T {
+    write(&mut std::io::stdout().lock())
+}
+
+/// A test build hands over the calling thread's [`ProxyLoginDoors`] stdout
+/// when one is held, and the real one otherwise.
+#[cfg(test)]
+fn with_login_stdout<T>(write: impl FnOnce(&mut dyn std::io::Write) -> T) -> T {
+    PROXY_LOGIN_DOORS.with(|doors| {
+        match doors.borrow_mut().as_mut().and_then(|d| d.stdout.as_mut()) {
+            Some(held) => write(held.as_mut()),
+            None => write(&mut std::io::stdout().lock()),
+        }
+    })
+}
+
+/// One stderr line of a proxy login that keeps waiting ([`errln!`]).
+#[cfg(not(test))]
+fn login_stderr(line: std::fmt::Arguments<'_>) {
+    errln!("{line}");
+}
+
+/// A test build hands the line to the calling thread's [`ProxyLoginDoors`]
+/// stderr when one is held, and to [`errln!`] otherwise.
+#[cfg(test)]
+fn login_stderr(line: std::fmt::Arguments<'_>) {
+    PROXY_LOGIN_DOORS.with(|doors| {
+        match doors.borrow_mut().as_mut().and_then(|d| d.stderr.as_mut()) {
+            Some(held) => {
+                let _ = std::io::Write::write_fmt(held, format_args!("{line}\n"));
+            }
+            None => errln!("{line}"),
+        }
+    });
+}
+
+/// The proxy login's progress line; `url` arrives escaped.
+fn proxy_login_opening_line(service: &proxy::Service, target: &str, url: &str) -> String {
+    format!(
+        "clauth: logging in to proxy {:?} for '{target}', opening {url}...",
+        service.as_str()
+    )
+}
+
+/// The proxy login's success line; `account` arrives escaped.
+fn proxy_login_captured_line(service: &proxy::Service, target: &str, account: &str) -> String {
+    format!(
+        "clauth: captured into profile '{target}' (proxy {:?}, account {account:?}). Switch to \
+         it with:  clauth {target}",
+        service.as_str()
+    )
+}
+
+/// The proxy login's paste door, open only when the flow declares the mode
+/// and a TTY is there to type into: the prompt prints and a reader thread
+/// sends the one line it reads, so the poll keeps racing it — the browser
+/// door's `done` lands while the prompt still waits. An empty answer, an EOF
+/// or a closed door (no paste mode, no TTY) leaves the poll to wait alone.
+/// `prompt` prints the prompt, and its error is the door's.
+#[cfg(not(test))]
+fn open_paste_door(
+    modes: &[String],
+    prompt: &mut dyn FnMut(std::fmt::Arguments<'_>) -> Result<()>,
+) -> Result<std::sync::mpsc::Receiver<String>> {
+    use std::io::IsTerminal as _;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if modes.iter().any(|mode| mode == "paste") && std::io::stdin().is_terminal() {
+        prompt(format_args!(
+            "clauth: paste the code from the proxy's login page (empty to wait): "
+        ))?;
+        // Detached, like the OAuth login's piped reader: a door the browser
+        // beat keeps it parked on stdin until clauth exits.
+        let _ = std::thread::spawn(
+            move || match read_manual_code_from(std::io::stdin().lock()) {
+                Ok(Some(line)) => {
+                    let _ = tx.send(line.trim().to_string());
+                }
+                Ok(None) => {}
+                Err(e) => errln!("clauth: {e}"),
+            },
+        );
+    }
+    Ok(rx)
+}
+
+/// A test build never reads stdin: the paste door is the calling thread's
+/// [`ProxyLoginDoors`] answer when one is held and the flow offers paste,
+/// its prompt printed as a TTY's would be, and closed otherwise.
+#[cfg(test)]
+fn open_paste_door(
+    modes: &[String],
+    prompt: &mut dyn FnMut(std::fmt::Arguments<'_>) -> Result<()>,
+) -> Result<std::sync::mpsc::Receiver<String>> {
+    let held = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.paste.take())
+    });
+    match held {
+        Some(rx) if modes.iter().any(|mode| mode == "paste") => {
+            prompt(format_args!(
+                "clauth: paste the code from the proxy's login page (empty to wait): "
+            ))?;
+            Ok(rx)
+        }
+        _ => Ok(std::sync::mpsc::channel().1),
+    }
+}
+
+/// The SIGINT or SIGTERM that reached clauth since the proxy login installed
+/// its handlers, in the signal discipline `clauth start` keeps: while they
+/// are held the signal no longer kills clauth, so the login cancels its flow
+/// and exits itself. Dropping the closure does not restore the default
+/// action: `signal-hook-registry` keeps its own handler installed, so both
+/// signals stay ignored until clauth exits, right after the login.
+#[cfg(all(unix, not(test)))]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    use anyhow::Context as _;
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+        .context("failed to install signal handlers")?;
+    Ok(Box::new(move || signals.pending().next()))
+}
+
+/// Windows has no signal handling on this path, as `clauth start` has none:
+/// a Ctrl-C ends clauth and the flow expires on the proxy's own clock.
+#[cfg(all(not(unix), not(test)))]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    Ok(Box::new(|| None))
+}
+
+/// A test build installs no handler (one would hold every sibling test's
+/// signal): the interrupt is the calling thread's [`ProxyLoginDoors`] one.
+#[cfg(test)]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    let held = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.interrupt.take())
+    });
+    Ok(match held {
+        Some(rx) => Box::new(move || rx.try_recv().ok()),
+        None => Box::new(|| None),
+    })
+}
+
+#[cfg(test)]
+struct HeldDoors {
+    paste: Option<std::sync::mpsc::Receiver<String>>,
+    interrupt: Option<std::sync::mpsc::Receiver<i32>>,
+    stdout: Option<Box<dyn std::io::Write>>,
+    stderr: Option<Box<dyn std::io::Write>>,
+    before_save: Option<Box<dyn FnOnce()>>,
+}
+
+/// A test build runs the calling thread's [`ProxyLoginDoors::before_save`]
+/// edit here: after a login's flow read `done`, before its save.
+#[cfg(test)]
+fn run_before_save_door() {
+    let edit = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.before_save.take())
+    });
+    if let Some(edit) = edit {
+        edit();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROXY_LOGIN_DOORS: std::cell::RefCell<Option<HeldDoors>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_TOKEN_MODE_GUARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_TOKEN_MODE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_DELETE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_delete_claim`] here: after `clauth delete` loaded every
+/// profile, right before it reads the proxy claim, where a `config.toml`
+/// turning unreadable after the load lands.
+#[cfg(test)]
+fn run_before_delete_claim() {
+    if let Some(edit) = BEFORE_DELETE_CLAIM.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `clauth delete` on this thread runs right before its
+/// proxy-claim read.
+#[cfg(test)]
+fn set_before_delete_claim(edit: impl FnOnce() + 'static) {
+    BEFORE_DELETE_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_token_mode_guard`] here: after `static-token`'s, its
+/// `--clear`'s and `rolling-token`'s snapshot (the clear's prompt included),
+/// right before their rotation guard.
+#[cfg(test)]
+fn run_before_token_mode_guard() {
+    if let Some(edit) = BEFORE_TOKEN_MODE_GUARD.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `static-token`, `static-token --clear` or
+/// `rolling-token` on this thread runs right before its rotation guard.
+#[cfg(test)]
+fn set_before_token_mode_guard(edit: impl FnOnce() + 'static) {
+    BEFORE_TOKEN_MODE_GUARD.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_token_mode_landing`] here: after `static-token`'s and
+/// `rolling-token`'s read under their rotation guard, right before their stage
+/// landing, where a record the landing's state-flock wait lets in lands.
+#[cfg(test)]
+fn run_before_token_mode_landing() {
+    if let Some(edit) = BEFORE_TOKEN_MODE_LANDING.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `static-token` or `rolling-token` on this thread runs
+/// right before its stage landing.
+#[cfg(test)]
+fn set_before_token_mode_landing(edit: impl FnOnce() + 'static) {
+    BEFORE_TOKEN_MODE_LANDING.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// The proxy login's outside doors for logins run on the calling thread while
+/// this guard lives: [`Self::paste`] answers the paste prompt, and
+/// [`Self::interrupt`] stands in for SIGINT/SIGTERM. Per-thread, so a parallel
+/// test's login never reads them, and `!Send` so it cannot be carried to a
+/// thread it does not serve.
+#[cfg(test)]
+pub(crate) struct ProxyLoginDoors(std::marker::PhantomData<*const ()>);
+
+#[cfg(test)]
+impl ProxyLoginDoors {
+    pub(crate) fn capture_here() -> Self {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            *doors.borrow_mut() = Some(HeldDoors {
+                paste: None,
+                interrupt: None,
+                stdout: None,
+                stderr: None,
+                before_save: None,
+            });
+        });
+        Self(std::marker::PhantomData)
+    }
+
+    /// The sender a code typed at the paste prompt arrives on, for the next
+    /// login on this thread.
+    pub(crate) fn paste(&self) -> std::sync::mpsc::Sender<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.paste = Some(rx);
+            }
+        });
+        tx
+    }
+
+    /// The sender a signal's number arrives on, for the next login on this
+    /// thread.
+    pub(crate) fn interrupt(&self) -> std::sync::mpsc::Sender<i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.interrupt = Some(rx);
+            }
+        });
+        tx
+    }
+
+    /// Where the next login on this thread writes the lines it prints while
+    /// its flow is open, in place of the real stdout.
+    pub(crate) fn stdout(&self, writer: impl std::io::Write + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.stdout = Some(Box::new(writer));
+            }
+        });
+    }
+
+    /// Where the next login on this thread writes the lines it says on
+    /// stderr while it keeps waiting, in place of the real stderr.
+    pub(crate) fn stderr(&self, writer: impl std::io::Write + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.stderr = Some(Box::new(writer));
+            }
+        });
+    }
+
+    /// An edit another writer lands while the next login on this thread sits
+    /// between its flow's `done` and its save.
+    pub(crate) fn before_save(&self, edit: impl FnOnce() + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.before_save = Some(Box::new(edit));
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProxyLoginDoors {
+    fn drop(&mut self) {
+        PROXY_LOGIN_DOORS.with(|doors| *doors.borrow_mut() = None);
+    }
+}
+
 /// `clauth capture <name>`: save the login Claude Code is using now as a new
 /// profile, or into the existing profile `name` when the login is a newer pair
 /// of its account. The refusal paths (an existing name the login does not
@@ -1670,7 +2399,7 @@ fn console_login_into(
     model: Option<&str>,
     trip: impl FnOnce(profile::ConsoleSite, &'static str) -> Result<alibaba_login::ConsoleLoginOutcome>,
 ) -> Result<alibaba_login::ConsoleLoginOutcome> {
-    let account = profile::claim_profile_id(target)?;
+    let account = actions::claim_off_proxy(target)??;
     let base_url = profile::read_claimed_profile(target, &account)?
         .base_url
         .unwrap_or_default();
@@ -1696,7 +2425,7 @@ fn reauth_profile(
     confirm: impl FnOnce(&Profile) -> Result<bool>,
     collect: impl FnOnce(&Profile) -> Result<actions::CaptureSnapshot>,
 ) -> Result<Option<AppConfig>> {
-    let account = profile::claim_profile_id(target)?;
+    let account = actions::claim_off_proxy(target)??;
     if !confirm(&profile::read_claimed_profile(target, &account)?)? {
         return Ok(None);
     }
@@ -1822,7 +2551,7 @@ fn setup_token_into(
     collect: impl FnOnce() -> Result<String>,
 ) -> Result<Option<i64>> {
     let claimed = if exists {
-        Some(profile::claim_profile_id(target)?)
+        Some(actions::claim_off_proxy(target)??)
     } else {
         None
     };
@@ -1864,12 +2593,14 @@ fn setup_token_into(
         // The writers take the flock again inside this hold, so the id check
         // and the write it guards are one section.
         Some(account) => crate::lock::with_state_lock(|held| {
+            actions::refuse_relogin_off_proxy(target)?;
             profile::require_profile_id(target, account, held)?;
             write()
         })?,
         // Created just above, with no wait since.
         None => write()?,
     };
+    // After the write, whose proxy refusal must leave the model untouched too.
     if let (Some(account), Some(model)) = (&claimed, model) {
         actions::set_profile_default_model(&mut config, target, account, model)?;
     }
@@ -1925,6 +2656,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let profile = config
         .find(target)
         .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
+    actions::refuse_token_mode_on_proxy(profile)?;
     let sidecar_present = claude::session_token_status(target).is_some();
     let backup_present = claude::has_static_backup(target);
     let rolling_armed = profile.rolling_token;
@@ -2011,8 +2743,14 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
     // just reported cleared.
+    #[cfg(test)]
+    run_before_token_mode_guard();
     let guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    // The refusal above read a snapshot from before the prompt and this wait:
+    // a record that landed since is refused on a read under the guard, before
+    // anything of the account moves.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(target)?)?;
     // The relink below puts the store in front of Claude Code: a staged pair
     // lands first.
     oauth::land_stage_for_install(target, &guard)
@@ -2023,6 +2761,9 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // during it — acting on the pre-prompt `active` relinks the wrong world
     // in both directions.
     let on_disk = profile::load_profile(target)?;
+    // Asked again on this read, as the TUI clear does: the record's writer
+    // takes no rotation guard, so it can land during the landing.
+    actions::refuse_token_mode_on_proxy(&on_disk)?;
     let sidecar_present = claude::session_token_status(target).is_some();
     let backup_present = claude::has_static_backup(target);
     // The pre-prompt "nothing to clear" re-checks here on the same three facts:
@@ -2304,14 +3045,53 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!("{}", codex_collision_note(&canonical, "deletes"));
     }
-    if !confirm_profile_delete(&canonical, yes)? {
+    #[cfg(test)]
+    run_before_delete_claim();
+    // A `[proxy]` table clauth cannot read still names an upstream account,
+    // and a config.toml clauth cannot classify may hold one: deleting the
+    // profile alone would orphan it on the proxy, so refuse before the
+    // confirm, deleting nothing.
+    let proxy = match crate::profile::stored_proxy_claim_failing_closed(&canonical) {
+        crate::profile::ProxyClaim::Account(record) => Some(record),
+        crate::profile::ProxyClaim::None => None,
+        crate::profile::ProxyClaim::Unreadable => {
+            return Err(actions::unreadable_proxy_record(&canonical));
+        }
+        crate::profile::ProxyClaim::Unclassifiable => {
+            return Err(actions::unclassifiable_proxy_config(&canonical));
+        }
+    };
+    if !confirm_profile_delete(&canonical, proxy.as_ref(), yes)? {
         return Ok(());
     }
     let was_active = config.is_active(&canonical);
-    // Deleting the active profile signs the live slot out.
+    // Deleting the active profile signs the live slot out. Settled ahead of a
+    // proxy account's upstream delete, so a refused or cancelled settle
+    // deletes nothing anywhere.
     #[cfg(target_os = "macos")]
     let _placed =
         settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::SignOut)?;
+    // A proxy account deletes through its proxy: every local refusal is
+    // decided first, then the proxy deletes the account (unreachable →
+    // refuse naming it, deleting NOTHING), then the profile goes
+    // ([`actions::delete_proxy_profile`]).
+    if let Some(record) = proxy {
+        let rotation = actions::rotation_guard_for_mutation(&canonical)?;
+        actions::delete_proxy_profile(&mut config, &canonical, force, &rotation, &record)?;
+        if was_active {
+            outln!(
+                "clauth: deleted profile '{canonical}' and its account on proxy {:?} (was \
+                 active; live credentials cleared).",
+                record.service.as_str()
+            );
+        } else {
+            outln!(
+                "clauth: deleted profile '{canonical}' and its account on proxy {:?}.",
+                record.service.as_str()
+            );
+        }
+        return Ok(());
+    }
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
     actions::delete_profile(&mut config, &canonical, force, &rotation)?;
     if was_active {
@@ -2325,7 +3105,11 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
 /// The `delete` confirm gate, one spelling for both harnesses: refuse a
 /// promptless non-TTY delete, prompt on a TTY, `--yes` skips. `Ok(false)` is
 /// the clean abort.
-fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
+fn confirm_profile_delete(
+    canonical: &str,
+    proxy: Option<&crate::profile::ProxyAccount>,
+    yes: bool,
+) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -2335,7 +3119,7 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
             "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
         );
     }
-    out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+    out!("{}", delete_prompt(canonical, proxy));
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     if !reauth_confirmed(&answer) {
@@ -2343,6 +3127,20 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The delete's confirm question. A proxy account's names the upstream half
+/// too: `--yes` there also deletes the account on the proxy, which drops its
+/// provider login.
+fn delete_prompt(canonical: &str, proxy: Option<&crate::profile::ProxyAccount>) -> String {
+    match proxy {
+        None => format!("clauth: delete profile '{canonical}' and all its credentials? [y/N] "),
+        Some(record) => format!(
+            "clauth: delete profile '{canonical}', its credentials, and its account on proxy \
+             {:?} (this also signs that account out of its provider)? [y/N] ",
+            record.service.as_str()
+        ),
+    }
 }
 
 /// The CLI's `--force` tail on the codex live-session refusal: the typed
@@ -2370,7 +3168,7 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
     let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
         return Err(unknown_profile_error(config, name));
     };
-    if !confirm_profile_delete(&canonical, yes)? {
+    if !confirm_profile_delete(&canonical, None, yes)? {
         return Ok(());
     }
     let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
@@ -2555,6 +3353,13 @@ fn cmd_switch(name: &str) -> Result<()> {
 fn cmd_rolling_token(name: &str) -> Result<()> {
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "rolling-token")?;
+    // Unreachable by contract — `resolve_or_bail` just proved membership — so
+    // this arm is a defensive seam, not a user-facing path (the user-facing
+    // not-found already exited 2 above).
+    let Some(profile) = config.find(&canonical) else {
+        anyhow::bail!("profile '{canonical}' vanished between resolve and read");
+    };
+    actions::refuse_token_mode_on_proxy(profile)?;
     // Same gate `start` and `switch` take. A disabled profile is off every
     // operational surface, the re-stamp timer included, so arming one produces
     // a bearer that dies in hours with nothing behind it. The shared pre-arm
@@ -2590,7 +3395,8 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     };
     // Above the arm, whose gate refreshes the chain an unsaved bare-item
     // login may have succeeded, and before the arm half below can touch the
-    // flag, so a refused settle leaves nothing to roll back.
+    // flag, so a refused settle leaves nothing to roll back. Above the guard
+    // too: the settle takes no lock of ours.
     #[cfg(target_os = "macos")]
     let mut config = config;
     #[cfg(target_os = "macos")]
@@ -2798,6 +3604,9 @@ fn cmd_static_token(name: &str) -> Result<()> {
     )]
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "static-token")?;
+    if let Some(profile) = config.find(&canonical) {
+        actions::refuse_token_mode_on_proxy(profile)?;
+    }
     // An active profile is relinked below; the settle takes no lock of ours.
     #[cfg(target_os = "macos")]
     let _placed = {
@@ -2813,12 +3622,24 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // Arriving at the error means the lock file could not be created or opened
     // — a filesystem or permissions problem under `~/.clauth` — and the
     // original error says which, so it is kept rather than replaced.
+    #[cfg(test)]
+    run_before_token_mode_guard();
     let guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // The refusal above read a snapshot from before this wait: a record that
+    // landed since is refused on a read under the guard, before anything of
+    // the account moves.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(&canonical)?)?;
     // The relink below puts the install source in front of Claude Code, the
     // store whenever the mint does not restore: a staged pair lands first.
+    #[cfg(test)]
+    run_before_token_mode_landing();
     oauth::land_stage_for_install(&canonical, &guard)
         .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
+    // Asked again after the landing, as the clear does: the record's writer
+    // takes no rotation guard, so it can land during the landing, and every
+    // write below follows this read.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(&canonical)?)?;
     // Flag OFF first, before the restore is known to land — DELIBERATE, and
     // load-bearing for every bail arm below, none of which rolls it back. The
     // command's primary effect is the disarm: with the flag still on, the
@@ -3392,6 +4213,7 @@ fn limit_reset_claude(
 ) -> Result<()> {
     use usage::claude_reset as reset;
     use usage::limit_reset_pending as pending;
+    actions::refuse_limit_reset_on_proxy(profile)?;
     let canonical = &profile.name;
     // A profile clauth holds no claude login for has nothing to spend; a
     // quarantined chain refuses the way every other claude surface does.

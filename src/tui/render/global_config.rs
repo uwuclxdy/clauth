@@ -69,7 +69,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
             auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
-            any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
+            any_auto_start: cfg.profiles.iter().any(|p| p.has_effective_auto_start()),
             reset_display: state.reset_display(),
             clock_format: state.clock_format(),
             home_tab: state.home_tab(),
@@ -248,7 +248,8 @@ struct RowState {
     auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
-    /// Whether ANY account has opted into `auto_start` — the queue toggle is
+    /// Whether ANY account's `auto_start` opts it in
+    /// ([`crate::profile::Profile::has_effective_auto_start`]) — the queue toggle is
     /// inert without one (there is nothing to space), so the row dims and its
     /// key no-ops, like every other row another setting makes inert.
     any_auto_start: bool,
@@ -592,7 +593,8 @@ fn detail_row(
                 selected,
             )]
         }
-        // Inert until some account opts into `auto_start` (rendered dimmed):
+        // Inert until some account's `auto_start` opts it in, which a proxy
+        // account's never does (rendered dimmed):
         // a queue with no possible member spaces nothing, so it stays a true
         // disabled row — the key is a no-op, and `faint` never decouples from
         // "not editable" (the `extra usage spent` contract above).

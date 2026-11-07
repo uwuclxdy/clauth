@@ -219,10 +219,11 @@ fn dated_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
 /// it before every delegate. `stale` still rides — a stale row costs a wrong
 /// routing decision rather than a slow one — and because the figure it dates
 /// lives in this same object, it renders beside that figure rather than beside a
-/// structural none.
+/// structural none. Being a routing flag, it reads a proxy account's chain
+/// windows ([`ProfileWindows::routing_stale`]).
 fn row_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
     let mut payload = windows_payload(windows);
-    if windows.stale() {
+    if windows.routing_stale() {
         payload["stale"] = serde_json::json!(true);
     }
     payload
@@ -314,11 +315,10 @@ fn profile_row(
     if !warnings.is_empty() {
         row["throughput"] = serde_json::Value::Array(warnings);
     }
-    // A third-party profile with no inference auth source is a delegate target
-    // that refuses at the spawn gate, so this flags it before the picker spends
-    // the call. The predicate is the delegate guard's own, not the usage
-    // predicate — see `preflight_target`.
-    if p.is_third_party() && !crate::claude::has_inference_auth(p) {
+    // A keyless account is a delegate target that refuses at the spawn gate,
+    // so this flags it before the picker spends the call. The predicate is the
+    // delegate guard's own, not the usage predicate — see `preflight_target`.
+    if p.is_keyless() {
         row["keyless"] = serde_json::json!(true);
     }
     // A credential the provider already refused — a third-party api KEY, or a
@@ -4418,6 +4418,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         opts.profile,
         &session_id,
         dead_key_fp,
+        target.proxy.as_ref().map(|record| &record.service),
     ) {
         RunOutcome::Exited {
             envelope,
@@ -4525,8 +4526,8 @@ enum RunOutcome {
 }
 
 /// The classifier the inline tests pose directly: a shared run with no
-/// `--agent`, the shape whose failure reason never gains the isolated-agent
-/// clause. The spawn path classifies through [`classify_run_with`]. Unix-only
+/// `--agent` on an account with no proxy claim, the shape whose failure reason
+/// never gains the isolated-agent clause. The spawn path classifies through [`classify_run_with`]. Unix-only
 /// because every caller builds an `ExitStatus` through
 /// `ExitStatusExt::from_raw`.
 #[cfg(all(test, unix))]
@@ -4547,11 +4548,13 @@ fn classify_run(
         profile,
         session_id,
         dead_key_fp,
+        None,
     )
 }
 
 /// [`classify_run`] carrying the run's own isolation and `--agent` spelling:
-/// the two facts the isolated-agent clause keys on, known only at the spawn.
+/// the two facts the isolated-agent clause keys on, known only at the spawn;
+/// and the target's proxy service, which the dead-key clause's fix names.
 #[allow(clippy::too_many_arguments)]
 fn classify_run_with(
     isolation: Isolation,
@@ -4562,6 +4565,7 @@ fn classify_run_with(
     profile: &str,
     session_id: &str,
     dead_key_fp: Option<u64>,
+    proxy: Option<&crate::proxy::Service>,
 ) -> RunOutcome {
     let stdout = capture.envelope_src();
     let stderr = String::from_utf8_lossy(stderr_bytes);
@@ -4586,7 +4590,7 @@ fn classify_run_with(
             reason.push_str(&clause);
         }
         if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
-            reason.push_str(&dead_key_clause(profile));
+            reason.push_str(&dead_key_clause(profile, proxy));
         }
         if let Some(clause) = isolated_agent_clause(isolation, subagent_type, &stderr) {
             reason.push_str(&clause);
@@ -4614,7 +4618,7 @@ fn classify_run_with(
                 reason.push_str(&clause);
             }
             if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
-                reason.push_str(&dead_key_clause(profile));
+                reason.push_str(&dead_key_clause(profile, proxy));
             }
             RunOutcome::Unparseable(
                 salvage_envelope(profile, reason, capture, Some(session_id)),
@@ -4879,18 +4883,19 @@ fn delegate_families(
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
-/// operator disabled, a recognised third-party profile whose inference has
-/// nothing to authenticate with (which
-/// would spawn a `claude` that dies on an empty envelope), an api-key profile
-/// (recognised or generic) whose key the provider already refused, an OAuth
-/// account whose setup token it refused that the account's sessions run on, or
-/// a quarantined one with nothing but that dead chain to authenticate with. The keyless test is
+/// operator disabled, a profile whose inference needs a key it does not
+/// carry, which would spawn a `claude` that dies on an empty envelope
+/// ([`Profile::is_keyless`]: a recognised provider, or a proxy account on its
+/// bind), an api-key profile (recognised or generic) whose key the provider
+/// already refused, an OAuth account whose setup token it refused that the
+/// account's sessions run on, or a quarantined one with nothing but that dead
+/// chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
 /// predicate `third_party_credentialed`, whose Alibaba exemption reads the
-/// console session that authenticates the quota gateway only. `is_third_party`
-/// scopes the check: an OAuth account has no provider.
+/// console session that authenticates the quota gateway only. `is_keyless`
+/// scopes the check: an OAuth account needs no key.
 ///
 /// A refusal a command can fix names that command, because the reader is a
 /// model that can run it: an unnamed one costs a turn to look up.
@@ -4908,7 +4913,7 @@ fn delegate_families(
 /// the exemption is for an account that demonstrably routes and authenticates
 /// on its own, never a judgement that the others have nothing. The keyless arm
 /// sits ABOVE it and is load-bearing
-/// there: a keyless third-party target fails that predicate too, and must be
+/// there: a keyless target fails that predicate too, and must be
 /// told about the key rather than sent to a browser login.
 ///
 /// Called from every path that refuses before a spawn: the single-background
@@ -4938,8 +4943,9 @@ fn preflight_target(
     // stopped by the missing key, and a key is what its fix has to name. The
     // quarantine sentence below would send it to a browser login that leaves
     // the key missing.
-    if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-        return Err(crate::format::third_party_keyless(name));
+    let proxy = profile.proxy.as_ref().map(|record| &record.service);
+    if profile.is_keyless() {
+        return Err(crate::format::third_party_keyless(name, proxy));
     }
     // After the keyless arm (a profile with no credential has none to reject)
     // and before quarantine: its browser-login fix leaves the refused
@@ -4948,7 +4954,7 @@ fn preflight_target(
         return Err(if crate::usage::dead_login_is_setup_token(profile) {
             crate::format::setup_token_rejected(name)
         } else {
-            crate::format::api_key_rejected(name)
+            crate::format::api_key_rejected(name, proxy)
         });
     }
     // A quarantined target whose own endpoint and credential serve inference
@@ -4959,9 +4965,13 @@ fn preflight_target(
     // whether inference works against it. What is left is the account with
     // nothing but the dead chain, refused with `switch`'s own sentence
     // (`actions.rs`, its AUTH-1 arm) so the two surfaces cannot spell that
-    // quarantine two ways.
+    // quarantine two ways. A proxy account takes no browser login, so it is
+    // told the quarantine's own copy, which names the login through its proxy.
     if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
-        return Err(crate::format::login_expired(name).line());
+        return Err(
+            crate::oauth::third_party_dead_chain_copy(Some(profile), name)
+                .unwrap_or_else(|| crate::format::login_expired(name).line()),
+        );
     }
     // The provider's own verdict, not clauth's guess at a figure: the freshest
     // cached third-party stats say this account cannot fund a call, so the
@@ -4969,11 +4979,16 @@ fn preflight_target(
     // setup spend. A missing cache is no verdict — an OAuth member, or a
     // provider clauth has never fetched for — and passes. The age rides so a
     // reader can discount a verdict the provider's next fetch may replace.
-    // Bounded to third-party profiles: a hand-edited config can strand a
-    // stale verdict on a profile that no longer runs third-party, where no
-    // fetch leg would ever refresh it away, and the guard keeps that file
-    // inert here the way it was before this arm existed.
-    if profile.is_third_party()
+    // Bounded to the accounts whose usage leg writes that verdict: a
+    // recognised provider, and a proxy account (its `[proxy]` record) the leg
+    // polls — the leg's own credential test, so a keyless one is out — whose
+    // leg rewrites the cache on every read that lands: the proxy arm, or the
+    // generic arm polling the same bind while the proxy has no registry row.
+    // A hand-edited config can strand a stale verdict on a profile outside
+    // both, where no fetch leg would ever refresh it away, and the guard keeps
+    // that file inert there the way it was before this arm existed.
+    if (profile.is_third_party()
+        || (profile.proxy.is_some() && crate::usage::third_party_credentialed(profile)))
         && let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
         && !stats.is_available
     {
@@ -6309,12 +6324,18 @@ fn dead_key_fingerprint(scan: &str, fp: Option<u64>) -> Option<u64> {
 
 /// The reply clause for a proven dead key. The provider's words here ARE the
 /// final verdict — unlike a 402, nothing re-checks — so the clause states the
-/// invalidation that ran and the fix, never a re-check.
-fn dead_key_clause(name: &str) -> String {
+/// invalidation that ran and the fix, never a re-check. A proxy account's key
+/// is the proxy's to mint (`proxy` is its service), so its fix is the one
+/// login clauth takes for it.
+fn dead_key_clause(name: &str, proxy: Option<&crate::proxy::Service>) -> String {
+    let login = match proxy {
+        Some(service) => crate::actions::proxy_login_command(name, service),
+        None => format!("clauth login {name} --api-key"),
+    };
     format!(
         ". the provider refused this run (401) naming the api key invalid; clauth dropped \
          this account's cached balance — `profiles` shows no figure for '{name}' until the \
-         key is re-captured (`clauth login {name} --api-key`)"
+         key is re-captured (`{login}`)"
     )
 }
 
@@ -6346,8 +6367,9 @@ fn isolated_agent_clause(
 /// cache IO, no lock taken. `fp` is the run's credential fingerprint
 /// ([`profile_credential_fingerprint`]); the dead-key record is keyed on the
 /// stored key alone, written only while the stored credential is still `fp`'s.
-/// Only a live body from a fetch that sent the key clears the records, and a
-/// re-captured key leaves them inert (`profile_cache.rs`'s contract).
+/// A live body from a fetch that sent the key or a proxy re-login's saved key
+/// clears the records, and a re-captured key leaves them inert
+/// (`profile_cache.rs`'s contract).
 fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64>) {
     // Gate on the third-party identity the delegate was launched with: a dead
     // key fired for the OLD key must not drop a NEW key's cache. An identity
@@ -6969,6 +6991,10 @@ mod profiles_tool_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_format.rs"]
 mod format_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6_delegate.rs"]
+mod proxy_p6_delegate_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_delegate_args.rs"]

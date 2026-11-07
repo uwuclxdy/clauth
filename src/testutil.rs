@@ -1144,12 +1144,14 @@ pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     std::fs::create_dir(&path).expect("block the credentials path with a directory");
 }
 
-/// Make `dir` refuse to create or write files for the guard's lifetime, so a
-/// test can drive a save failure without root: on Unix the dir's mode drops to
-/// 0o500 (no write bit), on Windows a deny ACE for Everyone removes add-file /
-/// add-subdir (`(WD,AD)`). The constructor probes a real write so a fault that
-/// never bites fails by name instead of greening the test; `Drop` restores
-/// best-effort and never asserts.
+/// Make `dir` refuse to create files for the guard's lifetime, so a test can
+/// drive a save failure without root: on Unix the dir's mode drops to 0o500
+/// (no write bit), on Windows a deny ACE for Everyone (`(WD,AD)`) refuses a
+/// new file. Windows still lets a new subdirectory through it (CI's
+/// `windows-latest`, 2026-10-21), so a fault a test poses is a new FILE. The
+/// constructor probes a real file write so a fault that never bites fails by
+/// name instead of greening the test; `Drop` restores best-effort and never
+/// asserts.
 #[cfg(test)]
 pub(crate) struct UnwritableDir {
     path: PathBuf,
@@ -2059,6 +2061,8 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 

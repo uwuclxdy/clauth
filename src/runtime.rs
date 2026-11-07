@@ -13170,8 +13170,9 @@ fn refusal_line(session: &str, current: &str, intended: &str, why: &SwapRefused)
 /// What [`drain_session_login`] did with a session's runtime credential file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drain {
-    /// Nothing to drain, or the file's login was judged and the session
-    /// relinked with the store's login unchanged.
+    /// Nothing to drain, the file's login was judged and the session
+    /// relinked with the store's login unchanged, or the file holds a login
+    /// a proxy account's store never takes and stays the session's.
     Unchanged,
     /// A session-side login of a changed account reached the store, and the
     /// session was relinked.
@@ -13209,6 +13210,11 @@ fn drain_session_login(link_path: &Path, canonical: &Path) -> Result<Drain> {
     }
     let canonical_bytes = std::fs::read(canonical).ok();
     let differs = canonical_bytes.as_deref() != Some(runtime_bytes.as_slice());
+    // Before the relink below: with no store behind a proxy account it would
+    // delete the file, dropping the session's login mid-session.
+    if differs && keeps_login_off_proxy_store(link_path.parent(), canonical, &runtime_creds) {
+        return Ok(Drain::Unchanged);
+    }
     // CLA-SPLIT: a static session token never rotates, so a differing runtime
     // file is a session-side re-login — never adopt it over the token (that
     // would clobber the long-lived login with a rotating chain). Keep
@@ -13310,6 +13316,40 @@ fn drain_session_login(link_path: &Path, canonical: &Path) -> Result<Drain> {
     } else {
         Drain::Unchanged
     })
+}
+
+/// Whether `login`, which a session's Claude Code left in its config dir
+/// `config_dir` (the credentials file, or on macOS the per-session Keychain
+/// item), stays out of `canonical`, the store of a proxy account
+/// ([`crate::claude::adopt_skips_proxy_account`]). A skip writes and relinks
+/// nothing: the login stays where Claude Code left it until a swap away
+/// replaces it with the incoming member's login or the session ends. The
+/// not-saved warning goes out once per login, and never for a logged-out
+/// shell ([`crate::claude::live_login_is_empty`]), which signed nobody in.
+pub(crate) fn keeps_login_off_proxy_store(
+    config_dir: Option<&Path>,
+    canonical: &Path,
+    login: &ClaudeCredentials,
+) -> bool {
+    let claim = crate::profile::proxy_claim_beside_failing_closed(canonical);
+    if claim == crate::profile::ProxyClaim::None {
+        return false;
+    }
+    let account = canonical
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| ProfileName::from(name.to_string_lossy().into_owned()));
+    if let (Some(account), Some(config_dir)) = (account, config_dir)
+        && !crate::claude::live_login_is_empty(login)
+        && let Some(warning) = crate::claude::unsaved_proxy_login_warning(
+            &account,
+            &claim,
+            crate::claude::UnsavedLogin::in_config_dir(config_dir, login),
+        )
+    {
+        logline!("clauth: {warning}");
+    }
+    true
 }
 
 /// Decide whether to keep the canonical credentials instead of adopting the
@@ -13568,6 +13608,12 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<bool> {
             && let Ok(bytes) = std::fs::read(runtime_path)
             && let Ok(runtime_creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes)
         {
+            if runtime_creds.claude_ai_oauth.is_some()
+                && std::fs::read(canonical).ok().as_deref() != Some(bytes.as_slice())
+                && keeps_login_off_proxy_store(runtime_path.parent(), canonical, &runtime_creds)
+            {
+                return Ok(false);
+            }
             match crate::oauth::session_login_copy(canonical, &runtime_creds) {
                 crate::oauth::SessionLoginCopy::Copyable
                     if crate::profile::chain_holder_elsewhere(canonical, &runtime_creds)?

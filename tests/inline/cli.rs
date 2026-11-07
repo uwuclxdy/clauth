@@ -7741,6 +7741,318 @@ mod static_token_landers {
         assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
         assert!(!dir.join("credentials.json.staged").exists());
     }
+
+    /// The bytes of each file [`verb_files`] reads, `None` for an absent one.
+    type VerbFiles = Vec<Option<Vec<u8>>>;
+
+    /// Every file of the profile a static-token verb could move.
+    fn verb_files(dir: &std::path::Path) -> VerbFiles {
+        [
+            "credentials.json.staged",
+            "credentials.json",
+            "config.toml",
+            "session-token.json",
+            "session-token.static.json",
+        ]
+        .map(|file| std::fs::read(dir.join(file)).ok())
+        .to_vec()
+    }
+
+    /// Arm the edit the next token-mode verb runs right before its rotation
+    /// guard: write `name`'s `[proxy]` record there, then snapshot the
+    /// profile's files into the returned cell.
+    fn record_lands_before_the_guard(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        record_lands(crate::set_before_token_mode_guard, name, dir)
+    }
+
+    /// [`record_lands_before_the_guard`] for the edit the next token-mode verb
+    /// runs under its guard, after its read there and right before its stage
+    /// landing.
+    fn record_lands_before_the_landing(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        record_lands(crate::set_before_token_mode_landing, name, dir)
+    }
+
+    fn record_lands(
+        arm: fn(Box<dyn FnOnce()>),
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (cell, name, dir) = (snapshot.clone(), name.to_string(), dir.to_path_buf());
+        arm(Box::new(move || {
+            crate::profile::write_proxy_record(
+                &crate::profile::ProfileName::from(name.as_str()),
+                &crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-1".to_string(),
+                },
+            )
+            .expect("write the record");
+            *cell.borrow_mut() = Some(verb_files(&dir));
+        }));
+        snapshot
+    }
+
+    fn outcome(result: anyhow::Result<()>) -> Result<(), (String, i32)> {
+        result.map_err(|e| {
+            (
+                format!("{e:#}"),
+                crate::exit_code_to(Err(e), &mut Vec::new()),
+            )
+        })
+    }
+
+    /// `clauth static-token --clear` re-reads the account under its rotation
+    /// guard: a `[proxy]` record that landed after the snapshot its first
+    /// refusal read (past the prompt `--yes` skips) refuses at exit 2 with the
+    /// token-mode sentence, and the stage, the store, the flag, the sidecar and
+    /// the preserved mint stay byte for byte.
+    #[test]
+    fn the_clear_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-clear-px", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-clear-px"),
+            "sk-ant-oat01-chain-land-clear-px-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_guard("land-clear-px", &dir);
+
+        let result = outcome(cmd_static_token_clear("land-clear-px", true));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-clear-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the clear as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// `clauth static-token` re-reads the account under its rotation guard: a
+    /// `[proxy]` record that landed while it waited for the guard refuses at
+    /// exit 2 with the token-mode sentence, and the stage, the store, the flag,
+    /// the sidecar and the preserved mint stay byte for byte.
+    #[test]
+    fn the_restore_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-restore-px", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-restore-px"),
+            "sk-ant-oat01-chain-land-restore-px-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_guard("land-restore-px", &dir);
+
+        let result = outcome(cmd_static_token("land-restore-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-restore-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the restore as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// `clauth static-token` re-reads the account after its stage landing: a
+    /// `[proxy]` record landing past its read under the guard, while the
+    /// landing waits for the state flock, keeps the stage, and the restore
+    /// then refuses at exit 2 with the token-mode sentence before its flag
+    /// flip, its mint restore and its relink.
+    #[test]
+    fn the_restore_refuses_a_proxy_record_landing_before_its_landing_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-restore-lp", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-restore-lp"),
+            "sk-ant-oat01-chain-land-restore-lp-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_landing("land-restore-lp", &dir);
+
+        let result = outcome(cmd_static_token("land-restore-lp"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-restore-lp' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the restore as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// A staged account `clauth rolling-token` would arm off its stored chain
+    /// with no refresh: the stage's pair is comfortably live and plan-stamped,
+    /// beside a preserved mint the arm would supersede.
+    fn rolling_profile(name: &str) -> std::path::PathBuf {
+        let dir = staged_profile(name, false);
+        std::fs::write(
+            dir.join("credentials.json.staged"),
+            r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+                "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                         "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+        )
+        .expect("write the stage");
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from(name),
+            &format!("sk-ant-oat01-chain-{name}-mint"),
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        dir
+    }
+
+    /// `clauth rolling-token` re-reads the account under its rotation guard: a
+    /// `[proxy]` record that landed after its snapshot refuses at exit 2 with
+    /// the token-mode sentence, and the stage, the store, the flag, the sidecar
+    /// and the preserved mint stay byte for byte.
+    #[test]
+    fn the_rolling_arm_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-guard-px");
+        let landed = record_lands_before_the_guard("roll-guard-px", &dir);
+
+        let result = outcome(cmd_rolling_token("roll-guard-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'roll-guard-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the arm as (text, exit), every file was there when the record landed, each kept \
+             byte for byte)"
+        );
+    }
+
+    /// `clauth rolling-token` re-reads the account after its stage landing: a
+    /// `[proxy]` record landing past its read under the guard keeps the stage,
+    /// and the arm then refuses at exit 2 with the token-mode sentence before
+    /// its flag write and the arm itself, each file as the record found it.
+    #[test]
+    fn the_rolling_arm_refuses_a_proxy_record_landing_before_its_landing_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-land-px");
+        let landed = record_lands_before_the_landing("roll-land-px", &dir);
+
+        let result = outcome(cmd_rolling_token("roll-land-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'roll-land-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the arm as (text, exit), every file was there when the record landed, each kept \
+             byte for byte)"
+        );
+    }
+
+    /// The rolling fixture's plain twin: with no record anywhere the same arm
+    /// lands the stage and stamps a rolling bearer over the mint, so the
+    /// refusals above are what kept those files.
+    #[test]
+    fn the_rolling_arm_lands_the_stage_and_stamps_a_plain_account() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-plain");
+        let sidecar = std::fs::read(dir.join("session-token.json")).expect("the mint");
+
+        cmd_rolling_token("roll-plain").expect("the arm succeeds");
+
+        assert_eq!(
+            (
+                store_refresh(&dir).as_deref(),
+                dir.join("credentials.json.staged").exists(),
+                std::fs::read(dir.join("session-token.json")).ok() == Some(sidecar),
+                crate::profile::load_profile(&crate::profile::ProfileName::from("roll-plain"))
+                    .expect("reload")
+                    .rolling_token,
+            ),
+            (Some("rt-mid"), false, false, true),
+            "(the store's refresh token, the stage still there, the sidecar unchanged, the flag)"
+        );
+    }
 }
 
 // ── limit-reset, a spend whose reply was lost ───────────────────────────────────

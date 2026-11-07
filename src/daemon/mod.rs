@@ -20,6 +20,10 @@ pub(crate) mod log_rotate;
 mod probe;
 pub(crate) mod proxies;
 mod status_json;
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6_feed.rs"]
+pub(crate) mod proxy_p6_feed_tests;
 mod tick;
 mod types;
 
@@ -1214,6 +1218,13 @@ fn entry_fresh(entry: &status_json::ProfileEntry) -> bool {
     !entry.stale && entry.fetch_status.as_deref() == Some(fresh)
 }
 
+/// [`entry_fresh`] as the 5h bell and the window push judge it: a proxy
+/// member's freshness is its chain windows' (`alert_stale`).
+fn entry_alert_fresh(entry: &status_json::ProfileEntry) -> bool {
+    let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+    !entry.alert_stale && entry.fetch_status.as_deref() == Some(fresh)
+}
+
 /// What a background hold keys on: the account's fixed pair, or one handed-off
 /// per-launch tree by its sid. The two coexist on one account and never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2396,7 +2407,7 @@ impl Daemon {
                 // follows that line too").
                 util: long_util(entry),
             },
-            fresh: entry_fresh(entry),
+            fresh: entry_alert_fresh(entry),
         });
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its latches must
@@ -2419,7 +2430,8 @@ impl Daemon {
     }
 
     /// The headless half of the 5h bell, judged on the figures this tick just
-    /// published so the bell and the feed never disagree. With no
+    /// published so the bell and the feed never disagree about a figure; a
+    /// proxy member's freshness is its chain windows' (`alert_stale`). With no
     /// `bell_command` a present account keeps its latch as it is, so setting
     /// one mid-crossing does not re-announce a bell already rung; a deleted
     /// account is forgotten either way.
@@ -2438,7 +2450,7 @@ impl Daemon {
         self.bells.forget_absent(&present);
         let Some(command) = command else { return };
         for entry in entries {
-            let fresh = entry_fresh(entry);
+            let fresh = entry_alert_fresh(entry);
             let util = entry
                 .windows
                 .iter()

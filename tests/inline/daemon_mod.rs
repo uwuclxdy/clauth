@@ -1661,6 +1661,61 @@ fn drain_pending_switch_off_strips_the_outgoing_oauth_account() {
     );
 }
 
+/// The daemon's wrap-off over an account whose `config.toml` turned
+/// unclassifiable after it loaded, holding a first login, is held: the login
+/// stays in `~/.claude`, the account stays active, and the line goes out once
+/// per login however often the scheduler queues the switch-off.
+#[test]
+fn a_spent_chain_holds_the_daemon_switch_off_over_an_unclassifiable_first_login() {
+    use crate::claude::tests::Unclassifiable;
+    let mut outcomes = Vec::new();
+    for (i, shape) in Unclassifiable::BOTH.into_iter().enumerate() {
+        let _home = HomeSandbox::new();
+        let config = persist(
+            vec![blank_profile(&crate::profile::ProfileName::from("alpha"))],
+            Some("alpha"),
+            90_000,
+        );
+        crate::testutil::write_live_creds(&oauth_creds(&format!("at-hold-daemon-{i}")));
+        let live_path = crate::claude::claude_credentials_path().unwrap();
+        let live = std::fs::read(&live_path).unwrap();
+        let mut daemon = daemon_for(config);
+        shape.pose("alpha");
+
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        for _ in 0..2 {
+            *daemon
+                .pending_switch_off
+                .lock()
+                .expect("pending_switch_off") = true;
+            daemon.drain_pending_switch_off();
+        }
+        drop(capture);
+
+        outcomes.push((
+            active_of(&daemon),
+            std::fs::read(&live_path).ok() == Some(live),
+            lines.snapshot(),
+        ));
+    }
+    let held = (
+        Some("alpha".to_string()),
+        true,
+        vec![
+            "clauth daemon: switch-off failed: can't read the config of 'alpha', so clauth can't \
+             tell whether Claude Code's current login belongs in it; fix its config.toml, and \
+             clauth switches off at its next check"
+                .to_string(),
+        ],
+    );
+    assert_eq!(
+        outcomes,
+        vec![held.clone(), held],
+        "(active, live login kept, log lines) per shape"
+    );
+}
+
 /// The daemon tick honours a pending strip with no `clauth start` wrapper
 /// running — a deferral lands while the daemon runs. Try-once, never waits: the
 /// tick is the wrapper-free retry path.

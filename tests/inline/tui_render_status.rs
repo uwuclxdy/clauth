@@ -53,6 +53,8 @@ fn oauth(name: &str) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 

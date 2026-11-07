@@ -77,6 +77,8 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -205,6 +207,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -278,6 +282,8 @@ fn profile_without_refresh_token_excluded() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -379,6 +385,8 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -420,6 +428,8 @@ fn third_party_config(name: &str) -> AppConfig {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -1489,6 +1499,51 @@ mod adopt_live_rotation {
         let on_disk: crate::profile::ClaudeCredentials =
             crate::profile::read_json_file(&store).expect("read store");
         assert_eq!(on_disk.refresh_token(), Some("at-rotated-refresh"));
+    }
+
+    /// A fresher same-account mirror is not adopted into a profile whose
+    /// `config.toml` turned unclassifiable after the config loaded (a
+    /// directory in its place, a `[proxy] # note` header that fails to
+    /// parse): the store and memory keep the old pair.
+    #[test]
+    fn adopts_nothing_into_an_account_whose_config_cannot_be_classified() {
+        use crate::claude::tests::Unclassifiable;
+        let outcomes: Vec<_> = Unclassifiable::BOTH
+            .iter()
+            .enumerate()
+            .map(|(i, shape)| {
+                // A home per shape: `setup` stores one login, which a second
+                // profile in the same home may not hold too.
+                let _home = HomeSandbox::new();
+                let name = format!("adopt-unclassified-{i}");
+                let handle = setup(&name, future_expiry(), future_expiry() + 3_600_000);
+                shape.pose(&name);
+                let store = crate::profile::profile_subpath(
+                    &crate::profile::ProfileName::from(name.as_str()),
+                    "credentials.json",
+                )
+                .unwrap();
+                let before = std::fs::read(&store).ok();
+                let adopted = try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name.as_str()),
+                    &guard(&name),
+                    &|_| Some("uuid-1".into()),
+                );
+                (
+                    adopted,
+                    std::fs::read(&store).ok() == before,
+                    stored_access(&handle, &name),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            outcomes,
+            vec![(None, true, "at-old".to_string()); 2],
+            "(the adopted pair, the store kept, memory's access token) for a directory and a \
+             noted header"
+        );
     }
 
     #[test]
@@ -6611,7 +6666,7 @@ fn dead_chain_copy_without_a_verdict_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6646,7 +6701,7 @@ fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6675,7 +6730,7 @@ fn dead_chain_copy_env_token_without_a_key_renders_the_keyless_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_keyless(&profile.name))
+        Some(crate::format::third_party_keyless(&profile.name, None))
     );
 }
 
@@ -6703,7 +6758,7 @@ fn dead_chain_copy_env_carried_api_key_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6788,7 +6843,7 @@ fn dead_chain_copy_alibaba_ignores_a_verdict_for_a_replaced_console() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6820,7 +6875,7 @@ fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -8609,6 +8664,127 @@ fn a_persist_lands_over_a_store_that_is_the_stages_base() {
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
 }
 
+/// What the catch-up's lander did to a live stage over the fixture's store
+/// once `fault` posed the account's `config.toml`: its outcome, whether the
+/// stage and the store are byte for byte what they were, and the store's
+/// refresh token.
+fn land_over_config(
+    name: &str,
+    fault: impl FnOnce(&std::path::Path),
+) -> (Result<StageOutcome, String>, bool, bool, Option<String>) {
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+    fault(&profile_dir(&pn(name)).expect("dir").join("config.toml"));
+    let (stage, store) = (
+        std::fs::read(stage_path(name)).expect("the stage"),
+        std::fs::read(store_path(name)).expect("the store"),
+    );
+    let guard = crate::runtime::RotationGuard::acquire(&pn(name)).expect("guard");
+
+    let landed = land_staged_pair(&config, &pn(name), &guard).map_err(|e| format!("{e:#}"));
+
+    (
+        landed,
+        std::fs::read(stage_path(name)).ok() == Some(stage),
+        std::fs::read(store_path(name)).ok() == Some(store),
+        stored_refresh(name),
+    )
+}
+
+/// A landing reads the account's `config.toml` before it writes, and one it
+/// cannot read may hold a `[proxy]` record: a directory in its place (a read
+/// error on every platform) keeps the stage and the store byte for byte. A
+/// missing file is the plain profile every loader reads, and lands.
+#[test]
+fn a_landing_keeps_the_stage_of_an_account_whose_config_cannot_be_read() {
+    let _home = HomeSandbox::new();
+
+    let unreadable = land_over_config("cfg-unreadable", |config| {
+        std::fs::remove_file(config).expect("remove config.toml");
+        std::fs::create_dir(config).expect("a directory in its place");
+    });
+    let missing = land_over_config("cfg-missing", |config| {
+        std::fs::remove_file(config).expect("remove config.toml");
+    });
+
+    assert_eq!(
+        (unreadable, missing),
+        (
+            (
+                Ok(StageOutcome::Kept),
+                true,
+                true,
+                Some("rt-old".to_string())
+            ),
+            (
+                Ok(StageOutcome::Landed),
+                false,
+                false,
+                Some("rt-mid".to_string())
+            ),
+        ),
+        "(outcome, stage kept, store kept, store's refresh token) for an unreadable and a \
+         missing config.toml"
+    );
+}
+
+/// A `config.toml` that fails to parse cannot say it holds no `[proxy]`
+/// record, however its header is spelled: each of these keeps the stage and
+/// the store byte for byte, the last naming the table through a unicode
+/// escape (`["prox` backslash `u0079"]`).
+#[test]
+fn a_landing_keeps_the_stage_of_an_account_whose_config_fails_to_parse() {
+    let _home = HomeSandbox::new();
+    let backslash = char::from(0x5c_u8);
+    let escaped = format!("[\"prox{backslash}u0079\"]");
+    let headers = [
+        "[proxy] # note",
+        "[ proxy ]",
+        "[\"proxy\"]",
+        escaped.as_str(),
+    ];
+    let body = "service = \"stub\"\naccount = \"acct-1\"\n";
+    for header in headers {
+        let table: toml::Table = format!("{header}\n{body}").parse().expect("parses");
+        assert!(
+            table.contains_key("proxy"),
+            "{header} names the proxy table"
+        );
+        assert!(
+            format!("{header}\n{body}broken =\n")
+                .parse::<toml::Table>()
+                .is_err(),
+            "{header}'s config fails to parse"
+        );
+    }
+
+    let landed: Vec<_> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, header)| {
+            land_over_config(&format!("cfg-broken-{i}"), |config| {
+                std::fs::write(config, format!("{header}\n{body}broken =\n"))
+                    .expect("a config that fails to parse");
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        landed,
+        vec![
+            (
+                Ok(StageOutcome::Kept),
+                true,
+                true,
+                Some("rt-old".to_string())
+            );
+            4
+        ],
+        "(outcome, stage kept, store kept, store's refresh token) per header"
+    );
+}
+
 /// A landing keeps its stage on disk until the Keychain mirror has returned: a
 /// process cut mid-mirror then leaves a stage the store already holds, and the
 /// next resolve re-runs the hooks, the mirror included, before deleting it.
@@ -9168,11 +9344,17 @@ fn the_rolling_arm_spends_its_refresh_under_no_keychain_budget() {
     ));
     let budget = std::sync::Mutex::new(None);
 
-    let _ = arm_rolling_token(&config, &pn(name), |rt: &str, _: Option<&str>| {
-        assert_eq!(rt, "rt-old");
-        *budget.lock().expect("budget slot") = Some(crate::lock::armed_budget_remaining());
-        Ok(minted("at-new", "rt-new"))
-    });
+    let guard = RotationGuard::acquire(&pn(name)).expect("the arm's guard");
+    let _ = arm_rolling_token(
+        &config,
+        &pn(name),
+        |rt: &str, _: Option<&str>| {
+            assert_eq!(rt, "rt-old");
+            *budget.lock().expect("budget slot") = Some(crate::lock::armed_budget_remaining());
+            Ok(minted("at-new", "rt-new"))
+        },
+        guard,
+    );
 
     let seen = budget
         .into_inner()
@@ -9203,9 +9385,13 @@ fn the_rolling_arm_lands_a_live_stage_before_it_stamps() {
         crate::profile::load_config().expect("load config"),
     ));
 
-    let _ = arm_rolling_token(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("a comfortable staged chain stamps without a refresh")
-    });
+    let guard = RotationGuard::acquire(&pn(name)).expect("the arm's guard");
+    let _ = arm_rolling_token(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| panic!("a comfortable staged chain stamps without a refresh"),
+        guard,
+    );
 
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
     assert!(!stage_path(name).exists(), "the landed stage is gone");

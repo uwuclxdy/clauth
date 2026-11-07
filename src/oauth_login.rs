@@ -629,9 +629,38 @@ fn handle_callback(
     Ok(Some(code))
 }
 
+/// The paste door of a wait that races two doors, polled between turns of the
+/// other one: a value on the channel wins it, a dropped sender closes it (the
+/// other door keeps waiting), and an empty channel hands the turn back. The
+/// OAuth login's loopback wait and the proxy login's poll share it.
+pub(crate) struct PasteDoor<'a, T> {
+    rx: &'a std::sync::mpsc::Receiver<T>,
+    open: bool,
+}
+
+impl<'a, T> PasteDoor<'a, T> {
+    pub(crate) fn new(rx: &'a std::sync::mpsc::Receiver<T>) -> Self {
+        Self { rx, open: true }
+    }
+
+    /// The value the door delivered since the last look, if any.
+    pub(crate) fn poll(&mut self) -> Option<T> {
+        if !self.open {
+            return None;
+        }
+        match self.rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.open = false;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+}
+
 /// Accept loop until a code arrives through either door or `deadline` passes.
-/// The paste door is polled first: `Ok` wins it, `Disconnected` closes it (the
-/// listener keeps waiting), `Empty` falls through to the loopback accept.
+/// The paste door is polled first ([`PasteDoor`]), then the loopback accept.
 /// Every accepted connection is read on its own reader thread under one
 /// whole-connection [`callback_read_timeout`] deadline armed at accept, so a
 /// silent or trickling socket never blocks the accept loop behind it; the first
@@ -647,19 +676,15 @@ fn wait_for_code(
     listener.set_nonblocking(true)?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>>>();
     let (wait_over, _wait_over_guard) = WaitOver::new();
-    let mut paste_open = true;
+    let mut paste = PasteDoor::new(paste);
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for the login code (browser callback or pasted code, {LOGIN_TIMEOUT_SECS}s)"
             );
         }
-        if paste_open {
-            match paste.try_recv() {
-                Ok(code) => return Ok((code.0, LoginMethod::Manual)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => paste_open = false,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
+        if let Some(code) = paste.poll() {
+            return Ok((code.0, LoginMethod::Manual));
         }
         // A reader thread's outcome. `tx` stays alive in this loop, so the
         // channel is never disconnected here; the arm only keeps the match

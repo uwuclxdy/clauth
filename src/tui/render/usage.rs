@@ -41,8 +41,19 @@ const KEY_W: usize = 8;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
 /// The fix for a third-party profile no leg will ever fetch — the status
-/// block's `[ no key ]` hint and the empty body share these exact words.
-const KEYLESS_FIX: &str = "no api key set, add one on the setup tab";
+/// block's `[ no key ]` hint and the empty body share these exact words. A
+/// proxy account's key is the proxy's to mint (`proxy` names the service its
+/// record names), so its fix is the re-login.
+fn keyless_fix(profile_name: &str, proxy: Option<&crate::proxy::Service>) -> Cow<'static, str> {
+    match proxy {
+        Some(service) => Cow::Owned(format!(
+            "no api key set, run `{}`",
+            crate::actions::proxy_login_command(profile_name, service)
+        )),
+        None => Cow::Borrowed("no api key set, add one on the setup tab"),
+    }
+}
+
 /// The 5h row's value on a plan with no 5h limit: the plan's shape in place of
 /// a figure clauth never read.
 const NO_FIVE_HOUR_LIMIT: &str = "no limit on this plan";
@@ -665,7 +676,7 @@ fn build_usage_lines(
 
     let Some(usage) = readings.usage_of(&profile.name) else {
         lines.extend(oauth_empty_lines(
-            oauth_empty_msg_here(
+            &oauth_empty_msg_here(
                 profile,
                 readings.status_of(&profile.name),
                 app.fetch_lease.fetches_here(),
@@ -678,7 +689,7 @@ fn build_usage_lines(
     let mut stats = collect_stats(usage, reset_fmt);
     if stats.is_empty() {
         lines.extend(oauth_empty_lines(
-            oauth_empty_msg_here(
+            &oauth_empty_msg_here(
                 profile,
                 readings.status_of(&profile.name),
                 app.fetch_lease.fetches_here(),
@@ -1429,10 +1440,11 @@ fn header_lines(
     let plan_key = key_span("plan");
     let left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
-    // A plan with no 5h limit has no window the kick could open, so the
-    // countdown would name a kick that never fires.
+    // A plan with no 5h limit has no window the kick could open, and no kick
+    // leg spends a chain clauth never spends, so either way the countdown
+    // would name a kick that never fires.
     let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
-    if profile.auto_start && !no_five_hour_limit {
+    if profile.has_effective_auto_start() && !no_five_hour_limit {
         plan_spans.extend(kick_spans(
             &kick_text(profile, header, readings),
             left_w,
@@ -1609,14 +1621,15 @@ fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into
 /// `auto_start` except one whose plan has no 5h limit (there is no window the
-/// kick could open), queue toggle on or off. The value is THIS account's next
-/// kick: with a queue slot, the LATER of the queue's next-opening estimate
-/// and the account's own 5h window reset — the kick fires once the queue
-/// gate has cleared AND this window has lapsed, so either clock can delay
-/// it, and the gate alone would name an instant no kick fires at. Without a
-/// slot (toggle off, or the profile is excluded from the queue) it is the
-/// account's own reset alone — the lapsed-leg kick fires the moment that
-/// reset passes.
+/// kick could open) or whose chain clauth never spends
+/// ([`Profile::spends_oauth_chain`]), queue toggle on or off. The value is
+/// THIS account's next kick: with a queue slot, the LATER of the queue's
+/// next-opening estimate and the account's own 5h window reset — the kick
+/// fires once the queue gate has cleared AND this window has lapsed, so
+/// either clock can delay it, and the gate alone would name an instant no
+/// kick fires at. Without a slot (toggle off, or the profile is excluded from
+/// the queue) it is the account's own reset alone — the lapsed-leg kick fires
+/// the moment that reset passes.
 fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapshot) -> String {
     let now = now_epoch_secs();
     let own_reset_in = readings
@@ -1753,7 +1766,12 @@ fn status_lines(
                 DIAG_AUTH_BROKEN.to_string(),
                 theme::danger().add_modifier(Modifier::BOLD),
             ),
-            hint: Some(diag_fix(UsageDiag::AuthBroken, &profile.name)),
+            hint: Some(diag_fix(
+                UsageDiag::AuthBroken {
+                    proxy: profile.proxy.as_ref().map(|record| record.service.clone()),
+                },
+                &profile.name,
+            )),
         });
         return render_status_rows(rows, w);
     }
@@ -1907,7 +1925,9 @@ fn status_lines(
             // The hint rides only when figures render — without them the body
             // already names the fix, and one pane must not say it twice.
             if readings.stats_of(&profile.name).is_some() {
-                fetch_hint = Some(UsageDiag::NoKey);
+                fetch_hint = Some(UsageDiag::NoKey {
+                    proxy: profile.proxy.as_ref().map(|record| record.service.clone()),
+                });
             }
         }
         Some(FetchStatus::Failed) => {
@@ -2132,8 +2152,11 @@ enum UsageDiag {
     /// OAuth streak, a typed provider's lowercase display name or `the endpoint`
     /// for a third-party streak.
     Stuck429 { throttler: String },
-    /// AUTH-1 quarantine.
-    AuthBroken,
+    /// AUTH-1 quarantine; `proxy` is the service a proxy account's record
+    /// names, whose login is the only one clauth takes for it.
+    AuthBroken {
+        proxy: Option<crate::proxy::Service>,
+    },
     /// Long window (7d, else the provider-marked monthly quota) at/over the
     /// hard cap; `monthly` names the monthly arm so the teach never calls a
     /// monthly-only block "weekly".
@@ -2148,8 +2171,11 @@ enum UsageDiag {
     RefreshFailing,
     /// Endpoint-shaped profile no leg will ever fetch (no OAuth pair, no
     /// third-party credential): the fetch row names the missing key instead
-    /// of a dot or a historical verdict.
-    NoKey,
+    /// of a dot or a historical verdict; `proxy` is the service a proxy
+    /// account's record names.
+    NoKey {
+        proxy: Option<crate::proxy::Service>,
+    },
     /// The usage probe's setup token was refused: only a new mint revives it.
     SetupTokenRefused,
     /// A credit refusal on record: the walks pass the account over for a
@@ -2196,12 +2222,16 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
             "expires at its ceiling, since no probe reads it".to_string()
         }
         UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
-        UsageDiag::AuthBroken => {
-            format!(
+        UsageDiag::AuthBroken { proxy } => match proxy {
+            Some(service) => format!(
+                "log in again with {}",
+                cmd(&crate::actions::proxy_login_command(profile_name, &service))
+            ),
+            None => format!(
                 "re-login with {}",
                 cmd(&format!("clauth login {profile_name}"))
-            )
-        }
+            ),
+        },
         UsageDiag::WeeklyHard { monthly } => {
             if monthly {
                 "monthly quota is spent".to_string()
@@ -2213,7 +2243,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
         UsageDiag::Stale => "last usage check failed".to_string(),
         UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
-        UsageDiag::NoKey => KEYLESS_FIX.to_string(),
+        UsageDiag::NoKey { proxy } => keyless_fix(profile_name, proxy.as_ref()).into_owned(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
         UsageDiag::CreditRefused => {
             "skipped for work that may need credits until a request on it succeeds, a window \
@@ -2256,7 +2286,7 @@ fn ordinal(n: u32) -> String {
 /// probed setup token is never scheduled, a disabled one is likewise skipped,
 /// and a terminal `Failed` or a refused setup token already tried — mirror
 /// `build_tp_rows`, never spin on "loading" forever (issue #2).
-fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static str {
+fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> Cow<'static, str> {
     let probed = profile.has_long_lived_sidecar && crate::usage::usage_probe_admits(profile);
     if crate::usage::usage_poll_pair(profile).is_none() && !probed {
         // A long-lived session-token sidecar is a login the OAuth leg cannot
@@ -2264,21 +2294,29 @@ fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static s
         // to log the same account in or probe it, the login first: the probe
         // spends inference, the login does not. An api key / `[env]` inference
         // token has no usage windows at all — nothing to fix, so no fix line.
-        // Only a member holding nothing is "not logged in".
-        if profile.has_long_lived_sidecar {
-            "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
+        // Only a member holding nothing is "not logged in", unless it is a
+        // proxy account, whose missing key only its proxy login mints, or
+        // carries a `[proxy]` table clauth cannot read, which refuses every
+        // login until the table is fixed. Both refuse `+ login`, so a sidecar
+        // there never gets the line naming it.
+        if profile.has_long_lived_sidecar && profile.spends_oauth_chain() {
+            "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe".into()
         } else if crate::claude::has_inference_auth(profile) {
-            "can't read usage, an api key has no usage windows"
+            "can't read usage, an api key has no usage windows".into()
+        } else if let Some(record) = &profile.proxy {
+            keyless_fix(&profile.name, Some(&record.service))
+        } else if profile.has_unreadable_proxy_record {
+            "can't read its [proxy] table, fix it in config.toml".into()
         } else {
-            "not logged in, use + login on the setup tab"
+            "not logged in, use + login on the setup tab".into()
         }
     } else if profile.is_disabled()
         || matches!(status, Some(FetchStatus::Failed | FetchStatus::AuthExpired))
     {
         // Disabled: never scheduled, so with no seeded cache no fetch will land.
-        "no usage available"
+        "no usage available".into()
     } else {
-        "loading"
+        "loading".into()
     }
 }
 
@@ -2290,10 +2328,10 @@ fn oauth_empty_msg_here(
     profile: &Profile,
     status: Option<FetchStatus>,
     fetches_here: bool,
-) -> &'static str {
+) -> Cow<'static, str> {
     match oauth_empty_msg(profile, status) {
-        "loading" if !fetches_here && crate::usage::usage_probe_admits(profile) => {
-            "no reading yet from the clauth process that fetches usage"
+        msg if msg == "loading" && !fetches_here && crate::usage::usage_probe_admits(profile) => {
+            "no reading yet from the clauth process that fetches usage".into()
         }
         msg => msg,
     }
@@ -2335,39 +2373,42 @@ fn build_tp_rows(
         // show, and a RateLimited one means the provider throttled us with
         // nothing cached — never spin on "loading" forever (the original z.ai bug).
         // A disabled profile is never scheduled either, so it never loads.
-        let msg = if profile.is_disabled() {
-            "no usage available"
+        let msg: Cow<'static, str> = if profile.is_disabled() {
+            "no usage available".into()
         } else {
             match readings.status_of(&profile.name) {
-                Some(FetchStatus::Failed) => "no usage available",
-                Some(FetchStatus::RateLimited) => "rate limited, retrying",
+                Some(FetchStatus::Failed) => "no usage available".into(),
+                Some(FetchStatus::RateLimited) => "rate limited, retrying".into(),
                 // The ways a provider's usage credential can be unusable read
                 // differently to the operator, and the profile itself says
                 // which one this is: a lapsed or never-captured console session
                 // (Alibaba), or a dead api key (any other provider, whose
                 // verdict only a 401 can produce).
                 Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
-                    concat!("console login expired, run ", cmd_lit!("clauth login"))
+                    concat!("console login expired, run ", cmd_lit!("clauth login")).into()
                 }
                 Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
-                    "api key rejected, re-enter it on the setup tab"
+                    "api key rejected, re-enter it on the setup tab".into()
                 }
                 Some(FetchStatus::AuthExpired) => {
-                    concat!("console login needed, run ", cmd_lit!("clauth login"))
+                    concat!("console login needed, run ", cmd_lit!("clauth login")).into()
                 }
                 // A profile no leg will ever fetch must not claim to be
                 // loading — the same rule `oauth_empty_msg` applies. An Alibaba
                 // profile is never in here: its quota runs on the console
                 // session, so it is scheduled with or without an api key.
-                _ if !crate::usage::third_party_credentialed(profile) => KEYLESS_FIX,
-                _ => "loading",
+                _ if !crate::usage::third_party_credentialed(profile) => keyless_fix(
+                    &profile.name,
+                    profile.proxy.as_ref().map(|record| &record.service),
+                ),
+                _ => "loading".into(),
             }
         };
         // Stack, don't truncate: the fix copy must survive a narrow pane, so
         // every terminal message routes through the shared greedy wrapper
         // (`panes::wrap_words`) instead of clipping its tail at the pane edge.
         lines.extend(
-            prose::wrap(msg, usize::from(inner_w), theme::faint())
+            prose::wrap(&msg, usize::from(inner_w), theme::faint())
                 .into_iter()
                 .map(Line::from),
         );

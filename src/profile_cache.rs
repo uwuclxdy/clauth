@@ -85,11 +85,12 @@ struct AuthVerdict {
 /// sessions and delegates spend — recorded against
 /// [`crate::usage::inference_key_fingerprint`], a digest of that key alone.
 /// Written by a delegate's 401 on the key and by a usage fetch that
-/// authenticated with the key and got `AuthExpired`; cleared only by a live
-/// body from a fetch that authenticated with the same key
-/// ([`clear_auth_expired`]). A console re-login, a console lapse and an
-/// endpoint edit never touch it, and a re-keyed profile leaves it inert. Read
-/// by [`crate::fallback::third_party_key_rejected`].
+/// authenticated with the key and got `AuthExpired`; cleared by a live body
+/// from a fetch that authenticated with the same key, by a proxy re-login
+/// saving a new key, or by a live setup-token probe ([`clear_auth_expired`]).
+/// A console re-login, a console lapse and an endpoint edit never touch it,
+/// and a re-keyed profile leaves it inert. Read by
+/// [`crate::fallback::third_party_key_rejected`].
 pub(crate) const DEAD_KEY_FILE: &str = "dead_key.json";
 
 /// Body of [`DEAD_KEY_FILE`].
@@ -112,8 +113,10 @@ pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
 }
 
 /// Drop both records — a live body from a fetch that authenticated with the
-/// api key proves the usage credential AND the key alive. Cheap and
-/// unconditional: the files are usually absent.
+/// api key proves the usage credential AND the key alive, and a proxy
+/// re-login's minted key replaces the key they judged; a live setup-token
+/// probe drops them too. Cheap and unconditional: the files are usually
+/// absent.
 pub(crate) fn clear_auth_expired(name: &ProfileName) {
     clear_usage_verdict(name);
     remove_profile_cache(name, DEAD_KEY_FILE);
@@ -639,6 +642,79 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
         .map_or(Some(mtime), |receipt| receipt.prev)
 }
 
+/// A third-party usage copy as [`THIRD_PARTY_CACHE_FILE`] holds it: the stats,
+/// plus, for a proxy reading, when its chain windows were read — epoch ms of
+/// the oldest `read_at` among its declared 5h/7d windows, clamped to the write
+/// instant — and the epoch ms clauth wrote it at. Both are absent on an older
+/// copy or a non-proxy copy, and the chain date on a reading with no chain
+/// window. The file's mtime stays the reading's stalest figure, the age every
+/// surface shows; the chain date is what a freshness DECISION about the chain
+/// reads (the walk, the 5h bell, the window push, the seed's status), and the
+/// write instant is the leg's own poll clock, which that dated-back mtime no
+/// longer carries.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThirdPartyCopy {
+    #[serde(flatten)]
+    pub(crate) stats: crate::providers::ThirdPartyStats,
+    #[serde(default)]
+    pub(crate) chain_read_at: Option<u64>,
+    #[serde(default)]
+    pub(crate) written_at: Option<u64>,
+}
+
+/// The borrowed write side of [`ThirdPartyCopy`]: a copy with no chain date
+/// carries no `chain_read_at` key.
+#[derive(Serialize)]
+struct ThirdPartyCopyRef<'a> {
+    #[serde(flatten)]
+    stats: &'a crate::providers::ThirdPartyStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_read_at: Option<u64>,
+    written_at: u64,
+}
+
+impl ThirdPartyCopy {
+    /// The instant clauth wrote this copy, whose file reads `mtime`: the
+    /// write instant it records, which only the proxy leg writes, never after
+    /// `now` nor before the mtime. A copy recording none is any other
+    /// writer's, and none of those dates its file back, so its mtime is that
+    /// instant.
+    pub(crate) fn written_ms(&self, mtime: u64, now: u64) -> u64 {
+        self.written_at
+            .map_or(mtime, |written| written.min(now).max(mtime))
+    }
+}
+
+/// Write `name`'s third-party copy stamped `written_at` (epoch ms), its chain
+/// windows' read date beside it when the reading carries one, landing with
+/// the mtime `dated` ([`crate::profile::atomic_write_600_dated`]). Best-effort
+/// like [`write_profile_cache_for`]; whether the copy landed.
+pub(crate) fn write_third_party_copy(
+    name: &ProfileName,
+    stats: &crate::providers::ThirdPartyStats,
+    chain_read_at: Option<u64>,
+    written_at: u64,
+    dated: SystemTime,
+) -> bool {
+    write_profile_cache_at(
+        Harness::Claude,
+        name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyCopyRef {
+            stats,
+            chain_read_at,
+            written_at,
+        },
+        Some(dated),
+    )
+}
+
+/// Read `name`'s third-party copy with its chain date; `None` as
+/// [`load_profile_cache`] answers it.
+pub(crate) fn load_third_party_copy(name: &ProfileName) -> Option<ThirdPartyCopy> {
+    load_profile_cache(name, THIRD_PARTY_CACHE_FILE)
+}
+
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathBuf> {
@@ -666,6 +742,7 @@ fn expected_cache_file<T: 'static>() -> Option<&'static str> {
         t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
         t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
         t if t == TypeId::of::<crate::usage::LimitResets>() => Some(LIMIT_RESETS_FILE),
+        t if t == TypeId::of::<ThirdPartyCopy>() => Some(THIRD_PARTY_CACHE_FILE),
         _ => None,
     }
 }
@@ -732,10 +809,22 @@ pub(crate) fn write_profile_cache_reported_for<T: Serialize>(
     file: &str,
     value: &T,
 ) -> bool {
+    write_profile_cache_at(harness, name, file, value, None)
+}
+
+/// [`write_profile_cache_reported_for`] landing with the mtime `dated` when
+/// given.
+fn write_profile_cache_at<T: Serialize>(
+    harness: Harness,
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
     if !roster_holds(harness, name) {
         return false;
     }
-    write_cache_file(name, file, value)
+    write_cache_file(name, file, value, dated)
 }
 
 /// Whether `harness`'s own roster holds `name`: `profiles.toml` for claude
@@ -755,14 +844,19 @@ fn codex_roster_holds(name: &ProfileName) -> bool {
     crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()))
 }
 
-fn write_cache_file<T: Serialize>(name: &ProfileName, file: &str, value: &T) -> bool {
+fn write_cache_file<T: Serialize>(
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
         return false;
     };
     let Ok(json) = serde_json::to_string(value) else {
         return false;
     };
-    crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+    crate::profile::atomic_write_600_dated(&path, json.as_bytes(), dated).is_ok()
 }
 
 /// Test-only either-roster writer: a fixture poses a cache under whichever
@@ -779,7 +873,7 @@ fn write_profile_cache_reported<T: Serialize>(name: &ProfileName, file: &str, va
     if !(claude_roster_holds(name) || codex_roster_holds(name)) {
         return false;
     }
-    write_cache_file(name, file, value)
+    write_cache_file(name, file, value, None)
 }
 
 /// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the
@@ -807,7 +901,11 @@ pub(crate) fn remove_profile_cache_reported(name: &ProfileName, file: &str) -> b
     }
 }
 
-/// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
+/// Epoch-ms of `<profile_dir>/<file>`'s mtime, or `None` when it's absent. For
+/// most files that is its last write; a proxy copy whose figures carry their
+/// read dates ([`write_third_party_copy`]) lands carrying its stalest figure's
+/// read, never its write, so when that copy was written reads the write
+/// instant it records ([`ThirdPartyCopy::written_ms`]).
 pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u64> {
     let modified = std::fs::metadata(profile_cache_path(name, file)?)
         .ok()?

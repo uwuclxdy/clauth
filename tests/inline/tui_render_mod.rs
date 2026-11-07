@@ -38,6 +38,8 @@ fn oauth(name: &str, auto: bool) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -2081,6 +2083,51 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
     );
 }
 
+/// A proxy account's login row names the one login clauth takes for it, whether
+/// the account holds only its key or a stored OAuth pair beside it: every other
+/// login is refused (`refuse_relogin_off_proxy`), so neither account-type hint
+/// may stand.
+#[test]
+fn setup_login_hint_on_a_proxy_account_names_its_proxy_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    for stored_chain in [false, true] {
+        let mut px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_stub-key-0".to_string()),
+        );
+        px.proxy = Some(crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        if stored_chain {
+            px.credentials = Some(hybrid_creds());
+        }
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["px".into()],
+                ..AppState::default()
+            },
+            profiles: vec![px],
+        };
+        let mut app = App::new(config);
+        app.tab = Tab::Setup;
+        app.config_focus = ConfigFocus::Actions;
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::Login)
+            .expect("every account shows a login row");
+
+        let out = dump(&app, 120, 30);
+        assert!(
+            out.lines().any(|l| l.trim_matches(|c| c == '│' || c == ' ')
+                == "└ log in with `clauth login px --proxy stub`"),
+            "stored_chain {stored_chain}: the hint names the proxy login, whole:\n{out}",
+        );
+    }
+}
+
 /// Same typing rule for the log-out row's own hint: a hybrid holding both an api
 /// key and an OAuth pair logs out of the pair, and the copy must say so.
 #[test]
@@ -3072,6 +3119,8 @@ fn bare(name: &str) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -7957,6 +8006,118 @@ fn a_display_only_provider_account_rings_no_bell_on_its_cached_reading() {
         toasts,
         vec!["alert: on at 47%".to_string()],
         "only the polled account rings"
+    );
+}
+
+/// The toasts one `apply_usage` tick raises for the proxy account `px`,
+/// armed at 90%, whose copy holds its chain 5h window at 97% read `chain_age`
+/// ago, the copy's mtime 3 h old (an offer figure beside the window, read
+/// then): the copy as the leg writes it. `status` overrides the status the
+/// startup seed took off the copy.
+fn proxy_bell_toasts(
+    chain_age: std::time::Duration,
+    status: Option<crate::usage::FetchStatus>,
+) -> Vec<String> {
+    let written = std::time::SystemTime::now();
+    proxy_bell_toasts_dated(
+        written,
+        written - chain_age,
+        written - std::time::Duration::from_secs(3 * 3600),
+        status,
+    )
+}
+
+/// [`proxy_bell_toasts`] over a copy written at `written`, its chain 5h
+/// window read at `chain` and its mtime `stalest`.
+fn proxy_bell_toasts_dated(
+    written: std::time::SystemTime,
+    chain: std::time::SystemTime,
+    stalest: std::time::SystemTime,
+    status: Option<crate::usage::FetchStatus>,
+) -> Vec<String> {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("px");
+    let port = 47_811;
+    let registry = crate::proxy::registry_path().unwrap();
+    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    std::fs::write(registry, format!("[stub]\nport = {port}\nenabled = true\n")).unwrap();
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some(format!("http://127.0.0.1:{port}"));
+    p.api_key = Some("clp_k".into());
+    p.bell_threshold = Some(90.0);
+    save_startup_state(&[&p], AppState::default());
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .unwrap();
+    let epoch_ms = |at: std::time::SystemTime| {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    crate::profile_cache::write_third_party_copy(
+        &name,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 97.0)]),
+        Some(epoch_ms(chain)),
+        epoch_ms(written),
+        stalest,
+    );
+    let mut app = startup_app_from_disk();
+    if let Some(status) = status {
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("px".to_string(), status);
+    }
+    app.apply_usage();
+    app.toasts.iter().map(|t| t.body.to_string()).collect()
+}
+
+/// The TUI's 5h bell judges a proxy copy by its chain windows, as the
+/// daemon's does: the chain window read now at 97% rings though an offer
+/// figure beside it is 3 h old. The same account whose chain window itself is
+/// 3 h old stays silent, under the status the seed took off it and under a
+/// `Fresh` one alike.
+#[test]
+fn the_tui_bell_rings_for_a_proxy_account_whose_chain_window_is_fresh() {
+    let three_hours = std::time::Duration::from_secs(3 * 3600);
+    assert_eq!(
+        proxy_bell_toasts(std::time::Duration::ZERO, None),
+        vec!["alert: px at 97%".to_string()],
+        "a fresh chain window rings"
+    );
+    assert_eq!(
+        proxy_bell_toasts(three_hours, None),
+        Vec::<String>::new(),
+        "a stale chain window is silent"
+    );
+    assert_eq!(
+        proxy_bell_toasts(three_hours, Some(crate::usage::FetchStatus::Fresh)),
+        Vec::<String>::new(),
+        "and silent on its own age, whatever the status"
+    );
+}
+
+/// The TUI's 5h bell reads a chain date ahead of the clock (the clock stepped
+/// back after the write) as undated, so stale, as the daemon's does: the
+/// chain window at 97% dated 1 h ahead stays silent under a `Fresh` status,
+/// though the copy's 60 s old mtime raises no stale cue.
+#[test]
+fn the_tui_bell_never_rings_on_a_chain_date_ahead_of_the_clock() {
+    let written = std::time::SystemTime::now();
+    assert_eq!(
+        proxy_bell_toasts_dated(
+            written,
+            written + std::time::Duration::from_secs(3600),
+            written - std::time::Duration::from_secs(60),
+            Some(crate::usage::FetchStatus::Fresh),
+        ),
+        Vec::<String>::new(),
+        "a chain window dated 1 h ahead is silent"
     );
 }
 

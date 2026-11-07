@@ -551,6 +551,61 @@ fn a_third_party_profiles_leftover_oauth_cache_is_not_the_file_watched() {
     );
 }
 
+/// A proxy account's copy lands dated to its stalest figure, so a
+/// rewrite whose stalest figure keeps its `read_at` (the contract's stale-figure
+/// carry) lands under the mtime the copy already had. The rewrite is still
+/// news: the digest reads the write instant the copy records. Both copies go
+/// through the proxy leg's own writer with the leg's dates: chain windows read
+/// at the write, the stalest figure 3 h old in both.
+#[test]
+fn a_proxy_copy_rewritten_under_one_stalest_figure_is_a_usage_cache_refresh() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    ))
+    .expect("save the proxy profile");
+    save_app_state(&AppState {
+        active_profile: Some(name.clone()),
+        profiles: vec![name.clone()],
+        ..Default::default()
+    })
+    .expect("save state");
+    seed_credentials_file(t0());
+    let now_s = crate::usage::now_epoch_secs();
+    let ms = |secs: i64| u64::try_from(secs).expect("after the epoch") * 1000;
+    let stalest = UNIX_EPOCH + Duration::from_secs(u64::try_from(now_s - 3 * 3600).unwrap());
+    let land = |pct: f64, written_s: i64| {
+        assert!(crate::profile_cache::write_third_party_copy(
+            &name,
+            &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", pct)]),
+            Some(ms(written_s)),
+            ms(written_s),
+            stalest,
+        ));
+    };
+    land(10.0, now_s - 120);
+    let server = ClauthServer::new();
+    let _ = call_session(&server);
+
+    land(20.0, now_s - 60);
+    assert_eq!(
+        std::fs::metadata(third_party_cache_path("px"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        stalest,
+        "fixture: the rewrite kept the copy's mtime"
+    );
+    let text = call_session(&server);
+    assert!(
+        text.contains("since your last call: usage cache refreshed"),
+        "a landed rewrite of the active proxy account's copy is news: {text}",
+    );
+}
+
 /// No lock may span a sleep in the digest machinery: the baseline lock must
 /// never be held across anything that can sleep, or one slow reply stalls every
 /// other digest-bearing reply on the server. The shape is what's checkable — a

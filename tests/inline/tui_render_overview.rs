@@ -309,6 +309,8 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
     )
@@ -374,6 +376,8 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             setup_token_digest: None,
             provider: Some(crate::providers::Provider::DeepSeek),
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_stats(ReadingsSnapshot::default(), name, stats),
     )
@@ -452,6 +456,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
@@ -1883,6 +1889,8 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         ReadingsSnapshot::default(),
     )

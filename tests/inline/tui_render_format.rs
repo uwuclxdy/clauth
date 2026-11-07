@@ -193,6 +193,8 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         status,
     )

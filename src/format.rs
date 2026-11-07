@@ -407,13 +407,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
-/// pre-flight's quarantine arm, and — through
-/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
-/// the quarantine's own log line, wherever the profile neither serves its own
-/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
-/// same `None` case but words its own sentence, since it also has to say the
-/// arming did not happen.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, and —
+/// through `oauth::third_party_dead_chain_copy`'s `None` case — the MCP
+/// pre-flight's quarantine arm, the rotate toast and the quarantine's own log
+/// line, wherever the profile neither serves its own inference nor is keyless
+/// (`Profile::is_keyless`, or a proxy account with no key). `clauth
+/// rolling-token`'s dead-chain bail takes that same `None` case but words its
+/// own sentence, since it also has to say the arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -432,9 +432,30 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
 /// line, so the surfaces cannot spell one state two ways. A key the provider
-/// refused renders [`api_key_rejected`] on those surfaces instead.
-pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
-    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+/// refused renders [`api_key_rejected`] on those surfaces instead. A proxy
+/// account (`proxy` is its runtime claim's service) takes its key only from a
+/// login through its proxy, so the fix names that login instead.
+pub(crate) fn third_party_keyless(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "profile has no api key: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
+}
+
+/// The command that re-captures `name`'s inference key: `--api-key`, or the
+/// login through its proxy for a proxy account, the only login clauth takes
+/// for one.
+fn key_fix_command(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    match proxy {
+        Some(service) => crate::actions::proxy_login_command(name.as_str(), service),
+        None => format!("clauth login {name} --api-key <key>"),
+    }
 }
 
 /// A third-party api key the provider's dead-key record names rejected
@@ -443,9 +464,16 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// `--api-key`, the command that also lifts a keyless profile — a bare
 /// `clauth login <name>` runs the browser flow and leaves the key untouched.
 /// Rendered by the MCP pre-flight's key-rejected arm and by
-/// `oauth::third_party_dead_chain_copy`'s callers.
-pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
-    format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
+/// `oauth::third_party_dead_chain_copy`'s callers. A proxy account's fix is
+/// the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn api_key_rejected(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "api key rejected: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
 }
 
 /// An OAuth account's setup token that the usage probe found refused
@@ -488,11 +516,16 @@ pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String
 /// The MCP pre-flight admits that target instead of refusing it, so it renders
 /// nothing (owner ruling 2026-08-30).
 /// The command is backticked to match [`third_party_keyless`], which renders
-/// beside it on the same surfaces (owner ruling: house style).
-pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+/// beside it on the same surfaces. A proxy
+/// account's fix is the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn third_party_dead_chain(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
-         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+         (run `{}` to clear the quarantine)",
+        key_fix_command(name, proxy)
     )
 }
 

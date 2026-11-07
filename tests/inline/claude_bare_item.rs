@@ -43,7 +43,7 @@ fn store(name: &str) -> std::path::PathBuf {
 fn carry(name: &str, item: &serde_json::Value) -> anyhow::Result<BareItemCarry> {
     carry_bare_item_login_into(
         &ProfileName::from(name),
-        &crate::testutil::profile_id(name),
+        Some(&crate::testutil::profile_id(name)),
         item,
     )
 }
@@ -481,7 +481,7 @@ fn settled(
     placed: Option<[u8; 32]>,
 ) -> BareItemSettle {
     BareItemSettle::Settled(BareItemSettled {
-        notice: notice.map(str::to_string),
+        notice: notice.map(|line| crate::claude::BareItemNotice::Saved(line.to_string())),
         saved_into: saved_into.map(ProfileName::from),
         placed,
     })

@@ -663,6 +663,83 @@ fn logout_hint_over_a_torn_store_names_the_file() {
     );
 }
 
+/// A proxy account's log out blanks its key and nothing else, so the hint says
+/// that over a stored chain and over a torn store, its `[proxy]` table readable
+/// or not. The snapshot takes the claim off the loaded profile: the
+/// `config.toml` is gone when it reads.
+#[test]
+fn a_proxy_accounts_log_out_hint_names_the_key_over_whatever_it_stores() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, ProxyAccount};
+    let hint = |chain: bool, readable_record: bool| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("px");
+        let mut px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        px.credentials = chain.then(|| crate::testutil::oauth_pair("at-px"));
+        crate::profile::save_profile(&px).unwrap();
+        if !chain {
+            let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+            std::fs::write(store, "{ torn").unwrap();
+        }
+        crate::profile::write_proxy_record(
+            &name,
+            &ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .unwrap();
+        if !readable_record {
+            crate::claude::tests::break_proxy_record("px");
+        }
+        let loaded = crate::profile::load_profile(&name).unwrap();
+        let shape = (
+            loaded.credentials.is_some(),
+            loaded.unreadable_credentials_store.is_some(),
+            loaded.proxy.is_some(),
+            loaded.has_unreadable_proxy_record,
+        );
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![loaded],
+        });
+        app.profile_cursor.set(0);
+        std::fs::remove_file(crate::profile::profile_subpath(&name, "config.toml").unwrap())
+            .unwrap();
+        (
+            shape,
+            row_hint(
+                ConfigRow::DeleteCreds,
+                &build_snap(&app, &app.readings_snapshot(), true),
+                "",
+            ),
+        )
+    };
+
+    let key = || Some("clears the stored API key".to_string());
+    assert_eq!(
+        [
+            hint(true, true),
+            hint(false, true),
+            hint(true, false),
+            hint(false, false),
+        ],
+        [
+            ((true, false, true, false), key()),
+            ((false, true, true, false), key()),
+            ((true, false, false, true), key()),
+            ((false, true, false, true), key()),
+        ],
+        "((chain, torn store, record, unreadable table), hint) per shape"
+    );
+}
+
 /// The log-out hint renders only on the focused row, and focus seeds a draft
 /// that blanks the snap's text fields: the key's presence must survive it.
 #[test]

@@ -1704,3 +1704,68 @@ fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
         "each account keeps its own MCP server logins"
     );
 }
+
+/// The `auto-start queue` row's label cells on the drawn Config tab, found by
+/// matching the label cell by cell (a glyph before it would shift a string
+/// index off its cell).
+fn auto_start_queue_label_cells(app: &crate::tui::app::App) -> Vec<ratatui::buffer::Cell> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let label: Vec<String> = "auto-start queue".chars().map(String::from).collect();
+    for y in 0..buf.area.height {
+        let row: Vec<ratatui::buffer::Cell> =
+            (0..buf.area.width).map(|x| buf[(x, y)].clone()).collect();
+        if let Some(start) = row
+            .windows(label.len())
+            .position(|win| win.iter().zip(&label).all(|(c, l)| c.symbol() == l))
+        {
+            return row[start..start + label.len()].to_vec();
+        }
+    }
+    panic!(
+        "no `auto-start queue` row on the Config tab:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// A Config-tab app holding `profile` alone, the cursor off the queue row.
+fn queue_row_app(profile: crate::profile::Profile) -> crate::tui::app::App {
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = crate::tui::app::Tab::Config;
+    app
+}
+
+/// A proxy account never joins the auto-start queue (its member filter takes
+/// only accounts that spend their own OAuth chain), so one carrying
+/// `auto_start = true` from before it became a proxy account leaves the
+/// queue with no possible member: the row stays the dimmed, inert one. The
+/// same flag on an ordinary account makes it live (the positive twin).
+#[test]
+fn a_proxy_account_with_auto_start_on_leaves_the_queue_row_dimmed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let mut px = crate::profile::Profile::new("px".to_string(), None, None);
+    px.auto_start = true;
+    px.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-px".to_string(),
+    });
+    let dimmed = auto_start_queue_label_cells(&queue_row_app(px));
+    assert!(
+        dimmed.iter().all(|c| c.fg == theme::faint().fg.unwrap()),
+        "a proxy account alone leaves the row faint: {dimmed:?}"
+    );
+
+    let mut kitty = crate::profile::Profile::new("kitty".to_string(), None, None);
+    kitty.auto_start = true;
+    let live = auto_start_queue_label_cells(&queue_row_app(kitty));
+    assert!(
+        live.iter().all(|c| c.fg != theme::faint().fg.unwrap()),
+        "an ordinary opted-in account makes the row live: {live:?}"
+    );
+}

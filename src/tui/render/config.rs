@@ -279,6 +279,13 @@ struct Snap {
     /// Whether the stored api key is non-blank: read off the profile, not the
     /// `api_key` text field, which a draft-open snap leaves empty.
     has_api_key: bool,
+    /// [`crate::profile::Profile::spends_oauth_chain`] read false: a proxy
+    /// account, whose log out blanks the key alone, whatever it stores.
+    logs_out_by_key: bool,
+    /// [`crate::actions::proxy_login_command`] on a proxy account
+    /// ([`crate::profile::Profile::proxy`]): the one login it takes, so the
+    /// `Login` row's hint names it over either account-type hint.
+    proxy_login: Option<String>,
     /// Credential typing for the login / log-out rows (`Profile::login_is_oauth`,
     /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
     /// keep tracking the base-url buffer instead.
@@ -423,6 +430,8 @@ impl Snap {
             logged_in: false,
             has_unreadable_store: false,
             has_api_key: false,
+            logs_out_by_key: false,
+            proxy_login: None,
             login_is_oauth: true,
             has_other_login: false,
             clear_falls_back_to_oauth: false,
@@ -577,6 +586,10 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 },
                 has_unreadable_store: p.unreadable_credentials_store.is_some(),
                 has_api_key: p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+                logs_out_by_key: !p.spends_oauth_chain(),
+                proxy_login: p.proxy.as_ref().map(|record| {
+                    crate::actions::proxy_login_command(p.name.as_str(), &record.service)
+                }),
                 login_is_oauth: p.login_is_oauth(),
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
@@ -1351,7 +1364,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe, phrased for the row's
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
-/// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
+/// name what ⏎ really does, and a proxy account's log out blanks only its key
+/// — while `auto_start`, `base_url` and `alert at` flip
 /// on their own value, and auto-start and the usage probe also on whether the
 /// plan has a 5h limit at all.
 /// `value` is the row's own live value (the draft buffer while a draft holds
@@ -1436,12 +1450,19 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
         ConfigRow::Login if snap.login_disabled_reason.is_some() => {
             return Some(snap.login_disabled_reason.clone().unwrap_or_default());
         }
+        ConfigRow::Login if snap.proxy_login.is_some() => {
+            return snap
+                .proxy_login
+                .as_ref()
+                .map(|command| format!("log in with `{command}`"));
+        }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "browser OAuth login",
         ConfigRow::CaptureLogin if snap.account_type == crate::tui::app::NewAccountType::Codex => {
             "capture the current codex login into this account"
         }
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if snap.logs_out_by_key => "clears the stored API key",
         ConfigRow::DeleteCreds if api_login && snap.has_unreadable_store => {
             if snap.has_api_key {
                 "clears the stored API key and the unreadable credentials.json"

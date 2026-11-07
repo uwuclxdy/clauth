@@ -67,6 +67,8 @@ fn the_usage_hints_advertise_the_note_key() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let with_account = App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),

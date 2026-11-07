@@ -43,6 +43,8 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -85,6 +87,8 @@ fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         None,
     )

@@ -197,13 +197,24 @@ pub(crate) fn funded_wallet_rate(
     history: &[WalletSample],
     rows: &[crate::providers::StatRow],
 ) -> Option<WalletRate> {
+    funded_wallet_rate_at(history, rows, crate::usage::now_ms())
+}
+
+/// Clock-injected body of [`funded_wallet_rate`]: `now_ms` is the instant
+/// the current balance is read at, so a test pins the fit by equality.
+pub(crate) fn funded_wallet_rate_at(
+    history: &[WalletSample],
+    rows: &[crate::providers::StatRow],
+    now_ms: u64,
+) -> Option<WalletRate> {
     let wallet = crate::providers::funded_wallets(rows).into_iter().next()?;
-    let per_day = compute_wallet_rate_from_history(
+    let per_day = compute_wallet_rate_from_history_at(
         history,
         &wallet,
         WALLET_BURN_LOOKBACK_MS,
         WALLET_BURN_MIN_SAMPLES,
         WALLET_BURN_GAP_CUT_MS,
+        now_ms,
     )?;
     Some(WalletRate {
         label: wallet.label,
@@ -231,18 +242,15 @@ pub(crate) fn funded_wallet_rate(
 ///
 /// The fit runs over actual sample timestamps, never an assumed cadence: the
 /// refresh interval is user-settable, so the derivation reads the spacing the
-/// series itself records.
-fn compute_wallet_rate_from_history(
+/// series itself records. `now_ms` stamps the freshest reading.
+fn compute_wallet_rate_from_history_at(
     history: &[WalletSample],
     wallet: &crate::providers::Wallet,
     lookback_ms: u64,
     min_samples: usize,
     gap_cut_ms: u64,
+    now_ms: u64,
 ) -> Option<f64> {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
     let half_life_ms = (lookback_ms as f64 / 4.0).max(1.0);
 
     let mut entries: Vec<(u64, f64)> = history
@@ -286,6 +294,27 @@ fn compute_wallet_rate_from_history(
     // post-top-up run and reads as no burn, never negative burn.
     let per_day = -weighted_slope_per_ms(recent, half_life_ms)? * 86_400_000.0;
     (per_day > 0.0).then_some(per_day)
+}
+
+/// [`compute_wallet_rate_from_history_at`] on the wall clock, for the burn
+/// tests that seed relative to it; production reads the clock once, in
+/// [`funded_wallet_rate`].
+#[cfg(test)]
+fn compute_wallet_rate_from_history(
+    history: &[WalletSample],
+    wallet: &crate::providers::Wallet,
+    lookback_ms: u64,
+    min_samples: usize,
+    gap_cut_ms: u64,
+) -> Option<f64> {
+    compute_wallet_rate_from_history_at(
+        history,
+        wallet,
+        lookback_ms,
+        min_samples,
+        gap_cut_ms,
+        crate::usage::now_ms(),
+    )
 }
 
 /// Slope of a recency-weighted least-squares fit of `y` over time, per ms.

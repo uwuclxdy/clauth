@@ -253,6 +253,16 @@ pub(crate) enum ThirdPartyTarget {
     /// Generic api-key endpoint: usage is discovered + scanned at this base_url's
     /// API origin (same host the key already authorises for completions).
     Generic { base_url: String },
+    /// A clauth proxy account: the usage read goes through the proxy's own
+    /// `GET /clauth/v1/usage` with clauth's admin token, keyed on the account
+    /// id the profile's `[proxy]` record holds. Keyed on the REGISTRY — the
+    /// profile's `base_url` must be that service's registered bind — never on
+    /// the host shape, which stays the generic arm's business.
+    Proxy {
+        service: crate::proxy::Service,
+        account: String,
+        base_url: String,
+    },
 }
 
 impl ThirdPartyTarget {
@@ -271,6 +281,11 @@ impl ThirdPartyTarget {
                 Provider::MiniMax => minimax::ORIGIN.to_string(),
             },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
+            // Accounts of one proxy share its bind, so they serialize against
+            // it and against nothing else.
+            Self::Proxy { base_url, .. } => {
+                api_origin(base_url).unwrap_or_else(|| base_url.clone())
+            }
         }
     }
 }
@@ -334,6 +349,14 @@ pub(crate) fn fetch_third_party_usage(
     match target {
         ThirdPartyTarget::Known { provider, console } => provider.fetch(api_key, console.as_ref()),
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
+        // The proxy read authenticates with clauth's admin token, not the
+        // profile's key: `api_key` is the proxy-local inference key and never
+        // rides the usage call.
+        // The read goes to the service's registered bind, which
+        // `proxy_target_for` already matched against this `base_url`.
+        ThirdPartyTarget::Proxy {
+            service, account, ..
+        } => crate::proxy_account::fetch_usage(service, account),
     }
 }
 

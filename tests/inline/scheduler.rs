@@ -1657,6 +1657,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
         ProfileActivity::Fetching,
     );
     let before = super::now_ms();
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
     let after = super::now_ms();
     {
@@ -4023,6 +4024,251 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
     assert!(
         state.weekly_reset_kicks.lock().unwrap().is_empty(),
         "an opted-out profile arms no mark"
+    );
+}
+
+/// The drain's weekly-reset mark reads the effective opt-in: a proxy account
+/// carrying `auto_start`, its `[proxy]` table readable or not, arms no mark on
+/// a rolled-over body, where the same profile without a record arms one
+/// (`drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles`).
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_for_a_proxy_account() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let marked = |profile: crate::profile::Profile| {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![profile];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w"))
+    };
+    let mut proxied = auto_start_queue_profile("w");
+    proxied.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let mut unreadable = auto_start_queue_profile("w");
+    unreadable.has_unreadable_proxy_record = true;
+
+    assert_eq!(
+        (marked(proxied), marked(unreadable)),
+        (false, false),
+        "the weekly-reset mark armed for: a proxy account, an unreadable proxy record"
+    );
+}
+
+/// The weekly-reset mark is confirmed against the record on disk: a `[proxy]`
+/// record that landed while the in-memory config still reads the account as
+/// plain and opted in (readable, then unreadable) arms no mark, where the same
+/// memory with no record on disk arms one.
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_for_a_record_the_memory_lags() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let marked = || {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w"))
+    };
+
+    let plain = marked();
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("w")).unwrap(),
+    )
+    .unwrap();
+    crate::profile::write_proxy_record(
+        &crate::profile::ProfileName::from("w"),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .unwrap();
+    let readable = marked();
+    crate::claude::tests::break_proxy_record("w");
+    let unreadable = marked();
+
+    assert_eq!(
+        (plain, readable, unreadable),
+        (true, false, false),
+        "the weekly-reset mark armed with, on disk: no record, a proxy record, an unreadable one"
+    );
+}
+
+/// A `config.toml` the in-memory opt-in outlived that cannot say whether it
+/// holds a `[proxy]` record (a directory in its place, a `[proxy] # note`
+/// header that fails to parse) arms no weekly-reset mark, where the same
+/// memory over a plain config arms one; the store and the stage are never
+/// written either way.
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_over_a_config_it_cannot_classify() {
+    use super::FetchOutcome;
+    use crate::claude::tests::Unclassifiable;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+    let pn = crate::profile::ProfileName::from("w");
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let chain = || {
+        ["credentials.json", "credentials.json.staged"]
+            .map(|file| std::fs::read(crate::profile::profile_subpath(&pn, file).unwrap()).ok())
+    };
+    let marked = || {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state.weekly_reset_kicks.lock().unwrap().contains(&pn)
+    };
+
+    let before = chain();
+    let plain = marked();
+    let shapes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            shape.pose("w");
+            marked()
+        })
+        .collect();
+
+    assert_eq!(
+        (plain, shapes, chain() == before),
+        (true, vec![false, false], true),
+        "(the mark over a plain config, over a directory and a noted header, the store and \
+         stage kept)"
     );
 }
 
@@ -27859,6 +28105,64 @@ fn write_codex_due(base: &str) {
     crate::usage::reset_request_slots();
 }
 
+/// The catch-up leaves a proxy account's live stage where it is, its `[proxy]`
+/// table readable or not: the stage and the store stay byte for byte, and the
+/// tick logs nothing about a pair it could not save.
+#[test]
+fn the_catch_up_lands_nothing_into_a_proxy_accounts_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let catch_up = |name: &str, unreadable: bool| {
+        let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+        std::fs::write(
+            chain_dir(name).join("auth.spent.json"),
+            r#"["068bfce5d78d07ac"]"#,
+        )
+        .expect("record P1");
+        write_chain_stage(name);
+        crate::profile::write_proxy_record(
+            &chain_pn(name),
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+        if unreadable {
+            crate::claude::tests::break_proxy_record(name);
+        }
+        let files = || {
+            (
+                std::fs::read(chain_dir(name).join("credentials.json.staged")).ok(),
+                std::fs::read(chain_dir(name).join("credentials.json")).ok(),
+            )
+        };
+        let before = files();
+        super::catch_up_staged_pairs(&config);
+        (
+            before.0.is_some() && before.1.is_some(),
+            chain_store_refresh(name),
+            files() == before,
+        )
+    };
+
+    assert_eq!(
+        (
+            catch_up("chain-catch-up-px", false),
+            catch_up("chain-catch-up-pu", true),
+            lines.snapshot(),
+        ),
+        (
+            (true, Some("rt-old".to_string()), true),
+            (true, Some("rt-old".to_string()), true),
+            Vec::<String>::new(),
+        ),
+        "(the stage and store were there, the store's refresh token, both kept byte for \
+         byte) for a readable proxy record, an unreadable one; the lines logged"
+    );
+}
+
 /// P3/Q4 (rewritten): a tick with codex due and no third-party due under a
 /// wedge takes ONE wait — `codex_usage_tick_flagged` shares the tick's
 /// `timed_out` flag with the OAuth drain, so the second leg skips. Handing the
@@ -38873,4 +39177,56 @@ fn a_resets_reap_under_a_spent_ticket_logs_no_left_running() {
     );
     stub.release();
     wait_for_no_activity(&state, "lrh-lease");
+}
+
+/// The usage probe never sends a proxy account's setup token, its `[proxy]`
+/// table readable or not, though the switch is on, the token is stored and a
+/// pair sits beside the record: a proxy account has no Claude Code login. A
+/// plain setup-token account on the same tick is probed.
+#[test]
+fn the_usage_probe_never_sends_a_proxy_accounts_setup_token() {
+    let home = crate::testutil::HomeSandbox::new();
+    // One probe is the right answer; a probe per account would be three.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(4, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state_over(&["plain", "px", "pu"], 300_000, true);
+    {
+        let mut config = state.config.lock().unwrap();
+        for name in ["px", "pu"] {
+            let profile = config
+                .find_mut(&crate::profile::ProfileName::from(name))
+                .expect("the profile");
+            profile.credentials = Some(crate::testutil::oauth_pair(name));
+            if name == "px" {
+                profile.proxy = Some(crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-1".to_string(),
+                });
+            } else {
+                profile.has_unreadable_proxy_record = true;
+            }
+        }
+    }
+
+    super::tick(&state);
+    let raw = server.join().expect("listener");
+
+    let stored = state.store.lock().unwrap();
+    assert_eq!(
+        (
+            raw.len(),
+            raw.iter()
+                .map(|r| crate::testutil::request_header(r, "authorization"))
+                .collect::<Vec<_>>(),
+            ["plain", "px", "pu"].map(|name| stored.contains_key(name)),
+        ),
+        (
+            1,
+            vec![Some(format!("Bearer {SETUP_TOKEN}"))],
+            [true, false, false],
+        ),
+        "(probes sent, their bearers, a reading stored for plain, px, pu)"
+    );
 }

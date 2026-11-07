@@ -787,6 +787,11 @@ pub(crate) fn auto_start_kick(
     if lease_spent() {
         return KickResult::not_opened();
     }
+    // The kick sends the access token, and every caller decided to kick off
+    // memory, which can lag a `[proxy]` record on disk.
+    if crate::profile::stored_proxy_claim_failing_closed(name) != crate::profile::ProxyClaim::None {
+        return KickResult::not_opened();
+    }
     let first_rl = match kick(access_token, || !lease_spent()) {
         Ok(Some(())) => {
             return KickResult {
@@ -886,7 +891,7 @@ pub(crate) fn auto_start_kick(
             mark_auth_broken(config, name, true);
             return KickResult::not_opened_with(first_rl);
         }
-        SendRule::Skip => return KickResult::not_opened_with(first_rl),
+        SendRule::NeverSpent | SendRule::Skip => return KickResult::not_opened_with(first_rl),
     };
 
     // Refresh spinner from the round trip through the land; the OAuth leg reads
@@ -997,7 +1002,7 @@ pub(crate) fn auto_start_kick(
 /// sites, one `Cause` arm: `format.rs` exists because this exact condition used
 /// to print a different sentence per surface, and `5391a4c` re-created that by
 /// rewording the gate's copy while leaving the two toasts on their own string.
-fn rotation_lock_unavailable(name: &ProfileName) -> crate::format::Transient {
+pub(crate) fn rotation_lock_unavailable(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::RotationLockUnavailable(name.to_string()),
         // The cause names its own next step; a second one contradicts it.
@@ -1130,10 +1135,12 @@ fn env_has_api_key(env: &BTreeMap<String, String>) -> bool {
 /// while here the own-endpoint arm already excludes it. An account serving its
 /// own inference is told the split state
 /// whether or not clauth recognises its provider (a dead chain beside a
-/// working key reads the same on litellm as on DeepSeek), and a RECOGNISED
-/// keyless one is told about the key. A keyless unrecognised endpoint falls
-/// through to `None` on purpose — it may be a local model needing no key, the
-/// same 2026-08-28 ruling that keeps the delegate's keyless arm scoped.
+/// working key reads the same on litellm as on DeepSeek), and a keyless one
+/// whose inference needs a key ([`crate::profile::Profile::is_keyless`]: a
+/// recognised provider, or a proxy account on its bind) is told about the key.
+/// A keyless unrecognised endpoint falls through to `None` on purpose — it may
+/// be a local model needing no key, the scope the delegate's keyless arm reads —
+/// unless the profile is a proxy account, whose key fix is its proxy login.
 ///
 /// The own-endpoint arm consults the durable verdicts before rendering the
 /// split state, and renders the sentence true for what each measured. A dead
@@ -1156,6 +1163,7 @@ pub(crate) fn third_party_dead_chain_copy(
     name: &ProfileName,
 ) -> Option<String> {
     let profile = profile?;
+    let proxy = profile.proxy.as_ref().map(|record| &record.service);
     if crate::claude::has_own_inference_endpoint(profile) {
         // A profile holding no usable api key has no key the split sentence
         // could claim still works — provided the env carries none either
@@ -1164,7 +1172,7 @@ pub(crate) fn third_party_dead_chain_copy(
         // `[env]`-token shape, so render it there without a verdict (the
         // consult has no fingerprint to match for that shape anyway).
         if !crate::claude::has_usable_api_key(profile) && !env_has_api_key(&profile.env) {
-            return Some(crate::format::third_party_keyless(name));
+            return Some(crate::format::third_party_keyless(name, proxy));
         }
         // A dead key (any provider, Alibaba included) retires the dead-chain
         // sentence, which would claim the key still works. A matching
@@ -1173,7 +1181,7 @@ pub(crate) fn third_party_dead_chain_copy(
         // one; the "never captured" collapse keeps the dead-chain sentence
         // there, which stays true of it.
         if crate::fallback::third_party_key_rejected(profile, name) {
-            return Some(crate::format::api_key_rejected(name));
+            return Some(crate::format::api_key_rejected(name, proxy));
         }
         if crate::usage::profile_credential_fingerprint(profile)
             .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
@@ -1182,10 +1190,14 @@ pub(crate) fn third_party_dead_chain_copy(
         {
             return Some(crate::format::third_party_dead_console(name));
         }
-        return Some(crate::format::third_party_dead_chain(name));
+        return Some(crate::format::third_party_dead_chain(name, proxy));
     }
-    if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-        return Some(crate::format::third_party_keyless(name));
+    // A proxy account with no key takes one only from a login through its
+    // proxy, the one login clauth takes for it, so it is told that login even
+    // where its routing puts it on no bind and `login_expired`'s browser
+    // login would otherwise render.
+    if profile.is_keyless() || (proxy.is_some() && !crate::claude::has_inference_auth(profile)) {
+        return Some(crate::format::third_party_keyless(name, proxy));
     }
     None
 }
@@ -1248,7 +1260,9 @@ fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) 
 /// activity slot. Returns [`RotateOutcome::GuardUnavailable`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
 /// the TUI confirm pre-stamps on the UI thread and this worker clears it). The
-/// no-refresh-token leg, and a
+/// no-refresh-token leg, which a proxy account takes whatever it stores
+/// ([`crate::profile::Profile::spends_oauth_chain`], read under the hold, so
+/// a confirm armed before the name became one spends nothing), and a
 /// spent token whose store already holds a newer login (adopted, nothing
 /// sent), return [`RotateOutcome::Persisted(false)`] silently.
 fn rotate_one_inner(
@@ -1273,6 +1287,7 @@ fn rotate_one_inner(
             }
             let Some(rt) = cfg
                 .find(name)
+                .filter(|p| p.spends_oauth_chain())
                 .and_then(|p| p.refresh_token().map(str::to_string))
             else {
                 return Ok(None);
@@ -1314,6 +1329,13 @@ fn rotate_one_inner(
         Err(refused) => Err(anyhow::anyhow!("{}", refused.text())),
         Ok(SendRule::Send(rt)) => {
             rotate_send(config, name, &rt, scopes.as_deref(), &rotation_guard)
+        }
+        // Nothing to spend, nothing failed, so no toast.
+        Ok(SendRule::NeverSpent) => {
+            if let Some(activity) = activity {
+                clear_activity(activity, name);
+            }
+            return RotateOutcome::Persisted(false);
         }
         // The store already holds a newer login than the spent one in memory:
         // nothing to spend, nothing failed, so no toast.
@@ -1391,7 +1413,8 @@ fn rotate_send(
 
 /// Profiles `refresh_all` would rotate, as `(name, refresh_token)` pairs.
 /// Extracted so tests can pin the inclusion logic without the network.
-/// Diverged-active profiles are included only when `force`. A live
+/// Diverged-active profiles are included only when `force`; a proxy account
+/// never is ([`crate::profile::Profile::spends_oauth_chain`]). A live
 /// `clauth start` session does not exclude a profile: it shares the credential
 /// file a rotation writes, so it follows the new pair instead of being cut off
 /// from one.
@@ -1403,7 +1426,7 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Profi
         .profiles
         .iter()
         .filter_map(|p| {
-            if skip_active && config.is_active(&p.name) {
+            if !p.spends_oauth_chain() || (skip_active && config.is_active(&p.name)) {
                 return None;
             }
             Some((p.name.clone(), p.refresh_token()?.to_string()))
@@ -1584,7 +1607,7 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
             let Some(profile) = cfg.find(name) else {
                 return Ok::<_, anyhow::Error>(None);
             };
-            if !profile.is_oauth() || !profile.auto_start {
+            if !profile.is_oauth() || !profile.has_effective_auto_start() {
                 return Ok(None);
             }
             let Some(token) = profile.access_token().map(str::to_string) else {
@@ -1982,6 +2005,12 @@ pub(crate) enum Landing {
     /// capture) or none (a cleared login): nothing was written and the stage
     /// is gone. `store` is the store's login as read.
     Refused { store: Option<ClaudeCredentials> },
+    /// The profile never spends its chain ([`crate::profile::Profile::spends_oauth_chain`]:
+    /// a proxy account, its `[proxy]` table readable or not), or its
+    /// `config.toml` cannot be read or parsed, read in the hold
+    /// ([`crate::profile::stored_proxy_claim_failing_closed`]): nothing was
+    /// written, the stage stays as it is and no hook ran.
+    NotSpent,
 }
 
 /// Land a pair in the profile's store and run the post-persist hooks — the one
@@ -1989,20 +2018,28 @@ pub(crate) enum Landing {
 /// itself; the caller holds the profile's [`RotationGuard`] and no state-flock
 /// hold of its own (the Keychain mirror runs after the hold ends).
 ///
-/// The store's refresh token `D` is read raw FIRST in the hold. The pair is
-/// written only when `D` is this chain's: `fp(D) = sent_fp` (the token this
-/// pair was minted from), or `D` is spent, or `D` is the base of the stage on
-/// disk (a rotation that sent a stage's token, or an evicted base). The stage
-/// is read for its `base` alone and never vouches for a login the store does
-/// not hold. Anything else refuses: an absent `D`, or a foreign login.
+/// The hold reads the profile's `config.toml` first: a `[proxy]` claim, or a
+/// file that cannot be read or parsed, lands nothing ([`Landing::NotSpent`]).
+/// The claim is read in the hold the record's writers also take, so whichever
+/// caller lands, a record on disk by then keeps the account's store and stage
+/// as they are.
+///
+/// Past the claim, the store's refresh token `D` is read raw, before anything
+/// else of the store. The pair is written only when `D` is this chain's:
+/// `fp(D) = sent_fp` (the token this pair was minted from), or `D` is spent,
+/// or `D` is the base of the stage on disk (a rotation that sent a stage's
+/// token, or an evicted base). The stage is read for its `base` alone and
+/// never vouches for a login the store does not hold. Anything else refuses:
+/// an absent `D`, or a foreign login.
 ///
 /// `in_hold` runs inside the same hold with the resolution, so a caller's
-/// in-memory copy moves with the disk: `Some` for a landing or a refusal,
-/// `None` when the store could not be read or written (the stage then stays
-/// for a retry). A refusal deletes the stage in the hold; a landing keeps it
-/// until the Keychain mirror after the hold has returned, whatever that mirror
-/// did. `old_access` is the access token of the login the pair replaces, which
-/// the hooks recognise in the live slot and Keychain.
+/// in-memory copy moves with the disk: `Some` for a landing, a refusal or a
+/// [`Landing::NotSpent`], `None` when the store could not be read or written
+/// (the stage then stays for a retry). A refusal deletes the stage in the
+/// hold; a landing keeps it until the Keychain mirror after the hold has
+/// returned, whatever that mirror did. `old_access` is the access token of the
+/// login the pair replaces, which the hooks recognise in the live slot and
+/// Keychain.
 pub(crate) fn land_pair(
     name: &ProfileName,
     sent_fp: &str,
@@ -2086,6 +2123,16 @@ fn land_pair_with(
         _ => pre_hook_install_access,
     };
     let landing = with_state_lock(|held| {
+        // `Profile::spends_oauth_chain` off the one file it is decided by: a
+        // readable record and an unreadable `[proxy]` table alike claim the
+        // account for its proxy, and so does a config.toml that cannot be read
+        // or parsed, which may hide one.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            in_hold(Some(&Landing::NotSpent), held);
+            return Ok(Landing::NotSpent);
+        }
         let store = match read_raw_store(name) {
             Ok(store) => store,
             Err(e) => {
@@ -2318,6 +2365,9 @@ fn land_pair_with(
         in_hold(Some(&Landing::Landed), held);
         Ok(Landing::Landed)
     })?;
+    if matches!(landing, Landing::NotSpent) {
+        return Ok(landing);
+    }
     // Armed past the hold, so the flock wait above (and a caller's token call
     // before it) spends none of the window the Keychain calls below share.
     crate::lock::with_keychain_budget(crate::runtime::KEYCHAIN_MIRROR_BUDGET, || {
@@ -2481,7 +2531,7 @@ pub(crate) fn apply_rotated_tokens_locked(
         };
         let next = match landing {
             Some(Landing::Refused { store }) => store.clone(),
-            Some(Landing::Landed) | None => Some(creds.clone()),
+            Some(Landing::Landed | Landing::NotSpent) | None => Some(creds.clone()),
         };
         profile.set_credentials(next, held);
     })
@@ -2491,6 +2541,11 @@ pub(crate) fn apply_rotated_tokens_locked(
         Landing::Refused { store } => Err(PersistError::Refused {
             store: store.map(Box::new),
         }),
+        // The stage stays and the minted pair is still the chain head, which
+        // is a failed write's state.
+        Landing::NotSpent => Err(PersistError::Failed(anyhow::anyhow!(
+            "failed to persist rotated tokens"
+        ))),
     }
 }
 
@@ -2511,6 +2566,11 @@ pub(crate) enum SendRule {
     /// The spent record cannot be read (or, under a spent `rt`, the store):
     /// skip this spend; a later tick retries.
     Skip,
+    /// The account's `config.toml` claims a proxy account, or cannot say it
+    /// claims none ([`crate::profile::stored_proxy_claim_failing_closed`]),
+    /// whatever the caller's memory reads: send nothing, answering as for a
+    /// chain clauth never spends.
+    NeverSpent,
 }
 
 /// Decide what a spend site holding `name`'s rotation guard may send, after
@@ -2521,12 +2581,17 @@ pub(crate) enum SendRule {
 /// bearer it carries, and a live stage that lands hands the spend its own
 /// pair's refresh token in place of `rt`. A resolve that cannot complete
 /// refuses the spend as `Transient`, so no spend goes past an unresolved stage.
+/// Before it, an account that may be a proxy account on disk answers
+/// [`SendRule::NeverSpent`].
 pub(crate) fn send_rule(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     rt: &str,
     guard: &RotationGuard,
 ) -> std::result::Result<SendRule, crate::format::Transient> {
+    if crate::profile::stored_proxy_claim_failing_closed(name) != crate::profile::ProxyClaim::None {
+        return Ok(SendRule::NeverSpent);
+    }
     // `rt`, read before the resolve, is the base a landed stage superseded: the
     // server consumed it whether or not the spent record says so yet. A live
     // stage always carries a refresh token (`StagedPair::state`), so the `Skip`
@@ -2610,6 +2675,9 @@ pub(crate) enum StageOutcome {
     /// The store still holds the stage's base or pair but the spent record
     /// cannot be read, so nothing can judge it: left as it is.
     Unjudgeable,
+    /// The landing answered [`Landing::NotSpent`]: the stage and the store are
+    /// left as they are, and the caller goes on without a landing.
+    Kept,
 }
 
 /// How a stage reader judges `stage` against the store's refresh token `d` and
@@ -2643,8 +2711,10 @@ fn stage_needs_landing(name: &ProfileName) -> bool {
 
 /// Resolve `name`'s stage under its rotation guard by its three states: live
 /// lands through `land_live`, landed runs the hooks with the base pair as the
-/// old one, inert is deleted. A stage the store is still bound to (holding its
-/// base or its pair) is never judged off an unreadable record.
+/// old one, inert is deleted. A live or landed stage of a profile whose landing
+/// answers [`Landing::NotSpent`] stays as it is ([`StageOutcome::Kept`]). A
+/// stage the store is still bound to (holding its base or its pair) is never
+/// judged off an unreadable record.
 fn resolve_stage(
     name: &ProfileName,
     _guard: &RotationGuard,
@@ -2662,10 +2732,12 @@ fn resolve_stage(
         StageState::Live => match land_live(&stage)? {
             Landing::Landed => StageOutcome::Landed,
             Landing::Refused { .. } => StageOutcome::Refused,
+            Landing::NotSpent => StageOutcome::Kept,
         },
         StageState::Landed => match land_hooks(name, &stage.creds, &stage.base_access)? {
             Landing::Landed => StageOutcome::HooksRan,
             Landing::Refused { .. } => StageOutcome::Dropped,
+            Landing::NotSpent => StageOutcome::Kept,
         },
         StageState::Inert => {
             delete_stage(name);
@@ -2710,13 +2782,14 @@ fn land_staged_pair_carrying(
             &stage.base_access,
             |_, _| {},
         )?;
-        next = Some(match &landing {
+        next = match &landing {
             Landing::Landed => {
                 landed = Some(stage.creds.clone());
-                landed.clone()
+                Some(landed.clone())
             }
-            Landing::Refused { store } => store.clone(),
-        });
+            Landing::Refused { store } => Some(store.clone()),
+            Landing::NotSpent => None,
+        };
         Ok(landing)
     })?;
     if let Some(next) = next
@@ -2743,7 +2816,10 @@ fn land_staged_pair_carrying(
 /// with the guard held and before any state-flock hold of the caller's own. A
 /// landing that cannot complete refuses the caller's operation as `Transient`
 /// (the flock busy or faulted, the store or record unreadable); the caller
-/// then never installs or seeds from the store.
+/// then never installs or seeds from the store. A profile whose landing answers
+/// [`Landing::NotSpent`] keeps its stage ([`StageOutcome::Kept`]) and the
+/// caller goes on: a stage nobody lands is no reason to refuse it, and a caller
+/// whose whole operation a proxy account refuses says so itself.
 pub(crate) fn land_stage_for_install(
     name: &ProfileName,
     guard: &RotationGuard,
@@ -3019,7 +3095,9 @@ pub(crate) fn try_adopt_live_rotation(
         if !cfg.is_active(name) {
             return None;
         }
-        let p = cfg.find(name)?;
+        // A proxy account's stored pair stays as it is: adopting would rewrite
+        // it and hand the scheduler's entry a refresh token to spend.
+        let p = cfg.find(name).filter(|p| p.spends_oauth_chain())?;
         // The expiry gate below weighs the live mirror against memory, and
         // memory is a fair yardstick only while the store carries that same
         // login pair: a store this leg cannot read, or one whose pair differs
@@ -3138,6 +3216,12 @@ pub(crate) fn try_adopt_live_rotation(
         // it cannot land while this leg holds it). The store write would recreate
         // its directory, so consult the on-disk list before writing.
         if !crate::profile::is_configured(name).unwrap_or(false) {
+            return Ok(false);
+        }
+        // The pre-HTTP filter read memory, which can lag a `[proxy]` record.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
             return Ok(false);
         }
         let Some(profile) = cfg.find_mut(name) else {
@@ -3425,7 +3509,15 @@ fn ensure_installable_with(
     // mis-filled/dead-chain) is decided there, so no rolling-token profile can fall
     // through a vanilla path and install the shared rotating pair.
     if profile_rolling_token(config, name) {
-        let gate = rolling_install_gate(config, name, refresher, horizon_ms, wait, spend_marker);
+        let gate = rolling_install_gate(
+            config,
+            name,
+            refresher,
+            horizon_ms,
+            wait,
+            spend_marker,
+            None,
+        );
         // A no-spend re-stamp in the gate may have revoked a copied bearer;
         // a no-op while the caller holds a flock or an armed budget.
         crate::runtime::repoint_copied_bearers();
@@ -3704,6 +3796,10 @@ fn take_rotation_guard(
 ///     on a refresh-less bearer never blocks — it holds nothing to strand;
 ///   * terminally dead chain → restore the static mint (Ready, degraded)
 ///     else Broken.
+///
+/// `held` is a rotation guard the caller already holds (the CLI arm), taken in
+/// place of the gate's own; it drops wherever the gate would release its own,
+/// before every vanilla fall-through, whose acquire blocks on the same lock.
 fn rolling_install_gate(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -3711,12 +3807,20 @@ fn rolling_install_gate(
     fresh_horizon_ms: i64,
     wait: LockWait,
     spend_marker: SpendMarker<'_>,
+    held: Option<RotationGuard>,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
+    // The heal writes the sidecar, so it runs only on an account that claims
+    // no proxy account on disk; a claimed one falls to the table below, where
+    // [`roll_from_stored_chain`] reads the same claim and stamps nothing. This
+    // read only spares a claimed account the flock: the heal decides on its
+    // own read under it.
     if matches!(
         crate::claude::session_token_status(name),
         Some(SessionTokenStatus::NotLongLived)
-    ) {
+    ) && crate::profile::stored_proxy_claim_failing_closed(name)
+        == crate::profile::ProxyClaim::None
+    {
         match crate::claude::heal_misfilled_sidecar(name) {
             Ok(crate::claude::HealOutcome::Healed) => logline!(
                 "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
@@ -3728,6 +3832,9 @@ fn rolling_install_gate(
             // this into "no backup" and sent a healthy sidecar down the
             // vanilla path.)
             Ok(crate::claude::HealOutcome::NotMisfilled) => {}
+            // A proxy record landed after the read above: the table below
+            // takes it as it takes one that read saw.
+            Ok(crate::claude::HealOutcome::ProxyClaimed) => {}
             Ok(crate::claude::HealOutcome::NoLiveBackup) => {
                 logline!(
                     "clauth: '{name}' sidecar is mis-filled and no live static backup exists \
@@ -3738,13 +3845,16 @@ fn rolling_install_gate(
                     // The switch/arm paths keep the pre-split behavior: the
                     // profile installs through the SAME plain gate a
                     // non-rolling mis-fill takes.
-                    LockWait::Block | LockWait::NoWaitInstall => vanilla_install_gate(
-                        config,
-                        name,
-                        refresher,
-                        fresh_horizon_ms,
-                        spend_marker,
-                    ),
+                    LockWait::Block | LockWait::NoWaitInstall => {
+                        drop(held);
+                        vanilla_install_gate(
+                            config,
+                            name,
+                            refresher,
+                            fresh_horizon_ms,
+                            spend_marker,
+                        )
+                    }
                     // The vanilla gate's own acquire BLOCKS, which is exactly
                     // what this axis exists to keep off the tick thread — and
                     // the work it would do there (install or refresh the
@@ -3783,9 +3893,12 @@ fn rolling_install_gate(
     }
     // Mint-shaped, stale, or absent: everything below mutates the sidecar or
     // the chain, so it serializes with rotations on the cross-process guard.
-    let guard = match take_rotation_guard(name, wait) {
-        Ok(guard) => guard,
-        Err(busy) => return AuthGate::Transient(busy.into_transient()),
+    let guard = match held {
+        Some(guard) => guard,
+        None => match take_rotation_guard(name, wait) {
+            Ok(guard) => guard,
+            Err(busy) => return AuthGate::Transient(busy.into_transient()),
+        },
     };
     // Everything below stamps the sidecar from the stored chain or spends it,
     // so a staged pair lands first (the arm and re-stamp legs reach here
@@ -3858,6 +3971,7 @@ fn rolling_install_gate(
                 AuthGate::Transient(rolling_grant_unrecorded(name))
             };
         }
+        RollAttempt::NeverSpent => return AuthGate::Ready,
         RollAttempt::ChainStale => {}
     }
     // A live session launched on the ROTATING PAIR — it started before any
@@ -3971,11 +4085,14 @@ pub(crate) enum RollingArmError {
 /// path. Same decision table as [`rolling_install_gate`] (the CLI pre-clears a
 /// mis-fill by quarantining it, so the vanilla fall-through leg is
 /// unreachable here in practice — and if raced back in, `Ready` from the
-/// vanilla gate still reports arming failure via the sidecar check).
+/// vanilla gate still reports arming failure via the sidecar check). The gate
+/// runs under the caller's `guard`, so whatever the caller read and wrote
+/// under it before the arm still holds when the gate stamps or spends.
 pub(crate) fn arm_rolling_token(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    guard: RotationGuard,
 ) -> std::result::Result<(), RollingArmError> {
     match rolling_install_gate(
         config,
@@ -3984,6 +4101,7 @@ pub(crate) fn arm_rolling_token(
         AUTH_GATE_GRACE_MS,
         LockWait::Block,
         None,
+        Some(guard),
     ) {
         AuthGate::Ready | AuthGate::Refreshed => {
             if crate::claude::has_session_token(name) {
@@ -4063,6 +4181,7 @@ pub(crate) fn restamp_rolling_token(
         refresher,
         ROLLING_RESTAMP_HORIZON_MS,
         LockWait::NoWait,
+        None,
         None,
     );
     crate::runtime::repoint_copied_bearers();
@@ -4232,6 +4351,11 @@ enum RollAttempt {
     /// routes to the guarded refresh leg, whose persist re-stamps the sidecar
     /// via the rotation hook.
     ChainStale,
+    /// The chain is one clauth never spends
+    /// ([`crate::profile::Profile::spends_oauth_chain`]): nothing is stamped
+    /// from it and no refresh will spend it, so the profile installs as is,
+    /// with no rotation block to ask.
+    NeverSpent,
     /// The chain is healthy but the sidecar write failed — the caller must
     /// NOT fall through (the refresh leg would early-Ready on the comfortable
     /// chain without re-stamping a stale sidecar).
@@ -4249,7 +4373,10 @@ enum RollAttempt {
 /// access token is comfortably live — the no-spend path for a stale rolling token
 /// at switch time. A standing `auth_broken` routes to `ChainStale` (server-side
 /// revocation kills the access token with the chain, so a comfortable clock
-/// proves nothing there — same rationale as [`expiring`]'s flag override).
+/// proves nothing there — same rationale as [`expiring`]'s flag override). A
+/// chain clauth never spends ([`crate::profile::Profile::spends_oauth_chain`],
+/// or on disk [`crate::profile::stored_proxy_claim_failing_closed`], which
+/// memory can lag) is `NeverSpent`, so nothing is stamped from it.
 /// `_rotation_guard` witnesses the caller holding the profile's rotation lock
 /// for the whole read-and-write: without it, a concurrent rotation's NEWER rolling
 /// token could be clobbered by this call's older cloned access token.
@@ -4259,12 +4386,18 @@ fn roll_from_stored_chain(
     _rotation_guard: &RotationGuard,
     fresh_horizon_ms: i64,
 ) -> RollAttempt {
+    if crate::profile::stored_proxy_claim_failing_closed(name) != crate::profile::ProxyClaim::None {
+        return RollAttempt::NeverSpent;
+    }
     let Ok(cfg) = config.lock() else {
         return RollAttempt::ChainStale;
     };
     let flagged = cfg.is_auth_broken(name);
-    let chain = cfg
-        .find(name)
+    let profile = cfg.find(name);
+    if profile.is_some_and(|p| !p.spends_oauth_chain()) {
+        return RollAttempt::NeverSpent;
+    }
+    let chain = profile
         .and_then(|p| p.credentials.as_ref())
         .and_then(|c| c.claude_ai_oauth.as_ref())
         .cloned();
@@ -4315,8 +4448,9 @@ fn oauth_shape(
         // "Profile not found".
         return Err(AuthGate::Ready);
     };
-    if !profile.is_oauth() {
-        // Third-party (api-key) profiles carry no OAuth token to expire.
+    if !profile.is_oauth() || !profile.spends_oauth_chain() {
+        // Third-party (api-key) profiles carry no OAuth token to expire, and
+        // a proxy account never spends the one it may hold.
         return Err(AuthGate::Ready);
     }
     Ok((
@@ -4501,6 +4635,8 @@ fn gate_under_guard(
             mark_auth_broken(config, name, true);
             return AuthGate::Broken;
         }
+        // As `oauth_shape` answers a chain clauth never spends.
+        SendRule::NeverSpent => return AuthGate::Ready,
         SendRule::Skip => return AuthGate::Transient(spent_record_unreadable(name)),
     };
 

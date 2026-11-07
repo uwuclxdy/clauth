@@ -21656,6 +21656,71 @@ fn assert_every_copy_keeps_the_siblings_write(copies: &[(&str, &std::path::Path)
     }
 }
 
+/// A session start on a proxy account, its `[proxy]` table readable or not,
+/// goes ahead with a live stage beside its store and lands none of it: the
+/// start-time arming refuses the rolling-token account, and the start's own
+/// install gate lands nothing into a store the account never spends, so the
+/// stage and the store stay byte for byte.
+#[test]
+fn a_session_start_on_a_proxy_account_lands_nothing_into_its_store() {
+    let files = |name: &crate::profile::ProfileName| {
+        let dir = crate::profile::profile_dir(name).expect("dir");
+        (
+            fs::read(dir.join("credentials.json.staged")).ok(),
+            fs::read(dir.join("credentials.json")).ok(),
+        )
+    };
+    // One home per shape: the two stores would hold one chain.
+    let start = |name: &str, unreadable: bool| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut seen = None;
+        with_fake_home(tmp.path(), || {
+            if !host_poses(tmp.path(), "a linked session store") {
+                return;
+            }
+            fake_claude_home(tmp.path());
+            let profile = staged_profile(name);
+            crate::profile::update_profile_config(&profile.name, |p| {
+                p.rolling_token = true;
+                Ok(())
+            })
+            .expect("arm the rolling flag");
+            crate::profile::write_proxy_record(
+                &profile.name,
+                &crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-1".to_string(),
+                },
+            )
+            .expect("write the record");
+            if unreadable {
+                crate::claude::tests::break_proxy_record(name);
+            }
+            let before = files(&profile.name);
+            let started =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .map(drop);
+            seen = Some((
+                before.0.is_some() && before.1.is_some(),
+                started.map_err(|e| format!("{e:#}")),
+                files(&profile.name) == before,
+            ));
+        });
+        seen
+    };
+
+    let (proxied, unreadable) = (start("proxy-start", false), start("proxy-start-u", true));
+    if proxied.is_none() && unreadable.is_none() {
+        return;
+    }
+    assert_eq!(
+        (proxied, unreadable),
+        (Some((true, Ok(()), true)), Some((true, Ok(()), true))),
+        "(the stage and store were there, the start, both kept byte for byte) for a \
+         readable proxy record, an unreadable one"
+    );
+}
+
 /// Home is clauth's own echo (a fresh mtime carrying a t10 write) when a new
 /// tree is seeded: the seed carries home's rank of t10, never home's fresh
 /// mtime, so a sibling's unpropagated t20 write still wins the next pass.
@@ -26164,4 +26229,399 @@ fn appdata_decides_the_manifest_dir_a_retire_repoints() {
     let got: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).expect("read")).expect("parse");
     assert_eq!(got["path"], stable.to_str().expect("utf-8 path"));
+}
+
+/// A `clauth start` session on a proxy account whose Claude Code runs its own
+/// `/login`: the session's drain never saves that login into the proxy
+/// account's store.
+#[cfg(unix)]
+#[test]
+fn a_session_login_on_a_proxy_account_stays_out_of_its_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        register_profile(&px);
+        crate::profile::write_proxy_record(
+            &px.name,
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-px".to_string(),
+            },
+        )
+        .expect("write the proxy record");
+        let px = crate::profile::load_profile(&px.name).expect("load px");
+        let store = crate::claude::install_source_path(&px.name).expect("store path");
+        let before = store.exists();
+        let session = ProfileRuntime::acquire(&px, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire px");
+        let live = session.config_dir().join(".credentials.json");
+        let _ = fs::remove_file(&live);
+        fs::write(
+            &live,
+            br#"{"claudeAiOauth":{"accessToken":"at-cc-own","refreshToken":"rt-cc-own","expiresAt":4102444800000}}"#,
+        )
+        .expect("Claude Code's own login");
+        // The drain the watchdog runs, run here: once it returns, a copy into
+        // the store is on disk, with no deadline to wait out on fixed code.
+        tick(&session.claude_home, &session.swap).expect("the session's drain");
+        let landed = fs::read(&store)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).contains("rt-cc-own"));
+        let claim_is_account = matches!(
+            crate::profile::stored_proxy_claim(&px.name),
+            crate::profile::ProxyClaim::Account(_)
+        );
+        drop(session);
+        assert_eq!(
+            (px.proxy.is_some(), before, claim_is_account, landed),
+            (true, false, true, None),
+            "(px is a proxy account, a store before, the claim reads Account, the session's \
+             login in px's store)"
+        );
+    });
+}
+
+/// `px`, an account on proxy "stub", saved and registered.
+fn proxy_account_px() -> Profile {
+    let px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    register_profile(&px);
+    crate::profile::write_proxy_record(
+        &px.name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    crate::profile::load_profile(&px.name).expect("load px")
+}
+
+/// Claude Code signed in to `account` in the session config dir `config_dir`,
+/// holding access token `access`: its `.claude.json` names the account and
+/// its credentials file holds the login.
+fn session_sign_in(config_dir: &Path, account: &str, access: &str) {
+    fs::write(
+        config_dir.join(".claude.json"),
+        serde_json::json!({ "oauthAccount": { "accountUuid": account } }).to_string(),
+    )
+    .expect("the session's .claude.json");
+    fs::write(
+        config_dir.join(".credentials.json"),
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": format!("rt-{access}"),
+                "expiresAt": 4_102_444_800_000_u64,
+            }
+        })
+        .to_string(),
+    )
+    .expect("the session's login");
+}
+
+/// A session's drain over a proxy account's store keeps Claude Code's own
+/// login in the session's file and never writes the store, and its not-saved
+/// line goes out once per signed-in account: a second pass over one login and
+/// a token refresh of the same account raise none, a different account a
+/// second.
+#[test]
+fn a_proxy_account_session_drain_keeps_the_login_and_warns_once_per_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let px = proxy_account_px();
+        let store = crate::claude::install_source_path(&px.name).expect("store path");
+        let config_dir = tmp.path().join("session-config");
+        fs::create_dir_all(&config_dir).expect("mkdir the session config dir");
+        let link = config_dir.join(".credentials.json");
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+
+        let mut drains = Vec::new();
+        for (account, access) in [
+            ("uuid-r19-drain-a", "at-r19-drain-1"),
+            ("uuid-r19-drain-a", "at-r19-drain-1"),
+            ("uuid-r19-drain-a", "at-r19-drain-2"),
+            ("uuid-r19-drain-b", "at-r19-drain-3"),
+        ] {
+            session_sign_in(&config_dir, account, access);
+            drains.push(drain_session_login(&link, &store).expect("drain"));
+        }
+
+        let line = "clauth: Claude Code signed in while proxy account 'px' was active; clauth did \
+                    not save that login into 'px'. To keep it as an account, run `clauth login \
+                    <name>` with a new name"
+            .to_string();
+        assert_eq!(
+            (
+                drains,
+                lines.snapshot(),
+                store.exists(),
+                fs::symlink_metadata(&link)
+                    .expect("the session's file")
+                    .is_file(),
+                fs::read_to_string(&link)
+                    .expect("the session's login")
+                    .contains("at-r19-drain-3"),
+            ),
+            (
+                vec![Drain::Unchanged; 4],
+                vec![line.clone(), line],
+                false,
+                true,
+                true
+            ),
+            "(drains, lines, px's store, the session's own file, its login kept)"
+        );
+    });
+}
+
+/// The fake transport (where symlinks are denied) mirrors the session's file
+/// instead of relinking it: a proxy account's store never takes Claude Code's
+/// own login there either, through a watchdog pass and the teardown's final
+/// one, and the session's file keeps it.
+#[test]
+fn a_fake_mode_session_on_a_proxy_account_keeps_its_login_through_teardown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let px = proxy_account_px();
+            let store = crate::claude::install_source_path(&px.name).expect("store path");
+            let session =
+                ProfileRuntime::acquire(&px, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire px");
+            let live = session.config_dir().join(".credentials.json");
+            let login = br#"{"claudeAiOauth":{"accessToken":"at-r19-fake","refreshToken":"rt-r19-fake","expiresAt":4102444800000}}"#;
+            fs::write(&live, login).expect("Claude Code's own login");
+
+            tick(&session.claude_home, &session.swap).expect("the session's mirror");
+            let after_tick = (store.exists(), fs::read(&live).ok() == Some(login.to_vec()));
+            drop(session);
+
+            assert_eq!(
+                (after_tick, store.exists()),
+                ((false, true), false),
+                "((px's store, the session's file kept) after a pass, px's store after teardown)"
+            );
+        });
+    });
+}
+
+/// A session drain over the store of a profile whose `[proxy]` table clauth
+/// cannot read keeps Claude Code's own login in the session's file and never
+/// writes the store: an unreadable claim counts as a proxy account's.
+#[test]
+fn an_unreadable_proxy_claim_keeps_the_session_login_off_its_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let px = proxy_account_px();
+        let config_path = crate::profile::profile_dir(&px.name)
+            .unwrap()
+            .join("config.toml");
+        let text = fs::read_to_string(&config_path).unwrap();
+        fs::write(&config_path, text.replace("acct-px", "")).unwrap();
+        let store = crate::claude::install_source_path(&px.name).expect("store path");
+        let config_dir = tmp.path().join("session-config");
+        fs::create_dir_all(&config_dir).expect("mkdir the session config dir");
+        let link = config_dir.join(".credentials.json");
+        session_sign_in(&config_dir, "uuid-r20-unread", "at-r20-unread");
+
+        let drained = drain_session_login(&link, &store).expect("drain");
+
+        assert_eq!(
+            (
+                crate::profile::stored_proxy_claim(&px.name),
+                drained,
+                store.exists(),
+                fs::read_to_string(&link)
+                    .unwrap_or_default()
+                    .contains("at-r20-unread"),
+            ),
+            (
+                crate::profile::ProxyClaim::Unreadable,
+                Drain::Unchanged,
+                false,
+                true
+            ),
+            "(px's claim, the drain, px's store, the session's file keeps its login)"
+        );
+    });
+}
+
+/// A session drain over the store of a proxy account whose `config.toml`
+/// cannot say whether it holds a `[proxy]` record (a directory in its place, a
+/// `[proxy] # note` header that fails to parse) keeps Claude Code's own login
+/// in the session's file: the store and the stage are never written and no
+/// other file of the profile moves.
+#[test]
+fn an_unclassifiable_config_keeps_the_session_login_off_its_store() {
+    use crate::claude::tests::Unclassifiable;
+    let outcomes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            with_fake_home(tmp.path(), || {
+                let px = proxy_account_px();
+                let store = crate::claude::install_source_path(&px.name).expect("store path");
+                let dir = crate::profile::profile_dir(&px.name).unwrap();
+                let config_dir = tmp.path().join("session-config");
+                fs::create_dir_all(&config_dir).expect("mkdir the session config dir");
+                let link = config_dir.join(".credentials.json");
+                let listing = || {
+                    let mut names: Vec<_> = fs::read_dir(&dir)
+                        .expect("the profile dir")
+                        .map(|entry| entry.expect("an entry").file_name())
+                        .collect();
+                    names.sort();
+                    names
+                };
+                shape.pose("px");
+                let before = listing();
+                session_sign_in(&config_dir, "uuid-r29l-drain", "at-r29l-drain");
+
+                let drained = drain_session_login(&link, &store).map_err(|e| e.to_string());
+
+                (
+                    drained,
+                    store.exists(),
+                    store.with_file_name("credentials.json.staged").exists(),
+                    listing() == before,
+                    fs::read_to_string(&link)
+                        .unwrap_or_default()
+                        .contains("at-r29l-drain"),
+                )
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![(Ok(Drain::Unchanged), false, false, true, true); 2],
+        "(the drain, px's store, its stage, px's dir listing kept, the session's file keeps its \
+         login) for a directory and a noted header"
+    );
+}
+
+/// The `clauth start` session drain's not-saved line over `px`'s store says
+/// what is true of each claim: a `config.toml` it cannot classify (a directory
+/// in its place, a `[proxy] # note` header that fails to parse) gets the line
+/// naming the unread config, a `[proxy]` table that does not read and a
+/// readable one keep the proxy account's.
+#[test]
+fn the_session_drain_says_clauth_cannot_read_an_unclassifiable_config() {
+    use crate::claude::tests::Unclassifiable;
+    let poses: [(&str, Option<Unclassifiable>, bool); 4] = [
+        ("dir", Some(Unclassifiable::Directory), false),
+        ("noted", Some(Unclassifiable::NotedProxyHeader), false),
+        ("unread", None, true),
+        ("record", None, false),
+    ];
+    let outcomes: Vec<_> = poses
+        .iter()
+        .map(|&(tag, shape, unread)| {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            with_fake_home(tmp.path(), || {
+                let px = proxy_account_px();
+                let store = crate::claude::install_source_path(&px.name).expect("store path");
+                let config_path = crate::profile::profile_dir(&px.name)
+                    .unwrap()
+                    .join("config.toml");
+                if let Some(shape) = shape {
+                    shape.pose("px");
+                }
+                if unread {
+                    let text = fs::read_to_string(&config_path).unwrap();
+                    fs::write(&config_path, text.replace("acct-px", "")).unwrap();
+                }
+                let config_dir = tmp.path().join("session-config");
+                fs::create_dir_all(&config_dir).expect("mkdir the session config dir");
+                let link = config_dir.join(".credentials.json");
+                session_sign_in(
+                    &config_dir,
+                    &format!("uuid-r29m-{tag}"),
+                    &format!("at-r29m-{tag}"),
+                );
+                let lines = crate::logline::LogLines::new();
+                let capture = lines.capture_here();
+
+                let drained = drain_session_login(&link, &store).map_err(|e| e.to_string());
+
+                drop(capture);
+                (drained, lines.snapshot(), store.exists())
+            })
+        })
+        .collect();
+
+    let said = |line: &str| (Ok(Drain::Unchanged), vec![line.to_string()], false);
+    let unclassifiable = "clauth: Claude Code signed in while 'px' was active, but clauth can't \
+                          read its config, so it did not save that login into 'px'. Fix its \
+                          config.toml, or run `clauth login <name>` with a new name to keep it";
+    let proxy = "clauth: Claude Code signed in while proxy account 'px' was active; clauth did \
+                 not save that login into 'px'. To keep it as an account, run `clauth login \
+                 <name>` with a new name";
+    assert_eq!(
+        outcomes,
+        vec![
+            said(unclassifiable),
+            said(unclassifiable),
+            said(proxy),
+            said(proxy)
+        ],
+        "(the drain, its lines, px's store) for a directory, a noted header, a table that does \
+         not read and a readable record"
+    );
+}
+
+/// Claude Code's logged-out shell (blank tokens, its `.claude.json` naming no
+/// account) in a proxy session's file after a login there raises no second
+/// not-saved line: a sign-out signed nobody in, as the global adopt reads it.
+/// The store takes neither.
+#[test]
+fn a_logged_out_shell_in_a_proxy_sessions_file_raises_no_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let px = proxy_account_px();
+        let store = crate::claude::install_source_path(&px.name).expect("store path");
+        let config_dir = tmp.path().join("session-config");
+        fs::create_dir_all(&config_dir).expect("mkdir the session config dir");
+        let link = config_dir.join(".credentials.json");
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+
+        session_sign_in(&config_dir, "uuid-r20-shell", "at-r20-shell");
+        let signed_in = drain_session_login(&link, &store).expect("drain the login");
+        fs::write(config_dir.join(".claude.json"), "{}").expect("the signed-out .claude.json");
+        let shell = br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#;
+        fs::write(&link, shell).expect("Claude Code's logged-out shell");
+        let signed_out = drain_session_login(&link, &store).expect("drain the shell");
+
+        let line = "clauth: Claude Code signed in while proxy account 'px' was active; clauth did \
+                    not save that login into 'px'. To keep it as an account, run `clauth login \
+                    <name>` with a new name"
+            .to_string();
+        assert_eq!(
+            (
+                (signed_in, signed_out),
+                lines.snapshot(),
+                store.exists(),
+                fs::read(&link).ok() == Some(shell.to_vec()),
+            ),
+            (
+                (Drain::Unchanged, Drain::Unchanged),
+                vec![line],
+                false,
+                true
+            ),
+            "((drain of the login, of the shell), lines, px's store, the session's file kept)"
+        );
+    });
 }

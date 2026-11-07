@@ -56,8 +56,8 @@ use crate::profile::{
     DivergenceChoice, HerdrSettings, HomeTab, MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS,
     MAX_WEEKLY_SWITCH_PCT, MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS,
     MIN_WEEKLY_SWITCH_PCT, ModelSettings, PopupWidth, Profile, ProfileId, ProfileName,
-    ReloadFingerprint, ResetDisplay, ThemeName, TypedEndpoint, WalkOrder, claim_profile_id,
-    load_config, reload_fingerprint, require_profile_id, update_app_state, update_profile_config,
+    ReloadFingerprint, ResetDisplay, ThemeName, TypedEndpoint, WalkOrder, load_config,
+    reload_fingerprint, require_profile_id, update_app_state, update_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -2024,8 +2024,9 @@ impl BareItemForm {
 pub(crate) struct BareItemOwnerForm {
     pub(crate) owners: [ProfileName; 2],
     /// The account each of `owners` held when the question opened: the pick
-    /// lands only while its name still holds it.
-    pub(crate) accounts: [ProfileId; 2],
+    /// lands only while its name still holds it. `None` for a proxy account,
+    /// which is never claimed.
+    pub(crate) accounts: [Option<ProfileId>; 2],
     /// The login the question is about ([`crate::claude::bare_item_login_key`]):
     /// the pick saves the item only while it still holds that login.
     pub(crate) login: Option<[u8; 32]>,
@@ -2041,13 +2042,13 @@ pub(crate) struct BareItemOwnerForm {
 impl BareItemOwnerForm {
     pub(crate) fn new(
         owners: [ProfileName; 2],
-        accounts: [ProfileId; 2],
+        accounts: [impl Into<Option<ProfileId>>; 2],
         login: Option<[u8; 32]>,
         write: BareItemWrite,
     ) -> Self {
         Self {
             owners,
-            accounts,
+            accounts: accounts.map(Into::into),
             login,
             write,
             cursor: 0,
@@ -2175,8 +2176,15 @@ enum BareItemOutcome {
     },
     /// `save` found two profiles cached with the login's account: the user
     /// picks which one takes it. Carries the account each name held when
-    /// the save named it, and the login's key.
-    OwnerNeeded([ProfileName; 2], [ProfileId; 2], Option<[u8; 32]>),
+    /// the save named it (none for a proxy account, never claimed), and the
+    /// login's key.
+    OwnerNeeded([ProfileName; 2], [Option<ProfileId>; 2], Option<[u8; 32]>),
+    /// `save` found the one profile cached with the login's account to be a
+    /// proxy account, never claimed: the save is refused.
+    ProxyOwner(ProfileName),
+    /// A worker that settled and wrote on its own skipped saving the login:
+    /// the user is told, and nothing is held.
+    NotSaved(crate::claude::BareItemNotice),
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -6949,7 +6957,7 @@ impl App {
             if let Some(active) = active {
                 let write = BareItemWrite::BootRelink(active.clone());
                 let writer = write.writer();
-                let answer = BareItemAnswerGuard::new(bare_item_tx, write);
+                let answer = BareItemAnswerGuard::new(bare_item_tx.clone(), write.clone());
                 let _check = check;
                 // One settle answers for the relink here and the startup
                 // one-shot's write after it. A login only the user can place
@@ -6959,7 +6967,7 @@ impl App {
                 match settle_bare_keychain_item(source, writer) {
                     Ok(crate::claude::BareItemSettle::Settled(settled)) => {
                         if let Some(notice) = &settled.notice {
-                            crate::logline::logline!("clauth: {notice}");
+                            post_bare_item_notice(&bare_item_tx, &write, notice);
                         }
                         if let Ok(mut boot) = boot_bare_item.lock() {
                             *boot = Some(settled.placed);
@@ -7561,7 +7569,26 @@ impl App {
                     .and_then(|u| u.five_hour.as_ref())
                     .filter(|w| crate::profile_json::window_row_is_live(w))
                     .map(|u| u.utilization);
-                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !stale;
+                // The bell judges a proxy copy by its chain windows, the
+                // figures it rings on, as the daemon's does; the cue above
+                // keeps the copy's stalest figure. A dated chain window is
+                // never older than that figure, so it can only clear a cue
+                // reading stale; a chain dated ahead of the clock is undated,
+                // so stale whatever the cue reads. The latch reads `fresh`
+                // only for an armed account with a live 5h figure: only that
+                // one parses its copy on this per-tick pass.
+                let armed = p.bell_threshold.is_some() && util.is_some();
+                let bell_stale = match (armed && p.usage_cache_is_third_party())
+                    .then(|| crate::profile_cache::load_third_party_copy(&p.name))
+                    .flatten()
+                    .and_then(|copy| copy.chain_read_at)
+                {
+                    Some(chain) => now
+                        .checked_sub(chain)
+                        .is_none_or(|age| stale && age > stale_after_ms(interval_ms)),
+                    None => stale,
+                };
+                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !bell_stale;
                 bells.push((name.clone(), p.bell_threshold, util, fresh));
                 if readings.usage.contains_key(&name) {
                     history_names.push(name.clone());
@@ -18341,7 +18368,10 @@ fn switch_to(app: &mut App, name: &ProfileName, queued: bool) {
         let mut cfg = app.config();
         with_state_lock(|held| crate::actions::mirror_active_on_disk(&mut cfg, held))
     };
-    let disk_active = match disk {
+    // Refused before the gate, which can refresh the target's chain.
+    let disk_active = match disk.and_then(|active| {
+        crate::actions::refuse_switch_off_unclassifiable(active.as_ref(), name).map(|()| active)
+    }) {
         Ok(active) => active,
         Err(e) => {
             app.toast(
@@ -18602,10 +18632,15 @@ impl Drop for BareItemAnswerGuard {
 }
 
 /// The account a confirm about to open for `name` lands on, or a toast
-/// headed `failed` when none can be claimed.
+/// headed `failed` when none can be claimed; a proxy account takes the
+/// re-login refusal's toast instead.
 fn claim_or_toast(app: &mut App, name: &str, failed: &str) -> Option<ProfileId> {
-    match claim_profile_id(&ProfileName::from(name)) {
-        Ok(account) => Some(account),
+    match crate::actions::claim_off_proxy(&ProfileName::from(name)) {
+        Ok(Ok(account)) => Some(account),
+        Ok(Err(refusal)) => {
+            toast_relogin_refusal(app, Err(refusal));
+            None
+        }
         Err(e) => {
             app.toast(
                 ToastKind::Danger,
@@ -18718,7 +18753,7 @@ fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItem
     match outcome {
         BareItemOutcome::Settled(Ok(crate::claude::BareItemSettle::Settled(settled))) => {
             if let Some(notice) = settled.notice {
-                app.toast(ToastKind::Warning, notice);
+                toast_bare_item_notice(app, notice);
             }
             resume_bare_item_write(app, write, settled.placed);
         }
@@ -18748,6 +18783,41 @@ fn land_bare_item_outcome(app: &mut App, write: BareItemWrite, outcome: BareItem
             app.open_modal(Modal::BareItemOwner(BareItemOwnerForm::new(
                 owners, accounts, login, write,
             )));
+        }
+        BareItemOutcome::ProxyOwner(owner) => {
+            if !relogin_refused_off_proxy(app, owner.as_str()) {
+                let unclaimed = crate::claude::bare_item_owner_unclaimed(&owner);
+                land_bare_item_outcome(app, write, BareItemOutcome::Settled(Err(unclaimed)));
+            }
+        }
+        BareItemOutcome::NotSaved(notice) => toast_bare_item_notice(app, notice),
+    }
+}
+
+/// A worker that settles and then writes on its own logs the settle's notice;
+/// a skipped save also reaches the user as [`toast_bare_item_notice`]'s
+/// toast, since the write replaces the login it names.
+fn post_bare_item_notice(
+    tx: &std::sync::mpsc::Sender<BareItemAnswer>,
+    write: &BareItemWrite,
+    notice: &crate::claude::BareItemNotice,
+) {
+    crate::logline::logline!("clauth: {notice}");
+    if matches!(notice, crate::claude::BareItemNotice::NotSaved(_)) {
+        let _ = tx.send(BareItemAnswer {
+            write: write.clone(),
+            outcome: BareItemOutcome::NotSaved(notice.clone()),
+        });
+    }
+}
+
+/// A settle's notice as a Warning toast; a skipped save heads it as the
+/// census not-saved warning does.
+fn toast_bare_item_notice(app: &mut App, notice: crate::claude::BareItemNotice) {
+    match notice {
+        crate::claude::BareItemNotice::Saved(line) => app.toast(ToastKind::Warning, line),
+        crate::claude::BareItemNotice::NotSaved(warning) => {
+            app.toast(ToastKind::Warning, format!("login not saved\n{warning}"));
         }
     }
 }
@@ -18909,14 +18979,22 @@ fn answer_bare_item(app: &mut App, write: BareItemWrite, choice: BareItemChoice)
                     Some((source, item)) => match (source.save)(&item) {
                         crate::claude::BareItemSave::Nothing => Ok(None),
                         crate::claude::BareItemSave::Owner(owner) => {
-                            crate::claude::claim_bare_item_owner(&owner).and_then(|account| {
-                                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
-                            })
+                            match crate::claude::claim_bare_item_owner(&owner) {
+                                Ok(Some(account)) => crate::claude::save_bare_item_into(
+                                    &owner, &account, &item, writer,
+                                ),
+                                Ok(None) => {
+                                    answer.send(BareItemOutcome::ProxyOwner(owner));
+                                    return;
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         crate::claude::BareItemSave::Owners(first, second) => {
                             // Claimed before the question: the pick lands only
                             // on the account each name held when it was asked
-                            // about.
+                            // about. A proxy account is not claimed; its pick
+                            // is refused at the press.
                             match crate::claude::claim_bare_item_owner(&first).and_then(|a| {
                                 crate::claude::claim_bare_item_owner(&second).map(|b| [a, b])
                             }) {
@@ -18993,14 +19071,18 @@ fn handle_bare_item_owner_key(app: &mut App, key: KeyEvent) {
 /// held write. An item holding another login by now is never saved into
 /// `owner`, whose account it may not be: the settle asks about it afresh. The
 /// save lands only while `owner` still holds `account`, claimed when the
-/// question opened.
+/// question opened (none for a proxy account). A proxy account `owner` is
+/// refused at the press, which drops the held write as a cancel does.
 fn save_bare_item_into_owner(
     app: &mut App,
     write: BareItemWrite,
     owner: ProfileName,
-    account: ProfileId,
+    account: Option<ProfileId>,
     login: Option<[u8; 32]>,
 ) {
+    if relogin_refused_off_proxy(app, owner.as_str()) {
+        return;
+    }
     let source = app.bare_item_source;
     let tx = app.bare_item_tx.clone();
     let check = begin_bare_item_check(app, &write);
@@ -19010,7 +19092,7 @@ fn save_bare_item_into_owner(
         let _check = check;
         let saved = match source.and_then(|source| (source.read)()) {
             Some(item) if login.is_some() && crate::claude::bare_item_login_key(&item) == login => {
-                crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+                crate::claude::save_bare_item_into_claimed(&owner, account.as_ref(), &item, writer)
             }
             Some(_) | None => Ok(None),
         };
@@ -19061,6 +19143,16 @@ fn finalize_switch(
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
     let outgoing = app.config().state.active_profile.as_ref().cloned();
+    // An account whose config is unclassifiable gets no prompt: no answer
+    // can tell whether the live login belongs in it.
+    if let Err(e) = crate::actions::refuse_switch_off_unclassifiable(outgoing.as_ref(), name) {
+        clear_activity(&app.activity, name);
+        app.toast(
+            ToastKind::Danger,
+            format!("switch failed\n{}", escape_control(&error_toast_detail(&e))),
+        );
+        return;
+    }
     if let Some(active) = outgoing
         && active != *name
         && active_diverged_unsaved(&active)
@@ -19117,13 +19209,17 @@ fn perform_switch_off(app: &mut App) {
                 "all accounts spent\nswitched off to halt usage".to_string(),
             );
         }
-        Err(e) => app.toast(
-            ToastKind::Danger,
-            format!(
-                "switch-off failed\n{}",
-                escape_control(&error_toast_detail(&e))
-            ),
-        ),
+        Err(e) => {
+            if !crate::actions::switch_off_hold_said(&e) {
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "switch-off failed\n{}",
+                        escape_control(&error_toast_detail(&e))
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -19785,11 +19881,16 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::SyncMcpLogins => toggle_sync_mcp_logins(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
-        // Inert while no account has `auto_start` on (rendered dimmed): a
-        // queue with no possible member spaces nothing, so it stays a true
+        // Inert while no account's `auto_start` opts it in (rendered dimmed):
+        // a queue with no possible member spaces nothing, so it stays a true
         // disabled row — the key is a no-op.
         GlobalConfigRow::AutoStartQueue => {
-            if app.config().profiles.iter().any(|p| p.auto_start) {
+            if app
+                .config()
+                .profiles
+                .iter()
+                .any(|p| p.has_effective_auto_start())
+            {
                 toggle_auto_start_queue(app);
             }
         }
@@ -22305,7 +22406,7 @@ fn account_by_name(app: &App, name: &ProfileName) -> Option<(ProfileName, bool, 
     cfg.profiles.iter().find(|p| p.name == *name).map(|p| {
         (
             p.name.clone(),
-            p.login_is_oauth(),
+            p.login_is_oauth() && p.spends_oauth_chain(),
             p.usage_cache_is_third_party(),
         )
     })
@@ -22319,7 +22420,8 @@ fn account_by_name(app: &App, name: &ProfileName) -> Option<(ProfileName, bool, 
 /// The OAuth bool is credential typing ([`Profile::login_is_oauth`]), not endpoint
 /// routing: the actions it gates (rotate, refresh) act on the stored token chain,
 /// so a hybrid holding a real pair behind a `base_url` can rotate it, and an
-/// endpoint-only profile cannot.
+/// endpoint-only profile cannot; nor can a proxy account, whose stored pair
+/// clauth never spends ([`Profile::spends_oauth_chain`]).
 ///
 /// The third bool is the shared cache selector, not `is_third_party`: the
 /// refresh gate asks whether the account has a usage fetch leg, and the
@@ -23517,8 +23619,10 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
     let mut rows = vec![ConfigRow::Name];
-    // auto-start sits right below name (OAuth-routed accounts).
-    if !is_api {
+    // auto-start sits right below name (OAuth-routed accounts). A proxy account
+    // never kicks or probes, so neither it nor the probe rows nested under it
+    // show there.
+    if !is_api && profile.is_none_or(|p| p.spends_oauth_chain()) {
         rows.push(ConfigRow::AutoStart);
         // The probe below it, only where `/usage` has nothing to read and a
         // setup token is stored: beside a pair the switch would do nothing,
@@ -23554,10 +23658,13 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // reads the OAuth token or the api key depending on the account's credential
     // typing (`login_is_oauth`, not the endpoint-shaped `is_api`): the log-out
     // row acts on what's on disk, so a hybrid's token can't be hidden behind
-    // either a base url or an uncommitted draft.
+    // either a base url or an uncommitted draft. A proxy account logs out by its
+    // key alone: a chain or a torn store beside its record stays on disk, so the
+    // row goes with the key.
     rows.push(ConfigRow::Login);
-    let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
-        profile.and_then(|p| p.credentials.as_ref()).is_some()
+    let spends_chain = profile.filter(|p| p.spends_oauth_chain());
+    let has_creds = if spends_chain.is_some_and(|p| p.login_is_oauth()) {
+        spends_chain.and_then(|p| p.credentials.as_ref()).is_some()
     } else {
         profile
             .and_then(|p| p.api_key.as_deref())
@@ -23566,7 +23673,8 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // A torn `credentials.json` loads logged out but is still a login on disk:
     // only a log out clears it, so the row shows over it too (beside, never in
     // place of, the typed credential above).
-    let has_creds = has_creds || profile.is_some_and(|p| p.unreadable_credentials_store.is_some());
+    let has_creds =
+        has_creds || spends_chain.is_some_and(|p| p.unreadable_credentials_store.is_some());
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
     }
@@ -23594,11 +23702,15 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // where hiding the row leaves the daemon to re-create what the operator
     // has no surface left to remove (the CLI's widened nothing-to-clear gate,
     // rendered). The no-other-login refusal is a dim, not a hide — see
-    // `run_config_row`.
+    // `run_config_row`. A proxy account (readable record or not) signs in
+    // through its proxy and has no Claude Code login to clear, which is the
+    // refusal `clauth static-token --clear` makes for it, so it never gets the
+    // row.
     if profile.is_some_and(|p| {
-        crate::claude::session_token_status(&p.name).is_some()
-            || p.rolling_token
-            || crate::claude::has_static_backup(&p.name)
+        p.spends_oauth_chain()
+            && (crate::claude::session_token_status(&p.name).is_some()
+                || p.rolling_token
+                || crate::claude::has_static_backup(&p.name))
     }) {
         rows.push(ConfigRow::ClearSessionToken);
     }
@@ -24138,6 +24250,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
+            if editing
+                .as_deref()
+                .is_some_and(|name| relogin_refused_off_proxy(app, name))
+            {
+                return;
+            }
             match login_row_flow(app, editing.as_deref()) {
                 LoginRowFlow::Console { site, region } => {
                     let name = editing.unwrap_or_default();
@@ -24168,12 +24286,16 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
+                // A proxy account logs out by its key alone, whatever it stores.
+                let proxy_claimed = crate::profile::stored_proxy_claim_failing_closed(&name)
+                    != crate::profile::ProxyClaim::None;
                 let (is_api, has_unreadable_store, has_api_key) = {
                     let cfg = app.config();
                     let profile = cfg.find(&name);
                     (
-                        profile.map(|p| !p.login_is_oauth()).unwrap_or(false),
-                        profile.is_some_and(|p| p.unreadable_credentials_store.is_some()),
+                        proxy_claimed || profile.map(|p| !p.login_is_oauth()).unwrap_or(false),
+                        !proxy_claimed
+                            && profile.is_some_and(|p| p.unreadable_credentials_store.is_some()),
                         profile
                             .and_then(|p| p.api_key.as_deref())
                             .is_some_and(|k| !k.trim().is_empty()),
@@ -24337,6 +24459,24 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
     };
+    // `config_rows` hid the row from a proxy account on a tick-stale
+    // snapshot; a record that landed since is refused on a disk read under the
+    // guard, before anything of the account moves, as the CLI refuses under
+    // its own.
+    let refused = match crate::profile::load_profile(name) {
+        Ok(on_disk) => crate::actions::refuse_token_mode_on_proxy(&on_disk).err(),
+        Err(e) => Some(e),
+    };
+    if let Some(refused) = refused {
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "clear failed\n{}",
+                escape_control(&error_toast_detail(&refused))
+            ),
+        );
+        return;
+    }
     // The relink below puts the store in front of Claude Code: a staged pair
     // lands first.
     if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
@@ -24362,6 +24502,18 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
     };
+    // Asked again on this read: the record's writer takes no rotation guard,
+    // so it can land during the landing.
+    if let Err(refused) = crate::actions::refuse_token_mode_on_proxy(&on_disk) {
+        app.toast(
+            ToastKind::Danger,
+            format!(
+                "clear failed\n{}",
+                escape_control(&error_toast_detail(&refused))
+            ),
+        );
+        return;
+    }
     let holds_credential_piece = crate::claude::session_token_status(name).is_some()
         || crate::claude::has_static_backup(name);
     // The row was armed on a snapshot: a disarm landing since then can leave
@@ -24786,6 +24938,30 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         ));
     });
     open_login_modal(app);
+}
+
+/// Toast [`crate::actions::refuse_relogin_off_proxy`]'s refusal of a re-login
+/// or a captured login landing in `name`, and answer whether it refused.
+fn relogin_refused_off_proxy(app: &mut App, name: &str) -> bool {
+    toast_relogin_refusal(
+        app,
+        crate::actions::refuse_relogin_off_proxy(&ProfileName::from(name)),
+    )
+}
+
+/// Toast the refusal a [`crate::actions::refuse_relogin_off_proxy`] verdict
+/// carries, and answer whether it refused.
+fn toast_relogin_refusal(app: &mut App, verdict: Result<()>) -> bool {
+    match verdict {
+        Ok(()) => false,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", escape_control(&e.to_string())),
+            );
+            true
+        }
+    }
 }
 
 /// Show the login progress modal (no-op when already open).
@@ -26721,8 +26897,8 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
             }
             // Deleting the active profile signs the live slot out. Settled on
             // this worker, so the placement guards this thread's write; the
-            // notice goes to the event log, the worker having no toast of its
-            // own. A login only the user can place holds the delete until
+            // notice goes to the event log, and a skipped save to a toast
+            // too. A login only the user can place holds the delete until
             // they answer; a resumed delete takes their answer instead.
             let _placed = if App::lock_config(&config).is_active(&name) {
                 let placed = match ready {
@@ -26745,7 +26921,14 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
                         match settle.map_err(|e| anyhow::anyhow!("{e:#}"))? {
                             crate::claude::BareItemSettle::Settled(settled) => {
                                 if let Some(notice) = &settled.notice {
-                                    crate::logline::logline!("clauth: {notice}");
+                                    post_bare_item_notice(
+                                        &bare_item_tx,
+                                        &BareItemWrite::Delete {
+                                            name: name.clone(),
+                                            force,
+                                        },
+                                        notice,
+                                    );
                                 }
                                 settled.placed
                             }
@@ -28035,7 +28218,9 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
         let mut cfg = app.config();
         match cfg.find(name) {
             None => Outcome::Missing,
-            Some(profile) if !profile.is_oauth() => Outcome::NotOAuth,
+            Some(profile) if !profile.is_oauth() || !profile.spends_oauth_chain() => {
+                Outcome::NotOAuth
+            }
             Some(profile) => {
                 let now_on = !profile.auto_start;
                 match update_profile_config(name, |p| {
@@ -29241,6 +29426,11 @@ fn run_capture_overwrite(
             .config_draft
             .as_ref()
             .is_some_and(|d| d.editing_name.is_none());
+    // Asked again at the press, inside the overwrite's own hold: the
+    // name may have been re-created as a proxy account while the
+    // confirm stood open. A divergence capture's detach and active
+    // clear wait until that refusal passed, and only a confirmed
+    // overwrite reaches them (a cancel pops without calling this).
     let result = {
         let mut cfg = app.config();
         match &from_divergence {
@@ -29255,10 +29445,12 @@ fn run_capture_overwrite(
                 },
             )
             .map(|outcome| {
-                outcome.map(|oauth_moved| {
-                    if oauth_moved {
-                        crate::usage::expire_profile_ttl(&name);
-                    }
+                outcome.map(|landed| {
+                    landed.map(|oauth_moved| {
+                        if oauth_moved {
+                            crate::usage::expire_profile_ttl(&name);
+                        }
+                    })
                 })
             }),
             None => crate::actions::overwrite_captured_profile_with(
@@ -29272,7 +29464,10 @@ fn run_capture_overwrite(
             let from = from_divergence.unwrap_or_default();
             app.toast(ToastKind::Warning, moved.skipped(copy.verb(), &from));
         }
-        Ok(Ok(())) => {
+        Ok(Ok(refusal)) => {
+            if toast_relogin_refusal(app, refusal) {
+                return;
+            }
             if closes_new_form {
                 finish_created_profile(app, name.as_str());
             } else {
@@ -29312,6 +29507,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             );
         }
         ConfirmAction::AdoptDivergence(snapshot, name, account, from) => {
+            // Asked again at the press: the name may have been re-created as
+            // a proxy account while the confirm stood open.
+            if relogin_refused_off_proxy(app, &name) {
+                return;
+            }
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
@@ -29349,7 +29549,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         let keys = crate::actions::outgoing_env_keys_now(cfg)?;
                         let oauth_moved = crate::actions::overwrite_captured_profile_held(
                             cfg, &name, &account, snapshot, false,
-                        )?;
+                        )??;
                         // This arm activates OUTSIDE `overwrite_captured_profile`,
                         // so the settings write its own activate arms make has
                         // to happen here too: an endpoint that never reaches
@@ -29628,8 +29828,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let result = {
                 let mut cfg = app.config();
                 // OAuth accounts drop the whole login; API accounts drop only
-                // the api key, keeping the base-url shell.
-                let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
+                // the api key, keeping the base-url shell. So do proxy accounts,
+                // whose stored chain stays.
+                let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true)
+                    && crate::profile::stored_proxy_claim_failing_closed(&name)
+                        == crate::profile::ProxyClaim::None;
                 if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
                 } else {
@@ -29880,6 +30083,9 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     // Same confirmed path as the "save elsewhere" picker: the
                     // live login is captured into its own profile, which then
                     // becomes active. Nothing is lost, nothing else rewritten.
+                    if relogin_refused_off_proxy(app, &owner) {
+                        return;
+                    }
                     // The owner was named for the login the prompt read, so
                     // only that login is captured.
                     let Some(snapshot) = capture_live_or_toast(app) else {
@@ -29926,6 +30132,18 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
 fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, seen: Option<u64>) {
     match choice {
         DivergenceChoice::Overwrite => {
+            if relogin_refused_off_proxy(app, active) {
+                return;
+            }
+            let name = ProfileName::from(active);
+            if toast_relogin_refusal(
+                app,
+                crate::actions::refuse_capture_into_unclassifiable(&name),
+            ) {
+                return;
+            }
+            #[cfg(test)]
+            crate::testutil::switch_race_seam::run();
             // The relink below replaces the bare item: settled before the
             // snapshot, so a held overwrite has changed nothing.
             let Some(_placed) = bare_item_gate(
@@ -29934,7 +30152,6 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, 
             ) else {
                 return;
             };
-            let name = ProfileName::from(active);
             // The capture and the relink share one hold with the check that
             // disk still names the modal's account active and the live login
             // is still the one the modal read.
@@ -29950,6 +30167,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, 
                     let oauth_moved = if owner.is_some() {
                         false
                     } else {
+                        crate::actions::refuse_capture_into_unclassifiable(&name)?;
                         crate::actions::force_capture_live_login(cfg)?
                     };
                     Ok(Ok((
@@ -29970,6 +30188,10 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice, 
                 }
                 Ok(Some(Ok(Err(moved)))) => {
                     app.toast(ToastKind::Warning, moved.skipped("overwrite", active));
+                    return;
+                }
+                Ok(Some(Err(e))) | Err(e) if e.is::<crate::actions::CaptureRefused>() => {
+                    toast_relogin_refusal(app, Err(e));
                     return;
                 }
                 Ok(Some(Err(e))) | Err(e) => {
@@ -30276,6 +30498,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             let Some(target) = form.targets.get(cursor - 1).cloned() else {
                 return;
             };
+            if relogin_refused_off_proxy(app, &target) {
+                return;
+            }
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
@@ -30421,6 +30646,12 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 let cfg = app.config();
                 cfg.canonical_name(&name)
             };
+            if collision
+                .as_deref()
+                .is_some_and(|existing| relogin_refused_off_proxy(app, existing))
+            {
+                return;
+            }
             let Some(Modal::CaptureName(form)) = app.pop_modal() else {
                 return;
             };
@@ -30881,6 +31112,11 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         .config()
         .find(&ProfileName::from(session.name.clone()))
         .is_some_and(|p| p.credentials.is_some());
+    // Asked again here: the `log in` row refused a proxy account before the
+    // browser opened, but the name may have been re-created as one since.
+    if relogin_refused_off_proxy(app, &session.name) {
+        return;
+    }
     // The uuid rides the snapshot: this may land in a confirm modal instead of
     // committing now, and only the commit may seed the anchor. The probe body's
     // plan rides it too, for the commit's `usage_cache.json` seed.
@@ -31008,6 +31244,11 @@ fn apply_console_login(
     session: LoginSession,
     outcome: crate::alibaba_login::ConsoleLoginOutcome,
 ) {
+    // The `log in` row refused a proxy account before the browser opened,
+    // but the name may have been re-created as one since.
+    if relogin_refused_off_proxy(app, &session.name) {
+        return;
+    }
     // `start_console_login` always claims an account; only a `+ new` draft's
     // session has none, and no draft session receives a console result.
     let Some(account) = session.account else {
@@ -32031,7 +32272,7 @@ fn drain_switch_gates(app: &mut App) {
         };
         // The settle's carry landed on the worker, before the gate ran.
         if let Some(notice) = settled.notice {
-            app.toast(ToastKind::Warning, notice);
+            toast_bare_item_notice(app, notice);
         }
         match gate {
             oauth::AuthGate::Ready => finalize_switch(app, &name, settled.placed, true, queued),
@@ -32223,12 +32464,31 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
     }
     // First login on a credential-less profile: adopt silently, don't prompt.
     if is_first_login(active).unwrap_or(false) {
-        let result = {
-            let mut cfg = app.config();
-            adopt_first_login(&mut cfg, active)
+        // A proxy account never takes it: nothing is written, and the warning
+        // goes out once per login, not once per poll. Read here first so a
+        // poll over such an account takes no flock, and again in the adopt's
+        // hold, which a record landing after this read cannot get past.
+        let result = match crate::claude::proxy_claim_skipping_adopt(active) {
+            Some(claim) => Ok(Some(claim)),
+            None => {
+                #[cfg(test)]
+                crate::testutil::switch_race_seam::run();
+                let mut cfg = app.config();
+                adopt_first_login(&mut cfg, active)
+            }
         };
         match result {
-            Ok(()) => {
+            Ok(Some(claim)) => {
+                app.divergence_pending = None;
+                if let Some(warning) = crate::claude::unsaved_proxy_login_warning(
+                    active,
+                    &claim,
+                    crate::claude::UnsavedLogin::live(),
+                ) {
+                    app.toast(ToastKind::Warning, format!("login not saved\n{warning}"));
+                }
+            }
+            Ok(None) => {
                 app.refresh_tokens();
                 // AUTH-1: an adopted first login is a fresh login — lift a
                 // standing auth_broken quarantine like the sibling fresh-login
@@ -32317,25 +32577,34 @@ fn live_login_sibling_owner(app: &App, active: &str) -> Option<ProfileName> {
 
 /// The configured `default_divergence` that actually acts at startup, or `None`
 /// when the resolution is the banner alone: unset, or a sibling owns the live
-/// login (the owner gate skips the default). ONE resolver so the seed's
-/// predicate ([`divergence_resolves_to_banner`]) and the drain's action
+/// login (the owner gate skips the default), or an `Overwrite` default on a
+/// proxy account or an unclassifiable account holding an unsaved login, which
+/// [`run_divergence_choice`] refuses: acting on it would raise that refusal on
+/// every poll. ONE resolver so the seed's predicate
+/// ([`divergence_resolves_to_banner`]) and the drain's action
 /// ([`resolve_or_note_divergence`]) cannot drift apart when the gate changes.
 fn startup_default(app: &App, active: &str) -> Option<crate::profile::DivergenceChoice> {
     if live_login_sibling_owner(app, active).is_some() {
         return None;
     }
+    let choice = app.config().state.default_divergence;
+    let name = ProfileName::from(active);
+    if choice == Some(DivergenceChoice::Overwrite)
+        && (crate::actions::refuse_relogin_off_proxy(&name).is_err()
+            || crate::actions::refuse_capture_into_unclassifiable(&name).is_err())
+    {
+        return None;
+    }
     // An `Overwrite` default cannot land on an account running on a
     // long-lived token, which the prompt does not offer it for either.
-    app.config().state.default_divergence.filter(|choice| {
+    choice.filter(|choice| {
         *choice != DivergenceChoice::Overwrite
             || !crate::claude::has_session_token(&ProfileName::from(active))
     })
 }
 
 /// Whether [`resolve_or_note_divergence`] will resolve a divergence on
-/// `active` by flagging the banner alone: no `default_divergence` is
-/// configured, or a sibling owns the live login (the owner gate skips the
-/// default).
+/// `active` by flagging the banner alone: [`startup_default`] answers `None`.
 fn divergence_resolves_to_banner(app: &App, active: &str) -> bool {
     startup_default(app, active).is_none()
 }

@@ -1907,8 +1907,8 @@ fn printable_never_splits_an_escape_at_its_cut() {
         admin: &admin,
         key: &key,
         secrets: Vec::new(),
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
     let text = format!("{}{}", "a".repeat(76), "\u{1b}bbbbbbbbbb");
@@ -1931,8 +1931,8 @@ fn printable_measures_an_emoji_presentation_sequence_as_its_drawn_cells() {
         admin: &admin,
         key: &key,
         secrets: Vec::new(),
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 
@@ -1956,8 +1956,8 @@ fn printable_bounds_a_run_of_zero_width_characters() {
         admin: &admin,
         key: &key,
         secrets: Vec::new(),
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 
@@ -1986,8 +1986,8 @@ fn printable_bounds_a_single_oversized_grapheme() {
         admin: &admin,
         key: &key,
         secrets: Vec::new(),
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 
@@ -2008,8 +2008,8 @@ fn printable_keeps_values_whole_through_the_budget_and_cuts_past_it() {
         admin: &admin,
         key: &key,
         secrets: Vec::new(),
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 
@@ -2533,14 +2533,19 @@ fn an_event_stream_that_never_sends_its_head_is_named_as_such() {
 fn a_numeric_setting_at_its_bound_moves_to_a_different_value() {
     let decl = SettingDecl {
         key: "level".to_string(),
-        default: Some(json!(0.0)),
-        account_scope: true,
+        scope: crate::proxy_account::Scope::Account,
+        label: "level".to_string(),
+        hint: String::new(),
         typ: "number".to_string(),
+        default: Some(json!(0.0)),
         options: Vec::new(),
         min: Some(0.0),
         max: Some(10.0),
         step: Some(1.0),
+        unit: None,
         active_when: None,
+        inactive_hint: None,
+        restart: false,
     };
 
     assert_eq!(decl.alternative(&json!(0)), Some(json!(10.0)));
@@ -2559,8 +2564,8 @@ fn a_secret_is_redacted_raw_and_json_escaped() {
         admin: &admin,
         key: &key,
         secrets: vec![admin.expose().to_string(), key.expose().to_string()],
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 

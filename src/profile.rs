@@ -472,6 +472,17 @@ pub(crate) struct Profile {
     /// only. [`Profile::new`] and a struct literal hold `Default` (nothing
     /// typed).
     pub(crate) typed_endpoint: TypedEndpoint,
+    /// The `[proxy]` record `config.toml` held when this profile loaded, read
+    /// once there so the cache selector never parses the file per call. Never
+    /// serialized: the table stays the one on-disk record, carried through every
+    /// rewrite as an unmodelled key, and a writer of it sets this beside it.
+    pub(crate) proxy: Option<ProxyAccount>,
+    /// Recorded at load beside `proxy`: `config.toml` holds a `[proxy]` table
+    /// that is no record ([`ProxyClaim::Unreadable`]), so `proxy` is `None`
+    /// while the table still names an upstream account. Never serialized; a
+    /// writer of the record clears it. A struct literal / [`Profile::new`]
+    /// leaves it `false`.
+    pub(crate) has_unreadable_proxy_record: bool,
 }
 
 /// The endpoint keys as typed, beside what clauth derived from them. `base_url`
@@ -543,6 +554,8 @@ impl Profile {
             setup_token_digest: None,
             provider,
             typed_endpoint: TypedEndpoint::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         }
     }
 
@@ -608,6 +621,27 @@ impl Profile {
         self.provider.is_some()
     }
 
+    /// Whether this account's inference needs a key it does not carry
+    /// ([`crate::claude::has_inference_auth`]), so a spawned `claude` would die
+    /// on an empty envelope. Needing one: a recognised provider's endpoint, or
+    /// a proxy account ([`Profile::proxy`]) routed to a loopback bind
+    /// ([`Profile::routing_endpoint`]), which its proxy serves on the
+    /// inference key it minted alone. An unrecognised endpoint needs none here,
+    /// since it may be a local model taking no key, and so does a proxy account
+    /// whose `[env] ANTHROPIC_BASE_URL` routes it elsewhere. A proxy record the
+    /// load boundary re-read as an OAuth login (a stored pair, no key) loses
+    /// its managed bind, so it is keyless only where that override still
+    /// routes it to one.
+    pub(crate) fn is_keyless(&self) -> bool {
+        let needs_key = self.is_third_party()
+            || (self.proxy.is_some()
+                && self
+                    .routing_endpoint()
+                    .and_then(crate::proxy::loopback_port)
+                    .is_some());
+        needs_key && !crate::claude::has_inference_auth(self)
+    }
+
     /// Whether this account's usage figures live in `third_party_cache.json`
     /// rather than the OAuth `usage_cache.json` — the question every reader of a
     /// cached figure asks, and the one the scheduler answers by writing.
@@ -616,11 +650,15 @@ impl Profile {
     /// discovered usage is cached the same way: `third_party_entry_for` builds a
     /// `ThirdPartyTarget::Generic` whenever `provider` is `None` and a
     /// `base_url` is set, so that leg genuinely fetches and caches for it.
+    /// True too for a proxy account on its loopback bind, keyed or keyless,
+    /// by the record it loaded with ([`Profile::proxy`]): a keyless one is
+    /// never polled, and its last copy still renders, aging to stale.
     /// A stored pair with an env token serving inference and nothing that leg
     /// could fetch with answers false: the chain feeds usage polling for such
     /// an account (the env-token account's inference spends on the token
     /// while the pair serves usage), and the OAuth leg writes the figures
-    /// this reader should read.
+    /// this reader should read. A proxy account of that shape answers false
+    /// too, though no leg polls it ([`Profile::spends_oauth_chain`]).
     /// Keying a reader on [`Profile::is_third_party`] instead answers a
     /// DIFFERENT question and renders a generic account, refreshed hourly, as
     /// never fetched.
@@ -631,6 +669,8 @@ impl Profile {
             self.api_key.as_deref(),
             self.credentials.is_some(),
             &self.env,
+            // The record as `load_profile` read it, so no call reads the file.
+            || self.proxy.is_some(),
         )
     }
 
@@ -663,6 +703,58 @@ impl Profile {
     /// auto-quarantine, always an operator's own choice.
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled
+    }
+
+    /// Whether this account has a Claude Code login clauth may use: poll
+    /// `/usage` on its access token, kick a window on it, refresh, rotate,
+    /// adopt or stamp it, probe with its setup token, or quarantine it on a
+    /// refusal. Never for a proxy account ([`Profile::proxy`]): it sends every
+    /// request with the key its proxy minted and never uses the chain, so a
+    /// pair stored beside its record stays on disk untouched. A `[proxy]`
+    /// table clauth cannot read ([`Profile::has_unreadable_proxy_record`]) is a
+    /// proxy account here too, as it is to the deletes and the re-login. The
+    /// one decision the OAuth leg's poll pair (`usage::usage_poll_pair`, which
+    /// seeds the scheduler's work list), the usage probe
+    /// (`usage::usage_probe_admits`), the live-mirror adopt
+    /// (`oauth::try_adopt_live_rotation`), the switch gate
+    /// (`oauth::oauth_shape`), its rolling stamp
+    /// (`oauth::roll_from_stored_chain`), the start-time rolling stamp
+    /// (`claude::arm_rolling_from_disk_synced`), rotate-all
+    /// (`oauth::rotation_candidates`), the rotate worker
+    /// (`oauth::rotate_one_inner`), the auto-start opt-in
+    /// ([`Profile::has_effective_auto_start`]: the switch kick
+    /// `oauth::prime_window`, the auto-start queue
+    /// `usage::auto_start_queue_members`, the Usage tab's auto-start countdown,
+    /// the Config tab's `auto-start queue` row and its key, the scheduler's
+    /// weekly-reset mark `usage::scheduler::drain_oauth_completions`), the token-mode
+    /// commands and the TUI clear's confirm
+    /// (`actions::refuse_token_mode_on_proxy`), `clauth limit-reset`
+    /// (`actions::refuse_limit_reset_on_proxy`), the status feed's refresh
+    /// countdown (`daemon::status_json::build_profile_entries`), the Usage
+    /// tab's empty body, the Setup tab's auto-start, usage-probe and clear
+    /// rows (`tui::app::config_rows`), its auto-start toggle, `build_snap`'s
+    /// log-out hint, the session env (`claude::session_env`) and the TUI's
+    /// rotate action read. Memory can lag the record on disk, so every write,
+    /// spend, mark, adopt and delete also takes the decision off the disk
+    /// through [`stored_proxy_claim_failing_closed`]: the stage landing every
+    /// lander shares (`oauth::land_pair`), the send rule every refresh asks
+    /// (`oauth::send_rule`), the kick (`oauth::auto_start_kick`), the rolling
+    /// stamp, the live-mirror adopt, the weekly-reset mark's confirmation, the
+    /// Claude Code login adopts (`claude::adopt_skips_proxy_account`), a
+    /// session's drain (`runtime::keeps_login_off_proxy_store`) and the
+    /// deletes.
+    pub(crate) fn spends_oauth_chain(&self) -> bool {
+        self.proxy.is_none() && !self.has_unreadable_proxy_record
+    }
+
+    /// Whether this account's stored `auto_start` opts it into anything: the
+    /// flag on an account that spends its own OAuth chain. A proxy account
+    /// carrying the flag (set before it became one, or by a hand edit) opts
+    /// into no kick and no queue seat, so it never makes the queue look
+    /// populated either. Surfaces that show or edit the stored flag itself
+    /// read [`Profile::auto_start`] instead.
+    pub(crate) fn has_effective_auto_start(&self) -> bool {
+        self.auto_start && self.spends_oauth_chain()
     }
 
     pub(crate) fn refresh_token(&self) -> Option<&str> {
@@ -2276,6 +2368,255 @@ struct ProfileConfig {
     console: ConsoleConfig,
 }
 
+/// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
+/// only. The record is deliberately UNMODELLED in [`ProfileConfig`]: a table
+/// `ProfileConfig` holds but `render_config_toml` never writes is dropped by
+/// the next rewrite, while a table neither holds rides every rewrite through
+/// the unmodelled-key carry. That is what keeps every pre-existing state file,
+/// fixture and `Profile` literal byte-identical — the runtime [`Profile`]
+/// gains no field.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+struct ProxyTable {
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// The typed proxy-account record a profile's `[proxy]` table carries: which
+/// proxy owns the account and the account's id there. `clauth delete` keys the
+/// upstream delete off it, the settings engine keys its PATCH off it, and the
+/// usage arm keys its per-account read off it — the registry bind match alone
+/// decides the arm, this record decides the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyAccount {
+    pub(crate) service: crate::proxy::Service,
+    pub(crate) account: String,
+}
+
+/// [`ProxyTable`] as the typed record. Both keys must be present and the
+/// service must still parse, so a hand-truncated or misnamed record reads as
+/// no record — the profile falls back to today's generic-endpoint arm rather
+/// than half-claiming an account.
+fn proxy_record(table: &ProxyTable) -> Option<ProxyAccount> {
+    let service = table
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let account = table
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())?;
+    Some(ProxyAccount {
+        service: crate::proxy::Service::parse(service).ok()?,
+        account: account.to_string(),
+    })
+}
+
+/// What `name`'s config.toml says about a proxy account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProxyClaim {
+    /// No `[proxy]` table (or no config clauth can read).
+    None,
+    Account(ProxyAccount),
+    /// A `[proxy]` table is there but is no record: a missing or blank key, a
+    /// service name that does not parse, or a config.toml whose TOML no longer
+    /// parses around a `[proxy]` header. The CLI loads every profile before it
+    /// asks, which refuses that last file first; the shared delete
+    /// ([`crate::actions::delete_profile`]) reads it under a config the TUI
+    /// loaded before the edit, and refuses it here.
+    Unreadable,
+    /// No reading of config.toml can say whether it holds a `[proxy]` table:
+    /// the file cannot be read, or its TOML does not parse and its text holds
+    /// `proxy` or a backslash on no `[proxy]` header line of its own, which
+    /// reads [`ProxyClaim::Unreadable`] first. Only
+    /// [`stored_proxy_claim_failing_closed`] answers it; [`stored_proxy_claim`]
+    /// reads such a file as [`ProxyClaim::None`].
+    Unclassifiable,
+}
+
+impl ProxyClaim {
+    /// The record, `None` for no record and for one clauth cannot read alike
+    /// ([`stored_proxy_record`]).
+    fn into_record(self) -> Option<ProxyAccount> {
+        match self {
+            Self::Account(record) => Some(record),
+            Self::None | Self::Unreadable | Self::Unclassifiable => None,
+        }
+    }
+}
+
+/// The proxy claim `name`'s config.toml carries, read lock-free off one file
+/// read — the [`stored_provider`] shape, for the same reason: callers hold no
+/// [`Profile`] or must not take the state flock for a read-only question. The
+/// re-login tells [`ProxyClaim::Unreadable`] from [`ProxyClaim::None`]: a
+/// table clauth cannot read still names an upstream account; each landing it
+/// guards then refuses a config.toml this reads as [`ProxyClaim::None`]
+/// without being able to tell, on its id check or claim
+/// ([`require_profile_id`], [`claim_profile_id`]). Any
+/// other guard on a write, a spend or a delete reads
+/// [`stored_proxy_claim_failing_closed`].
+pub(crate) fn stored_proxy_claim(name: &ProfileName) -> ProxyClaim {
+    // A config clauth cannot read claims nothing, as an empty one.
+    proxy_claim_in(&read_profile_config_text(name).unwrap_or_default())
+}
+
+/// [`stored_proxy_claim`] for a guard deciding whether clauth may write into,
+/// spend, mark, adopt into or delete `name` as an account that is no proxy
+/// account: what [`stored_proxy_claim`] reads as [`ProxyClaim::None`] because
+/// it cannot tell is [`ProxyClaim::Unclassifiable`] here. A missing file
+/// claims nothing, as [`load_profile`] reads it as an empty config: the
+/// record's one writer ([`write_proxy_record`]) replaces the file whole, so no
+/// record exists without it.
+pub(crate) fn stored_proxy_claim_failing_closed(name: &ProfileName) -> ProxyClaim {
+    match profile_config_path(name) {
+        Ok(path) => proxy_claim_failing_closed_at(&path),
+        Err(_) => ProxyClaim::Unclassifiable,
+    }
+}
+
+/// [`stored_proxy_claim_failing_closed`] for the profile whose credential
+/// store is `store`, read off the `config.toml` beside it: a session's drain
+/// knows its store's path, not a name to resolve under the home.
+pub(crate) fn proxy_claim_beside_failing_closed(store: &Path) -> ProxyClaim {
+    proxy_claim_failing_closed_at(&store.with_file_name("config.toml"))
+}
+
+/// The fail-closed proxy claim of the `config.toml` at `path`.
+fn proxy_claim_failing_closed_at(path: &Path) -> ProxyClaim {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return ProxyClaim::Unclassifiable,
+    };
+    match parsed_proxy_claim(&raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(&raw) => ProxyClaim::Unreadable,
+        None if may_name_proxy_key(&raw) => ProxyClaim::Unclassifiable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse may still name a `proxy`
+/// key. TOML keys compare byte for byte, so such a key spells `proxy` out or
+/// escapes it with a backslash. A text that does not parse has no grammar to
+/// tell a key from a comment or a string, so either one anywhere counts: a
+/// plain account whose broken config only mentions one stays refused until
+/// the file is fixed. A text with a `[proxy]` header line never gets here: it
+/// reads [`ProxyClaim::Unreadable`] first.
+fn may_name_proxy_key(raw: &str) -> bool {
+    raw.contains("proxy") || raw.contains('\\')
+}
+
+/// The proxy claim a `config.toml` text carries, as [`stored_proxy_claim`]
+/// reads it.
+fn proxy_claim_in(raw: &str) -> ProxyClaim {
+    match parsed_proxy_claim(raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(raw) => ProxyClaim::Unreadable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse still opens a `[proxy]`
+/// table on a line of its own.
+fn has_proxy_header_line(raw: &str) -> bool {
+    raw.lines().any(|line| line.trim() == "[proxy]")
+}
+
+/// The proxy claim of a `config.toml` text that parses as TOML; `None` when it
+/// does not.
+fn parsed_proxy_claim(raw: &str) -> Option<ProxyClaim> {
+    #[cfg(test)]
+    PROXY_CLAIM_READS.with(|reads| reads.set(reads.get() + 1));
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(match table.get("proxy") {
+        None => ProxyClaim::None,
+        Some(proxy) => proxy
+            .clone()
+            .try_into::<ProxyTable>()
+            .ok()
+            .as_ref()
+            .and_then(proxy_record)
+            .map_or(ProxyClaim::Unreadable, ProxyClaim::Account),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The proxy-claim reads on this thread ([`stored_proxy_claim`] and the
+    /// name-keyed classifier's record read alike), so a pin can see which
+    /// paths parse a config.toml for a proxy record.
+    static PROXY_CLAIM_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many proxy claims were read on this thread.
+#[cfg(test)]
+pub(crate) fn proxy_claim_reads() -> usize {
+    PROXY_CLAIM_READS.with(std::cell::Cell::get)
+}
+
+/// The proxy-account record `name`'s config.toml carries; `None` for no
+/// record and for one clauth cannot read alike, which every reader but the
+/// delete treats as the generic-endpoint profile it then is.
+pub(crate) fn stored_proxy_record(name: &ProfileName) -> Option<ProxyAccount> {
+    stored_proxy_claim(name).into_record()
+}
+
+/// Write the `[proxy]` table into `name`'s rendered config.toml — the ONE
+/// write path for the record, and an unmodelled key from then on: every later
+/// rewrite carries it through the preserving carry, so no profile edit can
+/// drop it. An existing record is replaced (the re-bind login's re-mint).
+pub(crate) fn write_proxy_record(name: &ProfileName, record: &ProxyAccount) -> Result<()> {
+    let path = profile_config_path(name)?;
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let raw = strip_proxy_table(&raw);
+    let table: toml::Table = [
+        (
+            "service".to_string(),
+            toml::Value::from(record.service.as_str()),
+        ),
+        (
+            "account".to_string(),
+            toml::Value::from(record.account.as_str()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let rendered = merge_carried_keys(raw, &[("proxy".to_string(), toml::Value::Table(table))]);
+    atomic_write_600(&path, &rendered).context("failed to write the proxy record")
+}
+
+/// Remove an existing `[proxy]` block — and a preserved-keys marker line that
+/// names nothing but it — so [`write_proxy_record`]'s carry can rewrite the
+/// table without duplicating a key, which is a hard parse error.
+fn strip_proxy_table(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(start) = lines.iter().position(|line| line.trim() == "[proxy]") else {
+        return raw.to_string();
+    };
+    let mut drop_start = start;
+    if drop_start > 0 && lines[drop_start - 1].trim() == PRESERVED_KEYS_MARKER {
+        drop_start -= 1;
+    }
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+    let mut out = String::with_capacity(raw.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= drop_start && i < end {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
 /// Never compiled into the binary.
 #[cfg(test)]
@@ -2372,6 +2713,11 @@ pub(crate) struct ReloadFingerprint {
     /// never shift the fingerprint. The dir walk below already covers a codex
     /// profile's `config.toml`; this is the only codex-specific stat needed.
     codex_toml_mtime: Option<SystemTime>,
+    /// `proxies.toml`'s mtime — a registry edit decides which usage arm (the
+    /// proxy's, or the generic endpoint scan) a proxy account's entry is built
+    /// on, and touches no profile file, so without this stat a fixed row
+    /// would wait for some unrelated reload to rebuild the entries.
+    proxies_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time,
     /// credentials.json write time)`, each `None` when the file is absent, sorted
     /// by name so readdir order can't spuriously flip equality. The store rides
@@ -2454,6 +2800,10 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     ReloadFingerprint {
         profiles_toml_mtime,
         codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
+        proxies_toml_mtime: crate::proxy::registry_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok()),
         config_mtimes,
         identity_mtimes,
     }
@@ -2699,7 +3049,7 @@ pub(crate) fn profile_wallet_history_path(name: &ProfileName) -> Result<PathBuf>
 
 /// Append this landing fetch's wallet readings to `wallet_history.jsonl` —
 /// the durable balance series the wallet-burn rate replays
-/// (`usage::burn::compute_wallet_rate_from_history`).
+/// (`usage::burn::compute_wallet_rate_from_history_at`).
 ///
 /// Mirrors [`append_usage_sample`]: per wallet, an unchanged reading (same
 /// amount under the same `(label, currency)` identity) writes nothing, and a
@@ -2951,17 +3301,19 @@ pub(crate) fn atomic_write_with(
     }
     let tmp = tmp_sibling(path);
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write)
+    publish_temp(&tmp, path, f, write, None)
 }
 
 /// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
 /// `path`; the temp is removed when either step fails, so a failing writer
-/// never leaves one behind (each temp name is used once).
+/// never leaves one behind (each temp name is used once). With `modified` the
+/// closed temp takes that mtime before the rename.
 fn publish_temp(
     tmp: &Path,
     path: &Path,
     mut f: std::fs::File,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let written = write(&mut f);
     drop(f);
@@ -2969,7 +3321,23 @@ fn publish_temp(
         let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
-    match std::fs::rename(tmp, path) {
+    if let Some(at) = modified {
+        // Through a handle of its own, opened once the writing one closed:
+        // Windows settles a written file's last write time when its writing
+        // handle closes, after a time set through that same handle.
+        let handle = std::fs::OpenOptions::new().write(true).open(tmp);
+        #[cfg(test)]
+        let handle = handle.map(|file| DatingHandle {
+            file,
+            fault: take_dating_fault(path),
+        });
+        let dated = handle.and_then(|file| file.set_modified(at));
+        if let Err(e) = dated {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
+    }
+    match land(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
@@ -2983,10 +3351,27 @@ fn publish_temp(
 /// and a stale temp at its name is removed first, so the mode is applied at
 /// creation.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    atomic_write_600_with(path, |f| {
-        use std::io::Write;
-        f.write_all(content.as_ref())
-    })
+    atomic_write_600_dated(path, content, None)
+}
+
+/// [`atomic_write_600`] whose file lands already carrying the mtime
+/// `modified`: the temp file takes it before the rename, which moves the name
+/// and keeps the file's times, so no reader sees the new bytes under any
+/// other mtime, and a write that fails leaves the old file's bytes and mtime
+/// as they were.
+pub(crate) fn atomic_write_600_dated(
+    path: &Path,
+    content: impl AsRef<[u8]>,
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    atomic_write_600_dated_with(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())
+        },
+        modified,
+    )
 }
 
 /// [`atomic_write_600`] with the content written by `write` into the temp
@@ -2996,6 +3381,16 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
 pub(crate) fn atomic_write_600_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_write_600_dated_with(path, write, None)
+}
+
+/// [`atomic_write_600_with`] landing with the mtime `modified` when given
+/// ([`atomic_write_600_dated`]).
+fn atomic_write_600_dated_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -3022,7 +3417,88 @@ pub(crate) fn atomic_write_600_with(
     };
     #[cfg(not(unix))]
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write)
+    publish_temp(&tmp, path, f, write, modified)
+}
+
+/// [`publish_temp`]'s rename. In a test build the file is read at the instant
+/// it lands, inside this step, so whatever the writer does after the rename
+/// shows as a landed file that lacks it ([`set_landed_hook`]).
+fn land(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    #[cfg(test)]
+    run_landed_hook(path);
+    Ok(())
+}
+
+/// A test's reader at the instant a dated write lands at a path, run once.
+#[cfg(test)]
+pub(crate) type LandedHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static LANDED_HOOKS: std::sync::Mutex<Option<HashMap<PathBuf, LandedHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_landed_hook(path: &Path, f: LandedHook) {
+    if let Ok(mut hooks) = LANDED_HOOKS.lock() {
+        hooks
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_landed_hook(path: &Path) {
+    let hook = LANDED_HOOKS
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(path)));
+    if let Some(f) = hook {
+        f(path);
+    }
+}
+
+/// The paths whose next dated write fails at its dating step, as a failed
+/// `set_modified` would; each fault fires once.
+#[cfg(test)]
+static DATING_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_dating(path: &Path) {
+    if let Ok(mut faults) = DATING_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The dated writer's dating handle in a test build: an armed fault is the
+/// result its `set_modified` answers, in place of the real call's, so the
+/// writer's handling of that result is what the fault exercises.
+#[cfg(test)]
+struct DatingHandle {
+    file: std::fs::File,
+    fault: std::io::Result<()>,
+}
+
+#[cfg(test)]
+impl DatingHandle {
+    fn set_modified(self, at: std::time::SystemTime) -> std::io::Result<()> {
+        self.fault.and_then(|()| self.file.set_modified(at))
+    }
+}
+
+#[cfg(test)]
+fn take_dating_fault(path: &Path) -> std::io::Result<()> {
+    let planted = DATING_FAULTS
+        .lock()
+        .ok()
+        .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,
@@ -4138,8 +4614,9 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`crate::claude::has_inference_auth`] applies: the settings writer clears
 /// its own token and applies `profile.env` LAST, so the env token is what the
 /// spawned process authenticates with and the bearer never reaches the
-/// endpoint. Both boundaries must count the same ENV shapes — the preserve
-/// arm (`actions::overwrite_captured_profile`) keys on
+/// endpoint; a proxy account's usable key leaves the entry out, whatever its
+/// value, and sends itself instead. Both boundaries must count the same ENV shapes — the
+/// preserve arm (`actions::overwrite_captured_profile`) keys on
 /// [`crate::claude::has_own_inference_endpoint`], which is built on
 /// [`crate::claude::has_inference_auth`], so an endpoint that predicate
 /// preserves must survive the load. The api-key halves deliberately differ:
@@ -4226,17 +4703,29 @@ fn usage_cache_is_third_party(
     api_key: Option<&str>,
     has_credentials: bool,
     env: &BTreeMap<String, String>,
+    proxy_recorded: impl FnOnce() -> bool,
 ) -> bool {
     let fetchable = matches!(provider, Some(Provider::Alibaba))
         || api_key.map(str::trim).is_some_and(|k| !k.is_empty());
     if has_credentials && !fetchable && env_has_inference_token(env) {
         return false;
     }
-    provider.is_some() || (base_url.is_some() && api_key.is_some())
+    // A proxy account's figures live in the third-party cache by RECORD, not
+    // by key presence: a keyless (re-mint pending) proxy account is never
+    // polled, and the copy its last poll wrote is still its figures. The usage
+    // arm reads a proxy only on the loopback bind its `base_url` names
+    // (`proxy_target_for`), so the record is asked for there alone, after the
+    // pure test, the way that arm asks; off it, the account reads as before.
+    provider.is_some()
+        || base_url.is_some_and(|url| {
+            api_key.is_some() || (crate::proxy::loopback_port(url).is_some() && proxy_recorded())
+        })
 }
 
 /// [`Profile::usage_cache_is_third_party`] for a caller holding only a name,
-/// read from `config.toml` plus one stat. A config clauth cannot read or parse
+/// read from one `config.toml` read and parse plus one stat; a keyless
+/// loopback endpoint parses the same bytes once more for its `[proxy]`
+/// record, and no answer reads the file twice. A config clauth cannot read or parse
 /// proves no endpoint, so it answers `false` and its reader falls back to the
 /// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
 /// cannot classify.
@@ -4258,9 +4747,8 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
-/// [`crate::profile_json::published_windows_with_label`] — can observe it; every
-/// other caller runs
+/// caller that skips the full load, [`crate::mcp::digest`]'s sample, can
+/// observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
 /// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a
 /// lock-free read like this one, but both its callers run `load_config` first,
@@ -4269,9 +4757,13 @@ fn usage_cache_is_third_party(
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
-/// `the_lock_free_third_party_read_agrees_with_a_full_load`.
+/// `the_lock_free_third_party_read_agrees_with_a_full_load` and, for a
+/// keyless proxy account, `both_readers_read_a_keyless_proxy_account_as_third_party`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
-    let Some(config) = read_profile_config(name) else {
+    let Some(raw) = read_profile_config_text(name) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
         return false;
     };
     let has_credentials = stored_credentials_file_exists(name);
@@ -4287,6 +4779,7 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
         config.api_key.as_deref(),
         has_credentials,
         &config.env,
+        || matches!(proxy_claim_in(&raw), ProxyClaim::Account(_)),
     )
 }
 
@@ -4294,9 +4787,12 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// name-keyed lock-free reader shares. `None` when the config cannot be read or
 /// parsed.
 fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
-    let config_path = profile_config_path(name).ok()?;
-    let raw = std::fs::read_to_string(&config_path).ok()?;
-    toml::from_str::<ProfileConfig>(&raw).ok()
+    toml::from_str::<ProfileConfig>(&read_profile_config_text(name)?).ok()
+}
+
+/// `name`'s `config.toml` text, lock-free; `None` when it cannot be read.
+fn read_profile_config_text(name: &ProfileName) -> Option<String> {
+    std::fs::read_to_string(profile_config_path(name).ok()?).ok()
 }
 
 /// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
@@ -5009,6 +5505,9 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         derived_base_url: base_url.clone(),
         derived_console: console.clone(),
     };
+    let claim = proxy_claim_in(&raw_config);
+    let has_unreadable_proxy_record = claim == ProxyClaim::Unreadable;
+    let proxy = claim.into_record();
 
     let profile = Profile {
         name: name.clone(),
@@ -5055,6 +5554,8 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
             .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
         typed_endpoint,
+        proxy,
+        has_unreadable_proxy_record,
     };
 
     (profile, config_path, raw_config)

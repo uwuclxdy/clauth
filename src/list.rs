@@ -139,8 +139,7 @@ impl Row {
             seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
             disabled: entry.disabled,
-            keyless: profile
-                .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
+            keyless: profile.is_some_and(|p| p.is_keyless()),
             canceled: profile.is_some_and(crate::profile_json::is_canceled_cached),
             org_refused: profile.is_some_and(crate::profile_json::is_org_refused_cached),
             stale: entry.stale,

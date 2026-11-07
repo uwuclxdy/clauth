@@ -24,7 +24,53 @@ pub(crate) fn installed_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
 /// Open `url` in the operator's default browser. Used by the interactive OAuth
 /// login (`oauth_login`) to launch the authorize page. Detached (stdio nulled)
 /// so it never blocks or leaks output into clauth's own stdout/stderr.
+///
+/// A test build never spawns an opener: the url goes to the calling thread's
+/// [`OpenedUrls`] capture when one is held, and nowhere otherwise.
 pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
+    #[cfg(test)]
+    OPENED.with(|opened| {
+        if let Some(urls) = opened.borrow_mut().as_mut() {
+            urls.push(url.to_string());
+        }
+    });
+    #[cfg(not(test))]
+    spawn_opener(url)?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPENED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Every url [`open_url`] received on the calling thread while this guard
+/// lives. Per-thread, so a parallel test's opens never land here, and `!Send`
+/// so it cannot be carried to a thread it does not capture.
+#[cfg(test)]
+pub(crate) struct OpenedUrls(std::marker::PhantomData<*const ()>);
+
+#[cfg(test)]
+impl OpenedUrls {
+    pub(crate) fn capture_here() -> Self {
+        OPENED.with(|opened| *opened.borrow_mut() = Some(Vec::new()));
+        Self(std::marker::PhantomData)
+    }
+
+    pub(crate) fn urls(&self) -> Vec<String> {
+        OPENED.with(|opened| opened.borrow().clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenedUrls {
+    fn drop(&mut self) {
+        OPENED.with(|opened| *opened.borrow_mut() = None);
+    }
+}
+
+#[cfg(not(test))]
+fn spawn_opener(url: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::process::{Command, Stdio};
 

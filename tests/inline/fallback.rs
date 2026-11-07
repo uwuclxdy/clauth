@@ -115,6 +115,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         usage,
         fresh: false,
