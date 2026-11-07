@@ -50,10 +50,10 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `disabled` | you ran `clauth disable <name>`, or flipped it on the Setup tab |
 | `canceled` | the subscription reads canceled at Anthropic |
 | `org refused` | the account's organization refuses it to the usage probe: on hold, disabled, a key whose creator left it, an endpoint closed to its region or an address outside its allowed range; no login fixes it |
-| `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`) |
-| `key rejected` | a third-party provider rejected the inference api key; re-enter it on the Setup tab |
+| `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`; a proxy account: `clauth login <name> --proxy <service>`) |
+| `key rejected` | a third-party provider rejected the inference api key; re-enter it on the Setup tab (a proxy account: `clauth login <name> --proxy <service>`) |
 | `token rejected` | the server refused the account's setup token to the usage probe; re-mint it with `clauth login <name> --setup-token` |
-| `logged out` | the account holds no login at all; log in with `clauth login <name>`, or add an api key on the Setup tab |
+| `logged out` | the account holds no login at all; log in with `clauth login <name>`, or add an api key on the Setup tab (a proxy account: `clauth login <name> --proxy <service>`) |
 | `weekly spent` | 7d at 100%, dead until the week resets |
 | `30d spent` | a monthly-only account's 30d quota at 100%, dead until it resets |
 | `claude code blocked` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
