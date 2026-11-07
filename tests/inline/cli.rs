@@ -7602,7 +7602,11 @@ fn limit_reset_stops_a_claude_spend_before_the_prompt_on_a_failed_read() {
 
 /// The grant the server names next is spent only when it is usable now and
 /// its id fits the pattern Claude Code checks before it sends one; otherwise
-/// nothing beyond the read leaves.
+/// nothing beyond the read leaves. The spend decides on the one rule the
+/// count reads (`ResetStatus::try_spend_grant`), so this test asserts the spend
+/// alone: a loosened rule reds it here, where a count assert placed first
+/// would catch the change before the spend ran (the count's own pins are in
+/// `tests/inline/claude_reset.rs`).
 #[test]
 fn limit_reset_refuses_a_next_grant_it_cannot_spend() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -7631,12 +7635,6 @@ fn limit_reset_refuses_a_next_grant_it_cannot_spend() {
         ),
     ];
     for (body, want) in cases {
-        let status = usage::claude_reset::read_status(&body).expect("a cedar_ember block");
-        assert_eq!(
-            status.usable_resets(),
-            0,
-            "a next grant the spend refuses counts nothing"
-        );
         let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
         let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
             .expect_err("refused before the spend");

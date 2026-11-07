@@ -993,3 +993,89 @@ fn the_refresh_store_failure_lines_name_what_was_not_stored() {
         "clauth: 'cl2': could not remove the stored limit reset count"
     );
 }
+
+/// A usable next grant on the pattern is the one the spend sends, and the
+/// count's view of the rule names the same grant.
+#[test]
+fn the_spend_rule_sends_the_servers_usable_next_grant() {
+    let status = status(THREE_GRANTS);
+    assert_eq!(
+        status.try_spend_grant().map(|g| g.id.as_str()).ok(),
+        Some("g-week")
+    );
+    assert_eq!(status.spend_grant().map(|g| g.id.as_str()), Some("g-week"));
+}
+
+/// No next grant and a next id naming no listed grant both refuse with the
+/// status the no-grant line reads.
+#[test]
+fn the_spend_rule_refuses_no_next_grant_with_its_status() {
+    for next in ["null", r#""g-gone""#] {
+        let status = status(&THREE_GRANTS.replacen(
+            r#""next_grant_id": "g-week""#,
+            &format!(r#""next_grant_id": {next}"#),
+            1,
+        ));
+        match status.try_spend_grant() {
+            Err(SpendRefusal::NoNextGrant(carried)) => {
+                assert!(std::ptr::eq(carried, &status), "next {next}");
+            }
+            other => panic!("next {next}: {other:?}"),
+        }
+        assert!(status.spend_grant().is_none(), "next {next}");
+    }
+}
+
+/// A next grant in cooldown refuses with that grant, though other grants are
+/// usable.
+#[test]
+fn the_spend_rule_refuses_a_cooling_next_grant_with_the_grant() {
+    let status = status(&THREE_GRANTS.replacen(
+        r#""next_grant_id": "g-week""#,
+        r#""next_grant_id": "g-cool""#,
+        1,
+    ));
+    match status.try_spend_grant() {
+        Err(SpendRefusal::NotUsableNow(grant)) => assert_eq!(grant.id, "g-cool"),
+        other => panic!("{other:?}"),
+    }
+    assert!(status.spend_grant().is_none());
+}
+
+/// A usable next grant whose id is off the pattern refuses as unsendable.
+#[test]
+fn the_spend_rule_refuses_a_next_grant_id_off_the_pattern() {
+    let status = status(
+        &THREE_GRANTS
+            .replacen(r#""id": "g-week""#, r#""id": "G WEEK""#, 1)
+            .replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": "G WEEK""#,
+                1,
+            ),
+    );
+    assert!(matches!(
+        status.try_spend_grant(),
+        Err(SpendRefusal::UnsendableId)
+    ));
+    assert!(status.spend_grant().is_none());
+}
+
+/// A next grant both cooling and off the pattern refuses as not usable now,
+/// so the spend names the cooldown rather than the id.
+#[test]
+fn the_spend_rule_names_a_cooldown_before_an_unsendable_id() {
+    let status = status(
+        &THREE_GRANTS
+            .replacen(r#""id": "g-cool""#, r#""id": "G COOL""#, 1)
+            .replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": "G COOL""#,
+                1,
+            ),
+    );
+    match status.try_spend_grant() {
+        Err(SpendRefusal::NotUsableNow(grant)) => assert_eq!(grant.id, "G COOL"),
+        other => panic!("{other:?}"),
+    }
+}

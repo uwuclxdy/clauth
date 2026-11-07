@@ -3450,17 +3450,18 @@ fn limit_reset_claude(
             )
         }
         None => {
-            let Some(grant) = status.next_grant() else {
-                anyhow::bail!("{}", reset::no_resets_available(canonical, &status));
+            let grant = match status.try_spend_grant() {
+                Ok(grant) => grant,
+                Err(reset::SpendRefusal::NoNextGrant(status)) => {
+                    anyhow::bail!("{}", reset::no_resets_available(canonical, status))
+                }
+                Err(reset::SpendRefusal::NotUsableNow(grant)) => {
+                    anyhow::bail!("{}", reset::unusable_next_line(canonical, grant))
+                }
+                Err(reset::SpendRefusal::UnsendableId) => {
+                    anyhow::bail!("{}", reset::unsendable_grant_line(canonical))
+                }
             };
-            // The server refuses any grant but its next one, and Claude Code
-            // refuses to send an id off the pattern before it spends.
-            if !grant.is_usable_now() {
-                anyhow::bail!("{}", reset::unusable_next_line(canonical, grant));
-            }
-            if !reset::grant_id_is_sendable(&grant.id) {
-                anyhow::bail!("{}", reset::unsendable_grant_line(canonical));
-            }
             let org_uuid =
                 reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
                     .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;

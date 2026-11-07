@@ -61,12 +61,27 @@ impl ResetStatus {
         self.grants.iter().find(|g| g.id == id)
     }
 
-    /// The grant a spend would send now: the server's next grant, when the
-    /// server marks it usable now and its id fits the pattern Claude Code
-    /// sends. A fresh spend refuses when this is `None`.
+    /// The grant a spend would send now, or why a fresh spend refuses: the
+    /// server's next grant, when the server marks it usable now and its id
+    /// fits the pattern Claude Code sends. The server refuses any grant but
+    /// its next one, and Claude Code refuses to send an id off the pattern
+    /// before it spends. A grant both cooling and off the pattern reads as
+    /// not usable now.
+    pub(crate) fn try_spend_grant(&self) -> Result<&Grant, SpendRefusal<'_>> {
+        let grant = self.next_grant().ok_or(SpendRefusal::NoNextGrant(self))?;
+        if !grant.is_usable_now() {
+            return Err(SpendRefusal::NotUsableNow(grant));
+        }
+        if !grant_id_is_sendable(&grant.id) {
+            return Err(SpendRefusal::UnsendableId);
+        }
+        Ok(grant)
+    }
+
+    /// [`Self::try_spend_grant`] without its reason, for the surfaces that
+    /// only count.
     pub(crate) fn spend_grant(&self) -> Option<&Grant> {
-        let grant = self.next_grant()?;
-        (grant.is_usable_now() && grant_id_is_sendable(&grant.id)).then_some(grant)
+        self.try_spend_grant().ok()
     }
 
     /// The account's banked resets a fresh spend can use now: the sum of
@@ -93,6 +108,18 @@ impl ResetStatus {
             .iter()
             .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
     }
+}
+
+/// Why [`ResetStatus::try_spend_grant`] refuses, each variant carrying what
+/// its refusal line names.
+#[derive(Debug)]
+pub(crate) enum SpendRefusal<'a> {
+    /// The server names no next grant, or none it lists matches its id.
+    NoNextGrant(&'a ResetStatus),
+    /// The server does not mark its next grant usable now.
+    NotUsableNow(&'a Grant),
+    /// The next grant's id is off `^[a-z0-9_-]{1,40}$`.
+    UnsendableId,
 }
 
 /// One grant, as the status block lists it. Every field but `id` defaults, so
