@@ -1781,6 +1781,7 @@ fn finish_switch(config: &mut AppConfig, target: Profile, held: &StateLockHeld) 
         profile.env = target.env;
         profile.models = target.models;
         profile.effort = target.effort;
+        profile.model_effort = target.model_effort;
     }
     Ok(())
 }
@@ -4487,6 +4488,7 @@ pub(crate) fn duplicate_profile(
         profile.env = src.env.clone();
         profile.models = src.models.clone();
         profile.effort = src.effort.clone();
+        profile.model_effort = src.model_effort.clone();
         profile.fallback_threshold = src.fallback_threshold;
         profile.weekly_threshold = src.weekly_threshold;
         profile.max_auto_spend = src.max_auto_spend;

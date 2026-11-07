@@ -34,6 +34,7 @@ fn oauth(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
         last_resort: false,

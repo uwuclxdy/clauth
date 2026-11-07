@@ -2042,6 +2042,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         env: Default::default(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
