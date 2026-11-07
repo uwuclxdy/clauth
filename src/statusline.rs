@@ -173,8 +173,7 @@ mod tests {
 
     #[test]
     fn should_read_an_input_without_rate_limits() {
-        let parsed: StatusInput =
-            serde_json::from_slice(br#"{"session_id":"s"}"#).expect("parses");
+        let parsed: StatusInput = serde_json::from_slice(br#"{"session_id":"s"}"#).expect("parses");
         assert!(parsed.rate_limits.is_none());
     }
 

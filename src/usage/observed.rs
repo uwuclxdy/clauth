@@ -133,7 +133,11 @@ const CONFIRM_EVERY_SECS: i64 = 30;
 /// unchanged. Same rules as [`fold_window`]: within one window the higher
 /// figure wins, a later reset starts a new window, an earlier one is an old
 /// reply and is ignored.
-fn next_window(stored: Option<ObservedWindow>, incoming: Reading, now: i64) -> Option<ObservedWindow> {
+fn next_window(
+    stored: Option<ObservedWindow>,
+    incoming: Reading,
+    now: i64,
+) -> Option<ObservedWindow> {
     let fresh = |r: Reading| ObservedWindow {
         used_percentage: r.used_percentage,
         resets_at: r.resets_at,
@@ -658,7 +662,8 @@ mod tests {
 
     #[test]
     fn should_create_a_record_from_the_first_reading() {
-        let r = fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
+        let r =
+            fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
         assert_eq!(r.profile.as_deref(), Some("p"));
         assert_eq!(r.updated_at, NOW);
         assert_eq!(
@@ -675,39 +680,75 @@ mod tests {
 
     #[test]
     fn should_never_lower_a_recorded_window() {
-        let r = fold_record(None, "p", None, Some(reading(40.0, WEEK_RESET)), NOW).expect("a record");
+        let r =
+            fold_record(None, "p", None, Some(reading(40.0, WEEK_RESET)), NOW).expect("a record");
         assert_eq!(
-            fold_record(Some(r.clone()), "p", None, Some(reading(35.0, WEEK_RESET)), NOW + 1),
+            fold_record(
+                Some(r.clone()),
+                "p",
+                None,
+                Some(reading(35.0, WEEK_RESET)),
+                NOW + 1
+            ),
             None
         );
-        let up = fold_record(Some(r), "p", None, Some(reading(41.0, WEEK_RESET)), NOW + 1).expect("raised");
+        let up = fold_record(Some(r), "p", None, Some(reading(41.0, WEEK_RESET)), NOW + 1)
+            .expect("raised");
         assert_eq!(up.windows.seven_day.map(|w| w.used_percentage), Some(41.0));
     }
 
     #[test]
     fn should_record_a_new_window_and_ignore_an_older_one() {
-        let r = fold_record(None, "p", Some(reading(90.0, NOW + 100)), None, NOW).expect("a record");
-        let next = fold_record(Some(r), "p", Some(reading(3.0, NOW + 18_000)), None, NOW + 200)
-            .expect("a new window");
+        let r =
+            fold_record(None, "p", Some(reading(90.0, NOW + 100)), None, NOW).expect("a record");
+        let next = fold_record(
+            Some(r),
+            "p",
+            Some(reading(3.0, NOW + 18_000)),
+            None,
+            NOW + 200,
+        )
+        .expect("a new window");
         assert_eq!(
-            next.windows.five_hour.map(|w| (w.used_percentage, w.resets_at)),
+            next.windows
+                .five_hour
+                .map(|w| (w.used_percentage, w.resets_at)),
             Some((3.0, NOW + 18_000))
         );
         assert_eq!(
-            fold_record(Some(next), "p", Some(reading(95.0, NOW + 100)), None, NOW + 300),
+            fold_record(
+                Some(next),
+                "p",
+                Some(reading(95.0, NOW + 100)),
+                None,
+                NOW + 300
+            ),
             None
         );
     }
 
     #[test]
     fn should_confirm_an_unchanged_window_every_thirty_seconds() {
-        let r = fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
+        let r =
+            fold_record(None, "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("a record");
         assert_eq!(
-            fold_record(Some(r.clone()), "p", None, Some(reading(35.0, WEEK_RESET)), NOW + 29),
+            fold_record(
+                Some(r.clone()),
+                "p",
+                None,
+                Some(reading(35.0, WEEK_RESET)),
+                NOW + 29
+            ),
             None
         );
-        let later = fold_record(Some(r), "p", None, Some(reading(35.0, WEEK_RESET)), NOW + 30)
-            .expect("confirmed");
+        let later = fold_record(
+            Some(r),
+            "p",
+            None,
+            Some(reading(35.0, WEEK_RESET)),
+            NOW + 30,
+        )
+        .expect("confirmed");
         assert_eq!(later.windows.seven_day.map(|w| w.seen_at), Some(NOW + 30));
     }
 
@@ -717,7 +758,14 @@ mod tests {
         record(dir.path(), "p", None, Some(reading(35.0, WEEK_RESET)), NOW).expect("writes");
         let got = read(dir.path(), "p").expect("reads back");
         assert_eq!(got.windows.seven_day.map(|w| w.used_percentage), Some(35.0));
-        record(dir.path(), "../evil", None, Some(reading(1.0, WEEK_RESET)), NOW).expect("refused quietly");
+        record(
+            dir.path(),
+            "../evil",
+            None,
+            Some(reading(1.0, WEEK_RESET)),
+            NOW,
+        )
+        .expect("refused quietly");
         assert!(!dir.path().join("../evil.json").exists());
     }
 
@@ -740,43 +788,83 @@ mod tests {
 
     #[test]
     fn should_confirm_a_candidate_its_weekly_reset_matches() {
-        let got = attribute(Some(("personal".into(), Source::Global)), Some(PERSONAL), &prints());
+        let got = attribute(
+            Some(("personal".into(), Source::Global)),
+            Some(PERSONAL),
+            &prints(),
+        );
         assert_eq!(got.as_deref(), Some("personal"));
     }
 
     #[test]
     fn should_move_a_reading_to_the_profile_its_weekly_reset_names() {
         // a global session still on `work` after the global switch to personal
-        let got = attribute(Some(("personal".into(), Source::Global)), Some(WORK), &prints());
+        let got = attribute(
+            Some(("personal".into(), Source::Global)),
+            Some(WORK),
+            &prints(),
+        );
         assert_eq!(got.as_deref(), Some("work"));
     }
 
     #[test]
     fn should_match_a_reset_a_week_on_and_a_fraction_off() {
-        assert_eq!(attribute(None, Some(PERSONAL + WEEK_SECS + 1), &prints()).as_deref(), Some("personal"));
+        assert_eq!(
+            attribute(None, Some(PERSONAL + WEEK_SECS + 1), &prints()).as_deref(),
+            Some("personal")
+        );
     }
 
     #[test]
     fn should_drop_a_reading_none_or_several_profiles_match() {
-        assert_eq!(attribute(Some(("personal".into(), Source::Global)), Some(PERSONAL + 3_600), &prints()), None);
+        assert_eq!(
+            attribute(
+                Some(("personal".into(), Source::Global)),
+                Some(PERSONAL + 3_600),
+                &prints()
+            ),
+            None
+        );
         let twins = vec![("a".into(), PERSONAL), ("b".into(), PERSONAL - WEEK_SECS)];
         assert_eq!(attribute(None, Some(PERSONAL), &twins), None);
     }
 
     #[test]
     fn should_trust_only_a_named_session_without_a_fingerprint() {
-        assert_eq!(attribute(Some(("tgp".into(), Source::ConfigDir)), None, &prints()).as_deref(), Some("tgp"));
         assert_eq!(
-            attribute(Some(("tgp".into(), Source::SessionOwner)), Some(PERSONAL + 3_600), &prints()).as_deref(),
+            attribute(Some(("tgp".into(), Source::ConfigDir)), None, &prints()).as_deref(),
             Some("tgp")
         );
-        assert_eq!(attribute(Some(("personal".into(), Source::Global)), None, &prints()), None);
-        assert_eq!(attribute(Some(("personal".into(), Source::Global)), Some(PERSONAL), &[]), None);
+        assert_eq!(
+            attribute(
+                Some(("tgp".into(), Source::SessionOwner)),
+                Some(PERSONAL + 3_600),
+                &prints()
+            )
+            .as_deref(),
+            Some("tgp")
+        );
+        assert_eq!(
+            attribute(Some(("personal".into(), Source::Global)), None, &prints()),
+            None
+        );
+        assert_eq!(
+            attribute(
+                Some(("personal".into(), Source::Global)),
+                Some(PERSONAL),
+                &[]
+            ),
+            None
+        );
     }
 
     #[test]
     fn should_not_trust_a_named_session_another_profile_fingerprints() {
-        let got = attribute(Some(("tgp".into(), Source::ConfigDir)), Some(PERSONAL), &prints());
+        let got = attribute(
+            Some(("tgp".into(), Source::ConfigDir)),
+            Some(PERSONAL),
+            &prints(),
+        );
         assert_eq!(got.as_deref(), Some("personal"));
     }
 
