@@ -6450,15 +6450,31 @@ impl SessionSwap {
 
     /// The swap's effort handover write: the member's effort (`""` when it
     /// holds none) into `env.CLAUDE_CODE_EFFORT_LEVEL` of the session's
-    /// runtime settings.json, recorded through the same owner-only path the
-    /// launch uses. Best-effort — a failure is logged naming the session dir
-    /// and the swap stands, per the handover's contract.
+    /// runtime settings.json, and its per-model levels into `modelSettings`
+    /// ([`crate::claude::set_settings_effort`]), recorded through the same
+    /// owner-only path the launch uses. The levels are read under the hold the
+    /// caller owns (`read_profile`, the under-hold form); an unreadable member
+    /// hands over the carrier alone. Best-effort — a failure is logged naming
+    /// the session dir and the swap stands, per the handover's contract.
     fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
-        if let Err(e) = crate::claude::set_settings_env_key(
+        let levels = match crate::profile::read_profile(member) {
+            Ok(profile) => Some(crate::model_effort::resolved(&profile)),
+            Err(e) => {
+                logline!(
+                    "clauth: session {} swapped onto {} but its per-model effort could not be \
+                     read: {e:#}",
+                    self.session.as_str(),
+                    member,
+                );
+                None
+            }
+        };
+        if let Err(e) = crate::claude::set_settings_effort(
             &self.runtime.join("settings.json"),
             record,
             "CLAUDE_CODE_EFFORT_LEVEL",
             effort.unwrap_or(""),
+            levels.as_ref(),
         ) {
             logline!(
                 "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",

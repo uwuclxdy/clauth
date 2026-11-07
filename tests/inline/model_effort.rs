@@ -316,3 +316,76 @@ fn an_account_with_only_a_table_creates_the_live_settings() {
         .unwrap();
     assert_eq!(level(&live(), "sonnet").as_deref(), Some("xhigh"));
 }
+
+#[test]
+fn a_swap_hands_back_the_outgoing_accounts_levels_and_writes_the_incoming_ones() {
+    let mut runtime = serde_json::json!({"modelSettings": {
+        "opus": {"effortLevel": "high", "autoCompactWindow": 200000},
+        "claude-opus-4-5[1m]": {"effortLevel": "xhigh"},
+        "haiku": {"effortLevel": "medium"},
+    }});
+    let fresh = serde_json::json!({"modelSettings": {
+        "opus": {"effortLevel": "low"},
+        "haiku": {"effortLevel": "low"},
+    }});
+    let pinned =
+        std::collections::BTreeSet::from(["opus".to_string(), "claude-opus-4-5".to_string()]);
+    let incoming = BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]);
+    hand_over(
+        runtime.as_object_mut().unwrap(),
+        fresh.as_object().unwrap(),
+        &incoming,
+        Some(&pinned),
+    )
+    .unwrap();
+    assert_eq!(
+        level(&runtime, "opus").as_deref(),
+        Some("low"),
+        "back to the user's own"
+    );
+    assert_eq!(
+        runtime["modelSettings"]["opus"]["autoCompactWindow"],
+        200000
+    );
+    assert!(
+        runtime["modelSettings"]
+            .get("claude-opus-4-5[1m]")
+            .is_none(),
+        "a pinned spelling with no level of the user's leaves: {runtime}"
+    );
+    assert_eq!(
+        level(&runtime, "haiku").as_deref(),
+        Some("medium"),
+        "unpinned: the sync's"
+    );
+    assert_eq!(level(&runtime, "sonnet").as_deref(), Some("xhigh"));
+}
+
+#[test]
+fn a_swap_writes_the_carrier_and_the_members_levels_into_the_session() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    crate::profile::save_profile_config(&profile("a", Some("opus"), Some("high"), &[])).unwrap();
+    crate::profile::save_profile_config(&profile("b", None, None, &[("sonnet", "xhigh")])).unwrap();
+    let runtime = crate::profile::clauth_dir()
+        .unwrap()
+        .join("session-settings.json");
+    atomic_write(
+        &runtime,
+        r#"{"env":{"CLAUDE_CODE_EFFORT_LEVEL":""},"modelSettings":{"opus":{"effortLevel":"high"}}}"#,
+    )
+    .unwrap();
+    let b = profile("b", None, None, &[("sonnet", "xhigh")]);
+    crate::claude::set_settings_effort(
+        &runtime,
+        None,
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        &effective_effort(&b),
+        Some(&resolved(&b)),
+    )
+    .unwrap();
+    let after: serde_json::Value = read_json_file(&runtime).unwrap();
+    assert_eq!(level(&after, "opus").as_deref(), Some("low"));
+    assert_eq!(level(&after, "sonnet").as_deref(), Some("xhigh"));
+    assert_eq!(after["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "");
+}

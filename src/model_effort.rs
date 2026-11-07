@@ -343,6 +343,37 @@ pub(crate) fn apply_runtime(
     Ok(())
 }
 
+/// A swapped session's levels: every model a level is pinned for (by any
+/// account, `pinned`, matched by canonical name) that the incoming account
+/// does not pin goes back to what a fresh launch would write (`fresh`, the
+/// live file after [`apply_runtime`]), and the incoming account's `levels`
+/// land over it. A model no account pins is shared and left to the sync.
+/// `pinned` is `None` when the sync's view is unreadable: only the incoming
+/// levels land then.
+pub(crate) fn hand_over(
+    runtime: &mut serde_json::Map<String, serde_json::Value>,
+    fresh: &serde_json::Map<String, serde_json::Value>,
+    levels: &BTreeMap<String, String>,
+    pinned: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    if let Some(pinned) = pinned {
+        let held: Vec<String> = runtime
+            .get("modelSettings")
+            .and_then(serde_json::Value::as_object)
+            .map(|models| models.keys().cloned().collect())
+            .unwrap_or_default();
+        for id in held {
+            if !levels.contains_key(&id) && pinned.contains(&canonical_model_id(&id)) {
+                set_level(runtime, &id, level_of(fresh, &id).cloned())?;
+            }
+        }
+    }
+    for (id, level) in levels {
+        set_level(runtime, id, Some(level.as_str().into()))?;
+    }
+    Ok(())
+}
+
 /// The record a live apply lands around its write: `found` as read (`None`
 /// when absent), `captured` with every new or moved entry, `landed` with every
 /// change.

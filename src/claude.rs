@@ -7428,10 +7428,14 @@ fn build_settings(
     })
 }
 
-/// Set ONE env key in the settings file `settings_path`, touching no other
-/// key: the swap executor's effort handover, which must not rebuild the file
-/// from the incoming profile (the session keeps its operator settings). Reads
-/// the file, sets `key = value` inside its `env` object, and writes it back
+/// The swap executor's effort handover into the settings file
+/// `settings_path`, touching nothing else: the session keeps its operator
+/// settings, so the file is never rebuilt from the incoming profile. Sets
+/// `key = value` inside its `env` object and, with `levels` (the incoming
+/// account's per-model levels), hands over `modelSettings` per
+/// [`crate::model_effort::hand_over`], against the levels a fresh launch would
+/// write over the live `~/.claude/settings.json`. Reads the file and writes it
+/// back
 /// through the same recorded, owner-only path the launch uses for this very
 /// file ([`crate::jsonsync::write_copy_and_record`] with `owner_only = true`):
 /// the session's settings.json lives under `~/.clauth` and can carry the
@@ -7451,11 +7455,12 @@ fn build_settings(
 /// logs it, naming the session dir, and the swap stands. The caller logs any
 /// failure and continues — a failed write must never undo the credential move
 /// it follows.
-pub(crate) fn set_settings_env_key(
+pub(crate) fn set_settings_effort(
     settings_path: &Path,
     record: Option<&Path>,
     key: &str,
     value: &str,
+    levels: Option<&BTreeMap<String, String>>,
 ) -> Result<()> {
     let meta = std::fs::metadata(settings_path)
         .with_context(|| format!("failed to stat {}", settings_path.display()))?;
@@ -7478,6 +7483,27 @@ pub(crate) fn set_settings_env_key(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
     env.insert(key.into(), value.into());
+    if let Some(levels) = levels {
+        let live = claude_settings_path()?;
+        let mut fresh: serde_json::Value = if live.exists() {
+            read_json_file(&live)?
+        } else {
+            serde_json::json!({})
+        };
+        let fresh = fresh
+            .as_object_mut()
+            .context("settings.json is not an object")?;
+        crate::model_effort::apply_runtime(fresh, levels)?;
+        let pinned = crate::settings_sync::pinned_models();
+        crate::model_effort::hand_over(
+            settings
+                .as_object_mut()
+                .context("settings.json is not an object")?,
+            fresh,
+            levels,
+            pinned.as_ref(),
+        )?;
+    }
     let content =
         serde_json::to_vec_pretty(&settings).context("failed to serialize settings.json")?;
     let carried_rank = match record {

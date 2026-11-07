@@ -161,6 +161,13 @@ fn key_role(path: KeyPath<'_>, keys: &PerProfileKeys) -> KeyRule {
     }
 }
 
+/// The `modelSettings` models (by canonical name) any profile pins or the
+/// per-model record covers, `None` while the sync is paused on an unreadable
+/// file: the set a swap's per-model handover restores.
+pub(crate) fn pinned_models() -> Option<BTreeSet<String>> {
+    per_profile_keys().map(|keys| keys.models)
+}
+
 /// The nested keys every member keeps as its own: `env` keys any profile
 /// declares or the base-env record covers, and `modelSettings` models (by
 /// canonical name) any profile pins or the per-model record covers.
