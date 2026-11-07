@@ -18631,6 +18631,58 @@ impl Drop for BareItemAnswerGuard {
     }
 }
 
+/// Refuse a write that would make `name` active while it is disabled in either
+/// copy: memory (the roster this app loaded) or disk (a peer's disable since).
+/// Toasts the refusal under `head` and answers `true`, so the caller returns.
+/// Answered before the bare-item gate, whose settle can already write the live
+/// login into the target's store, and before a door raises a confirm for an
+/// activation a disabled target can never perform.
+fn refuse_disabled_target(app: &mut App, name: &ProfileName, head: &str) -> bool {
+    let in_memory = app.config().find(name).is_some_and(|p| p.is_disabled());
+    let refusal = match read_target_profile(name) {
+        Ok(profile) if in_memory || profile.is_disabled() => {
+            anyhow::anyhow!(crate::disabled_account_refusal(name))
+        }
+        Ok(_) => return false,
+        Err(e) => e,
+    };
+    app.toast(
+        ToastKind::Danger,
+        format!(
+            "{head} failed\n{}",
+            escape_control(&error_toast_detail(&refusal))
+        ),
+    );
+    true
+}
+
+/// Refuse `name` when disk marks it disabled. Called under the caller's hold:
+/// a peer's disable can land after the early refusal, on disk alone.
+fn refuse_disabled_on_disk(name: &ProfileName) -> Result<()> {
+    if read_target_profile(name)?.is_disabled() {
+        return Err(anyhow::anyhow!(crate::disabled_account_refusal(name)));
+    }
+    Ok(())
+}
+
+/// `name`'s profile off disk for a disabled check. A `config.toml` the proxy
+/// checks refuse fails with their own refusal, in their order (an account on a
+/// proxy or an unreadable `[proxy]` table, then an unclassifiable file), the
+/// one they give when they run first, rather than the raw read error.
+fn read_target_profile(name: &ProfileName) -> Result<crate::profile::Profile> {
+    crate::profile::read_profile(name).map_err(|e| {
+        if let Err(refusal) = crate::actions::refuse_relogin_off_proxy(name) {
+            return refusal;
+        }
+        match crate::profile::stored_proxy_claim_failing_closed(name) {
+            crate::profile::ProxyClaim::Unclassifiable => {
+                crate::actions::CaptureRefused(name.clone()).into()
+            }
+            _ => e,
+        }
+    })
+}
+
 /// The account a confirm about to open for `name` lands on, or a toast
 /// headed `failed` when none can be claimed; a proxy account takes the
 /// re-login refusal's toast instead.
@@ -29386,6 +29438,16 @@ fn run_capture_overwrite(
     from_divergence: Option<String>,
     copy: OverwriteCopy,
 ) {
+    // A divergence's capture relinks and activates the target, which a
+    // disabled account can never take; the gate's settle could already write
+    // the live login into it, so refuse first. A proxy account refuses ahead
+    // of that: enabling it would not let the save through.
+    if from_divergence.is_some()
+        && (relogin_refused_off_proxy(app, &name)
+            || refuse_disabled_target(app, &ProfileName::from(name.as_str()), copy.verb()))
+    {
+        return;
+    }
     // The overwrite relinks the live slot when the profile is or
     // becomes the active one, a divergence's capture always (it
     // deactivates the prior one first). Settled before that detach,
@@ -29411,6 +29473,12 @@ fn run_capture_overwrite(
     } else {
         None
     };
+    // A held divergence write resumes here too, past its gate; the hook lets
+    // a test act as a peer between that gate and the hold.
+    #[cfg(test)]
+    if from_divergence.is_some() {
+        run_before_adopt_hold_hook();
+    }
     // Same deferred detach as the non-colliding path: only disown the
     // prior active profile once the overwrite is actually confirmed,
     // so a cancel (handled entirely by `handle_confirm_key` popping
@@ -29439,6 +29507,7 @@ fn run_capture_overwrite(
                 &ProfileName::from(from.as_str()),
                 *snapshot,
                 |cfg, snapshot| {
+                    refuse_disabled_on_disk(&name)?;
                     crate::actions::overwrite_captured_profile_held(
                         cfg, &name, &account, snapshot, true,
                     )
@@ -29512,6 +29581,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if relogin_refused_off_proxy(app, &name) {
                 return;
             }
+            // The gate's settle can write the live login into the target's
+            // store, so a target already disabled refuses first. A held adopt
+            // resumes here too, past its settle.
+            if refuse_disabled_target(app, &ProfileName::from(name.as_str()), "save") {
+                return;
+            }
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
@@ -29528,6 +29603,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             ) else {
                 return;
             };
+            #[cfg(test)]
+            run_before_adopt_hold_hook();
             let name = ProfileName::from(name);
             // The store, the activation and the relink share one hold with the
             // check that the divergence the prompt showed still stands.
@@ -29538,6 +29615,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     &ProfileName::from(from.as_str()),
                     *snapshot,
                     |cfg, snapshot| {
+                        refuse_disabled_on_disk(&name)?;
                         // Captured before the activation replaces the marker,
                         // through the one helper that also answers for a
                         // CLEARED marker — this arm can run after a
@@ -30086,6 +30164,9 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     if relogin_refused_off_proxy(app, &owner) {
                         return;
                     }
+                    if refuse_disabled_target(app, &ProfileName::from(owner.as_str()), "save") {
+                        return;
+                    }
                     // The owner was named for the login the prompt read, so
                     // only that login is captured.
                     let Some(snapshot) = capture_live_or_toast(app) else {
@@ -30345,6 +30426,30 @@ impl DivergenceMoved {
     }
 }
 
+/// Test seam: what a peer does right after the next divergence write's (an
+/// adopt or a capture overwrite) bare-item gate, before its hold, run once.
+#[cfg(test)]
+static BEFORE_ADOPT_HOLD: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn before_the_next_adopt_hold(f: impl FnOnce() + Send + 'static) {
+    if let Ok(mut hook) = BEFORE_ADOPT_HOLD.lock() {
+        *hook = Some(Box::new(f));
+    }
+}
+
+#[cfg(test)]
+fn run_before_adopt_hold_hook() {
+    let hook = BEFORE_ADOPT_HOLD
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 /// Test seam: what a peer does right after the next divergence adopt's hold
 /// releases, run once.
 #[cfg(test)]
@@ -30501,6 +30606,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             if relogin_refused_off_proxy(app, &target) {
                 return;
             }
+            if refuse_disabled_target(app, &ProfileName::from(target.as_str()), "save") {
+                return;
+            }
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
@@ -30628,6 +30736,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
+            let is_divergence = form.from_divergence.is_some();
             // Chars + cross-harness only — the own-roster duplicate branch of
             // `validate_profile_name` is deliberately skipped so a claude
             // collision falls through to the canonical_name lookup below
@@ -30649,6 +30758,15 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             if collision
                 .as_deref()
                 .is_some_and(|existing| relogin_refused_off_proxy(app, existing))
+            {
+                return;
+            }
+            // The divergence picker's rows refuse a disabled target before
+            // their confirm; this typed-name route is the same door, and the
+            // prompt stays open so the name can be changed.
+            if let Some(existing) = collision.as_deref()
+                && is_divergence
+                && refuse_disabled_target(app, &ProfileName::from(existing), "save")
             {
                 return;
             }

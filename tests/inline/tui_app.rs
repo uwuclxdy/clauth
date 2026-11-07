@@ -65608,6 +65608,1042 @@ fn an_adopt_activation_refuses_an_account_a_peer_deleted() {
     );
 }
 
+/// Saving a divergent login into an account makes that account active, which a
+/// disabled one can never be. The refusal reads disk, where a peer's disable
+/// lands, and comes before the overwrite: the target keeps its own login.
+#[test]
+fn an_adopt_refuses_a_disabled_target_and_leaves_its_login() {
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut active = Profile::new("work".to_string(), None, None);
+    active.credentials = Some(creds_ra("rt-work", "at-work"));
+    let mut target = Profile::new("off".to_string(), None, None);
+    target.credentials = Some(creds_ra("rt-off", "at-off"));
+    save_profile(&active).expect("save work");
+    let in_memory = target.clone();
+    target.disabled = true;
+    save_profile(&target).expect("save off, disabled on disk alone");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "off".into()],
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![active, in_memory],
+    });
+    crate::profile::save_app_state(&app.config().state).expect("persist the app's state");
+    let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
+    let gate_reached = Arc::new(AtomicBool::new(false));
+    let ran = Arc::clone(&gate_reached);
+    super::before_the_next_adopt_hold(move || ran.store(true, Ordering::SeqCst));
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "off".to_string(),
+            crate::testutil::profile_id("off"),
+            "work".to_string(),
+        ),
+    );
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'off': account is disabled"],
+        "the refusal names the account and the state"
+    );
+    assert!(
+        !gate_reached.load(Ordering::SeqCst),
+        "the early refusal answers before the hold"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("work"),
+        "the active account stays on disk"
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("work"),
+        "and in memory"
+    );
+    let off = crate::profile::read_profile(&"off".into()).expect("read off");
+    assert_eq!(
+        off.refresh_token(),
+        Some("rt-off"),
+        "the disabled account keeps its own login"
+    );
+}
+
+/// The early refusal reads the roster and disk before the bare-item gate, so a
+/// disable landing after that read is on disk alone. The hold's own read, under
+/// the lock, still refuses: the overwrite never lands and the target keeps its
+/// own login.
+#[test]
+fn an_adopt_refuses_a_target_disabled_after_its_gate() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    super::before_the_next_adopt_hold(move || {
+        let mut target = read_profile(&ProfileName::from("x")).expect("read x");
+        target.disabled = true;
+        save_profile(&target).expect("disable x on disk");
+    });
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'x': account is disabled"],
+        "the hold check refuses the disable that landed after the gate"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("a"),
+        "the active account stays on disk"
+    );
+    assert_eq!(
+        read_profile(&ProfileName::from("x"))
+            .expect("read x")
+            .refresh_token(),
+        Some("rt-x"),
+        "the target keeps its own login"
+    );
+}
+
+/// The divergence resolver's leading owner row refuses an owner whose disk copy
+/// is disabled, before any capture or confirm: one refusal, nothing raised.
+#[test]
+fn the_divergence_owner_door_refuses_a_disabled_target() {
+    use super::{DivergenceAction, Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut play = Profile::new("play".to_string(), None, None);
+    play.credentials = Some(creds_ra("rt-play", "at-play"));
+    let in_memory = play.clone();
+    save_profile(&play).expect("save play");
+    play.disabled = true;
+    save_profile(&play).expect("disable play on disk alone");
+    write_live_creds(&creds_ra("rt-play", "at-play"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into(), "play".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::profile::save_app_state(&app.config().state).expect("persist the roster");
+
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    let Some(Modal::Divergence(form)) = app.modals.last() else {
+        panic!("d opens the resolver");
+    };
+    assert_eq!(
+        form.actions().first(),
+        Some(&DivergenceAction::SwitchToOwner("play".to_string())),
+        "fixture: the owner switch leads"
+    );
+
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "a disabled owner raises no confirm"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'play': account is disabled"],
+        "the door refuses with the account's own state"
+    );
+}
+
+/// The "save elsewhere" picker refuses a target the app's roster disables,
+/// before its confirm: the picker still lists the account, and picking it only
+/// refuses.
+#[test]
+fn the_divergence_picker_door_refuses_a_disabled_target() {
+    use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    save_profile(&spare).expect("save spare");
+    // Disabled in the app's roster alone, its disk copy still enabled: a
+    // re-enable by a peer the running app has not reloaded.
+    let mut in_memory = spare.clone();
+    in_memory.disabled = true;
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::testutil::register_names(&["work", "spare"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.targets,
+        vec!["spare".to_string()],
+        "fixture: the picker lists the disabled target"
+    );
+
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "a disabled target raises no confirm"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'spare': account is disabled"],
+        "the door refuses with the account's own state"
+    );
+}
+
+/// An adopt target clauth cannot read refuses: its disabled flag is unknown,
+/// so the toast never calls it disabled.
+#[test]
+fn an_unreadable_adopt_target_refuses() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("torn");
+    let profile = crate::testutil::blank_profile(&name);
+    crate::profile::save_profile(&profile).expect("save torn");
+    let config = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::write(&config, "not = [toml").expect("tear the config");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    assert!(
+        super::refuse_disabled_target(&mut app, &name, "save"),
+        "a read failure refuses"
+    );
+    let toasts = toast_bodies(&app);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert!(toasts[0].starts_with("save failed\n"), "{toasts:?}");
+    assert!(
+        !toasts[0].contains("account is disabled"),
+        "a read failure is no disabled refusal: {toasts:?}"
+    );
+}
+
+/// The picker's `+ new` row opens the name prompt; typing a disabled account's
+/// name there refuses before the overwrite confirm opens, as the picker's own
+/// rows do, and leaves the prompt open for another name.
+#[test]
+fn the_divergence_name_prompt_refuses_a_disabled_name() {
+    use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    let in_memory = spare.clone();
+    spare.disabled = true;
+    save_profile(&spare).expect("save spare, disabled on disk alone");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::testutil::register_names(&["work", "spare"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    assert!(
+        matches!(app.modals.last(), Some(Modal::DivergenceTarget(_))),
+        "fixture: the target picker opens"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::CaptureName(form)) = app.modals.last() else {
+        panic!("expected the name prompt, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.from_divergence.as_deref(),
+        Some("work"),
+        "fixture: the prompt carries its divergence"
+    );
+    for c in "spare".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "a disabled name raises no overwrite confirm"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'spare': account is disabled"],
+        "the prompt refuses with the account's own state"
+    );
+    assert!(
+        matches!(app.modals.last(), Some(Modal::CaptureName(_))),
+        "the prompt stays open for another name, as its other name refusals do"
+    );
+}
+
+/// A divergence save door whose target is both disabled and an account on a
+/// proxy refuses with the proxy's re-login toast alone: enabling the account
+/// would not let the save through. The resolver's owner row.
+#[test]
+fn the_divergence_owner_door_refuses_a_disabled_proxy_owner_as_a_proxy_account() {
+    use super::{DivergenceAction, Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, read_profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut play = Profile::new("play".to_string(), None, None);
+    play.credentials = Some(creds_ra("rt-play", "at-play"));
+    let in_memory = play.clone();
+    play.disabled = true;
+    save_profile(&play).expect("disable play on disk alone");
+    write_live_creds(&creds_ra("rt-play", "at-play"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into(), "play".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::profile::save_app_state(&app.config().state).expect("persist the roster");
+
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    let Some(Modal::Divergence(form)) = app.modals.last() else {
+        panic!("d opens the resolver");
+    };
+    assert_eq!(
+        form.actions().first(),
+        Some(&DivergenceAction::SwitchToOwner("play".to_string())),
+        "fixture: the owner switch leads"
+    );
+    make_stub_proxy_account("play");
+    let on_disk = read_profile(&"play".into()).expect("read play");
+    assert!(
+        on_disk.disabled && on_disk.proxy.is_some(),
+        "fixture: play is disabled and on a proxy"
+    );
+
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "the refused owner raises no confirm"
+    );
+    assert_eq!(toast_pairs(&app), vec![proxy_relogin_toast("play")]);
+}
+
+/// [`the_divergence_owner_door_refuses_a_disabled_proxy_owner_as_a_proxy_account`]
+/// at the "save elsewhere" picker's rows.
+#[test]
+fn the_divergence_picker_door_refuses_a_disabled_proxy_target_as_a_proxy_account() {
+    use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, Profile, read_profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    let in_memory = spare.clone();
+    spare.disabled = true;
+    save_profile(&spare).expect("save spare, disabled on disk alone");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::testutil::register_names(&["work", "spare"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.targets,
+        vec!["spare".to_string()],
+        "fixture: the picker lists the target"
+    );
+    make_stub_proxy_account("spare");
+    let on_disk = read_profile(&"spare".into()).expect("read spare");
+    assert!(
+        on_disk.disabled && on_disk.proxy.is_some(),
+        "fixture: spare is disabled and on a proxy"
+    );
+
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "the refused target raises no confirm"
+    );
+    assert_eq!(toast_pairs(&app), vec![proxy_relogin_toast("spare")]);
+}
+
+/// [`the_divergence_owner_door_refuses_a_disabled_proxy_owner_as_a_proxy_account`]
+/// at the picker's `+ new` name prompt; the prompt stays open for another name.
+#[test]
+fn the_divergence_name_prompt_refuses_a_disabled_proxy_name_as_a_proxy_account() {
+    use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, Profile, read_profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    let in_memory = spare.clone();
+    spare.disabled = true;
+    save_profile(&spare).expect("save spare, disabled on disk alone");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, in_memory],
+    });
+    crate::testutil::register_names(&["work", "spare"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    assert!(
+        matches!(app.modals.last(), Some(Modal::DivergenceTarget(_))),
+        "fixture: the target picker opens"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::CaptureName(_))),
+        "fixture: the name prompt opens"
+    );
+    make_stub_proxy_account("spare");
+    let on_disk = read_profile(&"spare".into()).expect("read spare");
+    assert!(
+        on_disk.disabled && on_disk.proxy.is_some(),
+        "fixture: spare is disabled and on a proxy"
+    );
+    for c in "spare".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "the refused name raises no overwrite confirm"
+    );
+    assert_eq!(toast_pairs(&app), vec![proxy_relogin_toast("spare")]);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::CaptureName(_))),
+        "the prompt stays open for another name"
+    );
+}
+
+/// [`the_divergence_owner_door_refuses_a_disabled_proxy_owner_as_a_proxy_account`]
+/// at the adopt confirm's press, before the bare-item gate.
+#[test]
+fn an_adopt_refuses_a_disabled_proxy_target_as_a_proxy_account() {
+    use crate::profile::{AppConfig, AppState, Profile, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut active = Profile::new("work".to_string(), None, None);
+    active.credentials = Some(creds_ra("rt-work", "at-work"));
+    let mut target = Profile::new("off".to_string(), None, None);
+    target.credentials = Some(creds_ra("rt-off", "at-off"));
+    save_profile(&active).expect("save work");
+    let in_memory = target.clone();
+    target.disabled = true;
+    save_profile(&target).expect("save off, disabled on disk alone");
+    make_stub_proxy_account("off");
+    let on_disk = read_profile(&"off".into()).expect("read off");
+    assert!(
+        on_disk.disabled && on_disk.proxy.is_some(),
+        "fixture: off is disabled and on a proxy"
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "off".into()],
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![active, in_memory],
+    });
+    crate::profile::save_app_state(&app.config().state).expect("persist the app's state");
+    let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
+    let gate_reached = Arc::new(AtomicBool::new(false));
+    let ran = Arc::clone(&gate_reached);
+    super::before_the_next_adopt_hold(move || ran.store(true, Ordering::SeqCst));
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "off".to_string(),
+            crate::testutil::profile_id("off"),
+            "work".to_string(),
+        ),
+    );
+
+    assert_eq!(toast_pairs(&app), vec![proxy_relogin_toast("off")]);
+    assert!(
+        !gate_reached.load(Ordering::SeqCst),
+        "the refusal answers before the hold"
+    );
+}
+
+/// [`the_divergence_owner_door_refuses_a_disabled_proxy_owner_as_a_proxy_account`]
+/// at the overwrite confirm the name prompt opens, its target turned into a
+/// disabled proxy account while the confirm stood open.
+#[test]
+fn the_divergence_overwrite_confirm_refuses_a_disabled_proxy_target_as_a_proxy_account() {
+    use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, Profile, read_profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    save_profile(&spare).expect("save spare");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, spare],
+    });
+    crate::testutil::register_names(&["work", "spare"]);
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+    for c in "spare".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "fixture: the overwrite confirm opens; toasts {:?}",
+        toast_pairs(&app)
+    );
+    let mut on_disk = read_profile(&"spare".into()).expect("read spare");
+    on_disk.disabled = true;
+    save_profile(&on_disk).expect("disable spare on disk");
+    make_stub_proxy_account("spare");
+    let on_disk = read_profile(&"spare".into()).expect("read spare");
+    assert!(
+        on_disk.disabled && on_disk.proxy.is_some(),
+        "fixture: spare is disabled and on a proxy"
+    );
+
+    handle_key(&mut app, key(KeyCode::Char('y')));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(toast_pairs(&app), vec![proxy_relogin_toast("spare")]);
+    assert_eq!(
+        read_profile(&"spare".into())
+            .expect("read spare")
+            .refresh_token(),
+        Some("rt-spare"),
+        "the refused target keeps its own login"
+    );
+}
+
+/// An adopt target whose `config.toml` turns unreadable after its gate, a
+/// `[proxy]` header over text that fails to parse, is refused under the hold by
+/// the proxy check's own sentence, never by the disabled check's parse error.
+#[test]
+fn an_adopt_target_turned_unreadable_after_its_gate_refuses_with_the_proxy_sentence() {
+    use crate::profile::{ProfileName, ProxyClaim, profile_subpath, stored_proxy_claim};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    let store = profile_subpath(&ProfileName::from("x"), "credentials.json").unwrap();
+    let stored = std::fs::read(&store).unwrap();
+    super::before_the_next_adopt_hold(move || {
+        let x = ProfileName::from("x");
+        let path = profile_subpath(&x, "config.toml").expect("config path");
+        std::fs::write(
+            &path,
+            "[proxy]\nservice = \"stub\"\naccount = \"acct-1\"\nbroken =\n",
+        )
+        .expect("tear x's config");
+        assert_eq!(
+            stored_proxy_claim(&x),
+            ProxyClaim::Unreadable,
+            "fixture: the proxy check reads x as unreadable"
+        );
+    });
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            "a".to_string(),
+        ),
+    );
+
+    let refusal = crate::actions::unreadable_proxy_login(&ProfileName::from("x"));
+    assert_eq!(
+        toast_pairs(&app),
+        vec![(
+            super::ToastKind::Danger,
+            format!(
+                "save failed\n{}",
+                super::escape_control(&super::error_toast_detail(&refusal))
+            )
+        )]
+    );
+    assert_eq!(
+        crate::profile::load_app_state().unwrap().active_profile,
+        Some(ProfileName::from("a")),
+        "the active account stays on disk"
+    );
+    assert!(
+        std::fs::read(&store).unwrap() == stored,
+        "the target's store keeps its own login"
+    );
+}
+
+/// An adopt target whose `config.toml` turns unclassifiable after its gate is
+/// refused under the hold by the capture's own sentence, as the proxy check
+/// would word it, never by the disabled check's raw read error.
+#[test]
+fn an_adopt_target_torn_after_its_gate_refuses_with_the_capture_sentence() {
+    use crate::claude::tests::Unclassifiable;
+    use crate::profile::ProfileName;
+    let mut outcomes = Vec::new();
+    for shape in Unclassifiable::BOTH {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (mut app, snapshot) = app_with_a_relogged();
+        let store =
+            crate::profile::profile_subpath(&ProfileName::from("x"), "credentials.json").unwrap();
+        let stored = std::fs::read(&store).unwrap();
+        super::before_the_next_adopt_hold(move || shape.pose("x"));
+
+        super::run_confirm_action(
+            &mut app,
+            super::ConfirmAction::AdoptDivergence(
+                Box::new(snapshot),
+                "x".to_string(),
+                crate::testutil::profile_id("x"),
+                "a".to_string(),
+            ),
+        );
+
+        outcomes.push((
+            std::fs::read(&store).unwrap() == stored,
+            crate::profile::load_app_state().unwrap().active_profile,
+            toast_pairs(&app),
+        ));
+    }
+    let refused = (
+        true,
+        Some(ProfileName::from("a")),
+        vec![(
+            super::ToastKind::Danger,
+            "save failed\ncan't read the config of 'x', so clauth can't tell whether Claude \
+             Code's current login belongs in it; fix its config.toml, then save the login again"
+                .to_string(),
+        )],
+    );
+    assert_eq!(
+        outcomes,
+        vec![refused.clone(), refused],
+        "(store kept, active on disk, toasts) per shape"
+    );
+}
+
+/// A divergence overwrite confirmed after a peer disabled its target refuses
+/// before the hold: the active account stays and the target keeps its own
+/// login.
+#[test]
+fn a_divergence_overwrite_refuses_a_disabled_target() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    let mut x = read_profile(&ProfileName::from("x")).expect("read x");
+    x.disabled = true;
+    save_profile(&x).expect("disable x on disk");
+    let gate_reached = Arc::new(AtomicBool::new(false));
+    let ran = Arc::clone(&gate_reached);
+    super::before_the_next_adopt_hold(move || ran.store(true, Ordering::SeqCst));
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            Some("a".to_string()),
+        ),
+    );
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["overwrite failed\n'x': account is disabled"],
+        "the overwrite refuses a disabled target in its own failure head"
+    );
+    assert!(
+        !gate_reached.load(Ordering::SeqCst),
+        "the early refusal answers before the hold"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("a"),
+        "the active account stays on disk"
+    );
+    assert_eq!(
+        read_profile(&ProfileName::from("x"))
+            .expect("read x")
+            .refresh_token(),
+        Some("rt-x"),
+        "the target keeps its own login"
+    );
+}
+
+/// A disable landing after the divergence overwrite's early refusal is on disk
+/// alone; the read under the hold still refuses it before the overwrite.
+#[test]
+fn a_divergence_overwrite_refuses_a_target_disabled_after_its_gate() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    super::before_the_next_adopt_hold(move || {
+        let mut target = read_profile(&ProfileName::from("x")).expect("read x");
+        target.disabled = true;
+        save_profile(&target).expect("disable x on disk");
+    });
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            Some("a".to_string()),
+        ),
+    );
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["overwrite failed\n'x': account is disabled"],
+        "the hold check refuses the disable that landed after the gate"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("a"),
+        "the active account stays on disk"
+    );
+    assert_eq!(
+        read_profile(&ProfileName::from("x"))
+            .expect("read x")
+            .refresh_token(),
+        Some("rt-x"),
+        "the target keeps its own login"
+    );
+}
+
+/// A divergence capture whose login looks like a disabled account's asks
+/// first; `save into` that account refuses before anything is overwritten.
+#[test]
+fn a_divergence_save_into_refuses_a_disabled_owner() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = id_matched_capture_app(&["work"], Some("work"));
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+    let mut b = read_profile(&ProfileName::from("b")).expect("read b");
+    b.disabled = true;
+    save_profile(&b).expect("disable b on disk");
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    app.config_draft = None;
+    super::begin_capture(
+        &mut app,
+        Some("work".to_string()),
+        super::live_creds_fingerprint(),
+    );
+    super::drain_capture_probe(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::CaptureOwner(_))),
+        "fixture: the divergence capture asks first: {:?}",
+        app.modals.last()
+    );
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'b': account is disabled"],
+        "save into a disabled owner refuses"
+    );
+    assert_eq!(
+        stored_refresh_of("b").as_deref(),
+        Some("rt-b"),
+        "b keeps its own login"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("work"),
+        "the active account stays on disk"
+    );
+}
+
+/// A divergence overwrite into a disabled target refuses before the bare-item
+/// gate: no settle runs, so none can carry the live login into its store.
+#[test]
+fn a_divergence_overwrite_into_a_disabled_target_settles_nothing() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let mut spare = read_profile(&ProfileName::from("spare")).expect("read spare");
+    spare.disabled = true;
+    save_profile(&spare).expect("disable spare on disk");
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            held_snapshot(),
+            "spare".to_string(),
+            crate::testutil::profile_id("spare"),
+            Some("work".to_string()),
+        ),
+    );
+    land_bare_item_answers(&mut app);
+
+    assert!(
+        SETTLE_WRITERS.lock().unwrap().is_empty(),
+        "a disabled target runs no settle"
+    );
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::BareItem(_))),
+        "and asks no bare-item question"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["overwrite failed\n'spare': account is disabled"]
+    );
+}
+
+/// Control for `a_divergence_overwrite_into_a_disabled_target_settles_nothing`:
+/// the same overwrite into an enabled account on the same fixture reaches the
+/// settle and is held as itself.
+#[test]
+fn a_divergence_overwrite_into_another_account_is_held_as_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            held_snapshot(),
+            "spare".to_string(),
+            crate::testutil::profile_id("spare"),
+            Some("work".to_string()),
+        ),
+    );
+    assert!(matches!(
+        held_write(&mut app),
+        super::BareItemWrite::CaptureOverwrite { ref name, from_divergence: Some(ref from), .. }
+            if name == "spare" && from == "work"
+    ));
+    assert_eq!(
+        SETTLE_WRITERS.lock().unwrap().len(),
+        1,
+        "one settle for the overwrite"
+    );
+    assert_eq!(active_on_disk(), Some(ProfileName::from("work")));
+}
+
+/// A divergence adopt into a disabled target refuses before the bare-item
+/// gate: no settle runs, so none can carry the live login into its store.
+#[test]
+fn a_divergence_adopt_into_a_disabled_target_settles_nothing() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = asking_app();
+    let mut spare = read_profile(&ProfileName::from("spare")).expect("read spare");
+    spare.disabled = true;
+    save_profile(&spare).expect("disable spare on disk");
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::AdoptDivergence(
+            held_snapshot(),
+            "spare".to_string(),
+            crate::testutil::profile_id("spare"),
+            "work".to_string(),
+        ),
+    );
+    land_bare_item_answers(&mut app);
+
+    assert!(
+        SETTLE_WRITERS.lock().unwrap().is_empty(),
+        "a disabled target runs no settle"
+    );
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::BareItem(_))),
+        "and asks no bare-item question"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\n'spare': account is disabled"]
+    );
+}
+
+/// Control: an overwrite with no divergence behind it (a fresh login for the
+/// account itself) still lands on a disabled account, the re-login recovery.
+#[test]
+fn a_plain_overwrite_still_relogs_a_disabled_account() {
+    use crate::profile::{ProfileName, read_profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, snapshot) = app_with_a_relogged();
+    let mut x = read_profile(&ProfileName::from("x")).expect("read x");
+    x.disabled = true;
+    save_profile(&x).expect("disable x on disk");
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(snapshot),
+            "x".to_string(),
+            crate::testutil::profile_id("x"),
+            None,
+        ),
+    );
+
+    assert_eq!(
+        toast_bodies(&app),
+        ["overwrote 'x' with the captured login"],
+        "the re-login lands without a refusal"
+    );
+    let x = read_profile(&ProfileName::from("x")).expect("read x");
+    assert_eq!(x.refresh_token(), Some("rt-fresh"), "the re-login lands");
+    assert!(x.is_disabled(), "and the account stays disabled");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("a"),
+        "the active account stays"
+    );
+}
+
 /// A refresh-interval step whose save fails puts the scheduler's interval back,
 /// so the cadence never runs at a value the Config row does not show.
 #[test]

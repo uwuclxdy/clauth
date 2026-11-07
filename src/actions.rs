@@ -221,7 +221,7 @@ impl std::error::Error for GateNeeded {}
 /// [`overwrite_captured_profile_held`]), typed so a caller that frames its
 /// failures by operation can give it the login's head.
 #[derive(Debug)]
-pub(crate) struct CaptureRefused(ProfileName);
+pub(crate) struct CaptureRefused(pub(crate) ProfileName);
 
 impl std::fmt::Display for CaptureRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
