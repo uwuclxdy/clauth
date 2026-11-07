@@ -3965,13 +3965,7 @@ pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
     let state = state.app_state();
     with_state_lock(|held| {
         let path = app_state_path()?;
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => Some(raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to read {}", path.display()));
-            }
-        };
+        let raw = read_state_file(&path)?;
         // The edit runs before anything is written, so a file the writer
         // refuses leaves the marker record untouched too.
         let edited = raw
@@ -3991,34 +3985,92 @@ pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
                 held,
             )?;
         }
-        let out = match (raw, edited) {
-            (Some(raw), Some((out, _))) if out == raw => return Ok(()),
-            (_, Some((out, _))) => out,
-            (_, None) => toml::to_string_pretty(state).context("failed to render profiles.toml")?,
-        };
-        mkdir_700(&clauth_dir()?)?;
-        atomic_write_600(&path, out).context("failed to write profiles.toml")
+        write_state_file(&path, state, raw, edited.map(|(out, _)| out))
     })
 }
 
-/// `profiles.toml` as it is on disk with `state` written into it in place:
-/// only the keys whose typed value moved are touched, so comments, key order,
-/// list layout and every key this clauth does not model stay as written (a
-/// newer clauth's keys included). Returns the edited bytes and the typed state
-/// the file held, `None` when it holds no readable state (an empty file).
+/// A typed state file the in-place writer edits: `profiles.toml`,
+/// `codex-profiles.toml` or `proxies.toml`.
+pub(crate) trait StateFile: Serialize + serde::de::DeserializeOwned {
+    /// The file's name, as its refusals and write errors print it.
+    const LABEL: &'static str;
+
+    /// The list keys the type cannot read without: a key read alone sits
+    /// beside these, empty.
+    const REQUIRED_LISTS: &'static [&'static str] = &[];
+
+    /// Write a table the file does not hold yet into it, as a block table.
+    fn insert_new_table(doc: &mut toml_edit::DocumentMut, key: &str, new: &toml::Table) {
+        append_root_table(doc, key, |t| {
+            for (sub, v) in new {
+                t.insert(sub, toml_edit::Item::Value(state_edit_value(v)));
+            }
+        });
+    }
+}
+
+impl StateFile for AppState {
+    const LABEL: &'static str = "profiles.toml";
+    const REQUIRED_LISTS: &'static [&'static str] = &["profiles"];
+}
+
+/// `state` saved over the file at `path`: edited in place over the file's own
+/// bytes, rendered whole where there is no file. The caller holds the state
+/// flock, so the raw read and the typed state belong to one hold.
+pub(crate) fn save_state_in_place<T: StateFile>(path: &Path, state: &T) -> Result<()> {
+    let raw = read_state_file(path)?;
+    let edited = raw
+        .as_deref()
+        .map(|raw| edit_state_in_place(path, raw, state))
+        .transpose()?;
+    write_state_file(path, state, raw, edited.map(|(out, _)| out))
+}
+
+/// A state file's raw bytes, `None` when it does not exist.
+fn read_state_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Write `edited` over `path` unless it equals the file's own bytes; with no
+/// file to edit, the whole render of `state`.
+fn write_state_file<T: StateFile>(
+    path: &Path,
+    state: &T,
+    raw: Option<String>,
+    edited: Option<String>,
+) -> Result<()> {
+    let out = match (raw, edited) {
+        (Some(raw), Some(out)) if out == raw => return Ok(()),
+        (_, Some(out)) => out,
+        (_, None) => toml::to_string_pretty(state)
+            .with_context(|| format!("failed to render {}", T::LABEL))?,
+    };
+    mkdir_700(&clauth_dir()?)?;
+    atomic_write_600(path, out).with_context(|| format!("failed to write {}", T::LABEL))
+}
+
+/// A state file as it is on disk with `state` written into it in place: only
+/// the keys whose typed value moved are touched, so comments, key order, list
+/// layout and every key this clauth does not model stay as written (a newer
+/// clauth's keys included). Returns the edited bytes and the typed state the
+/// file held, `None` when it holds no readable state (an empty file).
 ///
 /// Two shapes refuse and write nothing: a file that is not TOML (the load's
 /// own parse error, position only) and a modelled key clauth cannot read into
 /// its type ([`ConfigEditRefusal`], naming the key). Old and new are compared
 /// as typed values, so a spelling the model reads as the same value (a serde
 /// variant alias) stays as written until that setting changes.
-fn edit_state_in_place(
+fn edit_state_in_place<T: StateFile>(
     path: &Path,
     raw: &str,
-    state: &AppState,
-) -> Result<(String, Option<AppState>)> {
+    state: &T,
+) -> Result<(String, Option<T>)> {
     let lf = raw.replace("\r\n", "\n");
-    let typed = toml::from_str::<AppState>(raw);
+    let typed = toml::from_str::<T>(raw);
     let parsed = lf
         .parse::<toml_edit::DocumentMut>()
         .ok()
@@ -4033,8 +4085,8 @@ fn edit_state_in_place(
     let disk = match typed {
         Ok(disk) => Some(disk),
         Err(_) => {
-            if let Some(key) = unreadable_state_key(&doc, &literal) {
-                return Err(ConfigEditRefusal::new("profiles.toml", &key).into());
+            if let Some(key) = unreadable_state_key::<T>(&doc, &literal) {
+                return Err(ConfigEditRefusal::new(T::LABEL, &key).into());
             }
             // No single key explains the failure: a file missing a required
             // key (an empty one) holds no state to diff against, so every
@@ -4047,7 +4099,7 @@ fn edit_state_in_place(
         None => toml::Table::new(),
     };
     let rendered = doc.to_string();
-    apply_state_edits(&mut doc, &old, &state_table(state)?, &literal);
+    apply_state_edits::<T>(&mut doc, &old, &state_table(state)?, &literal);
     let mut out = doc.to_string();
     if out == rendered {
         // The edit list changed nothing, so the file already holds this state:
@@ -4065,28 +4117,31 @@ fn edit_state_in_place(
 
 /// `state` as the typed table a save writes: the serializer's own view, so a
 /// key at its `skip_serializing_if` default is absent.
-fn state_table(state: &AppState) -> Result<toml::Table> {
-    match toml::Value::try_from(state).context("failed to render profiles.toml")? {
+fn state_table<T: StateFile>(state: &T) -> Result<toml::Table> {
+    let render_failed = || format!("failed to render {}", T::LABEL);
+    match toml::Value::try_from(state).with_context(render_failed)? {
         toml::Value::Table(t) => Ok(t),
-        _ => Err(anyhow::anyhow!("failed to render profiles.toml")),
+        _ => Err(anyhow::anyhow!(render_failed())),
     }
 }
 
-/// `key = value` read alone as `AppState` (beside an empty `profiles` list the
+/// `key = value` read alone as the file's type (beside the empty lists the
 /// type requires), or `None` when the model cannot read it.
-fn read_state_key_alone(key: &str, value: &toml::Value) -> Option<AppState> {
+fn read_state_key_alone<T: StateFile>(key: &str, value: &toml::Value) -> Option<T> {
     let mut t = toml::Table::new();
-    t.insert("profiles".to_string(), toml::Value::Array(Vec::new()));
+    for required in T::REQUIRED_LISTS {
+        t.insert((*required).to_string(), toml::Value::Array(Vec::new()));
+    }
     t.insert(key.to_string(), value.clone());
-    toml::Value::Table(t).try_into::<AppState>().ok()
+    toml::Value::Table(t).try_into::<T>().ok()
 }
 
 /// Whether two values of `key` read as the same typed value: the comparison
 /// that keeps an alias spelling as written when the model reads it as the
 /// value the save holds.
-fn reads_the_same(key: &str, a: &toml::Value, b: &toml::Value) -> bool {
+fn reads_the_same<T: StateFile>(key: &str, a: &toml::Value, b: &toml::Value) -> bool {
     let view = |v| {
-        read_state_key_alone(key, v)
+        read_state_key_alone::<T>(key, v)
             .and_then(|s| state_table(&s).ok())
             .map(|mut t| t.remove(key))
     };
@@ -4096,15 +4151,18 @@ fn reads_the_same(key: &str, a: &toml::Value, b: &toml::Value) -> bool {
     }
 }
 
-/// The first key, in file order, whose value `AppState` cannot read on its
-/// own: the key a shape refusal names.
-fn unreadable_state_key(doc: &toml_edit::DocumentMut, literal: &toml::Table) -> Option<String> {
+/// The first key, in file order, whose value the file's type cannot read on
+/// its own: the key a shape refusal names.
+fn unreadable_state_key<T: StateFile>(
+    doc: &toml_edit::DocumentMut,
+    literal: &toml::Table,
+) -> Option<String> {
     doc.iter()
         .map(|(key, _)| key)
         .find(|key| {
             literal
                 .get(*key)
-                .is_some_and(|v| read_state_key_alone(key, v).is_none())
+                .is_some_and(|v| read_state_key_alone::<T>(key, v).is_none())
         })
         .map(str::to_string)
 }
@@ -4112,7 +4170,7 @@ fn unreadable_state_key(doc: &toml_edit::DocumentMut, literal: &toml::Table) -> 
 /// The per-key edit list of a state save: every top-level key whose typed
 /// value moved between `old` (the file) and `new` (the save), and nothing
 /// else. `literal` is the file's own untyped view, for the keys `old` omits.
-fn apply_state_edits(
+fn apply_state_edits<T: StateFile>(
     doc: &mut toml_edit::DocumentMut,
     old: &toml::Table,
     new: &toml::Table,
@@ -4121,13 +4179,16 @@ fn apply_state_edits(
     for (key, n) in new {
         let o = old.get(key);
         if o == Some(n)
-            || (o.is_none() && literal.get(key).is_some_and(|l| reads_the_same(key, l, n)))
+            || (o.is_none()
+                && literal
+                    .get(key)
+                    .is_some_and(|l| reads_the_same::<T>(key, l, n)))
         {
             continue;
         }
         match n {
             toml::Value::Table(n) => {
-                edit_state_table(doc, key, o.and_then(toml::Value::as_table), n, literal);
+                edit_state_table::<T>(doc, key, o.and_then(toml::Value::as_table), n, literal);
             }
             n => set_root_state_value(doc, key, n),
         }
@@ -4148,10 +4209,10 @@ fn apply_state_edits(
 
 /// A modelled table written into the file: edited subkey by subkey where the
 /// file already holds it in any table form (block, dotted or inline, the form
-/// kept), else appended as a new block table. A value where the table belongs
+/// kept), else inserted as a new block table. A value where the table belongs
 /// (the scalar `theme = "full"` a pick turns into `[theme]`) is removed with
 /// its comments kept, and the table takes its place.
-fn edit_state_table(
+fn edit_state_table<T: StateFile>(
     doc: &mut toml_edit::DocumentMut,
     key: &str,
     old: Option<&toml::Table>,
@@ -4162,11 +4223,7 @@ fn edit_state_table(
         if doc.contains_key(key) {
             remove_key_keeping_comments(doc, key, &[], "");
         }
-        append_root_table(doc, key, |t| {
-            for (sub, v) in new {
-                t.insert(sub, toml_edit::Item::Value(state_edit_value(v)));
-            }
-        });
+        T::insert_new_table(doc, key, new);
         return;
     }
     let literal = literal.get(key).and_then(toml::Value::as_table);
@@ -4179,7 +4236,7 @@ fn edit_state_table(
             || (old.is_none()
                 && literal
                     .and_then(|t| t.get(sub))
-                    .is_some_and(|l| reads_the_same(key, &alone(sub, l), &alone(sub, n))))
+                    .is_some_and(|l| reads_the_same::<T>(key, &alone(sub, l), &alone(sub, n))))
         {
             continue;
         }
@@ -4242,7 +4299,7 @@ fn set_state_entry(t: &mut dyn toml_edit::TableLike, key: &str, value: &toml::Va
 
 /// A typed value as the value the writer inserts: a list it creates is one
 /// line, a table inline (a block table is built by its own caller).
-fn state_edit_value(v: &toml::Value) -> toml_edit::Value {
+pub(crate) fn state_edit_value(v: &toml::Value) -> toml_edit::Value {
     match v {
         toml::Value::String(s) => s.as_str().into(),
         toml::Value::Integer(i) => (*i).into(),
@@ -4607,7 +4664,7 @@ fn layout_of(prefix: &str) -> String {
     }
 }
 
-fn decor_prefix(decor: &toml_edit::Decor) -> &str {
+pub(crate) fn decor_prefix(decor: &toml_edit::Decor) -> &str {
     decor.prefix().and_then(|r| r.as_str()).unwrap_or("")
 }
 
@@ -6057,7 +6114,7 @@ pub(crate) fn update_profile_config<T>(
 /// In a profile's `config.toml`: an inline table, a dotted or implicit table, a
 /// multi-line string, a multi-line array, a value of the wrong type, a table
 /// where a value belongs or a value where a table belongs, or the `kick_timer`
-/// alias beside `auto_start`. In `profiles.toml`, which edits every readable
+/// alias beside `auto_start`. In a [`StateFile`], which edits every readable
 /// shape in place: a key its model cannot read. Nothing is written; the file
 /// and the key are named and the file is left byte for byte. A distinct type so
 /// a caller can `downcast_ref` the refusal instead of matching its text.
@@ -6094,7 +6151,7 @@ impl std::fmt::Display for ConfigEditRefusal {
 
 impl std::error::Error for ConfigEditRefusal {}
 
-/// A save refused because the file (`config.toml` or `profiles.toml`) does not
+/// A save refused because the file (`config.toml` or a [`StateFile`]) does not
 /// parse as TOML. Its `Display` is that file's load error, `failed to parse
 /// <label> at line L, column C`, byte for byte; the position rides on the type
 /// so a caller can name it without matching the text.
@@ -7350,7 +7407,7 @@ fn insert_root_value_before(
 /// before them: the trailing text moves onto the table's header prefix so a
 /// root-level trailing comment stays above the new header instead of landing
 /// inside the table's body.
-fn append_root_table(
+pub(crate) fn append_root_table(
     doc: &mut toml_edit::DocumentMut,
     key: &str,
     build: impl FnOnce(&mut dyn toml_edit::TableLike),
@@ -7392,7 +7449,7 @@ fn take_trailing_lines(doc: &mut toml_edit::DocumentMut) -> String {
     tail
 }
 
-fn insert_root_table(
+pub(crate) fn insert_root_table(
     doc: &mut toml_edit::DocumentMut,
     key: &str,
     build: impl FnOnce(&mut dyn toml_edit::TableLike),
@@ -7590,7 +7647,7 @@ fn remove_key_keeping_comments(
     }
 }
 
-fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
+pub(crate) fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
     if let Some(t) = doc
         .get_mut(key)
         .and_then(toml_edit::Item::as_table_mut)
@@ -7607,16 +7664,19 @@ fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
         prepend_to_first_header(t, prefix);
         return;
     }
-    if doc.get(key).is_some_and(|i| i.as_table().is_some()) {
-        if let Some(tm) = doc.get_mut(key).and_then(|i| i.as_table_mut()) {
-            let existing = tm
-                .decor()
-                .prefix()
-                .and_then(|r| r.as_str())
-                .unwrap_or("")
-                .to_string();
-            tm.decor_mut().set_prefix(format!("{prefix}{existing}"));
-        }
+    let header = match doc.get_mut(key) {
+        Some(toml_edit::Item::Table(t)) => Some(t),
+        Some(toml_edit::Item::ArrayOfTables(a)) => a.get_mut(0),
+        _ => None,
+    };
+    if let Some(tm) = header {
+        let existing = tm
+            .decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        tm.decor_mut().set_prefix(format!("{prefix}{existing}"));
     } else if let Some(mut km) = doc.as_table_mut().key_mut(key) {
         let existing = km
             .leaf_decor()
@@ -7632,7 +7692,7 @@ fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
 /// The document position of the first header `item` renders: its own for a
 /// header table, its first element's for an array of tables, and its earliest
 /// child's for an implicit table, which renders no header of its own.
-fn first_header_position(item: &toml_edit::Item) -> Option<isize> {
+pub(crate) fn first_header_position(item: &toml_edit::Item) -> Option<isize> {
     match item {
         toml_edit::Item::Table(t) if t.is_implicit() => {
             t.iter().filter_map(|(_, c)| first_header_position(c)).min()

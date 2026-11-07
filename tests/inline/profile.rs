@@ -10501,6 +10501,21 @@ fn removing_a_middle_name_keeps_the_comment_after_its_value() {
 }
 
 #[test]
+fn a_refusal_skips_a_readable_key_above_the_wrong_typed_one() {
+    let _home = HomeSandbox::new();
+    let before = "wrap_off = true\nprofiles = \"oops\"\n";
+    let path = write_state_file(before);
+    let err = save_app_state(&AppState::default()).expect_err("refuses");
+    assert!(
+        err.chain().any(|c| c.to_string()
+            == "profiles.toml has `profiles` in a shape clauth cannot read; \
+                fix or remove that line, then try again"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+}
+
+#[test]
 fn a_refusal_names_the_first_unreadable_key_in_file_order() {
     let _home = HomeSandbox::new();
     let before = "wrap_off = \"no\"\nprofiles = \"oops\"\n";
