@@ -8958,6 +8958,100 @@ fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
     });
 }
 
+/// Backdate `path` (a dir or a file) past [`crate::claude_jobs::MID_CREATE_GRACE`].
+///
+/// Unix sets a dir's mtime through a read-only handle (a dir cannot be opened
+/// for writing). Windows needs write access to change any timestamp, and
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a dir handle at all.
+fn backdate_past_mid_create_grace(path: &std::path::Path) {
+    let old = std::time::SystemTime::now()
+        - crate::claude_jobs::MID_CREATE_GRACE
+        - std::time::Duration::from_secs(60);
+    let mut options = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    #[cfg(not(windows))]
+    options.read(true);
+    options
+        .open(path)
+        .expect("open to backdate")
+        .set_modified(old)
+        .expect("backdate mtime");
+}
+
+/// An EMPTY global job dir older than the mid-create grace is an abandoned
+/// creation, not one in flight: it must not fail the rotation term closed. On
+/// 2026-11-06 a single empty `~/.claude/jobs/<id>/` left behind in May blocked
+/// every account's token rotation until each session token expired.
+#[test]
+fn an_old_empty_global_job_dir_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("54705843");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        backdate_past_mid_create_grace(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Ok(Vec::new()),
+            "an abandoned empty job dir names no job and must not block rotation"
+        );
+    });
+}
+
+/// The staged-only mid-create shape ages out the same way: an old dir holding
+/// only an old `state.json.tmp.*` is an abandoned creation.
+#[test]
+fn an_old_staged_only_global_job_dir_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f6");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        let staged = job.join("state.json.tmp.123.456");
+        fs::write(&staged, b"{").expect("stage a record");
+        backdate_past_mid_create_grace(&staged);
+        backdate_past_mid_create_grace(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Ok(Vec::new()),
+            "an abandoned staged-only job dir names no job and must not block rotation"
+        );
+    });
+}
+
+/// A YOUNG staged record inside an old dir keeps the shape mid-create: the
+/// newest mtime decides, so a record being written right now still fails the
+/// gate closed.
+#[test]
+fn a_fresh_staged_record_in_an_old_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f7");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        fs::write(job.join("state.json.tmp.123.789"), b"{").expect("stage a record");
+        backdate_past_mid_create_grace(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert!(
+            jobs.unfinished_under(&profiles.join("anyaccount")).is_err(),
+            "a record staged inside the grace is still a creation in flight"
+        );
+    });
+}
+
 /// A `state.json` that is not a regular file — a FIFO planted in the store —
 /// fails the STORE read closed, and returns within a bounded wait: the read
 /// runs in the 1 Hz tally and every MCP `profiles` call, so it opens with

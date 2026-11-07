@@ -949,14 +949,32 @@ enum RecordlessJobDir {
     /// record, renames it, and only then creates `tmp/` (measured 5/5, 2.1.308),
     /// so a creation never makes the leftover shape and a `tmp/` holding
     /// anything is neither.
+    ///
+    /// Only while the shape is YOUNG: a creation lands its record within
+    /// milliseconds, so the same shape older than [`MID_CREATE_GRACE`] is an
+    /// abandoned creation (a crashed or killed `claude --bg`) and reads as
+    /// [`RecordlessJobDir::Removed`]. Without the bound one empty dir left
+    /// behind months ago fails every account's rotation closed forever, and
+    /// each account's session token then expires with nothing able to roll it.
     MidCreate,
     /// Any other record-less dir: unreadable, fail closed.
     Unknown,
 }
 
+/// How long a record-less job dir may keep the mid-create shape before it is
+/// read as an abandoned creation. A real creation stages and renames its record
+/// within milliseconds; ten minutes leaves room for a stalled disk or a
+/// suspended laptop without letting a leftover block rotations for good.
+pub(crate) const MID_CREATE_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Classify a record-less job dir. A list that cannot be read is `Err`, which
 /// the caller reads as unreadable (fail closed).
 fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
+    // The newest mtime across the dir and its entries: a staged record being
+    // written keeps the shape young even inside an older dir.
+    let mut newest = std::fs::metadata(job_dir)
+        .and_then(|meta| meta.modified())
+        .ok();
     let mut seen = false;
     let mut leftover = true;
     let mut mid_create = true;
@@ -982,11 +1000,24 @@ fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
         if !(staged && file_type.is_file()) {
             mid_create = false;
         }
+        // An entry whose mtime cannot be read could be the young one: `None`
+        // keeps the shape young (fail closed).
+        newest = newest
+            .zip(entry.metadata().and_then(|meta| meta.modified()).ok())
+            .map(|(a, b)| a.max(b));
     }
     if seen && leftover {
         return Ok(RecordlessJobDir::Removed);
     }
     if mid_create {
+        // An unreadable mtime, or one in the future, cannot prove the shape is
+        // old: it stays mid-create (fail closed).
+        let abandoned = newest
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > MID_CREATE_GRACE);
+        if abandoned {
+            return Ok(RecordlessJobDir::Removed);
+        }
         return Ok(RecordlessJobDir::MidCreate);
     }
     Ok(RecordlessJobDir::Unknown)
