@@ -33,6 +33,10 @@ const NOTE_TIMEOUT_MS = 10_000
 // in `src/hook_note.rs`).
 const AGENT_SPAWN_TOOLS: readonly string[] = ['Task', 'Agent']
 const NOTE_COMMAND = ['clauth', 'hook-profile-changed-note'] as const
+// How long an Edit ask waits on its file. A `$` call in flight stops the hook
+// budget, so nothing else ends a read that hangs on a dead mount or in a hook
+// above; at the 4 MiB cap one takes 3-21 ms (measured 2026-11-07, 2.1.319).
+const START_LINE_READ_BOUND_MS = 1000
 // The rows an `append` wake is posted for. Where an organization seats its
 // policy plugin (`cc-plugin-sec-default`, outermost for Team and Enterprise
 // and on a machine with managed settings), attachment, hook-context and
@@ -122,6 +126,43 @@ const firstQuestion = (input: unknown): string => {
   return ''
 }
 
+// The 1-based line `oldString` starts on in the bytes read; null when it is
+// absent or, without `replaceAll`, matches twice, overlapping included. The
+// engine searches a CRLF-folded copy, so this does too, and the BOM of a UTF-16
+// file this read garbles shows as two U+FFFD (measured 2026-11-07, 2.1.319).
+const startLineIn = (text: string, oldString: string, replaceAll: boolean): number | null => {
+  if (text.startsWith('\u{fffd}\u{fffd}')) return null
+  const folded = text.replaceAll('\r\n', '\n')
+  const first = folded.indexOf(oldString)
+  if (first === -1) return null
+  if (!replaceAll && folded.indexOf(oldString, first + 1) !== -1) return null
+  let line = 1
+  for (let at = folded.indexOf('\n'); at !== -1 && at < first; at = folded.indexOf('\n', at + 1)) {
+    line += 1
+  }
+  return line
+}
+
+// The pre-edit line of an Edit ask, or null: the number is a nicety on the ask,
+// so this read may not fail the ask, and holds it for its bound at most.
+async function editStartLine($: EngineInterface, input: unknown): Promise<number | null> {
+  const { file_path: path, old_string: oldString, replace_all: replaceAll } = (input ?? {}) as {
+    file_path?: unknown
+    old_string?: unknown
+    replace_all?: unknown
+  }
+  if (typeof path !== 'string' || typeof oldString !== 'string' || oldString === '') return null
+  try {
+    const text = await new Promise<string | null>((resolve, reject) => {
+      const bound = $.clock.after(START_LINE_READ_BOUND_MS, () => resolve(null))
+      $.fs.read(path).then(resolve, reject).finally(() => bound.cancel())
+    })
+    return text === null ? null : startLineIn(text, oldString, replaceAll === true)
+  } catch {
+    return null
+  }
+}
+
 function mintAskId(): string {
   askCounter += 1
   return `ask-${askCounter}-${Math.random().toString(36).slice(2, 10)}`
@@ -186,10 +227,14 @@ async function postAskOpened(
   agentId: string | undefined,
 ): Promise<boolean | null> {
   if (sessionId === null) return null
+  // Started here and awaited in the link: a slow read ahead of a quick one
+  // must not swap their asks in the send order.
+  const startLine = tool === 'Edit' ? editStartLine($, input) : undefined
   return enqueueSend(async () => {
-    const seq = await nextSeq($)
     const fields: Record<string, unknown> = { ask, tool, input }
     if (agentId !== undefined) fields.agent_id = agentId
+    if (startLine !== undefined) fields.start_line = await startLine
+    const seq = await nextSeq($)
     const body = JSON.stringify({ session: sessionId, seq, kind: 'ask_opened', ...fields })
     if (bodyBytes(body) > BODY_LIMIT) return null
     try {

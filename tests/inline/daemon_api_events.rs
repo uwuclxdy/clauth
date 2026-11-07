@@ -709,7 +709,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         .expect("an ask frame");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&ask.2).expect("ask json"),
-        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null})
+        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null})
     );
     // The snapshot sits right after the herdr frame and before the first status
     // frame, so a client sees the sessions before the feed or any relayed frame.

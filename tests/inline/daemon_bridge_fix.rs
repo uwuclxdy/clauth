@@ -237,6 +237,45 @@ fn a_transient_unreadable_record_keeps_the_instance() {
     assert!(queued, "the ask survived an unreadable record");
 }
 
+/// The mod reads the line, so the daemon only carries what it posted: a number,
+/// a null, or nothing at all from an older mod, which reads as null.
+#[test]
+fn an_ask_carries_the_start_line_its_mod_posted() {
+    let _home = HomeSandbox::new();
+    let (_t, r) = table(&[(100, instance("s1", "1"))]);
+    let hub = Hub::new(true, r);
+    assert_eq!(
+        ev(&hub, 100, json!({"session":"s1","seq":1,"kind":"start"})).0,
+        200
+    );
+    for (seq, ask, posted) in [
+        (2, "located", json!({"start_line": 42})),
+        (3, "unlocated", json!({"start_line": null})),
+        (4, "older-mod", json!({})),
+    ] {
+        let mut body = json!({"session":"s1","seq":seq,"kind":"ask_opened","ask":ask,"tool":"Edit","input":{}});
+        body.as_object_mut()
+            .expect("an object")
+            .extend(posted.as_object().expect("an object").clone());
+        assert_eq!(ev(&hub, 100, body).0, 200);
+    }
+    let snapshot = hub.snapshot();
+    let lines: Vec<_> = snapshot["asks"]
+        .as_array()
+        .expect("the asks")
+        .iter()
+        .map(|ask| (ask["ask"].clone(), ask["start_line"].clone()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (json!("located"), json!(42)),
+            (json!("unlocated"), json!(null)),
+            (json!("older-mod"), json!(null)),
+        ]
+    );
+}
+
 /// MB-7/SB-19: only a mod-HELD ask is answerable. An ask opened while
 /// hold=false (no control device yet) must not take a 200 answer later.
 #[test]

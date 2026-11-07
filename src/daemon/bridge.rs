@@ -184,9 +184,22 @@ struct OpenAsk {
     tool: Value,
     input: Value,
     agent_id: Value,
+    /// The 1-based line the mod found an `Edit`'s `old_string` on, see
+    /// [`posted_start_line`]. The daemon opens no file for it.
+    start_line: Option<u64>,
     /// Whether the mod held this check for a device answer: `remote_flag()` at
     /// open time. An unheld ask is shown and closed, but never answered (SB-19).
     held: bool,
+}
+
+/// An `ask_opened` post's `start_line`, kept only as a positive integer: the
+/// value goes on to every paired device, so a string, zero, a negative or a
+/// float reads as absent.
+fn posted_start_line(value: &Value) -> Option<u64> {
+    value
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .filter(|line| *line > 0)
 }
 
 /// One tailed transcript file (the main file or a subagent's): the complete-
@@ -577,6 +590,7 @@ impl Hub {
                     "tool": info.tool,
                     "input": info.input,
                     "agent_id": info.agent_id,
+                    "start_line": info.start_line,
                 }));
             }
         }
@@ -782,6 +796,7 @@ impl Hub {
                 let tool = value.get("tool").cloned().unwrap_or(Value::Null);
                 let input = value.get("input").cloned().unwrap_or(Value::Null);
                 let agent_id = value.get("agent_id").cloned().unwrap_or(Value::Null);
+                let start_line = posted_start_line(&value);
                 // A wait announces its `blocked` push once: the decision and the
                 // reservation share this lock hold, so a second ask of the same
                 // wait handled before the push queues reads the reservation and
@@ -798,6 +813,7 @@ impl Hub {
                         info.tool = tool.clone();
                         info.input = input.clone();
                         info.agent_id = agent_id.clone();
+                        info.start_line = start_line;
                         info.held |= hold;
                     }
                     None => live.open_asks.push((
@@ -806,13 +822,14 @@ impl Hub {
                             tool: tool.clone(),
                             input: input.clone(),
                             agent_id: agent_id.clone(),
+                            start_line,
                             held: hold,
                         },
                     )),
                 }
                 self.broadcast(
                     "session.ask",
-                    json!({"session": named, "ask": ask, "state": "opened", "tool": tool, "input": input, "agent_id": agent_id}),
+                    json!({"session": named, "ask": ask, "state": "opened", "tool": tool, "input": input, "agent_id": agent_id, "start_line": start_line}),
                 );
                 opened_wait = announce;
                 (200, json!({ "ok": true, "remote": hold, "hold": hold }))

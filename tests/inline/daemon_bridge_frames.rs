@@ -806,7 +806,7 @@ fn asks_reach_subscribers_opened_and_closed() {
         next(&sub, WAIT),
         Some((
             "session.ask".into(),
-            serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null})
+            serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null})
         ))
     );
     event(
@@ -887,10 +887,92 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
                 {"session": "s-two", "cwd": "/w/app", "interactive": true}
             ],
             "asks": [
-                {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null}
+                {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null}
             ]
         })
     );
+}
+
+/// The opened frame carries the line the mod posted, a positive integer alone:
+/// the socket is same-user, but the value goes on to every paired phone, so
+/// anything else reads as null on the frame and in the snapshot alike.
+#[test]
+fn an_opened_frame_carries_only_a_positive_start_line() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    let cases = [
+        (serde_json::json!(1), serde_json::json!(1)),
+        (serde_json::json!(4242), serde_json::json!(4242)),
+        (serde_json::json!(null), serde_json::Value::Null),
+        (serde_json::json!(0), serde_json::Value::Null),
+        (serde_json::json!(-3), serde_json::Value::Null),
+        (serde_json::json!(1.5), serde_json::Value::Null),
+        (serde_json::json!(42.0), serde_json::Value::Null),
+        (serde_json::json!("42"), serde_json::Value::Null),
+        (serde_json::json!(true), serde_json::Value::Null),
+        (serde_json::json!([7]), serde_json::Value::Null),
+        (serde_json::json!({"line": 7}), serde_json::Value::Null),
+    ];
+    for (i, (posted, carried)) in cases.iter().enumerate() {
+        let ask = format!("a{i}");
+        event(
+            &hub,
+            100,
+            serde_json::json!({"session": "s-one", "seq": i + 2, "kind": "ask_opened", "ask": ask, "tool": "Edit", "input": {}, "start_line": posted}),
+        );
+        assert_eq!(
+            next(&sub, WAIT),
+            Some((
+                "session.ask".into(),
+                serde_json::json!({"session": "s-one", "ask": ask, "state": "opened", "tool": "Edit", "input": {}, "agent_id": null, "start_line": carried})
+            )),
+            "the frame for a posted {posted}"
+        );
+        let snapshot = hub.snapshot();
+        let row = snapshot["asks"]
+            .as_array()
+            .and_then(|asks| asks.iter().find(|row| row["ask"] == ask.as_str()))
+            .expect("the ask is open");
+        assert_eq!(
+            row["start_line"], *carried,
+            "the snapshot for a posted {posted}"
+        );
+    }
+}
+
+/// An ask opened again under its own id takes the new post's line whole, so a
+/// stale number never outlives the post that carried it.
+#[test]
+fn a_reopened_ask_takes_the_line_of_its_new_post() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Edit", "input": {}, "start_line": 7}),
+    );
+    assert_eq!(hub.snapshot()["asks"][0]["start_line"], 7);
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a1", "tool": "Edit", "input": {}}),
+    );
+    assert_eq!(
+        hub.snapshot()["asks"][0]["start_line"],
+        serde_json::Value::Null
+    );
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 4, "kind": "ask_opened", "ask": "a1", "tool": "Edit", "input": {}, "start_line": 9}),
+    );
+    assert_eq!(hub.snapshot()["asks"][0]["start_line"], 9);
 }
 
 /// A `/clear` (the record's id moved) closes the old session for subscribers:

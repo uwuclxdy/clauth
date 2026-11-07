@@ -1901,6 +1901,248 @@ test('Q2: a failure after next lands in the note hook own catch', { plugins: [TR
   expect(lines).toContain('clauth: caught')
 })
 
+// --- an Edit ask's start line (group L) ---
+
+// How long the mod lets the pre-edit read run before the ask opens without it.
+const START_LINE_READ_BOUND_MS = 1000
+
+const EDIT_PATH = '/w/f.txt'
+
+function editInput(oldString: unknown, replaceAll?: unknown): Record<string, unknown> {
+  return {
+    file_path: EDIT_PATH,
+    old_string: oldString,
+    new_string: 'n',
+    ...(replaceAll !== undefined ? { replace_all: replaceAll } : {}),
+  }
+}
+
+// The file as `$.fs.read` finds it, with every read recorded: `body` is a text,
+// an Error the read rejects with, or a promise the test settles itself.
+function installDisk(on: On) {
+  const disk = {
+    body: '' as string | Error | Promise<string>,
+    reads: [] as { path: string; as: string }[],
+  }
+  on('fs.read', async ($, e, next) => {
+    disk.reads.push({ path: e.path, as: e.as })
+    const body = disk.body
+    if (body instanceof Error) throw body
+    return { value: await body }
+  })
+  return disk
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>(r => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+function opened(events: EventBody[]): EventBody[] {
+  return events.filter(b => b.kind === 'ask_opened')
+}
+
+test('L1: the posted line is the 1-based line of the match in the bytes read', async ($, on) => {
+  const { bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const cases: [string, string, string, unknown, number | null][] = [
+    ['first line', 'alpha\nbeta\ngamma\n', 'alpha', undefined, 1],
+    ['last line', 'alpha\nbeta\ngamma\n', 'gamma', undefined, 3],
+    ['no final newline', 'alpha\nbeta\ngamma', 'gamma', undefined, 3],
+    ['past empty lines', 'a\n\n\nb\n', 'b', undefined, 4],
+    ['many lines in old_string', 'a\nb\nc\nd\n', 'b\nc', undefined, 2],
+    ['old_string opening on a newline', 'a\nb\n', '\nb', undefined, 1],
+    ['mid-line', 'one\nsay alpha now\n', 'alpha', undefined, 2],
+    ['after non-ascii text', 'é😀\nb\n', 'b', undefined, 2],
+    ['crlf', 'one\r\ntwo\r\nthree\r\n', 'three', undefined, 3],
+    ['crlf in old_string', 'one\r\ntwo\r\nthree\r\n', 'two\r\nthree', undefined, null],
+    ['lf old_string on a crlf file', 'one\r\ntwo\r\nthree\r\n', 'two\nthree', undefined, 2],
+    ['lf old_string twice on a crlf file', 'a\r\nb\r\na\r\nb\r\n', 'a\nb', undefined, null],
+    ['both endings, first form first', 'a\r\nb\r\nX\na\nb\n', 'a\nb', true, 1],
+    ['a folded overlap', 'x\r\nx\nx\n', 'x\nx', undefined, null],
+    ['mixed endings inside one match', 'a\r\nb\nc\n', 'a\nb\nc', undefined, 1],
+    ['three lines on a crlf file', 'a\r\nb\r\nc\r\nd\r\n', 'b\nc\nd', undefined, 2],
+    ['a utf-16 file read as utf-8', '��\nN\r\0\n\0x\0\r\0\n\0', 'x', undefined, null],
+    ['a utf-16 file with no nul', '��\nA上A\nN', '上', undefined, null],
+    ['a nul in a utf-8 file', 'a\0b\nc\n', 'c', undefined, 2],
+    ['one replacement character opens the file', '�a\nb\n', 'b', undefined, 2],
+    ['mixed endings', 'one\ntwo\r\nthree\nfour\r\n', 'four', undefined, 4],
+    ['a lone cr ends no line', 'a\rb\nc\n', 'c', undefined, 2],
+    ['replace_all, one match', 'x\nA\n', 'A', true, 2],
+    ['replace_all, several: the first', 'x\nA\ny\nA\n', 'A', true, 2],
+    ['replace_all, overlapping: the first', 'q\nbabab\n', 'bab', true, 2],
+    ['two matches, no replace_all', 'x\nA\ny\nA\n', 'A', undefined, null],
+    ['two matches, replace_all false', 'x\nA\ny\nA\n', 'A', false, null],
+    ['two matches, replace_all not a boolean', 'x\nA\ny\nA\n', 'A', 'true', null],
+    ['overlapping matches, no replace_all', 'q\nbabab\n', 'bab', undefined, null],
+    ['overlapping at the start', 'aaa\n', 'aa', undefined, null],
+    ['not found', 'alpha\n', 'zeta', undefined, null],
+  ]
+  for (const [name, text, oldString, replaceAll, line] of cases) {
+    disk.body = text
+    await $.tool.check({ tool: 'Edit', input: editInput(oldString, replaceAll) } as never)
+    expect([name, opened(bridge.events).at(-1)!.start_line]).toEqual([name, line])
+  }
+  expect(opened(bridge.events)).toHaveLength(cases.length)
+  expect(disk.reads[0]).toEqual({ path: EDIT_PATH, as: 'text' })
+})
+
+test('L2: a failed read posts null and the ask opens and answers as before', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const failures = [
+    new Error('$.fs.read failed: ENOENT'),
+    new Error('$.fs.read: refused: the file is over the 4194304-byte limit'),
+  ]
+  for (const failure of failures) {
+    disk.body = failure
+    const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+    await clock.settle()
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+    bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'allow' })
+  }
+  expect(opened(bridge.events)).toHaveLength(failures.length)
+})
+
+test('L3: a file changed between validation and the read posts null, and the ask holds', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const changed = ['someone rewrote the file\n', 'alpha\nalpha\n', '']
+  for (const text of changed) {
+    disk.body = text
+    const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+    await clock.settle()
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+    bridge.answer(bridge.lastAsk()!, { decision: 'deny' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'deny' })
+  }
+})
+
+test('L4: an Edit with no usable field posts null and reads nothing', async ($, on) => {
+  const { bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const inputs: unknown[] = [
+    {},
+    { file_path: EDIT_PATH },
+    { old_string: 'alpha' },
+    { file_path: 7, old_string: 'alpha' },
+    { file_path: EDIT_PATH, old_string: 7 },
+    { file_path: EDIT_PATH, old_string: null },
+    { file_path: EDIT_PATH, old_string: '' },
+    null,
+  ]
+  for (const input of inputs) {
+    await $.tool.check({ tool: 'Edit', input } as never)
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+  }
+  expect(opened(bridge.events)).toHaveLength(inputs.length)
+  expect(disk.reads).toEqual([])
+})
+
+test('L5: no tool but Edit reads a file or posts a line', async ($, on) => {
+  const { clock, bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => ({ result: 'dialog' }))
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls', ...editInput('alpha') } } as never)
+  await $.tool.check({ tool: 'Write', input: { ...editInput('alpha'), content: 'x' } } as never)
+  await $.tool.check({ tool: 'Read', input: { file_path: EDIT_PATH } })
+  await $.tool.call({
+    tool: 'AskUserQuestion',
+    questions: [{ question: 'q?', header: 'h', options: [], multiSelect: false }],
+  } as never)
+  await clock.settle()
+  const asks = opened(bridge.events)
+  expect([...new Set(asks.map(b => b.tool))]).toEqual(['Bash', 'Write', 'Read', 'AskUserQuestion'])
+  expect(asks.filter(b => 'start_line' in b)).toEqual([])
+  expect(disk.reads).toEqual([])
+})
+
+test('L6: a check that opens no ask reads no file', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ({ decision: 'allow', reason: 'rule', rule: 'Edit' }))
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  expect(disk.reads).toEqual([])
+  expect(opened(bridge.events)).toHaveLength(0)
+})
+
+test('L6b: a non-interactive session reads no file for an Edit ask', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: null, isInteractive: false })
+  await $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  expect(disk.reads).toEqual([])
+  expect(opened(bridge.events)).toHaveLength(0)
+})
+
+test('L7: a read that never settles gives up at its bound, and the ask opens with null', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = new Promise<string>(() => {})
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  await clock.advance(START_LINE_READ_BOUND_MS - 1)
+  expect(opened(bridge.events)).toHaveLength(0)
+  await clock.advance(1)
+  await clock.settle()
+  expect(opened(bridge.events).map(b => b.start_line)).toEqual([null])
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+})
+
+test('L8: asks post in check order, however long an earlier ask reads', async ($, on) => {
+  const { clock, bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const slow = deferred<string>()
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+
+  disk.body = slow.promise
+  const first = $.tool.check({ tool: 'Edit', input: editInput('slow') } as never)
+  await clock.settle()
+  const second = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  disk.body = 'x\nfast\n'
+  const third = $.tool.check({ tool: 'Edit', input: editInput('fast') } as never)
+  await clock.settle()
+  // Neither later ask's post passes the read still running ahead of it.
+  expect(opened(bridge.events)).toHaveLength(0)
+
+  slow.resolve('a\nb\nslow\n')
+  await Promise.all([first, second, third])
+  const asks = opened(bridge.events)
+  expect(asks.map(b => [b.tool, b.start_line])).toEqual([
+    ['Edit', 3],
+    ['Bash', undefined],
+    ['Edit', 2],
+  ])
+  const seqs = asks.map(b => b.seq as number)
+  expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+})
+
 // --- under the organization's policy plugin (group S) ---
 
 // Where Claude Code seats `cc-plugin-sec-default` the session tells the
