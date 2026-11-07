@@ -18,6 +18,7 @@ pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
+mod observed;
 // The auto-start kick sends the probe's request, so the two cannot drift apart.
 pub(crate) use inference::anthropic::send as anthropic_send;
 mod scheduler;
