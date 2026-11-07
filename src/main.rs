@@ -62,6 +62,7 @@ mod sessions_cli;
 mod settings_sync;
 mod spinner;
 mod start;
+mod statusline;
 mod status;
 mod throughput;
 mod token_ledger;
@@ -248,6 +249,7 @@ fn torn_store_notice_applies(command: &Command) -> bool {
             | Command::McpAwaitJob
             | Command::HookProfileChangedNote
             | Command::HookReadExempt
+            | Command::Statusline { .. }
             | Command::SelfHeal
             | Command::Complete { .. }
             | Command::ApiKey { .. }
@@ -351,6 +353,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
+        Command::Statusline { command } => statusline::run(&command),
         Command::HookReadExempt => {
             cc_exempt::run_read_hook();
             Ok(())

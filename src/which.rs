@@ -351,7 +351,7 @@ fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
 /// has never covered the isolated flavor, and an isolated session's stored creds
 /// are already reached by the credential matches above (`refreshToken`, or the
 /// session-token match when the install is a refresh-less mint).
-fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
+pub(crate) fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
     if !dir
         .file_name()?
         .to_str()

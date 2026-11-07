@@ -520,6 +520,17 @@ pub(crate) enum Command {
     #[command(hide = true)]
     HookReadExempt,
 
+    /// The status line tap: record the 5h/7d usage Claude Code hands its
+    /// status line (`rate_limits`) for the session's profile, then run the
+    /// command after `--` on the same input and pass its output through.
+    /// Prints nothing without one. See `wiki/Daemon.md` (Observed usage).
+    #[command(hide = true)]
+    Statusline {
+        /// The status line command to run on the same input.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {
