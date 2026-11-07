@@ -22,6 +22,7 @@ use super::devices::Tier;
 use super::http::{Request, Response, sanitize_for_log};
 use super::panes::{HerdrOut, HerdrProbeOut, NO_SERVER, NOT_INSTALLED};
 use super::routes::{ApiContext, Caller, ErrorBody};
+use crate::format::strip_ansi_csi;
 use crate::logline::logline;
 use crate::profile::ProfileName;
 
@@ -285,16 +286,21 @@ fn profile_roster(
 /// The 8-hex job id off `claude --bg`'s `backgrounded · <id>` line. The id is
 /// the first word after the dot: a no-prompt launch follows it with a note on
 /// the same line (`(idle — send a prompt to start)` on Claude Code 2.1.318).
+/// `FORCE_COLOR` in the child's env wraps the id in colour codes (measured on
+/// 2.1.319), so the lines are read with CSI sequences stripped.
 fn background_id(stdout: &[u8]) -> Option<String> {
     // `claude --bg` separates the id with a middle dot (U+00B7); matched as its
     // UTF-8 bytes so the source stays ASCII.
     const PREFIX: &[u8] = b"backgrounded \xc2\xb7 ";
-    for line in stdout.split(|&b| b == b'\n') {
-        let Some(rest) = line.strip_prefix(PREFIX) else {
+    let text = strip_ansi_csi(&String::from_utf8_lossy(stdout));
+    for line in text.split('\n') {
+        if !line.as_bytes().starts_with(PREFIX) {
             continue;
-        };
-        let rest = String::from_utf8_lossy(rest);
-        let Some(id) = rest.split_whitespace().next() else {
+        }
+        let Some(id) = line
+            .get(PREFIX.len()..)
+            .and_then(|rest| rest.split_whitespace().next())
+        else {
             continue;
         };
         if id.len() == 8

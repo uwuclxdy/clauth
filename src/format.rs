@@ -840,6 +840,38 @@ pub(crate) fn terminal_safe(s: &str) -> String {
     s.chars().filter(|c| !unsafe_on_terminal(*c)).collect()
 }
 
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so a reader gets the
+/// text, not CSI bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+pub(crate) fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
 /// overrides (`U+202A..=U+202E`), the isolates (`U+2066..=U+2069`), and the
 /// three directional marks — `U+200E` LRM, `U+200F` RLM, and `U+061C` ALM, the

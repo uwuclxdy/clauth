@@ -1195,6 +1195,82 @@ fn background_id_reads_the_first_word_after_the_dot() {
     }
 }
 
+/// `FORCE_COLOR` in the daemon's env wraps the id in colour codes (the first
+/// line's bytes measured on Claude Code 2.1.319); the id still reads, and a
+/// word that is not 8 lowercase hex stays refused once the codes are gone.
+#[test]
+fn background_id_reads_through_colour_codes() {
+    assert_eq!(
+        background_id(
+            b"backgrounded \xc2\xb7 \x1b[36m97441de9\x1b[39m\x1b[2m \
+              (idle \xe2\x80\x94 send a prompt to start)\x1b[22m\n"
+        ),
+        Some("97441de9".to_string())
+    );
+    assert_eq!(
+        background_id("\x1b[1mbackgrounded · \x1b[22m3fde53e3\n".as_bytes()),
+        Some(BG_ID.to_string())
+    );
+    for stdout in [
+        "backgrounded · \x1b[38;5;75m3fde53e3\x1b[0m\n",
+        "backgrounded · \x1b[38;2;1;2;3m3fde53e3\x1b[0m\n",
+        "backgrounded · \x1b[0;36m3fde53e3\x1b[0m\n",
+        "Starting background service\n\x1b[2mnote\x1b[22m\nbackgrounded · \x1b[36m3fde53e3\x1b[39m\n",
+    ] {
+        assert_eq!(
+            background_id(stdout.as_bytes()),
+            Some(BG_ID.to_string()),
+            "{stdout:?}"
+        );
+    }
+    for stdout in [
+        "backgrounded · \x1b[36m3fde53e\x1b[39m\n",
+        "backgrounded · \x1b[36m3FDE53E3\x1b[39m\n",
+        "backgrounded · \x1b[36m\x1b[39m\n",
+    ] {
+        assert_eq!(background_id(stdout.as_bytes()), None, "{stdout:?}");
+    }
+}
+
+/// The route answers both ids over a coloured launch, never a 502 over a
+/// session that is running.
+#[test]
+fn background_with_colour_in_its_stdout_answers_both_ids() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _calls) = herdr_untouched();
+    let (spawn, _launches) = launch_seam(Some((
+        true,
+        "backgrounded · \x1b[36m3fde53e3\x1b[39m\x1b[2m (idle)\x1b[22m\n",
+        "",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+}
+
 /// A create with no prompt starts an idle session and answers both ids, never
 /// a 502 over a session that is running.
 #[test]

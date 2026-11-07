@@ -45,7 +45,7 @@ use crate::fallback::{
     DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
     parse_threshold, threshold_for,
 };
-use crate::format::format_threshold_tokens;
+use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedGuard, RankedMutex};
@@ -12574,38 +12574,6 @@ fn stderr_display_lines(text: &str) -> Vec<String> {
 /// herdr heal and the plugin install failure toasts.
 fn diagnostic_toast_body(title: &str, diagnostic: &str) -> String {
     format!("{title}\n{}", stderr_display_lines(diagnostic).join("\n"))
-}
-
-/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
-/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so the modal shows
-/// text, not terminal escape bytes. Any byte outside those ranges before the
-/// final byte ends the sequence without eating text: the `ESC` is kept and
-/// scanning resumes after it, so a malformed CSI never swallows a line.
-fn strip_ansi_csi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(esc) = rest.find('\x1b') {
-        out.push_str(&rest[..esc]);
-        let after = &rest[esc + 1..];
-        if let Some(body) = after.strip_prefix('[') {
-            match body
-                .char_indices()
-                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
-            {
-                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
-                _ => {
-                    // No final byte, or a non-parameter byte: not a CSI.
-                    out.push('\x1b');
-                    rest = after;
-                }
-            }
-        } else {
-            out.push('\x1b');
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
