@@ -37,7 +37,7 @@ fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'stat
 
 /// [`effort_cycle_lines`] in a pane wide enough that the row is one line.
 fn effort_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
-    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE);
+    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE, false);
     assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
     lines.remove(0)
 }
@@ -65,6 +65,30 @@ fn model_cycle_brackets_the_active_option_only_on_focus() {
         focused.chars().count(),
         blurred.chars().count() + 2,
         "the bracket pair is the only width change on focus"
+    );
+}
+
+/// While the `model` row names one model the effort row edits that model's
+/// level, which Claude Code keeps only as low, medium, high or xhigh: the
+/// cycle drops `max`, and an account-wide `max` left on the scalar shows as
+/// the custom value it now is.
+#[test]
+fn a_models_own_effort_cycle_has_no_max() {
+    let per_model = |current| {
+        let mut lines = effort_cycle_lines(Span::raw("  "), current, false, WIDE, true);
+        assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+        line_text(&lines.remove(0))
+    };
+    let options: Vec<String> = per_model("high")
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(options, ["unset", "low", "medium", "high", "xhigh"]);
+    assert!(per_model("max").contains("max"), "{}", per_model("max"));
+    assert!(
+        line_text(&effort_line(Span::raw("  "), "", false)).contains("max"),
+        "the account-wide cycle keeps max"
     );
 }
 

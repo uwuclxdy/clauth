@@ -24016,7 +24016,11 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         ),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
-        effort: InputState::new(profile.and_then(|p| p.effort.as_deref()).unwrap_or("")),
+        effort: InputState::new(
+            &profile
+                .and_then(crate::model_effort::row_level)
+                .unwrap_or_default(),
+        ),
         opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
@@ -25122,7 +25126,9 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::Model => profile
             .and_then(|p| p.models.default.clone())
             .unwrap_or_default(),
-        ConfigRow::Effort => profile.and_then(|p| p.effort.clone()).unwrap_or_default(),
+        ConfigRow::Effort => profile
+            .and_then(crate::model_effort::row_level)
+            .unwrap_or_default(),
         ConfigRow::OpusModel => profile
             .and_then(|p| p.models.opus.clone())
             .unwrap_or_default(),
@@ -25256,9 +25262,19 @@ fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
                 let cfg = app.config();
                 row_committed_value(cfg.find(&name), &name, field)
             };
+            let effort = (field == ConfigRow::Model).then(|| {
+                let cfg = app.config();
+                cfg.find(&name)
+                    .and_then(crate::model_effort::row_level)
+                    .unwrap_or_default()
+            });
             if let Some(d) = app.config_draft.as_mut() {
                 if let Some(input) = d.field_mut(field) {
                     *input = InputState::new(&value);
+                }
+                if let Some(effort) = effort {
+                    // The effort row follows the model it now edits.
+                    d.effort = InputState::new(&effort);
                 }
                 d.active = None;
             }
@@ -25294,6 +25310,22 @@ fn commit_effort_field(app: &mut App) -> bool {
         .and_then(|d| d.field(ConfigRow::Effort))
         .map(|i| i.trimmed().to_string())
         .unwrap_or_default();
+    let per_model = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .is_some_and(|p| crate::model_effort::selected_model(&p.models).is_some())
+    };
+    if per_model && !raw.is_empty() && !crate::model_effort::is_level(&raw) {
+        app.toast(
+            ToastKind::Warning,
+            format!(
+                "effort not saved\na model's own level is one of {}; set `model` to default \
+                 for an account-wide value",
+                crate::model_effort::LEVELS.join(", ")
+            ),
+        );
+        return false;
+    }
     let effort = (!raw.is_empty()).then_some(raw);
     let result = {
         let mut cfg = app.config();
@@ -25506,14 +25538,22 @@ fn cycle_model(app: &mut App) {
     };
     match result {
         Ok(()) => {
-            let value = {
+            let (value, effort) = {
                 let cfg = app.config();
-                cfg.find(&name)
-                    .and_then(|p| p.models.default.clone())
-                    .unwrap_or_default()
+                let profile = cfg.find(&name);
+                (
+                    profile
+                        .and_then(|p| p.models.default.clone())
+                        .unwrap_or_default(),
+                    profile
+                        .and_then(crate::model_effort::row_level)
+                        .unwrap_or_default(),
+                )
             };
             if let Some(d) = app.config_draft.as_mut() {
                 d.model = InputState::new(&value);
+                // The effort row follows the model it now edits.
+                d.effort = InputState::new(&effort);
             }
         }
         Err(e) => app.toast(
@@ -25552,15 +25592,22 @@ pub(crate) fn cycle_effort(app: &mut App) {
         .map(ProfileName::from);
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
-            let next = next_effort_preset(d.effort.trimmed_some().as_deref()).unwrap_or_default();
+            let per_model = crate::model_effort::names_one_model(&d.model.value);
+            let next = next_effort_preset(d.effort.trimmed_some().as_deref(), per_model)
+                .unwrap_or_default();
             d.effort = InputState::new(&next);
         }
         return;
     };
+    let per_model = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .is_some_and(|p| crate::model_effort::selected_model(&p.models).is_some())
+    };
     let result = {
         let mut cfg = app.config();
         edit_profile_effort(&mut cfg, &name, |slot| {
-            *slot = next_effort_preset(slot.as_deref());
+            *slot = next_effort_preset(slot.as_deref(), per_model);
         })
     };
     match result {
@@ -25568,7 +25615,7 @@ pub(crate) fn cycle_effort(app: &mut App) {
             let value = {
                 let cfg = app.config();
                 cfg.find(&name)
-                    .and_then(|p| p.effort.clone())
+                    .and_then(crate::model_effort::row_level)
                     .unwrap_or_default()
             };
             if let Some(d) = app.config_draft.as_mut() {
@@ -25587,12 +25634,18 @@ pub(crate) fn cycle_effort(app: &mut App) {
 
 /// Advance the `effort` cycle: unset → low → medium → high → xhigh → max →
 /// unset. A value outside [`EFFORT_PRESETS`] (a custom value) collapses to
-/// unset.
-fn next_effort_preset(current: Option<&str>) -> Option<String> {
+/// unset. `per_model` (the `model` row names one model) drops `max`, which
+/// Claude Code does not keep per model ([`crate::model_effort::LEVELS`]).
+pub(crate) fn next_effort_preset(current: Option<&str>, per_model: bool) -> Option<String> {
+    let presets: &[&str] = if per_model {
+        &crate::model_effort::LEVELS
+    } else {
+        &EFFORT_PRESETS
+    };
     match current {
-        None => Some(EFFORT_PRESETS[0].to_string()),
-        Some(cur) => match EFFORT_PRESETS.iter().position(|p| *p == cur) {
-            Some(i) if i + 1 < EFFORT_PRESETS.len() => Some(EFFORT_PRESETS[i + 1].to_string()),
+        None => presets.first().map(|p| (*p).to_string()),
+        Some(cur) => match presets.iter().position(|p| *p == cur) {
+            Some(i) if i + 1 < presets.len() => Some(presets[i + 1].to_string()),
             _ => None,
         },
     }

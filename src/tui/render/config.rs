@@ -238,6 +238,8 @@ struct Snap {
     api_key: String,
     model: String,
     effort: String,
+    /// The `model` row names one model, so the `effort` row edits its level.
+    per_model_effort: bool,
     opus: String,
     sonnet: String,
     haiku: String,
@@ -410,6 +412,7 @@ impl Snap {
             api_key: String::new(),
             model: String::new(),
             effort: String::new(),
+            per_model_effort: false,
             opus: String::new(),
             sonnet: String::new(),
             haiku: String::new(),
@@ -503,6 +506,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 };
                 snap.account_type = d.account_type;
                 snap.family = d.family;
+                snap.per_model_effort = crate::model_effort::names_one_model(&d.model.value);
                 snap.name_refusal = d.name_refusal.clone();
                 snap.create_refusal = d.create_refusal.clone();
             }
@@ -533,7 +537,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 base_url_unused: saved_url.is_some() && p.base_url.is_none(),
                 api_key: text(&p.api_key),
                 model: text(&p.models.default),
-                effort: text(&p.effort),
+                effort: crate::model_effort::row_level(p).unwrap_or_default(),
+                per_model_effort: crate::model_effort::selected_model(&p.models).is_some(),
                 opus: text(&p.models.opus),
                 sonnet: text(&p.models.sonnet),
                 haiku: text(&p.models.haiku),
@@ -1385,6 +1390,12 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
         ConfigRow::AdvisorModel => "server-side advisor model in this account",
+        ConfigRow::Effort if snap.per_model_effort && value.trim().is_empty() => {
+            "no level for this model: /effort and Claude Code's default apply"
+        }
+        ConfigRow::Effort if snap.per_model_effort => {
+            "reasoning effort for this model in this account"
+        }
         ConfigRow::Effort if value.trim().is_empty() => {
             "no effort set: /effort and Claude Code's default apply"
         }
@@ -1692,7 +1703,7 @@ fn detail_row(
         // The `model` row's shape: the fixed cycle at rest, a plain text field
         // while typing a custom value.
         ConfigRow::Effort if !editing => {
-            return effort_cycle_lines(arrow, &input.value, selected, width);
+            return effort_cycle_lines(arrow, &input.value, selected, width, snap.per_model_effort);
         }
         ConfigRow::Effort => {
             return kv_field(
@@ -2115,12 +2126,19 @@ fn effort_cycle_lines(
     current: &str,
     selected: bool,
     width: usize,
+    per_model: bool,
 ) -> Vec<Line<'static>> {
     let lead = kv_lead(arrow, "effort", selected);
+    // A model's own level drops `max`, which Claude Code keeps only
+    // account-wide.
+    let presets: &[&str] = if per_model {
+        &crate::model_effort::LEVELS
+    } else {
+        &EFFORT_PRESETS
+    };
     let mut options: Vec<(&str, bool)> = vec![("unset", current.is_empty())];
-    options.extend(EFFORT_PRESETS.iter().map(|p| (*p, *p == current)));
-    let custom =
-        (!current.is_empty() && !EFFORT_PRESETS.contains(&current)).then_some((current, true));
+    options.extend(presets.iter().map(|p| (*p, *p == current)));
+    let custom = (!current.is_empty() && !presets.contains(&current)).then_some((current, true));
     cycle_row_lines(lead, &options, custom, None, selected, width)
 }
 

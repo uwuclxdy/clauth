@@ -58,8 +58,28 @@ pub(crate) fn is_level(value: &str) -> bool {
 /// otherwise), which keep the account-wide effort.
 pub(crate) fn selected_model(models: &ModelSettings) -> Option<&str> {
     let model = models.default.as_deref()?.trim();
-    let lower = model.to_ascii_lowercase();
-    (!model.is_empty() && lower != "default" && lower != "opusplan").then_some(model)
+    names_one_model(model).then_some(model)
+}
+
+/// Whether a `model` row value names one model ([`selected_model`]'s test on
+/// a raw value, for a form that has no saved profile yet).
+pub(crate) fn names_one_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    !model.is_empty() && model != "default" && model != "opusplan"
+}
+
+/// The level the Setup tab's `effort` row shows and edits: the selected
+/// model's (its `[model_effort]` entry, else the scalar) while the `model` row
+/// names one model, the account-wide scalar otherwise.
+pub(crate) fn row_level(profile: &Profile) -> Option<String> {
+    match selected_model(&profile.models) {
+        Some(model) => profile
+            .model_effort
+            .get(model)
+            .or(profile.effort.as_ref())
+            .cloned(),
+        None => profile.effort.clone(),
+    }
 }
 
 /// The `modelSettings` key clauth writes for a `model` value: a tier with a

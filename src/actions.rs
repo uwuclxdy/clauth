@@ -2002,6 +2002,12 @@ pub(crate) fn edit_profile_model(
 /// the live `~/.claude/settings.json` when the profile is active, so a running
 /// `claude` picks the new effort up on its next settings read. Mirrors
 /// [`edit_profile_model`].
+///
+/// The slot `edit` sees is the Setup row's ([`crate::model_effort::row_level`]):
+/// while the `model` row names one model, that model's level, which lands in
+/// `[model_effort]`. The scalar is then cleared, since it was either that
+/// model's level already or an account-wide value the per-model edit
+/// replaces. Otherwise the slot is the account-wide `effort`.
 pub(crate) fn edit_profile_effort(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2010,12 +2016,24 @@ pub(crate) fn edit_profile_effort(
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
         let (fresh, ()) = update_profile_config(name, |fresh| {
-            edit(&mut fresh.effort);
+            match crate::model_effort::selected_model(&fresh.models).map(str::to_string) {
+                Some(model) => {
+                    let mut slot = crate::model_effort::row_level(fresh);
+                    edit(&mut slot);
+                    match slot {
+                        Some(level) => fresh.model_effort.insert(model, level),
+                        None => fresh.model_effort.remove(&model),
+                    };
+                    fresh.effort = None;
+                }
+                None => edit(&mut fresh.effort),
+            }
             Ok(())
         })?
         .with_context(|| format!("profile '{name}' not found"))?;
         if let Some(profile) = config.find_mut(name) {
             profile.effort = fresh.effort.clone();
+            profile.model_effort = fresh.model_effort.clone();
         }
 
         if active {

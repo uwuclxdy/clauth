@@ -68076,6 +68076,89 @@ mod effort_row {
         assert_eq!(effort_on_disk(), None, "an emptied field unsets the effort");
     }
 
+    fn acct_on_disk() -> Profile {
+        crate::profile::load_config()
+            .expect("reload")
+            .profiles
+            .into_iter()
+            .find(|p| p.name == "acct")
+            .expect("the account is on disk")
+    }
+
+    fn saved_model_account_app(model: &str, effort: Option<&str>) -> App {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.models.default = Some(model.to_string());
+        profile.effort = effort.map(str::to_string);
+        crate::testutil::persist_profiles(std::slice::from_ref(&profile));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(0);
+        enter_config_detail(&mut app);
+        app
+    }
+
+    /// Under a selected model the effort row is that model's level: the
+    /// account's scalar shows there and moves into `[model_effort]` on the
+    /// first edit, and the cycle skips `max`, which Claude Code does not keep
+    /// per model.
+    #[test]
+    fn under_a_selected_model_the_effort_row_edits_that_models_level() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("sonnet", Some("high"));
+        assert_eq!(
+            app.config_draft.as_ref().expect("draft").effort.value,
+            "high",
+            "the scalar is sonnet's level while sonnet is selected"
+        );
+        cycle_effort(&mut app);
+        let p = acct_on_disk();
+        assert_eq!(p.effort, None, "the scalar moved into the table");
+        assert_eq!(
+            p.model_effort.get("sonnet").map(String::as_str),
+            Some("xhigh")
+        );
+        cycle_effort(&mut app);
+        assert_eq!(
+            acct_on_disk().model_effort.get("sonnet"),
+            None,
+            "xhigh -> unset: no max for a model's own level"
+        );
+        assert_eq!(app.config_draft.as_ref().expect("draft").effort.value, "");
+    }
+
+    #[test]
+    fn a_selected_model_refuses_a_level_claude_code_would_drop() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("opus", None);
+        put_cursor_on_effort(&mut app);
+        handle_key(&mut app, key(KeyCode::Enter));
+        for c in "max".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        let p = acct_on_disk();
+        assert_eq!(p.effort, None);
+        assert!(p.model_effort.is_empty(), "max is refused under a model");
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            Some(ConfigRow::Effort),
+            "the field stays open on the refusal"
+        );
+    }
+
+    #[test]
+    fn opusplan_keeps_the_account_wide_effort_cycle() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("opusplan", Some("xhigh"));
+        cycle_effort(&mut app);
+        let p = acct_on_disk();
+        assert_eq!(p.effort.as_deref(), Some("max"));
+        assert!(p.model_effort.is_empty());
+    }
+
     #[test]
     fn the_new_account_form_cycles_the_effort_and_create_persists_it() {
         let _home = HomeSandbox::new();
