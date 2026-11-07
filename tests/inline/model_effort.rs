@@ -1,0 +1,318 @@
+use super::*;
+
+use crate::claude::{
+    FailLiveSettingsWrite, apply_profile_to_claude_settings, build_claude_settings_json,
+    claude_settings_path, effective_effort, release_saved_base_env,
+};
+use crate::lock::with_state_lock;
+use crate::profile::{atomic_write, atomic_write_600, read_json_file};
+use crate::testutil::HomeSandbox;
+
+fn profile(
+    name: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    table: &[(&str, &str)],
+) -> Profile {
+    let mut p = Profile::new(name.to_string(), None, None);
+    p.models.default = model.map(str::to_string);
+    p.effort = effort.map(str::to_string);
+    p.model_effort = table
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    p
+}
+
+fn seed_live(json: serde_json::Value) {
+    atomic_write(
+        &claude_settings_path().expect("settings path"),
+        serde_json::to_string(&json).expect("serialize"),
+    )
+    .expect("seed live settings");
+}
+
+fn live() -> serde_json::Value {
+    read_json_file(&claude_settings_path().expect("settings path")).expect("live settings")
+}
+
+fn level(settings: &serde_json::Value, id: &str) -> Option<String> {
+    settings["modelSettings"][id]["effortLevel"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn switch_off() {
+    with_state_lock(|held| release_saved_base_env(&[], held)).expect("switch off");
+}
+
+#[test]
+fn canonical_model_id_folds_claude_spellings_and_leaves_other_ids() {
+    for (raw, want) in [
+        ("claude-opus-4-8", "claude-opus-4-8"),
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("Claude-Sonnet-4-5[2m]", "claude-sonnet-4-5"),
+        ("claude-opus-4-5-20251101", "claude-opus-4-5"),
+        ("claude-opus-4-5@20251101", "claude-opus-4-5"),
+        (
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5",
+        ),
+        (
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "claude-haiku-4-5",
+        ),
+        ("~anthropic/claude-opus-latest[1m]", "claude-opus-latest"),
+        ("deepseek-v4-pro[1m]", "deepseek-v4-pro"),
+        ("deepseek-v4-pro-v1", "deepseek-v4-pro-v1"),
+        ("MiniMax-M3", "MiniMax-M3"),
+        ("opus", "opus"),
+    ] {
+        assert_eq!(canonical_model_id(raw), want, "{raw}");
+    }
+}
+
+#[test]
+fn only_a_single_model_row_selects_a_model() {
+    let mut models = ModelSettings::default();
+    assert_eq!(selected_model(&models), None);
+    for none in ["default", "opusplan", "OpusPlan", "  "] {
+        models.default = Some(none.to_string());
+        assert_eq!(selected_model(&models), None, "{none:?}");
+    }
+    models.default = Some("sonnet".to_string());
+    assert_eq!(selected_model(&models), Some("sonnet"));
+    models.default = Some("claude-opus-4-8[1m]".to_string());
+    assert_eq!(selected_model(&models), Some("claude-opus-4-8[1m]"));
+}
+
+#[test]
+fn the_scalar_is_the_selected_models_level_until_the_table_names_it() {
+    let p = profile("p", Some("opus"), Some("medium"), &[("sonnet", "xhigh")]);
+    assert_eq!(
+        resolved(&p),
+        BTreeMap::from([
+            ("opus".to_string(), "medium".to_string()),
+            ("sonnet".to_string(), "xhigh".to_string()),
+        ])
+    );
+    assert_eq!(effective_effort(&p), "", "the carrier would pin sonnet too");
+
+    let p = profile("p", Some("opus"), Some("medium"), &[("opus", "low")]);
+    assert_eq!(
+        resolved(&p),
+        BTreeMap::from([("opus".to_string(), "low".to_string())]),
+        "the table's own entry wins over the scalar"
+    );
+}
+
+#[test]
+fn an_account_wide_model_row_keeps_the_scalar_on_the_carrier() {
+    for model in [None, Some("opusplan")] {
+        let p = profile("p", model, Some("high"), &[("sonnet", "xhigh")]);
+        assert_eq!(effective_effort(&p), "high", "{model:?}");
+        assert_eq!(
+            resolved(&p),
+            BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
+            "{model:?}: only the table is per-model"
+        );
+    }
+}
+
+#[test]
+fn max_or_a_custom_scalar_stays_account_wide_under_a_selected_model() {
+    for scalar in ["max", "turbo"] {
+        let p = profile("p", Some("opus"), Some(scalar), &[]);
+        assert_eq!(effective_effort(&p), scalar);
+        assert!(resolved(&p).is_empty(), "{scalar} has no per-model form");
+    }
+}
+
+#[test]
+fn an_env_override_still_wins_and_a_table_value_claude_code_drops_is_skipped() {
+    let mut p = profile(
+        "p",
+        Some("opus"),
+        Some("high"),
+        &[("sonnet", "max"), ("haiku", "low")],
+    );
+    p.env
+        .insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "low".to_string());
+    assert_eq!(effective_effort(&p), "low");
+    assert_eq!(invalid(&p), vec!["sonnet"]);
+    assert_eq!(
+        resolved(&p),
+        BTreeMap::from([
+            ("haiku".to_string(), "low".to_string()),
+            ("opus".to_string(), "high".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn a_tier_with_a_models_row_resolves_to_its_canonical_id() {
+    let mut p = profile("p", Some("opus"), Some("high"), &[("sonnet", "low")]);
+    p.models.opus = Some("claude-opus-4-5-20251101[1m]".to_string());
+    assert_eq!(
+        resolved(&p),
+        BTreeMap::from([
+            ("claude-opus-4-5".to_string(), "high".to_string()),
+            ("sonnet".to_string(), "low".to_string()),
+        ]),
+        "a tier with no row stays its alias"
+    );
+}
+
+#[test]
+fn a_runtime_build_writes_each_level_and_keeps_the_models_other_keys() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({
+        "modelSettings": {"opus": {"autoCompactWindow": 200000}, "haiku": {"effortLevel": "low"}}
+    }));
+    let p = profile("p", Some("opus"), Some("high"), &[("sonnet", "xhigh")]);
+    let built: serde_json::Value = serde_json::from_str(
+        &build_claude_settings_json(Some(&claude_settings_path().unwrap()), &p, &[]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(level(&built, "opus").as_deref(), Some("high"));
+    assert_eq!(level(&built, "sonnet").as_deref(), Some("xhigh"));
+    assert_eq!(
+        level(&built, "haiku").as_deref(),
+        Some("low"),
+        "an unpinned level stays"
+    );
+    assert_eq!(built["modelSettings"]["opus"]["autoCompactWindow"], 200000);
+    assert_eq!(built["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "");
+}
+
+#[test]
+fn a_switch_saves_the_users_level_and_a_switch_away_puts_it_back() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    let a = profile("a", Some("opus"), Some("high"), &[]);
+    apply_profile_to_claude_settings(&a, &[]).unwrap();
+    assert_eq!(level(&live(), "opus").as_deref(), Some("high"));
+
+    let b = profile("b", None, None, &[]);
+    apply_profile_to_claude_settings(&b, &[]).unwrap();
+    assert_eq!(level(&live(), "opus").as_deref(), Some("low"));
+    let record: Record = read_json_file(&record_path().unwrap()).unwrap();
+    assert!(
+        record.ids.is_empty(),
+        "the cover ended, so its entry retired"
+    );
+}
+
+#[test]
+fn a_switch_off_puts_back_every_covered_level_and_removes_one_the_user_never_had() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    let a = profile("a", Some("opus"), Some("high"), &[("sonnet", "xhigh")]);
+    apply_profile_to_claude_settings(&a, &[]).unwrap();
+    switch_off();
+    let after = live();
+    assert_eq!(level(&after, "opus").as_deref(), Some("low"));
+    assert!(
+        after["modelSettings"].get("sonnet").is_none(),
+        "no level of the user's own: the key leaves with clauth's: {after}"
+    );
+}
+
+#[test]
+fn a_level_the_user_changes_while_covered_is_kept_on_a_switch_away() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    apply_profile_to_claude_settings(&profile("a", Some("opus"), Some("high"), &[]), &[]).unwrap();
+    let mut changed = live();
+    changed["modelSettings"]["opus"]["effortLevel"] = "medium".into();
+    seed_live(changed);
+    apply_profile_to_claude_settings(&profile("b", None, None, &[]), &[]).unwrap();
+    assert_eq!(level(&live(), "opus").as_deref(), Some("medium"));
+}
+
+#[test]
+fn a_takeover_whose_live_write_failed_never_loses_the_users_level() {
+    let home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    apply_profile_to_claude_settings(&profile("a", Some("opus"), Some("high"), &[]), &[]).unwrap();
+    {
+        let _fault = FailLiveSettingsWrite::new(&home);
+        apply_profile_to_claude_settings(&profile("b", Some("opus"), Some("medium"), &[]), &[])
+            .expect_err("the live write fails after the record's pre-write");
+    }
+    assert_eq!(
+        level(&live(), "opus").as_deref(),
+        Some("high"),
+        "a's level is still live"
+    );
+    apply_profile_to_claude_settings(&profile("c", None, None, &[]), &[]).unwrap();
+    assert_eq!(
+        level(&live(), "opus").as_deref(),
+        Some("low"),
+        "a's live level reads as clauth's through `pending`, so the user's base survives"
+    );
+}
+
+#[test]
+fn a_session_started_after_a_switch_never_inherits_the_switched_accounts_level() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    apply_profile_to_claude_settings(&profile("a", Some("opus"), Some("high"), &[]), &[]).unwrap();
+    let b = profile("b", None, None, &[]);
+    let built: serde_json::Value = serde_json::from_str(
+        &build_claude_settings_json(Some(&claude_settings_path().unwrap()), &b, &[]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(level(&built, "opus").as_deref(), Some("low"));
+}
+
+#[test]
+fn a_session_started_after_a_switch_keeps_a_level_the_user_set_since() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    apply_profile_to_claude_settings(&profile("a", Some("opus"), Some("high"), &[]), &[]).unwrap();
+    let mut changed = live();
+    changed["modelSettings"]["opus"]["effortLevel"] = "medium".into();
+    seed_live(changed);
+    let built: serde_json::Value = serde_json::from_str(
+        &build_claude_settings_json(
+            Some(&claude_settings_path().unwrap()),
+            &profile("b", None, None, &[]),
+            &[],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(level(&built, "opus").as_deref(), Some("medium"));
+}
+
+#[test]
+fn a_record_that_does_not_parse_refuses_the_build_instead_of_guessing() {
+    let _home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "high"}}}));
+    atomic_write_600(&record_path().unwrap(), "{not json").unwrap();
+    let err = build_claude_settings_json(
+        Some(&claude_settings_path().unwrap()),
+        &profile("b", None, None, &[]),
+        &[],
+    )
+    .expect_err("a torn record could hide another account's level");
+    assert!(format!("{err:#}").contains("model-effort.json"), "{err:#}");
+    apply_profile_to_claude_settings(&profile("b", None, None, &[]), &[])
+        .expect_err("a live apply refuses too");
+    assert_eq!(
+        level(&live(), "opus").as_deref(),
+        Some("high"),
+        "nothing was written"
+    );
+}
+
+#[test]
+fn an_account_with_only_a_table_creates_the_live_settings() {
+    let _home = HomeSandbox::new();
+    let path = claude_settings_path().unwrap();
+    let _ = std::fs::remove_file(&path);
+    apply_profile_to_claude_settings(&profile("a", None, None, &[("sonnet", "xhigh")]), &[])
+        .unwrap();
+    assert_eq!(level(&live(), "sonnet").as_deref(), Some("xhigh"));
+}

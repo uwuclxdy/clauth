@@ -260,13 +260,12 @@ fn run_stamp_error_hook() -> std::io::Result<()> {
 
 /// Where a key sits in a synced document. The walk is one level deep, so
 /// [`KeyPath::Nested`] is only ever asked about keys of a top-level object whose
-/// own rule was [`KeyRule::Nested`]. It carries no parent name because no spec
-/// yet nests more than one object; a second one would need it back, or both
-/// would silently share a rule.
+/// own rule was [`KeyRule::Nested`]. It names that object (`parent`), so two
+/// nested objects (`env`, `modelSettings`) never share a rule.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum KeyPath<'a> {
     Top(&'a str),
-    Nested(&'a str),
+    Nested { parent: &'a str, key: &'a str },
 }
 
 /// What the syncer does with one key.
@@ -746,12 +745,19 @@ fn merge_member(
         }
         let mut nested = target_obj.unwrap_or_default();
         nested.retain(|nk, _| {
-            rule(KeyPath::Nested(nk)) == KeyRule::PerProfile
+            rule(KeyPath::Nested {
+                parent: &key,
+                key: nk,
+            }) == KeyRule::PerProfile
                 || winner_obj.is_some_and(|w| w.contains_key(nk))
         });
         if let Some(winner_obj) = winner_obj {
             for (nk, nv) in winner_obj {
-                if rule(KeyPath::Nested(nk)) != KeyRule::PerProfile {
+                if rule(KeyPath::Nested {
+                    parent: &key,
+                    key: nk,
+                }) != KeyRule::PerProfile
+                {
                     nested.insert(nk.clone(), nv.clone());
                 }
             }
