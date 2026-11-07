@@ -188,6 +188,47 @@ fn an_update_that_changes_nothing_leaves_the_file_alone() {
 }
 
 #[test]
+fn a_proxy_enable_slots_the_new_row_in_service_order() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(
+        &path,
+        "# top\n[alpha]\nport = 9101\nenabled = true\n\n# the gamma note\n[gamma]\nport = 9103\nenabled = false\n",
+    );
+    Registry::update(|registry| {
+        registry.rows.insert(
+            service("beta"),
+            ProxyRow {
+                port: 9102,
+                enabled: true,
+                binary: None,
+            },
+        );
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "# top\n[alpha]\nport = 9101\nenabled = true\n\n[beta]\nport = 9102\nenabled = true\n\n# the gamma note\n[gamma]\nport = 9103\nenabled = false\n",
+    );
+}
+
+#[test]
+fn a_proxy_disable_edits_only_the_enabled_key() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(
+        &path,
+        "# by hand\n[zcode]\nenabled = true # on\n# the port\nport = 9101\n",
+    );
+    disable("zcode").expect("disable");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "# by hand\n[zcode]\nenabled = false # on\n# the port\nport = 9101\n",
+    );
+}
+
+#[test]
 fn a_missing_registry_reads_empty() {
     let _home = HomeSandbox::new();
     assert_eq!(Registry::load().expect("load"), Registry::default());
@@ -1259,8 +1300,8 @@ fn enable_refuses_a_token_the_checks_reader_refuses_and_leaves_it_alone() {
 }
 
 /// A row carrying a key clauth does not know is refused by name: the other
-/// rows still load, the refused row is never run, and no verb rewrites a file
-/// it cannot read whole, so the unknown key is never dropped.
+/// rows still load, the refused row is never run, and no verb writes over a
+/// file it cannot read whole.
 #[cfg(unix)]
 #[test]
 fn a_row_with_an_unknown_key_refuses_a_rewrite_and_leaves_the_file_alone() {
@@ -1600,5 +1641,165 @@ fn the_disk_keys_match_a_fully_populated_disk_row() {
     assert_eq!(
         keys, want,
         "a field added to DiskRow must join DISK_KEYS, else it reads as an unknown key"
+    );
+}
+
+fn enabled_row(port: u16) -> ProxyRow {
+    ProxyRow {
+        port,
+        enabled: true,
+        binary: None,
+    }
+}
+
+/// The row after `beta` in name order (`delta`) and the first in the file that
+/// sorts after it (`zeta`) differ, so only the file-order rule lands here; the
+/// hand order stays.
+#[test]
+fn a_new_row_lands_before_the_first_row_in_file_order_sorting_after_it() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(
+        &path,
+        "[alpha]\nport = 9101\n\n[zeta]\nport = 9103\n\n# the delta note\n[delta]\nport = 9104\n",
+    );
+    Registry::update(|registry| {
+        registry.rows.insert(service("beta"), enabled_row(9102));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "[alpha]\nport = 9101\n\n[beta]\nport = 9102\nenabled = true\n\n\
+         [zeta]\nport = 9103\n\n# the delta note\n[delta]\nport = 9104\n",
+    );
+}
+
+/// Taking first place, a row keeps the comment above the old first where it
+/// stood, with the blank line a row keeps from the one before it, and its keys
+/// in the render's order.
+#[test]
+fn a_new_first_row_leaves_the_old_firsts_comment_on_it() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "# top\n[beta]\nport = 9102\n");
+    Registry::update(|registry| {
+        registry.rows.insert(
+            service("alpha"),
+            ProxyRow {
+                binary: Some(PathBuf::from("/opt/clauth-alpha-proxy")),
+                ..enabled_row(9101)
+            },
+        );
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "[alpha]\nport = 9101\nenabled = true\nbinary = \"/opt/clauth-alpha-proxy\"\n\n\
+         # top\n[beta]\nport = 9102\n",
+    );
+}
+
+#[test]
+fn a_new_last_row_lands_after_the_files_closing_comment() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[alpha]\nport = 9101\n# end\n");
+    Registry::update(|registry| {
+        registry.rows.insert(service("beta"), enabled_row(9102));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "[alpha]\nport = 9101\n# end\n[beta]\nport = 9102\nenabled = true\n",
+    );
+}
+
+/// One row placed between two others and one past the last, in a single save:
+/// the second's place must not follow the first's.
+#[test]
+fn two_new_rows_in_one_save_each_land_in_place() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[alpha]\nport = 9101\n\n[gamma]\nport = 9103\n");
+    Registry::update(|registry| {
+        registry.rows.insert(service("beta"), enabled_row(9102));
+        registry.rows.insert(service("zeta"), enabled_row(9104));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "[alpha]\nport = 9101\n\n[beta]\nport = 9102\nenabled = true\n\n\
+         [gamma]\nport = 9103\n\n[zeta]\nport = 9104\nenabled = true\n",
+    );
+}
+
+/// The load refuses a wrong-typed row first, so only a hand edit landing
+/// between the in-hold load and the save's raw read reaches this refusal.
+#[test]
+fn a_wrong_typed_row_landing_inside_the_hold_refuses_the_save_naming_it() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[alpha]\nport = 9101\n");
+    let hand_edit = "# mine\n[alpha]\nport = \"oops\"\n";
+    let err = Registry::update(|registry| {
+        write(&path, hand_edit);
+        registry.rows.insert(service("beta"), enabled_row(9102));
+        Ok(())
+    })
+    .expect_err("the save refuses");
+    assert_eq!(
+        err.to_string(),
+        "proxies.toml has `alpha` in a shape clauth cannot read; \
+         fix or remove that line, then try again",
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read"), hand_edit);
+}
+
+#[test]
+fn a_registry_turning_unparseable_inside_the_hold_refuses_the_save() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[alpha]\nport = 9101\n");
+    let hand_edit = "= nope\n";
+    let err = Registry::update(|registry| {
+        write(&path, hand_edit);
+        registry.rows.insert(service("beta"), enabled_row(9102));
+        Ok(())
+    })
+    .expect_err("the save refuses");
+    assert_eq!(
+        err.to_string(),
+        format!("failed to parse {} at line 1, column 1", path.display()),
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read"), hand_edit);
+}
+
+#[test]
+fn a_registry_save_whose_edit_changes_no_bytes_leaves_the_mtime_alone() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[alpha]\nport = 9101\nenabled = true\n");
+    let hand_edit = "[alpha] # mine\nenabled = false\nport = 9101\n";
+    let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    Registry::update(|registry| {
+        write(&path, hand_edit);
+        crate::testutil::set_mtime(&path, stamp);
+        if let Some(row) = registry.rows.get_mut(&service("alpha")) {
+            row.enabled = false;
+        }
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(fs::read_to_string(&path).expect("read"), hand_edit);
+    assert_eq!(
+        fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        stamp,
     );
 }

@@ -20,7 +20,11 @@ use serde::{Deserialize, Serialize};
 use crate::gateway::{Bounded, SecretToken, mint_token, run_bounded, run_bounded_cancellable};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::plugin_probe::is_executable;
-use crate::profile::{atomic_write_600, clauth_dir, mkdir_700};
+use crate::profile::{
+    StateFile, append_root_table, atomic_write_600, clauth_dir, decor_prefix,
+    first_header_position, insert_root_table, mkdir_700, prepend_prefix, save_state_in_place,
+    state_edit_value,
+};
 
 // ── the service name ────────────────────────────────────────────────────────
 
@@ -159,7 +163,7 @@ pub(crate) struct Registry {
     /// Rows whose table holds a key [`DiskRow`] does not know, refused by name:
     /// never run, published as `misconfigured` with their reason. Raw table
     /// name -> the reason naming the key and the table. A write refuses while
-    /// any is present, so the unknown key is never dropped.
+    /// any is present.
     misconfigured: BTreeMap<String, String>,
 }
 
@@ -296,8 +300,8 @@ impl Registry {
     pub(crate) fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
         with_state_lock(|held| {
             let before = Self::load()?;
-            // A file holding a row clauth cannot read whole is never rewritten:
-            // the unknown key would be dropped with the save.
+            // A file holding a row clauth cannot read whole is never written:
+            // the verb names the row to fix instead.
             before.refuse_misconfigured()?;
             let mut registry = before.clone();
             let out = f(&mut registry)?;
@@ -311,12 +315,12 @@ impl Registry {
     /// Persist, witness-gated; called by [`Registry::update`] alone.
     fn save(&self, _held: &StateLockHeld) -> Result<()> {
         self.check_ports()?;
-        let disk: BTreeMap<&str, DiskRow> = self
+        let disk: BTreeMap<String, DiskRow> = self
             .rows
             .iter()
             .map(|(service, row)| {
                 (
-                    service.as_str(),
+                    service.as_str().to_string(),
                     DiskRow {
                         port: Some(i64::from(row.port)),
                         enabled: row.enabled,
@@ -325,13 +329,60 @@ impl Registry {
                 )
             })
             .collect();
-        atomic_write_600(&registry_path()?, toml::to_string_pretty(&disk)?)
-            .context("failed to write proxies.toml")
+        save_state_in_place(&registry_path()?, &disk)
     }
 }
 
-/// The keys one registry row may carry; anything else makes the row
-/// unreadable whole, so it is refused by name rather than dropped.
+impl StateFile for BTreeMap<String, DiskRow> {
+    const LABEL: &'static str = "proxies.toml";
+
+    /// A row the file does not hold yet lands before the first row in file
+    /// order whose name sorts after it, so a sorted file stays sorted and a
+    /// hand-ordered one keeps its rows where they are, else past the last row.
+    fn insert_new_table(doc: &mut toml_edit::DocumentMut, key: &str, new: &toml::Table) {
+        let fill = |t: &mut dyn toml_edit::TableLike| {
+            for sub in DISK_KEYS {
+                if let Some(v) = new.get(*sub) {
+                    t.insert(sub, toml_edit::Item::Value(state_edit_value(v)));
+                }
+            }
+        };
+        let mut rows: Vec<(isize, String)> = doc
+            .iter()
+            .filter_map(|(name, item)| first_header_position(item).map(|p| (p, name.to_string())))
+            .collect();
+        rows.sort_unstable();
+        match rows.into_iter().find(|(_, name)| name.as_str() > key) {
+            Some((position, next)) => {
+                // Parsed headers number consecutively, comments uncounted, and
+                // a tie renders in insertion order: one below `next`, this
+                // row, inserted last, renders right above it (measured
+                // 2026-11-07).
+                insert_root_table(doc, key, fill, None, Some(position - 1));
+                // Each row keeps a blank line above it, as the render does.
+                let separated = doc
+                    .get(&next)
+                    .and_then(toml_edit::Item::as_table)
+                    .is_some_and(|t| decor_prefix(t.decor()).starts_with('\n'));
+                if !separated {
+                    prepend_prefix(doc, &next, "\n");
+                }
+            }
+            None => {
+                append_root_table(doc, key, fill);
+                // Unnumbered, the row takes the number of the table before it
+                // in the map, and that can be a row this same save placed
+                // further up (measured 2026-11-07).
+                if let Some(t) = doc.get_mut(key).and_then(toml_edit::Item::as_table_mut) {
+                    t.set_position(Some(isize::MAX));
+                }
+            }
+        }
+    }
+}
+
+/// The keys one registry row may carry, in the order a new row writes them;
+/// anything else makes the row unreadable whole, so it is refused by name.
 const DISK_KEYS: &[&str] = &["port", "enabled", "binary"];
 
 /// Split `table` into the rows carrying a key [`DiskRow`] does not know —
