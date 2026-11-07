@@ -4259,7 +4259,7 @@ fn usage_cache_is_third_party(
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
 /// callers that skip the full load — [`crate::mcp::digest`]'s sample and
-/// [`crate::profile_json::published_windows`] — can observe it; every
+/// [`crate::profile_json::published_windows_with_label`] — can observe it; every
 /// other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
 /// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a

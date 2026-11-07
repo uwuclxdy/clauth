@@ -4225,3 +4225,212 @@ fn a_codex_entry_dates_its_banked_resets_by_its_poll() {
         "no count dates nothing"
     );
 }
+
+/// The state a poll landing between a stat and a load leaves such a reader
+/// with: the body is the new poll's while the mtime is the older poll's. The
+/// body's own stamp rides the bytes the count rides, so a count and its age
+/// taken from it come from one read of one file, whatever else lands around it.
+#[test]
+fn a_codex_count_and_its_age_come_from_one_read_of_one_file() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["landed", "spent"]);
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC, 1_789_000_000 s is
+    // 2026-09-10T00:26:40 UTC (`date -u -d @<secs>`).
+    let new_poll_ms = 1_790_000_000_000;
+    let old_poll = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_000_000);
+    for (name, usable) in [("landed", 3), ("spent", 0)] {
+        let profile = crate::profile::ProfileName::from(name);
+        crate::profile_cache::write_profile_cache(
+            &profile,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(new_poll_ms),
+                limit_resets: Some(crate::usage::LimitResets {
+                    usable,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let path =
+            crate::profile::profile_subpath(&profile, crate::profile_cache::USAGE_CACHE_FILE)
+                .expect("usage cache path");
+        crate::testutil::set_mtime(&path, old_poll);
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    let new_poll = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("landed")["limit_resets"], 3);
+    assert_eq!(row("landed")["limit_resets_read_at"], new_poll);
+    assert_eq!(row("landed")["fetched_at"], new_poll);
+    assert_eq!(
+        row("landed")["next_refresh_at"],
+        "2026-09-21T14:18:20+00:00"
+    );
+    assert_eq!(row("spent")["limit_resets"], 0);
+    assert_eq!(row("spent")["limit_resets_read_at"], new_poll);
+}
+
+/// A poll landing right after the entry's one load leaves the whole entry on
+/// the body that load returned: the count, its age, every date and the windows.
+#[test]
+fn a_poll_landing_during_a_codex_entrys_build_changes_nothing_in_that_entry() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["mid-build"]);
+    let profile = crate::profile::ProfileName::from("mid-build");
+    // A reset far enough ahead that the published filter keeps the window.
+    let body = |usable: u32, stamp_ms: u64, used: f64| crate::usage::UsageInfo {
+        fetched_at: Some(stamp_ms),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: used,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        limit_resets: Some(crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &profile,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+        &body(3, 1_790_000_000_000, 10.0),
+    );
+    super::set_codex_entry_load_hook(
+        "mid-build",
+        Box::new(move |name| {
+            crate::profile_cache::write_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &body(1, 1_790_000_600_000, 90.0),
+            );
+        }),
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let row = &entries.as_array().unwrap()[0];
+    assert_eq!(row["limit_resets"], 3);
+    assert_eq!(row["limit_resets_read_at"], "2026-09-21T14:13:20+00:00");
+    assert_eq!(row["fetched_at"], "2026-09-21T14:13:20+00:00");
+    assert_eq!(row["next_refresh_at"], "2026-09-21T14:18:20+00:00");
+    assert_eq!(row["windows"][0]["utilization_pct"], 10.0);
+}
+
+/// `fetch_status` reads the clock the dates read: a usable stamp outranks the
+/// file's mtime, in both directions the two can disagree.
+#[test]
+fn a_codex_entrys_freshness_reads_the_polls_stamp_over_the_mtime() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["polled-now", "polled-long-ago"]);
+    let now = crate::usage::now_ms();
+    let long_ago_ms = 1_790_000_000_000;
+    let at = |ms: u64| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    for (name, stamp_ms, mtime_ms) in [
+        ("polled-now", now - 1_000, long_ago_ms),
+        ("polled-long-ago", long_ago_ms, now - 1_000),
+    ] {
+        let profile = crate::profile::ProfileName::from(name);
+        crate::profile_cache::write_profile_cache(
+            &profile,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(stamp_ms),
+                ..Default::default()
+            },
+        );
+        let path =
+            crate::profile::profile_subpath(&profile, crate::profile_cache::USAGE_CACHE_FILE)
+                .expect("usage cache path");
+        crate::testutil::set_mtime(&path, at(mtime_ms));
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000);
+    let status = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .fetch_status
+            .clone()
+    };
+    assert_eq!(status("polled-now").as_deref(), Some("Fresh"));
+    assert_eq!(status("polled-long-ago").as_deref(), Some("Cached"));
+}
+
+/// The Usage tab's codex row rule, on the feed: a stamp past the clock proves
+/// the clock moved, so the file's mtime dates the entry and its count; a file
+/// that does not parse holds no reading, so nothing dates it.
+#[test]
+fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["ahead", "garbled"]);
+    let ahead = crate::profile::ProfileName::from("ahead");
+    crate::profile_cache::write_profile_cache(
+        &ahead,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(crate::usage::now_ms() + 86_400_000),
+            limit_resets: Some(crate::usage::LimitResets {
+                usable: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    let ahead_path =
+        crate::profile::profile_subpath(&ahead, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(&ahead_path, written);
+    let garbled_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("garbled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("usage cache path");
+    std::fs::create_dir_all(garbled_path.parent().expect("profile dir")).expect("profile dir");
+    std::fs::write(&garbled_path, "not json").expect("garbled cache");
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    let dated = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("ahead")["fetched_at"], dated);
+    assert_eq!(row("ahead")["limit_resets_read_at"], dated);
+    assert_eq!(row("ahead")["fetch_status"], "Cached");
+    assert_eq!(row("ahead")["next_refresh_at"], "2026-09-21T14:18:20+00:00");
+    for key in [
+        "fetched_at",
+        "fetch_status",
+        "next_refresh_at",
+        "limit_resets",
+        "limit_resets_read_at",
+    ] {
+        assert_eq!(
+            row("garbled").get(key),
+            Some(&serde_json::Value::Null),
+            "garbled's {key} dates nothing"
+        );
+    }
+}

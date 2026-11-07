@@ -787,8 +787,8 @@ pub(crate) fn status_probe() -> Result<()> {
 
 /// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads
 /// the on-disk caches and prints the same shape the daemon writes, then
-/// exits. No scheduler; freshness and next-refresh are derived from cache
-/// mtimes. `include_disabled` mirrors `build_status`'s flag of the same name
+/// exits. No scheduler; freshness and next-refresh are derived from each
+/// account's cache. `include_disabled` mirrors `build_status`'s flag of the same name
 /// (hidden by default; `dispatch`'s `--all`/`--disabled` flips it).
 pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;

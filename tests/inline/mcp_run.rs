@@ -8982,7 +8982,7 @@ fn roster_rank_takes_the_first_live_5h_bar_when_a_label_occurs_twice() {
 /// old `usage_cache.json` from that earlier life. The leftover is not headroom:
 /// the shared cache selector says the account's figures live in the
 /// third-party cache, so the rank falls through to that arm exactly as
-/// `published_windows` drops the leftover, never sorting the account on a
+/// `published_windows_with_label` drops the leftover, never sorting the account on a
 /// stale Anthropic window its own published `windows[]` carries none of (#74).
 #[test]
 fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
@@ -9158,7 +9158,7 @@ fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
 /// An api-key account whose disk still holds a stale OAuth `usage_cache.json`
 /// from an earlier OAuth life ranks off its own provider bars, never the
 /// stale Anthropic window — the same stale-leftover read
-/// `profile_json::published_windows` guards against, and the reason
+/// `profile_json::published_windows_with_label` guards against, and the reason
 /// `load_usage` answers nothing for an api-key account, dropping the rank
 /// onto the provider's own live bars.
 #[test]

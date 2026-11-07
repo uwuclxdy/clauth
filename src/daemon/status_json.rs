@@ -9,7 +9,7 @@
 //! `fetch_status` and
 //! `next_refresh_at` — live only in the scheduler's in-memory stores; when a
 //! live daemon passes [`LiveSignals`] they come from there, otherwise they are
-//! derived from the cache-file mtime so the single-shot `status --json` still
+//! derived from the account's cache so the single-shot `status --json` still
 //! produces a coherent shape.
 
 use std::collections::{BTreeMap, HashMap};
@@ -24,8 +24,8 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::profile_json::{
-    OauthAge, Window, oauth_age, provider_label, published_windows, published_windows_with_label,
-    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_windows_with_label,
+    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file, usage_windows,
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
@@ -40,7 +40,7 @@ pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Live scheduler signals a running daemon has that the single-shot
 /// `clauth status --json` cannot see. When absent, freshness and next-refresh
-/// are derived from the cache-file mtime instead.
+/// are derived from the account's cache instead.
 ///
 /// These are already-snapshotted plain maps, not the live `Arc<RankedMutex<…>>`
 /// stores. [`build_status`] runs holding NO lock at all — the config it takes is
@@ -237,8 +237,9 @@ pub(crate) struct ProfileEntry {
     pub(crate) has_live_session: bool,
     /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
     pub(crate) auth_status: String,
-    /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
-    /// when there is no cache at all.
+    /// Freshness: a live daemon's verdict or a derivation off the clock
+    /// `fetched_at` names; `None` when there is no cache at all, or a codex
+    /// cache that does not parse.
     #[schema(required = true)]
     pub(crate) fetch_status: Option<String>,
     /// Additive: true when this reading is distrusted, by
@@ -248,8 +249,10 @@ pub(crate) struct ProfileEntry {
     /// treating it as current truth.
     pub(crate) stale: bool,
     /// ISO-8601 UTC stamp of when the published figures were last fetched
-    /// (OAuth: the body's `fetched_at`; third-party: the cache write);
-    /// `None` when there is no cache or the body is undated.
+    /// (OAuth: the body's `fetched_at`; third-party: the cache write; codex:
+    /// the body's `fetched_at`, or the cache write where that stamp is missing
+    /// or in the future); `None` when there is no cache, a codex cache that
+    /// does not parse, or an undated OAuth body.
     #[schema(required = true)]
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
@@ -307,7 +310,7 @@ pub(crate) struct ProfileEntry {
     pub(crate) limit_resets: Option<u32>,
     /// When that count was read, in the feed's `+00:00` form: a claude
     /// account's off `limit_resets.json`'s own read stamp, a codex account's
-    /// off the usage cache's poll (`fetched_at`). `null` with no reading, or a
+    /// off its own `fetched_at`. `null` with no reading, or a
     /// claude reading with no stamp or one stamped in the future. A claude
     /// entry's `fetched_at`/`stale` date only the usage cache, so they never
     /// stand in for this. Never required: an older daemon's body lacks it.
@@ -716,8 +719,10 @@ pub(crate) fn build_codex_entries(
         .profiles()
         .iter()
         .map(|name| {
-            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
             let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            #[cfg(test)]
+            run_codex_entry_load_hook(name);
+            let clock_ms = crate::usage::usage_cache_clock_of(name, cached.as_ref());
             let banked_resets = cached
                 .as_ref()
                 .and_then(|u| u.limit_resets.as_ref())
@@ -751,7 +756,7 @@ pub(crate) fn build_codex_entries(
                     "unknown"
                 }
                 .to_string(),
-                fetch_status: mtime_ms.map(|mt| {
+                fetch_status: clock_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
                         "Fresh"
                     } else {
@@ -760,14 +765,14 @@ pub(crate) fn build_codex_entries(
                     .to_string()
                 }),
                 stale: false,
-                fetched_at: mtime_ms.map(ms_to_iso),
-                next_refresh_at: mtime_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
+                fetched_at: clock_ms.map(ms_to_iso),
+                next_refresh_at: clock_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
                 bell_threshold: None,
                 fallback: None,
-                windows: published_windows(name),
+                windows: cached.as_ref().map(usage_windows).unwrap_or_default(),
                 // Codex windows are always 5h/7d; the push reads its 7d label
                 // directly (no monthly), so the presence label is never needed.
                 long_window_label: None,
@@ -779,14 +784,44 @@ pub(crate) fn build_codex_entries(
                 extra_usage: None,
                 credit_capped: false,
                 limit_resets: banked_resets,
-                // A codex count rides the usage cache, so the time that file
-                // landed dates it, as it dates the entry; no count dates nothing.
-                limit_resets_read_at: banked_resets.and(mtime_ms).map(ms_to_iso),
+                // A codex count rides the usage cache, so the clock read off the
+                // body that carries it dates it, as it dates the entry; no count
+                // dates nothing.
+                limit_resets_read_at: banked_resets.and(clock_ms).map(ms_to_iso),
                 // The codex roster has no disabled state.
                 disabled: false,
             }
         })
         .collect()
+}
+
+/// One landing to run right after a codex entry's cache load, keyed by account:
+/// the moment a poll can land under a feed build, with no thread and no sleep.
+#[cfg(test)]
+type CodexEntryLoadHook = Box<dyn FnOnce(&ProfileName) + Send>;
+
+#[cfg(test)]
+static CODEX_ENTRY_LOAD_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, CodexEntryLoadHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_codex_entry_load_hook(name: &str, hook: CodexEntryLoadHook) {
+    CODEX_ENTRY_LOAD_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_string(), hook);
+}
+
+#[cfg(test)]
+fn run_codex_entry_load_hook(name: &ProfileName) {
+    let hook = CODEX_ENTRY_LOAD_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// The full `status.json` body. Field order is the published key order, and

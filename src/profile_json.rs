@@ -447,7 +447,7 @@ pub(crate) fn live_bar<'a>(
 /// inference quota (`30d`) when present, then one entry per weekly model
 /// window (`7d <model>`). Serves both cache shapes: an OAuth read
 /// directly, and a third-party read through the derivation
-/// [`published_windows`] maps it with. A window whose `resets_at` has passed
+/// [`published_windows_with_label`] maps it with. A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last
 /// utilization, not a current reading, and a lapsed 5h at `100%` read as a
 /// permanently spent account. A window with no parseable `resets_at` stays —
@@ -536,10 +536,17 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
     }
 }
 
-/// The profile's usage windows, read fresh from the disk cache; empty when
-/// there is no cache. The rows of the published `status.json` `windows` array —
-/// hence this flat spelling rather than [`ProfileWindows`]'s discriminated one,
-/// which the MCP surface renders.
+/// The profile's published `windows` rows AND the label of its LONG window,
+/// read fresh from the disk cache in ONE cache load so the daemon's per-tick
+/// status build and its push sender derive both from the same read (never two
+/// reads a fetch landing between them could pair one cache's label with the
+/// other's rows); empty when there is no cache. The rows are the flat
+/// [`Window`] spelling, not [`ProfileWindows`]'s discriminated one the MCP
+/// surface renders. The label is `7d` when the account has a 7d window, else
+/// `30d` for a provider-marked monthly quota — decided by PRESENCE off the
+/// account's own cache (the accessor's rule), never by which row survived the
+/// published liveness filter. Codex accounts have no monthly window and read
+/// their 7d separately.
 ///
 /// Each account is read from ITS OWN cache, on the shared cache selector's
 /// name-only form ([`crate::profile::stored_usage_cache_is_third_party`]) — an
@@ -550,19 +557,6 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
 /// describing a window that account no longer has; keeping the two files apart
 /// is what makes publishing the third-party figures safe rather than a second
 /// way to render that same leftover.
-pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
-    published_windows_with_label(name).0
-}
-
-/// The profile's published `windows` rows AND the label of its LONG window,
-/// read in ONE cache load so the daemon's per-tick status build and its push
-/// sender derive both from the same read (never two reads a fetch landing
-/// between them could pair as one cache's label with the other's rows). The
-/// label is `7d` when the account has a 7d window, else `30d` for a
-/// provider-marked monthly quota — decided by PRESENCE off the account's own
-/// cache (the accessor's rule), never by which row survived the published
-/// liveness filter. Codex accounts have no monthly window and read their 7d
-/// separately.
 pub(crate) fn published_windows_with_label(
     name: &ProfileName,
 ) -> (Vec<Window>, Option<&'static str>) {

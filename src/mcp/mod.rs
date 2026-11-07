@@ -126,7 +126,8 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// The cached OAuth usage block for `name`, or `None` when the shared cache
 /// selector says this name's cache is third-party: a retyped profile's leftover
 /// `usage_cache.json` is a fossil from its OAuth life, not headroom, so this
-/// reader never opens it — the same cache-split `published_windows` reads by.
+/// reader never opens it — the same cache-split `published_windows_with_label`
+/// reads by.
 fn load_usage(name: &ProfileName) -> Option<UsageInfo> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
         return None;
