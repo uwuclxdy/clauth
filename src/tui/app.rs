@@ -13259,10 +13259,17 @@ pub(crate) fn herdr_check(
 }
 
 /// The Services tab's `rex` row (experimental, read-only): the clauth plugin
-/// beside Rex's config and whether a pane-label watcher runs.
+/// beside Rex's config and whether a pane-label watcher runs. A missing or
+/// stale install names `clauth rex install`, the command that writes it; the
+/// row itself runs nothing.
 pub(crate) fn rex_check(status: &crate::rex::RexStatus) -> Check {
     let this = env!("CARGO_PKG_VERSION");
     let mut detail = Vec::new();
+    let install_hint = match &status.plugin {
+        crate::rex::PluginDir::Absent => true,
+        crate::rex::PluginDir::Managed { version } => version != this,
+        _ => false,
+    };
     let health = match &status.plugin {
         crate::rex::PluginDir::Absent => {
             detail.push("plugin: not installed".to_string());
@@ -13325,6 +13332,10 @@ pub(crate) fn rex_check(status: &crate::rex::RexStatus) -> Check {
         }
     ));
     detail.push("experimental: may change in any release".to_string());
+    if install_hint {
+        detail.push(String::new());
+        detail.push(format!("  {}", prose::cmd("clauth rex install")));
+    }
     Check {
         label: "rex",
         health,

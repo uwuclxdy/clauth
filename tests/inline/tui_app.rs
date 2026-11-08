@@ -67825,6 +67825,8 @@ fn a_hung_rex_plugin_read_leaves_the_first_paint_unblocked() {
             "plugin: not installed".to_string(),
             "watcher: not running".to_string(),
             "experimental: may change in any release".to_string(),
+            String::new(),
+            format!("  {}", crate::tui::render::prose::cmd("clauth rex install")),
         ]
     );
     super::join_test_workers();
