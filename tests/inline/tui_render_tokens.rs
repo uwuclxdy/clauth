@@ -3306,6 +3306,60 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
     }
 }
 
+/// A machine with no `stats-cache.json` yet — Claude Code writes the rollup late,
+/// or not at all before the first compaction — still builds the Tokens tab from
+/// what is on disk. Before the fix the worker sent `Failed(Missing)` and returned
+/// before the ledger fold and the transcript sweep, so a fresh install, a rebuilt
+/// box, or a wiped `~/.claude` showed only "unreadable".
+#[test]
+fn a_missing_stats_cache_builds_the_tab_from_the_ledger() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    let clauth = sb.home().join(".clauth");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        clauth.join("token_ledger.json"),
+        r#"{"recorded_through":"2026-06-01",
+            "days":{"2026-06-01":{"opus":
+              {"input":1000,"output":2000,"cache_read":0,"cache_create":0}}}}"#,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    crate::tokens::spawn(tx, refresh_rx, claude, Some(clauth));
+    let stats = loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
+            Ok(crate::tokens::TokensEvent::Failed(cause)) => {
+                panic!(
+                    "a missing stats cache failed the tab: {}",
+                    cause.cause_line()
+                )
+            }
+            Ok(_) => {}
+            Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+        }
+    };
+    drop(refresh_tx);
+    assert_eq!(
+        stats.total_input, 1000,
+        "the ledger's input reached the tab"
+    );
+    assert_eq!(
+        stats.total_output, 2000,
+        "the ledger's output reached the tab"
+    );
+    assert!(
+        stats
+            .daily
+            .iter()
+            .any(|d| d.date == "2026-06-01" && d.tokens == 3000),
+        "the ledger day reached the tab: {:?}",
+        stats.daily
+    );
+}
+
 /// The access error Windows returns for a directory reads as a directory on
 /// every OS, while the same error on a file stays a permission cause.
 #[test]

@@ -2168,6 +2168,12 @@ pub(crate) fn spawn(
             };
             let mut base = match loaded {
                 Ok(base) => base,
+                // No rollup on disk yet — a fresh machine, a wiped `~/.claude`,
+                // or a Claude Code build that hasn't written one. The ledger and
+                // the transcripts are still there, so an absent cache is an
+                // empty base, never a failed tab. A cache that exists and cannot
+                // be read still reports its cause.
+                Err(TokensLoadError::Missing) => TokenStats::default(),
                 Err(cause) => {
                     let _ = tx.send(TokensEvent::Failed(cause));
                     return;
