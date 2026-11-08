@@ -65,7 +65,7 @@
 //! profile's delete does the same for its own trees first
 //! ([`rescue_profile_trees`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5318,6 +5318,11 @@ struct SwapPlan {
     /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
     /// new, so no caller reads the field there.
     effort: Option<String>,
+    /// The outgoing member's per-model levels
+    /// ([`crate::model_effort::resolved`]), read before the swap: the levels
+    /// the handover takes back out of the session. `None` when unreadable (or
+    /// on the converge branch).
+    outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
 /// Move the mtime of the store the credential link is about to resolve to.
@@ -5660,6 +5665,9 @@ struct SwapItemRetry {
     /// settings.json once the item legs land (on macOS the handover write is
     /// deferred to that point). `None` (the adopting read failed) writes `""`.
     effort: Option<String>,
+    /// The outgoing member's per-model levels, as [`SwapPlan`] carries them;
+    /// `None` for an adopted retry, whose swap is gone.
+    outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
 /// A [`SwapItemRetry`] in the cell, with its backoff: the attempt it next
@@ -5749,6 +5757,7 @@ fn adopted_item_retry(
         store: canonical.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
         effort,
+        outgoing_levels: None,
     })
 }
 
@@ -6141,6 +6150,7 @@ impl SessionSwap {
                 member: intended,
                 store,
                 effort: None,
+                outgoing_levels: None,
             });
         }
         let store = swap_target_precondition(&intended, &self.launch, models)?;
@@ -6151,10 +6161,14 @@ impl SessionSwap {
         // this load can still refuse `ProfileUnreadable`.
         let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+        let outgoing_levels = crate::profile::read_profile(&ProfileName::from(self.member()))
+            .ok()
+            .map(|outgoing| crate::model_effort::resolved(&outgoing));
         Ok(SwapPlan {
             member: intended,
             store,
             effort: Some(crate::claude::effective_effort(&profile)),
+            outgoing_levels,
         })
     }
 
@@ -6359,10 +6373,20 @@ impl SessionSwap {
             // that may still read the outgoing member's pair must not run at
             // the incoming member's effort.
             #[cfg(not(target_os = "macos"))]
-            self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
+            self.write_effort_env(
+                &plan.member,
+                plan.effort.as_deref(),
+                plan.outgoing_levels.as_ref(),
+                record.as_deref(),
+            );
             #[cfg(target_os = "macos")]
             if !crate::keychain::enabled() {
-                self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
+                self.write_effort_env(
+                    &plan.member,
+                    plan.effort.as_deref(),
+                    plan.outgoing_levels.as_ref(),
+                    record.as_deref(),
+                );
             }
             Ok(SwapOutcome::Swapped)
         })?;
@@ -6406,6 +6430,7 @@ impl SessionSwap {
                 store: plan.store.clone(),
                 previous_store,
                 effort: plan.effort.clone(),
+                outgoing_levels: plan.outgoing_levels.clone(),
             });
             let legs = match &target {
                 Some(target) => self.run_swap_item_legs(target),
@@ -6419,7 +6444,12 @@ impl SessionSwap {
                 // layer onto: what the session reads moved, so the row's
                 // verdict follows.
                 Ok(()) => {
-                    self.land_item_legs(&plan.member, &plan.store, plan.effort.as_deref());
+                    self.land_item_legs(
+                        &plan.member,
+                        &plan.store,
+                        plan.effort.as_deref(),
+                        plan.outgoing_levels.as_ref(),
+                    );
                 }
                 Err(failure) => {
                     let (failed, rerun, retried) = failure.describe();
@@ -6456,7 +6486,13 @@ impl SessionSwap {
     /// caller owns (`read_profile`, the under-hold form); an unreadable member
     /// hands over the carrier alone. Best-effort — a failure is logged naming
     /// the session dir and the swap stands, per the handover's contract.
-    fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
+    fn write_effort_env(
+        &self,
+        member: &ProfileName,
+        effort: Option<&str>,
+        outgoing_levels: Option<&BTreeMap<String, String>>,
+        record: Option<&Path>,
+    ) {
         let levels = match crate::profile::read_profile(member) {
             Ok(profile) => Some(crate::model_effort::resolved(&profile)),
             Err(e) => {
@@ -6474,7 +6510,12 @@ impl SessionSwap {
             record,
             "CLAUDE_CODE_EFFORT_LEVEL",
             effort.unwrap_or(""),
-            levels.as_ref(),
+            levels
+                .as_ref()
+                .map(|incoming| crate::model_effort::Handover {
+                    incoming,
+                    outgoing: outgoing_levels,
+                }),
         ) {
             logline!(
                 "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",
@@ -6495,7 +6536,13 @@ impl SessionSwap {
     /// hold (a `security` leg must never span the flock) so the record merge
     /// cannot race the settings sync's persist — the same lock the in-hold
     /// rewrite rides on every other platform.
-    fn land_item_legs(&self, member: &ProfileName, store: &Path, effort: Option<&str>) {
+    fn land_item_legs(
+        &self,
+        member: &ProfileName,
+        store: &Path,
+        effort: Option<&str>,
+        outgoing_levels: Option<&BTreeMap<String, String>>,
+    ) {
         self.repoint_row_store(member, store);
         self.retouch_after_item_leg(member, store);
         // The written-copy record the settings reconciler keys echoes on: the
@@ -6509,7 +6556,7 @@ impl SessionSwap {
             Isolation::Isolated => None,
         };
         if let Err(e) = with_state_lock(|_held| {
-            self.write_effort_env(member, effort, record.as_deref());
+            self.write_effort_env(member, effort, outgoing_levels, record.as_deref());
             Ok(())
         }) {
             logline!(
@@ -7012,7 +7059,12 @@ impl SessionSwap {
         match leg(&armed.target) {
             SwapItemLeg::Landed => {
                 let target = &armed.target;
-                self.land_item_legs(&target.member, &target.store, target.effort.as_deref());
+                self.land_item_legs(
+                    &target.member,
+                    &target.store,
+                    target.effort.as_deref(),
+                    target.outgoing_levels.as_ref(),
+                );
                 logline!(
                     "clauth: session {} finished its swap onto {}: its per-session Keychain leg \
                      landed on a swap-poll retry",

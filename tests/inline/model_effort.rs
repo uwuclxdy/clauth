@@ -63,6 +63,9 @@ fn canonical_model_id_folds_claude_spellings_and_leaves_other_ids() {
             "claude-haiku-4-5",
         ),
         ("~anthropic/claude-opus-latest[1m]", "claude-opus-latest"),
+        ("claude-sonnet-4.5", "claude-sonnet-4-5"),
+        ("claude-sonnet-4-5-v1@20250929", "claude-sonnet-4-5"),
+        ("claude-sonnet-4-5-latest", "claude-sonnet-4-5-latest"),
         ("deepseek-v4-pro[1m]", "deepseek-v4-pro"),
         ("deepseek-v4-pro-v1", "deepseek-v4-pro-v1"),
         ("MiniMax-M3", "MiniMax-M3"),
@@ -321,21 +324,23 @@ fn an_account_with_only_a_table_creates_the_live_settings() {
 fn a_swap_hands_back_the_outgoing_accounts_levels_and_writes_the_incoming_ones() {
     let mut runtime = serde_json::json!({"modelSettings": {
         "opus": {"effortLevel": "high", "autoCompactWindow": 200000},
-        "claude-opus-4-5[1m]": {"effortLevel": "xhigh"},
+        "claude-opus-4-5": {"effortLevel": "xhigh"},
         "haiku": {"effortLevel": "medium"},
     }});
     let fresh = serde_json::json!({"modelSettings": {
         "opus": {"effortLevel": "low"},
         "haiku": {"effortLevel": "low"},
     }});
-    let pinned =
-        std::collections::BTreeSet::from(["opus".to_string(), "claude-opus-4-5".to_string()]);
+    let outgoing = BTreeMap::from([
+        ("opus".to_string(), "high".to_string()),
+        ("claude-opus-4-5".to_string(), "xhigh".to_string()),
+    ]);
     let incoming = BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]);
     hand_over(
         runtime.as_object_mut().unwrap(),
         fresh.as_object().unwrap(),
         &incoming,
-        Some(&pinned),
+        Some(&outgoing),
     )
     .unwrap();
     assert_eq!(
@@ -348,25 +353,36 @@ fn a_swap_hands_back_the_outgoing_accounts_levels_and_writes_the_incoming_ones()
         200000
     );
     assert!(
-        runtime["modelSettings"]
-            .get("claude-opus-4-5[1m]")
-            .is_none(),
-        "a pinned spelling with no level of the user's leaves: {runtime}"
+        runtime["modelSettings"].get("claude-opus-4-5").is_none(),
+        "no level of the user's own: the outgoing key leaves: {runtime}"
     );
     assert_eq!(
         level(&runtime, "haiku").as_deref(),
         Some("medium"),
-        "unpinned: the sync's"
+        "never the outgoing's"
     );
     assert_eq!(level(&runtime, "sonnet").as_deref(), Some("xhigh"));
+}
+
+#[test]
+fn a_swap_keeps_a_level_the_user_changed_in_the_session() {
+    let mut runtime = serde_json::json!({"modelSettings": {"opus": {"effortLevel": "medium"}}});
+    let fresh = serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}});
+    let outgoing = BTreeMap::from([("opus".to_string(), "high".to_string())]);
+    hand_over(
+        runtime.as_object_mut().unwrap(),
+        fresh.as_object().unwrap(),
+        &BTreeMap::new(),
+        Some(&outgoing),
+    )
+    .unwrap();
+    assert_eq!(level(&runtime, "opus").as_deref(), Some("medium"));
 }
 
 #[test]
 fn a_swap_writes_the_carrier_and_the_members_levels_into_the_session() {
     let _home = HomeSandbox::new();
     seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
-    crate::profile::save_profile_config(&profile("a", Some("opus"), Some("high"), &[])).unwrap();
-    crate::profile::save_profile_config(&profile("b", None, None, &[("sonnet", "xhigh")])).unwrap();
     let runtime = crate::profile::clauth_dir()
         .unwrap()
         .join("session-settings.json");
@@ -375,17 +391,92 @@ fn a_swap_writes_the_carrier_and_the_members_levels_into_the_session() {
         r#"{"env":{"CLAUDE_CODE_EFFORT_LEVEL":""},"modelSettings":{"opus":{"effortLevel":"high"}}}"#,
     )
     .unwrap();
+    let a = profile("a", Some("opus"), Some("high"), &[]);
     let b = profile("b", None, None, &[("sonnet", "xhigh")]);
     crate::claude::set_settings_effort(
         &runtime,
         None,
         "CLAUDE_CODE_EFFORT_LEVEL",
         &effective_effort(&b),
-        Some(&resolved(&b)),
+        Some(Handover {
+            incoming: &resolved(&b),
+            outgoing: Some(&resolved(&a)),
+        }),
     )
     .unwrap();
     let after: serde_json::Value = read_json_file(&runtime).unwrap();
     assert_eq!(level(&after, "opus").as_deref(), Some("low"));
     assert_eq!(level(&after, "sonnet").as_deref(), Some("xhigh"));
     assert_eq!(after["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "");
+}
+
+#[test]
+fn a_swap_still_hands_over_the_carrier_when_the_live_settings_do_not_read() {
+    let _home = HomeSandbox::new();
+    atomic_write(&claude_settings_path().unwrap(), "{torn").unwrap();
+    let runtime = crate::profile::clauth_dir()
+        .unwrap()
+        .join("session-settings.json");
+    atomic_write(&runtime, r#"{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"max"}}"#).unwrap();
+    let b = profile("b", None, None, &[("sonnet", "xhigh")]);
+    crate::claude::set_settings_effort(
+        &runtime,
+        None,
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "",
+        Some(Handover {
+            incoming: &resolved(&b),
+            outgoing: None,
+        }),
+    )
+    .expect("the carrier lands whatever the live file holds");
+    let after: serde_json::Value = read_json_file(&runtime).unwrap();
+    assert_eq!(after["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "");
+}
+
+#[test]
+fn two_takeovers_whose_live_writes_failed_never_lose_the_users_level() {
+    let home = HomeSandbox::new();
+    seed_live(serde_json::json!({"modelSettings": {"opus": {"effortLevel": "low"}}}));
+    apply_profile_to_claude_settings(&profile("a", Some("opus"), Some("high"), &[]), &[]).unwrap();
+    for (name, level) in [("b", "medium"), ("c", "xhigh")] {
+        let _fault = FailLiveSettingsWrite::new(&home);
+        apply_profile_to_claude_settings(&profile(name, Some("opus"), Some(level), &[]), &[])
+            .expect_err("the live write fails after the record's pre-write");
+    }
+    assert_eq!(
+        level(&live(), "opus").as_deref(),
+        Some("high"),
+        "a's level is still live"
+    );
+    switch_off();
+    assert_eq!(level(&live(), "opus").as_deref(), Some("low"));
+}
+
+#[test]
+fn an_alias_pin_holds_every_claude_id_of_its_tier_in_the_sync() {
+    let pinned = std::collections::BTreeSet::from(["sonnet".to_string()]);
+    assert!(is_pinned(&pinned, "sonnet"));
+    assert!(is_pinned(&pinned, "claude-sonnet-4-5"));
+    assert!(is_pinned(&pinned, "claude-sonnet-4-5-20250929[1m]"));
+    assert!(!is_pinned(&pinned, "claude-opus-4-5"));
+    assert!(!is_pinned(&pinned, "deepseek-sonnet"));
+}
+
+#[test]
+fn the_effort_row_shows_and_replaces_every_spelling_of_the_selected_model() {
+    let mut p = profile("p", Some("sonnet"), None, &[("claude-sonnet-4-5", "high")]);
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(row_level(&p).as_deref(), Some("high"));
+    assert_eq!(
+        selected_entries(&p, "sonnet"),
+        vec!["claude-sonnet-4-5".to_string()]
+    );
+    p.model_effort
+        .insert("sonnet".to_string(), "low".to_string());
+    assert_eq!(
+        row_level(&p).as_deref(),
+        Some("low"),
+        "the row's own spelling first"
+    );
 }

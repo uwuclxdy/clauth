@@ -26693,6 +26693,23 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return;
     }
+    // The same refusal the saved account's effort row gives: under a selected
+    // model the row is that model's level, which has no `max` or custom form.
+    if crate::model_effort::selected_model(&models).is_some()
+        && effort
+            .as_deref()
+            .is_some_and(|level| !crate::model_effort::is_level(level))
+    {
+        app.toast(
+            ToastKind::Warning,
+            format!(
+                "account not created\na model's own level is one of {}; set `model` to default \
+                 for an account-wide value",
+                crate::model_effort::LEVELS.join(", ")
+            ),
+        );
+        return;
+    }
     // A fresh login becomes the active one when none is, linking the live
     // slot. Settled before the gateway mint below, so a held create has
     // minted nothing. A captured live login needs no settle: the capture

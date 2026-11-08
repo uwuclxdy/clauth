@@ -20175,6 +20175,7 @@ fn item_retry_for(prefix: &str, store: &Path, previous_store: &Path) -> SwapItem
         store: store.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
         effort: None,
+        outgoing_levels: None,
     }
 }
 
@@ -20286,6 +20287,7 @@ fn a_landed_swap_item_retry_hands_the_session_the_retrys_effort() {
             store: intended_store,
             previous_store: launch_store,
             effort: Some("high".to_string()),
+            outgoing_levels: None,
         });
         let settings = swap.runtime.join("settings.json");
         fs::write(
@@ -20474,6 +20476,7 @@ fn a_swap_item_retry_for_another_member_runs_no_leg() {
             store: intended_store,
             previous_store: launch_store.clone(),
             effort: None,
+            outgoing_levels: None,
         });
 
         let calls = std::cell::Cell::new(0_u32);
@@ -20764,6 +20767,7 @@ fn a_convergence_waits_while_an_item_retry_is_armed() {
             store: store.clone(),
             previous_store: tmp.path().join("outgoing-store.json"),
             effort: None,
+            outgoing_levels: None,
         };
         swap.arm_item_retry(retry.clone());
 
@@ -20842,6 +20846,7 @@ fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
             store: PathBuf::from("/profiles/adopt-retry-b/credentials.json"),
             previous_store: PathBuf::from("/profiles/adopt-retry-a/credentials.json"),
             effort: None,
+            outgoing_levels: None,
         })
     );
     assert_eq!(

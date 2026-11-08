@@ -2020,10 +2020,14 @@ pub(crate) fn edit_profile_effort(
                 Some(model) => {
                     let mut slot = crate::model_effort::row_level(fresh);
                     edit(&mut slot);
-                    match slot {
-                        Some(level) => fresh.model_effort.insert(model, level),
-                        None => fresh.model_effort.remove(&model),
-                    };
+                    // Every spelling that lands on this model goes, so the
+                    // row's value is the one in force.
+                    for key in crate::model_effort::selected_entries(fresh, &model) {
+                        fresh.model_effort.remove(&key);
+                    }
+                    if let Some(level) = slot {
+                        fresh.model_effort.insert(model, level);
+                    }
                     fresh.effort = None;
                 }
                 None => edit(&mut fresh.effort),

@@ -68150,6 +68150,28 @@ mod effort_row {
     }
 
     #[test]
+    fn the_new_account_form_refuses_max_under_a_selected_model() {
+        let _home = HomeSandbox::new();
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(app.profile_count());
+        enter_config_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("fresh");
+            d.model = InputState::new("sonnet");
+            d.effort = InputState::new("max");
+        }
+        commit_new_account(&mut app);
+        assert!(
+            app.config().find(&ProfileName::from("fresh")).is_none(),
+            "a typed max under a selected model creates nothing"
+        );
+    }
+
+    #[test]
     fn opusplan_keeps_the_account_wide_effort_cycle() {
         let _home = HomeSandbox::new();
         let mut app = saved_model_account_app("opusplan", Some("xhigh"));

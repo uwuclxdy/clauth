@@ -73,13 +73,28 @@ pub(crate) fn names_one_model(model: &str) -> bool {
 /// names one model, the account-wide scalar otherwise.
 pub(crate) fn row_level(profile: &Profile) -> Option<String> {
     match selected_model(&profile.models) {
-        Some(model) => profile
-            .model_effort
-            .get(model)
+        Some(model) => selected_entries(profile, model)
+            .first()
+            .and_then(|key| profile.model_effort.get(key))
             .or(profile.effort.as_ref())
             .cloned(),
         None => profile.effort.clone(),
     }
+}
+
+/// The `[model_effort]` keys that land on the same `modelSettings` key as
+/// `model` (the alias and its `[models]` id, say), `model`'s own spelling
+/// first: the entries the effort row shows and replaces.
+pub(crate) fn selected_entries(profile: &Profile, model: &str) -> Vec<String> {
+    let target = settings_key(&profile.models, model);
+    let mut keys: Vec<String> = profile
+        .model_effort
+        .keys()
+        .filter(|key| settings_key(&profile.models, key) == target)
+        .cloned()
+        .collect();
+    keys.sort_by_key(|key| key != model);
+    keys
 }
 
 /// The `modelSettings` key clauth writes for a `model` value: a tier with a
@@ -104,7 +119,7 @@ pub(crate) fn settings_key(models: &ModelSettings, model: &str) -> String {
 #[allow(clippy::expect_used, reason = "the model-id pattern is a literal")]
 static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r"^(?:.*/)?(?:[a-z-]+\.)?(?:anthropic\.)?(claude-[a-z0-9.-]*?)(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?$",
+        r"^(?:.*/)?(?:[a-z-]+\.)?(?:anthropic\.)?(claude-[a-z0-9.-]*?)(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?(?:@\d{8})?$",
     )
     .expect("the model-id pattern is a literal")
 });
@@ -114,8 +129,10 @@ static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// spellings to one canonical name, and within one settings file an exact
 /// canonical key beats any other spelling of the same model, so a level
 /// clauth writes under a raw `[models]` id would lose to the user's own
-/// `/effort` entry. Any other id (a gateway's own model) is left as written
-/// apart from a trailing `[1m]`, as Claude Code leaves it.
+/// `/effort` entry. A dotted version (`claude-sonnet-4.5`) folds to its
+/// dashed form too. Any other id (a gateway's own model) is left as written
+/// apart from a trailing `[1m]`, as Claude Code leaves it; so is a moving
+/// alias such as `claude-sonnet-4-5-latest`, which names no fixed model.
 pub(crate) fn canonical_model_id(id: &str) -> String {
     let id = id.trim();
     let lower = id.to_ascii_lowercase();
@@ -124,12 +141,42 @@ pub(crate) fn canonical_model_id(id: &str) -> String {
         .or_else(|| lower.strip_suffix("[2m]"))
         .unwrap_or(&lower);
     if let Some(caps) = CLAUDE_ID.captures(bare) {
-        return caps[1].to_string();
+        return dash_versions(&caps[1]);
     }
     match lower.strip_suffix("[1m]") {
         Some(_) => id[..id.len() - "[1m]".len()].to_string(),
         None => id.to_string(),
     }
+}
+
+/// `claude-sonnet-4.5` → `claude-sonnet-4-5`: a dot between two digits is a
+/// version separator Claude Code spells with a dash.
+fn dash_versions(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let between_digits = *c == '.'
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit);
+            if between_digits { '-' } else { *c }
+        })
+        .collect()
+}
+
+/// Whether a `modelSettings` key belongs to a model some account pins:
+/// `pinned` holds [`resolved`] keys (canonical ids, or a tier alias without a
+/// `[models]` row). An alias pin covers every Claude id of its tier, since
+/// Claude Code's `/effort` writes the tier's current model under its
+/// canonical id, which clauth cannot name.
+pub(crate) fn is_pinned(pinned: &std::collections::BTreeSet<String>, key: &str) -> bool {
+    let key = canonical_model_id(key);
+    pinned.contains(&key)
+        || TIERS
+            .iter()
+            .any(|tier| pinned.contains(*tier) && key.starts_with(&format!("claude-{tier}-")))
 }
 
 /// The account's per-model levels, keyed by the `modelSettings` key clauth
@@ -363,29 +410,30 @@ pub(crate) fn apply_runtime(
     Ok(())
 }
 
-/// A swapped session's levels: every model a level is pinned for (by any
-/// account, `pinned`, matched by canonical name) that the incoming account
-/// does not pin goes back to what a fresh launch would write (`fresh`, the
-/// live file after [`apply_runtime`]), and the incoming account's `levels`
-/// land over it. A model no account pins is shared and left to the sync.
-/// `pinned` is `None` when the sync's view is unreadable: only the incoming
-/// levels land then.
+/// The per-model half of a swap's effort handover: the incoming account's
+/// levels and, when it could be read, the outgoing account's.
+pub(crate) struct Handover<'a> {
+    pub(crate) incoming: &'a BTreeMap<String, String>,
+    pub(crate) outgoing: Option<&'a BTreeMap<String, String>>,
+}
+
+/// A swapped session's levels: a model the outgoing account pinned
+/// (`outgoing`, its [`resolved`] levels) and the incoming one does not goes
+/// back to what a fresh launch would write (`fresh`, the live file after
+/// [`apply_runtime`]) while the session still holds the outgoing level; a level
+/// the user changed or deleted in the session stays. The incoming account's
+/// `levels` then land. `outgoing` is `None` when the outgoing account could not
+/// be read: only the incoming levels land then.
 pub(crate) fn hand_over(
     runtime: &mut serde_json::Map<String, serde_json::Value>,
     fresh: &serde_json::Map<String, serde_json::Value>,
     levels: &BTreeMap<String, String>,
-    pinned: Option<&std::collections::BTreeSet<String>>,
+    outgoing: Option<&BTreeMap<String, String>>,
 ) -> Result<()> {
-    if let Some(pinned) = pinned {
-        let held: Vec<String> = runtime
-            .get("modelSettings")
-            .and_then(serde_json::Value::as_object)
-            .map(|models| models.keys().cloned().collect())
-            .unwrap_or_default();
-        for id in held {
-            if !levels.contains_key(&id) && pinned.contains(&canonical_model_id(&id)) {
-                set_level(runtime, &id, level_of(fresh, &id).cloned())?;
-            }
+    for (id, level) in outgoing.into_iter().flatten() {
+        let held = level_of(runtime, id).and_then(serde_json::Value::as_str);
+        if !levels.contains_key(id) && held == Some(level.as_str()) {
+            set_level(runtime, id, level_of(fresh, id).cloned())?;
         }
     }
     for (id, level) in levels {
@@ -432,16 +480,19 @@ pub(crate) fn apply_live(
     for (id, level) in levels {
         let live = level_of(settings, id).cloned();
         let held = record.ids.get(id);
-        let (base, pending) = match held.map(|entry| (entry, owner(entry, live.as_ref()))) {
-            Some((entry, Owner::Clauth(base))) => {
-                let pending = if entry.wrote == *level {
-                    entry.pending.clone()
-                } else {
-                    Some(entry.wrote.clone())
-                };
+        let (base, pending) = match held.map(|entry| owner(entry, live.as_ref())) {
+            // The live value is clauth's (`wrote`, or a `pending` an earlier
+            // failed takeover left): it stays recognisable until this write
+            // lands, whichever account wrote it.
+            Some(Owner::Clauth(base)) => {
+                let pending = live
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|live| *live != level)
+                    .map(str::to_string);
                 (base, pending)
             }
-            Some((_, Owner::User)) | None => (live, None),
+            Some(Owner::User) | None => (live, None),
         };
         captured.ids.insert(
             id.clone(),
