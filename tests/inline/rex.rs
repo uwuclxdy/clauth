@@ -697,73 +697,45 @@ fn the_cli_parses_both_subcommands() {
     ));
 }
 
-/// Runs the real `rex-plugin/resolve-profile.sh` for pid 100, faked in a
-/// `/proc` of its own as `argv` under pid 1, against a sandbox `$HOME` whose
-/// live-session registry holds `rows`. `adopted_codex = Some(name)` lays
-/// `~/.codex/auth.json` as the link `clauth login <name> --codex` leaves, and
-/// `which` is what a `clauth which` shim on the script's PATH answers.
+/// Runs the real `rex-plugin/resolve-profile.sh` for pid 100 against a
+/// sandbox `$HOME` whose `.local/bin/clauth` shim, first on the script's PATH,
+/// is `clauth_body`. Returns whether the script exited 0, and its stdout.
 #[cfg(unix)]
-fn resolve(argv: &str, rows: &[&str], adopted_codex: Option<&str>, which: &str) -> String {
+fn resolve_with(clauth_body: &str) -> (bool, String) {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path();
-    let proc_dir = home.join("proc/100");
-    std::fs::create_dir_all(&proc_dir).expect("proc dir");
-    std::fs::write(proc_dir.join("stat"), "100 (a) S 1 100 100 0 -1\n").expect("stat");
-    let mut cmdline = argv.replace(' ', "\0");
-    cmdline.push('\0');
-    std::fs::write(proc_dir.join("cmdline"), cmdline).expect("cmdline");
-    let sessions = home.join(".clauth/live_sessions");
-    std::fs::create_dir_all(&sessions).expect("sessions dir");
-    for (i, row) in rows.iter().enumerate() {
-        std::fs::write(sessions.join(format!("s{i}.json")), row).expect("row");
-    }
-    if let Some(name) = adopted_codex {
-        let store = home.join(".clauth/profiles").join(name);
-        std::fs::create_dir_all(&store).expect("profile store");
-        std::fs::write(store.join("auth.json"), "{}").expect("chain");
-        std::fs::create_dir_all(home.join(".codex")).expect("codex home");
-        std::os::unix::fs::symlink(store.join("auth.json"), home.join(".codex/auth.json"))
-            .expect("adopted link");
-    }
-    // The script puts $HOME/.local/bin first on its PATH, so the shim answers
-    // ahead of any real clauth.
-    let bin = home.join(".local/bin");
+    let bin = tmp.path().join(".local/bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
     let shim = bin.join("clauth");
-    std::fs::write(
-        &shim,
-        format!("#!/bin/sh\n[ \"$1\" = which ] && echo {which}\n"),
-    )
-    .expect("shim");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
+    std::fs::write(&shim, format!("#!/bin/sh\n{clauth_body}")).expect("shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let out = std::process::Command::new("sh")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/rex-plugin/resolve-profile.sh"
         ))
         .arg("100")
-        .env("HOME", home)
-        .env("CLAUTH_PROC_ROOT", home.join("proc"))
-        .env_remove("CODEX_HOME")
+        .env("HOME", tmp.path())
         .output()
         .expect("resolve-profile.sh runs");
-    assert!(
+    (
         out.status.success(),
-        "exits 0: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf-8")
+        String::from_utf8(out.stdout).expect("utf-8"),
+    )
 }
 
+/// The script's answer when `clauth which --pid 100 --json` prints `json`.
+/// The join itself is the Rust resolver's, pinned by `which::tests`; these
+/// pin what the script asks for and how it maps the answer onto the
+/// watcher's tab-separated line. Any other argv exits 2, as an unknown flag
+/// does.
 #[cfg(unix)]
-fn row(harness: Option<&str>) -> String {
-    let harness = harness.map_or(String::new(), |h| format!(r#""harness":"{h}","#));
-    format!(
-        r#"{{"session_id":"s0","start_profile":"work",{harness}"pid":100,"follows_chain":false,"current_member":null}}"#
-    )
+fn resolve(json: &str) -> String {
+    let (ok, out) = resolve_with(&format!(
+        "[ \"$*\" = 'which --pid 100 --json' ] || exit 2\nprintf '%s\\n' '{json}'\n"
+    ));
+    assert!(ok, "exits 0 on an answer");
+    out
 }
 
 #[cfg(unix)]
@@ -771,41 +743,58 @@ fn row(harness: Option<&str>) -> String {
 fn a_codex_session_clauth_started_names_the_codex_agent() {
     // `clauth start <codex profile>`: the pane runs the clauth supervisor, so
     // only the row's harness says the agent is codex, not Claude Code.
-    let out = resolve("clauth start work", &[&row(Some("codex"))], None, "main");
+    let out = resolve(r#"{"harness":"codex","profile":"work","source":"live_session"}"#);
     assert_eq!(out, "work\tclauth\tcodex\n");
 }
 
 #[cfg(unix)]
 #[test]
 fn a_claude_session_clauth_started_names_the_claude_agent() {
-    let out = resolve("clauth start work", &[&row(Some("claude"))], None, "main");
-    assert_eq!(out, "work\tclauth\tclaude\n");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_row_from_before_the_harness_field_is_claude() {
-    let out = resolve("clauth start work", &[&row(None)], None, "main");
+    let out = resolve(r#"{"harness":"claude","profile":"work","source":"live_session"}"#);
     assert_eq!(out, "work\tclauth\tclaude\n");
 }
 
 #[cfg(unix)]
 #[test]
 fn a_bare_codex_on_an_adopted_login_names_its_profile() {
-    let out = resolve("codex", &[], Some("work"), "main");
+    let out = resolve(r#"{"harness":"codex","profile":"work","source":"codex_adopted"}"#);
     assert_eq!(out, "work\tcodex\tcodex\n");
 }
 
 #[cfg(unix)]
 #[test]
-fn a_bare_codex_on_its_own_login_spends_no_account() {
-    let out = resolve("codex", &[], None, "main");
+fn a_bare_claude_spends_the_global_login() {
+    let out = resolve(r#"{"harness":"claude","profile":"main","source":"global"}"#);
+    assert_eq!(out, "main\tglobal\tclaude\n");
+}
+
+/// A bare codex on its own login, a `clauth start` whose row is not written
+/// yet, a shell: nothing resolves, and the line is empty.
+#[cfg(unix)]
+#[test]
+fn nothing_resolved_prints_nothing() {
+    let out = resolve(r#"{"harness":null,"profile":null,"source":null}"#);
     assert_eq!(out, "");
 }
 
 #[cfg(unix)]
 #[test]
-fn a_bare_claude_spends_the_global_login() {
-    let out = resolve("claude", &[], None, "main");
-    assert_eq!(out, "main\tglobal\tclaude\n");
+fn an_answer_the_watcher_cannot_label_prints_nothing() {
+    for json in [
+        r#"{"harness":"cursor","profile":"work","source":"live_session"}"#,
+        r#"{"harness":"claude","profile":"work","source":"somewhere_new"}"#,
+        r#"{"harness":"claude","profile":"","source":"global"}"#,
+    ] {
+        assert_eq!(resolve(json), "", "{json}");
+    }
+}
+
+/// A clauth that predates `which --pid` exits 2 on the flag. That is no
+/// answer, so the script fails and the watcher keeps the pane's label.
+#[cfg(unix)]
+#[test]
+fn a_clauth_without_which_pid_fails_the_script() {
+    let (ok, out) = resolve_with("exit 2\n");
+    assert!(!ok, "exits nonzero");
+    assert_eq!(out, "");
 }

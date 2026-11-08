@@ -41,9 +41,12 @@ local function looks_like_agent(fg)
   return false
 end
 
+-- The account `pid` spends as profile, how and agent; nothing when it spends
+-- none; or false when clauth could not answer (none on PATH, or one older than
+-- `which --pid`), which is no answer at all rather than "no account".
 local function resolve(pid)
   local r = rex.exec({ "sh", resolver, tostring(pid) }, { timeout = 10 })
-  if not (r and r.ok) then return nil end
+  if not (r and r.ok) then return false end
   local profile, how, agent = r.stdout:match("^([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)")
   return profile, how, agent
 end
@@ -85,7 +88,11 @@ end
 local function apply(session_id, block_id, pid)
   local t = tracked[block_id]
   local profile, how, agent
-  if pid then profile, how, agent = resolve(pid) end
+  if pid then
+    profile, how, agent = resolve(pid)
+    -- A failed read keeps whatever label stands; the timer asks again.
+    if profile == false then return end
+  end
   local current = label_of(session_id, block_id)
 
   if not profile then

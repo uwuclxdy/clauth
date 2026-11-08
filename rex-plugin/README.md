@@ -2,8 +2,9 @@
 
 The [Rex](https://www.superlogical.com/rex) counterpart of `herdr-plugin/`. clauth's Rex support
 is experimental: nothing heals or updates the install on its own (rerun `clauth rex install`
-after upgrading clauth), the Services tab has no controls for it, and Rex is in beta, so a new
-Rex build can break it. It does three things:
+after upgrading clauth), the Services tab's `rex` row only reports it and names
+`clauth rex install` when it is missing or stale, and Rex is in beta, so a new Rex build can
+break it. It does three things:
 
 - **Launch Claude Code through clauth.** The `clauth_claude` action splits a pane running
   `clauth start --auto --with-fallback`, so a new session starts on the fallback-chain member
@@ -55,16 +56,16 @@ documents each. Default keys: `alt+cmd+c` splits right, `shift+alt+cmd+c` splits
   tag-watch.lua` per Rex server and exits. Several servers (one per installed Rex version) each
   get their own watcher, pinned to the server's `--listen` socket.
 - The watcher runs `resolve-profile.sh` when a pane's foreground program is `claude`, `clauth`
-  or `codex`, and every 10 s for each pane it tags. The resolver reads `ps` (or `/proc`), clauth's
-  `~/.clauth/live_sessions/`, `readlink $CODEX_HOME/auth.json`, and runs `clauth which` for a
-  bare `claude`. It never writes clauth state.
+  or `codex`, and every 10 s for each pane it tags. The resolver is one
+  `clauth which --pid <pid> --json` call; a clauth older than `--pid` leaves labels as they are.
+  It never writes clauth state.
 - The only writes are pane labels and the files under `~/.local/state/clauth-rex/`.
 
 ## How the labels work
 
 Rex runs event handlers only in `rex do` scripts, not in `init.lua`, hence the separate watcher.
-It hears `terminal.process_changed`, resolves the foreground pid the way
-`herdr-plugin/report-profile.sh` does (the `clauth start` supervisor is the terminal's
+It hears `terminal.process_changed`, resolves the foreground pid through `clauth which --pid`,
+as `herdr-plugin/report-profile.sh` does (the `clauth start` supervisor is the terminal's
 foreground process and keys its live-session row), and appends the account to the pane's label.
 The original label comes back when the agent exits, unless someone relabeled the pane meanwhile.
 Only a suffix naming a known clauth profile is ever taken for a tag, so a label such as
