@@ -559,8 +559,13 @@ fn uninstall_leaves_a_foreign_directory() {
 /// exec-ing into `sleep`, which would drop the name from the argv.
 #[cfg(unix)]
 fn fake_watcher() -> std::process::Child {
+    // Null stdio: the TERM stops `sh`, but its `sleep` lives on for up to a
+    // second, and holding the test's stdout it would read as a leak.
     std::process::Command::new("sh")
         .args(["-c", "while :; do sleep 1; done", "tag-watch.lua"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn fake watcher")
 }
