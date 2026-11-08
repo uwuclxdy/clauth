@@ -20179,6 +20179,75 @@ fn item_retry_for(prefix: &str, store: &Path, previous_store: &Path) -> SwapItem
     }
 }
 
+/// Give a registered member a `[model_effort]` table.
+fn pin_levels(name: &str, table: &[(&str, &str)]) {
+    let mut profile =
+        crate::profile::read_profile(&crate::profile::ProfileName::from(name)).expect("profile");
+    profile.model_effort = table
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    crate::profile::save_profile(&profile).expect("save profile");
+}
+
+/// An item retry left unlanded still has its outgoing member's levels in the
+/// session's settings.json, so the outgoing levels come from the member whose
+/// store the retry's `previous_store` is, not from the member the cell names.
+#[test]
+fn a_member_store_names_its_members_levels() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let a = member("lvl-store-a");
+        let store = member_store(&a);
+        pin_levels("lvl-store-a", &[("opus", "high")]);
+        assert_eq!(
+            levels_of_store(&store),
+            Some(BTreeMap::from([("opus".to_string(), "high".to_string())]))
+        );
+        assert_eq!(
+            levels_of_store(&tmp.path().join("elsewhere/credentials.json")),
+            None
+        );
+    });
+}
+
+/// A swap that retargets while an earlier swap's item legs are still armed
+/// takes back the levels that swap never handed over (the retry's outgoing
+/// member's), not those of the member the cell names.
+#[test]
+fn a_retarget_over_an_armed_retry_takes_back_the_retrys_outgoing_levels() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("lvl-retarget");
+        pin_levels("lvl-retarget-a", &[("opus", "high")]);
+        pin_levels("lvl-retarget-b", &[("sonnet", "low")]);
+        let c = member("lvl-retarget-c");
+        member_store(&c);
+
+        // An adopted retry carries no snapshot: the store names the member.
+        swap.arm_item_retry(item_retry_for(
+            "lvl-retarget",
+            &intended_store,
+            &launch_store,
+        ));
+        let plan = swap.precondition("lvl-retarget-c").expect("plan");
+        assert_eq!(
+            plan.outgoing_levels,
+            Some(BTreeMap::from([("opus".to_string(), "high".to_string())]))
+        );
+
+        // A swap's own retry carries the snapshot its plan read.
+        let snapshot = BTreeMap::from([("haiku".to_string(), "medium".to_string())]);
+        swap.arm_item_retry(SwapItemRetry {
+            outgoing_levels: Some(snapshot.clone()),
+            ..item_retry_for("lvl-retarget", &intended_store, &launch_store)
+        });
+        let plan = swap.precondition("lvl-retarget-c").expect("plan");
+        assert_eq!(plan.outgoing_levels, Some(snapshot));
+    });
+}
+
 fn row_store(swap: &SessionSwap) -> Option<PathBuf> {
     crate::live_sessions::get(swap.session.as_str())
         .expect("row")

@@ -72,28 +72,45 @@ pub(crate) fn names_one_model(model: &str) -> bool {
 /// model's (its `[model_effort]` entry, else the scalar) while the `model` row
 /// names one model, the account-wide scalar otherwise.
 pub(crate) fn row_level(profile: &Profile) -> Option<String> {
-    match selected_model(&profile.models) {
-        Some(model) => selected_entries(profile, model)
-            .first()
-            .and_then(|key| profile.model_effort.get(key))
-            .or(profile.effort.as_ref())
-            .cloned(),
-        None => profile.effort.clone(),
-    }
+    let Some(model) = selected_model(&profile.models) else {
+        return profile.effort.clone();
+    };
+    let entries = selected_entries(profile, model);
+    let level = |key: &String| profile.model_effort.get(key);
+    // The entry [`resolved_parts`] lands (the first valid one in this order),
+    // else the first one at all, so a value Claude Code would drop still shows.
+    entries
+        .iter()
+        .filter_map(level)
+        .find(|value| is_level(value.trim()))
+        .or_else(|| entries.first().and_then(level))
+        .or(profile.effort.as_ref())
+        .cloned()
 }
 
 /// The `[model_effort]` keys that land on the same `modelSettings` key as
-/// `model` (the alias and its `[models]` id, say), `model`'s own spelling
-/// first: the entries the effort row shows and replaces.
+/// `model` (the alias and its `[models]` id, say), in [`entry_order`]: the
+/// entries the effort row shows and replaces.
 pub(crate) fn selected_entries(profile: &Profile, model: &str) -> Vec<String> {
     let target = settings_key(&profile.models, model);
-    let mut keys: Vec<String> = profile
-        .model_effort
-        .keys()
+    entry_order(&profile.models, &profile.model_effort)
+        .into_iter()
         .filter(|key| settings_key(&profile.models, key) == target)
-        .cloned()
-        .collect();
-    keys.sort_by_key(|key| key != model);
+        .map(str::to_string)
+        .collect()
+}
+
+/// The order in which `[model_effort]` keys claim their `modelSettings` key:
+/// the selected model's own spelling first, then the table's order. The first
+/// valid entry for a key wins, in [`resolved_parts`] and on the effort row
+/// alike.
+fn entry_order<'a>(
+    models: &ModelSettings,
+    model_effort: &'a BTreeMap<String, String>,
+) -> Vec<&'a str> {
+    let selected = selected_model(models);
+    let mut keys: Vec<&str> = model_effort.keys().map(String::as_str).collect();
+    keys.sort_by_key(|key| Some(*key) != selected);
     keys
 }
 
@@ -115,11 +132,14 @@ pub(crate) fn settings_key(models: &ModelSettings, model: &str) -> String {
 
 /// A Claude model id's provider and suffix spellings: an optional path, an
 /// optional Bedrock `region.anthropic.` prefix, then the `claude-` name with an
-/// optional `-YYYYMMDD` / `@YYYYMMDD` date and `-vN[:N]` version.
+/// optional `-fast` / `-latest` trailer, `-YYYYMMDD` / `@YYYYMMDD` date and
+/// `-vN[:N]` version. The lazy name stops at the trailer (group 2), which
+/// [`canonical_model_id`] puts back when the name carries no version number
+/// (`claude-opus-latest`).
 #[allow(clippy::expect_used, reason = "the model-id pattern is a literal")]
 static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r"^(?:.*/)?(?:[a-z-]+\.)?(?:anthropic\.)?(claude-[a-z0-9.-]*?)(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?(?:@\d{8})?$",
+        r"^(?:.*/)?(?:[a-z-]+\.)?(?:anthropic\.)?(claude-[a-z0-9.-]*?)(-fast|-latest)?(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?(?:@\d{8})?$",
     )
     .expect("the model-id pattern is a literal")
 });
@@ -130,9 +150,11 @@ static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// canonical key beats any other spelling of the same model, so a level
 /// clauth writes under a raw `[models]` id would lose to the user's own
 /// `/effort` entry. A dotted version (`claude-sonnet-4.5`) folds to its
-/// dashed form too. Any other id (a gateway's own model) is left as written
-/// apart from a trailing `[1m]`, as Claude Code leaves it; so is a moving
-/// alias such as `claude-sonnet-4-5-latest`, which names no fixed model.
+/// dashed form too, and so does a `-latest` or `-fast` trailer after a
+/// versioned name (`claude-sonnet-4-5-latest` keys as `claude-sonnet-4-5`, as
+/// Claude Code 2.1.316's `hfs` trailer rule reads it). Any other id (a
+/// gateway's own model, or `claude-opus-latest`, which names no version) is
+/// left as written apart from a trailing `[1m]`, as Claude Code leaves it.
 pub(crate) fn canonical_model_id(id: &str) -> String {
     let id = id.trim();
     let lower = id.to_ascii_lowercase();
@@ -141,7 +163,13 @@ pub(crate) fn canonical_model_id(id: &str) -> String {
         .or_else(|| lower.strip_suffix("[2m]"))
         .unwrap_or(&lower);
     if let Some(caps) = CLAUDE_ID.captures(bare) {
-        return dash_versions(&caps[1]);
+        let name = &caps[1];
+        let trailer = caps.get(2).map_or("", |m| m.as_str());
+        return if name.contains(|c: char| c.is_ascii_digit()) {
+            dash_versions(name)
+        } else {
+            dash_versions(&format!("{name}{trailer}"))
+        };
     }
     match lower.strip_suffix("[1m]") {
         Some(_) => id[..id.len() - "[1m]".len()].to_string(),
@@ -199,19 +227,23 @@ pub(crate) fn resolved_parts(
     model_effort: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    for model in entry_order(models, model_effort) {
+        let level = model_effort[model].trim();
+        if model.trim().is_empty() || !is_level(level) {
+            continue;
+        }
+        out.entry(settings_key(models, model))
+            .or_insert_with(|| level.to_string());
+    }
+    // The scalar is the selected model's level only where no table entry for
+    // that model landed.
     if let Some(selected) = selected_model(models)
         && !model_effort.contains_key(selected)
         && let Some(level) = effort.map(str::trim)
         && is_level(level)
     {
-        out.insert(settings_key(models, selected), level.to_string());
-    }
-    for (model, level) in model_effort {
-        let level = level.trim();
-        if model.trim().is_empty() || !is_level(level) {
-            continue;
-        }
-        out.insert(settings_key(models, model), level.to_string());
+        out.entry(settings_key(models, selected))
+            .or_insert_with(|| level.to_string());
     }
     out
 }

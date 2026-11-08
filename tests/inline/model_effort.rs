@@ -65,7 +65,10 @@ fn canonical_model_id_folds_claude_spellings_and_leaves_other_ids() {
         ("~anthropic/claude-opus-latest[1m]", "claude-opus-latest"),
         ("claude-sonnet-4.5", "claude-sonnet-4-5"),
         ("claude-sonnet-4-5-v1@20250929", "claude-sonnet-4-5"),
-        ("claude-sonnet-4-5-latest", "claude-sonnet-4-5-latest"),
+        ("claude-sonnet-4-5-latest", "claude-sonnet-4-5"),
+        ("claude-sonnet-4-5-latest-20250929", "claude-sonnet-4-5"),
+        ("claude-opus-4-6-fast[1m]", "claude-opus-4-6"),
+        ("claude-3-5-sonnet-latest", "claude-3-5-sonnet"),
         ("deepseek-v4-pro[1m]", "deepseek-v4-pro"),
         ("deepseek-v4-pro-v1", "deepseek-v4-pro-v1"),
         ("MiniMax-M3", "MiniMax-M3"),
@@ -479,4 +482,71 @@ fn the_effort_row_shows_and_replaces_every_spelling_of_the_selected_model() {
         Some("low"),
         "the row's own spelling first"
     );
+    assert_eq!(
+        resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
+        Some("low"),
+        "a launch runs the level the row shows"
+    );
+}
+
+#[test]
+fn the_row_and_a_launch_agree_on_which_equivalent_entry_wins() {
+    // The selected spelling is the full id: it wins over the alias, which a
+    // plain table walk would visit last.
+    let mut p = profile(
+        "p",
+        Some("claude-sonnet-4-5"),
+        None,
+        &[("claude-sonnet-4-5", "high"), ("sonnet", "low")],
+    );
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(row_level(&p).as_deref(), Some("high"));
+    assert_eq!(
+        resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
+        Some("high")
+    );
+
+    // Neither entry is the selected spelling: the table's first one wins.
+    let mut p = profile(
+        "p",
+        Some("sonnet"),
+        None,
+        &[("claude-sonnet-4-5", "high"), ("claude-sonnet-4.5", "low")],
+    );
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(row_level(&p).as_deref(), Some("high"));
+    assert_eq!(
+        resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
+        Some("high")
+    );
+
+    // A value Claude Code drops never wins; the row shows the one that lands.
+    let mut p = profile(
+        "p",
+        Some("sonnet"),
+        None,
+        &[("claude-sonnet-4-5", "max"), ("sonnet", "medium")],
+    );
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(row_level(&p).as_deref(), Some("medium"));
+    assert_eq!(
+        resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
+        Some("medium")
+    );
+}
+
+#[test]
+fn a_table_entry_for_the_selected_model_beats_the_scalar_under_any_spelling() {
+    let mut p = profile(
+        "p",
+        Some("sonnet"),
+        Some("high"),
+        &[("claude-sonnet-4-5", "low")],
+    );
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(
+        resolved(&p),
+        BTreeMap::from([("claude-sonnet-4-5".to_string(), "low".to_string())])
+    );
+    assert_eq!(row_level(&p).as_deref(), Some("low"));
 }

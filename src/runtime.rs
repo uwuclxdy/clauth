@@ -5320,8 +5320,9 @@ struct SwapPlan {
     effort: Option<String>,
     /// The outgoing member's per-model levels
     /// ([`crate::model_effort::resolved`]), read before the swap: the levels
-    /// the handover takes back out of the session. `None` when unreadable (or
-    /// on the converge branch).
+    /// the handover takes back out of the session. While an item retry is
+    /// armed these are the retry's outgoing levels, since its handover never
+    /// ran. `None` when unreadable (or on the converge branch).
     outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
@@ -5666,7 +5667,8 @@ struct SwapItemRetry {
     /// deferred to that point). `None` (the adopting read failed) writes `""`.
     effort: Option<String>,
     /// The outgoing member's per-model levels, as [`SwapPlan`] carries them;
-    /// `None` for an adopted retry, whose swap is gone.
+    /// an adopted retry, whose swap is gone, reads them from the member whose
+    /// store `previous_store` is ([`levels_of_store`]).
     outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
@@ -5757,8 +5759,25 @@ fn adopted_item_retry(
         store: canonical.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
         effort,
-        outgoing_levels: None,
+        outgoing_levels: levels_of_store(previous_store),
     })
+}
+
+/// The per-model levels ([`crate::model_effort::resolved`]) of the member
+/// whose own credential store `store` is: the outgoing side of a swap whose
+/// item legs never landed, whose levels the session's settings.json still
+/// carries. `None` when `store` is no member's own store or the member's
+/// config does not read.
+fn levels_of_store(store: &Path) -> Option<BTreeMap<String, String>> {
+    let name = store.parent()?.file_name()?.to_str()?;
+    let member = ProfileName::from(name);
+    let own = profile_dir(&member).ok()?.join(store.file_name()?);
+    if crate::canonical::identity(&own).ok()? != crate::canonical::identity(store).ok()? {
+        return None;
+    }
+    crate::profile::read_profile(&member)
+        .ok()
+        .map(|profile| crate::model_effort::resolved(&profile))
 }
 
 /// One-shot shutdown gate for a session's swap executor: `begin` is a Release
@@ -6161,9 +6180,21 @@ impl SessionSwap {
         // this load can still refuse `ProfileUnreadable`.
         let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        let outgoing_levels = crate::profile::read_profile(&ProfileName::from(self.member()))
-            .ok()
-            .map(|outgoing| crate::model_effort::resolved(&outgoing));
+        // The levels the session's settings.json carries now: while an item
+        // retry is armed its swap's handover never ran, so they are still the
+        // retry's outgoing member's, not the member the cell names.
+        let armed_outgoing = self.cell().item_retry.as_ref().map(|armed| {
+            armed
+                .target
+                .outgoing_levels
+                .clone()
+                .or_else(|| levels_of_store(&armed.target.previous_store))
+        });
+        let outgoing_levels = armed_outgoing.unwrap_or_else(|| {
+            crate::profile::read_profile(&ProfileName::from(self.member()))
+                .ok()
+                .map(|outgoing| crate::model_effort::resolved(&outgoing))
+        });
         Ok(SwapPlan {
             member: intended,
             store,
