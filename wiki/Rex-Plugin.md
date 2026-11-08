@@ -2,7 +2,7 @@
 
 clauth ships a plugin for [Rex](https://www.superlogical.com/rex), a terminal multiplexer for coding agents that is in beta. It does what the [herdr plugin](Herdr-Plugin) does, through Rex's own extension points: it opens Claude Code through `clauth start`, opens the clauth dashboard in a floating pane, and labels every Rex pane with the account that pane is spending.
 
-**clauth's Rex support is experimental.** Nothing heals or updates the install on its own, the way clauth heals its Claude Code and herdr plugins: rerun `clauth rex install` after upgrading clauth. The Services tab has no controls for it. And a new Rex build can break it, since Rex's Lua API can still change under the plugin; everything here was checked against Rex builds from October 2026.
+**clauth's Rex support is experimental.** Nothing heals or updates the install on its own, the way clauth heals its Claude Code and herdr plugins: rerun `clauth rex install` after upgrading clauth. The Services tab's `rex` row only reports it (installed, written by another clauth version, watcher running) and offers no fix; a missing or stale install names `clauth rex install` there. And a new Rex build can break it, since Rex's Lua API can still change under the plugin; everything here was checked against Rex builds from October 2026.
 
 Requires Rex with Lua config (`rex config check` answers), `clauth` on `PATH`, and Linux or macOS. The watcher and resolver are POSIX shell scripts.
 
@@ -85,6 +85,6 @@ Both are read from the Rex server's environment. The watcher logs to `~/.local/s
 
 - `start-watch.sh`, on every Rex config load; it exits at once when its server already has a watcher.
 - `rex do --all tag-watch.lua`, one per Rex server, for as long as that server runs.
-- `resolve-profile.sh`, when a pane's foreground program is `claude`, `clauth` or `codex`, and on the timer for each tagged pane. It reads `ps` (or `/proc` on Linux), `~/.clauth/live_sessions/`, `readlink $CODEX_HOME/auth.json`, and runs `clauth which` for a bare `claude`. It never writes clauth state.
+- `resolve-profile.sh`, when a pane's foreground program is `claude`, `clauth` or `codex`, and on the timer for each tagged pane. It runs `clauth which --pid <pid> --json`, which finds the live-session row up that process's parent chain, else a bare codex's adopted login, else the global login a bare `claude` reads. A clauth that cannot answer (one older than `which --pid`) leaves the pane's label as it is. It never writes clauth state.
 
 The only writes are pane labels and the files under `~/.local/state/clauth-rex/`.

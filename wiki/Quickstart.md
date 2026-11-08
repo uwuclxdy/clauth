@@ -196,7 +196,7 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
   - After that, clauth keeps the plugin current on its own: it lands the plugin at the latest release and compares the installed checkout's commit against that release's commit, reinstalling when they differ, up to once per 30 minutes (`CLAUTH_NO_UPDATE=1` opts out).
   - The whole surface, including the per-pane account tag: [herdr plugin](Herdr-Plugin).
 - **`rex install`** writes the Rex plugin bundled in the binary to `clauth/` beside Rex's `init.lua` and appends one marked `require("clauth")` block that loads it, after a `[y/N]`.
-  - **Rex support is experimental**: nothing heals or updates the install on its own, the Services tab has no controls for it, and a new Rex build can break it.
+  - **Rex support is experimental**: nothing heals or updates the install on its own, the Services tab's `rex` row only reports it (naming `clauth rex install` when it is missing or stale), and a new Rex build can break it.
   - The plugin opens Claude Code through `clauth start --auto --with-fallback`, shows the dashboard in a floating pane, and labels each pane with the account it spends.
   - Rerun it after upgrading clauth to refresh the files; it stops the running pane-label watcher so Rex's reload starts one on the new files. **`rex uninstall`** takes the block and the files back out, stops the watcher and removes its state under `~/.local/state/clauth-rex/`. `--yes` skips the prompt for either.
   - The whole surface: [Rex plugin](Rex-Plugin).

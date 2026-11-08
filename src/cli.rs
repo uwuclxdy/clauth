@@ -492,7 +492,7 @@ pub(crate) enum Command {
     /// `clauth/` beside Rex's `init.lua` and appends one marked
     /// `require("clauth")` block that loads it. The plugin opens Claude Code
     /// through `clauth start`, shows the dashboard in a floating pane, and
-    /// labels each pane with the account it spends. Rex is in beta.
+    /// labels each pane with the account it spends. Rex support is experimental.
     /// `clauth rex uninstall` takes the block and the files back out.
     Rex {
         #[command(subcommand)]
