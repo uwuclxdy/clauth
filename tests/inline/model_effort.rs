@@ -69,6 +69,17 @@ fn canonical_model_id_folds_claude_spellings_and_leaves_other_ids() {
         ("claude-sonnet-4-5-latest-20250929", "claude-sonnet-4-5"),
         ("claude-opus-4-6-fast[1m]", "claude-opus-4-6"),
         ("claude-3-5-sonnet-latest", "claude-3-5-sonnet"),
+        ("claude-custom-123-latest", "claude-custom-123-latest"),
+        ("claude-sonnet-4", "claude-sonnet-4-0"),
+        ("claude-sonnet-4-20250514", "claude-sonnet-4-0"),
+        (
+            "us.anthropic.claude-opus-4-20250514-v1:0",
+            "claude-opus-4-0",
+        ),
+        ("claude-opus-4@20250514", "claude-opus-4-0"),
+        ("claude-sonnet-4-latest", "claude-sonnet-4-0"),
+        ("claude-sonnet-4-0", "claude-sonnet-4-0"),
+        ("claude-sonnet-5", "claude-sonnet-5"),
         ("deepseek-v4-pro[1m]", "deepseek-v4-pro"),
         ("deepseek-v4-pro-v1", "deepseek-v4-pro-v1"),
         ("MiniMax-M3", "MiniMax-M3"),
@@ -533,6 +544,26 @@ fn the_row_and_a_launch_agree_on_which_equivalent_entry_wins() {
         resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
         Some("medium")
     );
+}
+
+#[test]
+fn the_row_shows_the_scalar_a_launch_lands_over_a_dropped_entry() {
+    let mut p = profile(
+        "p",
+        Some("sonnet"),
+        Some("high"),
+        &[("claude-sonnet-4-5", "max")],
+    );
+    p.models.sonnet = Some("claude-sonnet-4-5".to_string());
+    assert_eq!(
+        resolved(&p).get("claude-sonnet-4-5").map(String::as_str),
+        Some("high")
+    );
+    assert_eq!(row_level(&p).as_deref(), Some("high"));
+
+    // With no level landing at all, the dropped value still shows.
+    p.effort = None;
+    assert_eq!(row_level(&p).as_deref(), Some("max"));
 }
 
 #[test]

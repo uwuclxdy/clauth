@@ -75,15 +75,15 @@ pub(crate) fn row_level(profile: &Profile) -> Option<String> {
     let Some(model) = selected_model(&profile.models) else {
         return profile.effort.clone();
     };
-    let entries = selected_entries(profile, model);
-    let level = |key: &String| profile.model_effort.get(key);
-    // The entry [`resolved_parts`] lands (the first valid one in this order),
-    // else the first one at all, so a value Claude Code would drop still shows.
-    entries
-        .iter()
-        .filter_map(level)
-        .find(|value| is_level(value.trim()))
-        .or_else(|| entries.first().and_then(level))
+    // The level a launch lands for the model (a table entry or the scalar),
+    // else the first entry at all, so a value Claude Code would drop still
+    // shows, else the scalar.
+    if let Some(level) = resolved(profile).remove(&settings_key(&profile.models, model)) {
+        return Some(level);
+    }
+    selected_entries(profile, model)
+        .first()
+        .and_then(|key| profile.model_effort.get(key))
         .or(profile.effort.as_ref())
         .cloned()
 }
@@ -152,9 +152,10 @@ static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// `/effort` entry. A dotted version (`claude-sonnet-4.5`) folds to its
 /// dashed form too, and so does a `-latest` or `-fast` trailer after a
 /// versioned name (`claude-sonnet-4-5-latest` keys as `claude-sonnet-4-5`, as
-/// Claude Code 2.1.316's `hfs` trailer rule reads it). Any other id (a
-/// gateway's own model, or `claude-opus-latest`, which names no version) is
-/// left as written apart from a trailing `[1m]`, as Claude Code leaves it.
+/// Claude Code 2.1.316's `hfs` trailer rule reads it), and Sonnet 4 / Opus 4
+/// take their catalog id ([`catalog_id`]). Any other id (a gateway's own
+/// model, or `claude-opus-latest`, which names no version) is left as written
+/// apart from a trailing `[1m]`, as Claude Code leaves it.
 pub(crate) fn canonical_model_id(id: &str) -> String {
     let id = id.trim();
     let lower = id.to_ascii_lowercase();
@@ -163,17 +164,43 @@ pub(crate) fn canonical_model_id(id: &str) -> String {
         .or_else(|| lower.strip_suffix("[2m]"))
         .unwrap_or(&lower);
     if let Some(caps) = CLAUDE_ID.captures(bare) {
-        let name = &caps[1];
+        let name = dash_versions(&caps[1]);
         let trailer = caps.get(2).map_or("", |m| m.as_str());
-        return if name.contains(|c: char| c.is_ascii_digit()) {
-            dash_versions(name)
+        let name = if trailer.is_empty() || VERSIONED_NAME.is_match(&name) {
+            name
         } else {
-            dash_versions(&format!("{name}{trailer}"))
+            format!("{name}{trailer}")
         };
+        return catalog_id(name);
     }
     match lower.strip_suffix("[1m]") {
         Some(_) => id[..id.len() - "[1m]".len()].to_string(),
         None => id.to_string(),
+    }
+}
+
+/// A Claude model name in the grammar Claude Code 2.1.316 parses a version
+/// from (its `d`): `claude-<family>-<major>[-<minor>]`, or the legacy
+/// `claude-<major>[-<minor>]-<family>`, with one- or two-digit numbers. Only
+/// such a name loses a `-latest` / `-fast` trailer; an unknown id such as
+/// `claude-custom-123-latest` keeps it, as Claude Code keeps it.
+#[allow(
+    clippy::expect_used,
+    reason = "the versioned-name pattern is a literal"
+)]
+static VERSIONED_NAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^claude-(?:[a-z]+-\d{1,2}(?:-\d{1,2})?|\d{1,2}(?:-\d{1,2})?-[a-z]+)$")
+        .expect("the versioned-name pattern is a literal")
+});
+
+/// The catalog id Claude Code keys a model by where it differs from the
+/// folded name: Claude Code 2.1.316's catalog names Sonnet 4 and Opus 4
+/// `claude-sonnet-4-0` and `claude-opus-4-0` (every other catalog id is its
+/// folded first-party name).
+fn catalog_id(name: String) -> String {
+    match name.as_str() {
+        "claude-sonnet-4" | "claude-opus-4" => format!("{name}-0"),
+        _ => name,
     }
 }
 

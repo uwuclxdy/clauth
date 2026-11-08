@@ -20211,6 +20211,31 @@ fn a_member_store_names_its_members_levels() {
     });
 }
 
+/// An adopted retry, whose swap is gone, takes the levels of the member whose
+/// store its `previous_store` is: the levels the session still carries.
+#[test]
+fn an_adopted_retry_reads_its_outgoing_members_levels() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let a = member("lvl-adopt-a");
+        let b = member("lvl-adopt-b");
+        let a_store = member_store(&a);
+        let b_store = member_store(&b);
+        pin_levels("lvl-adopt-a", &[("opus", "high")]);
+        let retry = adopted_item_retry(
+            Some(&a_store),
+            &b_store,
+            &crate::profile::ProfileName::from("lvl-adopt-b"),
+            None,
+        )
+        .expect("an unlanded leg re-arms");
+        assert_eq!(
+            retry.outgoing_levels,
+            Some(BTreeMap::from([("opus".to_string(), "high".to_string())]))
+        );
+    });
+}
+
 /// A swap that retargets while an earlier swap's item legs are still armed
 /// takes back the levels that swap never handed over (the retry's outgoing
 /// member's), not those of the member the cell names.
@@ -20905,6 +20930,9 @@ fn keychain_leg_retry_clears_retries_only_what_clears_on_its_own() {
 /// re-arms them. A landed row, or one never swapped, arms nothing.
 #[test]
 fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
+    // The outgoing store names no member's own store here, so the retry
+    // carries no levels; the sandbox keeps that lookup off the real home.
+    let _home = HomeSandbox::new();
     let member = crate::profile::ProfileName::from("adopt-retry-b");
     let canonical = Path::new("/profiles/adopt-retry-b/credentials.json");
     let outgoing = Path::new("/profiles/adopt-retry-a/credentials.json");
