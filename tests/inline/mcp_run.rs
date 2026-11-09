@@ -8100,6 +8100,595 @@ fn a_corpse_polled_past_the_window_is_answered_with_its_session_id_not_the_aged_
     );
 }
 
+/// A collect from a session other than the one a kept corpse is tied to never
+/// takes that session's lost wake away: the record stays for its owner, whose
+/// next turn end still adopts it and wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_lost_wake() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let _ = call_monitor(&id);
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's kept corpse"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the dead job");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. \
+                 resume it with `delegate` `session_id: d-run-1`, or run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A collect of a corpse tied to another session leaves the record and
+/// answers the crashed copy's shared arm — the existing line that reads true
+/// for a record still on disk — so the answer never claims a removal that
+/// did not happen.
+#[test]
+fn a_foreign_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the foreign collect answers the crashed copy, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A foreign corpse that never recorded a session id has no handle to name:
+/// the collect says the job died, no more, and leaves the record for its
+/// owner's wake.
+#[test]
+fn a_foreign_collect_of_a_handleless_corpse_says_it_died_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// The isolated arm of the same answer: a foreign isolated corpse's
+/// transcript left with the throwaway tree, so the collect names no resume
+/// handle it could not honour.
+#[test]
+fn a_foreign_isolated_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+        "isolated": true,
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the foreign isolated collect answers the isolated arm, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A server launched outside Claude Code resolves no host session of its
+/// own, so it owns no corpse tied to a session: the collect leaves the
+/// record for the session the corpse is tied to.
+#[test]
+fn a_collect_without_a_host_session_leaves_a_tied_corpse() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUDE_CODE_SESSION_ID", None)]);
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the sessionless collect answers the crashed copy: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "a sessionless server owns no tied corpse: the record stays"
+    );
+}
+
+/// The batch arm follows the same rule per id: a foreign corpse's row reads
+/// the crashed copy, the record stays, and the batch is an error like the
+/// one-id spelling.
+#[test]
+fn a_batch_collect_leaves_a_foreign_corpse_and_answers_its_row() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor_batch(vec![&id, "d-absent-0"]);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse makes the batch an error, like the one-id spelling"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.starts_with(&format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )),
+        "the foreign row reads the crashed copy, raw like a tombstone's: {text}"
+    );
+    assert!(
+        text.contains("job `d-absent-0` unknown"),
+        "the batch still reports its other rows: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the batch leaves the record for its owner's wake"
+    );
+}
+
+/// A crashed tombstone tied to `host_session`, with `session_id` as its resume
+/// handle when it has one, written raw as the sweep writes it.
+fn seed_tied_tombstone(id: &str, host_session: &str, session_id: Option<&str>) {
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let mut record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "host_session": host_session,
+    });
+    if let Some(sid) = session_id {
+        record["session_id"] = sid.into();
+    }
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The text of a by-id `monitor` reply, asserting it is a tool error.
+fn monitor_reply(id: &str) -> String {
+    let result = call_monitor(id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a dead job's id is a tool error"
+    );
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text")
+}
+
+/// Another session's collect of a crashed tombstone that never named a
+/// session id says the job died, no more, and leaves the record.
+#[test]
+fn a_foreign_collect_of_a_handleless_tombstone_says_it_died_and_leaves_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", None);
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(jobs::read(&id).is_some(), "the record stays for its owner");
+}
+
+/// The owning session's own collect of its tied crashed tombstone claims it:
+/// the owner's copy, raw, and the record is gone, so no later turn end wakes
+/// about a job its model already asked after.
+#[test]
+fn the_owners_collect_of_its_tied_tombstone_claims_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-owner")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", Some("d-run-1"));
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )
+    );
+    assert!(jobs::read(&id).is_none(), "the owner's collect claims it");
+}
+
+/// A dead BLOCKING run's lost wake rides its crashed tombstone; a collect from
+/// another session leaves that tombstone for its owner, whose turn end still
+/// wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_crashed_tombstone() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "a foreign collect answers the crashed copy"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's crashed tombstone"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the tombstone");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. \
+                 resume it with `delegate` `session_id: d-run-1`, or run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A `monitor` collect on a dead job the sweeps now KEEP — a collectable
+/// corpse tied to a session, inside the silence window — consumes the record
+/// itself and answers the existing orphan copy, whose "its record was
+/// removed" this collect makes true; nothing is left for a later turn end to
+/// adopt.
+#[test]
+fn a_collect_consumes_the_kept_corpse_and_answers_the_orphan_copy() {
+    let home = HomeSandbox::new();
+    // The collect consumes a kept corpse only when it is the collecting
+    // session's own; pin this collector to the corpse's host session, since
+    // the bare test process resolves no session of its own.
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-kept-1")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "sess-kept-1",
+        "host_session": "sess-kept-1",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc_running_corpses(now);
+    assert!(
+        jobs::read(&id).is_some(),
+        "the collect's own sweep keeps the tied corpse inside the window"
+    );
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a corpse's id is still a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: unknown job_id: {id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: sess-kept-1"
+        ),
+        "the collect answers the existing orphan copy: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "the collect consumed the record its copy says was removed"
+    );
+    assert!(
+        !crate::hook_jobs::own_jobs("sess-kept-1", now).contains(&id),
+        "no later turn end of the session adopts the job"
+    );
+}
+
 /// The owner ruling's fallback: a corpse whose record carries no session id (a
 /// file written before the field existed) keeps the existing aged branch,
 /// byte-for-byte as shipped — the orphan copy names a handle and must not fire
@@ -12813,6 +13402,55 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             .unwrap();
         assert_eq!(row[key], serde_json::json!(want), "{id} {key}: {payload}");
     }
+}
+
+/// An orphaned row offers its session id as a resume handle only where
+/// `delegate` accepts it: an isolated run's transcript left with its throwaway
+/// tree, so its row names no resume, while a shared one beside it still does.
+#[test]
+fn the_listing_offers_no_resume_on_an_isolated_orphan() {
+    let _home = HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let started = now_ms() - 10_000;
+    for (id, isolated) in [("d-iso-0", true), ("d-shared-0", false)] {
+        let record = serde_json::json!({
+            "job_id": id,
+            "profile": "acct",
+            "state": "running",
+            "started_at": started,
+            "owner_pid": 4242,
+            "session_id": format!("{id}-sid"),
+            "isolated": isolated,
+        });
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let text = monitor_state_text();
+    let line = |id: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no row for {id}:\n{text}"))
+            .trim()
+            .to_string()
+    };
+
+    assert!(
+        line("d-iso-0").starts_with("job `d-iso-0` orphaned on `acct`, last seen "),
+        "{}",
+        line("d-iso-0")
+    );
+    assert!(
+        line("d-shared-0").starts_with(
+            "job `d-shared-0` orphaned on `acct`; resume with session id `d-shared-0-sid`, last seen "
+        ),
+        "{}",
+        line("d-shared-0")
+    );
 }
 
 /// A store at or under the bound says nothing about what it left out.

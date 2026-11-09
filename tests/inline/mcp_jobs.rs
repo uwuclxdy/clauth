@@ -851,6 +851,48 @@ fn a_record_from_a_dead_epoch_of_a_reused_pid_is_a_corpse() {
     );
 }
 
+/// A `monitor` collect runs this narrow sweep, and it must not destroy the
+/// wake a resumed session is owed: a collectable corpse tied to a session
+/// survives while it is inside the silence window, while an untied one and a
+/// silent one are reaped exactly as before.
+#[test]
+fn gc_running_corpses_keeps_a_tied_corpse_inside_the_window() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let tied = new_job_id(now);
+    let untied = new_job_id(now);
+    let silent = new_job_id(now - RUNNING_TTL_MS - 1);
+    write_running(&RunningSpec {
+        host_session: Some("sess-kept".to_string()),
+        owner_pid: 42_424,
+        ..spec(&tied, "work", now)
+    })
+    .unwrap();
+    write_running(&RunningSpec {
+        owner_pid: 42_424,
+        ..spec(&untied, "work", now)
+    })
+    .unwrap();
+    write_running(&RunningSpec {
+        host_session: Some("sess-kept".to_string()),
+        owner_pid: 42_424,
+        ..spec(&silent, "work", now - RUNNING_TTL_MS - 1)
+    })
+    .unwrap();
+
+    gc_running_corpses(now);
+
+    assert!(
+        read(&tied).is_some(),
+        "a tied corpse inside the window survives for the session's wake"
+    );
+    assert!(
+        read(&untied).is_none(),
+        "no session to wake: reaped at once"
+    );
+    assert!(read(&silent).is_none(), "silent past the window: reaped");
+}
+
 /// The partition the docs state: silence is the OWNERLESS rule. An owned
 /// record whose server is alive is never a corpse however silent it sits —
 /// its marker is the whole verdict — so the two legs cannot disagree about a

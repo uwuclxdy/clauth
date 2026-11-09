@@ -2807,7 +2807,9 @@ fn fold_jobs_listing(payload: &mut serde_json::Value, now: u64) {
 /// One listing row. A live run is dated by how long it has been going, a
 /// finished or orphaned one by how long since its record last mattered — two
 /// different questions, so two different keys rather than one that means
-/// whichever the state implies.
+/// whichever the state implies. An isolated record's row also carries the
+/// only-when-true `isolated` flag, so the listing prose can drop the resume
+/// sentence whose handle an isolated transcript cannot honour.
 fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
     let phase = job.phase();
     let mut row = serde_json::json!({
@@ -2823,6 +2825,9 @@ fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
     }
     if let Some(sid) = &job.record.session_id {
         row["session_id"] = serde_json::json!(sid);
+    }
+    if job.record.isolated {
+        row["isolated"] = serde_json::json!(true);
     }
     row
 }
@@ -2876,22 +2881,26 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
     // path component.
     debug_assert!(jobs::is_safe_job_id(&job_id));
     let now = now_ms();
-    // READ FIRST: the sweep below destroys the very record this call came for
-    // when that record is a corpse, and the `session_id` it carried is the
-    // handle the caller needs. Captured before the sweep, it is what answers
-    // the `Unknown` arm below instead of the aged branch.
+    // READ FIRST: the sweep below reaps this call's very record when that
+    // record is an untied or silent corpse, and the collect consumes it when
+    // it is a kept one this session owns; the `session_id` it carried is the
+    // handle the caller needs either way. Captured before both, it is what
+    // answers the `Unknown` arm below instead of the aged branch. A kept
+    // corpse another session owns is neither swept nor consumed, and its
+    // answer reads the record itself, not this capture.
     let before_sweep = jobs::read(&job_id);
     // A collect is the other moment a corpse matters — see
     // `jobs::gc_running_corpses`.
     jobs::gc_running_corpses(now);
-    let outcome = read_collectable(&job_id);
+    let outcome = collect_one(&job_id, now);
 
     match outcome {
         WaitOutcome::Unknown => {
-            // A corpse the sweep just reaped answers with the handle it carried;
-            // anything else keeps the hedged branches. The silence check is the
-            // sweep's own predicate, so this arm names exactly what the sweep
-            // removed and nothing a concurrent collect made vanish.
+            // A corpse the sweep reaped or this collect consumed answers with
+            // the handle it carried; anything else keeps the hedged branches.
+            // The corpse check is the sweep's own predicate, so this arm names
+            // exactly the record the sweep or the collect removed and nothing
+            // a concurrent collect made vanish.
             let reason = match &before_sweep {
                 Some(record)
                     if record.state == jobs::JobState::Running
@@ -2902,6 +2911,17 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
                 }
                 _ => unknown_job_reason(&job_id, now),
             };
+            let payload = serde_json::json!({
+                "is_error": true,
+                "result": reason,
+            });
+            let prose = render::monitor_job_prose(&payload);
+            Ok(CallToolResult::error(single_block(prose)))
+        }
+        WaitOutcome::Foreign(record) => {
+            // The record stays on disk for its owner's wake, so the orphan
+            // copy's "its record was removed" must not fire.
+            let reason = foreign_job_reason(&job_id, &record);
             let payload = serde_json::json!({
                 "is_error": true,
                 "result": reason,
@@ -2945,10 +2965,12 @@ async fn monitor_batch(
 
     let now = now_ms();
     // READ FIRST, for the same reason the one-id arm does: the sweep below
-    // reaps a corpse before the read, and the handle it carried is the whole
-    // point of polling the id. An unsafe id can never name a job file and
-    // resolves `Unknown` like the read resolves it, so it is not read at all
-    // here — the path join below must stay off a caller's string.
+    // reaps a corpse before the read, and the collect consumes a kept one this
+    // session owns; the handle it carried is the whole point of polling the
+    // id. An unsafe id can never name a job file and resolves `Unknown` like
+    // the read resolves it, so it is not read at all here — the path join
+    // below must stay off a caller's string. A kept corpse another session
+    // owns is left and its answer reads the record itself, not this capture.
     let before_sweep: Vec<Option<jobs::JobRecord>> = job_ids
         .iter()
         .map(|id| jobs::is_safe_job_id(id).then(|| jobs::read(id)).flatten())
@@ -2959,7 +2981,7 @@ async fn monitor_batch(
         .iter()
         .map(|id| {
             let outcome = if jobs::is_safe_job_id(id) {
-                read_collectable(id)
+                collect_one(id, now)
             } else {
                 WaitOutcome::Unknown
             };
@@ -2970,10 +2992,11 @@ async fn monitor_batch(
     let mut results = Vec::with_capacity(outcomes.len());
     let mut any_error = false;
     let mut unknown_job_id_count = 0u64;
-    // The owner-ruled orphan copy, one line per reaped corpse with a handle,
-    // in the order asked. Rendered after the rows because the row for a
-    // missing file is the batch's bare `unknown` verdict — which stays TRUE,
-    // the sweep did remove it — and this line says why it is missing.
+    // The owner-ruled orphan copy, one line per reaped or consumed corpse
+    // with a handle, in the order asked. Rendered after the rows because the
+    // row for a missing file is the batch's bare `unknown` verdict — which
+    // stays TRUE, the sweep or the collect did remove it — and this line says
+    // why it is missing.
     let mut orphan_reasons: Vec<String> = Vec::new();
     for ((id, outcome), prior) in outcomes.into_iter().zip(&before_sweep) {
         let entry = match outcome {
@@ -2989,6 +3012,13 @@ async fn monitor_batch(
                 serde_json::json!({ "job_id": echo_name(&id), "status": "unknown" })
             }
             WaitOutcome::Running(record) => running_payload(&echo_name(&id), &record, now_ms()),
+            WaitOutcome::Foreign(record) => {
+                // Same rule as the one-id arm, rendered raw like a crashed
+                // tombstone's.
+                let reason = foreign_job_reason(&id, &record);
+                any_error = true;
+                serde_json::json!({ "crashed": true, "result": reason })
+            }
             WaitOutcome::Done(record) => {
                 // An owned record's file is already evicted by its claim; a
                 // refused one (mismatched self-report) was renamed back and
@@ -3205,15 +3235,32 @@ enum WaitOutcome {
     /// Present but not yet finished. Carries the record so the caller can
     /// report `elapsed_secs`.
     Running(jobs::JobRecord),
-    /// No such job file: never created, already evicted, or claimed by a
-    /// sibling collect — the hedged unknown copy answers all three.
+    /// No such job file: never created, already evicted, claimed by a
+    /// sibling collect, or a corpse this call's sweep reaped or its collect
+    /// removed — a reaped or collected corpse is answered with the orphan
+    /// copy when it carried a session id, the rest with the hedged unknown
+    /// one.
     Unknown,
+    /// A dead job tied to ANOTHER session — a kept corpse, or a blocking
+    /// run's crashed tombstone: left on disk for its owner's lost wake, and
+    /// answered with the crashed copy, which reads true for a record still on
+    /// disk.
+    Foreign(jobs::JobRecord),
 }
 
 /// Read one collectable record, claiming a done file so exactly one delivery
-/// owns it. An absent file is `Unknown`; a running file is `Running`.
+/// owns it. An absent file is `Unknown`; a running file is `Running`. A
+/// crashed tombstone carries its owner's lost wake, so one tied to another
+/// session is left unclaimed as `Foreign`.
 fn read_collectable(job_id: &str) -> WaitOutcome {
     match jobs::read(job_id) {
+        Some(r)
+            if r.state == jobs::JobState::Done
+                && r.crashed
+                && !corpse_reports_to(&r, host_session(host_pid()).as_deref()) =>
+        {
+            WaitOutcome::Foreign(r)
+        }
         Some(r) if r.state == jobs::JobState::Done => {
             match jobs::claim(job_id, jobs::Claimant::Monitor) {
                 jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
@@ -3223,6 +3270,40 @@ fn read_collectable(job_id: &str) -> WaitOutcome {
         Some(r) => WaitOutcome::Running(r),
         None => WaitOutcome::Unknown,
     }
+}
+
+/// Whether a corpse's lost wake is `session`'s to carry: the record is tied
+/// to that session, or it is tied to no session and a session is asking. The
+/// watcher's [`poll_job`] and a `monitor` collect ([`collect_one`]) share it,
+/// so one session can consume exactly what it may report — a corpse tied to
+/// another session is that session's to wake about.
+fn corpse_reports_to(record: &jobs::JobRecord, session: Option<&str>) -> bool {
+    record.host_session.as_deref() == session
+        || (session.is_some() && record.host_session.is_none())
+}
+
+/// A collect answering a dead job by id consumes the record the sweep kept
+/// when the corpse is this session's to report, and the orphan copy answers
+/// "its record was removed" — this collect is the removal the copy names.
+/// Consuming it also keeps any later turn end of the session from adopting
+/// the job. A corpse tied to ANOTHER session is left on disk for its owner's
+/// wake and answered as [`WaitOutcome::Foreign`]; a live record passes
+/// through untouched.
+fn collect_one(job_id: &str, now: u64) -> WaitOutcome {
+    let outcome = read_collectable(job_id);
+    if let WaitOutcome::Running(record) = &outcome
+        && jobs::running_is_corpse(record, now)
+    {
+        // The watcher's own ownership test: a session may consume exactly
+        // what it may report, so a foreign corpse stays for its owner's turn
+        // end instead of being collected out from under it.
+        if corpse_reports_to(record, host_session(host_pid()).as_deref()) {
+            jobs::remove(job_id);
+            return WaitOutcome::Unknown;
+        }
+        return WaitOutcome::Foreign(record.clone());
+    }
+    outcome
 }
 
 /// The running-check payload both `monitor` arms render, so the one-id and
@@ -3302,7 +3383,10 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// branch unchanged (owner ruling 2026-09-02), since the orphan copy names a
 /// handle it has nothing to put there.
 ///
-/// The copy is owner-ruled (2026-09-02, verbatim), never reworded. The split is
+/// The copy is owner-ruled (2026-09-02, verbatim), never reworded. The removal
+/// the copy names is the sweep's for an untied or silent corpse and this
+/// collect's own for a kept one ([`collect_one`]); either way the copy answers
+/// only a record that is already gone. The split is
 /// the record's own isolation flag: a shared run's transcript is in the global
 /// store and its handle resolves, an isolated one's left with its throwaway
 /// tree — the crash skipped the rescue — so offering that handle would promise
@@ -3322,13 +3406,14 @@ fn orphan_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
     })
 }
 
-/// The owner-ruled copy (verbatim, never reworded) for a crashed run whose
-/// tombstone is STILL ON DISK ([`jobs::JobRecord::crashed`]): the sweep
-/// converted the silent blocking run's liveness record into a `Done` record
-/// with no envelope, keeping the handle and isolation flag. The shared arm
-/// names the handle; the isolated arm cannot, because its transcript left with
-/// the throwaway tree. A shared tombstone with no `session_id` returns `None` —
-/// it has no handle to promise — and the caller keeps the envelope fallback.
+/// The owner-ruled copy (verbatim, never reworded) for a dead job whose
+/// record is STILL ON DISK: a crashed tombstone ([`jobs::JobRecord::crashed`]),
+/// which the sweep converted from the silent blocking run's liveness record,
+/// and a foreign kept corpse a collect leaves for its owner's wake. The
+/// shared arm names the handle; the isolated arm cannot, because its
+/// transcript left with the throwaway tree. A shared record with no
+/// `session_id` returns `None` — it has no handle to promise — and the caller
+/// keeps its own fallback.
 fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
     Some(if record.isolated {
         format!(
@@ -3342,6 +3427,16 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
              it's still resumable from its session id: {session_id}"
         )
     })
+}
+
+/// The answer to a collect of a dead job tied to another session, whose record
+/// stays on disk for its owner's wake: the crashed copy, which reads true for a
+/// record still on disk, and for a shared record with no `session_id` (it died
+/// before naming one) the same first sentence alone, since there is no handle
+/// to promise.
+fn foreign_job_reason(job_id: &str, record: &jobs::JobRecord) -> String {
+    crashed_job_reason(job_id, record)
+        .unwrap_or_else(|| format!("job {job_id} died without finishing and left no result."))
 }
 
 /// Why an id names no job file, and what the caller can do about it.
@@ -3362,8 +3457,8 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
 /// older than [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain —
 /// neither reap runs from less than a day back ([`jobs::RUNNING_TTL_MS`] adds
 /// a 600 s grace on top), so a younger id cannot have been swept — and
-/// collection leads there because every collect evicts while the sweep runs at
-/// startup alone.
+/// collection leads there because a collect evicts what it delivers while the
+/// sweep runs at startup alone.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // Checked FIRST, because it is the one cause this function can actually
     // know. Everything below hedges; this does not. A blocking delegate's record
@@ -6992,15 +7087,26 @@ fn print_mode_stop() -> bool {
 /// A turn-end payload names no job, and its prose can quote one, so its watched
 /// set comes from the store alone. `None` ends the hook: print mode (see
 /// [`print_mode_stop`]); a subagent's turn end writes its own cache, not the
-/// session's; nothing of this session's is out; or a live watcher already
-/// holds the session.
+/// session's; nothing of this session's is out; every job of this session's
+/// that is out was already reported lost; or a live watcher already holds the
+/// session.
 fn turn_end_watch(payload: Option<&crate::hook_note::Payload>) -> Option<AwaitWatch> {
     let payload = payload.filter(|p| turn_end_event(&p.event) && p.agent_id.is_none())?;
     if print_mode_stop() {
         return None;
     }
     let now = crate::usage::now_ms();
-    let adopted = crate::hook_jobs::own_jobs(&payload.session_id, now);
+    let mut adopted = crate::hook_jobs::own_jobs(&payload.session_id, now);
+    if !adopted.is_empty() {
+        // A kept corpse stays in the store for up to the silence window after
+        // the wake already reported it lost; the reported-lost sidecar is what
+        // keeps that report to once. Drop the ids it names here, so a turn end
+        // whose only adopted jobs are already reported ends the hook at once —
+        // no watcher process, no lease — instead of starting a watcher that
+        // would find nothing left to say.
+        let reported = crate::hook_jobs::reported_lost(&payload.session_id);
+        adopted.retain(|id| !reported.contains(id));
+    }
     if adopted.is_empty() {
         return None;
     }
@@ -7133,16 +7239,18 @@ fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String
     (2, Some(reminder))
 }
 
-/// The line a job past the 24 h limit earns: nothing promises a wake for it.
+/// The line a job past the 24 h limit earns: the wait's deadline has passed,
+/// so the watcher points the caller at `monitor` instead of promising a wake
+/// it can no longer deliver.
 fn await_limit_line(pending: &[String]) -> String {
     if let [job] = pending {
         format!(
-            "24 hours have passed and delegate job `{job}` still running; call `monitor` to retrieve it — clauth will not wake this session when it finishes."
+            "24 hours have passed and delegate job `{job}` is still running; call `monitor` to check on it."
         )
     } else {
         let ids = pending.join("`, `");
         format!(
-            "24 hours have passed and delegate jobs `{ids}` still running; call `monitor` to retrieve them — clauth will not wake this session when they finish."
+            "24 hours have passed and delegate jobs `{ids}` are still running; call `monitor` to check on them."
         )
     }
 }
@@ -7160,7 +7268,9 @@ const LOST_AGE_AFTER_SECS: u64 = 5 * 60;
 /// than [`LOST_AGE_AFTER_SECS`] after the record last moved, how long ago that
 /// was, in the same duration spelling the listing's orphaned row dates "last
 /// seen" with ([`crate::format::humanize_span`]). Several share the plural
-/// line, which carries no ages.
+/// line, which carries no ages and offers the resume arm only when every job
+/// names a session id and none ran isolated: one job without a handle would
+/// make the offer false for the rest.
 fn await_lost_line(dead: &[LostJob]) -> String {
     if let [lost] = dead {
         let age_secs = crate::usage::now_ms().saturating_sub(lost.last_seen_ms) / 1000;
@@ -7185,10 +7295,15 @@ fn await_lost_line(dead: &[LostJob]) -> String {
             .map(|lost| lost.id.as_str())
             .collect::<Vec<_>>()
             .join("`, `");
-        format!(
-            "delegate jobs `{ids}` ended with their server; their results are lost. \
-             resume each with `delegate` and its session id from `monitor`, or run them again."
-        )
+        let resume = if dead
+            .iter()
+            .all(|lost| lost.session_id.is_some() && !lost.isolated)
+        {
+            " resume each with `delegate` and its session id from `monitor`, or run them again."
+        } else {
+            " run them again."
+        };
+        format!("delegate jobs `{ids}` ended with their server; their results are lost.{resume}")
     }
 }
 
@@ -7264,9 +7379,9 @@ fn poll_job(
         // The wake keys on the phase alone. A job tied to another session is
         // that session's to report; an untied one has this hook alone. The
         // ownership test reads the payload's session, lease or not, so a
-        // print-mode wait reports the same lost jobs an interactive one would.
-        let ours = record.host_session.as_deref() == report_session
-            || (report_session.is_some() && record.host_session.is_none());
+        // print-mode wait reports the same lost jobs an interactive one would
+        // — and it is the same predicate the collect gates on.
+        let ours = corpse_reports_to(&record, report_session);
         return if ours {
             WatchedJob::Dead(LostJob {
                 id: record.job_id.clone(),

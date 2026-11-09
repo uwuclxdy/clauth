@@ -755,7 +755,9 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 /// One age per row and no tail, no quota and no deadline countdown: this
 /// enumerates so a caller can NAME a job, and `monitor({job_ids})` is the check
 /// that reports what one is doing. Ten rows of the full running line would cost
-/// more than the reply it rides on.
+/// more than the reply it rides on. An isolated orphan's row names no resume:
+/// its transcript left with the throwaway tree, so the session id is no handle
+/// `delegate` accepts.
 fn jobs_listing_prose(p: &Value) -> String {
     let Some(rows) = p.get("jobs").and_then(Value::as_array) else {
         return String::new();
@@ -788,8 +790,16 @@ fn jobs_listing_prose(p: &Value) -> String {
         // for an orphaned row (the only handle left) and a done one (the
         // completion's own id, stamped by every completion arm). On a running
         // row it would invite resuming a session the live run still holds, so
-        // it stays unsaid there — the JSON row still carries the key either way.
+        // it stays unsaid there — the JSON row still carries the key either
+        // way. An isolated orphan's id is no handle either (its transcript
+        // left with the throwaway tree), so its row says nothing about
+        // resuming; a done row keeps the sentence whatever its run was.
+        let isolated = row
+            .get("isolated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if matches!(state, "orphaned" | "done")
+            && !(state == "orphaned" && isolated)
             && let Some(sid) = row.get("session_id").and_then(Value::as_str)
         {
             out.push_str(&format!("; resume with session id `{sid}`"));

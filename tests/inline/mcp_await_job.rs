@@ -460,11 +460,168 @@ fn several_lost_jobs_share_one_plural_line() {
             2,
             Some(
                 "delegate jobs `d-a`, `d-b` ended with their server; their results are lost. \
-                 resume each with `delegate` and its session id from `monitor`, or run them again."
+                 run them again."
                     .to_string(),
             ),
         ),
     );
+}
+
+/// One isolated job among shared ones: its session id is no handle `delegate`
+/// accepts, so the plural line offers no resume at all.
+#[test]
+fn several_lost_jobs_with_one_isolated_offer_no_resume() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    write_lost_record("d-shared", Some(SESSION), Some("d-shared-1"), now);
+    write_lost_record("d-iso", Some(SESSION), Some("d-iso-1"), now);
+    let path = jobs::jobs_dir().unwrap().join("d-iso.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["isolated"] = true.into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let watch = watcher(&["d-shared", "d-iso"], &[], 0);
+
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(
+                "delegate jobs `d-shared`, `d-iso` ended with their server; their results are lost. \
+                 run them again."
+                    .to_string(),
+            ),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// One job with no session id among resumable ones: nothing to resume it
+/// from, so the plural line offers no resume.
+#[test]
+fn several_lost_jobs_with_one_lacking_a_session_id_offer_no_resume() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    write_lost_record("d-shared", Some(SESSION), Some("d-shared-1"), now);
+    write_lost_record("d-bare", Some(SESSION), None, now);
+    let watch = watcher(&["d-shared", "d-bare"], &[], 0);
+
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(
+                "delegate jobs `d-shared`, `d-bare` ended with their server; their results are lost. \
+                 run them again."
+                    .to_string(),
+            ),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// Claude Code quitting kills its `clauth mcp`, and a background job with it;
+/// the resumed session's own `clauth mcp` runs the store's startup sweep (and a
+/// `monitor` collect runs the corpse sweep) before that session's first turn
+/// end. A dead job tied to a session outlives both sweeps while inside the
+/// store's silence window, so that first turn end still adopts it and wakes
+/// with the lost line, once.
+#[test]
+fn a_dead_job_tied_to_a_session_outlives_the_startup_sweep_and_wakes_once() {
+    let home = HomeSandbox::new();
+    let _env = entrypoint_pin(&home, "cli");
+    write_job("d-gone", Some(SESSION), "running", 4242);
+
+    let now = crate::usage::now_ms();
+    jobs::gc(now);
+    jobs::gc_running_corpses(now);
+
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the dead job still arms the watcher");
+    assert_eq!(watch.adopted, ["d-gone"], "the resumed session adopts it");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(
+                "delegate job `d-gone` ended with its server; its result is lost. run the task again."
+                    .to_string(),
+            ),
+        ),
+        "{outcome:?}"
+    );
+
+    let again = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&again), (0, None), "{again:?}");
+}
+
+/// The retention the resumed-session wake buys is bounded: a dead job tied to
+/// a session but silent past the store's window goes at the startup sweep, and
+/// a dead job tied to no session goes at once, as before.
+#[test]
+fn the_startup_sweep_still_reaps_a_silent_or_untied_dead_job() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    write_job_started(
+        "d-silent",
+        Some(SESSION),
+        "running",
+        4242,
+        now - jobs::RUNNING_TTL_MS - MINUTE_MS,
+    );
+    write_job("d-untied", None, "running", 4242);
+    write_job("d-tied", Some(SESSION), "running", 4242);
+
+    jobs::gc(now);
+
+    assert!(jobs::read("d-silent").is_none(), "silent past the window");
+    assert!(jobs::read("d-untied").is_none(), "no session to wake");
+    assert!(jobs::read("d-tied").is_some(), "inside the window, tied");
+}
+
+/// A kept corpse stays in the store for up to the silence window after its
+/// lost wake, so every later turn end of the session adopts it again. The
+/// reported-lost sidecar keeps the wake to once, and a turn end whose only
+/// adopted jobs are already reported ends the hook at once — no watcher
+/// process, no lease, nothing to wait on.
+#[test]
+fn a_turn_end_with_only_reported_jobs_starts_no_watcher() {
+    let home = HomeSandbox::new();
+    let _env = entrypoint_pin(&home, "cli");
+    write_job("d-gone", Some(SESSION), "running", 4242);
+    crate::hook_jobs::record_lost(SESSION, &["d-gone".to_string()]);
+
+    let watch = turn_end_watch(Some(&payload("Stop")));
+
+    assert!(
+        watch.is_none(),
+        "the sidecar already names the only adopted job, so the hook ends with no watcher"
+    );
+    assert!(
+        jobs::read("d-gone").is_some(),
+        "the turn end leaves the kept corpse where the sweeps keep it"
+    );
+}
+
+/// A reported job beside one still to deliver: the turn end drops only the
+/// ids the reported-lost sidecar names and still watches the rest.
+#[test]
+fn a_turn_end_drops_only_the_jobs_already_reported_lost() {
+    let home = HomeSandbox::new();
+    let _env = entrypoint_pin(&home, "cli");
+    write_job("d-gone", Some(SESSION), "running", 4242);
+    running("d-live");
+    crate::hook_jobs::record_lost(SESSION, &["d-gone".to_string()]);
+
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the live job still arms the watcher");
+
+    assert_eq!(watch.adopted, ["d-live"]);
 }
 
 /// A lost job beside a delivered result: one wake carries both — the folded
@@ -697,7 +854,7 @@ fn the_limit_line_alone_asks_for_monitor() {
         (
             2,
             Some(
-                "24 hours have passed and delegate job `d-a` still running; call `monitor` to retrieve it — clauth will not wake this session when it finishes."
+                "24 hours have passed and delegate job `d-a` is still running; call `monitor` to check on it."
                     .to_string(),
             ),
         ),
@@ -707,7 +864,7 @@ fn the_limit_line_alone_asks_for_monitor() {
         (
             2,
             Some(
-                "24 hours have passed and delegate jobs `d-a`, `d-b` still running; call `monitor` to retrieve them — clauth will not wake this session when they finish."
+                "24 hours have passed and delegate jobs `d-a`, `d-b` are still running; call `monitor` to check on them."
                     .to_string(),
             ),
         ),
@@ -1149,7 +1306,7 @@ fn a_live_owner_job_silent_past_the_ttl_ends_the_wait_naming_only_it() {
         (
             2,
             Some(
-                "24 hours have passed and delegate job `d-hung` still running; call `monitor` to retrieve it — clauth will not wake this session when it finishes."
+                "24 hours have passed and delegate job `d-hung` is still running; call `monitor` to check on it."
                     .to_string(),
             ),
         ),
@@ -1295,7 +1452,7 @@ fn the_deadline_names_the_untied_rest_beside_the_lost_job() {
         await_job_wake(&outcome).1.as_deref(),
         Some(
             "delegate job `d-t` ended with its server; its result is lost. run the task again. \
-             24 hours have passed and delegate job `d-u` still running; call `monitor` to retrieve it — clauth will not wake this session when it finishes."
+             24 hours have passed and delegate job `d-u` is still running; call `monitor` to check on it."
         ),
     );
 }

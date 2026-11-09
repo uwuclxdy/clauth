@@ -63,10 +63,15 @@ pub(crate) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 ///
 /// Since the owner marker landed, this window is the FALLBACK a record an older
 /// server wrote keeps: an owned record's corpse verdict is its marker (see
-/// [`owner_is_live`]), which reaps it at the owner's death, not a day later. The
+/// [`owner_is_live`]), read dead at the owner's death, not a day later. The
 /// day plus 600 s grace still buys the pre-marker records their old behaviour —
 /// a crashed old server's record stays resolvable for a day, so the `session_id`
-/// it carries can still be collected and resumed the next morning. Nothing a
+/// it carries can still be collected and resumed the next morning — and it is
+/// how long a collectable corpse tied to a session is kept until it has been
+/// silent past this window (see [`sweep`]), giving the session's watcher its
+/// chance to report the lost job. The keep runs from the record's silence
+/// anchor, not the owner's death, so a record silent before its server died
+/// is kept only for the rest of the window. Nothing a
 /// healthy run does comes near the window: a delegate is unbounded, so once a
 /// run has spawned, only a dead server keeps its record silent for anything
 /// close to a day. The 600 s grace covers the heartbeat throttle and the
@@ -625,9 +630,11 @@ pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Delete a job file (best-effort). No delivery path calls this any more:
-/// a collect evicts through [`claim`]. The remaining caller gives a reserved
-/// running job's record back on abandon.
+/// Delete a job file (best-effort). A delivered RESULT still evicts through
+/// [`claim`], never here: the claim's rename is what hands one delivery to
+/// exactly one claimant. The two callers left delete a record no envelope
+/// has to serialize — a monitor collect consuming a kept corpse, and an
+/// abandon giving a reserved running job's record back.
 pub(crate) fn remove(job_id: &str) {
     if let Ok(path) = job_path(job_id, RecordKind::Collectable) {
         let _ = std::fs::remove_file(path);
@@ -1096,7 +1103,9 @@ fn gc_server_markers() {
 }
 
 /// Best-effort GC at server startup: drop `done` files past their TTL and
-/// `running` files whose server is gone ([`running_is_corpse`]), sweep stray
+/// `running` files whose server is gone ([`running_is_corpse`], save a
+/// collectable corpse tied to a session, kept until it has been silent past the
+/// window so its session's watcher can report it lost), sweep stray
 /// `.tmp` from a crash mid-write, reap stale delivery ledgers, reap the result
 /// files whose job the same rules retired, and prune the owner markers no
 /// server holds any more. Nothing is evicted by count: the store is bounded by
@@ -1115,10 +1124,12 @@ pub(crate) fn gc(now: u64) {
 /// here is the corpse: [`running_is_corpse`] already knows a record whose
 /// server died mid-job is dead — the moment its owner marker drops, not just
 /// after the silence window — and until now `serve()` was the only place that
-/// knowledge was ever applied, so a corpse polled `running` for hours. One
-/// corpse shape is CONVERTED instead of reaped: a dead blocking run's liveness
+/// knowledge was ever applied, so a corpse polled `running` for hours. Two
+/// corpse shapes survive it. One is CONVERTED: a dead blocking run's liveness
 /// record becomes the sweep's tombstone, which keeps the handle for a later
-/// resume (see [`sweep`]).
+/// resume (see [`sweep`]). The other is KEPT: a collectable corpse tied to a
+/// session, until it has been silent past the window — the session's watcher
+/// still owes it one lost-job wake (see [`sweep`]).
 pub(crate) fn gc_running_corpses(now: u64) {
     sweep(now, Scope::RunningCorpses);
 }
@@ -1198,7 +1209,10 @@ pub(crate) fn owner_is_gone(record: &JobRecord) -> bool {
 }
 
 /// Whether a `running` record is a corpse — the one question
-/// [`gc_running_corpses`] reaps on. A record whose owner is gone is a corpse AT
+/// [`gc_running_corpses`] reaps on. The verdict is unchanged by the keep: a
+/// tied collectable corpse inside the silence window still reads a corpse
+/// here, and the sweep's keep arm adds a second condition beside the verdict
+/// (see [`sweep`]). A record whose owner is gone is a corpse AT
 /// THE NEXT READ, never only after the silence window: the marker flock drops
 /// with the owning server however it dies, so a killed session's rows read dead
 /// within one poll of its death. The silence window is the OWNERLESS rule — a
@@ -1550,7 +1564,17 @@ fn sweep(now: u64, scope: Scope) {
         let kind = record_kind(&path);
         let expired = match record.state {
             JobState::Done => full && done_is_expired(&record, now),
-            JobState::Running => running_is_corpse(&record, now),
+            // A collectable corpse tied to a session is kept until it has been
+            // silent past the window: the session's watcher still owes it one
+            // lost-job wake. An untied corpse has no watcher to owe, a silent
+            // one has had the window, and a liveness record keeps its own arm
+            // below.
+            JobState::Running => {
+                running_is_corpse(&record, now)
+                    && (kind == RecordKind::Liveness
+                        || record.host_session.is_none()
+                        || running_is_silent(&record, now))
+            }
         };
         if !expired {
             surviving.insert(record.job_id.clone());
@@ -1558,8 +1582,10 @@ fn sweep(now: u64, scope: Scope) {
         }
         // A dead blocking run's liveness record is CONVERTED rather than
         // deleted: the caller holding the join is gone, and the run's handle is
-        // the only thing it left to resume from. The collectable spelling keeps
-        // being deleted, since its server dying means its result died with it.
+        // the only thing it left to resume from. A collectable corpse tied to a
+        // session was kept above for the session's watcher to report lost; an
+        // untied or silent one is deleted, since its result died with its
+        // server and no watcher will report it.
         if record.state == JobState::Running && kind == RecordKind::Liveness {
             // The conversion writes to the COLLECTABLE spelling, a file this
             // sweep has not read. Never overwrite a record that carries an

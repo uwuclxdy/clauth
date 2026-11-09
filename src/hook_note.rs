@@ -1691,8 +1691,13 @@ pub(crate) fn gc_conversation_records() {
         }
         // A print-mode (unleased) watcher writes the lost sidecar with no
         // `.watch` beside it, so the lease arm never reaches it: reap it on
-        // its own once it has outlived the job store's day. A fresher one
-        // still guards a live session's once.
+        // its own once it has outlived the longest a kept corpse can survive —
+        // the running store's silence window — since a fresher one still
+        // guards a live session's once. The age implies the corpse's age, but
+        // removal does not follow it: a process running this sweep without a
+        // jobs sweep reaps the sidecar first, and the next turn end adopts
+        // the still-kept corpse and wakes a second time. The sidecar stays
+        // while any id it names still has a collectable record.
         if path
             .extension()
             .is_some_and(|ext| ext == crate::hook_jobs::REPORTED_LOST_EXTENSION)
@@ -1702,11 +1707,23 @@ pub(crate) fn gc_conversation_records() {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|m| SystemTime::now().duration_since(m).ok())
-                .is_some_and(|a| a > Duration::from_millis(crate::mcp::jobs::DONE_TTL_MS));
+                .is_some_and(|a| a > Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS));
+            let still_guarding = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(crate::hook_jobs::reported_lost)
+                .is_some_and(|ids| {
+                    // The sidecar is user-editable, so only a safe id may
+                    // reach a path join in the jobs store.
+                    ids.iter().any(|id| {
+                        crate::mcp::jobs::is_safe_job_id(id) && crate::mcp::jobs::read(id).is_some()
+                    })
+                });
             if aged
                 && !path
                     .with_extension(crate::hook_jobs::WATCH_LEASE_EXTENSION)
                     .exists()
+                && !still_guarding
             {
                 let _ = std::fs::remove_file(path);
             }

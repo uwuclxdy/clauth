@@ -448,7 +448,8 @@ fn the_sweep_reaps_a_record_whose_transcript_is_gone() {
 
 /// A print-mode (unleased) watcher writes the lost sidecar with no `.watch`
 /// beside it, so the lease reap never reaches it: once the sidecar has
-/// outlived the job store's day, the sweep removes it on its own.
+/// outlived the longest a kept corpse can survive — the running store's
+/// silence window — the sweep removes it on its own.
 #[test]
 fn the_sweep_reaps_an_aged_lost_sidecar_with_no_lease() {
     let _home = HomeSandbox::new();
@@ -460,13 +461,148 @@ fn the_sweep_reaps_an_aged_lost_sidecar_with_no_lease() {
     crate::testutil::set_mtime(
         &sidecar,
         SystemTime::now()
-            - Duration::from_millis(crate::mcp::jobs::DONE_TTL_MS)
+            - Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS)
             - Duration::from_secs(60),
     );
 
     gc_conversation_records();
 
     assert!(!sidecar.exists(), "an aged no-lease sidecar is reaped");
+}
+
+/// The sidecar alone must outlive every record it guards: a kept corpse
+/// survives the store until its silence window (ten minutes past the done
+/// TTL), so a no-lease sidecar inside that window still guards the live
+/// session's once and the sweep leaves it.
+#[test]
+fn a_no_lease_sidecar_survives_the_sweep_until_the_corpses_window_ends() {
+    let _home = HomeSandbox::new();
+    crate::hook_jobs::record_lost("conv-print-2", &["d-dead".to_string()]);
+    let sidecar = record_path("conv-print-2", None)
+        .expect("record path")
+        .with_extension("lost");
+    assert!(sidecar.exists());
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now() - Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS)
+            + Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(
+        sidecar.exists(),
+        "a sidecar inside the corpse window still guards the once"
+    );
+}
+
+/// The sidecar's age implies its corpse's age, but removal does not follow
+/// it: a process running the conversation sweep without a jobs sweep reaps
+/// the aged sidecar first, and the next turn end adopts the still-kept
+/// corpse and wakes a second time. The sweep leaves the sidecar while any id
+/// it names still has a collectable record.
+#[test]
+fn an_aged_sidecar_whose_record_still_sits_on_disk_survives_the_sweep() {
+    let _home = HomeSandbox::new();
+    crate::hook_jobs::record_lost("conv-print-f2", &["d-f2".to_string()]);
+    // A collectable record for the id the sidecar names, as a jobs sweep
+    // that has not run since would leave it on disk.
+    let dir = crate::mcp::jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = crate::usage::now_ms();
+    std::fs::write(
+        dir.join("d-f2.json"),
+        format!(
+            r#"{{"job_id":"d-f2","profile":"acct","state":"running","started_at":{},"owner_pid":4242,"host_session":"conv-print-f2"}}"#,
+            now - 10_000,
+        ),
+    )
+    .unwrap();
+    let sidecar = record_path("conv-print-f2", None)
+        .expect("record path")
+        .with_extension("lost");
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now()
+            - Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS)
+            - Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(
+        sidecar.exists(),
+        "the sidecar outlives the window while the record it names is still on disk"
+    );
+}
+
+/// A sidecar naming two lost jobs stays while ANY of them still has a record:
+/// one record already reaped, the other still on disk, and the sidecar keeps
+/// guarding the second job's once.
+#[test]
+fn an_aged_sidecar_stays_while_any_job_it_names_still_has_a_record() {
+    let _home = HomeSandbox::new();
+    crate::hook_jobs::record_lost(
+        "conv-print-two",
+        &["d-gone-a".to_string(), "d-kept-b".to_string()],
+    );
+    let dir = crate::mcp::jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = crate::usage::now_ms();
+    std::fs::write(
+        dir.join("d-kept-b.json"),
+        format!(
+            r#"{{"job_id":"d-kept-b","profile":"acct","state":"running","started_at":{},"owner_pid":4242,"host_session":"conv-print-two"}}"#,
+            now - 10_000,
+        ),
+    )
+    .unwrap();
+    let sidecar = record_path("conv-print-two", None)
+        .expect("record path")
+        .with_extension("lost");
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now()
+            - Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS)
+            - Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(
+        sidecar.exists(),
+        "one named job still on disk keeps the sidecar guarding its once"
+    );
+}
+
+/// A sidecar id that is not a job id never reaches a path join: an aged
+/// sidecar naming only `../` paths reads as guarding nothing and is reaped,
+/// even when a file sits where the unsafe join would land.
+#[test]
+fn an_aged_sidecar_naming_only_unsafe_ids_is_reaped() {
+    let _home = HomeSandbox::new();
+    let dir = crate::mcp::jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let outside = dir.parent().unwrap().join("outside.json");
+    std::fs::write(
+        &outside,
+        r#"{"job_id":"x","profile":"acct","state":"running","started_at":1,"owner_pid":4242}"#,
+    )
+    .unwrap();
+    crate::hook_jobs::record_lost("conv-print-unsafe", &["../outside".to_string()]);
+    let sidecar = record_path("conv-print-unsafe", None)
+        .expect("record path")
+        .with_extension("lost");
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now()
+            - Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS)
+            - Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(!sidecar.exists(), "an unsafe id guards nothing");
 }
 
 /// The same sidecar fresh still guards the live session's once: the sweep
