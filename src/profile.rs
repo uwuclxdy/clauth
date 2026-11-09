@@ -4326,6 +4326,34 @@ enum ListSlot {
     New,
 }
 
+/// A note written after an element's comma: the comment text and the line
+/// break it sat before, kept apart so a re-attach into a one-line list can
+/// mint a break of its own.
+struct CommaNote {
+    text: String,
+    line_break: String,
+}
+
+/// Split the same-line comment off the head of `text` when the first line
+/// holds one: the note (with its line break held apart) and the rest of the
+/// text. `None` when the first line holds no `#`.
+fn strip_head_note(text: &str) -> Option<(CommaNote, &str)> {
+    let nl = text.find('\n')?;
+    let before = &text[..nl];
+    if !before.contains('#') {
+        return None;
+    }
+    // The document reaches the editor LF-normalized, so a lifted break is
+    // always "\n"; the writer re-expands it on a CRLF file.
+    Some((
+        CommaNote {
+            text: before.to_string(),
+            line_break: "\n".to_string(),
+        },
+        &text[nl + 1..],
+    ))
+}
+
 /// Edit `arr` into `target` with the fewest element moves: the longest run the
 /// two share in order stays put with its decor, a name that moved carries its
 /// own comment to its new place, and a new name takes the list's own element
@@ -4335,6 +4363,12 @@ enum ListSlot {
 /// moving elsewhere) and a name new to it pair off in order, the pair being one
 /// value replacement that keeps the removed element's whole decor; a comment
 /// above an unpaired removal moves onto the next element.
+///
+/// A note written after an element's comma is that element's, though toml_edit
+/// parks it in the next element's prefix (or the trailing after the last
+/// comma, or the last element's suffix when there is no trailing comma): each
+/// such note is lifted off before the decor moves and put back right after
+/// its owner's comma wherever the owner lands.
 fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
     let cur: Vec<String> = arr
         .iter()
@@ -4343,16 +4377,68 @@ fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
     if cur.iter().map(String::as_str).eq(target.iter().copied()) {
         return;
     }
+    // Lift each note after an element's comma off the decor it parked in,
+    // keyed by owner name plus occurrence so two equal names never lend each
+    // other a note. Every stripped decor keeps its line break.
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    let cur_keys: Vec<(String, usize)> = cur
+        .iter()
+        .map(|name| {
+            let n = seen.entry(name.clone()).or_default();
+            let key = (name.clone(), *n);
+            *n += 1;
+            key
+        })
+        .collect();
+    let mut notes: std::collections::HashMap<(String, usize), CommaNote> =
+        std::collections::HashMap::new();
+    for (i, key) in cur_keys.iter().enumerate() {
+        if i + 1 < arr.len() {
+            let note = arr.get_mut(i + 1).and_then(|v| {
+                let prefix = decor_prefix(v.decor()).to_string();
+                strip_head_note(&prefix).map(|(note, rest)| {
+                    v.decor_mut()
+                        .set_prefix(format!("{}{}", note.line_break, rest));
+                    note
+                })
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        } else if arr.trailing_comma() {
+            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+            let note = strip_head_note(&trailing).map(|(note, rest)| {
+                arr.set_trailing(format!("{}{}", note.line_break, rest));
+                note
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        } else {
+            let note = arr.get_mut(i).and_then(|v| {
+                let suffix = decor_suffix(v.decor()).to_string();
+                strip_head_note(&suffix).map(|(note, rest)| {
+                    v.decor_mut()
+                        .set_suffix(format!("{}{}", note.line_break, rest));
+                    note
+                })
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        }
+    }
     // The whitespace closing a list with no trailing comma rides the last
-    // element's suffix; held as the list's trailing text, it stays at the end
-    // whichever element ends up last.
+    // element's suffix, and so does a comment line after the last element:
+    // held as the list's trailing text, both stay at the end whichever
+    // element ends up last.
     if !arr.trailing_comma()
         && let Some(last) = arr.len().checked_sub(1)
     {
         let trailing = arr.trailing().as_str().unwrap_or("").to_string();
         let moved = arr.get_mut(last).and_then(|v| {
             let suffix = decor_suffix(v.decor()).to_string();
-            (!suffix.is_empty() && suffix.trim().is_empty()).then(|| {
+            (!suffix.is_empty() && (suffix.trim().is_empty() || suffix.contains('#'))).then(|| {
                 v.decor_mut().set_suffix("");
                 suffix
             })
@@ -4444,21 +4530,36 @@ fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
         } else if let Some(j) = pair_of[i] {
             paired_values[j] = Some(remove_list_element(arr, i, false));
         } else {
+            // An unpaired removal leaves its lifted note behind as a comment
+            // line of its own where it sat: riding the suffix, the carry
+            // renders it at the list's element indent.
+            if let Some(note) = notes.remove(&cur_keys[i])
+                && let Some(v) = arr.get_mut(i)
+            {
+                // The note lands after the comments the element already
+                // holds in its suffix, keeping the file's own order.
+                let suffix = decor_suffix(v.decor()).to_string();
+                v.decor_mut()
+                    .set_suffix(format!("{suffix}{}{}", note.text, note.line_break));
+            }
             remove_list_element(arr, i, true);
+        }
+    }
+    // Pool the notes of the elements that survive as themselves, in file
+    // order per name: the re-attach hands them to that name's target slots
+    // in target order, so equal names keep their notes in file order while
+    // a renamed copy keeps its own (still keyed in `notes`).
+    let mut pool: std::collections::HashMap<String, Vec<CommaNote>> =
+        std::collections::HashMap::new();
+    for i in 0..cur.len() {
+        if (kept_cur[i] || moving[i])
+            && let Some(note) = notes.remove(&cur_keys[i])
+        {
+            pool.entry(cur[i].clone()).or_default().push(note);
         }
     }
     for (j, name) in target.iter().enumerate() {
         let slot = slots[j];
-        // An element appended after the list's last one takes over its
-        // same-line comment: the comment joins the appended element's prefix
-        // (the encoder's comma lands before it, keeping the comment on its
-        // element's line) and the closing newline moves to the list's
-        // trailing, so the close stays on its own line.
-        let pending = if !matches!(slot, ListSlot::Kept) && j == arr.len() {
-            take_last_same_line_comment(arr)
-        } else {
-            None
-        };
         match slot {
             ListSlot::Kept => {}
             ListSlot::Moved => {
@@ -4478,42 +4579,73 @@ fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
                 insert_list_element(arr, j, None, name, false, &layout, &first_layout);
             }
         }
-        if let Some(mut comment) = pending
-            && let Some(v) = arr.get_mut(j)
-        {
-            let existing = decor_prefix(v.decor()).to_string();
-            // A comment ends its line, so a prefix that does not start on a
-            // new line (a one-line list) needs one before the value, or the
-            // comment swallows it.
-            if !existing.starts_with('\n') {
-                comment.push('\n');
+    }
+    // Put each lifted note back right after its owner's comma: at the head of
+    // the next element's prefix, of the trailing when the owner is last with a
+    // trailing comma, of its own suffix when it is last without one.
+    for j in 0..target.len() {
+        let note = match slots[j] {
+            ListSlot::Paired(i) => notes.remove(&cur_keys[i]),
+            ListSlot::New => continue,
+            _ => pool.get_mut(target[j]).and_then(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            }),
+        };
+        if let Some(note) = note {
+            if j + 1 < target.len() {
+                if let Some(next) = arr.get_mut(j + 1) {
+                    let prefix = decor_prefix(next.decor()).to_string();
+                    // A comment ends its line, so a prefix that does not
+                    // start on a new line (a one-line list) needs one before
+                    // the value, or the comment swallows it.
+                    let line_break = if prefix.starts_with('\n') {
+                        ""
+                    } else {
+                        note.line_break.as_str()
+                    };
+                    next.decor_mut()
+                        .set_prefix(format!("{}{}{}", note.text, line_break, prefix));
+                }
+            } else if arr.trailing_comma() {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                // A close hugging the comma (`"b",]`) leaves no break between
+                // the note and the `]` unless the note's own is minted.
+                let line_break = if trailing.contains('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                arr.set_trailing(format!("{}{}{}", note.text, line_break, trailing));
+            } else {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                if let Some(v) = arr.get_mut(j) {
+                    let suffix = decor_suffix(v.decor()).to_string();
+                    // The close newline rides the suffix or the trailing: when
+                    // both hold none (a close on the last name's line, `"b"]`)
+                    // the note mints its own, or the comment swallows the `]`.
+                    let line_break = if suffix.contains('\n') || trailing.contains('\n') {
+                        ""
+                    } else {
+                        note.line_break.as_str()
+                    };
+                    v.decor_mut()
+                        .set_suffix(format!("{}{}{}", note.text, line_break, suffix));
+                }
             }
-            v.decor_mut().set_prefix(format!("{comment}{existing}"));
         }
     }
-}
-
-/// Move the same-line comment off the list's last element when an element is
-/// appended after it: the comment comes back as the text for the appended
-/// element's prefix (the encoder's comma lands before it) and its closing
-/// newline moves to the list's trailing, so the comment stays on its
-/// element's line. `None` when the last element's suffix holds no comment.
-fn take_last_same_line_comment(arr: &mut toml_edit::Array) -> Option<String> {
-    let last = arr.len().checked_sub(1)?;
-    let suffix = arr
-        .get(last)
-        .map(|v| decor_suffix(v.decor()).to_string())
-        .filter(|s| s.contains('#'))?;
-    let (comment, close) = match suffix.rfind('\n') {
-        Some(nl) => (suffix[..nl].to_string(), suffix[nl..].to_string()),
-        None => (suffix, String::new()),
-    };
-    if let Some(v) = arr.get_mut(last) {
-        v.decor_mut().set_suffix("");
-    }
-    let trailing = arr.trailing().as_str().unwrap_or("").to_string();
-    arr.set_trailing(format!("{close}{trailing}"));
-    Some(comment)
+    debug_assert!(
+        notes.is_empty(),
+        "every lifted note is re-attached or carried"
+    );
+    debug_assert!(
+        pool.values().all(Vec::is_empty),
+        "every pooled note finds a target slot"
+    );
 }
 
 /// Take one unit of `name`'s remaining count: `false` when none is left.

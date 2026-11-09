@@ -10500,6 +10500,396 @@ fn removing_a_middle_name_keeps_the_comment_after_its_value() {
     );
 }
 
+/// A note written after an element's comma (`"work", # day job`) belongs to
+/// that element, though toml_edit parses it into the NEXT element's prefix (or
+/// the list's trailing after the last comma): every list edit keeps each note
+/// on its own name's line, and a removed name's note stays as a line of its
+/// own where the name sat.
+#[test]
+fn a_note_after_an_elements_comma_stays_with_that_name_through_every_list_edit() {
+    let _home = HomeSandbox::new();
+    let noted = "profiles = [\n  \"a\", # first\n  \"b\", # second\n]\n";
+    let cases: [(&str, &str, &[&str], &str); 9] = [
+        (
+            "append",
+            noted,
+            &["a", "b", "c"],
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n]\n",
+        ),
+        (
+            "swap",
+            noted,
+            &["b", "a"],
+            "profiles = [\n  \"b\", # second\n  \"a\", # first\n]\n",
+        ),
+        (
+            "middle insert",
+            noted,
+            &["a", "x", "b"],
+            "profiles = [\n  \"a\", # first\n  \"x\",\n  \"b\", # second\n]\n",
+        ),
+        (
+            "rename in place",
+            noted,
+            &["a", "z"],
+            "profiles = [\n  \"a\", # first\n  \"z\", # second\n]\n",
+        ),
+        (
+            "remove a noted middle name",
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n]\n",
+            &["a", "c"],
+            "profiles = [\n  \"a\", # first\n  # second\n  \"c\",\n]\n",
+        ),
+        (
+            "swap with no trailing comma",
+            "profiles = [\n  \"a\", # first\n  \"b\" # second\n]\n",
+            &["b", "a"],
+            "profiles = [\n  \"b\", # second\n  \"a\" # first\n]\n",
+        ),
+        (
+            "swap under an own-line comment",
+            "profiles = [\n  # group\n  \"a\", # first\n  \"b\",\n]\n",
+            &["b", "a"],
+            "profiles = [\n  \"b\",\n  # group\n  \"a\", # first\n]\n",
+        ),
+        (
+            "append, CRLF",
+            "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n]\r\n",
+            &["a", "b", "c"],
+            "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n  \"c\",\r\n]\r\n",
+        ),
+        (
+            "append to a list ending in a note line",
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  # end\n]\n",
+            &["a", "b", "c"],
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n  # end\n]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!("{name}:\n  got  {after:?}\n  want {expected:?}"));
+        }
+        let back = load_app_state().expect("reload");
+        assert_eq!(
+            back.profiles, state.profiles,
+            "{name}: the edit keeps the names"
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The chain the TUI reorders, beside a one-line roster: each account's note
+/// rides its own name.
+#[test]
+fn a_chain_reorder_keeps_each_accounts_note_on_its_own_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [\n  \"work\", # day job\n  \"home\", # weekend\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.fallback_chain = ["home", "work"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [\n  \"home\", # weekend\n  \"work\", # day job\n]\n"
+    );
+}
+
+/// A list with no notes goes through the lift byte-identically: the same
+/// bytes come back from an append and from a reorder.
+#[test]
+fn a_one_line_list_with_no_notes_survives_every_edit_byte_identical() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\"]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("c"));
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after append"),
+        "profiles = [\"a\", \"b\", \"c\"]\n"
+    );
+
+    state.profiles = ["c", "a", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after reorder"),
+        "profiles = [\"c\", \"a\", \"b\"]\n"
+    );
+}
+
+/// Two equal names never lend each other a note: each copy keeps its own
+/// through a reorder.
+#[test]
+fn two_equal_names_keep_each_their_own_note_through_a_reorder() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n");
+
+    let mut state = load_app_state().expect("load");
+    assert_eq!(state.profiles.len(), 3, "the load keeps duplicates");
+    state.profiles = ["b", "a", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"b\",\n  \"a\", # one\n  \"a\", # two\n]\n"
+    );
+}
+
+/// A name leaving the list keeps its notes in file order: the note on its own
+/// value's line before the after-comma one.
+#[test]
+fn a_leaving_name_keeps_its_own_line_notes_in_file_order() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\",\n  \"b\" # s\n  , # t\n  \"c\",\n]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"a\",\n  # s\n  # t\n  \"c\",\n]\n"
+    );
+}
+
+/// The list's end shapes a person writes: the close on the last name's line
+/// (`"b"]`, `"b",]`) and a comment line after the last name with no trailing
+/// comma. A note re-attached there still ends its own line, so the close and
+/// the next value stay outside it, the end comment stays at the end, and a
+/// duplicate name's note survives a rename of its twin.
+#[test]
+fn a_note_reattached_at_the_lists_end_keeps_the_file_valid_and_every_comment() {
+    let _home = HomeSandbox::new();
+    let cases: [(&str, &str, &[&str], &str); 6] = [
+        (
+            "reorder past an earlier copy of a name keeps equal names in file order",
+            "profiles = [\n  \"a\", # one\n  \"x\",\n  \"a\", # two\n]\n",
+            &["x", "a", "a"],
+            "profiles = [\n  \"x\",\n  \"a\", # one\n  \"a\", # two\n]\n",
+        ),
+        (
+            "two moving pairs of equal names keep their notes in file order",
+            "profiles = [\n  \"a\", # a1\n  \"a\", # a2\n  \"b\", # b1\n  \"b\", # b2\n]\n",
+            &["b", "b", "a", "a"],
+            "profiles = [\n  \"b\", # b1\n  \"b\", # b2\n  \"a\", # a1\n  \"a\", # a2\n]\n",
+        ),
+        (
+            "removal leaves a noted name last, close on the removed name's line",
+            "profiles = [\n  \"a\", # first\n  \"b\"]\n",
+            &["a"],
+            "profiles = [\n  \"a\" # first\n]\n",
+        ),
+        (
+            "reorder lands a noted name last, close after a trailing comma",
+            "profiles = [\n  \"work\", # day job\n  \"home\",]\n",
+            &["home", "work"],
+            "profiles = [\n  \"home\",\n  \"work\", # day job\n]\n",
+        ),
+        (
+            "reorder with an end comment and no trailing comma",
+            "profiles = [\n  \"work\", # day job\n  \"home\" # weekend\n  # end\n]\n",
+            &["home", "work"],
+            "profiles = [\n  \"home\", # weekend\n  \"work\" # day job\n  # end\n]\n",
+        ),
+        (
+            "rename of the first of two equal names",
+            "profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+            &["x", "a", "b"],
+            "profiles = [\n  \"x\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!("{name}:\n  got  {after:?}\n  want {expected:?}"));
+        }
+        if let Err(e) = load_app_state() {
+            wrong.push(format!("{name}: the saved file no longer loads: {e:#}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A CRLF file stays CRLF when a removal carries a note: the writer
+/// normalizes before the edit and re-expands every line on the way out.
+#[test]
+fn a_crlf_removal_that_carries_a_note_keeps_crlf_on_every_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n  \"c\",\r\n]\r\n",
+    );
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\r\n  \"a\", # first\r\n  # second\r\n  \"c\",\r\n]\r\n"
+    );
+}
+
+/// A reorder that lands a noted name last in a compact list mints the line
+/// break the close no longer provides, so the `]` stays outside the comment.
+#[test]
+fn a_reorder_landing_a_noted_name_last_in_a_compact_list_keeps_the_close() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", # one\n  \"b\"]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"b\",\n  \"a\" # one\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b", "a"].map(ProfileName::from));
+}
+
+/// One sweep row: the fixture, its names, and each after-comma note's owner
+/// and trimmed text.
+type SweepCase<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
+
+/// Every edit of every list shape keeps the file loadable, every comment
+/// line, and every after-comma note on its owner's line while that owner's
+/// copies all survive.
+#[test]
+fn list_edits_keep_every_comment_and_every_note_on_its_owner() {
+    let _home = HomeSandbox::new();
+    let corpus: &[SweepCase] = &[
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\", # two\n  \"c\",\n]\n",
+            &["a", "b", "c"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        ("profiles = [\"a\", \"b\"]\n", &["a", "b"], &[]),
+        (
+            "profiles = [\"a\", # one\n  \"b\"]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\" # two\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\", # two\n  # end\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+            &["a", "a", "b"],
+            &[("a", "# one"), ("a", "# two")],
+        ),
+        (
+            "profiles = [\n  # group\n  \"a\", # one\n  \"b\",\n]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\n  \"a\",\n  \"b\" # pre\n  ,\n]\n",
+            &["a", "b"],
+            &[],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\" # two\n  # end\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"work\", # day job\n  \"home\",]\n",
+            &["work", "home"],
+            &[("work", "# day job")],
+        ),
+        (
+            "profiles = [ # open\n  \"a\", # one\n  \"b\",\n]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\"solo\" # only\n]\n",
+            &["solo"],
+            &[("solo", "# only")],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for &(fixture, names, notes) in corpus {
+        let edits: [(&str, Vec<&str>); 6] = [
+            ("append", [names, &["z"]].concat()),
+            ("remove first", names[1..].to_vec()),
+            (
+                "remove middle",
+                [&names[..names.len() / 2], &names[names.len() / 2 + 1..]].concat(),
+            ),
+            ("remove last", names[..names.len() - 1].to_vec()),
+            ("reverse", names.iter().rev().copied().collect()),
+            (
+                "rename first",
+                std::iter::once("z")
+                    .chain(names[1..].iter().copied())
+                    .collect(),
+            ),
+        ];
+        for (edit, target) in edits {
+            let path = write_state_file(fixture);
+            let mut state = load_app_state().expect("load");
+            state.profiles = target.iter().copied().map(ProfileName::from).collect();
+            save_app_state(&state).expect("save");
+            let after = std::fs::read_to_string(&path).expect("read");
+            match load_app_state() {
+                Ok(back) if back.profiles == state.profiles => {}
+                Ok(back) => wrong.push(format!("{edit} of {fixture:?}: names moved to {back:?}")),
+                Err(e) => wrong.push(format!(
+                    "{edit} of {fixture:?}: the saved file no longer loads: {e:#}"
+                )),
+            }
+            let comment_texts = |text: &str| {
+                let mut lines: Vec<String> = text
+                    .lines()
+                    .filter_map(|l| l.find('#').map(|i| l[i..].trim().to_string()))
+                    .collect();
+                lines.sort_unstable();
+                lines
+            };
+            if comment_texts(fixture) != comment_texts(&after) {
+                wrong.push(format!(
+                    "{edit} of {fixture:?}: a comment line was lost or gained\n  got  {after:?}"
+                ));
+            }
+            for &(owner, note) in notes {
+                let all_copies_survive = names.iter().filter(|n| **n == owner).count()
+                    == target.iter().filter(|n| **n == owner).count();
+                if all_copies_survive
+                    && !after
+                        .lines()
+                        .any(|l| l.contains(&format!("\"{owner}\"")) && l.contains(note))
+                {
+                    wrong.push(format!(
+                        "{edit} of {fixture:?}: note {note:?} left its owner {owner:?}\n  got  {after:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn a_refusal_skips_a_readable_key_above_the_wrong_typed_one() {
     let _home = HomeSandbox::new();
