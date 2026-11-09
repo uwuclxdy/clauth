@@ -1436,7 +1436,7 @@ impl utoipa::Modify for SessionsCreateOneOf {
         let Some(RefOr::T(response)) = operation.responses.responses.get_mut("200") else {
             return;
         };
-        let Some(content) = response.content.get_mut("application/json") else {
+        let Some(RefOr::T(content)) = response.content.get_mut("application/json") else {
             return;
         };
         let [pane, background] = [

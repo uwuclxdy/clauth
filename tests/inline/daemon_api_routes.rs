@@ -751,6 +751,12 @@ fn every_operation_documents_the_auth_answers_its_access_implies() {
                     route.method, route.path
                 )
             });
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!(
+                    "{} {} status {status} must be inline json content",
+                    route.method, route.path
+                );
+            };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 panic!(
                     "{} {} status {status} must reference ErrorBody",
@@ -852,7 +858,7 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
         .get("bearer")
         .expect("the bearer scheme exists");
     match scheme {
-        utoipa::openapi::security::SecurityScheme::Http(http) => {
+        utoipa::openapi::RefOr::T(utoipa::openapi::security::SecurityScheme::Http(http)) => {
             assert!(http.scheme == utoipa::openapi::security::HttpAuthScheme::Bearer);
             assert_eq!(
                 http.description.as_deref(),
@@ -868,6 +874,13 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
         .as_ref()
         .expect("status names its parameters");
     assert_eq!(params.len(), 3);
+    let params: Vec<_> = params
+        .iter()
+        .map(|param| match param {
+            utoipa::openapi::RefOr::T(param) => param,
+            utoipa::openapi::RefOr::Ref(_) => panic!("status parameters must be inline"),
+        })
+        .collect();
     assert_eq!(params[0].name, "all");
     assert_eq!(params[1].name, "wait");
     assert_eq!(params[2].name, "If-None-Match");
@@ -901,6 +914,9 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
                 .content
                 .get("application/json")
                 .unwrap_or_else(|| panic!("{method} {path} status {status} must be json"));
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!("{method} {path} status {status} must be inline json content");
+            };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 panic!("{method} {path} status {status} must reference ErrorBody");
             };
@@ -947,6 +963,9 @@ fn check_answer(
             "{method} {path} {status} documents no body but the answer carries one"
         );
         return;
+    };
+    let utoipa::openapi::RefOr::T(content) = content else {
+        panic!("{method} {path} {status} must be inline json content");
     };
     let Some(schema) = content.schema.as_ref() else {
         assert!(
@@ -2333,6 +2352,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         .content
         .get("application/json")
         .expect("json content");
+    let utoipa::openapi::RefOr::T(openapi_content) = openapi_content else {
+        panic!("openapi.json 200 must be inline json content");
+    };
     let openapi_schema = openapi_content.schema.as_ref().expect("a schema");
     assert_eq!(
         serde_json::to_value(openapi_schema).expect("schema serializes"),
@@ -3072,6 +3094,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             };
             let Some(content) = response.content.get("application/json") else {
                 continue;
+            };
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!("{method} {path} {code}: response content is a $ref the scan cannot read");
             };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 continue;

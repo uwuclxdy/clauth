@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
+utoipa = { version = "6.0", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
 toml = "1.2.1"
 # Format-preserving edits of the user's own `shunt.toml` (the gateway's admin
 # key entry): `toml` re-renders a document and drops its comments and layout.
@@ -37,7 +37,7 @@ shlex = "2.0.1"
 tempfile = "3.27.0"
 libc = "0.2.191"
 sha2 = "0.11.1"
-minisign-verify = "0.2.5"
+minisign-verify = "0.3.0"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
@@ -112,7 +112,7 @@ hex = "0.4"
 # other surface does: SHA-1 over `Sec-WebSocket-Key` + the RFC 6455 GUID, then
 # base64. base64 0.23 is already in the lock graph; sha1 is a new (pure-Rust)
 # entry, pinned to the sha2-compatible RustCrypto line already compiled here.
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.23"
 # Web Push: the VAPID signing key (ECDSA P-256) and, for the sender, the RFC
 # 8291 ECDH + HKDF + AES-128-GCM steps. The same `ring` rustls already builds
