@@ -33527,6 +33527,188 @@ fn a_refused_move_leaves_the_record_disabled() {
     );
 }
 
+/// The adopt's address read refuses a config whose `[server].bind` is a
+/// `${...}` reference, and the card's `adopt failed` toast carries the
+/// refusal whole. Every refusal this arm can surface is a single-error
+/// chain, so the pin is the arm's exact text, never a shortened form.
+#[test]
+fn an_adopt_refused_at_the_address_read_surfaces_the_refusal_whole() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\nbind = \"${SHUNT_BIND}\"\n").unwrap();
+    let outcome = super::run_adopt(&config);
+    match outcome {
+        super::ShuntActionOutcome::AdoptFailed { error } => assert_eq!(
+            error,
+            "[server].bind is a ${...} reference, which clauth does not resolve; set \
+             SHUNT_SERVER__BIND in the gateway's env file to the address instead",
+            "the bind refusal, whole"
+        ),
+        other => panic!("expected AdoptFailed, got {other:?}"),
+    }
+}
+
+/// The adopt's record write fails (a directory at `gateway.toml`): the
+/// surfaced error keeps the read's cause chain, root cause first, so a
+/// `{e}`-only format at that arm drops `Is a directory …` and reds this pin.
+#[cfg(unix)]
+#[test]
+fn an_adopt_failed_by_the_record_write_carries_the_cause_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth")).unwrap();
+    let record_file = crate::gateway::record_path().unwrap();
+    std::fs::create_dir(&record_file).unwrap();
+    let config = adopt_config(&home, closed_port());
+    let outcome = super::run_adopt(&config);
+    let why = std::fs::read_to_string(&record_file)
+        .unwrap_err()
+        .to_string();
+    match outcome {
+        super::ShuntActionOutcome::AdoptFailed { error } => assert_eq!(
+            error,
+            format!("{why} · failed to read {}", record_file.display()),
+            "the record read's chain, root cause first"
+        ),
+        other => panic!("expected AdoptFailed, got {other:?}"),
+    }
+}
+
+/// The move's `/health` probe fails (the gateway takes the connection, reads
+/// the request head and closes without answering): the surfaced error keeps
+/// the transport cause beside the probe's own context, root cause first.
+#[test]
+fn a_move_failed_by_the_health_probe_carries_the_cause_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        if let Some(Ok(mut stream)) = listener.incoming().next() {
+            let _head = crate::testutil::read_request_head(&mut stream);
+        }
+    });
+    let config = adopt_config(&home, addr.port());
+    let record = crate::gateway::GatewayRecord::new(config).unwrap();
+    let plan = crate::gateway::StoreMovePlan {
+        moved: vec![],
+        kept: vec![],
+    };
+    let outcome = super::run_move(&record, &plan);
+    // ureq's own text for a connection closed before any response byte, not
+    // an OS message, so the spelling is the dep's to change and the pin's to
+    // re-measure.
+    let why = "io: Peer disconnected";
+    match outcome {
+        super::ShuntActionOutcome::MoveFailed { error } => assert_eq!(
+            error,
+            format!("{why} · GET http://{addr}/health"),
+            "the probe failure's chain, root cause first"
+        ),
+        other => panic!("expected MoveFailed, got {other:?}"),
+    }
+    handle.join().unwrap();
+}
+
+/// The store move re-plans before it moves: with a file at
+/// `~/.clauth/shunt/accounts` the fresh plan's destination inspection fails
+/// `Not a directory`, surfaced root first beside its `failed to inspect`
+/// context, so a `{e}`-only format at that arm drops the cause and reds.
+///
+/// Unix only: Windows reports a path through a regular file as
+/// `ERROR_PATH_NOT_FOUND`, which std maps to `NotFound`, so there the
+/// destination reads as absent and the move fails later, at its staging.
+#[cfg(unix)]
+#[test]
+fn a_move_failed_by_the_store_move_carries_the_cause_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("main.json"), "claude-main").unwrap();
+    let mut record =
+        crate::gateway::GatewayRecord::new(adopt_config(&home, closed_port())).unwrap();
+    record.disabled = true;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let confirmed = crate::gateway::plan_standalone_stores(&record).unwrap();
+    assert_eq!(confirmed.moved.len(), 1, "fixture: one store file moves");
+    let to = confirmed.moved[0].to.clone();
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(clauth.join("shunt").join("accounts").join("claude")).unwrap();
+    std::fs::remove_dir_all(clauth.join("shunt").join("accounts")).unwrap();
+    std::fs::write(clauth.join("shunt").join("accounts"), "not a dir").unwrap();
+
+    let outcome = super::run_move(&record, &confirmed);
+    let why = std::fs::symlink_metadata(&to).unwrap_err().to_string();
+    match outcome {
+        super::ShuntActionOutcome::MoveFailed { error } => assert_eq!(
+            error,
+            format!("{why} · failed to inspect {}", to.display()),
+            "the destination inspection's chain, root cause first"
+        ),
+        other => panic!("expected MoveFailed, got {other:?}"),
+    }
+}
+
+/// The `MovedEnableFailed` save: the stores moved, the `disabled = false`
+/// record write failed (a directory at `gateway.toml`), and the outcome's
+/// error keeps the read's cause chain root first, so the `save failed` toast
+/// names why, not just where.
+#[cfg(unix)]
+#[test]
+fn a_moved_enable_failed_save_carries_the_cause_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let src = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("main.json"), "claude-main").unwrap();
+    let config = adopt_config(&home, closed_port());
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = true;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let plan = crate::gateway::plan_standalone_stores(&record).expect("plan");
+    assert!(!plan.moved.is_empty(), "fixture: the plan moves a file");
+
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(clauth.join("shunt").join("accounts").join("claude")).unwrap();
+    let record_file = crate::gateway::record_path().unwrap();
+    std::fs::remove_file(&record_file).unwrap();
+    std::fs::create_dir(&record_file).unwrap();
+
+    let outcome = super::run_move(&record, &plan);
+    let why = std::fs::read_to_string(&record_file)
+        .unwrap_err()
+        .to_string();
+    match outcome {
+        super::ShuntActionOutcome::MovedEnableFailed { n, error } => {
+            assert_eq!(n, plan.moved.len(), "the move landed");
+            assert_eq!(
+                error,
+                format!("{why} · failed to read {}", record_file.display()),
+                "the save failure's chain, root cause first"
+            );
+        }
+        other => panic!("expected MovedEnableFailed, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(
+            clauth
+                .join("shunt")
+                .join("accounts")
+                .join("claude")
+                .join("main.json")
+        )
+        .unwrap(),
+        "claude-main",
+        "the credential moved before the enable write"
+    );
+}
+
 /// `space` on the focused `enabled` row flips `disabled` on disk at once, no
 /// confirm.
 #[test]
