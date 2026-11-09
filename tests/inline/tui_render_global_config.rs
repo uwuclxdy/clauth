@@ -384,6 +384,34 @@ fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
     );
 }
 
+/// The compatible toggle's bracket frame drops exactly one bracket pair: a
+/// glyph carrying its own (`[[on]]`) renders whole, its inner brackets in the
+/// word span's state colour, while the theme's own `[on]`/`[off]` glyphs keep
+/// their word alone between the dim brackets.
+#[test]
+fn the_compatible_toggle_drops_exactly_one_bracket_pair() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let state = theme::accent();
+    let frames = crate::tui::render::panes::compatible_toggle_spans("[[on]]", state);
+    let rendered: Vec<_> = frames.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(rendered, vec!["[", "[on]", "]"], "the glyph renders whole");
+    assert_eq!(frames[0].style, theme::dim(), "the frame's own bracket");
+    assert_eq!(frames[1].style, state, "the word carries the state");
+    assert_eq!(frames[2].style, theme::dim());
+
+    // The theme's glyphs hold no inner brackets: the word is the glyph less
+    // its one frame pair.
+    let plain = crate::tui::render::panes::compatible_toggle_spans("[on]", state);
+    let words: Vec<_> = plain.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(words, vec!["[", "on", "]"]);
+
+    // The call site feeds the tier's glyph through the same frame.
+    let on = toggle_value(true, false);
+    let parts: Vec<_> = on.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(parts, vec!["[", "on", "]"], "the on toggle at compatible");
+    assert_eq!(on[1].style, theme::accent());
+}
+
 /// `refresh spent` is a pure on/off boolean — a toggle (`─●` / `○─`),
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
