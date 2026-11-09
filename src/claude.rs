@@ -1761,7 +1761,9 @@ fn keychain_mirror_verdict(linkable: bool, absent: AbsentSource) -> KeychainMirr
 /// refreshed the account it runs on there): the write then leaves the item in
 /// place and says so ([`bare_item_may_be_replaced`]; `placed` is the key of
 /// an item the caller settled), returning [`ItemWrite::Refused`], which the
-/// caller turns into a failed switch before it publishes the link.
+/// caller turns into a failed switch before it publishes the link. An install
+/// whose source already holds the item's login replaces it either way
+/// ([`bare_item_may_take_source`]).
 #[cfg(target_os = "macos")]
 fn keychain_mirror_source(
     path: &Path,
@@ -1791,7 +1793,9 @@ fn keychain_mirror_source(
                 if preserve {
                     sync_item_into_its_store(item, Some(path));
                 }
-                may_replace(item)
+                let may = bare_item_may_take_source(item, &store, placed);
+                refused.set(!may);
+                may
             })?
         }
         // Both other outcomes complete the switch: an actually-signed-out item,
@@ -2117,23 +2121,53 @@ fn bare_item_token_holders<'a>(
     item: &serde_json::Value,
     stores: &'a [(ProfileName, serde_json::Value)],
 ) -> Option<Vec<&'a ProfileName>> {
-    let access = login_access_token(item)?;
-    let (key, token) = match login_refresh_token(item) {
-        Some(refresh) => ("refreshToken", refresh),
-        None => ("accessToken", access),
-    };
+    login_access_token(item)?;
     let mut holders: Vec<&ProfileName> = Vec::new();
     for (name, store) in stores {
-        let held = store
-            .get("claudeAiOauth")
-            .and_then(|login| login.get(key))
-            .and_then(serde_json::Value::as_str)
-            == Some(token);
-        if held && !holders.contains(&name) {
+        if store_holds_item_login(item, store) && !holders.contains(&name) {
             holders.push(name);
         }
     }
     Some(holders)
+}
+
+/// Whether `store` holds the item's login, on [`bare_item_token_holders`]'
+/// tiers: the refresh token of a rotating pair, the access token of a mint.
+/// `false` when the item holds no login.
+fn store_holds_item_login(item: &serde_json::Value, store: &serde_json::Value) -> bool {
+    let Some(access) = login_access_token(item) else {
+        return false;
+    };
+    let (key, token) = match login_refresh_token(item) {
+        Some(refresh) => ("refreshToken", refresh),
+        None => ("accessToken", access),
+    };
+    store
+        .get("claudeAiOauth")
+        .and_then(|login| login.get(key))
+        .and_then(serde_json::Value::as_str)
+        == Some(token)
+}
+
+/// Whether an install of `source` may replace the bare `item`: `source`
+/// already holds the item's login, so the write puts back the login it
+/// replaces and strands nothing, or [`bare_item_may_be_replaced`] lets it go.
+/// The first arm is the first capture's relink (#158): it runs before the
+/// roster names the new profile, so the guard's roster search cannot find the
+/// store that just saved the item's login.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS item mirror; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_may_take_source(
+    item: &serde_json::Value,
+    source: &serde_json::Value,
+    placed: Option<&[u8; 32]>,
+) -> bool {
+    store_holds_item_login(item, source) || bare_item_may_be_replaced(item, placed)
 }
 
 /// The non-empty refresh token of `store`'s login.
