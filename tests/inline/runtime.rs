@@ -8958,35 +8958,17 @@ fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
     });
 }
 
-/// Backdate `path` (a dir or a file) past [`crate::claude_jobs::MID_CREATE_GRACE`].
-///
-/// Unix sets a dir's mtime through a read-only handle (a dir cannot be opened
-/// for writing). Windows needs write access to change any timestamp, and
-/// `FILE_FLAG_BACKUP_SEMANTICS` to open a dir handle at all.
-fn backdate_past_mid_create_grace(path: &std::path::Path) {
-    let old = std::time::SystemTime::now()
-        - crate::claude_jobs::MID_CREATE_GRACE
-        - std::time::Duration::from_secs(60);
-    let mut options = fs::OpenOptions::new();
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    }
-    #[cfg(not(windows))]
-    options.read(true);
-    options
-        .open(path)
-        .expect("open to backdate")
-        .set_modified(old)
-        .expect("backdate mtime");
+/// Backdate `path` (a dir or a file) by a day, far past the mid-create grace.
+fn backdate_by_a_day(path: &std::path::Path) {
+    crate::testutil::set_mtime(
+        path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60),
+    );
 }
 
 /// An EMPTY global job dir older than the mid-create grace is an abandoned
-/// creation, not one in flight: it must not fail the rotation term closed. On
-/// 2026-11-06 a single empty `~/.claude/jobs/<id>/` left behind in May blocked
-/// every account's token rotation until each session token expired.
+/// creation, not one in flight: it must not fail the rotation term closed, or
+/// one leftover dir blocks every account's token rotation for good.
 #[test]
 fn an_old_empty_global_job_dir_does_not_block_rotation() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -8995,7 +8977,7 @@ fn an_old_empty_global_job_dir_does_not_block_rotation() {
         fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
         let job = tmp.path().join(".claude").join("jobs").join("54705843");
         fs::create_dir_all(&job).expect("mkdir the record-less dir");
-        backdate_past_mid_create_grace(&job);
+        backdate_by_a_day(&job);
 
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
@@ -9018,8 +9000,8 @@ fn an_old_staged_only_global_job_dir_does_not_block_rotation() {
         fs::create_dir_all(&job).expect("mkdir the record-less dir");
         let staged = job.join("state.json.tmp.123.456");
         fs::write(&staged, b"{").expect("stage a record");
-        backdate_past_mid_create_grace(&staged);
-        backdate_past_mid_create_grace(&job);
+        backdate_by_a_day(&staged);
+        backdate_by_a_day(&job);
 
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
@@ -9042,12 +9024,105 @@ fn a_fresh_staged_record_in_an_old_job_dir_still_blocks_rotation() {
         let job = tmp.path().join(".claude").join("jobs").join("0add99f7");
         fs::create_dir_all(&job).expect("mkdir the record-less dir");
         fs::write(job.join("state.json.tmp.123.789"), b"{").expect("stage a record");
-        backdate_past_mid_create_grace(&job);
+        backdate_by_a_day(&job);
 
         let jobs = crate::claude_jobs::job_trees();
-        assert!(
-            jobs.unfinished_under(&profiles.join("anyaccount")).is_err(),
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(std::path::PathBuf::from("~/.claude/jobs")),
             "a record staged inside the grace is still a creation in flight"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
+        );
+    });
+}
+
+/// A creation a minute old is still in flight, not abandoned: the grace must
+/// cover a creation's write-then-rename with room to spare.
+#[test]
+fn a_minute_old_empty_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f9");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        crate::testutil::set_mtime(
+            &job,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        );
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            "a minute-old mid-create dir is a creation in flight and fails closed"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
+        );
+    });
+}
+
+/// An OLD empty global job dir holds no gate that reads the store: the macOS
+/// rotation runs, the account reads idle, and its dead tree is collected.
+/// Driven through the gates themselves, not the store reader alone.
+#[test]
+fn an_old_empty_global_job_dir_blocks_no_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f169", "runtime-4242-169", "4242-169");
+        let job = tmp.path().join(".claude").join("jobs").join("54705843");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        backdate_by_a_day(&job);
+        let name = crate::profile::ProfileName::from("f169");
+
+        assert_eq!(
+            rotation_block_on(&name, true),
+            None,
+            "the macOS rotation is not refused over an abandoned job dir"
+        );
+        assert!(
+            !has_live_session(&name),
+            "an abandoned job dir keeps no account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "the dead tree is collected"
+        );
+    });
+}
+
+/// A job dir whose mtime lies in the FUTURE cannot prove its age, so it stays
+/// mid-create and the gate fails closed: a clock stepped back must never read
+/// a creation in flight as abandoned.
+#[test]
+fn a_future_dated_empty_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f8");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        crate::testutil::set_mtime(
+            &job,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60),
+        );
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            "a future-dated mid-create dir cannot prove it is old and must fail closed"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
         );
     });
 }

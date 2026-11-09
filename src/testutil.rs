@@ -2697,7 +2697,13 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
         .to_string()
 }
 
-/// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+/// Overwrite a file's or a directory's modification time — for cache-staleness,
+/// tie-break and age tests.
+///
+/// A file opens for writing. A directory opens differently per platform: unix
+/// cannot open one for writing and sets its mtime through a read-only handle;
+/// Windows needs write access to change any timestamp, plus
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle at all.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
 /// inside another thread's `MoveFileEx` replace over the same path fails with
@@ -2707,9 +2713,23 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
 /// one attempt. Bounded, so a genuinely absent file still panics with its own
 /// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
+    let mut options = std::fs::OpenOptions::new();
+    // `metadata` follows a symlink, as the open does.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+    } else {
+        options.write(true);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let file = loop {
-        match std::fs::OpenOptions::new().write(true).open(path) {
+        match options.open(path) {
             Ok(file) => break file,
             Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
