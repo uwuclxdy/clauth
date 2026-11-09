@@ -423,6 +423,7 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/sessions/{id}", Access::View),
             ("POST", "/panes/{id}/prompt", Access::Control),
             ("POST", "/panes/{id}/keys", Access::Control),
+            ("POST", "/panes/{id}/ticket", Access::View),
             ("POST", "/sessions/{id}/prompt", Access::Control),
             ("POST", "/sessions/{id}/interrupt", Access::Control),
             ("POST", "/sessions/{id}/asks/{ask}", Access::Control),
@@ -771,6 +772,28 @@ fn every_operation_documents_the_auth_answers_its_access_implies() {
             }
         }
     }
+}
+
+/// The mint's own answers, beyond the auth set above: the `201`'s schema and
+/// the `400` a request with no `Origin` gets.
+#[test]
+fn the_ticket_mint_documents_its_answers() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+    let operation = doc_operation(&doc, "POST", "/panes/{id}/ticket").expect("the mint's row");
+    let json = serde_json::to_value(operation).expect("the operation as JSON");
+    assert_eq!(
+        json["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TicketMinted"
+    );
+    let bad_request = json["responses"]["400"]["description"]
+        .as_str()
+        .expect("a 400");
+    assert!(bad_request.contains("origin_required"), "{bad_request}");
+    let schemas = serde_json::to_value(&doc).expect("the document as JSON");
+    assert_eq!(
+        schemas["components"]["schemas"]["TicketMinted"]["required"],
+        serde_json::json!(["ticket", "expires_in"])
+    );
 }
 
 /// OpenAPI 3.1 requires every `operationId` to be unique, and both client
@@ -2345,6 +2368,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
         ("POST", "/sessions/{id}/prompt"),
         ("POST", "/sessions/{id}/interrupt"),
         ("POST", "/sessions/{id}/asks/{ask}"),
@@ -2407,6 +2431,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
         ("POST", "/sessions/{id}/prompt"),
         ("POST", "/sessions/{id}/interrupt"),
         ("POST", "/sessions/{id}/asks/{ask}"),
@@ -2492,6 +2517,41 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         "/pair",
         415,
         &pair_untyped,
+        &mut driven,
+        &mut produced,
+    );
+
+    // The ticket mint's own answers: a page's 201, and the 400 of a request
+    // that names no origin to bind.
+    let minted = call(
+        &ctx,
+        &Request {
+            cross_origin: super::super::http::CrossOrigin {
+                origin: super::super::http::SoloHeader::One("https://app.example.com".to_string()),
+                ..Default::default()
+            },
+            ..req("POST", &concrete("/panes/{id}/ticket"), Some(TOKEN), "")
+        },
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/panes/{id}/ticket",
+        201,
+        &minted,
+        &mut driven,
+        &mut produced,
+    );
+    let no_origin = call(
+        &ctx,
+        &req("POST", &concrete("/panes/{id}/ticket"), Some(TOKEN), ""),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/panes/{id}/ticket",
+        400,
+        &no_origin,
         &mut driven,
         &mut produced,
     );
@@ -2952,6 +3012,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
         ("POST", "/sessions/{id}/prompt"),
         ("POST", "/sessions/{id}/interrupt"),
         ("POST", "/sessions/{id}/asks/{ask}"),
@@ -3338,7 +3399,8 @@ fn a_view_device_is_refused_every_control_route() {
 /// Every view row answers 200 to a view device with an empty query: an empty
 /// store lists zero sessions, the one templated view row pages the fixture
 /// transcript seeded under [`FIXTURE_ID`], and the push subscription's PUT
-/// carries a subscription its DELETE then drops.
+/// carries a subscription its DELETE then drops. The ticket mint is the one
+/// view row that creates, so it answers 201, and a page's `Origin` is its input.
 #[test]
 fn a_view_device_reads_every_view_route() {
     let _home = HomeSandbox::new();
@@ -3351,11 +3413,20 @@ fn a_view_device_reads_every_view_route() {
         } else {
             ""
         };
-        let resp = call(
-            &ctx,
-            &req(route.method, &route_path(route), Some(OTHER_TOKEN), body),
+        let mut request = req(route.method, &route_path(route), Some(OTHER_TOKEN), body);
+        let mint = route.path == "/panes/{id}/ticket";
+        if mint {
+            request.cross_origin.origin =
+                super::super::http::SoloHeader::One("https://app.example.com".to_string());
+        }
+        let resp = call(&ctx, &request);
+        assert_eq!(
+            resp.status,
+            if mint { 201 } else { 200 },
+            "{} {}",
+            route.method,
+            route.path
         );
-        assert_eq!(resp.status, 200, "{} {}", route.method, route.path);
     }
 }
 
@@ -3365,6 +3436,9 @@ fn a_view_device_reads_every_view_route() {
 #[test]
 fn an_unknown_tier_device_is_refused_while_the_others_work() {
     let _home = HomeSandbox::new();
+    // The line is logged once per process, and other tests reach it too; every
+    // one of them holds a sandbox, so a reset under this one cannot race them.
+    UNKNOWN_TIER_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let ctx = ctx_with(seeded_config());
     seed_device("wall", Tier::Unknown("readonly".to_string()), OTHER_TOKEN);
     let lines = crate::logline::LogLines::new();
@@ -3431,12 +3505,192 @@ fn a_revoked_device_is_refused_on_its_next_request() {
     assert_eq!(health(TOKEN), 200);
 }
 
+/// A long poll parked for a device answers that device only while it is still
+/// paired: revoked mid-wait, the feed change that wakes it answers the 401 its
+/// next request would get, never the feed.
+#[test]
+fn a_long_poll_whose_device_is_revoked_mid_wait_answers_401_on_a_change() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let path = ctx.status_path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        devices::revoke("phone").expect("revoke");
+        std::fs::write(&path, feed("beta", "2026-09-02T06:00:05+00:00")).expect("republish");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=10", Some(OTHER_TOKEN), &tag),
+    );
+    writer.join().expect("writer thread");
+
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            401,
+            serde_json::json!({"ok": false, "error": "unauthorized"})
+        )
+    );
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 401 came from the answer's own row read, after the wait"
+    );
+}
+
+/// The deadline arm of the same rule: a wait that ends with no change answers
+/// a revoked device 401, never a 304 carrying the feed's tag.
+#[test]
+fn a_long_poll_whose_device_is_revoked_mid_wait_answers_401_at_its_deadline() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let revoker = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        devices::revoke("phone").expect("revoke");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=2", Some(OTHER_TOKEN), &tag),
+    );
+    revoker.join().expect("revoker thread");
+
+    assert_eq!(resp.status, 401);
+    assert_eq!(resp.etag, None, "no tag reaches a revoked device");
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 401 came from the answer's own row read, after the wait"
+    );
+}
+
+/// The cost side: a long poll that waits out its deadline reads its row once,
+/// when it answers, never once per poll tick; a request that never waits
+/// reads none.
+#[test]
+fn a_long_poll_reads_its_row_once_per_answer() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=2", Some(TOKEN), &tag),
+    );
+    assert_eq!(resp.status, 304);
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "one read for the answer"
+    );
+
+    let reads = devices::row_reads_here();
+    let resp = call(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    assert_eq!(resp.status, 304);
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        0,
+        "no wait, no extra read"
+    );
+}
+
+/// The wait's re-check fails closed: a caller with no device, which the route
+/// table never builds for `/status`, answers the 500 a list that does not read
+/// answers rather than the feed without a row read.
+#[test]
+fn a_waited_answer_with_no_device_fails_closed() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+    let reader = Caller {
+        peer: peer(),
+        device: None,
+        target: None,
+        ask: None,
+    };
+    let reads = devices::row_reads_here();
+    let resp = wait_for_status_change(&ctx, &tag, std::time::Duration::from_millis(0), &reader);
+    assert_eq!(resp.status, 500);
+    assert_eq!(
+        body_json(&resp),
+        serde_json::json!({"ok": false, "error": "internal"})
+    );
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        0,
+        "no device, no row read"
+    );
+}
+
+/// A device list that stops reading mid-wait is answered as at a request's
+/// start: the 500 `internal`, with the once-per-process line naming the cause.
+#[test]
+fn a_long_poll_whose_device_list_stops_reading_mid_wait_answers_500() {
+    let _home = HomeSandbox::new();
+    READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let path = ctx.status_path.clone();
+    let list = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("devices.json");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::write(&list, b"{ not json").expect("damage the list");
+        std::fs::write(&path, feed("beta", "2026-09-02T06:00:05+00:00")).expect("republish");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=10", Some(TOKEN), &tag),
+    );
+    writer.join().expect("writer thread");
+
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 500 came from the answer's own row read, after the wait"
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (500, serde_json::json!({"ok": false, "error": "internal"}))
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line
+                .starts_with("clauth api: refusing every request until the device list reads: "))
+            .count(),
+        1
+    );
+}
+
 /// The list is read per request and fails closed: an unreadable one refuses
 /// every request with a 500 said once in the log, never read as an empty list
 /// and never as the last one that parsed.
 #[test]
 fn an_unreadable_device_list_refuses_every_request() {
     let _home = HomeSandbox::new();
+    // The line is once per process, and other tests flip its latch; every
+    // flipper holds a sandbox, so this reset cannot race one.
+    READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let ctx = ctx_with(seeded_config());
     std::fs::write(
         crate::profile::clauth_dir()
@@ -5141,4 +5395,46 @@ fn a_fight_recorded_on_the_context_reaches_the_events_route() {
         ),
         "the stream relays the context's contention record: {rendered_text:?}"
     );
+}
+
+/// A refused `Origin` that no list entry can ever equal gets a reason saying
+/// so; one a list could hold keeps the reason that names the list as the fix.
+#[test]
+fn a_refused_origin_no_list_can_hold_says_so() {
+    use super::super::http::{CrossOrigin, SoloHeader};
+    let unlistable = "this page sends an origin `[serve] app_origins` can never list (`null`, \
+                      sent twice, or not UTF-8); open the app from the web address it is \
+                      served at";
+    let unlisted =
+        "this page's origin is not in `[serve] app_origins` in profiles.toml on the host";
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let cases = [
+        (SoloHeader::One("null".to_string()), unlistable),
+        (SoloHeader::Unusable, unlistable),
+        (
+            SoloHeader::One("https://unlisted.example".to_string()),
+            unlisted,
+        ),
+        (SoloHeader::Absent, unlisted),
+    ];
+    for (case, (origin, reason)) in cases.into_iter().enumerate() {
+        let resp = call(
+            &ctx,
+            &Request {
+                cross_origin: CrossOrigin {
+                    origin,
+                    refused: true,
+                    ..Default::default()
+                },
+                ..req("GET", "/api/v1/status", Some(TOKEN), "")
+            },
+        );
+        assert_eq!(resp.status, 403, "case {case}");
+        assert_eq!(
+            body_json(&resp),
+            serde_json::json!({"ok": false, "error": "origin_not_allowed", "reason": reason}),
+            "case {case}"
+        );
+    }
 }

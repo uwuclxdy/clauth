@@ -38,6 +38,25 @@
 //! bridge's own bounds apply: the 200 ms read slice, the inherited 10 s
 //! single-write timeout, a bounded frames channel, and control commands that
 //! cross to herdr's stdin on their own untimed-wait-free thread.
+//!
+//! A revoke reaches an open stream through [`RowWatch`]: the socket closes
+//! `1008` at the top of the first pass after its row check comes due; a pass's
+//! own writes (herdr frames, pongs) each carry the inherited 10 s write
+//! timeout, so a client that reads slowly delays its own close. A device list
+//! that stops reading ends the stream the same way, as a server fault: the
+//! socket closes `1011` "device list unreadable", the close line says so, and
+//! the read error goes through the once-per-process refusal line. `/events`
+//! checks its row at the top of a pass too, so its bound is one pass (a 250 ms
+//! herdr read, an `open_herdr`, its frame writes, a 250 ms `WAIT_POLL` sleep)
+//! plus the row check, and a client that reads slowly stretches those writes
+//! the same way.
+//!
+//! A bearer upgrades here as it always has, and a browser, which can set no
+//! header on a WebSocket, upgrades on a [`super::ticket`] that selects a fixed
+//! subprotocol. The two also differ in their refusals and their origin order: a
+//! refused ticket answers with no device and a closed connection, the refusal
+//! burns it, and its bind's 401 comes ahead of the origin 403. Both write the
+//! same close line; the 101's access line marks a ticket's with ` auth=ticket`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
@@ -45,7 +64,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::devices::{Device, Tier};
+use super::devices::{Device, RowCheck, RowWatch, Tier};
 use super::http::{Request, Response, accept_key};
 use super::panes::{NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND};
 use super::routes::{self, ApiContext, Handled};
@@ -89,6 +108,14 @@ impl Mode {
     }
 }
 
+/// What authorized an upgrade. It decides the 101's subprotocol and the audit
+/// line, and nothing about the stream: the device's row decides that.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Credential {
+    Bearer,
+    Ticket,
+}
+
 /// A validated upgrade, handed to the connection loop to run. Everything the
 /// bridge needs is decided here, before the `101`, so no refusal can arrive
 /// over the upgraded protocol that could have been an HTTP status.
@@ -109,6 +136,29 @@ pub(crate) struct Hijack {
     device_for_log: String,
     cols: u16,
     rows: u16,
+    credential: Credential,
+    /// The stream's look at the device's row, on the bridge's clock.
+    row: RowWatch,
+}
+
+impl Hijack {
+    /// The subprotocol the 101 selects. A bearer upgrade selects none: its head
+    /// stays what it was, and `null` is RFC 6455 §4.2.2's legal answer to a
+    /// client that offered some.
+    pub(crate) fn selected_protocol(&self) -> Option<&'static str> {
+        match self.credential {
+            Credential::Bearer => None,
+            Credential::Ticket => Some(super::ticket::TERMINAL_PROTOCOL),
+        }
+    }
+
+    /// What the 101's per-request line ends with.
+    pub(crate) fn auth_field(&self) -> &'static str {
+        match self.credential {
+            Credential::Bearer => "",
+            Credential::Ticket => " auth=ticket",
+        }
+    }
 }
 
 /// One pane fought over: `terminal_contention` on `/events`.
@@ -308,8 +358,16 @@ pub(crate) fn pane_stream_target(path: &str) -> Option<String> {
 }
 
 /// The route half: validate, decide the mode, and hand back the hijack. Every
-/// failure answers as an ordinary HTTP response, before any upgrade.
-pub(crate) fn request(ctx: &ApiContext, req: &Request, device: &Device, pane_id: &str) -> Handled {
+/// failure answers as an ordinary HTTP response, before any upgrade. `device`
+/// comes from a bearer or a spent ticket, and its row alone decides the mode;
+/// the ticket path owns what a failure here does to its connection.
+pub(crate) fn request(
+    ctx: &ApiContext,
+    req: &Request,
+    device: &Device,
+    pane_id: &str,
+    credential: Credential,
+) -> Handled {
     if req.method != "GET" {
         return Handled {
             response: Response::error(405, "method_not_allowed"),
@@ -402,6 +460,8 @@ pub(crate) fn request(ctx: &ApiContext, req: &Request, device: &Device, pane_id:
             accept,
             cols: rect.width,
             rows: rect.height,
+            credential,
+            row: RowWatch::new(device, Instant::now()),
         }),
     }
 }
@@ -520,11 +580,11 @@ pub(crate) fn unspawnable_terminal() -> TerminalSpawn {
 /// slot is ever held forever; the reconnect re-attaches at the pane's own
 /// geometry). A control stream records itself in `holders` once herdr is
 /// spawned and clears that record when it ends, unless another stream took the
-/// pane meanwhile.
+/// pane meanwhile. It ends sooner, `1008`, once its device's row is gone.
 pub(crate) fn run(
     mut stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     leftover: Vec<u8>,
-    hijack: Hijack,
+    mut hijack: Hijack,
     spawn: &TerminalSpawn,
     holders: &TerminalHolders,
     deadline: std::time::Instant,
@@ -677,31 +737,52 @@ pub(crate) fn run(
     let mut client_closed = false;
     let mut herdr_ended = false;
     let mut lifetime_ended = false;
+    let mut row_lost = false;
+    let mut row_unreadable = false;
     'io: loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             lifetime_ended = true;
             let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1000, ""));
             break 'io;
         }
+        match hijack.row.check(now) {
+            RowCheck::Present => {}
+            RowCheck::Gone => {
+                row_lost = true;
+                let _ = ws_write(
+                    &mut stream,
+                    OP_CLOSE,
+                    &close_payload(1008, "device not paired"),
+                );
+                break 'io;
+            }
+            RowCheck::Unreadable(e) => {
+                row_unreadable = true;
+                routes::note_unread_devices(&e);
+                let _ = ws_write(
+                    &mut stream,
+                    OP_CLOSE,
+                    &close_payload(1011, "device list unreadable"),
+                );
+                break 'io;
+            }
+        }
         // Out with herdr's frames first, so a queued frame never waits on a
         // client that stays silent for the whole read slice.
-        loop {
-            match frames_rx.try_recv() {
-                Ok(line) => {
-                    if ws_write(&mut stream, OP_TEXT, &line).is_err() {
-                        client_closed = true;
-                        break 'io;
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // herdr exited; whatever it printed — its `terminal.closed`
-                    // record included — has been queued and drained, so this is
-                    // the clean end of the stream.
-                    herdr_ended = true;
-                    break;
-                }
+        match drain_frames(&frames_rx, deadline, &hijack.row, Instant::now, |line| {
+            ws_write(&mut stream, OP_TEXT, line)
+        }) {
+            Drained::Empty => {}
+            Drained::Due => continue 'io,
+            Drained::WriteFailed => {
+                client_closed = true;
+                break 'io;
             }
+            // herdr exited; whatever it printed — its `terminal.closed` record
+            // included — has been queued and drained, so this is the clean end
+            // of the stream.
+            Drained::Ended => herdr_ended = true,
         }
         if herdr_ended {
             let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1000, ""));
@@ -822,6 +903,10 @@ pub(crate) fn run(
     let taken_by = held.and_then(HolderGuard::release);
     let why = if lifetime_ended {
         " (connection lifetime)".to_string()
+    } else if row_lost {
+        " (device no longer paired)".to_string()
+    } else if row_unreadable {
+        " (device list unreadable)".to_string()
     } else if herdr_ended && !client_closed {
         match taken_by {
             Some(device) => format!(
@@ -840,6 +925,47 @@ pub(crate) fn run(
         pane_for_log,
     );
     send_close_notify(&mut stream);
+}
+
+/// Where one pass over herdr's queued frames stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Drained {
+    /// The queue read empty.
+    Empty,
+    /// The lifetime or the row check came due between frames.
+    Due,
+    /// herdr exited and every frame it queued went out.
+    Ended,
+    /// A frame did not reach the client.
+    WriteFailed,
+}
+
+/// Write herdr's queued frames, oldest first, until the queue reads empty. A
+/// pane printing without pause can keep it from ever reading empty, so the
+/// lifetime and the row check are looked at before every frame, and a due one
+/// hands the loop back to its top, which acts on it.
+fn drain_frames(
+    frames: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Instant,
+    row: &RowWatch,
+    mut now: impl FnMut() -> Instant,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Drained {
+    loop {
+        let now = now();
+        if now >= deadline || row.due(now) {
+            return Drained::Due;
+        }
+        match frames.try_recv() {
+            Ok(line) => {
+                if write(&line).is_err() {
+                    return Drained::WriteFailed;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Drained::Empty,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Drained::Ended,
+        }
+    }
 }
 
 /// Why a client frame ends the connection.

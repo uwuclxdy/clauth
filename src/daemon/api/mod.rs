@@ -15,9 +15,11 @@
 //!   * **A device always.** Every route but the pairing redemption needs
 //!     `Authorization: Bearer <token>` from a paired device, and the switch
 //!     needs one paired with control; see [`devices`], [`pairing`], and the
-//!     table in [`routes`]. A CORS preflight from an origin in `[serve]
-//!     app_origins` is the one answer before authentication on any path: one
-//!     fixed head, the same for every path and method.
+//!     table in [`routes`]. The terminal stream's upgrade also takes a
+//!     [`ticket`] that device minted, since a page can set no header on a
+//!     WebSocket. A CORS preflight from an origin in `[serve] app_origins` is
+//!     the one answer before authentication on any path: one fixed head, the
+//!     same for every path and method.
 //!   * **Operations.** The health check, the status feed, the OpenAPI document,
 //!     the account switch and the fallback-chain edits (order, per-member
 //!     threshold, wrap-off; control devices only), and the pairing redemption.
@@ -41,6 +43,7 @@ pub(crate) mod push;
 pub(crate) mod routes;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
+pub(crate) mod ticket;
 pub(crate) mod tls;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -267,7 +270,7 @@ impl Prepared {
 /// running daemon, so a certificate that had just been renewed badly used to
 /// take the incumbent down and then abort — leaving the host with no daemon at
 /// all, and with it no refresh and no auto-switch, not merely no listener.
-/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
+/// `wiki/REST-API.md` recommends `clauth daemon --replace --listen` as the
 /// post-`lego renew` hook, which makes the documented automation the trigger.
 /// Settled first, a bad renewal is a no-op: the incumbent keeps running.
 /// The `--standby` park the result can be carried through is unbounded, so
@@ -512,8 +515,15 @@ fn serve_connection(
                 .device
                 .as_deref()
                 .map_or_else(|| "-".to_string(), http::sanitize_for_log);
-            logline!("clauth api: {peer} {device} {summary} -> 101{origin_field}");
-            if let Err(e) = http::write_upgrade_head(reader.stream_mut(), &hijack.accept) {
+            logline!(
+                "clauth api: {peer} {device} {summary} -> 101{origin_field}{}",
+                hijack.auth_field()
+            );
+            if let Err(e) = http::write_upgrade_head(
+                reader.stream_mut(),
+                &hijack.accept,
+                hijack.selected_protocol(),
+            ) {
                 logline!("clauth api: {peer}: failed to write the upgrade head: {e}");
                 break;
             }
@@ -540,19 +550,25 @@ fn serve_connection(
         // What is advertised is the budget genuinely left, so a client is never
         // told it has time it does not have.
         //
-        // An answer no device earned (a 401, a failed pairing, a preflight,
-        // whose 200 needs only an origin and an origin is no secret) never
-        // keeps the connection. Otherwise anyone able to reach the port could
-        // hold a slot for the whole budget by sending one bogus request and
-        // going quiet, and at 32 slots that is a lockout for the price of a TCP
-        // connection; and every wrong pairing code costs its sender a new
-        // connection rather than one more request on an open one. Before
-        // connections persisted,
-        // one socket timeout capped the hold; now the budget would. A real
-        // client presents its token, and a pairing that succeeds may carry on,
-        // so this costs nothing legitimate.
+        // An answer keeps the connection when a success answered it or when a
+        // device earned a non-401 answer; nothing else does. A preflight earns
+        // nothing whatever its status: its 200 needs only an origin, and an
+        // origin is no secret. A 401 closes the connection even when a handler
+        // wrote it after the router stamped the device on the request — a
+        // device revoked while a long poll or a push subscription re-checked
+        // its row is owed the close its next request would get; the line still
+        // names it, so the refusal reads as one from that device. Otherwise
+        // anyone able to reach the port could hold a slot for the whole budget
+        // by sending one bogus request and going quiet, and at 32 slots that is
+        // a lockout for the price of a TCP connection; and every wrong pairing
+        // code costs its sender a new connection rather than one more request
+        // on an open one. Before connections persisted, one socket timeout
+        // capped the hold; now the budget would. A real client presents its
+        // token, and a pairing that succeeds may carry on, so this costs
+        // nothing legitimate.
         let earned = !response.cors.is_preflight()
-            && (handled.device.is_some() || (200..300).contains(&response.status));
+            && ((handled.device.is_some() && response.status != 401)
+                || (200..300).contains(&response.status));
         let remaining = expires.saturating_duration_since(std::time::Instant::now());
         let disposition =
             if request.keep_alive && earned && served < limits.max_requests && !remaining.is_zero()

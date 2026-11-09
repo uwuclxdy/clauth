@@ -1250,7 +1250,7 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
 /// `--replace` terminates the running daemon as part of claiming, so a
 /// certificate that fails to load after that point takes the incumbent down and
 /// then aborts, leaving the host with no daemon at all — no refresh, no
-/// auto-switch, not merely no listener. `wiki/Daemon.md` recommends
+/// auto-switch, not merely no listener. `wiki/REST-API.md` recommends
 /// `clauth daemon --replace --listen` as the post-`lego renew` hook, so the
 /// documented automation is the trigger.
 ///
@@ -1622,6 +1622,7 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
             path: "/api/v1/health".to_string(),
             query: String::new(),
             bearer: Some(bearer.to_string()),
+            authorization_seen: true,
             if_none_match: None,
             body: Vec::new(),
             keep_alive: false,

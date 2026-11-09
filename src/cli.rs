@@ -359,7 +359,7 @@ pub(crate) enum Command {
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
     /// `--listen` also serves the REST API to the devices `clauth devices`
-    /// pairs (see the Daemon wiki page); `--status` prints and exits without
+    /// pairs (see the REST API wiki page); `--status` prints and exits without
     /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
@@ -976,7 +976,7 @@ pub(crate) enum DevicesCommand {
         sessions: bool,
     },
 
-    /// Remove a device; its next request is refused
+    /// Remove a device; its next request is refused and its open streams close within seconds
     Revoke {
         /// Device to remove.
         name: String,

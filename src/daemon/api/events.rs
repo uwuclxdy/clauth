@@ -7,7 +7,10 @@
 //! bridge saw fought over (`terminal_contention`), without polling. The stream
 //! runs until the connection's deadline and then closes cleanly, so an
 //! `EventSource` client reconnects on its own and gets the current feed first
-//! again.
+//! again. It closes sooner once its device's row is gone, and that reconnect
+//! gets the 401; a device list that stops reading ends it as a server fault
+//! instead, its error going through the once-per-process refusal line and the
+//! reconnect meeting the 500 while the list still does not read.
 //!
 //! The herdr half speaks herdr's socket protocol: one JSON object per line. It
 //! is unix-only (a `std::os::unix::net::UnixStream`); on every other target the
@@ -21,8 +24,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::io::Read;
 
+use super::devices::{RowCheck, RowWatch};
 use super::http::Response;
-use super::routes::{ApiContext, Caller, ErrorBody, WAIT_POLL, read_feed_tagged};
+use super::routes::{
+    ApiContext, Caller, ErrorBody, WAIT_POLL, note_unread_devices, read_feed_tagged,
+};
 use super::terminal::{Contention, TerminalHolders};
 
 /// How the stream learns where herdr's API socket is. The daemon passes the
@@ -93,7 +99,7 @@ fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool 
     get,
     path = "/api/v1/events",
     responses(
-        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then, when the mod bridge is live, an `event: session.snapshot` frame carrying every live mod session and its open asks, and `event: session.status` / `event: session.record` / `event: session.ask` frames relaying each live session's state, transcript rows and asks; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, `event: terminal_contention` frames (`{\"pane_id\":…,\"devices\":[…]}`) when one pane changed hands between devices 3 times in 5 minutes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects", content_type = "text/event-stream", body = String),
+        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then, when the mod bridge is live, an `event: session.snapshot` frame carrying every live mod session and its open asks, and `event: session.status` / `event: session.record` / `event: session.ask` frames relaying each live session's state, transcript rows and asks; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, `event: terminal_contention` frames (`{\"pane_id\":…,\"devices\":[…]}`) when one pane changed hands between devices 3 times in 5 minutes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects, and it ends within seconds of its device's revoke (its row is re-read every 5 s; a client slow to read what the stream writes delays its own close), the reconnect then answering 401", content_type = "text/event-stream", body = String),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
@@ -103,13 +109,16 @@ fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool 
 pub(crate) fn events(
     ctx: &ApiContext,
     _req: &super::http::Request,
-    _caller: &Caller<'_>,
+    caller: &Caller<'_>,
 ) -> Response {
     let status_path = ctx.status_path.clone();
     let herdr = std::sync::Arc::clone(&ctx.herdr);
     let holders = std::sync::Arc::clone(&ctx.terminal_holders);
     #[cfg(unix)]
     let bridge = ctx.bridge.clone();
+    let mut row = caller
+        .device
+        .map(|device| RowWatch::new(device, Instant::now()));
     Response::stream(
         200,
         "text/event-stream",
@@ -121,6 +130,7 @@ pub(crate) fn events(
                 herdr.as_ref(),
                 &holders,
                 &StreamConfig::DEFAULT,
+                row.as_mut(),
                 #[cfg(unix)]
                 bridge.as_deref(),
             )
@@ -147,13 +157,18 @@ fn run_stream(
         resolve_herdr,
         holders,
         &StreamConfig::DEFAULT,
+        None,
         #[cfg(unix)]
         None,
     )
 }
 
 /// The loop itself, with the config injected. Everything is flushed frame by
-/// frame so a client sees an event the moment it is written.
+/// frame so a client sees an event the moment it is written. `row` ends the
+/// stream once its device is gone or the device list stops reading; the
+/// reconnect then gets the 401 for a gone row, or the 500 while the list still
+/// does not read.
+#[allow(clippy::too_many_arguments)]
 fn run_stream_with_config(
     sink: &mut dyn Write,
     deadline: Instant,
@@ -161,6 +176,7 @@ fn run_stream_with_config(
     resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
     holders: &TerminalHolders,
     config: &StreamConfig,
+    mut row: Option<&mut RowWatch>,
     #[cfg(unix)] bridge: Option<&crate::daemon::bridge::Hub>,
 ) -> std::io::Result<()> {
     // The one field line every stream opens with, so a reconnect is bounded.
@@ -216,6 +232,14 @@ fn run_stream_with_config(
             // return still goes out, or the next stream's cursor starts past it.
             drain_contention(sink, holders, &mut contention_cursor)?;
             return Ok(());
+        }
+        match row.as_mut().map(|row| row.check(now)) {
+            Some(RowCheck::Present) | None => {}
+            Some(RowCheck::Gone) => return Ok(()),
+            Some(RowCheck::Unreadable(e)) => {
+                note_unread_devices(&e);
+                return Ok(());
+            }
         }
 
         // The published feed, whole, keyed on its entity tag: a rewrite that
@@ -317,10 +341,17 @@ fn run_stream_with_config(
         // with one-line JSON data. A dropped subscription (its channel filled)
         // ends the stream, so the client reconnects for a fresh snapshot. The
         // frame and the drop verdict come from one non-consuming read, so a
-        // frame landing between a drain and a drop check is never eaten.
+        // frame landing between a drain and a drop check is never eaten. A
+        // steady trickle can keep the channel from ever reading empty, so the
+        // deadline and the row check are looked at before every frame, and the
+        // loop's top acts on a due one.
         #[cfg(unix)]
         if let Some(sub) = &sub {
             loop {
+                let now = Instant::now();
+                if now >= deadline || row.as_ref().is_some_and(|row| row.due(now)) {
+                    break;
+                }
                 match sub.try_next() {
                     Ok(Some((name, data))) => {
                         write_session_frame(sink, &name, &data)?;
