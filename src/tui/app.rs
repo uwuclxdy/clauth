@@ -30564,8 +30564,8 @@ fn run_capture_overwrite(
             )
             .map(|outcome| {
                 outcome.map(|landed| {
-                    landed.map(|oauth_moved| {
-                        if oauth_moved {
+                    landed.map(|plan_read_due| {
+                        if plan_read_due {
                             crate::usage::expire_profile_ttl(&name);
                         }
                     })
@@ -30674,7 +30674,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         // disk holds for the
                         // account it names active.
                         let keys = crate::actions::outgoing_env_keys_now(cfg)?;
-                        let oauth_moved = crate::actions::overwrite_captured_profile_held(
+                        let plan_read_due = crate::actions::overwrite_captured_profile_held(
                             cfg, &name, &account, snapshot, false,
                         )??;
                         // This arm activates OUTSIDE `overwrite_captured_profile`,
@@ -30693,17 +30693,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                                 let fresh = crate::profile::read_profile(&name)?;
                                 crate::claude::apply_profile_to_claude_settings(&fresh, &keys)
                             });
-                        Ok((oauth_moved, activated))
+                        Ok((plan_read_due, activated))
                     },
                 )
             };
             #[cfg(test)]
             run_after_adopt_hold_hook();
             let result = match result {
-                Ok(Ok((oauth_moved, activated))) => {
+                Ok(Ok((plan_read_due, activated))) => {
                     // After the hold (the TTL store ranks below the flock),
                     // whether or not the activation landed: the store moved.
-                    if oauth_moved {
+                    if plan_read_due {
                         crate::usage::expire_profile_ttl(&name);
                     }
                     activated
