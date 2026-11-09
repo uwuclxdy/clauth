@@ -12349,6 +12349,141 @@ fn a_proven_same_account_relogin_forgets_nothing() {
     );
 }
 
+fn canceled_plan() -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+        ..crate::usage::PlanInfo::default()
+    }
+}
+
+fn active_plan_for(account: &str) -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        subscription_status: Some("active".to_string()),
+        ..plan_for(account)
+    }
+}
+
+/// Re-login `acct` as the same account over a usage cache holding `cached`, one
+/// 5h window and an old mtime, with the login's probe reading `probe`. Answers
+/// the mtime the cache was left with before the login, in epoch ms.
+fn relogin_over_cached_plan(
+    cached: crate::usage::PlanInfo,
+    probe: crate::usage::PlanInfo,
+) -> (HomeSandbox, ProfileName, u64) {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, profile_cache_path};
+
+    let home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let info = crate::usage::UsageInfo {
+        plan: Some(cached),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    crate::profile_cache::write_profile_cache(&name, PROFILE_FETCHED_CACHE_FILE, &123u64);
+    let dated_secs = 1_000_000u64;
+    crate::testutil::set_mtime(
+        &profile_cache_path(&name, USAGE_CACHE_FILE).expect("the cache path"),
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dated_secs),
+    );
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+            plan: Some(probe),
+        },
+    )
+    .expect("same-account re-login");
+    (home, name, dated_secs * 1000)
+}
+
+/// Resubscribing changes the plan and not the account, so a same-account
+/// re-login must carry the plan its probe read: a cached `canceled` otherwise
+/// keeps the account out of every walk until the next hourly `/profile` read.
+/// Only the plan moves. The windows and the age they read as stay, and the
+/// `/profile` clock lapses for the processes holding the old plan in memory.
+#[test]
+fn a_same_account_relogin_corrects_a_canceled_plan_and_keeps_the_windows() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    };
+
+    let (_home, name, dated_ms) =
+        relogin_over_cached_plan(canceled_plan(), active_plan_for("uuid-A"));
+
+    let plan = seeded_plan("acct").expect("the cache keeps a plan");
+    assert!(
+        !plan.is_canceled(),
+        "the login's own reading replaces the cached cancellation"
+    );
+    assert_eq!(plan.tier, crate::usage::PlanTier::Max(Some(5)));
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the cache survives");
+    assert_eq!(
+        disk.five_hour.map(|w| w.utilization),
+        Some(42.0),
+        "only the plan moves"
+    );
+    assert_eq!(
+        profile_cache_mtime_ms(&name, USAGE_CACHE_FILE),
+        Some(dated_ms),
+        "old windows must not read as fresh because the plan beside them changed"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "the /profile clock lapses, so a process holding the old plan re-reads it"
+    );
+}
+
+/// A re-login whose probe agrees with the cached plan changes nothing, the
+/// common case: the file keeps its date and the hourly clock keeps running.
+#[test]
+fn a_same_account_relogin_on_an_unchanged_plan_keeps_the_stamp() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    };
+
+    let (_home, name, dated_ms) =
+        relogin_over_cached_plan(active_plan_for("uuid-A"), active_plan_for("uuid-A"));
+
+    assert_eq!(
+        profile_cache_mtime_ms(&name, USAGE_CACHE_FILE),
+        Some(dated_ms)
+    );
+    assert!(load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some());
+}
+
+/// A probe plan paired with another account is not this login's plan, the
+/// same refusal the new-account seed makes.
+#[test]
+fn a_same_account_relogin_ignores_a_plan_paired_with_another_account() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+
+    let (_home, name, _) = relogin_over_cached_plan(canceled_plan(), active_plan_for("uuid-B"));
+
+    assert!(
+        seeded_plan("acct").is_some_and(|plan| plan.is_canceled()),
+        "another account's plan never lands"
+    );
+    assert!(load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some());
+}
+
 /// A hybrid's OAuth log out forgets the OAuth half alone — the provider
 /// reading stays, on disk and in memory.
 #[test]
