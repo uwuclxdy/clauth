@@ -13,15 +13,19 @@ use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
-/// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
-/// provider, tier, base url). Volatile usage figures rot within a turn, so they are
-/// served fresh per call by `profiles`, never baked into the boot-time block.
+/// Per-profile snapshot fed to [`instructions_block`]: stable identity (name,
+/// provider, tier, base url), the active and disabled flags, and a sort key.
+/// Volatile usage figures rot within a turn, so they are served fresh per call by
+/// `profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
+    /// Whether the account is disabled. A disabled row the roster keeps says so in
+    /// its marker, since the header tells a reader disabled ones are left out.
+    pub(crate) disabled: bool,
     /// Where this profile sorts in the roster. See [`RosterRank`].
     pub(crate) rank: RosterRank,
 }
@@ -270,20 +274,35 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
 /// runtime marks the profile the session is pinned to and the account the global
 /// link points at separately; a global session IS the global link, so the active
 /// profile carries both names; a custom config dir holds no clauth session
-/// profile, so only the global link gets a name. The old bare `(active)` read as
+/// profile, so only the global link gets a name. A bare `active` would read as
 /// "this session's account" where a `clauth start` session does not spend the
 /// active profile at all.
 fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
     match auth {
         SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime && p.active => {
-            Some(" (global active, this session)")
+            Some("global active, this session")
         }
-        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some(" (this session)"),
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some("this session"),
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom if p.active => {
-            Some(" (global active)")
+            Some("global active")
         }
-        SessionAuth::Global if p.active => Some(" (global active, this session)"),
+        SessionAuth::Global if p.active => Some("global active, this session"),
         SessionAuth::Global | SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => None,
+    }
+}
+
+/// A roster member as the block spells it: the name, then one paren holding the
+/// [`marker`] and, for a kept disabled account, `disabled`. Composed here once so
+/// every marker arm carries the flag.
+fn member_label(p: &ProfileSnapshot, auth: &SessionAuth) -> String {
+    let tags: Vec<&str> = marker(p, auth)
+        .into_iter()
+        .chain(p.disabled.then_some("disabled"))
+        .collect();
+    if tags.is_empty() {
+        p.name.clone()
+    } else {
+        format!("{} ({})", p.name, tags.join("; "))
     }
 }
 
@@ -318,10 +337,7 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 
     let mut out = String::new();
     for (bracket, members) in &groups {
-        let names: Vec<String> = members
-            .iter()
-            .map(|p| marker(p, auth).map_or_else(|| p.name.clone(), |m| format!("{}{m}", p.name)))
-            .collect();
+        let names: Vec<String> = members.iter().map(|p| member_label(p, auth)).collect();
         out.push_str("- ");
         out.push_str(&names.join(", "));
         out.push(' ');

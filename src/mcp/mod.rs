@@ -6643,6 +6643,7 @@ fn build_instructions() -> String {
             provider: provider_label(p),
             base_url: p.base_url.clone(),
             sub_type: tier_label(p),
+            disabled: p.is_disabled(),
             rank: roster_rank_for(p),
         })
         .collect();

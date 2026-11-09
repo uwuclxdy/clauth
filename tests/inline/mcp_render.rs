@@ -10,6 +10,7 @@ fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: None,
         sub_type: Some("max".to_string()),
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }
@@ -21,6 +22,7 @@ fn third_party_snapshot(name: &str, base_url: &str, rank: RosterRank) -> Profile
         provider: "DeepSeek".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank,
     }
 }
@@ -493,6 +495,82 @@ fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
     ];
     let out = roster_lines(&profiles, &SessionAuth::Global);
     assert_eq!(out, "- healthy, overdrawn [DeepSeek, api.deepseek.com]\n");
+}
+
+/// A disabled account the roster keeps says so inside its marker paren on every
+/// session tier, while its enabled bracket-mate keeps its plain spelling.
+#[test]
+fn a_kept_disabled_account_reads_disabled_inside_its_marker_on_every_tier() {
+    let roster = |off: ProfileSnapshot, on: ProfileSnapshot, auth: SessionAuth| {
+        let block = instructions_block(&[off, on], &auth, crate::runtime::LinkProbe::NothingShared);
+        let (_, roster) = block
+            .split_once("`profiles` for live usage and anything added since):\n")
+            .expect("the roster header");
+        roster.to_string()
+    };
+    let disabled = |mut p: ProfileSnapshot| {
+        p.disabled = true;
+        p
+    };
+
+    assert_eq!(
+        roster(
+            snapshot("off", true),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session), on [anthropic, max]\n",
+        "an enabled account's marker carries no flag",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("on".into()),
+        ),
+        "- off (global active; disabled), on (this session) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedCustom,
+        ),
+        "- off (global active; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (this session; disabled), on (global active) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::Global
+        ),
+        "- off (disabled), on (global active, this session) [anthropic, max]\n",
+        "a markerless disabled row still opens a paren for the flag",
+    );
 }
 
 #[test]
@@ -1185,6 +1263,7 @@ fn endpoint_snapshot(name: &str, base_url: &str) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }

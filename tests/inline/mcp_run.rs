@@ -1424,8 +1424,8 @@ fn the_roster_keeps_a_disabled_active_account() {
         "the identity line survives: {block}"
     );
     assert!(
-        block.contains("acct-off (global active, this session)"),
-        "the roster keeps the account behind this session: {block}"
+        block.contains("acct-off (global active, this session; disabled)"),
+        "the roster keeps the account behind this session and says it is disabled: {block}"
     );
     assert!(
         !block.contains("acct-spare"),
@@ -1446,13 +1446,21 @@ fn the_roster_keeps_a_disabled_active_account_in_the_other_session_tiers() {
         block.contains("runtime profile: `acct-on` (anthropic) · global active: `acct-off`"),
         "the runtime identity line names the global account: {block}"
     );
+    assert!(
+        block.contains("acct-off (global active; disabled)"),
+        "a runtime session reads the disabled global account as disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (this session)"),
+        "the enabled runtime account carries no disabled mark: {block}"
+    );
     drop(dir);
     let custom = home.home().join("custom-config");
     let _dir = crate::testutil::ConfigDirSandbox::new(&home, &custom);
     let block = build_instructions();
     assert!(
-        block.contains("acct-off (global active)"),
-        "a custom dir still marks the global account: {block}"
+        block.contains("acct-off (global active; disabled)"),
+        "a custom dir still marks the global account and says it is disabled: {block}"
     );
 }
 
@@ -1478,8 +1486,26 @@ fn the_roster_keeps_the_disabled_account_a_runtime_dir_names() {
         "the identity line keeps its provider: {block}"
     );
     assert!(
-        block.contains("acct-off (this session)"),
-        "the roster keeps this session's own account: {block}"
+        block.contains("acct-off (this session; disabled)"),
+        "the roster keeps this session's own account and says it is disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (global active)"),
+        "the enabled global account carries no disabled mark: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active, this session; disabled)"),
+        "a runtime on the disabled global account marks both and the flag: {block}"
     );
     assert!(
         !block.contains("acct-spare"),
