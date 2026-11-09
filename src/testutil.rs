@@ -71,8 +71,8 @@ pub(crate) fn node_path(path: &Path) -> PathBuf {
 /// A `RecvBody` bound or one of ureq's other phases is a different, unruled
 /// budget even when it errors inside the window.
 ///
-/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
-/// ureq error is the io error's inner source.
+/// ureq's `BodyReader` (3.4.2; unchanged through 3.5.1) surfaces its timeout as
+/// `io::Error::other`, so the ureq error is the io error's inner source.
 pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
     let err = result.as_ref().expect_err("a stalled body is an error");
     let io = err

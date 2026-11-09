@@ -327,9 +327,10 @@ const HTTP_RECV_HEADERS_SECS: u64 = 15;
 /// [`token_agent`] arms `timeout_global` with this sum, whose upstream wording
 /// is "end-to-end, from DNS lookup to finishing reading the response body", so
 /// the body is held to it too and the sum is a ceiling on a token call.
-/// Measured on 3.4.2 against a 300 ms bound on loopback: a body that never
-/// arrives and bodies trickling one byte every 100, 250, 290 or 600 ms all ended
-/// at 301-304 ms with `Timeout(Global)`, so a slow drip cannot outlast it.
+/// Measured on 3.4.2 (timeout path unchanged through 3.5.1) against a 300 ms
+/// bound on loopback: a body that never arrives and bodies trickling one byte
+/// every 100, 250, 290 or 600 ms all ended at 301-304 ms with
+/// `Timeout(Global)`, so a slow drip cannot outlast it.
 ///
 /// `timeout_connect` is a true phase bound — upstream's wording is "Max duration
 /// for establishing the connection. For a TLS connection this includes opening
@@ -337,14 +338,15 @@ const HTTP_RECV_HEADERS_SECS: u64 = 15;
 ///
 /// `timeout_recv_response` is the header phase's bound — upstream's wording is
 /// "Max duration for receiving the response headers, but not the body", and it
-/// stops applying once the headers are received. Measured on the locked 3.4.2
-/// (2026-10-21): a loopback stub dribbling one header byte every 100 ms against
-/// a 500 ms bound returned `Timeout(RecvResponse)` at 502 ms — the deadline is
-/// armed from the header phase's START, not re-armed per byte (the earlier
-/// 3.4.0 note here claimed a per-byte re-arm; 3.4.2 does not). The same stub
-/// sending complete headers then stalling the body stayed blocked past 3 s,
-/// which is what proves the deadline stops applying at the headers: without the
-/// end-to-end budget beside it, a stalled body would hang the call.
+/// stops applying once the headers are received. Measured on 3.4.2
+/// (2026-10-21; unchanged through 3.5.1): a loopback stub dribbling one header
+/// byte every 100 ms against a 500 ms bound returned `Timeout(RecvResponse)` at
+/// 502 ms — the deadline is armed from the header phase's START, not re-armed
+/// per byte (the earlier 3.4.0 note here claimed a per-byte re-arm; 3.4.2 does
+/// not). The same stub sending complete headers then stalling the body stayed
+/// blocked past 3 s, which is what proves the deadline stops applying at the
+/// headers: without the end-to-end budget beside it, a stalled body would hang
+/// the call.
 ///
 /// `timeout_recv_body`, `timeout_resolve`, `timeout_send_request` and
 /// `timeout_send_body` stay at their `None` default; the one end-to-end budget

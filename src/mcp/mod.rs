@@ -1993,7 +1993,7 @@ across accounts."
             // so the run went on as a background job instead of throwing its
             // result away.
             //
-            // This reply is never sent: rmcp (3.4.0, `service.rs`) removes the
+            // This reply is never sent: rmcp (`service.rs`, 3.4.0-3.9.0) removes the
             // request from `local_ct_pool` when the `notifications/cancelled`
             // arrives, and the response path drops any message whose id is no
             // longer in that pool — "dropping response for cancelled request" —
@@ -6562,10 +6562,11 @@ impl ServerHandler for ClauthServer {
         // default `Implementation` reads its OWN build env, so the server
         // introduces itself to every client as "rmcp".
         //
-        // The protocol version stays at rmcp's default. It is only the fallback
-        // for an `initialize` caller asking for a revision this SDK does not
-        // know — a legacy client, which a 2026-07-28 answer would break —
-        // while `server/discover` advertises the full supported set instead.
+        // The protocol version stays at rmcp's default, `LATEST`, a revision
+        // with no `initialize`: rmcp answers an `initialize` caller asking
+        // for a revision this SDK does not know with the newest version that
+        // has one — a legacy client, which a 2026-07-28 answer would break —
+        // while `server/discover` advertises the full supported set.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -6796,15 +6797,36 @@ pub(crate) fn serve() -> Result<()> {
 }
 
 async fn run_server(delegate_dot: bool) -> Result<()> {
-    use rmcp::{ServiceExt, transport::stdio};
+    use rmcp::{ServiceExt, service::ServerInitializeError, transport::stdio};
     // Resolve the pane reporter once, at startup: the pane env is what this
     // process inherited from herdr, and a per-call re-read would race a
     // delegate with a changed environment.
     let server =
         ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve(delegate_dot));
-    let service = server.serve(stdio()).await?;
+    let service = match server.serve(stdio()).await {
+        Ok(service) => service,
+        // rmcp answers `server/discover`, pings and malformed requests before
+        // it selects a lifecycle, so a client may get every reply it asked for
+        // and close stdin without one existing. Its transport ending there is
+        // the same client exit that ends an established session cleanly.
+        Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+        // A client that stops reading first leaves the reply to its probe on a
+        // closed pipe: the reader leaving, which `out` ends at exit 0 too.
+        Err(ServerInitializeError::TransportError { error, .. }) if is_broken_pipe(&error) => {
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     service.waiting().await?;
     Ok(())
+}
+
+/// Whether any error in `error`'s source chain is an `EPIPE` write.
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |e| e.source()).any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 pub(crate) fn await_job() -> ! {
