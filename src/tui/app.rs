@@ -665,6 +665,14 @@ impl ConfigRow {
             | ConfigRow::Create => false,
         }
     }
+
+    /// `+` / `-` step only the two numeric rows: `alert at` and `probe every`.
+    pub(crate) fn steps(self) -> bool {
+        matches!(
+            self,
+            ConfigRow::BellThreshold | ConfigRow::UsageProbeInterval
+        )
+    }
 }
 
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
@@ -5729,6 +5737,11 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
+    /// The model the Models selection holds, by identity: written with the
+    /// cursor by `set_token_model_cursor`, so a list that re-ranked since the
+    /// last write (a bucket rollover) still re-homes the picker onto its model
+    /// rather than the row the old index now names.
+    pub(crate) token_model_identity: Option<String>,
     pub(crate) model_detail_focus: StatusFocus,
     pub(crate) model_detail_scroll: u16,
     pub(crate) model_detail_max_scroll: std::cell::Cell<u16>,
@@ -6596,6 +6609,7 @@ impl App {
             tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
+            token_model_identity: None,
             model_detail_focus: StatusFocus::List,
             model_detail_scroll: 0,
             model_detail_max_scroll: std::cell::Cell::new(0),
@@ -9044,6 +9058,87 @@ pub(crate) fn pane_state(app: &App) -> PaneState {
     PaneState::Rest
 }
 
+/// Whether the tab's descended scrolling pane has anywhere to scroll: the bound
+/// its render published this frame, which the body draws before the footer and
+/// the help modal, and the one its `↑`/`↓` clamp against. A pane that fits
+/// moves nothing either way, so no hint offers its arrows.
+pub(crate) fn detail_scrolls(app: &App) -> bool {
+    match app.tab {
+        Tab::Usage => app.usage_detail_max_scroll.get() > 0,
+        Tab::Tokens => app.model_detail_max_scroll.get() > 0,
+        Tab::Status => app.status.detail_max_scroll.get() > 0,
+        Tab::Services => app.services.detail_max_scroll.get() > 0,
+        Tab::Overview | Tab::Setup | Tab::Fallback | Tab::Config => false,
+    }
+}
+
+/// What the page keys do on this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageAction {
+    /// The press pages a selection: a list walk, or the delegates job list.
+    Move,
+    /// The press scrolls a pane: a detail's scroll, the shunt card, the
+    /// herdr / plugin diagnostics.
+    Scroll,
+}
+
+/// The page keys' effect on this frame, read off the same routing the key
+/// handlers use: `None` where a press moves nothing. A list, a Setup card and
+/// the Fallback card or `+ add` picker page their selection only while they
+/// have a second row to walk to; the Tokens dashboard pages its cards only
+/// once [`dash_walks`] holds; the delegates detail pages its job list only
+/// while it can move; the Usage / Tokens / Status scroll details, the shunt
+/// card, the herdr / plugin diagnostics and the generic scroll details scroll
+/// only while their published bound leaves somewhere to go.
+pub(crate) fn page_keys_act(app: &App) -> Option<PageAction> {
+    match app.tab {
+        Tab::Overview => walk_moves(app.main_items().len()).then_some(PageAction::Move),
+        Tab::Usage => match app.usage_detail_focus {
+            StatusFocus::Detail => detail_scrolls(app).then_some(PageAction::Scroll),
+            StatusFocus::List => walk_moves(app.setup_items().len()).then_some(PageAction::Move),
+        },
+        Tab::Tokens => match app.token_view {
+            TokenView::Dashboard => dash_walks(app).then_some(PageAction::Move),
+            TokenView::Models if app.model_detail_focus == StatusFocus::Detail => {
+                detail_scrolls(app).then_some(PageAction::Scroll)
+            }
+            TokenView::Models => walk_moves(token_model_count(app)).then_some(PageAction::Move),
+        },
+        Tab::Setup => match app.config_focus {
+            ConfigFocus::Profiles => {
+                walk_moves(app.setup_items().len() + 1).then_some(PageAction::Move)
+            }
+            ConfigFocus::Actions => {
+                walk_moves(setup_card_row_count(app)).then_some(PageAction::Move)
+            }
+        },
+        Tab::Fallback => match app.fallback_focus {
+            FallbackFocus::Chain => walk_moves(chain_items(app).len()).then_some(PageAction::Move),
+            // A member card walks its rows; the `+ add` picker its candidates.
+            FallbackFocus::Detail => walk_moves(match selected_chain_member(app) {
+                Some(_) => FALLBACK_ROWS.len(),
+                None => chain_candidates(app).len(),
+            })
+            .then_some(PageAction::Move),
+        },
+        Tab::Config => Some(PageAction::Move),
+        Tab::Status => match app.status.focus {
+            StatusFocus::Detail => detail_scrolls(app).then_some(PageAction::Scroll),
+            StatusFocus::List => walk_moves(app.status.incidents.len()).then_some(PageAction::Move),
+        },
+        Tab::Services => match app.services.focus {
+            ServicesFocus::List => walk_moves(app.services.row_count()).then_some(PageAction::Move),
+            ServicesFocus::Detail => match app.services.selected_check().map(|c| c.label) {
+                Some("delegates") => app
+                    .services
+                    .delegates_selection_moves()
+                    .then_some(PageAction::Move),
+                _ => detail_scrolls(app).then_some(PageAction::Scroll),
+            },
+        },
+    }
+}
+
 /// Back out of the current sub-focus, the `esc`/`←` ascend path. Mirrors the
 /// `esc` chain exactly so `←` and `esc` can never diverge.
 fn ascend_pane(app: &mut App) {
@@ -9290,9 +9385,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('a') => {
-            let state = build_action_menu(app);
-            if !state.items.is_empty() {
-                app.open_modal(Modal::ActionMenu(state));
+            if action_menu_opens(app) {
+                app.open_modal(Modal::ActionMenu(build_action_menu(app)));
             }
             return;
         }
@@ -9477,16 +9571,40 @@ pub(crate) fn token_model_count(app: &App) -> usize {
     token_period_models(app).len()
 }
 
-/// Keep detail focus on a model only while the active list can select one.
-fn clamp_token_model_cursor(app: &mut App) {
-    let len = token_model_count(app);
-    if len == 0 {
+/// The identity of the model under the Models cursor, `None` while the active
+/// list is empty.
+fn token_model_at_cursor(app: &App) -> Option<String> {
+    token_period_models(app)
+        .get(app.token_model_cursor)
+        .map(|m| m.model.clone())
+}
+
+/// Point the Models cursor at row `cursor` and store the model that row names
+/// as the selection's anchor. The one writer of both, so the anchor a later
+/// re-home reads always names the model the picker shows.
+fn set_token_model_cursor(app: &mut App, cursor: usize) {
+    app.token_model_cursor = cursor;
+    app.token_model_identity = token_model_at_cursor(app);
+}
+
+/// Re-anchor the Models cursor after the ranked list changed: the selection
+/// follows its model wherever the new ranking put it, and a model gone from
+/// the new list keeps the old row index, clamped to the last row. Sites that
+/// change the list BEFORE re-ranking (the cache toggle, a period or filter
+/// change) capture the identity from the live cursor; the sites that may run
+/// after the list already re-ranked (a bucket-bound tick, a stats load) pass
+/// the stored anchor instead.
+fn rehome_token_model_cursor(app: &mut App, identity: Option<String>) {
+    let models = token_period_models(app);
+    // Detail focus holds only while the active list can select a model.
+    if models.is_empty() {
         app.model_detail_focus = StatusFocus::List;
         app.model_detail_scroll = 0;
     }
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    let cursor = identity
+        .and_then(|identity| models.iter().position(|m| m.model == identity))
+        .unwrap_or_else(|| app.token_model_cursor.min(models.len().saturating_sub(1)));
+    set_token_model_cursor(app, cursor);
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -9523,7 +9641,7 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                 app.token_view = TokenView::Models;
                 app.model_detail_focus = StatusFocus::List;
                 app.model_detail_scroll = 0;
-                app.token_model_cursor = 0;
+                set_token_model_cursor(app, 0);
             }
             KeyCode::Up => dash_move_focus(app, DashDir::Prev),
             KeyCode::Down => dash_move_focus(app, DashDir::Next),
@@ -9562,22 +9680,25 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
             } else {
                 let len = token_model_count(app);
                 match key.code {
-                    KeyCode::Up if len > 0 => {
-                        app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+                    KeyCode::Up if walk_moves(len) => {
+                        set_token_model_cursor(
+                            app,
+                            (app.token_model_cursor + len - 1).rem_euclid(len),
+                        );
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::Down if len > 0 => {
-                        app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                    KeyCode::Down if walk_moves(len) => {
+                        set_token_model_cursor(app, (app.token_model_cursor + 1).rem_euclid(len));
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::PageUp if len > 0 => {
-                        app.token_model_cursor =
-                            selector_page_up(app.token_model_cursor, &app.models_selector);
+                    KeyCode::PageUp if walk_moves(len) => {
+                        let next = selector_page_up(app.token_model_cursor, &app.models_selector);
+                        set_token_model_cursor(app, next);
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::PageDown if len > 0 => {
-                        app.token_model_cursor =
-                            selector_page_down(app.token_model_cursor, &app.models_selector);
+                    KeyCode::PageDown if walk_moves(len) => {
+                        let next = selector_page_down(app.token_model_cursor, &app.models_selector);
+                        set_token_model_cursor(app, next);
                         app.model_detail_scroll = 0;
                     }
                     KeyCode::Enter if len > 0 => {
@@ -9599,15 +9720,23 @@ enum DashDir {
     PageDown,
 }
 
+/// Whether the dashboard's card walk (`↑`/`↓` and the page keys) acts: only
+/// once the render has laid out all seven cards. A failed read and the
+/// pre-first-paint spinner draw no cards, so the walk has nothing to move.
+/// The walk's handler, the help's card rows and [`page_keys_act`] read this.
+pub(crate) fn dash_walks(app: &App) -> bool {
+    app.token_dash_rows.borrow().len() == 7
+}
+
 /// Move dashboard card focus one step (or one page) and reconcile the
 /// first-visible card, both through [`follow_dash_focus`].
 fn dash_move_focus(app: &mut App, dir: DashDir) {
+    if !dash_walks(app) {
+        return;
+    }
     let (new_focus, new_first) = {
         let order = app.token_dash_order.get();
         let rows = app.token_dash_rows.borrow();
-        if rows.len() != 7 {
-            return;
-        }
         let viewport = app.token_dash_viewport.get();
         let Some(pos) = order.iter().position(|&k| k == app.token_dash_focus) else {
             return;
@@ -10168,7 +10297,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.token_view = TokenView::Dashboard;
             app.model_detail_focus = StatusFocus::List;
             app.model_detail_scroll = 0;
-            app.token_model_cursor = 0;
+            set_token_model_cursor(app, 0);
         }
         Tab::Setup => {
             if keyboard_owner(app).is_some() {
@@ -10410,6 +10539,15 @@ fn reseed_shunt_field(app: &mut App) {
     *saved = current;
 }
 
+/// Whether a wrapping `↑`/`↓` walk over `len` rows lands anywhere new: a lone
+/// row wraps onto itself, so its walk moves nothing and no hint offers it.
+/// The Overview, Tokens Models, Usage, Status, Services and Setup account
+/// lists and the Setup pool detail gate their walk and page arms on it, so a
+/// press the surfaces hide there changes nothing.
+pub(crate) fn walk_moves(len: usize) -> bool {
+    len > 1
+}
+
 /// Move `profile_cursor` by `delta`, wrapping in `0..len`.
 /// Move Usage's selection by `delta`, wrapping over the flat item list (the
 /// band walk's items; headings and spacers are never selectable). A step onto a
@@ -10625,19 +10763,19 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up if count > 0 => {
+        KeyCode::Up if walk_moves(count) => {
             app.move_overview_cursor((app.overview_cursor + count - 1) % count);
         }
-        KeyCode::Down if count > 0 => {
+        KeyCode::Down if walk_moves(count) => {
             app.move_overview_cursor((app.overview_cursor + 1) % count);
         }
-        KeyCode::PageUp if count > 0 => {
+        KeyCode::PageUp if walk_moves(count) => {
             app.move_overview_cursor(selector_page_up(
                 app.overview_cursor,
                 &app.overview_selector,
             ));
         }
-        KeyCode::PageDown if count > 0 => {
+        KeyCode::PageDown if walk_moves(count) => {
             app.move_overview_cursor(selector_page_down(
                 app.overview_cursor,
                 &app.overview_selector,
@@ -10675,20 +10813,20 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
     }
     let count = app.setup_items().len();
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up if walk_moves(count) => {
             step_usage_cursor(app, -1);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::Down => {
+        KeyCode::Down if walk_moves(count) => {
             step_usage_cursor(app, 1);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp if walk_moves(count) => {
             let next = selector_page_up(app.usage_position(), &app.usage_selector);
             app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown if walk_moves(count) => {
             let next = selector_page_down(app.usage_position(), &app.usage_selector);
             app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
@@ -10819,19 +10957,19 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
         StatusFocus::List => {
             let len = app.status.incidents.len();
             match key.code {
-                KeyCode::Up if len > 0 => {
+                KeyCode::Up if walk_moves(len) => {
                     app.status.cursor = (app.status.cursor + len - 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::Down if len > 0 => {
+                KeyCode::Down if walk_moves(len) => {
                     app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::PageUp if len > 0 => {
+                KeyCode::PageUp if walk_moves(len) => {
                     app.status.cursor = selector_page_up(app.status.cursor, &app.status.selector);
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::PageDown if len > 0 => {
+                KeyCode::PageDown if walk_moves(len) => {
                     app.status.cursor = selector_page_down(app.status.cursor, &app.status.selector);
                     app.status.detail_scroll = 0;
                 }
@@ -10893,27 +11031,46 @@ fn trigger_status_refresh(app: &mut App) {
 /// options rows, the delegates detail walks its jobs, every other detail
 /// scrolls (clamped by the render pass); `f` walks to the next fix line and `↵`
 /// on a focused one opens its confirm.
+/// Whether the focused Services frame binds the fix keys (`f` walks to the
+/// next fix line, `↵` opens the focused one's confirm): the list, and the
+/// shunt, herdr and plugin-problems detail keymaps. Every other detail is
+/// scroll-only, so a fix line there acts on neither key, and neither surface
+/// advertises one.
+pub(crate) fn services_fix_keys_act(app: &App) -> bool {
+    match app.services.focus {
+        ServicesFocus::List => true,
+        ServicesFocus::Detail => match app.services.selected_check().map(|c| c.label) {
+            Some("shunt" | "herdr") => true,
+            Some("plugin") => app
+                .services
+                .selected_check()
+                .is_some_and(|c| !c.problems.is_empty()),
+            _ => false,
+        },
+    }
+}
+
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
             let len = app.services.row_count();
             let before = app.services.cursor;
             match key.code {
-                KeyCode::Up if len > 0 => {
+                KeyCode::Up if walk_moves(len) => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
                     app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::Down if len > 0 => {
+                KeyCode::Down if walk_moves(len) => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
                     app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::PageUp if len > 0 => {
+                KeyCode::PageUp if walk_moves(len) => {
                     app.services.cursor =
                         selector_page_up(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
@@ -10921,7 +11078,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::PageDown if len > 0 => {
+                KeyCode::PageDown if walk_moves(len) => {
                     app.services.cursor =
                         selector_page_down(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
@@ -10973,6 +11130,11 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
             if matches!(label, Some("herdr" | "plugin"))
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
+                // Diagnostics that fit leave a page press nothing to read: it
+                // neither scrolls nor moves focus onto them.
+                if page_keys_act(app).is_none() {
+                    return;
+                }
                 let max = app.services.detail_max_scroll.get();
                 let viewport = app.services.detail_viewport.get();
                 let origin = if app.services.diagnostic_focus {
@@ -10988,12 +11150,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 };
             } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
-            } else if label == Some("plugin")
-                && app
-                    .services
-                    .selected_check()
-                    .is_some_and(|c| !c.problems.is_empty())
-            {
+            } else if label == Some("plugin") && services_fix_keys_act(app) {
                 handle_plugin_problems_key(app, key);
             } else if label == Some("shunt") {
                 handle_shunt_detail_key(app, key);
@@ -12508,70 +12665,69 @@ fn leave_shunt_detail(app: &mut App) {
     }
 }
 
-/// `esc` on a config row that is not editing: fold its entry (back to the
-/// entry row), or fold its open draft (back to the `+ add` row) — the Setup
-/// `+ new` form's precedent, whose `esc` at rest drops the draft. Returns
-/// `true` when it folded; a server field row (or no config focus) leaves it to
-/// ascend as today.
+/// What `esc` on a shunt config row that is not editing folds instead of
+/// leaving the card: its open draft (back to the `+ add` row) — the Setup
+/// `+ new` form's precedent, whose `esc` at rest drops the draft — or its
+/// expanded entry (back to the entry row).
+enum ShuntEscFold {
+    Draft(ShuntAddKind),
+    Entry(ShuntEntryKey),
+}
+
+/// The fold `esc` runs on the focused shunt row, `None` where it ascends as
+/// today: a server field row, no config focus, or a locked row.
+fn shunt_esc_fold(app: &App) -> Option<ShuntEscFold> {
+    match app.services.focused_shunt_focus()? {
+        ShuntFocus::Field { key } => {
+            if field_locked(app, key) {
+                return None;
+            }
+            if let ShuntFieldKey::Draft { kind, .. } = key {
+                return Some(ShuntEscFold::Draft(*kind));
+            }
+            field_entry(key).map(ShuntEscFold::Entry)
+        }
+        ShuntFocus::SaveAdd { kind } => (!app.services.saving(&ShuntSaveKey::SaveAdd(*kind)))
+            .then_some(ShuntEscFold::Draft(*kind)),
+        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(*kind) => {
+            (!app.services.saving(&ShuntSaveKey::SaveAdd(*kind)))
+                .then_some(ShuntEscFold::Draft(*kind))
+        }
+        // `esc` on the `remove <kind>` row folds its entry like the field
+        // rows, unless the remove is locked: then it ascends.
+        ShuntFocus::Remove { key } => (!app.services.saving(&ShuntSaveKey::Remove(key.clone())))
+            .then(|| ShuntEscFold::Entry(key.clone())),
+        _ => None,
+    }
+}
+
+/// Whether `esc` (and `←`) on the shunt card folds a row instead of leaving
+/// the card: the help modal names that `go back`, never a list return.
+pub(crate) fn shunt_esc_folds(app: &App) -> bool {
+    shunt_esc_fold(app).is_some()
+}
+
+/// Run [`shunt_esc_fold`]'s fold. Returns `true` when it folded.
 fn shunt_esc_folds_entry(app: &mut App) -> bool {
-    let Some(focus) = app.services.focused_shunt_focus().cloned() else {
+    let Some(fold) = shunt_esc_fold(app) else {
         return false;
     };
-    let fold_draft = |app: &mut App, kind: ShuntAddKind| {
-        app.services.shunt_drafts.fold(kind);
-        rebuild_shunt_config_stops(app);
-        app.services
-            .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
-    };
-    match focus {
-        ShuntFocus::Field { key } => {
-            // A locked row's `esc` ascends to the list (no fold) — ruling 2.
-            if field_locked(app, &key) {
-                return false;
-            }
-            if let ShuntFieldKey::Draft { kind, .. } = &key {
-                fold_draft(app, *kind);
-                return true;
-            }
-            let Some(entry) = field_entry(&key) else {
-                return false;
-            };
+    match fold {
+        ShuntEscFold::Draft(kind) => {
+            app.services.shunt_drafts.fold(kind);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+        }
+        ShuntEscFold::Entry(entry) => {
             app.services.shunt_expanded.remove(&entry);
             retire_remove_refusal(app, &entry);
             rebuild_shunt_config_stops(app);
             app.services
                 .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
-            true
         }
-        ShuntFocus::SaveAdd { kind } => {
-            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-                return false;
-            }
-            fold_draft(app, kind);
-            true
-        }
-        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(kind) => {
-            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-                return false;
-            }
-            fold_draft(app, kind);
-            true
-        }
-        ShuntFocus::Remove { key } => {
-            // `esc` on the `remove <kind>` row folds its entry like C2's field
-            // rows, unless the remove is locked (ruling 2): then it ascends.
-            if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
-                return false;
-            }
-            app.services.shunt_expanded.remove(&key);
-            retire_remove_refusal(app, &key);
-            rebuild_shunt_config_stops(app);
-            app.services
-                .set_shunt_focus(Some(ShuntFocusLine::Entry(key)));
-            true
-        }
-        _ => false,
     }
+    true
 }
 
 /// Open the read-only `check output` modal over the held failed-check stderr,
@@ -12605,7 +12761,7 @@ fn diagnostic_toast_body(title: &str, diagnostic: &str) -> String {
 
 /// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
 /// active profile's repair lives on the divergence resolver's own `d` prompt,
-/// never on this tab. Only the four shunt fixes are gated by an in-flight shunt
+/// never on this tab. Only the five shunt fixes are gated by an in-flight shunt
 /// action — a second shunt press starts nothing, while the plugin and herdr
 /// fixes keep working.
 fn apply_service_fix(app: &mut App) {
@@ -12813,10 +12969,7 @@ fn require_after_mint(app: &mut App, pid_at_mint: Option<u32>) {
 /// tag-refresh stepper. Only the herdr detail routes here — every other
 /// detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
-    let has_fix = app
-        .services
-        .selected_check()
-        .is_some_and(|c| !c.problems.is_empty());
+    let has_fix = herdr_check_has_fix(app);
     if !has_fix {
         app.services.herdr_fix_focus = false;
     }
@@ -12852,10 +13005,10 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
             activate_herdr_option(app, HERDR_OPTIONS[cursor]);
         }
         KeyCode::Char('+') if !app.services.diagnostic_focus && !on_fix => {
-            step_herdr_tag_refresh(app, 1);
+            step_herdr_tag_refresh(app, true);
         }
         KeyCode::Char('-') if !app.services.diagnostic_focus && !on_fix => {
-            step_herdr_tag_refresh(app, -1);
+            step_herdr_tag_refresh(app, false);
         }
         _ => {}
     }
@@ -12901,17 +13054,52 @@ pub(crate) fn herdr_config_writable(app: &App) -> bool {
     app.services.herdr_config.as_ref().is_some_and(|c| c.parsed)
 }
 
-/// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
-/// every other row.
-fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
-    if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
-        return;
+/// Whether the selected herdr check offers its heal line. The handler clears a
+/// fix-line focus the check no longer backs before it reads that focus.
+fn herdr_check_has_fix(app: &App) -> bool {
+    app.services
+        .selected_check()
+        .is_some_and(|c| !c.problems.is_empty())
+}
+
+/// Whether `space` activates the focused herdr options row: the handler's own
+/// arm (not on the fix line, not reading diagnostics) with the row's
+/// activation gate — the delegate-row rewrite needs a writable config, every
+/// other option row acts. A stored fix-line focus counts only while the check
+/// still offers the fix, as the handler reads it after its entry cleanup.
+pub(crate) fn herdr_space_acts(app: &App) -> bool {
+    let on_fix = app.services.herdr_fix_focus && herdr_check_has_fix(app);
+    if app.services.diagnostic_focus || on_fix {
+        return false;
+    }
+    match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+        Some(HerdrOption::DelegateRowText) => herdr_config_writable(app),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// The tag-refresh seconds one `+` (`up`) or `-` lands on: ±1 second, floored
+/// at 1. `None` on every other row, or where that direction does not move the
+/// value; the step and the footer's per-direction hints read this.
+pub(crate) fn herdr_tag_step(app: &App, up: bool) -> Option<u64> {
+    if HERDR_OPTIONS.get(app.services.herdr_options_cursor) != Some(&HerdrOption::TagRefresh) {
+        return None;
     }
     let cur = app.config().state.herdr.tag_watch_secs;
-    let next = if delta > 0 {
+    let next = if up {
         cur.saturating_add(1)
     } else {
         cur.saturating_sub(1).max(1)
+    };
+    (next != cur).then_some(next)
+}
+
+/// `+`/`-` on the tag-refresh stepper: persist where [`herdr_tag_step`]
+/// lands.
+fn step_herdr_tag_refresh(app: &mut App, up: bool) {
+    let Some(next) = herdr_tag_step(app, up) else {
+        return;
     };
     app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = next);
     app.apply_forgets();
@@ -18228,20 +18416,27 @@ fn open_incident_link(app: &mut App) {
     }
 }
 
+/// The account a switch to profile `idx` would confirm, `None` when it is
+/// already active. `switch_profile` already refuses a disabled target (shared
+/// guard), but a disabled row must never even offer the confirm — never
+/// selectable, not just never landed.
+fn switch_offer(app: &App, idx: usize) -> Option<ProfileName> {
+    let cfg = app.config();
+    let profile = cfg.profiles.get(idx)?;
+    (!cfg.is_active(&profile.name) && !profile.is_disabled()).then(|| profile.name.clone())
+}
+
+/// Whether the Overview `↵` offers a switch on the row under the cursor: a
+/// codex or pool row, the active account and a disabled one take none.
+pub(crate) fn overview_enter_switches(app: &App) -> bool {
+    matches!(app.current_main_item(), Some(MainItemKind::Profile(idx)) if switch_offer(app, idx).is_some())
+}
+
 /// Request switch to profile at `idx`; no-ops if already active.
 fn request_switch_to(app: &mut App, idx: usize) {
-    let cfg = app.config();
-    let Some(profile) = cfg.profiles.get(idx) else {
+    let Some(name) = switch_offer(app, idx) else {
         return;
     };
-    let name = profile.name.clone();
-    // `switch_profile` already refuses a disabled target (shared guard), but a
-    // disabled row must never even offer the confirm — never selectable, not
-    // just never landed.
-    if cfg.is_active(&name) || profile.is_disabled() {
-        return;
-    }
-    drop(cfg);
     app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("switch to '{name}'?"),
         detail: None,
@@ -18262,14 +18457,30 @@ fn activate_main_item(app: &mut App) {
     }
 }
 
-fn reorder_main_cursor(app: &mut App, delta: i32) {
+/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the account under the
+/// Overview cursor between, `None` off an account row or at that end of the
+/// roster.
+fn main_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
-        return;
+        return None;
     };
     let new_idx = match delta.signum() {
         -1 if idx > 0 => idx - 1,
         1 if idx + 1 < app.config().profiles.len() => idx + 1,
-        _ => return,
+        _ => return None,
+    };
+    Some((idx, new_idx))
+}
+
+/// Whether `⇧↑↓` moves the account under the Overview cursor either way: the
+/// joined key stays offered while one of its directions swaps.
+pub(crate) fn main_reorder_moves(app: &App) -> bool {
+    main_reorder_slots(app, -1).is_some() || main_reorder_slots(app, 1).is_some()
+}
+
+fn reorder_main_cursor(app: &mut App, delta: i32) {
+    let Some((idx, new_idx)) = main_reorder_slots(app, delta) else {
+        return;
     };
     let (result, moved) = {
         let mut cfg = app.config();
@@ -19886,21 +20097,58 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Whether `space` (and `↵` off the typed rows) acts on a Config-tab row. A
+/// row another setting makes inert renders dimmed and its keys no-op:
+/// `clock` while the countdown is relative (no surface draws a clock then, so
+/// the notation would decide nothing); `burn floor` / `burn horizon` while
+/// burn-aware is off (they only shape the projection the static path never
+/// runs); `extra usage spent` while spend budget is off (it decides no halt
+/// when nothing spends); `auto-start queue` while no account's `auto_start`
+/// opts it in (a queue with no possible member spaces nothing).
+pub(crate) fn global_config_row_live(app: &App, row: GlobalConfigRow) -> bool {
+    match row {
+        GlobalConfigRow::ClockNotation => app.config().state.reset_display().shows_clock(),
+        GlobalConfigRow::BurnFloor | GlobalConfigRow::BurnHorizon => {
+            app.config().state.burn_aware_switching
+        }
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => app.config().state.spend_budget_switching,
+        GlobalConfigRow::AutoStartQueue => app
+            .config()
+            .profiles
+            .iter()
+            .any(|p| p.has_effective_auto_start()),
+        GlobalConfigRow::Theme
+        | GlobalConfigRow::ResetShape
+        | GlobalConfigRow::HomeTab
+        | GlobalConfigRow::DivergenceDefault
+        | GlobalConfigRow::SwitchOffWhenSpent
+        | GlobalConfigRow::WeeklyThreshold
+        | GlobalConfigRow::RefreshInterval
+        | GlobalConfigRow::ContextNudge
+        | GlobalConfigRow::BurnAware
+        | GlobalConfigRow::WalkOrder
+        | GlobalConfigRow::SpendBudget
+        | GlobalConfigRow::PreemptiveRotation
+        | GlobalConfigRow::AutoUpdate
+        | GlobalConfigRow::PreserveNonLoginKeys
+        | GlobalConfigRow::SyncMcpLogins
+        | GlobalConfigRow::RefreshSpentAccounts => true,
+    }
+}
+
 /// Apply space (or ⏎ on non-refresh rows) on a Config-tab row: cycle the theme
 /// tier, flip wrap-off, or step the refresh interval forward through presets
-/// (wrapping past the top preset back to the first).
+/// (wrapping past the top preset back to the first). An inert row
+/// ([`global_config_row_live`]) changes nothing.
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
+    if !global_config_row_live(app, row) {
+        return;
+    }
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::ResetShape => cycle_reset_display(app),
         GlobalConfigRow::HomeTab => cycle_home_tab(app),
-        // Inert while the countdown is relative (rendered dimmed): no surface
-        // draws a clock then, so the notation would decide nothing.
-        GlobalConfigRow::ClockNotation => {
-            if app.config().state.reset_display().shows_clock() {
-                cycle_clock_format(app);
-            }
-        }
+        GlobalConfigRow::ClockNotation => cycle_clock_format(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
@@ -19908,44 +20156,16 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::ContextNudge => step_context_nudge(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::WalkOrder => cycle_walk_order(app),
-        // Inert while burn-aware is off (rendered dimmed): the floor/cap only
-        // shape the projection, which the static path never runs.
-        GlobalConfigRow::BurnFloor => {
-            if app.config().state.burn_aware_switching {
-                step_burn_floor(app);
-            }
-        }
-        GlobalConfigRow::BurnHorizon => {
-            if app.config().state.burn_aware_switching {
-                step_burn_horizon(app);
-            }
-        }
+        GlobalConfigRow::BurnFloor => step_burn_floor(app),
+        GlobalConfigRow::BurnHorizon => step_burn_horizon(app),
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
-        // Inert while spend budget is off (rendered dimmed): decides no halt when
-        // nothing spends, so it stays a true disabled row — the key is a no-op.
-        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
-            if app.config().state.spend_budget_switching {
-                toggle_budget_wrap_off(app);
-            }
-        }
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => toggle_budget_wrap_off(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
         GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::SyncMcpLogins => toggle_sync_mcp_logins(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
-        // Inert while no account's `auto_start` opts it in (rendered dimmed):
-        // a queue with no possible member spaces nothing, so it stays a true
-        // disabled row — the key is a no-op.
-        GlobalConfigRow::AutoStartQueue => {
-            if app
-                .config()
-                .profiles
-                .iter()
-                .any(|p| p.has_effective_auto_start())
-            {
-                toggle_auto_start_queue(app);
-            }
-        }
+        GlobalConfigRow::AutoStartQueue => toggle_auto_start_queue(app),
     }
 }
 
@@ -20398,8 +20618,10 @@ fn toggle_show_estimates(app: &mut App) {
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
 fn toggle_count_cache(app: &mut App) {
+    let identity = token_model_at_cursor(app);
     let next = !app.config().state.count_cache;
     app.save_state_delta(|s, _held| s.count_cache = next);
+    rehome_token_model_cursor(app, identity);
     app.apply_forgets();
 }
 
@@ -20692,10 +20914,14 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
         }
         // Continuous fields only — `max spend` (a dollar ceiling) has no
         // natural step unit and stays typed-only.
-        KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
-        KeyCode::Char('-' | '_') if row == FallbackRow::Threshold => adjust_threshold(app, -5.0),
-        KeyCode::Char('+' | '=') if row == FallbackRow::WeeklyAt => adjust_weekly(app, 5.0),
-        KeyCode::Char('-' | '_') if row == FallbackRow::WeeklyAt => adjust_weekly(app, -5.0),
+        KeyCode::Char(key @ ('+' | '=' | '-' | '_')) if fallback_row_steps(app, row) => {
+            let up = matches!(key, '+' | '=');
+            if row == FallbackRow::Threshold {
+                adjust_threshold(app, up);
+            } else {
+                adjust_weekly(app, up);
+            }
+        }
         // The day row is a cycle row at rest and a chip row once descended:
         // space walks the preset ladder (the `weekly limit` row's grammar), ⏎
         // opens the chip picker. Split here so `run_fallback_row` keeps its
@@ -20893,12 +21119,20 @@ pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &ProfileName) -> bool {
     candidate.api_key.is_some() != chain_kind
 }
 
+/// Whether the chain list's `↵` descends: on a member, or on `+ add` while an
+/// account can still join.
+pub(crate) fn chain_enter_acts(app: &App) -> bool {
+    match chain_items(app).get(app.chain_cursor).copied() {
+        Some(ChainItemKind::Member(_)) => true,
+        Some(ChainItemKind::Add) => !chain_candidates(app).is_empty(),
+        None => false,
+    }
+}
+
 /// Enter right pane for the selected chain item. No-op on `+ add` when empty.
 fn enter_fallback_detail(app: &mut App) {
-    match chain_items(app).get(app.chain_cursor).copied() {
-        Some(ChainItemKind::Member(_)) => {}
-        Some(ChainItemKind::Add) if !chain_candidates(app).is_empty() => {}
-        _ => return,
+    if !chain_enter_acts(app) {
+        return;
     }
     app.fallback_edit = None;
     app.fallback_focus = FallbackFocus::Detail;
@@ -20922,21 +21156,36 @@ fn drop_fallback_detail(app: &mut App) {
     app.fallback_detail_entered = false;
 }
 
+/// The chain slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the selected member
+/// between, `None` on `+ add` or at that end of the chain.
+fn chain_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
+    let pos = selected_chain_member(app)?;
+    let target = usize::try_from(pos as i32 + delta).ok()?;
+    (target < app.config().state.fallback_chain.len()).then_some((pos, target))
+}
+
+/// Whether `⇧↑↓` moves the selected member either way: the joined key stays
+/// offered while one of its directions swaps.
+pub(crate) fn chain_reorder_moves(app: &App) -> bool {
+    chain_reorder_slots(app, -1).is_some() || chain_reorder_slots(app, 1).is_some()
+}
+
 /// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
 /// or at boundary. Chain index == cursor for members (they precede `+ add`).
 fn reorder_chain_member(app: &mut App, delta: i32) {
-    let Some(pos) = selected_chain_member(app) else {
+    let Some((pos, target)) = chain_reorder_slots(app, delta) else {
         return;
     };
-    let target = pos as i32 + delta;
     let landed = {
         let mut cfg = app.config();
-        if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
+        // Re-read under the guard that writes the order: a reload since the
+        // slot was resolved may have shortened the chain.
+        if target >= cfg.state.fallback_chain.len() {
             return;
         }
         let mut order = cfg.state.fallback_chain.clone();
-        order.swap(pos, target as usize);
-        let moved = order[target as usize].clone();
+        order.swap(pos, target);
+        let moved = order[target].clone();
         set_chain_order(&mut cfg, &order)
             .ok()
             .and_then(|saved| saved.iter().position(|n| n == &moved))
@@ -20951,11 +21200,55 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     }
 }
 
+/// Whether a member card row's keys act (`↵`, `space`, and `+`/`-` where the
+/// row binds them): `rotate at` while the member resolves to an account,
+/// `weekly at` while its weekly gate is on, `preferred days` while the chain
+/// entry has an account to hold the list, `max spend` while spend budget is on.
+/// A dimmed row, or a chain entry with no account behind it, takes no key.
+pub(crate) fn fallback_row_acts(app: &App, row: FallbackRow) -> bool {
+    match row {
+        FallbackRow::Threshold => selected_threshold(app).is_some(),
+        FallbackRow::WeeklyAt => {
+            selected_weekly_override(app).is_some_and(|(_, check_weekly)| check_weekly)
+        }
+        FallbackRow::PreferredDays => {
+            selected_member_name(app).is_some_and(|member| member_days(app, &member).is_some())
+        }
+        FallbackRow::MaxSpend => {
+            let armed = app.config().state.spend_budget_switching;
+            armed && selected_max_spend(app).is_some()
+        }
+        FallbackRow::CheckWeekly
+        | FallbackRow::CheckScoped
+        | FallbackRow::CheckCreditCap
+        | FallbackRow::LastResort
+        | FallbackRow::Preferred => {
+            // The toggles write through the member's roster profile; a chain
+            // entry whose account is gone has nowhere to flip, so the keys
+            // are inert there (the handler's write returns at the lookup).
+            selected_member_name(app).is_some_and(|member| app.config().find(&member).is_some())
+        }
+        FallbackRow::Remove => true,
+    }
+}
+
+/// Whether `+` / `-` step the member card's focused `row`: `rotate at` and
+/// `weekly at` only, while [`fallback_row_acts`] holds for it and either
+/// direction moves it ([`fallback_step_lands`]). The card's key handler and
+/// the help's joined `+ / -` row read this.
+pub(crate) fn fallback_row_steps(app: &App, row: FallbackRow) -> bool {
+    fallback_step_lands(app, row, true) || fallback_step_lands(app, row, false)
+}
+
 /// ⏎ on a member detail row: a typed row opens its field and `preferred
 /// days` its picker; remove arms, then removes on the second press. Each one
 /// pins the member under the cursor. Space reaches here for every row but
-/// `remove` and `preferred days` (the key handler splits both out).
+/// `remove` and `preferred days` (the key handler splits both out). A row
+/// [`fallback_row_acts`] rules inert changes nothing.
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
+    if !fallback_row_acts(app, row) {
+        return;
+    }
     match row {
         FallbackRow::Threshold => {
             if let Some(current) = selected_threshold(app) {
@@ -21402,37 +21695,58 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     false
 }
 
-/// Step the threshold by `delta`, clamped to 0..=100, and persist.
-fn adjust_threshold(app: &mut App, delta: f64) {
-    if let Some(name) = selected_member_name(app)
-        && let Some(current) = selected_threshold(app)
-    {
-        write_threshold(
-            app,
-            &name,
-            (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD),
-        );
+/// The `rotate at` value one `+` (`up`) or `-` lands on, clamped to 0..=100;
+/// `None` where that direction does not move it or [`fallback_row_acts`]
+/// rules the row inert.
+fn threshold_step(app: &App, up: bool) -> Option<f64> {
+    if !fallback_row_acts(app, FallbackRow::Threshold) {
+        return None;
+    }
+    let current = selected_threshold(app)?;
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
+    let next = (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD);
+    (next != current).then_some(next)
+}
+
+/// The `weekly at` override one `+` (`up`) or `-` lands on, clamped to
+/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`; `None` where that
+/// direction does not move it or [`fallback_row_acts`] rules the row inert
+/// (its weekly gate off, rendered dimmed). An unset override bases the nudge
+/// on the chain-wide resolved default so the value visibly moves off what the
+/// dimmed-default row already shows.
+fn weekly_step(app: &App, up: bool) -> Option<f64> {
+    if !fallback_row_acts(app, FallbackRow::WeeklyAt) {
+        return None;
+    }
+    let (override_pct, _) = selected_weekly_override(app)?;
+    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
+    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
+    (next != base).then_some(next)
+}
+
+/// Whether one `+` (`up`) or `-` moves the member card's stepper `row`: the
+/// value each step function returns on and the footer's per-direction hints.
+pub(crate) fn fallback_step_lands(app: &App, row: FallbackRow, up: bool) -> bool {
+    match row {
+        FallbackRow::Threshold => threshold_step(app, up).is_some(),
+        FallbackRow::WeeklyAt => weekly_step(app, up).is_some(),
+        _ => false,
     }
 }
 
-/// Step the selected member's `weekly at` override by `delta`, clamped to
-/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`, and persist. Mirrors
-/// `run_fallback_row`'s `check_weekly` guard: inert while the member's weekly
-/// gate is off (rendered dimmed), same no-op contract as a dimmed row's ⏎.
-/// An unset override bases the nudge on the chain-wide resolved default so
-/// the value visibly moves off what the dimmed-default row already shows.
-fn adjust_weekly(app: &mut App, delta: f64) {
-    let (Some(name), Some((override_pct, check_weekly))) =
-        (selected_member_name(app), selected_weekly_override(app))
-    else {
-        return;
-    };
-    if !check_weekly {
-        return;
+/// `+`/`-` on `rotate at`: persist where [`threshold_step`] lands.
+fn adjust_threshold(app: &mut App, up: bool) {
+    if let (Some(name), Some(next)) = (selected_member_name(app), threshold_step(app, up)) {
+        write_threshold(app, &name, next);
     }
-    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
-    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
-    write_weekly_override(app, &name, Some(next));
+}
+
+/// `+`/`-` on `weekly at`: persist where [`weekly_step`] lands.
+fn adjust_weekly(app: &mut App, up: bool) {
+    if let (Some(name), Some(next)) = (selected_member_name(app), weekly_step(app, up)) {
+        write_weekly_override(app, &name, Some(next));
+    }
 }
 
 /// A per-member usage gate a toggle row flips (`Profile::check_weekly` /
@@ -21995,6 +22309,13 @@ fn submit_paste_code(app: &mut App) {
             );
         }
     }
+}
+
+/// Whether `a` opens the action menu: never while it would list nothing. The
+/// footer's `a actions`, the help modal's `a` rows and the key handler read
+/// this.
+pub(crate) fn action_menu_opens(app: &App) -> bool {
+    !build_action_menu(app).items.is_empty()
 }
 
 /// Build the action menu for the current screen/focus context: what acts on the
@@ -22996,20 +23317,22 @@ fn reprobe_daemon(app: &mut App) {
     app.last_daemon_probe = Instant::now();
 }
 
-/// Swap the Tokens model filter and re-clamp the Models cursor — the filtered
-/// list can be shorter than where the cursor sat.
+/// Swap the Tokens model filter and re-anchor the Models cursor — the
+/// filtered list re-ranks and can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
+    let identity = token_model_at_cursor(app);
     app.token_filter = filter;
     app.model_detail_scroll = 0;
-    clamp_token_model_cursor(app);
+    rehome_token_model_cursor(app, identity);
 }
 
-/// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
-/// list can be shorter than where the cursor sat.
+/// Swap the Tokens period lens and re-anchor the Models cursor — the scoped
+/// list re-ranks and can be shorter than where the cursor sat.
 fn set_token_period(app: &mut App, period: TokenPeriod) {
+    let identity = token_model_at_cursor(app);
     app.token_period = period;
     app.model_detail_scroll = 0;
-    clamp_token_model_cursor(app);
+    rehome_token_model_cursor(app, identity);
 }
 
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
@@ -23021,13 +23344,13 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
         ConfigFocus::Profiles => {
             let before = app.setup_position();
             match key.code {
-                KeyCode::Up => step_setup_cursor(app, -1, sel_len),
-                KeyCode::Down => step_setup_cursor(app, 1, sel_len),
-                KeyCode::PageUp => {
+                KeyCode::Up if walk_moves(sel_len) => step_setup_cursor(app, -1, sel_len),
+                KeyCode::Down if walk_moves(sel_len) => step_setup_cursor(app, 1, sel_len),
+                KeyCode::PageUp if walk_moves(sel_len) => {
                     let next = selector_page_up(app.setup_position(), &app.setup_selector);
                     app.step_selection(SelectionSlotKind::Setup, next);
                 }
-                KeyCode::PageDown => {
+                KeyCode::PageDown if walk_moves(sel_len) => {
                     let next = selector_page_down(app.setup_position(), &app.setup_selector);
                     app.step_selection(SelectionSlotKind::Setup, next);
                 }
@@ -23122,25 +23445,15 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         _ => run_config_row(app, row),
                     }
                 }
-                KeyCode::Char('+' | '=')
-                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                KeyCode::Char(key @ ('+' | '=' | '-' | '_'))
+                    if rows[app.config_action_cursor].steps() =>
                 {
-                    step_bell_threshold(app, 5.0);
-                }
-                KeyCode::Char('-' | '_')
-                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
-                {
-                    step_bell_threshold(app, -5.0);
-                }
-                KeyCode::Char('+' | '=')
-                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
-                {
-                    step_usage_probe_interval(app, USAGE_PROBE_STEP_MS);
-                }
-                KeyCode::Char('-' | '_')
-                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
-                {
-                    step_usage_probe_interval(app, -USAGE_PROBE_STEP_MS);
+                    let up = matches!(key, '+' | '=');
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold {
+                        step_bell_threshold(app, up);
+                    } else {
+                        step_usage_probe_interval(app, up);
+                    }
                 }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
@@ -23270,15 +23583,17 @@ fn pool_provider_name(app: &App, pi: usize) -> Option<String> {
 /// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎ runs
 /// them — `refresh` on a worker, `remove` behind the inline 2-step (never the
 /// Overview's confirm modal). The 2-step acts on the selection's own pool pair.
+/// A lone row has nowhere to walk, so its walk keys leave an armed remove armed.
 fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
     let rows = app.pool_detail_rows();
     if rows.is_empty() {
         return;
     }
     let last = rows.len() - 1;
+    let walks = walk_moves(rows.len());
     app.config_action_cursor = app.config_action_cursor.min(last);
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up if walks => {
             disarm_pool_2step(app);
             app.config_action_cursor = if app.config_action_cursor == 0 {
                 last
@@ -23286,7 +23601,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.config_action_cursor - 1
             };
         }
-        KeyCode::Down => {
+        KeyCode::Down if walks => {
             disarm_pool_2step(app);
             app.config_action_cursor = if app.config_action_cursor >= last {
                 0
@@ -23294,7 +23609,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.config_action_cursor + 1
             };
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp if walks => {
             disarm_pool_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
@@ -23309,7 +23624,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.setup_detail_total.get(),
             );
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown if walks => {
             disarm_pool_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
@@ -23641,6 +23956,18 @@ fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
     rows
 }
 
+/// How many rows the descended Setup card walks: the codex detail's action
+/// rows, the pool detail's, or the claude / `+ new` card's.
+pub(crate) fn setup_card_row_count(app: &App) -> usize {
+    match app.setup_selection() {
+        SetupSelection::Item(MainItemKind::Codex(_)) => CodexDetailRow::ALL.len(),
+        SetupSelection::Item(MainItemKind::Shunt(..)) => app.pool_detail_rows().len(),
+        SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
+            config_rows(app).len()
+        }
+    }
+}
+
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
@@ -23897,13 +24224,26 @@ fn land_new_account(app: &mut App) {
 /// loss-warning route as `n`, landing on the row that fixes the account's dead
 /// credential (or the editor's first row for a healthy account).
 fn start_edit_selected(app: &mut App, item: MainItemKind) {
-    let target = match item {
-        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
-        other => app.setup_item_for(other).map(EditTarget::Item),
-    };
-    if let Some(target) = target {
+    if let Some(target) = edit_target_of(app, item) {
         request_target(app, LossWarningTarget::EditAccount(target));
     }
+}
+
+/// The Setup editor `e` opens for an Overview row, `None` when the row
+/// resolves to no account.
+fn edit_target_of(app: &App, item: MainItemKind) -> Option<EditTarget> {
+    match item {
+        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
+        other => app.setup_item_for(other).map(EditTarget::Item),
+    }
+}
+
+/// Whether the Overview `e` opens an editor: a row under the cursor that
+/// resolves to an account.
+pub(crate) fn overview_edit_acts(app: &App) -> bool {
+    app.current_main_item()
+        .and_then(|item| edit_target_of(app, item))
+        .is_some()
 }
 
 /// `start_edit_selected`'s landing: switch to Setup, select the item the way an
@@ -24135,16 +24475,49 @@ fn disarm_armed_action(app: &mut App) {
     }
 }
 
-/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
-fn run_config_row(app: &mut App, row: ConfigRow) {
-    // The mint-seeded api key row is a Disabled row: focusable but inert, so
-    // ⏎ opens no editor while the base url still names the gateway.
-    if row == ConfigRow::ApiKey
+/// Whether the Setup `disable` row on `name` is dimmed inert: the account is
+/// active or holds a live `clauth start` session. Reads the tick's job
+/// snapshot, as the row's dim does, so a frame never walks the job store;
+/// [`run_config_row`] re-checks the live store before it acts.
+pub(crate) fn disable_row_gated(app: &App, name: &ProfileName) -> bool {
+    let active = app.config().is_active(name);
+    active || crate::runtime::has_live_session_in(name, &app.job_trees, &app.handed_off)
+}
+
+/// Whether the Setup `Login` row on `name` refuses its `↵`: a proxy account,
+/// or one whose `[proxy]` table clauth cannot read, logs in only through its
+/// proxy. Reads the loaded roster, as the footer and the help do;
+/// [`run_config_row`] also re-checks the record on disk before it acts.
+pub(crate) fn login_row_refused(app: &App, name: &ProfileName) -> bool {
+    app.config()
+        .find(name)
+        .is_some_and(|p| !p.spends_oauth_chain())
+}
+
+/// Whether the Setup `switch to a rolling token` row on `name` is dimmed
+/// inert: a disabled account or a quarantined login, the two states the CLI
+/// refuses up front. The one predicate the row's dim, the footer's `↵` gate
+/// and [`run_config_row`]'s arm share.
+pub(crate) fn rolling_switch_row_gated(app: &App, name: &ProfileName) -> bool {
+    let cfg = app.config();
+    cfg.find(name).is_some_and(|p| p.is_disabled()) || cfg.state.auth_broken.contains(name)
+}
+
+/// Whether `row` is the mint-seeded api key row: a Disabled row, focusable but
+/// inert, so ⏎ opens no editor while the base url still names the gateway.
+/// The handler's return, the footer's dropped `↵` and the help's `↵ on a
+/// field` count read this.
+pub(crate) fn minted_key_row(app: &App, row: ConfigRow) -> bool {
+    row == ConfigRow::ApiKey
         && app
             .config_draft
             .as_ref()
             .is_some_and(ConfigDraft::mint_armed)
-    {
+}
+
+/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
+fn run_config_row(app: &mut App, row: ConfigRow) {
+    if minted_key_row(app, row) {
         return;
     }
     // Env rows seed their buffer before editing, so they're driven out of band.
@@ -24302,10 +24675,13 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
-            if editing
-                .as_deref()
-                .is_some_and(|name| relogin_refused_off_proxy(app, name))
-            {
+            // The disk's refusal toasts; a roster that still holds a proxy
+            // claim the disk dropped stays inert, since no surface offers the
+            // key until the roster reloads.
+            if editing.as_deref().is_some_and(|name| {
+                relogin_refused_off_proxy(app, name)
+                    || login_row_refused(app, &ProfileName::from(name))
+            }) {
                 return;
             }
             match login_row_flow(app, editing.as_deref()) {
@@ -24408,15 +24784,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::RollingTokenSwitch => {
             if let Some(name) = name {
-                // Same dim gate the renderer dims on, re-derived here (the
-                // clear row's three-surface pattern): a disabled account and
+                // Same dim gate the renderer dims on, the one spelling both
+                // surfaces and this handler share: a disabled account and
                 // a quarantined login are both inert, a stale arm included.
-                let gated = {
-                    let cfg = app.config();
-                    cfg.find(&name).is_some_and(|p| p.is_disabled())
-                        || cfg.state.auth_broken.contains(&name)
-                };
-                if gated {
+                if rolling_switch_row_gated(app, &name) {
                     return;
                 }
                 let armed = app
@@ -25400,18 +25771,17 @@ pub(crate) fn parse_bell_threshold(raw: &str) -> Option<Option<f64>> {
     crate::fallback::parse_threshold(raw).map(Some)
 }
 
-/// `+`/`-` on the `alert at` row: step by `delta` inside the typed range,
-/// starting from 95% when the alert is off.
-fn step_bell_threshold(app: &mut App, delta: f64) {
-    let Some(name) = app
+/// The `alert at` value one `+` (`up`) or `-` lands on inside the typed
+/// range, starting from 95% when the alert is off; `None` where that
+/// direction does not move it.
+fn bell_threshold_step(app: &App, up: bool) -> Option<f64> {
+    let name = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
-        .map(ProfileName::from)
-    else {
-        return;
-    };
+        .map(ProfileName::from)?;
     let current = app.config().find(&name).and_then(|p| p.bell_threshold);
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
     let next = match current {
         // Rounded to hundredths, so a step off `5.01` lands on `0.01`, not on
         // a float tail.
@@ -25421,12 +25791,34 @@ fn step_bell_threshold(app: &mut App, delta: f64) {
         ),
         None => DEFAULT_BELL_THRESHOLD,
     };
-    write_bell_threshold(app, Some(next));
+    (current != Some(next)).then_some(next)
+}
+
+/// `+`/`-` on the `alert at` row: write where [`bell_threshold_step`] lands.
+fn step_bell_threshold(app: &mut App, up: bool) {
+    if let Some(next) = bell_threshold_step(app, up) {
+        write_bell_threshold(app, Some(next));
+    }
 }
 
 /// Where `+`/`-` start on an account with no alert: the commented-out default
 /// in a fresh `config.toml`.
 const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
+
+/// What one `+`/`-` moves a percentage stepper by: `alert at`, `rotate at`
+/// and `weekly at`.
+const PERCENT_STEP: f64 = 5.0;
+
+/// Whether one `+` (`up`) or `-` moves the Setup card's stepper `row`: the
+/// value each step function returns on, the footer's per-direction hints and,
+/// either direction holding, the help's joined `+ / -` row.
+pub(crate) fn config_step_lands(app: &App, row: ConfigRow, up: bool) -> bool {
+    match row {
+        ConfigRow::BellThreshold => bell_threshold_step(app, up).is_some(),
+        ConfigRow::UsageProbeInterval => usage_probe_step(app, up).is_some(),
+        _ => false,
+    }
+}
 
 /// Persist the drafted account's alert threshold, rolling memory back on a
 /// failed save, then reseed the row's buffer from what was saved.
@@ -28364,17 +28756,33 @@ fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
 /// What one `+`/`-` on the `probe every` row moves the interval by.
 const USAGE_PROBE_STEP_MS: i64 = 30_000;
 
-/// Step the drafted account's probe interval by `delta_ms` from wherever it
-/// stands. It writes the interval alone, never the switch.
-fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
-    let Some(current) = app.config_draft.as_ref().and_then(|d| {
+/// The drafted account's probe interval one `+` (`up`) or `-` lands on from
+/// wherever it stands, kept in its band; `None` where that direction does not
+/// move it.
+fn usage_probe_step(app: &App, up: bool) -> Option<u64> {
+    let current = app.config_draft.as_ref().and_then(|d| {
         let cfg = app.config();
         cfg.find(&ProfileName::from(d.editing_name.clone()?))
             .map(|p| p.usage_probe_interval_ms)
-    }) else {
-        return;
+    })?;
+    let delta = if up {
+        USAGE_PROBE_STEP_MS
+    } else {
+        -USAGE_PROBE_STEP_MS
     };
-    write_usage_probe_interval(app, current.saturating_add_signed(delta_ms));
+    let next = current.saturating_add_signed(delta).clamp(
+        crate::profile::MIN_USAGE_PROBE_INTERVAL_MS,
+        crate::profile::MAX_USAGE_PROBE_INTERVAL_MS,
+    );
+    (next != current).then_some(next)
+}
+
+/// `+`/`-` on the `probe every` row: write where [`usage_probe_step`] lands.
+/// It writes the interval alone, never the switch.
+fn step_usage_probe_interval(app: &mut App, up: bool) {
+    if let Some(next) = usage_probe_step(app, up) {
+        write_usage_probe_interval(app, next);
+    }
 }
 
 /// ⏎ on the `probe every` field: whole seconds, an `s` after them allowed,
@@ -30497,15 +30905,18 @@ fn while_divergence_stands<T>(
 }
 
 /// Open the "save elsewhere" picker from the Divergence modal about `active`.
-/// Lists every profile except that diverged one; a refresh-token match is
-/// pre-selected. With no other profile to pick, drops straight into a
-/// new-profile capture.
+/// Lists every profile except that diverged one and those its `↵` would only
+/// refuse (a disabled account, or one that logs in through its proxy); a
+/// refresh-token match is pre-selected. With no other profile to pick, drops
+/// straight into a new-profile capture. The `↵` still re-checks each target
+/// on disk.
 fn open_divergence_target_picker(app: &mut App, active: &str, seen: Option<u64>) {
     let (targets, preselect) = {
         let cfg = app.config();
         let targets: Vec<String> = cfg
             .profiles
             .iter()
+            .filter(|p| !p.is_disabled() && p.spends_oauth_chain())
             .map(|p| p.name.as_str().to_string())
             .filter(|n| n != active)
             .collect();
@@ -31050,9 +31461,13 @@ fn drain_tokens_events(app: &mut App) {
                 app.tokens_failed_expanded = false;
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
+                // Re-anchor after the loader replaces the grouped list. The
+                // anchor the selection stored, never the model the old row
+                // names now: the list being replaced may already re-rank
+                // under the new bucket bounds.
+                let identity = app.token_model_identity.clone();
                 app.token_stats = Some(*stats);
-                // Re-clamp after the loader replaces the grouped list.
-                clamp_token_model_cursor(app);
+                rehome_token_model_cursor(app, identity);
             }
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
@@ -31442,7 +31857,11 @@ pub(crate) fn on_tick(app: &mut App) {
         && app.token_view == TokenView::Models
         && app.token_period.bucket().is_some()
     {
-        clamp_token_model_cursor(app);
+        // The bucket bounds shift with the clock, so the drain above may
+        // already have re-ranked the list under the new bucket: re-home off
+        // the stored anchor, never the model the old row names now.
+        let identity = app.token_model_identity.clone();
+        rehome_token_model_cursor(app, identity);
     }
     drain_pricing_events(app);
     drain_login_events(app);

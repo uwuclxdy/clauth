@@ -306,22 +306,33 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
     let mut tokens = empty_app(Tab::Tokens);
     let empty_usage = empty_app(Tab::Usage);
 
+    // A second account and a second model give each selector somewhere to
+    // walk: a lone row wraps onto itself and its help lists no `↑ ↓`.
     let usage_at_rest = app_on(
         Tab::Usage,
-        vec![crate::testutil::blank_profile(
-            &crate::profile::ProfileName::from("acct"),
-        )],
+        vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct")),
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct2")),
+        ],
     );
     usage.usage_detail_focus = StatusFocus::Detail;
     let dashboard = empty_app(Tab::Tokens);
     let mut model_selector = empty_app(Tab::Tokens);
     model_selector.token_stats = Some(crate::tokens::TokenStats {
-        models: vec![crate::tokens::ModelTokens {
-            model: "claude-opus-4-8".into(),
-            input: 12,
-            output: 8,
-            ..Default::default()
-        }],
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4-8".into(),
+                input: 12,
+                output: 8,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4-8".into(),
+                input: 3,
+                output: 2,
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     });
     model_selector.token_view = TokenView::Models;
@@ -332,6 +343,31 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
     tokens.token_stats = model_selector.token_stats.clone();
     tokens.token_view = TokenView::Models;
     tokens.model_detail_focus = StatusFocus::Detail;
+    // Each detail draws at a height it overflows, so it has somewhere to
+    // scroll: the bound its body publishes is the one the help reads.
+    for detail in [&usage, &tokens] {
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, detail)).unwrap();
+        assert!(
+            crate::tui::app::detail_scrolls(detail),
+            "the {:?} detail overflows",
+            detail.tab
+        );
+    }
+    // The populated dashboard lays out its cards, which its card walk needs;
+    // the empty one has none to lay out.
+    for dash in [&populated_dashboard, &dashboard] {
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, dash)).unwrap();
+    }
+    assert_eq!(
+        (
+            populated_dashboard.token_dash_rows.borrow().len(),
+            dashboard.token_dash_rows.borrow().len()
+        ),
+        (7, 0),
+        "(populated, empty) laid-out cards"
+    );
 
     let cases: [(&str, &App, &str, &[&str]); 8] = [
         (
@@ -352,7 +388,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &empty_usage,
             "USAGE",
             &[
-                "│    ↑ ↓                 pick account to inspect",
                 "│    e                   toggle estimates",
                 "│    p                   toggle pace marker",
             ],
@@ -376,8 +411,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &dashboard,
             "TOKENS",
             &[
-                "│    ↑ ↓                 move between cards",
-                "│    pgup/pgdn           move a page of cards",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
                 "│    r                   reload on-disk stats",
@@ -401,7 +434,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &empty_model_selector,
             "TOKENS",
             &[
-                "│    ↑ ↓                 pick model",
                 "│    esc                 back to dashboard",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
@@ -490,6 +522,17 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
     });
     models.token_view = TokenView::Models;
     models.model_detail_focus = StatusFocus::Detail;
+    // Each detail draws at a height it overflows, so it has somewhere to
+    // scroll: the bound its body publishes is the one the help reads.
+    for detail in [&usage, &models] {
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, detail)).unwrap();
+        assert!(
+            crate::tui::app::detail_scrolls(detail),
+            "the {:?} detail overflows",
+            detail.tab
+        );
+    }
 
     let cases: [(&str, &App, &[&str]); 2] = [
         (
@@ -615,12 +658,20 @@ fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
     let mut empty = empty_app(Tab::Tokens);
     let mut populated = empty_app(Tab::Tokens);
     populated.token_stats = Some(crate::tokens::TokenStats {
-        models: vec![crate::tokens::ModelTokens {
-            model: "claude-opus-4-8".into(),
-            input: 12,
-            output: 8,
-            ..Default::default()
-        }],
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4-8".into(),
+                input: 12,
+                output: 8,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4-8".into(),
+                input: 3,
+                output: 2,
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     });
     for (name, app, expected) in [
@@ -710,44 +761,60 @@ fn every_sub_focus_tab_documents_esc_in_help() {
 /// reordering the rows reds here instead of drifting unnoticed. Flattening
 /// drops section titles: every current tab documents exactly one, so nothing
 /// is lost. Add another tab's row list to this loop by extending the call.
-fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
+/// The rows follow the focus and the row under the cursor, so `build` sets up
+/// the state whose rows the caller pins.
+fn assert_tab_rows(build: impl FnOnce() -> App, expected: &[(&str, &str)]) {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = empty_app(tab);
-    if tab == Tab::Usage {
-        app = app_on(
-            tab,
-            vec![crate::testutil::blank_profile(
-                &crate::profile::ProfileName::from("acct"),
-            )],
-        );
-    }
-    if tab == Tab::Tokens {
-        app.token_view = TokenView::Models;
-    }
+    let app = build();
     let rows: Vec<(&str, &str)> = tab_specific_rows(&app)
         .iter()
         .flat_map(|(_, entries)| entries.iter().copied())
         .collect();
-    assert_eq!(rows, expected, "{tab:?} help-modal row list drifted");
+    assert_eq!(rows, expected, "{:?} help-modal row list drifted", app.tab);
 }
 
 #[test]
 fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
+    use crate::tui::app::{Check, Health};
+    // A descended herdr detail whose diagnostics overflow: the bound its body
+    // publishes, stood in here, is what the page keys read through.
+    let herdr_detail = |option: usize| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: vec![],
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.herdr_options_cursor = option;
+        app.services.detail_max_scroll.set(4);
+        app
+    };
+    let arrows = ("↑ ↓", "move between rows");
+    let pages = ("pgup/pgdn", "scroll a page");
     assert_tab_rows(
-        Tab::Services,
+        || herdr_detail(0),
         &[
-            (
-                "↑ ↓",
-                "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
-            ),
-            (
-                "pgup/pgdn",
-                "scroll a page · read plugin / herdr diagnostics · page delegates",
-            ),
-            ("↵", "open detail · activate · open fix"),
+            arrows,
+            pages,
+            ("↵", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+    );
+    assert_tab_rows(
+        || herdr_detail(2),
+        &[
+            arrows,
+            pages,
+            ("↵", "open or act on the focused row"),
             ("space", "activate the focused herdr option"),
             ("+ / -", "step the tag refresh"),
-            ("f", "next fix"),
             ("r", "re-run all checks"),
             ("esc", "back to the list · close the editor"),
         ],
@@ -756,16 +823,29 @@ fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
 
 #[test]
 fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    let enter = ("↵", "open or change the focused row");
+    // The chain list's own keys.
     assert_tab_rows(
-        Tab::Fallback,
+        two_member_chain_app,
         &[
-            ("↑ ↓", "move cursor / detail row"),
+            ("↑ ↓", "move between rows"),
             ("shift ↑ ↓", "reorder to set priority"),
-            (
-                "↵",
-                "open · edit threshold · edit weekly at · edit max spend · toggle gates / last resort · remove · add",
-            ),
-            ("+ / -", "step rotate at / weekly at by 5"),
+            enter,
+        ],
+    );
+    // A member card whose every row acts: its account is on the roster and its
+    // weekly gate is on.
+    assert_tab_rows(
+        || {
+            let mut app = two_member_chain_app();
+            app.fallback_focus = FallbackFocus::Detail;
+            app
+        },
+        &[
+            ("↑ ↓", "move between rows"),
+            enter,
+            ("space", "change the focused setting"),
+            ("+ / -", "step the focused number"),
             (
                 "↵ on rotate at",
                 concat!("type a value, ", key_lit!("↵"), " saves"),
@@ -981,21 +1061,18 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
 /// `has a live session`, one screen apart, with no test on either wording.
 #[test]
 fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    // The card holds focus, on its `disable` row: the account is neither
+    // active nor holding a live session, so the row acts and its help row
+    // lists with its gate copy.
     assert_tab_rows(
-        Tab::Setup,
+        || setup_row_app(crate::tui::app::ConfigRow::Disabled),
         &[
-            ("↑ ↓", "pick account / + new, then a row"),
-            ("↵", "open settings · edit field · flip toggle"),
+            ("↑ ↓", "move between rows"),
+            ("↵", "disable"),
             (
                 "↵ on a field",
                 concat!("edit inline; ", key_lit!("↵"), " again saves"),
             ),
-            (
-                "space",
-                "cycle model preset · flip auto-start, usage probe ·",
-            ),
-            ("", "open alert at, probe every"),
-            ("+ / -", "step alert at by 5 · probe every by 30s"),
             (
                 "env",
                 concat!("+ add env · ", key_lit!("↵"), " edits a value"),
@@ -1710,7 +1787,7 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         "    ⇧tab                previous screen",
         "    ⌥1-9                jump to tab",
         "    esc                 back within a sub-view (no-op at the top level)",
-        "    pgup/pgdn           scroll a page",
+        "    pgup/pgdn           move a page",
         "    ⌃c                  quit from anywhere",
         "",
     ];
@@ -1729,7 +1806,6 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         "    ⇧tab                previous screen",
         "    ⌥1-9                jump to tab",
         "    esc                 back within a sub-view (no-op at the top level)",
-        "    pgup/pgdn           scroll a page",
         "    ⌃c                  quit from anywhere",
         "",
     ];
@@ -4157,7 +4233,6 @@ fn the_help_global_section_names_the_switch_keys() {
             "    ⇧tab                previous screen",
             "    ⌥1-9                jump to tab",
             "    esc                 back within a sub-view (no-op at the top level)",
-            "    pgup/pgdn           scroll a page",
             "    ⌃c                  quit from anywhere",
             "",
         ]
@@ -5375,9 +5450,9 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// modal): a long description wraps onto the next row under the key column.
 /// One exact pin here, beside the widened (content-fit) help pins above.
 ///
-/// The thumb's extent is part of that shape, so it moves when the legend does:
-/// the `× logged out` row joins the legend, and the thumb is shorter for it.
-/// The wrapped rows above are what this test is for and none of them changed.
+/// The thumb's extent is part of that shape: it follows the modal's total, so a
+/// row joining or leaving any section moves it. The wrapped rows are what this
+/// test is for.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -5399,13 +5474,8 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│                                            ┃ │",
         "│  ACCOUNTS                                  ┃ │",
         "│                                            ┃ │",
-        "│    ↑ ↓                 move cursor         ┃ │",
-        "│    ↵                   switch to selected  ┃ │",
-        "│  account (confirm)                         ┃ │",
-        "│    shift ↑ ↓           reorder account up /┃ │",
-        "│  down                                      ┃ │",
-        "│    e                   edit selected       ┃ │",
-        "│  account in setup                          ┃ │",
+        "│    c                   cycle the harness   ┃ │",
+        "│  filter                                    ┃ │",
         "│                                            ┃ │",
         "│  GLOBAL                                    ┃ │",
         "│                                            ┃ │",
@@ -5425,25 +5495,30 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⌥1-9                jump to tab         ┃ │",
         "│    esc                 back within a       ┃ │",
         "│  sub-view (no-op at the top level)         ┃ │",
-        "│    pgup/pgdn           scroll a page       ┃ │",
         "│    ⌃c                  quit from anywhere  ┃ │",
         "│                                            ┃ │",
         "│  GLYPHS                                    ┃ │",
         "│                                            ┃ │",
-        "│    ✻                   active claude       ┊ │",
-        "│  account                                   ┊ │",
-        "│    ⏣                   active codex account┊ │",
-        "│    ⥋                   active, via shunt   ┊ │",
-        "│    ⇄                   a live session here ┊ │",
-        "│  follows the fallback chain                ┊ │",
-        "│    ⊘                   before a name: setup┊ │",
-        "│  token expired,                            ┊ │",
-        "│                        mis-filled or       ┊ │",
-        "│  refused                                   ┊ │",
+        "│    ✻                   active claude       ┃ │",
+        "│  account                                   ┃ │",
+        "│    ⏣                   active codex account┃ │",
+        "│    ⥋                   active, via shunt   ┃ │",
+        "│    ⇄                   a live session here ┃ │",
+        "│  follows the fallback chain                ┃ │",
+        "│    ⊘                   before a name: setup┃ │",
+        "│  token expired,                            ┃ │",
+        "│                        mis-filled or       ┃ │",
+        "│  refused                                   ┃ │",
         "│    ↲                   the chain switches  ┊ │",
         "│  to this account next                      ┊ │",
         "│    ⊖                   disabled            ┊ │",
         "│    ⊖                   canceled            ┊ │",
+        "│    ⊖                   org refused         ┊ │",
+        "│    ×                   auth broken         ┊ │",
+        "│    ×                   key rejected        ┊ │",
+        "│    ×                   token rejected      ┊ │",
+        "│    ×                   logged out          ┊ │",
+        "│    ⊘                   weekly spent        ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]
@@ -7732,4 +7807,2407 @@ fn a_whitespace_only_run_wider_than_the_row_splits_by_cell() {
     let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 2);
     assert_eq!(prose_rows, want, "prose: {text:?}");
     assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+// ---- hints follow their handler past the states pinned below ----
+
+/// A member card row whose keys are inert offers none: with the member's
+/// weekly gate off, `weekly at` takes no `+ / -` and no `↵` in the footer or
+/// the help, which keeps only the rows other card rows act on; with spend
+/// budget off, `max spend` offers no `↵`.
+#[test]
+fn an_inert_fallback_card_row_offers_no_keys() {
+    use crate::tui::app::{FALLBACK_ROWS, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let card_on = |row: FallbackRow| {
+        let mut app = one_member_chain_app();
+        app.config().profiles[0].check_weekly = false;
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = FALLBACK_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("a card row");
+        app
+    };
+    let inert = [
+        ("←", "back"),
+        ("↑↓", "row"),
+        ("a", "actions"),
+        ("?", "help"),
+        ("q", "back"),
+    ];
+
+    let app = card_on(FallbackRow::WeeklyAt);
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget is off"
+    );
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &inert),
+        "weekly at, gate off"
+    );
+    let help = help_of(&app);
+    assert!(
+        help.iter().all(|(k, _)| *k != "\u{21b5} on weekly at"),
+        "no typing a weekly line the gate ignores: {help:?}"
+    );
+    assert_eq!(
+        help,
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on rotate at",
+                concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+            ),
+            (
+                "space on preferred days",
+                "step never / weekdays / weekends / every day",
+            ),
+            (
+                "\u{21b5} on preferred days",
+                concat!(
+                    "pick days: ",
+                    key_lit!("\u{2190} \u{2192}"),
+                    " walk \u{00b7} ",
+                    key_lit!("space"),
+                    " toggles and saves \u{00b7} ",
+                    key_lit!("\u{21b5} esc q"),
+                    " leave \u{00b7} ",
+                    key_lit!("\u{2191} \u{2193}"),
+                    " leave and move",
+                ),
+            ),
+            ("esc", "back / cancel edit"),
+        ]
+    );
+
+    let app = card_on(FallbackRow::MaxSpend);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &inert),
+        "max spend, budget off"
+    );
+}
+
+/// The Overview `↵` offers no switch onto the account already active, and the
+/// help says so by leaving its row out.
+#[test]
+fn the_overview_help_offers_no_switch_onto_the_active_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    app.config().state.active_profile = Some(crate::profile::ProfileName::from("alpha"));
+    app.overview_cursor = app
+        .main_items()
+        .iter()
+        .position(|item| *item == crate::tui::app::MainItemKind::Profile(0))
+        .expect("alpha's row");
+    let help = help_of(&app);
+    assert!(
+        help.iter().all(|(k, _)| *k != "\u{21b5}"),
+        "no switch onto the active account: {help:?}"
+    );
+    assert_eq!(
+        help,
+        vec![
+            ("\u{2191} \u{2193}", "move cursor"),
+            ("shift \u{2191} \u{2193}", "reorder account up / down"),
+            ("e", "edit selected account in setup"),
+            ("c", "cycle the harness filter"),
+        ]
+    );
+}
+
+/// The Setup `disable` row on the active account is inert: its footer offers
+/// no `↵`, and the help drops both the row's `↵` and its disable row.
+#[test]
+fn an_inert_setup_disable_row_offers_no_enter() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = setup_row_app(crate::tui::app::ConfigRow::Disabled);
+    app.config().state.active_profile = Some(crate::profile::ProfileName::from("alpha"));
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    let help = help_of(&app);
+    assert!(
+        help.iter()
+            .all(|(k, _)| *k != "\u{21b5}" && *k != "disable / enable"),
+        "no disable key on the active account: {help:?}"
+    );
+}
+
+/// A timeline taller than its pane offers its scroll, in the footer and the
+/// help, named for what it scrolls.
+#[test]
+fn an_overflowing_status_timeline_offers_its_scroll() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = status_detail_fits_app();
+    app.status.incidents[0].updates = (0..40)
+        .map(|i| crate::status::IncidentUpdate {
+            phase: crate::status::UpdatePhase::Monitoring,
+            at_ms: 1_780_740_881_000 + i * 60_000,
+            text: format!("update {i}"),
+            transitions: vec![],
+        })
+        .collect();
+    let footer = wide_footer(&app);
+    assert!(
+        app.status.detail_max_scroll.get() > 0,
+        "the timeline overflows"
+    );
+    assert_eq!(
+        footer,
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "scroll"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "scroll the timeline"),
+            ("r", "refresh the feed"),
+            ("esc", "back to the list"),
+        ]
+    );
+}
+
+// ---- every hint derives from its handler: the tab footers and help rows ----
+
+use ratatui::crossterm::event::KeyCode;
+
+/// The frame every hint pin below draws at: wide enough that the footer sheds
+/// no hint and tall enough for the art header, so a row is the whole row.
+const HINT_W: u16 = 200;
+const HINT_H: u16 = 40;
+
+/// Draw `app` twice at the hint frame and return its rows.
+pub(crate) fn hint_frame(app: &App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(HINT_W, HINT_H)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The settled footer row, trimmed.
+pub(crate) fn wide_footer(app: &App) -> String {
+    hint_frame(app)
+        .last()
+        .expect("the footer row")
+        .trim()
+        .to_string()
+}
+
+/// The footer row `groups` compose to: `key label` groups 3 cells apart. The
+/// `a actions` group follows the action menu's own emptiness, which is not
+/// what these pins are about, so it is dropped where the menu is empty.
+pub(crate) fn footer_of(app: &App, groups: &[(&str, &str)]) -> String {
+    let menu_empty = crate::tui::app::build_action_menu(app).items.is_empty();
+    groups
+        .iter()
+        .filter(|(k, _)| !(menu_empty && *k == "a"))
+        .map(|(k, l)| format!("{k} {l}"))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
+/// The per-tab help rows, flattened across sections.
+pub(crate) fn help_of(app: &App) -> Vec<(&'static str, &'static str)> {
+    tab_specific_rows(app)
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().copied())
+        .collect()
+}
+
+fn hint_profiles(names: &[&str]) -> Vec<crate::profile::Profile> {
+    names
+        .iter()
+        .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)))
+        .collect()
+}
+
+fn chain_app(members: &[&str]) -> App {
+    let app = app_on(Tab::Fallback, hint_profiles(members));
+    app.config().state.fallback_chain = members
+        .iter()
+        .map(|n| crate::profile::ProfileName::from(*n))
+        .collect();
+    app
+}
+
+fn one_member_chain_app() -> App {
+    chain_app(&["alpha"])
+}
+
+fn two_member_chain_app() -> App {
+    chain_app(&["alpha", "beta"])
+}
+
+fn hint_incident(id: &str) -> crate::status::Incident {
+    crate::status::Incident {
+        id: id.into(),
+        title: format!("incident {id}"),
+        link: "https://stspg.io/abc".into(),
+        phase: crate::status::UpdatePhase::Monitoring,
+        impact: crate::status::Impact::Minor,
+        started_ms: 1_780_740_881_000,
+        resolved_ms: None,
+        components: vec![],
+        updates: vec![],
+    }
+}
+
+fn status_list_app(incidents: usize) -> App {
+    let mut app = app_on(Tab::Status, vec![]);
+    app.status.incidents = (0..incidents)
+        .map(|i| hint_incident(&format!("i{i}")))
+        .collect();
+    app
+}
+
+fn status_empty_app() -> App {
+    status_list_app(0)
+}
+
+fn status_two_app() -> App {
+    status_list_app(2)
+}
+
+/// A short incident's timeline fits the hint frame, so its scroll bound is 0.
+fn status_detail_fits_app() -> App {
+    let mut app = status_list_app(1);
+    app.status.focus = StatusFocus::Detail;
+    app
+}
+
+/// One short model's detail fits the hint frame, so its scroll bound is 0.
+fn model_detail_fits_app() -> App {
+    let mut app = app_on(Tab::Tokens, vec![]);
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![crate::tokens::ModelTokens {
+            model: "claude-model-a".into(),
+            input: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::Detail;
+    app
+}
+
+fn setup_empty_app() -> App {
+    app_on(Tab::Setup, vec![])
+}
+
+/// Setup on one account, descended into its card with the cursor on `row`.
+fn setup_row_app(row: crate::tui::app::ConfigRow) -> App {
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| panic!("the card shows {row:?}"));
+    app
+}
+
+/// Setup's `+ new` form, descended, with the cursor on `create account`.
+fn setup_create_app() -> App {
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the form holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == crate::tui::app::ConfigRow::Create)
+        .expect("the form shows create account");
+    app
+}
+
+fn config_row_app(row: crate::tui::app::GlobalConfigRow) -> App {
+    let mut app = app_on(Tab::Config, vec![]);
+    app.global_config_cursor = crate::tui::app::GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("a Config row");
+    app
+}
+
+/// A one-member chain has nothing to walk to and no neighbour to swap with:
+/// its footer offers neither `↑↓` nor `⇧↑↓`, and its help lists only `↵`.
+#[test]
+fn a_one_member_chain_offers_no_walk_or_reorder() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = one_member_chain_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↵", "open"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![("\u{21b5}", "open or change the focused row",)]
+    );
+}
+
+/// A joined key keeps its hint while either direction acts: the top member of
+/// a two-member chain can only move down, and `⇧↑↓` stays. The chain focus
+/// lists no detail-row key and no `esc`, which does nothing at the top level.
+#[test]
+fn the_top_member_of_a_longer_chain_keeps_the_joined_reorder_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = two_member_chain_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↑↓", "move"),
+                ("⇧↑↓", "reorder"),
+                ("↵", "open"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("shift \u{2191} \u{2193}", "reorder to set priority"),
+            ("\u{21b5}", "open or change the focused row",),
+        ]
+    );
+}
+
+/// The Overview help lists a key only while it acts: on an empty roster only
+/// the harness filter, which acts on any roster; with two accounts every row
+/// key plus that filter.
+#[test]
+fn the_overview_help_lists_only_live_keys_and_the_harness_filter() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_on(Tab::Overview, vec![]);
+    assert_eq!(help_of(&app), vec![("c", "cycle the harness filter")]);
+
+    let app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move cursor"),
+            ("\u{21b5}", "switch to selected account (confirm)"),
+            ("shift \u{2191} \u{2193}", "reorder account up / down"),
+            ("e", "edit selected account in setup"),
+            ("c", "cycle the harness filter"),
+        ]
+    );
+}
+
+/// A model detail that fits has nothing to scroll: neither the footer nor the
+/// help offers `↑↓` there, as the help modal's own row does on a fitting body.
+#[test]
+fn a_fitting_model_detail_offers_no_scroll() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = model_detail_fits_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(app.model_detail_max_scroll.get(), 0, "the detail fits");
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("esc", "return to model selector"),
+            ("\u{2190}", "return to model selector"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ]
+    );
+}
+
+/// The Status help follows the focus: the list names its walk and its open,
+/// a fitting timeline offers no scroll and no `↵`, and an empty feed only the
+/// refresh.
+#[test]
+fn the_status_help_follows_the_focus_and_the_feed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = status_two_app();
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "pick incident"),
+            ("\u{21b5}", "open incident timeline"),
+            ("r", "refresh the feed"),
+        ]
+    );
+
+    let app = status_empty_app();
+    assert_eq!(help_of(&app), vec![("r", "refresh the feed")]);
+
+    let app = status_detail_fits_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back")
+            ]
+        )
+    );
+    assert_eq!(app.status.detail_max_scroll.get(), 0, "the timeline fits");
+    assert_eq!(
+        help_of(&app),
+        vec![("r", "refresh the feed"), ("esc", "back to the list")]
+    );
+}
+
+/// An empty roster's Setup list holds only `+ new`: `↑↓` has nowhere to go.
+#[test]
+fn an_empty_setup_roster_offers_no_account_walk() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = setup_empty_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↵", "configure"),
+                ("n", "new"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+}
+
+/// The Setup account list's help lists the list's own keys, never a card
+/// row's: no `space`, `+ / -`, env, disable, delete or `esc` while the list
+/// holds focus.
+#[test]
+fn the_setup_list_help_lists_no_card_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open the focused account"),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+        ]
+    );
+}
+
+/// Each Setup card row's `↵` names what it does there.
+#[test]
+fn the_setup_card_names_each_rows_enter() {
+    use crate::tui::app::ConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let card = |verb: (&'static str, &'static str)| {
+        vec![
+            ("←", "back"),
+            ("↑↓", "row"),
+            verb,
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ]
+    };
+
+    let app = setup_row_app(ConfigRow::Name);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "edit"))),
+        "a text row"
+    );
+    let app = setup_row_app(ConfigRow::AutoStart);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("space/↵", "toggle"))),
+        "an on/off row"
+    );
+    let app = setup_row_app(ConfigRow::Delete);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "delete"))),
+        "the delete row"
+    );
+    let app = setup_create_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "create"))),
+        "the create row"
+    );
+}
+
+/// An armed delete on a claude card reads like the codex and pool cards' armed
+/// rows: the confirm, its way out, and help.
+#[test]
+fn an_armed_setup_delete_names_its_confirm_and_cancel() {
+    use crate::tui::app::ConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = setup_row_app(ConfigRow::Delete);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↵", "confirm delete"),
+                ("esc", "cancel"),
+                ("?", "help"),
+            ]
+        )
+    );
+}
+
+/// The Config help follows the focused row: `↵` types a value on the three
+/// typed rows, mirrors `space` elsewhere, and a dimmed row whose keys do
+/// nothing lists only the walk.
+#[test]
+fn the_config_help_follows_the_focused_row() {
+    use crate::tui::app::GlobalConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let walk = ("\u{2191} \u{2193}", "move between settings");
+    let space = ("space", "cycle the focused setting");
+
+    for row in [
+        GlobalConfigRow::RefreshInterval,
+        GlobalConfigRow::ContextNudge,
+        GlobalConfigRow::WeeklyThreshold,
+    ] {
+        let app = config_row_app(row);
+        assert_eq!(
+            help_of(&app),
+            vec![walk, space, ("\u{21b5}", "type a value")],
+            "{row:?}"
+        );
+    }
+
+    let app = config_row_app(GlobalConfigRow::AutoUpdate);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            walk,
+            space,
+            ("\u{21b5}", concat!("same as ", key_lit!("space")))
+        ]
+    );
+
+    let app = config_row_app(GlobalConfigRow::BurnFloor);
+    assert!(
+        !app.config().state.burn_aware_switching,
+        "burn floor is dimmed while burn-aware switching is off"
+    );
+    assert_eq!(help_of(&app), vec![walk]);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+}
+
+/// A failed token read's `↵` expands the cause: the help names that, never the
+/// per-model breakdown the same key opens on a healthy dashboard.
+#[test]
+fn a_failed_token_dashboard_help_names_the_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = model_detail_fits_app();
+    app.token_view = TokenView::Dashboard;
+    app.model_detail_focus = StatusFocus::List;
+    app.tokens_failed = true;
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{21b5}", "show why"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ]
+    );
+}
+
+/// The Services list names no key its focused row ignores: a delegates row
+/// with no job opens no detail and carries no fix, and `space`, `+ / -` and
+/// `esc` act only inside a detail.
+#[test]
+fn the_services_list_help_names_no_dead_row_key() {
+    use crate::tui::app::{Check, Health};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Services, vec![]);
+    app.services.checks = ["delegates", "plugin"]
+        .into_iter()
+        .map(|label| Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: vec![],
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        })
+        .collect();
+    assert!(app.services.delegates.is_empty(), "no delegate job");
+    let keys: Vec<&str> = help_of(&app).into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec!["\u{2191} \u{2193}", "pgup/pgdn", "r"]);
+}
+
+/// A long incident's timeline overflows the hint frame, so its detail scrolls.
+fn status_detail_overflows_app() -> App {
+    let mut app = status_list_app(1);
+    app.status.incidents[0].updates = (0..200u64)
+        .map(|i| crate::status::IncidentUpdate {
+            phase: crate::status::UpdatePhase::Monitoring,
+            at_ms: 1_780_740_881_000 + i * 60_000,
+            text: format!("update {i}"),
+            transitions: vec![],
+        })
+        .collect();
+    app.status.focus = StatusFocus::Detail;
+    app
+}
+
+/// The help's GLOBAL `pgup/pgdn` row says what the key does on this frame: a
+/// list moves its selection a page, a detail pane that overflows scrolls one,
+/// and a detail pane that fits lists no page row, since the press moves nothing.
+#[test]
+fn the_global_page_row_follows_list_or_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        let rows = {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut term = Terminal::new(TestBackend::new(HINT_W, 120)).expect("backend");
+            term.draw(|f| crate::tui::render::draw(f, app))
+                .expect("draw");
+            term.draw(|f| crate::tui::render::draw(f, app))
+                .expect("draw");
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        rows.iter()
+            .filter(|r| r.contains("pgup/pgdn") && r.contains("a page"))
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    };
+
+    let mut app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    let found = page_rows(&mut app);
+    assert_eq!(found.len(), 1, "one global page row: {found:?}");
+    assert!(
+        found[0].contains("pgup/pgdn move a page"),
+        "a list moves its selection: {found:?}"
+    );
+    assert_eq!(
+        help_row_segments(&found, "pgup/pgdn"),
+        ["│ pgup/pgdn move a page │"],
+        "the list's page row whole"
+    );
+    let mut app = status_detail_overflows_app();
+    let found = page_rows(&mut app);
+    assert_eq!(found.len(), 1, "one global page row: {found:?}");
+    assert!(
+        found[0].contains("pgup/pgdn scroll a page"),
+        "an overflowing detail pane scrolls: {found:?}"
+    );
+    assert_eq!(
+        help_row_segments(&found, "pgup/pgdn"),
+        ["│ pgup/pgdn scroll a page │"],
+        "the detail's page row whole"
+    );
+    let mut app = status_detail_fits_app();
+    let found = page_rows(&mut app);
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "a fitting detail pane's page press moves nothing, so the help lists no page row"
+    );
+}
+
+/// Every footer hint acts through the real handler: pressing its key changes
+/// the frame. The control first proves a frame drawn twice with no key between
+/// reads the same, so a changed frame is the key's doing.
+#[test]
+fn every_tab_footer_hint_acts_through_the_handler() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    type Case = (&'static str, fn() -> App);
+    let _home = crate::testutil::HomeSandbox::new();
+    let cases: &[Case] = &[
+        ("one-member chain", one_member_chain_app),
+        ("two-member chain", two_member_chain_app),
+        ("model detail that fits", model_detail_fits_app),
+        ("status detail that fits", status_detail_fits_app),
+        ("status list", status_two_app),
+        ("empty setup roster", setup_empty_app),
+        ("setup create row", setup_create_app),
+        ("config burn floor", || {
+            config_row_app(crate::tui::app::GlobalConfigRow::BurnFloor)
+        }),
+        ("config refresh", || {
+            config_row_app(crate::tui::app::GlobalConfigRow::RefreshInterval)
+        }),
+    ];
+    for (name, build) in cases {
+        let app = build();
+        let footer = wide_footer(&app);
+        assert_eq!(hint_frame(&app), hint_frame(&app), "{name}: control");
+        for group in footer.split("   ") {
+            let key = group.split(' ').next().expect("a key");
+            let event = match key {
+                "←→" => crate::testutil::key(KeyCode::Right),
+                "←" => crate::testutil::key(KeyCode::Left),
+                "↑↓" => crate::testutil::key(KeyCode::Down),
+                "⇧↑↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                "↵" => crate::testutil::key(KeyCode::Enter),
+                "space" | "space/↵" => crate::testutil::key(KeyCode::Char(' ')),
+                "esc" => crate::testutil::key(KeyCode::Esc),
+                "+" => crate::testutil::key(KeyCode::Char('+')),
+                "-" => crate::testutil::key(KeyCode::Char('-')),
+                k if k.chars().count() == 1 => {
+                    crate::testutil::key(KeyCode::Char(k.chars().next().expect("a char")))
+                }
+                other => panic!("{name}: unmapped hint key {other:?}"),
+            };
+            let mut app = build();
+            let before = hint_frame(&app);
+            let cache_before = app.config().state.count_cache;
+            crate::tui::app::handle_key(&mut app, event);
+            // `c` on the Tokens tab flips a saved setting; on a model detail
+            // that keeps its model selected the frame can stay as it was.
+            if key == "c" && app.tab == Tab::Tokens {
+                assert_ne!(
+                    app.config().state.count_cache,
+                    cache_before,
+                    "{name}: `{group}` changes nothing"
+                );
+                continue;
+            }
+            assert_ne!(
+                hint_frame(&app),
+                before,
+                "{name}: `{group}` changes nothing"
+            );
+        }
+    }
+}
+
+// ---- the token model selection follows its model across a reorder ----
+
+/// Two models whose order flips with the cache count: `claude-model-a` leads
+/// on input + output (200 vs 20), `claude-model-b` once cache reads join the
+/// count (200 vs 5020).
+fn two_model_app() -> App {
+    let mut app = app_on(Tab::Tokens, vec![]);
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-model-a".into(),
+                input: 100,
+                output: 100,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-model-b".into(),
+                input: 10,
+                output: 10,
+                cache_read: 5000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app.token_period = crate::tui::app::TokenPeriod::Lifetime;
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::List;
+    app
+}
+
+/// The model picker's caret row, read off the drawn frame.
+fn selected_model_row(app: &App) -> String {
+    let rows = hint_frame(app);
+    let picked: Vec<&String> = rows.iter().filter(|r| r.contains('❯')).collect();
+    assert_eq!(picked.len(), 1, "one caret row: {picked:?}");
+    picked[0].clone()
+}
+
+fn shows(row: &str, model: &str) -> bool {
+    row.contains(&crate::tokens::model_display_name(model))
+}
+
+/// `c` re-ranks the model list; the selection moves with its model to the
+/// model's new row.
+#[test]
+fn the_model_selection_follows_its_model_across_the_cache_toggle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_model_app();
+    let row = selected_model_row(&app);
+    assert!(shows(&row, "claude-model-a"), "starts on a: {row:?}");
+    // The list's own order, the one the picker draws (the detail pane's title
+    // also names the selected model, so frame rows cannot rank the list).
+    let rank = |app: &App| -> Vec<String> {
+        crate::tui::app::token_period_models(app)
+            .into_iter()
+            .map(|m| m.model)
+            .collect()
+    };
+    assert_eq!(
+        rank(&app),
+        ["claude-model-a", "claude-model-b"],
+        "a ranks first without cache"
+    );
+
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert!(app.config().state.count_cache, "the toggle saved");
+    assert_eq!(
+        rank(&app),
+        ["claude-model-b", "claude-model-a"],
+        "b ranks first with cache"
+    );
+    let row = selected_model_row(&app);
+    assert!(
+        shows(&row, "claude-model-a"),
+        "the caret moved with a: {row:?}"
+    );
+}
+
+/// The same toggle from the detail keeps the detail on its model: back on the
+/// list, the caret still names it.
+#[test]
+fn the_model_detail_keeps_its_model_across_the_cache_toggle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_model_app();
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.model_detail_focus, StatusFocus::Detail, "descended");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.model_detail_focus, StatusFocus::List, "ascended");
+    let row = selected_model_row(&app);
+    assert!(
+        shows(&row, "claude-model-a"),
+        "the detail stayed on a: {row:?}"
+    );
+}
+
+// ---- a hidden key changes nothing on the boundary fixtures ----
+
+/// The reverse of the shown-hint loop: on the boundary fixtures (one row,
+/// empty, fitting detail, dimmed row), every key the footer hides that the
+/// loop's mapping knows is pressed, and the frame and the state the press
+/// used to touch stay unchanged. Keys another documented surface covers on
+/// that frame (the help's GLOBAL `n`/`r`/`t` rows, `esc` where the help names
+/// its own sense — a descended pane's back, the models list's back to
+/// dashboard — and a shifted walk where the plain walk is shown) are skipped:
+/// those are the curated omissions, not the hidden-hint class.
+#[test]
+fn a_key_the_footer_hides_changes_nothing_on_the_boundary_fixtures() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::{ConfigRow, handle_key};
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let key = crate::testutil::key;
+    let mapped: &[(&str, KeyEvent)] = &[
+        ("↑↓", key(KeyCode::Down)),
+        ("⇧↑↓", KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
+        ("↵", key(KeyCode::Enter)),
+        ("space", key(KeyCode::Char(' '))),
+        ("esc", key(KeyCode::Esc)),
+        ("+", key(KeyCode::Char('+'))),
+        ("-", key(KeyCode::Char('-'))),
+        ("c", key(KeyCode::Char('c'))),
+        ("r", key(KeyCode::Char('r'))),
+        ("t", key(KeyCode::Char('t'))),
+        ("e", key(KeyCode::Char('e'))),
+        ("p", key(KeyCode::Char('p'))),
+        ("f", key(KeyCode::Char('f'))),
+        ("n", key(KeyCode::Char('n'))),
+    ];
+    let one_model = || {
+        let mut app = model_detail_fits_app();
+        app.model_detail_focus = StatusFocus::List;
+        app.model_detail_scroll = 3;
+        app
+    };
+    let empty_setup = || {
+        let mut app = setup_empty_app();
+        app.pending_pool_landing = Some((crate::gateway_admin::PoolFamily::Claude, "pool".into()));
+        app
+    };
+    let dimmed_disable = || {
+        let app = setup_row_app(ConfigRow::Disabled);
+        app.config().state.active_profile = Some(ProfileName::from("alpha"));
+        app
+    };
+    // (name, build, curated skips, state read)
+    type Fixture = (
+        &'static str,
+        fn() -> App,
+        &'static [&'static str],
+        fn(&App) -> String,
+    );
+    let fixtures: Vec<Fixture> = vec![
+        ("one model", one_model, &["esc", "r", "n"], |a| {
+            a.model_detail_scroll.to_string()
+        }),
+        ("empty setup", empty_setup, &["r", "t"], |a| {
+            a.pending_pool_landing.is_some().to_string()
+        }),
+        (
+            "fitting status detail",
+            status_detail_fits_app,
+            &["esc", "r", "t", "n"],
+            |a| a.status.detail_scroll.to_string(),
+        ),
+        (
+            "dimmed disable row",
+            dimmed_disable,
+            &["esc", "r", "t", "n"],
+            |a| {
+                format!(
+                    "{}:{}",
+                    a.config().profiles[0].disabled,
+                    a.config_draft
+                        .as_ref()
+                        .is_some_and(|d| d.armed_action.is_some())
+                )
+            },
+        ),
+    ];
+    for (name, build, skip, read) in fixtures {
+        let app = build();
+        let _ = hint_frame(&app); // publish the bounds the footer reads
+        let footer = wide_footer(&app);
+        let held = read(&app);
+        let before = hint_frame(&app);
+        assert_eq!(
+            hint_frame(&app),
+            before,
+            "{name}: control frame holds still"
+        );
+        for (mapped_key, event) in mapped {
+            let shown = footer.split("   ").any(|g| {
+                let k = g.split(' ').next().unwrap_or("");
+                k == *mapped_key
+                    || (*mapped_key == "space" && k == "space/↵")
+                    || (*mapped_key == "↵" && k == "space/↵")
+                    || (*mapped_key == "⇧↑↓" && k == "↑↓")
+            });
+            if shown || skip.contains(mapped_key) {
+                continue;
+            }
+            let mut app = build();
+            let _ = hint_frame(&app);
+            handle_key(&mut app, *event);
+            assert_eq!(
+                read(&app),
+                held,
+                "{name}: the hidden {mapped_key} changed state"
+            );
+            assert_eq!(
+                hint_frame(&app),
+                before,
+                "{name}: the hidden {mapped_key} changed the frame"
+            );
+        }
+    }
+}
+
+/// The help's `f next fix` row lists only while the focused check holds a fix
+/// line to walk: a herdr check with a problem, not one without.
+#[test]
+fn the_help_names_the_next_fix_row_only_while_the_check_holds_one() {
+    use crate::tui::app::{Check, Health, Problem, ServiceFix};
+    let _home = crate::testutil::HomeSandbox::new();
+    let herdr = |problems: Vec<Problem>| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems,
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_max_scroll.set(4);
+        app
+    };
+    let with_fix = herdr(vec![Problem {
+        line: 0,
+        fix: ServiceFix::MoveStoresIn,
+    }]);
+    assert_eq!(
+        help_of(&with_fix),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("pgup/pgdn", "scroll a page",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("f", "next fix"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "a herdr check with a fix lists the walk"
+    );
+    let without_fix = herdr(Vec::new());
+    assert_eq!(
+        help_of(&without_fix),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("pgup/pgdn", "scroll a page",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "no fix line, no f row"
+    );
+}
+
+/// A fallback card row for a chain member whose profile left the roster takes
+/// no key: the five toggle rows drop their `space/↵ toggle` from the footer,
+/// the same gate the handler refuses at.
+#[test]
+fn a_fallback_card_row_for_a_gone_member_offers_no_toggle() {
+    use crate::tui::app::FallbackFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = one_member_chain_app();
+    app.config().profiles.pop();
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::CheckWeekly)
+        .expect("a card row");
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        ),
+        "a gone member's toggle row offers no toggle"
+    );
+}
+
+// ---- a descended walk lists its page row only while it has a row to move to ----
+
+/// The help modal's page-key rows on `app`'s frame, whitespace-collapsed.
+fn help_page_rows(app: &mut App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    app.help_scroll = 0;
+    app.open_modal(Modal::Help);
+    let mut term = Terminal::new(TestBackend::new(HINT_W, 120)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let _ = app.pop_modal();
+    rows.iter()
+        .filter(|r| r.contains("pgup/pgdn"))
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// A descended Setup pool detail for a pool account whose provider runs `auth`.
+fn pool_detail_app(auth: crate::gateway_admin::PoolAuth) -> App {
+    use crate::gateway_admin::{PoolAccount, PoolProvider};
+    use crate::tui::app::handle_key;
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "pool-main".to_string(),
+        auth,
+        accounts: vec![PoolAccount {
+            name: "pool-a".to_string(),
+            available: true,
+            near_quota: false,
+            cooldown_secs_remaining: None,
+            needs_relogin: false,
+            paused: false,
+            disabled: false,
+            utilization_5h: None,
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
+            plan: None,
+            status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
+        }],
+    }]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.setup_selection(),
+            SetupSelection::Item(MainItemKind::Shunt(..))
+        ),
+        "the pool account is selected"
+    );
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "↵ descends");
+    app
+}
+
+/// A pool detail with one action row (a codex-family account: `remove` only)
+/// has nowhere to walk, so the help lists no page row; two rows list
+/// `move a page`.
+#[test]
+fn a_pool_detail_lists_its_page_row_only_with_a_second_row() {
+    use crate::gateway_admin::PoolAuth;
+    use crate::tui::app::PoolDetailRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_detail_app(PoolAuth::Codex);
+    assert_eq!(app.pool_detail_rows(), vec![PoolDetailRow::Remove]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        Vec::<String>::new(),
+        "a lone row lists no page row"
+    );
+    let mut app = pool_detail_app(PoolAuth::Claude);
+    assert_eq!(
+        app.pool_detail_rows(),
+        vec![PoolDetailRow::Refresh, PoolDetailRow::Remove]
+    );
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two rows list the page row"
+    );
+}
+
+/// On a one-row pool detail with the remove armed, each walk and page key the
+/// surfaces hide leaves the cursor, the arm and the frame unchanged. With two
+/// rows the joined page key is listed, and a page press that lands on the row
+/// it left still acts: it disarms the remove, while its other direction moves
+/// the cursor.
+#[test]
+fn a_lone_row_pool_detail_keeps_its_armed_remove_under_the_hidden_walk_keys() {
+    use crate::gateway_admin::PoolAuth;
+    use crate::tui::app::{PoolDetailRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = pool_detail_app(PoolAuth::Codex);
+    assert_eq!(app.pool_detail_rows(), vec![PoolDetailRow::Remove]);
+    app.pool_detail_armed = true;
+    let before = hint_frame(&app);
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.config_action_cursor, app.pool_detail_armed),
+            (0, true),
+            "{code:?} on a lone row keeps the cursor and the arm"
+        );
+        assert_eq!(hint_frame(&app), before, "{code:?} changes no frame");
+    }
+
+    let mut app = pool_detail_app(PoolAuth::Claude);
+    assert_eq!(
+        app.pool_detail_rows(),
+        vec![PoolDetailRow::Refresh, PoolDetailRow::Remove]
+    );
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two rows list the page row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let _ = hint_frame(&app);
+    app.pool_detail_armed = true;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        (app.config_action_cursor, app.pool_detail_armed),
+        (1, false),
+        "pgdn on the last row stays there and disarms the remove"
+    );
+}
+
+/// A Fallback `+ add` picker with one candidate has nowhere to walk: the help
+/// lists no page row and each walk and page key leaves the picker and the
+/// frame unchanged. Two candidates list `move a page`.
+#[test]
+fn the_add_picker_pages_only_while_it_has_a_second_candidate() {
+    use crate::tui::app::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let picker = |names: &[&str]| {
+        let mut app = app_on(Tab::Fallback, hint_profiles(names));
+        app.config().state.fallback_chain = vec![crate::profile::ProfileName::from(names[0])];
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            crate::tui::app::fallback_hint(&app),
+            FallbackHint::DetailAdd,
+            "↵ on `+ add` opens the picker"
+        );
+        app
+    };
+
+    let mut app = picker(&["alpha", "beta"]);
+    assert_eq!(chain_candidates(&app), vec!["beta".to_string()]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        Vec::<String>::new(),
+        "one candidate lists no page row"
+    );
+    let before = hint_frame(&app);
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.fallback_focus, app.fallback_detail_cursor),
+            (FallbackFocus::Detail, 0),
+            "{code:?} keeps the picker on its one candidate"
+        );
+        assert_eq!(hint_frame(&app), before, "{code:?} changes no frame");
+    }
+
+    let mut app = picker(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two candidates list the page row"
+    );
+}
+
+/// A re-check that clears the herdr problem while the heal line held focus
+/// leaves the stored focus flag behind; the handler drops it at entry, so
+/// `space` acts on the focused option, and the help lists `space`.
+#[test]
+fn a_cleared_herdr_fix_line_hands_space_back_to_the_option() {
+    use crate::profile::PopupWidth;
+    use crate::tui::app::{Check, Health, Problem, ServiceFix, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let herdr = |problems: Vec<Problem>| Check {
+        label: "herdr",
+        health: Health::Ok,
+        detail: vec![],
+        fix: None,
+        problems,
+        shunt_focus: vec![],
+        shunt_action_start: None,
+    };
+    let mut app = empty_app(Tab::Services);
+    app.services.checks = vec![herdr(vec![Problem {
+        line: 0,
+        fix: ServiceFix::MoveStoresIn,
+    }])];
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.herdr_fix_focus,
+        "↑ from the first option focuses the heal line"
+    );
+    // The recompute replaces the checks and leaves the focus flag alone.
+    app.services.checks = vec![herdr(Vec::new())];
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "the cleared heal line lists the option's space"
+    );
+    assert_eq!(
+        app.config().state.herdr.popup_width,
+        PopupWidth::Fit,
+        "the popup width starts at fit"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.herdr.popup_width,
+        PopupWidth::Half,
+        "space cycles the focused popup-width option"
+    );
+}
+
+// ---- a key whose only effect is a refusal shows no hint ----
+
+/// A proxy account logs in only through its proxy: on its Setup card's
+/// `Login` row the footer and the help offer no `↵`, and a press only toasts
+/// the refusal, opening no login.
+#[test]
+fn a_proxy_accounts_login_row_offers_no_enter_and_its_press_only_refuses() {
+    use crate::tui::app::{ConfigRow, config_rows, handle_key};
+    use crate::tui::render::prose::cmd;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    crate::profile::save_profile(&px).expect("save px");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").expect("the stub service"),
+        account: "acct-px".to_string(),
+    };
+    crate::profile::write_proxy_record(&px.name, &record).expect("write the proxy record");
+    px.proxy = Some(record);
+    let mut app = app_on(Tab::Setup, vec![px]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("the card holds a login row");
+
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+            (
+                "env",
+                concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+            ),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+            (
+                "disable / enable",
+                concat!(
+                    key_lit!("\u{21b5}"),
+                    " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                ),
+            ),
+            (
+                "delete",
+                concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+            ),
+            ("esc", "stop editing / back to account list"),
+        ]
+    );
+
+    let cursor = app.config_action_cursor;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>(),
+        vec![format!(
+            "login failed\n'px' is an account on proxy \"stub\": log in to it again with {}, \
+             or delete it with {} first",
+            cmd("clauth login px --proxy stub"),
+            cmd("clauth delete px")
+        )],
+        "the press toasts the refusal"
+    );
+    assert_eq!(
+        (
+            app.modals.len(),
+            app.login.is_some(),
+            app.config_action_cursor
+        ),
+        (0, false, cursor),
+        "(modals, a login in flight, the card row): the press opens nothing"
+    );
+}
+
+// ---- the Tokens dashboard walks only laid-out cards ----
+
+/// A failed token read lays out no cards, so the card walk has nothing to
+/// move: the help lists neither `↑ ↓` nor `pgup/pgdn`, no global page row
+/// shows, and the arrows and page keys change nothing. Once stats load and
+/// the cards are laid out, the walk and its rows return.
+#[test]
+fn a_failed_token_dashboard_lists_no_card_walk_and_its_keys_change_nothing() {
+    use crate::tui::app::{PageAction, handle_key, page_keys_act};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Tokens);
+    app.tokens_failed = true;
+    let _ = hint_frame(&app);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{21b5}", "show why"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ],
+        "the failed dashboard's rows"
+    );
+    assert_eq!(page_keys_act(&app), None, "no global page row");
+    let held = (app.token_dash_focus, app.token_dash_first.get());
+    let held_frame = hint_frame(&app);
+    for code in [
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::PageDown,
+        KeyCode::PageUp,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.token_dash_focus, app.token_dash_first.get()),
+            held,
+            "{code:?} moves no card focus"
+        );
+        assert_eq!(hint_frame(&app), held_frame, "{code:?} changes no frame");
+    }
+
+    // Stats land: the cards are laid out and the walk acts.
+    let mut app = model_detail_fits_app();
+    app.token_view = TokenView::Dashboard;
+    app.model_detail_focus = StatusFocus::List;
+    let _ = hint_frame(&app);
+    assert_eq!(
+        help_of(&app)[..2],
+        [
+            ("\u{2191} \u{2193}", "move between cards"),
+            ("pgup/pgdn", "move a page of cards"),
+        ],
+        "laid-out cards list their walk"
+    );
+    assert_eq!(page_keys_act(&app), Some(PageAction::Move));
+    let before = app.token_dash_focus;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_ne!(app.token_dash_focus, before, "↓ moves card focus");
+}
+
+/// Each whitespace-joined row's help-modal segment, from the `│` before `key`
+/// to the `│` after its label: the modal's own row whole, without the panes
+/// it overlays.
+pub(crate) fn help_row_segments(rows: &[String], key: &str) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let at = row.find(key).expect("the row holds the key");
+            let left = row[..at].rfind('│').expect("the modal's left border");
+            let right = at + row[at..].find('│').expect("the modal's right border");
+            row[left..right + '│'.len_utf8()].to_string()
+        })
+        .collect()
+}
+
+// ---- a help row says what its key does on the focused thing ----
+
+/// The Fallback `+ add` picker's `↵` adds the focused candidate: the help
+/// names it in the footer's own word, beside the walk while there is a
+/// second candidate.
+#[test]
+fn the_add_picker_help_names_its_enter_add() {
+    use crate::tui::app::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let picker = |names: &[&str]| {
+        let mut app = app_on(Tab::Fallback, hint_profiles(names));
+        app.config().state.fallback_chain = vec![crate::profile::ProfileName::from(names[0])];
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            crate::tui::app::fallback_hint(&app),
+            FallbackHint::DetailAdd,
+            "↵ on `+ add` opens the picker"
+        );
+        app
+    };
+    let app = picker(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "pick"),
+                ("↵", "add"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "add"),
+            ("esc", "back / cancel edit"),
+        ],
+        "two candidates"
+    );
+    let app = picker(&["alpha", "beta"]);
+    assert_eq!(
+        help_of(&app),
+        vec![("\u{21b5}", "add"), ("esc", "back / cancel edit")],
+        "one candidate"
+    );
+}
+
+/// The Setup card's `space` and `+ / -` rows follow the focused row, as the
+/// card's key handler does: on `name` neither lists and both keys change
+/// nothing; on `auto-start` only `space`; on `alert at` both.
+#[test]
+fn the_setup_card_space_and_step_rows_follow_the_focused_row() {
+    use crate::tui::app::{ConfigRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let head = |verb: &'static str| {
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", verb),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+        ]
+    };
+    let tail = [
+        (
+            "env",
+            concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+        ),
+        (
+            "a",
+            "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+        ),
+        (
+            "disable / enable",
+            concat!(
+                key_lit!("\u{21b5}"),
+                " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+            ),
+        ),
+        (
+            "delete",
+            concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+        ),
+        ("esc", "stop editing / back to account list"),
+    ];
+    let space = ("space", "change the focused setting");
+    let step = ("+ / -", "step the focused number");
+
+    let mut app = setup_row_app(ConfigRow::Name);
+    let mut expected = head("edit");
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "name: neither row");
+    let held = |app: &App| {
+        (
+            app.config_action_cursor,
+            app.config_draft
+                .as_ref()
+                .map(|d| (d.active, d.bell_threshold.value.clone())),
+            app.config().profiles[0].auto_start,
+            app.toasts.len(),
+        )
+    };
+    let before = held(&app);
+    let before_frame = hint_frame(&app);
+    for c in [' ', '+', '-'] {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+        assert_eq!(held(&app), before, "{c:?} on name changes no state");
+        assert_eq!(
+            hint_frame(&app),
+            before_frame,
+            "{c:?} on name changes no frame"
+        );
+    }
+
+    let app = setup_row_app(ConfigRow::AutoStart);
+    let mut expected = head("toggle");
+    expected.push(space);
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "auto-start: space only");
+
+    let app = setup_row_app(ConfigRow::BellThreshold);
+    let mut expected = head("type");
+    expected.extend([space, step]);
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "alert at: space and + / -");
+}
+
+/// A Services detail that only scrolls names its arrows `scroll`, the
+/// footer's own word there; a detail that walks rows keeps
+/// `move between rows`.
+#[test]
+fn the_services_detail_arrows_row_follows_the_footers_sense() {
+    use crate::tui::app::{Check, Health, Problem, ServiceFix};
+    let _home = crate::testutil::HomeSandbox::new();
+    let detail = |label: &'static str, problems: Vec<Problem>, bound: u16| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems,
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_max_scroll.set(bound);
+        app
+    };
+    let scroll_only = vec![
+        ("\u{2191} \u{2193}", "scroll"),
+        ("pgup/pgdn", "scroll a page"),
+        ("r", "re-run all checks"),
+        ("esc", "back to the list · close the editor"),
+    ];
+    for label in ["rex", "plugin", "shunt"] {
+        assert_eq!(
+            help_of(&detail(label, Vec::new(), 4)),
+            scroll_only,
+            "{label}: a detail that only scrolls"
+        );
+    }
+    let problem = |line| Problem {
+        line,
+        fix: ServiceFix::MoveStoresIn,
+    };
+    let app = detail("plugin", vec![problem(0), problem(1)], 0);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("f", "next fix"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "plugin problems: a walk"
+    );
+}
+
+/// A Fallback member card lists `↵`, `space` and `+ / -` only while the
+/// focused row takes them, as its key handler does: the gate-off `weekly at`
+/// lists none and `↵` / `+` / `-` change nothing there; `rotate at` lists all
+/// three; a toggle row lists `↵` and `space`, no `+ / -`.
+#[test]
+fn the_member_card_enter_and_step_rows_follow_the_focused_row() {
+    use crate::tui::app::{FALLBACK_ROWS, FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let card_on = |row: FallbackRow| {
+        let mut app = one_member_chain_app();
+        app.config().profiles[0].check_weekly = false;
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = FALLBACK_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("a card row");
+        app
+    };
+    let enter = ("\u{21b5}", "open or change the focused row");
+    let space = ("space", "change the focused setting");
+    let step = ("+ / -", "step the focused number");
+    let tail = [
+        (
+            "\u{21b5} on rotate at",
+            concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+        ),
+        (
+            "space on preferred days",
+            "step never / weekdays / weekends / every day",
+        ),
+        (
+            "\u{21b5} on preferred days",
+            concat!(
+                "pick days: ",
+                key_lit!("\u{2190} \u{2192}"),
+                " walk \u{00b7} ",
+                key_lit!("space"),
+                " toggles and saves \u{00b7} ",
+                key_lit!("\u{21b5} esc q"),
+                " leave \u{00b7} ",
+                key_lit!("\u{2191} \u{2193}"),
+                " leave and move",
+            ),
+        ),
+        ("esc", "back / cancel edit"),
+    ];
+    let walk = ("\u{2191} \u{2193}", "move between rows");
+
+    let mut app = card_on(FallbackRow::WeeklyAt);
+    let mut expected = vec![walk];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "weekly at, gate off: neither row");
+    let held = |app: &App| {
+        (
+            format!("{:?}", app.config().profiles[0]),
+            app.fallback_edit.is_some(),
+            app.fallback_detail_cursor,
+            app.toasts.len(),
+            app.modals.len(),
+        )
+    };
+    let before = held(&app);
+    let before_frame = hint_frame(&app);
+    for code in [KeyCode::Enter, KeyCode::Char('+'), KeyCode::Char('-')] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            held(&app),
+            before,
+            "{code:?} on the inert row changes no state"
+        );
+        assert_eq!(
+            hint_frame(&app),
+            before_frame,
+            "{code:?} on the inert row changes no frame"
+        );
+    }
+
+    let app = card_on(FallbackRow::Threshold);
+    let mut expected = vec![walk, enter, space, step];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "rotate at: all three rows");
+
+    let app = card_on(FallbackRow::CheckWeekly);
+    let mut expected = vec![walk, enter, space];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "a toggle row: ↵ and space");
+}
+
+// ---- a stepper's `+` and `-` each follow their own direction ----
+
+/// One persisted claude account `acct` shaped by `edit`, its Setup card open
+/// on `row`: the on-disk shape the steppers write through. A probe-on account
+/// stores a setup token, the shape that lists `probe every`.
+fn persisted_setup_card(
+    row: crate::tui::app::ConfigRow,
+    edit: impl FnOnce(&mut crate::profile::Profile),
+) -> App {
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    edit(&mut profile);
+    crate::profile::save_profile(&profile).expect("persist acct");
+    if profile.usage_probe {
+        crate::testutil::write_long_lived_sidecar(&name);
+        profile.has_long_lived_sidecar = true;
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![name],
+        ..AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_on(Tab::Setup, vec![profile]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| panic!("the card shows {row:?}"));
+    app
+}
+
+/// One persisted chain member `alpha` shaped by `edit` under a state shaped by
+/// `state_edit`, its member card open on `row`.
+fn persisted_member_card(
+    row: crate::tui::app::FallbackRow,
+    edit: impl FnOnce(&mut crate::profile::Profile),
+    state_edit: impl FnOnce(&mut AppState),
+) -> App {
+    let name = crate::profile::ProfileName::from("alpha");
+    let mut profile = crate::testutil::blank_profile(&name);
+    edit(&mut profile);
+    crate::profile::save_profile(&profile).expect("persist alpha");
+    let mut state = AppState {
+        profiles: vec![name.clone()],
+        fallback_chain: vec![name],
+        ..AppState::default()
+    };
+    state_edit(&mut state);
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Fallback;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = crate::tui::app::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("a card row");
+    app
+}
+
+/// Pins one stepper frame: the footer lists exactly `steps` between `↑↓ row`
+/// and `↵ type`, and each key in `dead` leaves `value`, the toasts and the
+/// drawn frame as they were.
+fn assert_stepper_frame(
+    app: &mut App,
+    steps: &[(&str, &str)],
+    dead: &[char],
+    value: &dyn Fn(&App) -> String,
+    case: &str,
+) {
+    let mut groups = vec![("←", "back"), ("↑↓", "row")];
+    groups.extend_from_slice(steps);
+    groups.extend([
+        ("↵", "type"),
+        ("a", "actions"),
+        ("?", "help"),
+        ("q", "back"),
+    ]);
+    assert_eq!(wide_footer(app), footer_of(app, &groups), "{case}: footer");
+    for &c in dead {
+        let before = (value(app), app.toasts.len());
+        let frame = hint_frame(app);
+        crate::tui::app::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+        assert_eq!(
+            (value(app), app.toasts.len()),
+            before,
+            "{case}: {c:?} changes no state"
+        );
+        assert_eq!(hint_frame(app), frame, "{case}: {c:?} changes no frame");
+    }
+}
+
+/// The Setup card's `alert at` and `probe every` offer `+` and `-` each only
+/// while that direction moves the value: at a bound the footer drops the dead
+/// key and its press writes nothing, while the help's joined `+ / -` stays.
+/// An unset alert starts both directions on 95, and a hundredths value steps
+/// onto the bound first.
+#[test]
+fn a_setup_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{ConfigRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let raise = ("+", "raise");
+    let lower = ("-", "lower");
+    let joined = ("+ / -", "step the focused number");
+    let bell = |app: &App| {
+        let name = crate::profile::ProfileName::from("acct");
+        format!(
+            "{:?}",
+            (
+                app.config().find(&name).and_then(|p| p.bell_threshold),
+                crate::profile::load_profile(&name)
+                    .expect("reload acct")
+                    .bell_threshold,
+            )
+        )
+    };
+    let alert =
+        |v: Option<f64>| persisted_setup_card(ConfigRow::BellThreshold, |p| p.bell_threshold = v);
+
+    let mut mid = alert(Some(50.0));
+    let mid_help = help_of(&mid);
+    assert!(mid_help.contains(&joined), "alert at 50: {mid_help:?}");
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &bell, "alert at 50");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        bell(&mid),
+        "(Some(55.0), Some(55.0))",
+        "alert at 50: + lands"
+    );
+
+    let mut top = alert(Some(100.0));
+    assert_eq!(
+        help_of(&top),
+        mid_help,
+        "alert at 100: the joined row stays"
+    );
+    assert_stepper_frame(&mut top, &[lower], &['+', '='], &bell, "alert at 100");
+
+    let mut bottom = alert(Some(0.0));
+    assert_eq!(
+        help_of(&bottom),
+        mid_help,
+        "alert at 0: the joined row stays"
+    );
+    assert_stepper_frame(&mut bottom, &[raise], &['-', '_'], &bell, "alert at 0");
+
+    let mut off = alert(None);
+    assert_stepper_frame(&mut off, &[raise, lower], &[], &bell, "alert off");
+    handle_key(&mut off, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        bell(&off),
+        "(Some(95.0), Some(95.0))",
+        "alert off: - starts on 95"
+    );
+
+    let mut near = alert(Some(0.004));
+    assert_stepper_frame(&mut near, &[raise, lower], &[], &bell, "alert at 0.004");
+    handle_key(&mut near, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        bell(&near),
+        "(Some(0.0), Some(0.0))",
+        "alert at 0.004: - lands on 0"
+    );
+    assert_stepper_frame(&mut near, &[raise], &['-'], &bell, "alert stepped to 0");
+
+    let probe = |app: &App| {
+        let name = crate::profile::ProfileName::from("acct");
+        format!(
+            "{:?}",
+            (
+                app.config().find(&name).map(|p| p.usage_probe_interval_ms),
+                crate::profile::load_profile(&name)
+                    .expect("reload acct")
+                    .usage_probe_interval_ms,
+            )
+        )
+    };
+    let every = |ms: u64| {
+        persisted_setup_card(ConfigRow::UsageProbeInterval, |p| {
+            p.usage_probe = true;
+            p.usage_probe_interval_ms = ms;
+        })
+    };
+    let less = ("+", "less often");
+    let more = ("-", "more often");
+
+    let mut mid = every(300_000);
+    let mid_help = help_of(&mid);
+    assert!(
+        mid_help.contains(&joined),
+        "probe every 300 s: {mid_help:?}"
+    );
+    assert_stepper_frame(&mut mid, &[less, more], &[], &probe, "probe every 300 s");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        probe(&mid),
+        "(Some(270000), 270000)",
+        "probe every 300 s: - lands"
+    );
+
+    let mut top = every(450_000);
+    assert_eq!(
+        help_of(&top),
+        mid_help,
+        "probe every 450 s: the joined row stays"
+    );
+    assert_stepper_frame(&mut top, &[more], &['+'], &probe, "probe every 450 s");
+
+    let mut bottom = every(60_000);
+    assert_eq!(
+        help_of(&bottom),
+        mid_help,
+        "probe every 60 s: the joined row stays"
+    );
+    assert_stepper_frame(&mut bottom, &[less], &['-'], &probe, "probe every 60 s");
+}
+
+/// The member card's `rotate at` and `weekly at` offer `+` and `-` each only
+/// while that direction moves the value, the help's joined `+ / -` staying. An
+/// unset `weekly at` steps off the chain default, so a default already at
+/// 100 % takes no `+` and its press leaves the override unset.
+#[test]
+fn a_member_card_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let raise = ("+", "raise");
+    let lower = ("-", "lower");
+    let joined = ("+ / -", "step the focused number");
+    let saved = |field: fn(&crate::profile::Profile) -> Option<f64>| {
+        move |app: &App| {
+            let name = crate::profile::ProfileName::from("alpha");
+            format!(
+                "{:?}",
+                (
+                    app.config().find(&name).map(field),
+                    field(&crate::profile::load_profile(&name).expect("reload alpha")),
+                )
+            )
+        }
+    };
+    let threshold = saved(|p| p.fallback_threshold);
+    let weekly = saved(|p| p.weekly_threshold);
+    let rotate = |v: f64| {
+        persisted_member_card(
+            FallbackRow::Threshold,
+            |p| p.fallback_threshold = Some(v),
+            |_| {},
+        )
+    };
+
+    // The footer and the dead presses first, then the help's joined row,
+    // which reads the same predicates either way round.
+    let mut helps = Vec::new();
+
+    let mut mid = rotate(50.0);
+    helps.push(("rotate at 50", help_of(&mid)));
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &threshold, "rotate at 50");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        threshold(&mid),
+        "(Some(Some(55.0)), Some(55.0))",
+        "rotate at 50: + lands"
+    );
+
+    let mut top = rotate(100.0);
+    helps.push(("rotate at 100", help_of(&top)));
+    assert_stepper_frame(&mut top, &[lower], &['+', '='], &threshold, "rotate at 100");
+
+    let mut bottom = rotate(0.0);
+    helps.push(("rotate at 0", help_of(&bottom)));
+    assert_stepper_frame(
+        &mut bottom,
+        &[raise],
+        &['-', '_'],
+        &threshold,
+        "rotate at 0",
+    );
+
+    let weekly_at = |v: Option<f64>, chain_default: Option<f64>| {
+        persisted_member_card(
+            FallbackRow::WeeklyAt,
+            |p| {
+                p.check_weekly = true;
+                p.weekly_threshold = v;
+            },
+            |s| s.weekly_switch_threshold = chain_default,
+        )
+    };
+
+    let mut mid = weekly_at(Some(75.0), None);
+    helps.push(("weekly at 75", help_of(&mid)));
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &weekly, "weekly at 75");
+
+    let mut top = weekly_at(Some(100.0), None);
+    helps.push(("weekly at 100", help_of(&top)));
+    assert_stepper_frame(&mut top, &[lower], &['+'], &weekly, "weekly at 100");
+
+    let mut bottom = weekly_at(Some(50.0), None);
+    helps.push(("weekly at 50", help_of(&bottom)));
+    assert_stepper_frame(&mut bottom, &[raise], &['-'], &weekly, "weekly at 50");
+
+    let mut unset_top = weekly_at(None, Some(100.0));
+    helps.push(("weekly at unset, chain default 100", help_of(&unset_top)));
+    assert_stepper_frame(
+        &mut unset_top,
+        &[lower],
+        &['+'],
+        &weekly,
+        "weekly at unset, chain default 100",
+    );
+
+    let mut unset = weekly_at(None, None);
+    assert_stepper_frame(&mut unset, &[raise, lower], &[], &weekly, "weekly at unset");
+    handle_key(&mut unset, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        weekly(&unset),
+        "(Some(Some(100.0)), Some(100.0))",
+        "weekly at unset: + steps off the 98 default"
+    );
+
+    // Each bound lists the rows of its row's mid-range control, the joined
+    // `+ / -` among them.
+    let (rotate_helps, weekly_helps) = helps.split_at(3);
+    for group in [rotate_helps, weekly_helps] {
+        let (base_case, base) = &group[0];
+        assert!(base.contains(&joined), "{base_case}: {base:?}");
+        for (case, help) in group {
+            assert_eq!(help, base, "{case}: the joined row stays");
+        }
+    }
+}
+
+/// The `+ add` picker whose last candidate went (a peer disabled it while the
+/// tick reload kept the picker open) offers no `↵ add` in the footer or the
+/// help, the count its handler reads; the press adds nothing.
+#[test]
+fn an_add_picker_with_no_candidates_offers_no_enter() {
+    use crate::tui::app::{FallbackHint, chain_candidates, fallback_hint, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Fallback, hint_profiles(&["alpha", "beta"]));
+    app.config().state.fallback_chain = vec![crate::profile::ProfileName::from("alpha")];
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        fallback_hint(&app),
+        FallbackHint::DetailAdd,
+        "the picker is open"
+    );
+    app.config().profiles[1].disabled = true;
+    assert!(chain_candidates(&app).is_empty(), "no account can join");
+    assert_eq!(
+        fallback_hint(&app),
+        FallbackHint::DetailAdd,
+        "the picker stays open"
+    );
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back")
+            ]
+        )
+    );
+    assert_eq!(help_of(&app), vec![("esc", "back / cancel edit")]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config().state.fallback_chain,
+        vec![crate::profile::ProfileName::from("alpha")],
+        "↵ adds nothing"
+    );
+    assert_eq!(
+        app.fallback_focus,
+        FallbackFocus::Chain,
+        "the empty picker folds back to the chain on any key"
+    );
+}
+
+/// The member card's help lists `space  change the focused setting` while the
+/// focused row is a state control `space` acts on: a toggle row lists it and
+/// `space` flips it; the gate-off `weekly at`, `remove` and `preferred days`
+/// (whose `space` keeps its own row) do not, and the inert row's `space`
+/// changes nothing.
+#[test]
+fn the_member_card_space_row_follows_the_focused_row() {
+    use crate::tui::app::{FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let space = ("space", "change the focused setting");
+    let mut toggle = persisted_member_card(FallbackRow::CheckWeekly, |_| {}, |_| {});
+    assert_eq!(
+        help_of(&toggle),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open or change the focused row"),
+            space,
+            (
+                "\u{21b5} on rotate at",
+                concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+            ),
+            ("\u{21b5} on weekly at", "type a %, empty clears"),
+            (
+                "space on preferred days",
+                "step never / weekdays / weekends / every day",
+            ),
+            (
+                "\u{21b5} on preferred days",
+                concat!(
+                    "pick days: ",
+                    key_lit!("\u{2190} \u{2192}"),
+                    " walk \u{00b7} ",
+                    key_lit!("space"),
+                    " toggles and saves \u{00b7} ",
+                    key_lit!("\u{21b5} esc q"),
+                    " leave \u{00b7} ",
+                    key_lit!("\u{2191} \u{2193}"),
+                    " leave and move",
+                ),
+            ),
+            ("esc", "back / cancel edit"),
+        ],
+        "check weekly"
+    );
+    let name = crate::profile::ProfileName::from("alpha");
+    handle_key(&mut toggle, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        (
+            toggle.config().find(&name).map(|p| p.check_weekly),
+            crate::profile::load_profile(&name)
+                .expect("reload alpha")
+                .check_weekly,
+        ),
+        (Some(false), false),
+        "space flips check weekly"
+    );
+
+    for row in [FallbackRow::Remove, FallbackRow::PreferredDays] {
+        let app = persisted_member_card(row, |_| {}, |_| {});
+        let help = help_of(&app);
+        assert!(!help.contains(&space), "{row:?}: {help:?}");
+    }
+
+    let mut inert =
+        persisted_member_card(FallbackRow::WeeklyAt, |p| p.check_weekly = false, |_| {});
+    let help = help_of(&inert);
+    assert!(!help.contains(&space), "weekly at, gate off: {help:?}");
+    let before = (
+        format!("{:?}", inert.config().find(&name)),
+        inert.fallback_edit.is_some(),
+        inert.toasts.len(),
+    );
+    let frame = hint_frame(&inert);
+    handle_key(&mut inert, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        (
+            format!("{:?}", inert.config().find(&name)),
+            inert.fallback_edit.is_some(),
+            inert.toasts.len(),
+        ),
+        before,
+        "space on the inert row changes no state"
+    );
+    assert_eq!(
+        hint_frame(&inert),
+        frame,
+        "space on the inert row changes no frame"
+    );
+}
+
+/// On a `+ new` form that mints its client token, the focused api key field
+/// is inert: no `↵` in the footer, and its press changes nothing. The help's
+/// `↵ on a field` legend still lists, read off the form's other fields, whose
+/// `↵` edits.
+#[test]
+fn the_minted_key_field_takes_no_enter_and_the_field_legend_reads_the_others() {
+    use crate::tui::app::{ConfigRow, config_rows, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let toml = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let config = home.home().join("shunt.toml");
+    std::fs::write(&config, toml).expect("write shunt.toml");
+    let bind = crate::gateway::resolve_bind(toml, None).expect("bind");
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new(&format!("http://{}", bind.probe));
+    draft.mint_for = Some(crate::tui::app::TokenMint {
+        record: crate::gateway::GatewayRecord::new(config).expect("record"),
+        bind,
+        require: false,
+    });
+    let mut app = app_on(Tab::Setup, vec![]);
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| d.mint_armed()),
+        "the form mints"
+    );
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::ApiKey)
+        .expect("the form shows api key");
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+            ("esc", "stop editing / back to account list"),
+        ],
+        "minted api key focus"
+    );
+    let before = (
+        app.config_draft.as_ref().map(|d| d.active),
+        app.toasts.len(),
+        app.modals.len(),
+    );
+    let frame = hint_frame(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        (
+            app.config_draft.as_ref().map(|d| d.active),
+            app.toasts.len(),
+            app.modals.len(),
+        ),
+        before,
+        "↵ on the minted key changes no state"
+    );
+    assert_eq!(
+        hint_frame(&app),
+        frame,
+        "↵ on the minted key changes no frame"
+    );
 }

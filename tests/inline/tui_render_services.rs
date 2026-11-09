@@ -9,6 +9,7 @@ use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
 use crate::testutil::{EYEBROW_ACTIVE, EYEBROW_AT_REST};
 use crate::tui::app::{App, Check, Health, Problem, ServiceFix, delegates_check, herdr_check};
+use crate::tui::render::modals::tests::help_row_segments;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
@@ -425,12 +426,12 @@ fn the_services_footer_hints_pin_each_focus_state() {
         "a job-less delegates row binds no `↵` beyond the shared keys"
     );
 
-    // List on a delegates row WITH jobs: `↵ detail` appears, no `f`.
+    // List on a delegates row WITH jobs: `↵ detail` appears, no `f`; the lone
+    // row's walk wraps onto itself, so no `↑↓`.
     let app = app_with_delegates(seed_walk_jobs(3));
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("a", "actions"),
@@ -461,7 +462,6 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("f", "next fix"),
@@ -476,7 +476,6 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("a", "actions"),
@@ -2129,11 +2128,11 @@ fn the_footer_names_enter_for_the_focused_fix_and_f_for_the_next() {
     let _home = crate::testutil::HomeSandbox::new();
     let hints = |app: &App| super::super::footer::services_hints(app);
 
+    // A lone row's walk wraps onto itself, so the list offers no `↑↓`.
     let mut app = app_with(plugin_check_with_problems());
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("f", "next fix"),
@@ -11961,4 +11960,540 @@ fn a_services_round_trip_leaves_a_never_entered_detail_untinted() {
         Vec::new(),
         "the never-entered plugin detail shades nothing after the round trip"
     );
+}
+
+/// The help's `space` row on the shunt card says what `space` does on the
+/// focused line, in the footer's words, and is absent where `space` does
+/// nothing: `toggle enabled` on the enabled line, no row on a fix line.
+#[test]
+fn the_shunt_help_space_row_follows_the_focused_line() {
+    use crate::tui::app::{Check, Health, Modal, ServiceFix, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let space_rows = |focus: ShuntFocus| -> Vec<String> {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label: "shunt",
+            health: Health::Ok,
+            detail: (0..6).map(|i| format!("card row {i}")).collect(),
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![focus],
+            shunt_action_start: Some(0),
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(&app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" space "))
+            .collect()
+    };
+    let rows = space_rows(ShuntFocus::Enabled { line: 1 });
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space toggle enabled"),
+        "the enabled line: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space toggle enabled │"],
+        "the enabled line's row whole"
+    );
+    let rows = space_rows(ShuntFocus::Fix {
+        line: 1,
+        fix: ServiceFix::MoveStoresIn,
+    });
+    assert!(rows.is_empty(), "a fix line's space does nothing: {rows:?}");
+}
+
+/// The help's `space` row on the shunt card names the focused state control
+/// in the footer's words: `expand the entry` / `collapse the entry` on an
+/// entry, `cycle the field` on a cycle field, and nothing on a typed field or
+/// a busy row, where `space` does nothing.
+#[test]
+fn the_shunt_help_space_row_names_the_entry_and_the_cycle_field() {
+    use crate::tui::app::{
+        Modal, ShuntEntryKey, ShuntFieldKey, ShuntFocusLine, ShuntSave, ShuntSaveKey,
+        UpstreamFieldKind, handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let entry_key = ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    };
+    let view = || {
+        let mut view = base_view();
+        view.upstreams = vec![shorthand_up("anthropic", "claude_oauth")];
+        view
+    };
+    let build = |expanded: bool| {
+        let mut expanded_set = std::collections::HashSet::new();
+        if expanded {
+            expanded_set.insert(entry_key.clone());
+        }
+        let mut app = config_view_app(view(), expanded_set);
+        render_tall(&app);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        app
+    };
+    let space_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" space "))
+            .collect()
+    };
+
+    let mut app = build(false);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry_key.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space expand the entry"),
+        "a collapsed entry expands: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space expand the entry │"],
+        "a collapsed entry's row whole"
+    );
+
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry_key.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space collapse the entry"),
+        "an expanded entry collapses: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space collapse the entry │"],
+        "an expanded entry's row whole"
+    );
+
+    let provider = ShuntFieldKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Provider,
+    };
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(provider.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space cycle the field"),
+        "a cycle field steps its pick: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space cycle the field │"],
+        "a cycle field's row whole"
+    );
+
+    let name_field = ShuntFieldKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    };
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(name_field)));
+    assert!(
+        space_rows(&mut app).is_empty(),
+        "a typed field's space does nothing"
+    );
+
+    let mut app = build(true);
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::Field(provider.clone()),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(provider)));
+    assert!(
+        space_rows(&mut app).is_empty(),
+        "a busy row's space does nothing"
+    );
+}
+
+/// A detail whose keymap is the scroll-only one (any check outside shunt /
+/// plugin / herdr / delegates) binds neither `↵` nor `f` on a fix line, so
+/// the footer offers neither and a press changes nothing.
+#[test]
+fn a_generic_detail_with_fix_lines_offers_no_inert_keys() {
+    use crate::tui::app::{ServicesFocus, fix_line, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let fix = ServiceFix::MoveStoresIn;
+    let mut app = app_with(Check {
+        label: "rex",
+        health: Health::Warn,
+        detail: vec![fix_line(&fix), fix_line(&fix)],
+        fix: Some(fix.clone()),
+        problems: vec![
+            Problem {
+                line: 0,
+                fix: fix.clone(),
+            },
+            Problem {
+                line: 1,
+                fix: fix.clone(),
+            },
+        ],
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    });
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::Detail,
+        "the rex detail descends"
+    );
+    let footer = draw_frame(&app, 200, 60)
+        .last()
+        .expect("the footer row")
+        .clone();
+    assert!(!footer.contains('↵'), "no inert ↵: {footer:?}");
+    assert!(!footer.contains("next fix"), "no inert f: {footer:?}");
+
+    let before = draw_frame(&app, 200, 60);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        draw_frame(&app, 200, 60),
+        before,
+        "↵ and f change nothing on the scroll-only detail"
+    );
+}
+
+// ---- the Services detail's page row follows the frame's own routing ----
+
+/// The help's page row on the Services detail names what the key does there:
+/// the shunt card scrolls (bound-gated — a fitting card lists none), herdr
+/// diagnostics that fit list none either (the press does nothing there), and
+/// the delegates detail pages its job selection while it can move.
+#[test]
+fn the_services_detail_page_row_follows_the_frames_routing() {
+    use crate::tui::app::{Modal, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" pgup/pgdn "))
+            .collect()
+    };
+    let shunt = |detail: usize| {
+        let mut app = app_with(Check {
+            label: "shunt",
+            health: Health::Ok,
+            detail: (0..detail).map(|i| format!("card row {i}")).collect(),
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![ShuntFocus::Enabled { line: 1 }],
+            shunt_action_start: Some(0),
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app
+    };
+
+    // The shunt card fits: the page keys scroll nothing, so no row lists them.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = shunt(2);
+        let _ = draw_frame(&app, 200, 60);
+        assert!(!crate::tui::app::detail_scrolls(&app), "the card fits");
+        let rows = page_rows(&mut app);
+        assert!(
+            rows.is_empty(),
+            "a fitting card lists no page row: {rows:?}"
+        );
+    }
+    // The shunt card overflows: the per-tab row names the scroll. Long
+    // enough to overflow the tall help frame too — the row reads the bound
+    // the frame under the modal published.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = shunt(130);
+        let _ = draw_frame(&app, 200, 60);
+        assert!(crate::tui::app::detail_scrolls(&app), "the card overflows");
+        let rows = page_rows(&mut app);
+        assert_eq!(rows.len(), 1, "one page row: {rows:?}");
+        assert!(
+            rows[0].contains("pgup/pgdn scroll a page"),
+            "the card's page keys scroll: {rows:?}"
+        );
+        assert_eq!(
+            help_row_segments(&rows, "pgup/pgdn"),
+            ["│ pgup/pgdn scroll a page │"],
+            "the card's page row whole"
+        );
+    }
+    // Herdr diagnostics that fit leave the page keys nothing to read: no row.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !crate::tui::app::detail_scrolls(&app),
+            "the diagnostics fit"
+        );
+        let rows = page_rows(&mut app);
+        assert!(
+            rows.is_empty(),
+            "fitting herdr diagnostics list no page row: {rows:?}"
+        );
+    }
+    // The delegates detail pages its job selection.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_delegates(seed_every_state(NOW));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(app.services.delegates_selection_moves(), "the jobs page");
+        let rows = page_rows(&mut app);
+        assert_eq!(rows.len(), 1, "one page row: {rows:?}");
+        assert!(
+            rows[0].contains("pgup/pgdn move a page"),
+            "the delegates page keys move the selection: {rows:?}"
+        );
+        assert_eq!(
+            help_row_segments(&rows, "pgup/pgdn"),
+            ["│ pgup/pgdn move a page │"],
+            "the delegates page row whole"
+        );
+    }
+    // A lone job wraps onto itself: the page row drops.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_delegates(seed_every_state(NOW).into_iter().take(1).collect());
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !app.services.delegates_selection_moves(),
+            "one job cannot page"
+        );
+        let rows = page_rows(&mut app);
+        assert!(rows.is_empty(), "a lone job lists no page row: {rows:?}");
+    }
+}
+
+/// On a herdr or plugin detail whose diagnostics fit, a page press has nothing
+/// to read: the help lists no page row, and a press changes neither the
+/// focus, the scroll nor the frame.
+#[test]
+fn a_fitting_diagnostic_detail_lists_no_page_row_and_ignores_the_press() {
+    use crate::tui::app::{Modal, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        let rows = draw_frame(app, 200, 120);
+        let _ = app.pop_modal();
+        rows.into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" pgup/pgdn "))
+            .collect()
+    };
+    for label in ["herdr", "plugin"] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !crate::tui::app::detail_scrolls(&app),
+            "{label}: the diagnostics fit"
+        );
+        assert!(!app.services.diagnostic_focus, "{label}: action focus");
+        let held_frame = draw_frame(&app, 200, 60);
+        assert_eq!(
+            page_rows(&mut app),
+            Vec::<String>::new(),
+            "{label}: a press moves nothing, so no row lists"
+        );
+        let held = (
+            app.services.diagnostic_focus,
+            app.services.detail_scroll,
+            app.services.detail_max_scroll.get(),
+        );
+        for code in [KeyCode::PageDown, KeyCode::PageUp] {
+            handle_key(&mut app, crate::testutil::key(code));
+            assert_eq!(
+                (
+                    app.services.diagnostic_focus,
+                    app.services.detail_scroll,
+                    app.services.detail_max_scroll.get(),
+                ),
+                held,
+                "{label}: {code:?} changes no state"
+            );
+            assert_eq!(
+                draw_frame(&app, 200, 60),
+                held_frame,
+                "{label}: {code:?} changes no frame"
+            );
+        }
+    }
+}
+
+/// A herdr detail whose diagnostics fit offers no page key on either surface,
+/// and pgdn / pgup change no state and no frame: the options keep focus.
+#[test]
+fn a_fitting_herdr_detail_offers_no_page_key_and_its_press_changes_nothing() {
+    use crate::tui::app::{Modal, Tab, handle_key, page_keys_act};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.tab = Tab::Services;
+    let held_frame = draw_frame(&app, 200, 60);
+    assert!(
+        !crate::tui::app::detail_scrolls(&app),
+        "the diagnostics fit"
+    );
+    assert_eq!(page_keys_act(&app), None, "the page keys act nowhere");
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("space/↵", "cycle / toggle"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the footer offers no page key"
+    );
+    app.help_scroll = 0;
+    app.open_modal(Modal::Help);
+    let help: Vec<String> = draw_frame(&app, 200, 120)
+        .into_iter()
+        .filter(|r| r.contains("pgup/pgdn"))
+        .collect();
+    let _ = app.pop_modal();
+    assert_eq!(help, Vec::<String>::new(), "the help lists no page row");
+    let held = (
+        app.services.diagnostic_focus,
+        app.services.detail_scroll,
+        app.services.herdr_options_cursor,
+        app.services.herdr_fix_focus,
+    );
+    for code in [KeyCode::PageDown, KeyCode::PageUp] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (
+                app.services.diagnostic_focus,
+                app.services.detail_scroll,
+                app.services.herdr_options_cursor,
+                app.services.herdr_fix_focus,
+            ),
+            held,
+            "{code:?} changes no state (diagnostic focus, scroll, option, fix focus)"
+        );
+        assert_eq!(
+            draw_frame(&app, 200, 60),
+            held_frame,
+            "{code:?} changes no frame"
+        );
+    }
+}
+
+/// The herdr `tag refresh` stepper offers `+` and `-` each only while that
+/// direction moves the seconds: at the 1 s floor no `- lower` and its press
+/// writes nothing, at the top no `+ raise`; the help's joined `+ / -` stays.
+#[test]
+fn the_tag_refresh_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{HERDR_OPTIONS, HerdrOption, Tab, handle_key};
+    use crate::tui::render::modals::tests::help_of;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let stepper = |secs: u64| {
+        let mut app = herdr_options_app(healthy_config());
+        app.tab = Tab::Services;
+        app.services.herdr_options_cursor = HERDR_OPTIONS
+            .iter()
+            .position(|o| *o == HerdrOption::TagRefresh)
+            .expect("the tag refresh row");
+        app.config().state.herdr.tag_watch_secs = secs;
+        app
+    };
+    let hints = |steps: &[(&'static str, &'static str)]| {
+        let mut hints = vec![("↑↓", "row")];
+        hints.extend_from_slice(steps);
+        hints.extend([
+            ("↵", "type"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ]);
+        hints
+    };
+    let joined = ("+ / -", "step the tag refresh");
+    let secs = |app: &App| app.config().state.herdr.tag_watch_secs;
+
+    let mut mid = stepper(5);
+    assert_eq!(
+        super::super::footer::services_hints(&mid),
+        hints(&[("+", "raise"), ("-", "lower")]),
+        "5 s"
+    );
+    let mid_help = help_of(&mid);
+    assert!(mid_help.contains(&joined), "5 s: {mid_help:?}");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(secs(&mid), 4, "5 s: - lands");
+
+    for (start, steps, dead) in [
+        (1, [("+", "raise")], '-'),
+        (u64::MAX, [("-", "lower")], '+'),
+    ] {
+        let mut app = stepper(start);
+        assert_eq!(
+            super::super::footer::services_hints(&app),
+            hints(&steps),
+            "{start} s"
+        );
+        assert_eq!(help_of(&app), mid_help, "{start} s: the joined row stays");
+        let frame = draw_frame(&app, 200, 60);
+        let toasts = app.toasts.len();
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(dead)));
+        assert_eq!(
+            (secs(&app), app.toasts.len()),
+            (start, toasts),
+            "{start} s: {dead:?} changes no state"
+        );
+        assert_eq!(
+            draw_frame(&app, 200, 60),
+            frame,
+            "{start} s: {dead:?} changes no frame"
+        );
+    }
 }

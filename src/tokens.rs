@@ -1093,8 +1093,33 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
 
 /// Current UTC calendar date as "YYYY-MM-DD".
 pub(crate) fn today_date() -> String {
+    #[cfg(test)]
+    if let Some(pinned) = TODAY_OVERRIDE.with(|c| c.borrow().clone()) {
+        return pinned;
+    }
     let iso = epoch_secs_to_iso(now_epoch_secs());
     iso.get(..10).map(str::to_owned).unwrap_or(iso)
+}
+
+// Test-only: pins [`today_date`] for the bucket-rollover tests, restoring
+// the real clock after, even on a panic.
+#[cfg(test)]
+thread_local! {
+    static TODAY_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_today_pinned<T>(date: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TODAY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    TODAY_OVERRIDE.with(|c| *c.borrow_mut() = Some(date.to_owned()));
+    let _restore = Restore;
+    run()
 }
 
 // ── Period bucketing ─────────────────────────────────────────────────────────

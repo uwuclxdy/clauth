@@ -21517,6 +21517,364 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
     assert_eq!(app.token_model_cursor, 0, "cursor clamps on an empty lens");
 }
 
+/// A period change re-ranks the Tokens model list and can drop models: the
+/// picker follows a surviving model to its new row, and a model gone from the
+/// new list keeps the old row index, clamped to the last row.
+#[test]
+fn a_period_change_keeps_a_gone_models_row_clamped_and_follows_a_survivor() {
+    use super::{KeyCode, StatusFocus, Tab, TokenPeriod, TokenView, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{DaySummary, ModelTokens, TokenStats};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let model = |m: &str, input: u64, output: u64| ModelTokens {
+        model: m.into(),
+        input,
+        output,
+        ..Default::default()
+    };
+    // Lifetime ranks a, b, c; today ranks b over a (500 vs 100) and holds no c.
+    let stats = TokenStats {
+        models: vec![
+            model("claude-model-a", 600, 300),
+            model("claude-model-b", 300, 200),
+            model("claude-model-c", 60, 40),
+        ],
+        today: Some(DaySummary {
+            date: crate::tokens::today_date(),
+            models: vec![
+                model("claude-model-b", 300, 200),
+                model("claude-model-a", 40, 60),
+            ],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let build = |cursor: usize| {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        });
+        app.tab = Tab::Tokens;
+        app.token_period = TokenPeriod::Lifetime;
+        app.token_view = TokenView::Models;
+        app.model_detail_focus = StatusFocus::List;
+        app.token_stats = Some(stats.clone());
+        app.token_model_cursor = cursor;
+        app
+    };
+    let caret_row = |app: &App| -> String {
+        let mut term = Terminal::new(TestBackend::new(200, 40)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let picked: Vec<&String> = rows.iter().filter(|r| r.contains('❯')).collect();
+        assert_eq!(picked.len(), 1, "one caret row: {picked:?}");
+        picked[0].clone()
+    };
+    let name = crate::tokens::model_display_name;
+
+    // c held row 2 and left the daily list: the old row index clamps to the
+    // two-row list's last row, which names a.
+    let mut app = build(2);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('t')));
+    assert_eq!(app.token_period, TokenPeriod::Daily, "t moved to daily");
+    assert_eq!(app.token_model_cursor, 1, "the gone model's row clamps");
+    let row = caret_row(&app);
+    assert!(
+        row.contains(&name("claude-model-a")),
+        "the clamped row names a: {row:?}"
+    );
+    assert!(
+        !row.contains(&name("claude-model-c")),
+        "c left the list: {row:?}"
+    );
+
+    // b held row 1 and survives: the picker follows it to row 0.
+    let mut app = build(1);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('t')));
+    assert_eq!(app.token_model_cursor, 0, "b followed its model to row 0");
+    let row = caret_row(&app);
+    assert!(
+        row.contains(&name("claude-model-b")),
+        "the caret names b: {row:?}"
+    );
+}
+
+/// A week/month bucket rollover re-ranks the Models list under the cursor:
+/// the tick's re-anchor follows the model the picker held (read off the
+/// stored selection, never the row the old index names after the re-rank),
+/// and a model gone from the new bucket keeps the old row index, clamped.
+#[test]
+fn a_bucket_rollover_rehomes_the_model_picker_from_the_stored_anchor() {
+    use super::{StatusFocus, Tab, TokenPeriod, TokenView, handle_key, on_tick};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{DayModelTokens, TokenStats, with_today_pinned};
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let day = |date: &str, model: &str, in_out: u64| DayModelTokens {
+        date: date.into(),
+        model: model.into(),
+        in_out,
+        split: None,
+        hours: None,
+    };
+    // The current week and the next, derived from the real clock so the pin
+    // never depends on which week the suite runs in.
+    let today = crate::tokens::today_date();
+    let this_monday = crate::tokens::bucket_start(&today, crate::tokens::Bucket::Week);
+    let next_monday = {
+        let secs = crate::usage::iso_to_epoch_secs(&format!("{this_monday}T00:00:00+00:00"))
+            .expect("the monday parses");
+        let iso = crate::usage::epoch_secs_to_iso(secs + 7 * 86_400);
+        iso.get(..10).expect("a date").to_owned()
+    };
+    let later_this_week = {
+        let secs = crate::usage::iso_to_epoch_secs(&format!("{this_monday}T00:00:00+00:00"))
+            .expect("the monday parses");
+        let iso = crate::usage::epoch_secs_to_iso(secs + 2 * 86_400);
+        iso.get(..10).expect("a date").to_owned()
+    };
+    // This week: a ranks first. Next week: b outranks a; a variant where a
+    // leaves the list entirely pins the gone-model clamp.
+    let build_stats = |keep_a: bool| TokenStats {
+        daily_models: {
+            let mut rows = vec![
+                day(&this_monday, "claude-model-a", 100),
+                day(&this_monday, "claude-model-b", 10),
+                day(&next_monday, "claude-model-b", 200),
+            ];
+            if keep_a {
+                rows.push(day(&next_monday, "claude-model-a", 5));
+            }
+            rows
+        },
+        ..Default::default()
+    };
+    let build = |stats: TokenStats| {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        });
+        app.tab = Tab::Tokens;
+        app.token_period = TokenPeriod::Weekly;
+        app.token_view = TokenView::Models;
+        app.model_detail_focus = StatusFocus::List;
+        app.token_stats = Some(stats);
+        app
+    };
+
+    // The picker follows a across the rollover.
+    let mut app = build(build_stats(true));
+    with_today_pinned(&later_this_week, || {
+        assert_eq!(
+            super::token_period_models(&app)
+                .into_iter()
+                .map(|m| m.model)
+                .collect::<Vec<_>>(),
+            ["claude-model-a", "claude-model-b"],
+            "this week ranks a first"
+        );
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+        assert_eq!(app.token_model_cursor, 0, "the picker holds a");
+    });
+    with_today_pinned(&next_monday, || {
+        assert_eq!(
+            super::token_period_models(&app)
+                .into_iter()
+                .map(|m| m.model)
+                .collect::<Vec<_>>(),
+            ["claude-model-b", "claude-model-a"],
+            "next week ranks b first"
+        );
+        on_tick(&mut app);
+        assert_eq!(
+            app.token_model_cursor, 1,
+            "the picker followed a to its new row"
+        );
+        assert_eq!(
+            super::token_period_models(&app)[app.token_model_cursor].model,
+            "claude-model-a",
+            "the cursor names a"
+        );
+    });
+
+    // A model gone from the new bucket keeps the old row index, clamped.
+    let mut app = build(build_stats(false));
+    with_today_pinned(&later_this_week, || {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+        assert_eq!(app.token_model_cursor, 0, "the picker holds a");
+    });
+    with_today_pinned(&next_monday, || {
+        assert_eq!(
+            super::token_period_models(&app)
+                .into_iter()
+                .map(|m| m.model)
+                .collect::<Vec<_>>(),
+            ["claude-model-b"],
+            "a left next week's bucket"
+        );
+        on_tick(&mut app);
+        assert_eq!(
+            app.token_model_cursor, 0,
+            "the gone model keeps the old row, clamped"
+        );
+        assert_eq!(
+            super::token_period_models(&app)[app.token_model_cursor].model,
+            "claude-model-b",
+            "the clamped row names b"
+        );
+    });
+}
+
+/// The Models view under the weekly lens, its list ranking a over b, the picker
+/// on row 0 (a).
+fn weekly_models_app() -> App {
+    use super::{StatusFocus, Tab, TokenPeriod, TokenView};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{DayModelTokens, TokenStats};
+    let today = crate::tokens::today_date();
+    let day = |model: &str, in_out: u64| DayModelTokens {
+        date: today.clone(),
+        model: model.into(),
+        in_out,
+        split: None,
+        hours: None,
+    };
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Tokens;
+    app.token_period = TokenPeriod::Weekly;
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::List;
+    app.token_stats = Some(TokenStats {
+        daily_models: vec![day("claude-model-a", 100), day("claude-model-b", 10)],
+        ..Default::default()
+    });
+    assert_eq!(
+        super::token_period_models(&app)
+            .into_iter()
+            .map(|m| m.model)
+            .collect::<Vec<_>>(),
+        ["claude-model-a", "claude-model-b"],
+        "a ranks first"
+    );
+    app
+}
+
+/// The model the picker shows: the list row under the cursor.
+fn shown_model(app: &App) -> Option<String> {
+    super::token_period_models(app)
+        .get(app.token_model_cursor)
+        .map(|m| m.model.clone())
+}
+
+/// Backing out of the Models view and descending again lands on row 0, and the
+/// bucket-bound ticks that follow keep the picker and its detail on the model
+/// row 0 names: the re-entry's reset is the selection the ticks re-home from.
+#[test]
+fn a_reentered_models_view_keeps_its_row_across_ticks() {
+    use super::{TokenView, handle_key, on_tick};
+    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode};
+    let _home = crate::testutil::HomeSandbox::new();
+    // The Models panes and the footer, from the list's top border down: the
+    // header art above them animates with the tick.
+    let frame = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(200, 40)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .into_iter()
+            .skip_while(|r| !r.starts_with("╭─ MODELS"))
+            .collect()
+    };
+    let mut app = weekly_models_app();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        shown_model(&app).as_deref(),
+        Some("claude-model-b"),
+        "↓ picks b"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.token_view, TokenView::Dashboard, "esc backs out");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.token_view, TokenView::Models, "↵ descends again");
+    assert_eq!(
+        shown_model(&app).as_deref(),
+        Some("claude-model-a"),
+        "the re-entry lands on row 0"
+    );
+    let entered = frame(&app);
+    let name = crate::tokens::model_display_name("claude-model-a");
+    let caret: Vec<&String> = entered.iter().filter(|r| r.contains('❯')).collect();
+    assert_eq!(caret.len(), 1, "one caret row: {caret:?}");
+    assert!(caret[0].contains(&name), "the caret names a: {caret:?}");
+    for tick in 0..3 {
+        on_tick(&mut app);
+        assert_eq!(
+            shown_model(&app).as_deref(),
+            Some("claude-model-a"),
+            "tick {tick}: the picker stays on a"
+        );
+        assert_eq!(
+            frame(&app),
+            entered,
+            "tick {tick}: the list and its detail stay on a"
+        );
+    }
+}
+
+/// Entering the Tokens tab resets the Models cursor to row 0, and the stored
+/// anchor names that row's model with it, so nothing re-homes the picker onto
+/// the model held before the tab was left.
+#[test]
+fn the_tokens_tab_entry_anchors_the_model_on_row_zero() {
+    use super::{Tab, TokenView, handle_key, on_tick};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = weekly_models_app();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        shown_model(&app).as_deref(),
+        Some("claude-model-b"),
+        "↓ picks b"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
+    assert_ne!(app.tab, Tab::Tokens, "tab leaves Tokens");
+    handle_key(&mut app, crate::testutil::key(KeyCode::BackTab));
+    assert_eq!(app.tab, Tab::Tokens, "⇧tab returns to Tokens");
+    assert_eq!(
+        app.token_view,
+        TokenView::Dashboard,
+        "the entry lands on the dashboard"
+    );
+    assert_eq!(
+        (shown_model(&app), app.token_model_identity.clone()),
+        (
+            Some("claude-model-a".to_string()),
+            Some("claude-model-a".to_string())
+        ),
+        "the entry's row 0 and the stored anchor name the same model"
+    );
+    for _ in 0..3 {
+        on_tick(&mut app);
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for tick in 0..3 {
+        on_tick(&mut app);
+        assert_eq!(
+            shown_model(&app).as_deref(),
+            Some("claude-model-a"),
+            "tick {tick}: the descended picker stays on a"
+        );
+    }
+}
+
 // ── tokens tab: loading-spinner busy flag ─────────────────────────────────────
 
 /// `tokens_topping_up` drives the tab's loading spinners. Only a seeding `Base`
@@ -36023,8 +36381,18 @@ fn help_descriptions_style_the_keys_they_name() {
     use crate::testutil::assert_prose_part;
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut app = bare_app();
+    // An account's card holds focus: the help lists the card's own rows, the
+    // ones whose prose names `↵`.
+    let alpha = crate::profile::ProfileName::from("alpha");
+    let mut app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec![alpha.clone()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&alpha)],
+    });
     app.tab = Tab::Setup;
+    super::handle_key(&mut app, crate::testutil::key(super::KeyCode::Enter));
     app.open_modal(super::Modal::Help);
     let buf = prose_frame(&app, 140, 80);
     assert_prose_part(
@@ -36054,7 +36422,7 @@ fn help_descriptions_style_the_keys_they_name() {
     app.open_modal(super::Modal::Help);
     assert_prose_part(
         &prose_frame(&app, 140, 80),
-        "same as space ·",
+        "same as space",
         "space",
         true,
         crate::tui::theme::body(),
@@ -44105,7 +44473,7 @@ fn the_new_profile_row_renders_accent_and_bold_when_selected() {
     );
 }
 
-/// The armed api key row's footer drops the `↵ edit / toggle` hint, pinned by
+/// The armed api key row's footer drops the `↵ edit` hint, pinned by
 /// equality.
 #[test]
 fn the_armed_key_row_footer_omits_the_edit_hint() {
@@ -65972,9 +66340,9 @@ fn the_divergence_owner_door_refuses_a_disabled_target() {
     );
 }
 
-/// The "save elsewhere" picker refuses a target the app's roster disables,
-/// before its confirm: the picker still lists the account, and picking it only
-/// refuses.
+/// The "save elsewhere" picker re-checks its target on disk before its
+/// confirm: an account the app's roster still holds enabled, disabled on disk,
+/// is listed, and picking it only refuses.
 #[test]
 fn the_divergence_picker_door_refuses_a_disabled_target() {
     use super::{DivergenceChoice, Modal, handle_key, run_divergence_choice};
@@ -65988,11 +66356,11 @@ fn the_divergence_picker_door_refuses_a_disabled_target() {
     save_profile(&work).expect("save work");
     let mut spare = Profile::new("spare".to_string(), None, None);
     spare.credentials = Some(login_creds("rt-spare"));
-    save_profile(&spare).expect("save spare");
-    // Disabled in the app's roster alone, its disk copy still enabled: a
-    // re-enable by a peer the running app has not reloaded.
-    let mut in_memory = spare.clone();
-    in_memory.disabled = true;
+    // Disabled on disk alone, the app's roster still enabled: a disable by a
+    // peer the running app has not reloaded.
+    let in_memory = spare.clone();
+    spare.disabled = true;
+    save_profile(&spare).expect("save spare, disabled on disk alone");
     write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
 
     let mut app = App::new(AppConfig {
@@ -66018,7 +66386,7 @@ fn the_divergence_picker_door_refuses_a_disabled_target() {
     assert_eq!(
         form.targets,
         vec!["spare".to_string()],
-        "fixture: the picker lists the disabled target"
+        "fixture: the picker lists the target its roster holds enabled"
     );
 
     handle_key(&mut app, key(KeyCode::Down));
@@ -73413,5 +73781,175 @@ fn a_save_into_an_unclassifiable_owner_refuses_with_the_capture_sentence() {
         outcomes,
         vec![refused.clone(), refused],
         "(store kept, active on disk, toasts) per shape"
+    );
+}
+
+/// A stats load that re-ranks the Tokens model list keeps the picker on the
+/// model it held: the caret row names `claude-model-a` before and after the
+/// load puts `claude-model-b` first.
+#[test]
+fn a_stats_load_keeps_the_model_picker_on_its_model() {
+    use super::drain_tokens_events;
+    use crate::tokens::{ModelTokens, TokenStats, TokensEvent};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let stats = |b_input: u64| TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-model-a".into(),
+                input: 100,
+                output: 100,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "claude-model-b".into(),
+                input: b_input,
+                output: 10,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+    app.tab = super::Tab::Tokens;
+    app.token_period = super::TokenPeriod::Lifetime;
+    app.token_view = super::TokenView::Models;
+    app.model_detail_focus = super::StatusFocus::List;
+    tx.send(TokensEvent::Loaded(Box::new(stats(10)))).unwrap();
+    drain_tokens_events(&mut app);
+
+    let frame = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(200, 40)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let name = |m: &str| crate::tokens::model_display_name(m);
+    let caret = |rows: &[String]| -> String {
+        let picked: Vec<&String> = rows.iter().filter(|r| r.contains('❯')).collect();
+        assert_eq!(picked.len(), 1, "one caret row: {picked:?}");
+        picked[0].clone()
+    };
+    let rows = frame(&app);
+    assert!(
+        caret(&rows).contains(&name("claude-model-a")),
+        "starts on a"
+    );
+
+    tx.send(TokensEvent::Loaded(Box::new(stats(1000)))).unwrap();
+    drain_tokens_events(&mut app);
+    // The list's own order: the detail title also names the selected model,
+    // so frame rows cannot rank the list.
+    let rank: Vec<String> = super::token_period_models(&app)
+        .into_iter()
+        .map(|m| m.model)
+        .collect();
+    assert_eq!(
+        rank,
+        ["claude-model-b", "claude-model-a"],
+        "the load put b first"
+    );
+    let rows = frame(&app);
+    let row = caret(&rows);
+    assert!(
+        row.contains(&name("claude-model-a")),
+        "the caret stayed on a: {row:?}"
+    );
+}
+
+/// A divergence roster beside the active `work`: `spare` enabled, plus each
+/// account `extra` names, disabled (`off`) or on proxy "stub" (`px`), in memory
+/// and on disk alike. The live file holds a login no account owns.
+fn divergence_roster_app(extra: &[&str]) -> App {
+    use crate::profile::{AppConfig, AppState, Profile, ProxyAccount, save_profile};
+    let mut profiles = Vec::new();
+    for name in ["work", "spare"].iter().chain(extra) {
+        let mut p = Profile::new((*name).to_string(), None, None);
+        p.credentials = Some(login_creds(&format!("rt-{name}")));
+        p.disabled = *name == "off";
+        save_profile(&p).expect("save the account");
+        if *name == "px" {
+            make_stub_proxy_account(name);
+            p.proxy = Some(ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("the stub service"),
+                account: "acct-px".to_string(),
+            });
+        }
+        profiles.push(p);
+    }
+    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+    crate::testutil::register_names(&names);
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    crate::profile::update_app_state(|s, held| s.set_active(Some("work".into()), held))
+        .expect("persist the active marker");
+    app
+}
+
+/// The "save elsewhere" picker lists only accounts its `↵` could save into: a
+/// disabled account and a proxy account, which would only refuse, are left
+/// out, in roster order around them.
+#[test]
+fn the_divergence_picker_lists_no_disabled_or_proxy_account() {
+    use super::{DivergenceChoice, Modal, run_divergence_choice};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = divergence_roster_app(&["off", "px", "late"]);
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        (form.targets.clone(), form.cursor),
+        (vec!["spare".to_string(), "late".to_string()], 0),
+        "(the listed targets, the cursor on `+ new`)"
+    );
+}
+
+/// With every other account disabled or on a proxy, the picker has no target
+/// to list and drops straight into the new-profile name prompt, as it does
+/// with no other account at all.
+#[test]
+fn a_divergence_picker_with_no_listable_target_opens_the_name_prompt() {
+    use super::{DivergenceChoice, Modal, run_divergence_choice};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = divergence_roster_app(&["off", "px"]);
+    // `spare` goes too, so only the unlistable two remain beside `work`.
+    app.config().profiles.retain(|p| p.name.as_str() != "spare");
+    run_divergence_choice(
+        &mut app,
+        "work",
+        DivergenceChoice::NewProfile,
+        super::live_creds_fingerprint(),
+    );
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, Modal::DivergenceTarget(_))),
+        "no picker opens: {:?}",
+        app.modals
+    );
+    let Some(Modal::CaptureName(form)) = app.modals.last() else {
+        panic!("expected the name prompt, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.from_divergence.as_deref(),
+        Some("work"),
+        "the prompt carries its divergence"
     );
 }
