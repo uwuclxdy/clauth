@@ -74,6 +74,39 @@ fn a_grant_with_an_end_names_it_after_its_state() {
     assert!(lines[2].ends_with("  (used next)"), "{}", lines[2]);
 }
 
+/// Each row names its own grant's end: two grants ending at different
+/// instants print two different stamps, so a row never borrows the next
+/// grant's end.
+#[test]
+fn each_grant_row_names_its_own_end() {
+    let old_ends = THREE_GRANTS.replacen(
+        r#""ends_at": null, "clears": ["five_hour"]"#,
+        r#""ends_at": "2027-01-01T00:00:00+00:00", "clears": ["five_hour"]"#,
+        1,
+    );
+    assert_ne!(old_ends, THREE_GRANTS, "the old grant's end applied");
+    let body = old_ends.replacen(
+        r#""ends_at": null, "clears": ["five_hour", "seven_day"]"#,
+        r#""ends_at": "2027-03-09T07:59:00+00:00", "clears": ["five_hour", "seven_day"]"#,
+        1,
+    );
+    assert_ne!(body, old_ends, "the weekly grant's end applied");
+    let old = crate::format::local_stamp(1_798_761_600).expect("stamp");
+    let week = crate::format::local_stamp(1_804_579_140).expect("stamp");
+
+    assert_eq!(
+        describe_grants("cl1", &status(&body)),
+        [
+            "clauth: 'cl1' has 2 limit resets available.".to_string(),
+            format!("    Old reset: 1 of 1 available, resets 5h, ends {old}"),
+            format!(
+                "  * Weekly reset: 1 of 2 available, resets 5h and 7d, ends {week}  (used next)"
+            ),
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown".to_string(),
+        ]
+    );
+}
+
 /// The server's label is cut to 40 cells on both surfaces that print it.
 #[test]
 fn a_long_server_label_is_cut_on_both_surfaces() {
