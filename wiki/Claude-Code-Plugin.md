@@ -83,7 +83,7 @@ The first answer wins, desk or phone. `1` and `2` answer once the row has the ke
   Answer on your phone, or here.   1: Answer here   Esc cancels
 ```
 
-`1` hands the question back to Claude Code's own dialog at the desk.
+`1` hands the question back to Claude Code's own dialog at the desk. A phone answer can carry a note on each question, which the model reads with that question.
 
 ## API-key profiles
 
