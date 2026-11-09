@@ -648,6 +648,7 @@ fn plugin_detail_over_completions() -> Check {
         None,
         None,
         crate::completions::detected_installed_script(),
+        crate::hook_jobs::CacheView::default(),
     )
 }
 
@@ -664,6 +665,9 @@ fn plugin_base_rows(pad: usize) -> Vec<String> {
         "writes the clauth entry into ~/.claude.json".to_string(),
         "f  wire mcp server".to_string(),
         format!("claude{}press r to probe", spaces(6)),
+        format!("cache{}auto: 1h subscription, 5m api key", spaces(5)),
+        format!("agent cache{}auto: 5m", spaces(11)),
+        format!("idle wake{}55 min idle with a delegate, 1h only", spaces(9)),
         format!("path{}/usr/bin/clauth", spaces(4)),
         "data".to_string(),
     ]
@@ -683,6 +687,270 @@ fn plugin_rows(rows: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The three cache-TTL rows of one plugin card, off the production builder
+/// and the real detail path, with the card's key column at `pad`.
+fn cache_rows_at(pad: usize, lines: [&str; 3]) -> Vec<String> {
+    let spaces = |key_w: usize| " ".repeat(pad.saturating_sub(key_w) + 2);
+    vec![
+        format!("cache{}{}", spaces(5), lines[0]),
+        format!("agent cache{}{}", spaces(11), lines[1]),
+        format!("idle wake{}{}", spaces(9), lines[2]),
+    ]
+}
+
+/// Render one plugin card over `view` and return its three cache rows.
+fn cache_rows(view: crate::hook_jobs::CacheView) -> Vec<String> {
+    let app = app_with(crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        view,
+    ));
+    let (rows, _) = render(&app);
+    detail_rows(&rows)
+        .into_iter()
+        .filter(|r| {
+            r.starts_with("cache") || r.starts_with("agent cache") || r.starts_with("idle wake")
+        })
+        .collect()
+}
+
+/// A TTL from a setting names the setting, main and subagent alike; a 1h
+/// main cache turns the wake on.
+#[test]
+fn the_cache_rows_name_a_setting() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = crate::hook_jobs::CacheView {
+        main_setting: Some("1h".to_string()),
+        subagent_setting: Some("1h".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        cache_rows(view),
+        cache_rows_at(
+            11,
+            [
+                "1h, promptCacheTtl",
+                "1h, subagentPromptCacheTtl",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+}
+
+/// A TTL from an env var names the var, each of the three.
+#[test]
+fn the_cache_rows_name_the_env_var() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            force_5m: Some("1".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            [
+                "5m, FORCE_PROMPT_CACHING_5M",
+                "5m, FORCE_PROMPT_CACHING_5M",
+                "off: a 5 min cache expires first",
+            ]
+        ),
+    );
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            main_env: Some("1h".to_string()),
+            subagent_env: Some("1h".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            [
+                "1h, CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "1h, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            enable_1h: Some("on".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            [
+                "1h, ENABLE_PROMPT_CACHING_1H",
+                "1h, ENABLE_PROMPT_CACHING_1H",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+}
+
+/// Nothing set reads the automatic rows: the account split on the main line,
+/// 5m on the agent line, and the wake's hedge on the 1h cache.
+#[test]
+fn the_cache_rows_read_automatic_when_nothing_is_set() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView::default()),
+        cache_rows_at(
+            11,
+            [
+                "auto: 1h subscription, 5m api key",
+                "auto: 5m",
+                "55 min idle with a delegate, 1h only",
+            ]
+        ),
+    );
+}
+
+/// A 5m main TTL turns the wake off, the agent row untouched.
+#[test]
+fn a_5m_main_cache_turns_the_wake_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            [
+                "5m, CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "auto: 5m",
+                "off: a 5 min cache expires first",
+            ]
+        ),
+    );
+}
+
+/// At an 80-column terminal the card's value column is 39 cells (key column
+/// 11): every cache-row value but the agent-env one renders whole, no cut
+/// ellipsis — the copy was sized to fit the card's real pane width there.
+#[test]
+fn the_cache_rows_render_whole_at_80_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let views = [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("1h".to_string()),
+            subagent_setting: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            subagent_env: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView::default(),
+    ];
+    for view in views {
+        let app = app_with(crate::tui::app::plugin_check(
+            Some(std::path::Path::new("/usr/bin/clauth")),
+            None,
+            None,
+            None,
+            view,
+        ));
+        let mut term = Terminal::new(TestBackend::new(80, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let cache_rows: Vec<String> = detail_rows(&rows)
+            .into_iter()
+            .filter(|row| {
+                row.starts_with("cache")
+                    || row.starts_with("agent cache")
+                    || row.starts_with("idle wake")
+            })
+            .collect();
+        for row in cache_rows {
+            // The agent-env row is the one value the 80-column pane still
+            // cuts; its cut form already drops the var name's tail.
+            if !row.contains("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_") {
+                assert!(
+                    !row.contains('…'),
+                    "the row renders whole at 80 columns: {row}"
+                );
+            }
+        }
+    }
+}
+
+/// The three cache keys never widen the card's key column: the fresh card
+/// keeps 11 (`agent cache` is the widest key there), and on the fullest
+/// plugin detail (an install record with `installedAt`) the column keeps its
+/// old width, `installed at` still the widest key at 12.
+#[test]
+fn the_cache_keys_do_not_widen_the_key_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let fresh = crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        crate::hook_jobs::CacheView::default(),
+    );
+    let fresh_key_w = fresh
+        .detail
+        .iter()
+        .filter_map(|line| line.split_once(": ").map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        fresh_key_w, 11,
+        "agent cache is the fresh card's widest key: {:?}",
+        fresh.detail
+    );
+
+    let dir = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let body = serde_json::json!({
+        "plugins": { "clauth@clauth": [
+            { "scope": "user", "version": "1.0.0", "installedAt": "2026-01-01T00:00:00Z" }
+        ] }
+    });
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(&body).expect("ser"),
+    )
+    .expect("write");
+
+    let check = crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        crate::hook_jobs::CacheView::default(),
+    );
+    let key_w = check
+        .detail
+        .iter()
+        .filter_map(|line| line.split_once(": ").map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        key_w, 12,
+        "installed at is still the widest key: {:?}",
+        check.detail
+    );
+
+    let app = app_with(check);
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    assert!(
+        detail.iter().any(|r| r == "agent cache   auto: 5m"),
+        "the agent cache key aligns to the 12-cell column: {:?}",
+        detail
+    );
 }
 
 /// A stale script names the problem and its `f  update completions` line; a
@@ -714,7 +982,7 @@ fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
     let (rows, _) = render(&current);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(10),
+        plugin_base_rows(11),
         "a current script shows no completions line and no fix, by equality"
     );
 }
@@ -749,7 +1017,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     let (rows, _) = render(&unknown);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(10),
+        plugin_base_rows(11),
         "an unknown shell renders the card without any completions row"
     );
     drop(_tcsh);
@@ -765,7 +1033,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     );
     assert_eq!(
         detail,
-        plugin_base_rows(10),
+        plugin_base_rows(11),
         "an unset $SHELL renders the card without any completions row"
     );
 }

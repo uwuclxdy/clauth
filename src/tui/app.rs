@@ -18108,21 +18108,74 @@ fn error_toast_detail(err: &anyhow::Error) -> String {
 /// renderer tones that line by it, so the copy and its color share one spelling.
 pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 
+/// The three cache-TTL detail lines of the Claude Code group, resolved by the
+/// one resolver over the one view ([`crate::hook_jobs::CacheView`]). The row
+/// reads the TUI process's env and settings, the wake the session's, so the
+/// two can name different sources. The wake's window reads its own constant,
+/// never a second spelling of it.
+fn cache_detail_lines(cache: &crate::hook_jobs::CacheView) -> [String; 3] {
+    use crate::hook_jobs::{CacheTtl, TtlSource};
+    let wake_min = crate::mcp::AWAIT_IDLE_WAKE_SECS / 60;
+    let main = cache.main_ttl();
+    let main_line = match main {
+        (_, TtlSource::Automatic) => "cache: auto: 1h subscription, 5m api key".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!("cache: {}, CLAUDE_CODE_PROMPT_CACHE_TTL", ttl.label())
+        }
+        (ttl, TtlSource::Setting) => format!("cache: {}, promptCacheTtl", ttl.label()),
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let agent = cache.subagent_ttl();
+    let agent_line = match agent {
+        (_, TtlSource::Automatic) => "agent cache: auto: 5m".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("agent cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!(
+                "agent cache: {}, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+                ttl.label()
+            )
+        }
+        (ttl, TtlSource::Setting) => {
+            format!("agent cache: {}, subagentPromptCacheTtl", ttl.label())
+        }
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("agent cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let wake_line = match main {
+        (_, TtlSource::Automatic) => {
+            format!("idle wake: {wake_min} min idle with a delegate, 1h only")
+        }
+        (CacheTtl::OneHour, _) => format!("idle wake: {wake_min} min idle with a delegate"),
+        (CacheTtl::FiveMinutes, _) => "idle wake: off: a 5 min cache expires first".to_string(),
+    };
+    [main_line, agent_line, wake_line]
+}
+
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
-/// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
-/// on PATH and the data dir, a blank line between the three groups, and the
-/// shell completion script's state last. The install leads because installing
-/// is the fix a fresh box needs, and it also registers the server. Health is
-/// the worst of the five, but a missing completion script offers its fix
-/// without moving it; the fixable problems walk in detail order, so
-/// list-level `f` lands on install first. `clauth_path` and `completions` are
-/// passed in (the recompute resolves both off the live box) so the verdict
-/// logic unit-tests without a live `PATH` or `$SHELL`.
+/// entry (+ the `r`-gated start probe), then the Claude Code version, the
+/// three cache-TTL lines, clauth on PATH and the data dir, a blank line
+/// between the three groups, and the shell completion script's state last.
+/// The install leads because installing is the fix a fresh box needs, and it
+/// also registers the server. Health is the worst of the five, but a missing
+/// completion script offers its fix without moving it; the fixable problems
+/// walk in detail order, so list-level `f` lands on install first.
+/// `clauth_path`, `completions` and `cache` are passed in (the recompute
+/// resolves them off the live box) so the verdict logic unit-tests without a
+/// live `PATH`, `$SHELL` or env.
 pub(crate) fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
     mcp_boot: Option<crate::plugin_probe::McpProbe>,
     completions: Option<crate::completions::InstalledScript>,
+    cache: crate::hook_jobs::CacheView,
 ) -> Check {
     use crate::plugin_probe as probe;
 
@@ -18317,6 +18370,9 @@ pub(crate) fn plugin_check(
         // `r` the row names the key that fills the line in instead of claiming
         // a binary is absent.
         None => detail.push(format!("claude: press {} to probe", prose::key("r"))),
+    }
+    for line in cache_detail_lines(&cache) {
+        detail.push(line);
     }
     match &clauth_path {
         Some(path) => detail.push(format!("path: {}", path.display())),
@@ -32598,6 +32654,7 @@ fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
         app.services.cc_version.clone(),
         app.services.mcp_boot.clone(),
         crate::completions::detected_installed_script(),
+        crate::hook_jobs::CacheView::read(),
     );
     // Its own group, last: the renderer wraps it over several rows, and past
     // every fix line those rows move no fix line's rendered row.

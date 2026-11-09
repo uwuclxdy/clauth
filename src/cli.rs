@@ -560,8 +560,8 @@ pub(crate) enum Command {
         session_id: String,
     },
 
-    /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
-    /// on stdin, wait for a background delegate, and wake the model.
+    /// The bundled PostToolUse and Stop `asyncRewake` hook body: read the hook
+    /// payload on stdin, wait for a background delegate, and wake the model.
     #[command(hide = true)]
     McpAwaitJob,
 

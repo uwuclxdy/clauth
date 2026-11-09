@@ -122,7 +122,7 @@ const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 /// and the hook manifest's `timeout` bounds TIME rather than memory: reading an
 /// unbounded stream reached 28.4 GB RSS in review. Matches the 10 MB cap
 /// `update.rs` already puts on a downloaded asset.
-const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The two spellings, behind one renderer so they cannot drift apart. The
 /// switched spelling carries an optional headroom clause (r9, 2026-08-28): the
@@ -298,6 +298,13 @@ pub(crate) struct NoteRecord {
     /// parsing.
     #[serde(default)]
     pub(crate) degrade_told: Vec<u32>,
+    /// When this conversation's last turn ended with a delegate of its own
+    /// still out, epoch ms; `None` while a turn runs. The start of the idle
+    /// count [`crate::hook_jobs`] keeps for the `mcp-await-job` watcher, which
+    /// clears it as its wait ends. `None` on every record written before the
+    /// field existed.
+    #[serde(default)]
+    pub(crate) turn_ended_at: Option<u64>,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -459,6 +466,7 @@ pub(crate) fn run() -> Result<()> {
         outln!("{}", block_envelope(&reason));
         return Ok(());
     }
+    crate::hook_jobs::note_turn_start(&payload);
     // One `load_config` per fire, shared by its two consumers — the account
     // note's resolve (gate-open only) and the nudge reader (every eligible
     // agent-spawn fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
@@ -554,8 +562,15 @@ pub(crate) fn block_envelope(reason: &str) -> serde_json::Value {
     })
 }
 
-fn parse_payload(input: &str) -> Option<Payload> {
+pub(crate) fn parse_payload(input: &str) -> Option<Payload> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    payload_from_value(&value)
+}
+
+/// The typed [`Payload`] off a value the caller already parsed, so a caller
+/// that also needs the raw JSON — `mcp-await-job`'s job-id scan — parses once.
+/// The validation is the same [`parse_payload`]'s: every gate lives here.
+pub(crate) fn payload_from_value(value: &serde_json::Value) -> Option<Payload> {
     let session_id = value.get("session_id")?.as_str()?.to_string();
     if !is_bare_id(&session_id) {
         return None;
@@ -955,9 +970,10 @@ fn touch_record(path: &Path) {
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
 /// Today there is no such nesting: `note_for_inner`, `nudge_note`,
-/// `gc_conversation_records`, `hook_context::context_note` and the
-/// resume-report leg's seq mint, re-send arm and restore-notice record and
-/// take are the only holders and none reaches another.
+/// `gc_conversation_records`, `hook_context::context_note`, the resume-report
+/// leg's seq mint, re-send arm and restore-notice record and take, and
+/// `hook_jobs`'s turn-end stamp and clear and its lease `try_lock` are the only
+/// holders and none reaches another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -1666,6 +1682,36 @@ pub(crate) fn gc_conversation_records() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == crate::hook_jobs::WATCH_LEASE_EXTENSION)
+        {
+            crate::hook_jobs::reap_watch_lease(&path);
+            continue;
+        }
+        // A print-mode (unleased) watcher writes the lost sidecar with no
+        // `.watch` beside it, so the lease arm never reaches it: reap it on
+        // its own once it has outlived the job store's day. A fresher one
+        // still guards a live session's once.
+        if path
+            .extension()
+            .is_some_and(|ext| ext == crate::hook_jobs::REPORTED_LOST_EXTENSION)
+        {
+            let aged = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_some_and(|a| a > Duration::from_millis(crate::mcp::jobs::DONE_TTL_MS));
+            if aged
+                && !path
+                    .with_extension(crate::hook_jobs::WATCH_LEASE_EXTENSION)
+                    .exists()
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
         // Records only. The dir also holds the `.lock` file and, for an instant,
         // an `atomic_write_600` temp; reaping either would be a sweep deleting
         // live machinery.

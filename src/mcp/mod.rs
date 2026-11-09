@@ -15,7 +15,7 @@ mod herdr_report;
 pub(crate) mod jobs;
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -35,6 +35,7 @@ use rmcp::{
 use serde::Deserialize;
 use sha2::Digest;
 
+use crate::hook_jobs::WatchLease;
 use crate::logline::logline;
 use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
@@ -3173,20 +3174,29 @@ fn render_done_envelope(
 
 /// Poll cadence the `mcp-await-job` hook's wait runs at.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Self-deadline for the `mcp-await-job` hook.
+/// How often a session's watcher re-lists the store. A hook that finds a
+/// watcher in place leaves its job to it and exits, so this bounds how late the
+/// watcher sees that job.
+const AWAIT_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// The `mcp-await-job` hook's wait limit: a safety net, never the delivery
+/// bound — the job's own end ends the wait, whatever it takes. A live job
+/// reaches it only where nothing else ended the wait first (no idle wake on a
+/// non-1 h prompt cache or a busy session, no silence window): the limit line
+/// then wakes the model with a nudge to call `monitor`.
 ///
-/// A delivery window, NOT a bound on the delegate: a streaming run has no wall
-/// clock, so no hook deadline can promise to outlast one and this number must
-/// not be read as trying to. It buys the common case — a run that finishes
-/// inside it is delivered without the model spending a turn — and on expiry the
-/// hook still exits 2, waking the model with a nudge to call `monitor`, so a
-/// longer run costs one deliberate check rather than a lost result.
+/// `plugins/hooks/hooks.json` carries the outer `timeout` at 86460 s on both
+/// events running the hook, and this must stay under it: the host kills the hook
+/// at that bound, and a kill delivers nothing.
+const AWAIT_JOB_DEADLINE_SECS: u64 = 24 * 60 * 60;
+/// How long a session sits idle past a turn end, a job of its own still running,
+/// before one wake: the prompt cache expires 1 h after its last use, a miss in a
+/// long context is expensive, and five minutes leaves room for the wake's own
+/// turn to reach the API.
 ///
-/// Its own literal rather than a `MAX_RUN_TIMEOUT_SECS` offset, because that
-/// constant now bounds only what a caller may type. `plugins/hooks/hooks.json`
-/// carries the outer bound at 4260 s, and this must stay under it: the hook
-/// process is killed at that one, and a kill delivers nothing.
-const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
+/// The wake ends the hook, and that turn's `Stop` starts the next watcher, so
+/// this counts one idle stretch rather than bounding the wait. It sits inside
+/// the manifest bound [`AWAIT_JOB_DEADLINE_SECS`] names.
+pub(crate) const AWAIT_IDLE_WAKE_SECS: u64 = 55 * 60;
 
 /// Result of one read of a collectable job file.
 #[derive(Debug)]
@@ -6829,25 +6839,258 @@ fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-pub(crate) fn await_job() -> ! {
+/// What one hook run waits on.
+struct AwaitWatch {
+    /// The ids a `delegate` result carried: one call's fan-out, delivered
+    /// together.
+    held: Vec<String>,
+    /// The session's other jobs, each delivered at its own end: holding one back
+    /// for a job from another call could cost it a day.
+    adopted: Vec<String>,
+    /// Present on the session's one watcher, the only hook that re-lists the
+    /// store or wakes an idle session.
+    lease: Option<WatchLease>,
+    /// The payload's session id, kept even without a lease (print mode): the
+    /// lost-job ownership test and the reported-lost once key on it, so a
+    /// print-mode wait reports a lost job once like an interactive one.
+    /// Adoption and the idle wake still gate on the lease alone.
+    session: Option<String>,
+}
+
+/// The wait's bounds, split from the constants so a test can run them short.
+struct AwaitLimits {
+    deadline: Duration,
+    idle_wake_ms: u64,
+    poll: Duration,
+    rescan: Duration,
+}
+
+const AWAIT_LIMITS: AwaitLimits = AwaitLimits {
+    deadline: Duration::from_secs(AWAIT_JOB_DEADLINE_SECS),
+    idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+    poll: JOB_POLL_INTERVAL,
+    rescan: AWAIT_RESCAN_INTERVAL,
+};
+
+/// One job the wake reports as lost: its id, the record's own session id (the
+/// `delegate({session_id})` resume handle), whether the run was isolated — an
+/// isolated run's transcript left with its throwaway tree, so that id is no
+/// resume handle — and the record's last-seen stamp at the poll that found it,
+/// what the wake derives "how long ago" from.
+#[derive(Debug, Clone, PartialEq)]
+struct LostJob {
+    id: String,
+    session_id: Option<String>,
+    isolated: bool,
+    last_seen_ms: u64,
+}
+
+/// How a wait ended.
+#[derive(Debug, PartialEq)]
+struct AwaitOutcome {
+    /// Folded the way every collect folds them ([`fold_done_envelope`]).
+    delivered: Vec<serde_json::Value>,
+    /// The ids still running.
+    pending: Vec<String>,
+    /// The jobs whose server died with their result: reported as lost, never
+    /// as still running. A wake names each at most once (the session's
+    /// reported-lost set).
+    dead: Vec<LostJob>,
+    /// The wait ran out rather than ending on a job or an idle session.
+    at_limit: bool,
+}
+
+/// Read one hook payload from `input`, capped at
+/// [`crate::hook_note::MAX_PAYLOAD_BYTES`], parsed ONCE: the raw value feeds
+/// the job-id scan ([`extract_job_ids`]) and the typed payload everything
+/// else, so nothing parses the same bytes twice. A payload the cap truncates
+/// fails to parse and the hook exits 0, the same outcome as any other
+/// malformed input.
+fn read_await_payload(
+    input: &mut impl std::io::Read,
+) -> (Option<serde_json::Value>, Option<crate::hook_note::Payload>) {
     use std::io::Read;
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let job_ids = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let mut text = String::new();
+    let _ = input
+        .take(crate::hook_note::MAX_PAYLOAD_BYTES)
+        .read_to_string(&mut text);
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok();
+    let payload = value
         .as_ref()
+        .and_then(crate::hook_note::payload_from_value);
+    (value, payload)
+}
+
+pub(crate) fn await_job() -> ! {
+    let (value, payload) = read_await_payload(&mut std::io::stdin());
+    let event = value
+        .as_ref()
+        .and_then(|v| v.get("hook_event_name"))
+        .and_then(serde_json::Value::as_str);
+    let watch = if event.is_some_and(|event| turn_end_event(event) || event == "SubagentStop") {
+        turn_end_watch(payload.as_ref())
+    } else {
+        tool_result_watch(value.as_ref(), payload.as_ref())
+    };
+    // Bound for the rest of the process: the lease inside lets go at exit.
+    let Some(watch) = watch else {
+        std::process::exit(0);
+    };
+
+    let outcome = await_job_outcomes(
+        &watch,
+        &AWAIT_LIMITS,
+        &crate::hook_jobs::prompt_cache_is_1h,
+        &crate::hook_jobs::host_session_moved,
+    );
+    let (exit_code, lines) = await_wake_lines(&outcome);
+    // A wake starts a turn no `UserPromptSubmit` announces, and a watcher ending
+    // in silence leaves nothing to count for.
+    if (exit_code == 2 || watch.lease.is_some())
+        && let Some(payload) = &payload
+    {
+        crate::hook_jobs::clear_turn_end(&payload.session_id);
+    }
+    for line in &lines {
+        outln!("{line}");
+    }
+    // A synchronous hook run builds its blocking error from stderr alone
+    // (measured on CC 2.1.319), so a claimed result on stdout alone would
+    // reach nobody in print mode: on exit 2 every delivered line and the
+    // reminder go to both streams, identical.
+    if exit_code == 2 {
+        for line in &lines {
+            crate::out::errln!("{line}");
+        }
+    }
+    std::process::exit(exit_code);
+}
+
+/// The turn-end events whose payloads arm the watcher: a turn ends with
+/// `Stop`, and with `StopFailure` when it ended in an API error, where Claude
+/// Code fires no `Stop` (measured 2026-11-07 on CC 2.1.319). `SubagentStop`
+/// routes through [`turn_end_watch`] too, where the `agent_id` gate drops it.
+fn turn_end_event(event: &str) -> bool {
+    matches!(event, "Stop" | "StopFailure")
+}
+
+/// Whether this hook process runs under print mode: the host sets
+/// `CLAUDE_CODE_ENTRYPOINT` to `sdk-*` for the SDK CLI and `cli` for an
+/// interactive session (measured 2026-11-07 on CC 2.1.319). On a print-mode
+/// turn end the host runs an `asyncRewake` hook SYNCHRONOUSLY and builds its
+/// blocking error from stderr alone, so a wait there would hold the `claude -p`
+/// run for up to a day and its exit 2 would claim a result the host then
+/// discards: [`turn_end_watch`] exits 0 at once, nothing read, claimed or
+/// stamped, no lease. A `PostToolUse` fire under print mode takes no lease
+/// either ([`tool_result_watch`]), because the session has no turn-end watcher
+/// to hand a job to: each hook waits on its own ids, so a streaming-input SDK
+/// session's results are not lost to a sibling hook's wait.
+fn print_mode_stop() -> bool {
+    std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|entrypoint| entrypoint.starts_with("sdk-"))
+}
+
+/// A turn-end payload names no job, and its prose can quote one, so its watched
+/// set comes from the store alone. `None` ends the hook: print mode (see
+/// [`print_mode_stop`]); a subagent's turn end writes its own cache, not the
+/// session's; nothing of this session's is out; or a live watcher already
+/// holds the session.
+fn turn_end_watch(payload: Option<&crate::hook_note::Payload>) -> Option<AwaitWatch> {
+    let payload = payload.filter(|p| turn_end_event(&p.event) && p.agent_id.is_none())?;
+    if print_mode_stop() {
+        return None;
+    }
+    let now = crate::usage::now_ms();
+    let adopted = crate::hook_jobs::own_jobs(&payload.session_id, now);
+    if adopted.is_empty() {
+        return None;
+    }
+    let lease = crate::hook_jobs::mark_turn_end(payload, now)?;
+    Some(AwaitWatch {
+        held: Vec::new(),
+        adopted,
+        lease: Some(lease),
+        session: Some(payload.session_id.clone()),
+    })
+}
+
+/// A `delegate` result carries its ids. Under a living watcher this hook keeps
+/// only what that watcher cannot find; under print mode it takes no lease,
+/// because the session has no turn-end watcher to hand a job to, and each hook
+/// waits on its own ids, whatever overlaps. A payload naming no session gets
+/// the wait alone.
+fn tool_result_watch(
+    value: Option<&serde_json::Value>,
+    payload: Option<&crate::hook_note::Payload>,
+) -> Option<AwaitWatch> {
+    let mut held = value
         .map(extract_job_ids)
         .unwrap_or_default()
         .into_iter()
         .filter(|id| jobs::is_safe_job_id(id))
         .collect::<Vec<_>>();
-    if job_ids.is_empty() {
-        std::process::exit(0); // sync delegate or unparseable input: nothing to deliver
+    if held.is_empty() {
+        return None; // sync delegate or unparseable input: nothing to deliver
     }
+    let lease = payload.filter(|_| !print_mode_stop()).and_then(|payload| {
+        // A running turn is not idle, whatever started it.
+        if payload.agent_id.is_none() {
+            crate::hook_jobs::clear_turn_end(&payload.session_id);
+        }
+        let lease = WatchLease::take(&payload.session_id);
+        if lease.is_none() {
+            held.retain(|id| !crate::hook_jobs::is_session_job(id, &payload.session_id));
+        }
+        lease
+    });
+    (!held.is_empty()).then_some(AwaitWatch {
+        held,
+        adopted: Vec::new(),
+        lease,
+        session: payload.map(|payload| payload.session_id.clone()),
+    })
+}
 
-    let (delivered, pending) =
-        await_job_outcomes(&job_ids, Duration::from_secs(AWAIT_JOB_DEADLINE_SECS));
-    for envelope in &delivered {
+/// The wake split into its parts: the exit code, the lost line, and the
+/// reminder. [`await_job_wake`] is the joined view; the print path needs the
+/// split so the lost line leads.
+fn await_wake_parts(outcome: &AwaitOutcome) -> (i32, Option<String>, Option<String>) {
+    let lost = (!outcome.dead.is_empty()).then(|| await_lost_line(&outcome.dead));
+    let (code, reminder) = if outcome.at_limit {
+        (2, Some(await_limit_line(&outcome.pending)))
+    } else {
+        await_job_verdict(!outcome.delivered.is_empty(), &outcome.pending)
+    };
+    // A lost line is a wake of its own: exit 2 carries it to both streams
+    // whatever the delivered/pending verdict said.
+    let code = if lost.is_some() { 2 } else { code };
+    (code, lost, reminder)
+}
+
+/// The hook's exit code and reminder for a finished wait. A lost job leads
+/// with its own line, joined by one space to whatever reminder follows, so a
+/// wake carrying both never claims a lost job is still working. The print
+/// path needs the split ([`await_wake_lines`]); this joined view is what the
+/// tests pin.
+#[cfg(test)]
+fn await_job_wake(outcome: &AwaitOutcome) -> (i32, Option<String>) {
+    let (code, lost, reminder) = await_wake_parts(outcome);
+    match (lost, reminder) {
+        (Some(lost), Some(reminder)) => (2, Some(format!("{lost} {reminder}"))),
+        (Some(lost), None) => (2, Some(lost)),
+        (None, reminder) => (code, reminder),
+    }
+}
+
+/// The wake's printed lines in order: the lost line first, then the delivered
+/// envelopes, then the reminder — a lost line never follows the results it
+/// warns about.
+fn await_wake_lines(outcome: &AwaitOutcome) -> (i32, Vec<String>) {
+    let (exit_code, lost, reminder) = await_wake_parts(outcome);
+    let mut lines = Vec::new();
+    if let Some(lost) = lost {
+        lines.push(lost);
+    }
+    for envelope in &outcome.delivered {
         // One line per delivered envelope, each opening with its account: a
         // fan-out delivers N lines in one hook run; a bare cost figure names
         // nobody to charge it to.
@@ -6856,19 +7099,20 @@ pub(crate) fn await_job() -> ! {
             .and_then(|lu| lu.get("profile"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        outln!(
+        lines.push(format!(
             "delegate to `{profile}` {}",
             render::envelope_prose(envelope)
-        );
+        ));
     }
-    let (exit_code, reminder) = await_job_verdict(!delivered.is_empty(), &pending);
     if let Some(reminder) = reminder {
-        outln!("{reminder}");
+        lines.push(reminder);
     }
-    std::process::exit(exit_code);
+    (exit_code, lines)
 }
 
-/// Choose the hook's exit code and reminder after the wait returns.
+/// Choose the hook's exit code and reminder for a wait that did not run out.
+/// A job still pending here is one a later turn end picks up, so the reminder
+/// promises the wake.
 fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String>) {
     if !delivered && pending.is_empty() {
         return (0, None); // every id already gone: nothing was delivered
@@ -6876,57 +7120,471 @@ fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String
     if pending.is_empty() {
         return (2, None); // wake the model with the result(s)
     }
-    let noun = if pending.len() == 1 { "job" } else { "jobs" };
-    let reminder = format!(
-        "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
-        pending.join("`, `"),
-        if pending.len() == 1 { "it" } else { "them" }
-    );
+    let ids = pending.join("`, `");
+    let reminder = if pending.len() == 1 {
+        format!(
+            "delegate job `{ids}` is still working. no action needed yet; clauth will wake this session when it finishes."
+        )
+    } else {
+        format!(
+            "delegate jobs `{ids}` are still working. no action needed yet; clauth will wake this session when they finish."
+        )
+    };
     (2, Some(reminder))
 }
 
-/// Poll every id in `job_ids` until each is `done` or gone, or `deadline`
-/// passes. Returns the delivered envelopes, folded the way every collect
-/// folds them ([`fold_done_envelope`]: live-usage footer, cost endpoint, and
-/// the no-envelope fallback), plus the ids still `running` at the deadline.
-/// A delivery claims its record ([`jobs::claim`]), so a `monitor` collect
-/// racing this wait owns the delivery and the hook drops that id; an absent
-/// id is dropped the same way (its file was GC'd or already collected).
-/// Blocking; the hook calls it directly on its own thread.
-fn await_job_outcomes(
-    job_ids: &[String],
-    deadline: Duration,
-) -> (Vec<serde_json::Value>, Vec<String>) {
-    let start = Instant::now();
-    let mut delivered = Vec::new();
-    let mut pending: Vec<&String> = job_ids.iter().collect();
-    loop {
-        pending.retain(|id| match jobs::read(id) {
-            Some(r) if r.state == jobs::JobState::Done => {
-                // The claim owns the delivery: a `monitor` collect that reads
-                // `Done` in the same instant finds the file gone and answers
-                // its hedged unknown copy, so exactly one full envelope
-                // reaches the conversation.
-                match jobs::claim(id, jobs::Claimant::Hook) {
-                    jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
-                        let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
-                        delivered.push(envelope);
-                        false
-                    }
-                    // Claimed between the read and the claim: a `monitor`
-                    // collect owns the delivery. Nothing to print, nothing
-                    // to wake — the collect's own reply reaches the model.
-                    jobs::Claim::Lost => false,
-                }
-            }
-            Some(_) => true, // still running: the loop exit decides on the deadline
-            None => false,
-        });
-        if pending.is_empty() || start.elapsed() >= deadline {
-            return (delivered, pending.into_iter().cloned().collect());
-        }
-        std::thread::sleep(JOB_POLL_INTERVAL);
+/// The line a job past the 24 h limit earns: nothing promises a wake for it.
+fn await_limit_line(pending: &[String]) -> String {
+    if let [job] = pending {
+        format!(
+            "24 hours have passed and delegate job `{job}` still running; call `monitor` to retrieve it — clauth will not wake this session when it finishes."
+        )
+    } else {
+        let ids = pending.join("`, `");
+        format!(
+            "24 hours have passed and delegate jobs `{ids}` still running; call `monitor` to retrieve them — clauth will not wake this session when they finish."
+        )
     }
+}
+
+/// A wake names how long ago the record last moved once that is past five
+/// minutes: an orphan found after the fact (a session resumed after its
+/// server died) says when, a fresher one names no age.
+const LOST_AGE_AFTER_SECS: u64 = 5 * 60;
+
+/// The line a lost job's wake carries: the server died with the result, and
+/// nothing can deliver it. One job names its resume handle when its record
+/// carries one and its run was not isolated — an isolated run's transcript
+/// left with its throwaway tree, so that id is no handle `delegate` accepts,
+/// and the line reads as a record with none — and, when the wake comes more
+/// than [`LOST_AGE_AFTER_SECS`] after the record last moved, how long ago that
+/// was, in the same duration spelling the listing's orphaned row dates "last
+/// seen" with ([`crate::format::humanize_span`]). Several share the plural
+/// line, which carries no ages.
+fn await_lost_line(dead: &[LostJob]) -> String {
+    if let [lost] = dead {
+        let age_secs = crate::usage::now_ms().saturating_sub(lost.last_seen_ms) / 1000;
+        let ago = if age_secs > LOST_AGE_AFTER_SECS {
+            format!(" {} ago", crate::format::humanize_span(age_secs))
+        } else {
+            String::new()
+        };
+        let resume = match &lost.session_id {
+            Some(sid) if !lost.isolated => {
+                format!(" resume it with `delegate` `session_id: {sid}`, or run the task again.")
+            }
+            None | Some(_) => " run the task again.".to_string(),
+        };
+        format!(
+            "delegate job `{}` ended with its server{ago}; its result is lost.{resume}",
+            lost.id
+        )
+    } else {
+        let ids = dead
+            .iter()
+            .map(|lost| lost.id.as_str())
+            .collect::<Vec<_>>()
+            .join("`, `");
+        format!(
+            "delegate jobs `{ids}` ended with their server; their results are lost. \
+             resume each with `delegate` and its session id from `monitor`, or run them again."
+        )
+    }
+}
+
+/// What one poll found of a watched id.
+enum WatchedJob {
+    Finished,
+    Running {
+        /// A later turn end can find it. An untied job has this hook alone, so
+        /// the hook must not end ahead of it.
+        rearmable: bool,
+    },
+    /// Running but silent past [`jobs::RUNNING_TTL_MS`] under a live owner:
+    /// hung, so the wait ends with the `monitor` limit line instead of
+    /// polling it for the deadline.
+    Silent,
+    /// Orphaned — a running record whose server is gone, or a crashed done
+    /// record — and this session's to report: the wake names it as lost.
+    Dead(LostJob),
+    /// Collected, reaped, an orphan some other session owns, or an orphan
+    /// this session already reported: nothing more to say.
+    Gone,
+}
+
+/// Whether a polled record reads [`jobs::JobPhase::Orphaned`]: the same two
+/// legs [`jobs::StoredJob::phase`] matches for it — a `crashed` done record,
+/// or a running record the store's [`jobs::running_is_corpse`] reads as dead
+/// — shared predicates, re-matched over the bare record a poll reads. A phase
+/// the store later derives from anything else does not carry here: the poll
+/// reads a [`jobs::JobRecord`], and the store builds its [`jobs::StoredJob`]
+/// only inside [`jobs::list`], so a single-record classified read would need
+/// a new store entry point.
+fn orphaned(record: &jobs::JobRecord, now: u64) -> bool {
+    (record.state == jobs::JobState::Done && record.crashed)
+        || (record.state == jobs::JobState::Running && jobs::running_is_corpse(record, now))
+}
+
+/// The stamp a record was last alive at: the same retention anchor the store
+/// keeps the record by — a done record's finish, a running one's freshest of
+/// its last output, its last write and its mint. Re-derived here from the
+/// bare record a poll reads (the store computes the anchor inside
+/// `jobs::list`), so the wake's "how long ago" is the same stamp the
+/// listing's orphaned row dates "last seen" from.
+fn last_seen_ms(record: &jobs::JobRecord) -> u64 {
+    match record.state {
+        jobs::JobState::Done => {
+            if record.done_at > 0 {
+                record.done_at
+            } else {
+                record.started_at
+            }
+        }
+        jobs::JobState::Running => record
+            .last_output_at
+            .max(record.recorded_at)
+            .max(record.started_at),
+    }
+}
+
+fn poll_job(
+    job_id: &str,
+    session: Option<&str>,
+    report_session: Option<&str>,
+    now: u64,
+    reported: &[String],
+) -> WatchedJob {
+    let Some(record) = jobs::read(job_id) else {
+        return WatchedJob::Gone;
+    };
+    if reported.contains(&record.job_id) {
+        return WatchedJob::Gone; // told once already: nothing left to say
+    }
+    if orphaned(&record, now) {
+        // The wake keys on the phase alone. A job tied to another session is
+        // that session's to report; an untied one has this hook alone. The
+        // ownership test reads the payload's session, lease or not, so a
+        // print-mode wait reports the same lost jobs an interactive one would.
+        let ours = record.host_session.as_deref() == report_session
+            || (report_session.is_some() && record.host_session.is_none());
+        return if ours {
+            WatchedJob::Dead(LostJob {
+                id: record.job_id.clone(),
+                session_id: record.session_id.clone(),
+                isolated: record.isolated,
+                last_seen_ms: last_seen_ms(&record),
+            })
+        } else {
+            WatchedJob::Gone
+        };
+    }
+    if record.state == jobs::JobState::Done {
+        return WatchedJob::Finished;
+    }
+    if jobs::running_is_silent(&record, now) {
+        return WatchedJob::Silent;
+    }
+    WatchedJob::Running {
+        rearmable: session.is_some() && record.host_session.as_deref() == session,
+    }
+}
+
+/// What one poll moved out of the watched sets, by where each id went.
+#[derive(Default)]
+struct WatchedMoves {
+    finished: Vec<String>,
+    silent: Vec<String>,
+    dead: Vec<LostJob>,
+}
+
+/// One poll over `ids`: keeps the running ones and moves the rest into
+/// `moved`, reporting whether a finished one moved. Clears `rearmable` for a
+/// running job only this hook can deliver.
+fn poll_jobs(
+    ids: &mut Vec<String>,
+    session: Option<&str>,
+    report_session: Option<&str>,
+    now: u64,
+    reported: &[String],
+    moved: &mut WatchedMoves,
+    rearmable: &mut bool,
+) -> bool {
+    let finished_before = moved.finished.len();
+    ids.retain(
+        |id| match poll_job(id, session, report_session, now, reported) {
+            WatchedJob::Finished => {
+                moved.finished.push(id.clone());
+                false
+            }
+            WatchedJob::Running { rearmable: tied } => {
+                *rearmable &= tied;
+                true
+            }
+            WatchedJob::Silent => {
+                moved.silent.push(id.clone());
+                false
+            }
+            WatchedJob::Dead(lost) => {
+                moved.dead.push(lost);
+                false
+            }
+            WatchedJob::Gone => false,
+        },
+    );
+    moved.finished.len() > finished_before
+}
+
+/// Add the session's jobs this wait has not met. `seen` outlives each job, so a
+/// record whose stored id reads back as nothing cannot be adopted twice.
+fn adopt_own_jobs(session: &str, seen: &mut HashSet<String>, adopted: &mut Vec<String>) {
+    for id in crate::hook_jobs::own_jobs(session, crate::usage::now_ms()) {
+        if seen.insert(id.clone()) {
+            adopted.push(id);
+        }
+    }
+}
+
+/// Claim every finished id and report what remains. A finished job stays in
+/// the store until here, so a day's wait holds no claimed result in memory for
+/// a killed hook to lose, and a `monitor` collect can still reach it.
+///
+/// A wait ended by silence names only the hung ids as pending: the still-live
+/// rest stays in the store for the next turn end, whose watcher picks it up,
+/// and [`crate::hook_jobs::own_jobs`] keeps later turn ends from re-adopting
+/// the hung ones. At the limit the pending set chains them all, because this
+/// wait is the last thing watching the untied rest, and a name dropped here is
+/// named nowhere again. A lost id never joins the pending set: nothing is
+/// still running for it to claim.
+fn settle_await(
+    finished: &[String],
+    held: &[String],
+    adopted: &[String],
+    at_limit: bool,
+    silent: &[String],
+    dead: &[LostJob],
+) -> AwaitOutcome {
+    let delivered = finished
+        .iter()
+        .filter_map(|id| {
+            // The claim owns the delivery: a `monitor` collect that reads `Done`
+            // in the same instant finds the file gone and answers its hedged
+            // unknown copy, so exactly one full envelope reaches the
+            // conversation.
+            match jobs::claim(id, jobs::Claimant::Hook) {
+                jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
+                    Some(fold_done_envelope(&r, DigestMode::Skip).0)
+                }
+                // Claimed since the read: a `monitor` collect owns the delivery,
+                // and its own reply reaches the model.
+                jobs::Claim::Lost => None,
+            }
+        })
+        .collect();
+    let pending = if !silent.is_empty() && !at_limit {
+        silent.to_vec()
+    } else {
+        silent.iter().chain(held).chain(adopted).cloned().collect()
+    };
+    AwaitOutcome {
+        delivered,
+        pending,
+        dead: dead.to_vec(),
+        at_limit: at_limit || !silent.is_empty(),
+    }
+}
+
+/// Poll the watched jobs until the wait can end: a call's whole fan-out is
+/// finished, any adopted job is, nothing remains, a watched job turns silent
+/// past the store's corpse window, a watched job's server dies with its
+/// result (the lost wake, reported once per session), the session has sat
+/// idle past `limits.idle_wake_ms` on a 1 h prompt cache, or
+/// `limits.deadline` passes. The idle wake needs the session the payload
+/// named to still be the host's current one (`session_moved`): `/clear`,
+/// `/fork` and `/branch` move the id while the process lives, and a wake then
+/// would fire mid-turn with no turn end of the old id left to re-arm the
+/// watcher, so the hook keeps waiting and delivers at the job's own end. A
+/// delivery claims its record ([`jobs::claim`]), so a `monitor` collect racing
+/// this wait owns the delivery and the hook drops that id. Blocking; the hook
+/// calls it directly on its own thread.
+fn await_job_outcomes(
+    watch: &AwaitWatch,
+    limits: &AwaitLimits,
+    cache_is_1h: &dyn Fn() -> bool,
+    session_moved: &dyn Fn(&str) -> bool,
+) -> AwaitOutcome {
+    let start = Instant::now();
+    let session = watch.lease.as_ref().map(WatchLease::session_id);
+    // The ownership test and the reported-lost once key on the payload's
+    // session even without a lease (print mode), so a lost job is reported
+    // once there too; adoption and the idle wake keep the lease as their
+    // gate.
+    let report_session = session.or(watch.session.as_deref());
+    let reported = report_session
+        .map(crate::hook_jobs::reported_lost)
+        .unwrap_or_default();
+    let mut held = watch.held.clone();
+    let mut adopted = watch.adopted.clone();
+    let mut seen: HashSet<String> = held.iter().chain(&adopted).cloned().collect();
+    let mut moved = WatchedMoves::default();
+    let mut adopted_finished = false;
+    let mut judged_turn_end = None;
+    let mut last_scan = start;
+    loop {
+        if let Some(session) = session
+            && last_scan.elapsed() >= limits.rescan
+        {
+            adopt_own_jobs(session, &mut seen, &mut adopted);
+            last_scan = Instant::now();
+        }
+        let now = crate::usage::now_ms();
+        let mut rearmable = true;
+        poll_jobs(
+            &mut held,
+            session,
+            report_session,
+            now,
+            &reported,
+            &mut moved,
+            &mut rearmable,
+        );
+        adopted_finished |= poll_jobs(
+            &mut adopted,
+            session,
+            report_session,
+            now,
+            &reported,
+            &mut moved,
+            &mut rearmable,
+        );
+
+        let deliverable = (held.is_empty() && !moved.finished.is_empty()) || adopted_finished;
+        // A moved id has no later turn end to find what this hook leaves, so
+        // the rest stays here, as an untied job does.
+        if (deliverable || !moved.silent.is_empty() || !moved.dead.is_empty())
+            && session.is_some_and(session_moved)
+        {
+            rearmable = false;
+        }
+
+        // A watched job turning silent past the store's corpse window ends the
+        // wait here: the limit line names the hung job once, and `is_awaited`
+        // keeps later turn ends from waking for it again. Only while every
+        // watched job is tied: an untied job has this hook alone, so its wait
+        // must not end on a tied one's silence.
+        if !moved.silent.is_empty() && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+
+        // A watched job whose server died ends the wait the same way: the
+        // wake names it as lost once, and the session's reported-lost set
+        // keeps every later wait silent about it.
+        if !moved.dead.is_empty() && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+
+        if deliverable && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+        if held.is_empty() && adopted.is_empty() {
+            // A hook that stepped aside for this watcher is trusting it to find
+            // that job, and no turn end may follow: look once more under the
+            // lease before letting it go.
+            if let Some(session) = session {
+                adopt_own_jobs(session, &mut seen, &mut adopted);
+            }
+            if adopted.is_empty() {
+                return settle_watched(
+                    report_session,
+                    &moved.finished,
+                    &held,
+                    &adopted,
+                    false,
+                    &moved.silent,
+                    &moved.dead,
+                );
+            }
+            continue;
+        }
+        if let Some(session) = session.filter(|_| rearmable) {
+            let turn_end = crate::hook_jobs::turn_ended_at(session);
+            if turn_end != judged_turn_end
+                && crate::hook_jobs::idle_wake_due(turn_end, now, limits.idle_wake_ms)
+                && !session_moved(session)
+            {
+                if cache_is_1h() {
+                    return settle_watched(
+                        report_session,
+                        &moved.finished,
+                        &held,
+                        &adopted,
+                        false,
+                        &moved.silent,
+                        &moved.dead,
+                    );
+                }
+                judged_turn_end = turn_end;
+            }
+        }
+        if start.elapsed() >= limits.deadline {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                true,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+        std::thread::sleep(limits.poll);
+    }
+}
+
+/// [`settle_await`] plus the once-record: a lost job the wake reports is
+/// written to the session's reported-lost set before the outcome leaves, so
+/// the next wait over the same session names it never again. Nothing else
+/// writes or claims the job record itself, so `monitor` and the job store
+/// answer exactly as before.
+fn settle_watched(
+    session: Option<&str>,
+    finished: &[String],
+    held: &[String],
+    adopted: &[String],
+    at_limit: bool,
+    silent: &[String],
+    dead: &[LostJob],
+) -> AwaitOutcome {
+    if !dead.is_empty()
+        && let Some(session) = session
+    {
+        let ids = dead.iter().map(|lost| lost.id.clone()).collect::<Vec<_>>();
+        crate::hook_jobs::record_lost(session, &ids);
+    }
+    settle_await(finished, held, adopted, at_limit, silent, dead)
 }
 
 /// Extract every background job id from a hook payload, preferring the
@@ -7028,6 +7686,10 @@ mod format_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/proxy_p6_delegate.rs"]
 mod proxy_p6_delegate_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_await_job.rs"]
+mod await_job_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_delegate_args.rs"]

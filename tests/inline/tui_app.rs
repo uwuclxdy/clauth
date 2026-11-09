@@ -545,12 +545,19 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(check.health, super::Health::Danger);
 
     // clauth present, nothing wired or installed: both fixes warn, and the
     // install leads.
-    let check = super::plugin_check(Some(&path), None, None, None);
+    let check = super::plugin_check(
+        Some(&path),
+        None,
+        None,
+        None,
+        crate::hook_jobs::CacheView::default(),
+    );
     assert_eq!(check.health, super::Health::Warn);
     assert_eq!(check.fix, Some(super::ServiceFix::InstallPlugin));
 
@@ -561,6 +568,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(check.fix.is_none());
@@ -574,6 +582,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
             shell: "bash".to_string(),
             state: ScriptState::Stale,
         }),
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(check.health, super::Health::Warn);
     assert_eq!(
@@ -599,6 +608,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
             shell: "bash".to_string(),
             state: ScriptState::Missing,
         }),
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(
         check.health,
@@ -624,6 +634,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Failed("refused".to_string())),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(check.health, super::Health::Danger);
 }
@@ -646,6 +657,7 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
 
     let data_line = format!(
@@ -669,6 +681,9 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
         "f  wire mcp server".to_string(),
         String::new(),
         "claude: 1.2.3".to_string(),
+        "cache: auto: 1h subscription, 5m api key".to_string(),
+        "agent cache: auto: 5m".to_string(),
+        "idle wake: 55 min idle with a delegate, 1h only".to_string(),
         "path: /usr/bin/clauth".to_string(),
         data_line,
     ];
@@ -710,6 +725,7 @@ fn the_plugin_check_reads_a_global_wire_as_wired() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert!(
         check.detail.iter().any(|l| l == "mcp entry: registered"),
@@ -745,6 +761,7 @@ fn the_plugin_check_reads_a_user_install_as_healthy() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(
@@ -776,6 +793,7 @@ fn the_plugin_check_warns_on_a_user_install_older_than_this_clauth() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     let data_line = format!(
         "data: {}",
@@ -798,6 +816,9 @@ fn the_plugin_check_warns_on_a_user_install_older_than_this_clauth() {
             "mcp source: plugin install (user)".to_string(),
             String::new(),
             "claude: 1.2.3".to_string(),
+            "cache: auto: 1h subscription, 5m api key".to_string(),
+            "agent cache: auto: 5m".to_string(),
+            "idle wake: 55 min idle with a delegate, 1h only".to_string(),
             "path: /usr/bin/clauth".to_string(),
             data_line,
         ],
@@ -858,6 +879,7 @@ fn the_plugin_check_reads_a_user_install_that_is_not_older_as_healthy() {
             Some(Some("1.2.3".to_string())),
             Some(McpProbe::Ok),
             None,
+            crate::hook_jobs::CacheView::default(),
         );
         assert_eq!(
             check.health,
@@ -893,6 +915,7 @@ fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
         None,
         None,
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     let data_line = format!(
         "data: {}",
@@ -916,6 +939,9 @@ fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
                 "claude: press {} to probe",
                 crate::tui::render::prose::key("r")
             ),
+            "cache: auto: 1h subscription, 5m api key".to_string(),
+            "agent cache: auto: 5m".to_string(),
+            "idle wake: 55 min idle with a delegate, 1h only".to_string(),
             "path: /usr/bin/clauth".to_string(),
             data_line,
         ],
@@ -1925,6 +1951,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
         None,
         None,
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert_eq!(
         check.health,
@@ -25799,6 +25826,7 @@ fn the_plugin_row_escapes_markers_in_fields_read_off_the_registry() {
         Some(Some("1.2.3".to_string())),
         Some(McpProbe::Ok),
         None,
+        crate::hook_jobs::CacheView::default(),
     );
     assert!(
         check.detail.iter().any(|l| l == "commit: abc\\u{e000}def"),

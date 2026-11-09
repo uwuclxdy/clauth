@@ -446,6 +446,45 @@ fn the_sweep_reaps_a_record_whose_transcript_is_gone() {
     );
 }
 
+/// A print-mode (unleased) watcher writes the lost sidecar with no `.watch`
+/// beside it, so the lease reap never reaches it: once the sidecar has
+/// outlived the job store's day, the sweep removes it on its own.
+#[test]
+fn the_sweep_reaps_an_aged_lost_sidecar_with_no_lease() {
+    let _home = HomeSandbox::new();
+    crate::hook_jobs::record_lost("conv-print", &["d-dead".to_string()]);
+    let sidecar = record_path("conv-print", None)
+        .expect("record path")
+        .with_extension("lost");
+    assert!(sidecar.exists());
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now()
+            - Duration::from_millis(crate::mcp::jobs::DONE_TTL_MS)
+            - Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(!sidecar.exists(), "an aged no-lease sidecar is reaped");
+}
+
+/// The same sidecar fresh still guards the live session's once: the sweep
+/// leaves it.
+#[test]
+fn a_fresh_lost_sidecar_with_no_lease_survives_the_sweep() {
+    let _home = HomeSandbox::new();
+    crate::hook_jobs::record_lost("conv-print", &["d-dead".to_string()]);
+    let sidecar = record_path("conv-print", None)
+        .expect("record path")
+        .with_extension("lost");
+    assert!(sidecar.exists());
+
+    gc_conversation_records();
+
+    assert!(sidecar.exists(), "a fresh once survives the sweep");
+}
+
 // ── the gate's input set ────────────────────────────────────────────────────
 
 /// The credential stamp and the config fingerprint are two SEPARATE inputs, and
@@ -2505,4 +2544,33 @@ mod hybrid_burn_replay {
             "the burn-aware replay never projects a hybrid's OAuth burn"
         );
     }
+}
+
+/// An aged sidecar beside a live conversation's held lease still names a once
+/// the session may need: the sidecar dies with the conversation, never on its
+/// age while the `.watch` beside it exists. A sweep that unlinks it past the
+/// day drops that once from a session that is still running.
+#[test]
+fn the_sweep_keeps_an_aged_lost_sidecar_beside_a_live_lease() {
+    let _home = HomeSandbox::new();
+    let _held =
+        crate::hook_jobs::mark_turn_end(&payload("Stop", "conv-lease"), crate::usage::now_ms())
+            .expect("a free session");
+    crate::hook_jobs::record_lost("conv-lease", &["d-dead".to_string()]);
+    let record = record_path("conv-lease", None).expect("record path");
+    let watch = record.with_extension(crate::hook_jobs::WATCH_LEASE_EXTENSION);
+    let sidecar = record.with_extension(crate::hook_jobs::REPORTED_LOST_EXTENSION);
+    assert!(watch.exists(), "the turn end takes the lease");
+    assert!(sidecar.exists(), "the lost set lands beside it");
+    crate::testutil::set_mtime(
+        &sidecar,
+        SystemTime::now()
+            - Duration::from_millis(crate::mcp::jobs::DONE_TTL_MS)
+            - Duration::from_secs(60),
+    );
+
+    gc_conversation_records();
+
+    assert!(sidecar.exists(), "a live lease keeps its aged sidecar");
+    assert!(watch.exists(), "the sweep keeps a held lease");
 }
