@@ -14,7 +14,8 @@ The [README](https://github.com/uwuclxdy/clauth#readme) is the tour. This wiki i
 | [Configuration](Configuration) | `profiles.toml`, per-profile `config.toml`, model routing, storage layout |
 | [Auto-switch](Auto-Switch) | the fallback chain: thresholds, gates, burn-aware mode, spend ceilings |
 | [Codex](Codex) | OpenAI codex accounts: adopt or mint a ChatGPT login, run `codex` under a profile, the codex chain, what stays Claude Code only |
-| [Daemon](Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
+| [Daemon](Daemon) | `clauth daemon` and the `status.json` read contract |
+| [REST API](REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its four tools, `delegate` in full, answering a session from your phone |
 | [herdr plugin](Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](Tokens-And-Cost) | where the token dashboard reads from, what the cost figure means |

@@ -181,12 +181,12 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
   - A flag-only profile has no login at all behind it, so the sign-out leaves nothing serving and the line says to log in before switching to it.
   - The line clauth prints for the clear names what backs the profile now: its OAuth login, its api key, or nothing; on the active profile that reads relinked, signed out with the api key serving, or signed out with nothing serving.
 - **`resume latest`** refuses rather than silently picking the second-newest when a live isolated session holds a newer one. `clauth info` names where any transcript actually lives.
-- **`daemon --listen`** also serves the REST API over TLS: the status feed, the OpenAPI document, the account switch, and device pairing. It is off unless asked for, and every request but a pairing or a CORS preflight from a listed origin needs the token of a device paired on this machine.
+- **`daemon --listen`** also serves the REST API over TLS: the status feed, the OpenAPI document, the account switch, and device pairing. It is off unless asked for, and every request but a pairing or a CORS preflight from a listed origin needs the token of a device paired on this machine (a browser's terminal-stream upgrade carries a one-use ticket that token minted instead).
   - `clauth devices pair <name> [--control] [--sessions]` prints a one-time code (5 minutes, one use) for the device to enter, `clauth devices add <name> [--control] [--sessions]` mints a token here and prints it once.
   - `--control` on `pair` or `add` lets that device switch accounts rather than only read, and `--sessions` (requires `--control`) grants it session creation once `[serve] session_creation` is on; `clauth devices allow-sessions <name>` grants that later.
-  - `clauth devices revoke <name>` refuses its next request, no restart needed. The token from before pairing keeps working as the device `legacy`.
+  - `clauth devices revoke <name>` refuses its next request and closes its open streams within seconds, no restart needed. The token from before pairing keeps working as the device `legacy`.
   - TLS comes from this host's lego certificate, or from `--cert`/`--key` when the host's own name resolves to no certificate.
-  - Full detail in [Daemon](Daemon).
+  - Full detail in [REST API](REST-API).
 - **`sessions --tokens`** parses every transcript in full to total tokens and cost. On a large store that takes a while, which is why it is opt-in.
 - **`herdr install`** runs herdr's own installer and passes its preview and confirm straight through, then adds the two things a herdr plugin cannot declare for itself: the key that opens the clauth dashboard, and the sidebar row that renders which account each Claude Code pane burns.
   - Both land in your herdr `config.toml`, appended after a diff and a `[y/N]`, and herdr validates the result before anything is written. Run it a second time and it adds nothing.
