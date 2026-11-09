@@ -28580,6 +28580,10 @@ fn pool_rows_app() -> App {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     let mut app = app_with(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
@@ -30172,6 +30176,10 @@ fn one_provider_pool(names: &[&str]) -> super::ShuntPool {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     super::ShuntPool::Read(vec![PoolProvider {
         name: "claude-main".to_string(),
@@ -50348,6 +50356,10 @@ fn b3_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     }
 }
 

@@ -498,9 +498,9 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// The Usage pool pane: `type`/`family`/`provider`/`plan`/`status`/`read`
-/// facts, then the 5h, 7d and `7d fable` bars from the pool account's own
-/// admin row. No notes, no speed/rate and no burn rate — the design's pool
-/// rows.
+/// facts and the `requests` row (see [`pool_requests_line`]), then the 5h, 7d
+/// and `7d fable` bars from the pool account's own admin row. No notes, no
+/// speed/rate and no burn rate — the design's pool rows.
 fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some((pi, ai)) = app.usage_pool_pair() else {
         return;
@@ -556,6 +556,9 @@ fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None => Span::styled("not read yet", theme::dim()),
         },
     ]));
+    if let Some(requests) = pool_requests_line(account, inner.width) {
+        lines.push(requests);
+    }
     lines.push(Line::from(""));
 
     let reset_fmt = ResetFmt::from_state(&app.config().state);
@@ -576,6 +579,49 @@ fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.extend(render_stat_block(&stats, inner.width));
     }
     render_usage_lines(frame, inner, app, lines);
+}
+
+/// The pool pane's `requests` row off shunt's per-account counters: the
+/// attempted count, then `N failed` and `N cancelled` when above zero, then
+/// the mean latency as `N ms avg` rounded to the whole millisecond once shunt
+/// measured one; every figure grouped by thousands. No row for a shunt that
+/// sends no counters. Parts shed whole from the right until the row fits
+/// `inner_w`; the attempted count never sheds.
+fn pool_requests_line(
+    account: &crate::gateway_admin::PoolAccount,
+    inner_w: u16,
+) -> Option<Line<'static>> {
+    let count = |n: u64| crate::format::group_thousands(n as f64, 0);
+    let mut parts = vec![count(account.requests_attempted?)];
+    for (n, word) in [
+        (account.requests_failed, "failed"),
+        (account.requests_cancelled, "cancelled"),
+    ] {
+        if let Some(n) = n.filter(|n| *n > 0) {
+            parts.push(format!("{} {word}", count(n)));
+        }
+    }
+    // shunt times elapsed spans, so a negative or non-finite mean is no
+    // measurement; `-0.0` too, which would draw `-0`.
+    if let Some(ms) = account
+        .mean_latency_ms
+        .filter(|ms| ms.is_finite() && ms.is_sign_positive())
+    {
+        parts.push(format!(
+            "{} ms avg",
+            crate::format::group_thousands(ms.round(), 0)
+        ));
+    }
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+    let mut value = parts.join(" · ");
+    while parts.len() > 1 && Span::raw(value.as_str()).width() > value_width {
+        parts.pop();
+        value = parts.join(" · ");
+    }
+    Some(Line::from(vec![
+        key_span("requests"),
+        Span::styled(value, theme::accent()),
+    ]))
 }
 
 /// Render an assembled Usage detail body into `inner`, publishing the scroll

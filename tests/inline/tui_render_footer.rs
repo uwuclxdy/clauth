@@ -117,6 +117,10 @@ fn the_usage_r_hint_derives_from_the_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     let with_claude = || {
         App::new(AppConfig {

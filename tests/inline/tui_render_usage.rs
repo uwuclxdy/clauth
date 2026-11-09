@@ -5873,6 +5873,10 @@ fn t6_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     }
 }
 
@@ -6276,6 +6280,234 @@ fn a_cooling_down_pool_account_shows_its_status_pill() {
         "the cooldown pill and its 240 s countdown: {detail:?}"
     );
     assert_eq!(detail[5], "read      2m ago", "{detail:?}");
+}
+
+/// Pool account `alpha` as shunt v0.61.0+ serializes its row: the request
+/// counters ride it as top-level keys, `requests_attempted` the sum of the
+/// other three since shunt's process start or the account's add,
+/// `mean_latency_ms` a float that is
+/// `null` until an attempt got response headers (shunt `tests/admin_surface.rs`
+/// at v0.64.0). Parsed through the listing's own `Deserialize`. A 5h reading
+/// keeps the bars below the facts, so the blank row after them stays inside
+/// the pane's trimmed rows.
+fn counted_alpha(
+    attempted: u64,
+    failed: u64,
+    cancelled: u64,
+    mean_latency_ms: Option<f64>,
+) -> crate::gateway_admin::PoolAccount {
+    let row = serde_json::json!({
+        "name": "alpha",
+        "available": true,
+        "near_quota": false,
+        "cooldown_secs_remaining": null,
+        "needs_relogin": false,
+        "paused": false,
+        "disabled": false,
+        "utilization_5h": 0.73,
+        "reset_5h": crate::usage::now_epoch_secs() as u64 + 2 * 3600 + 13 * 60,
+        "utilization_7d": null,
+        "reset_7d": null,
+        "utilization_7d_oi": null,
+        "reset_7d_oi": null,
+        "status": null,
+        "requests_attempted": attempted,
+        "requests_succeeded": attempted - failed - cancelled,
+        "requests_failed": failed,
+        "requests_cancelled": cancelled,
+        "mean_latency_ms": mean_latency_ms,
+    });
+    serde_json::from_value(row).expect("a v0.61.0 pool row parses")
+}
+
+/// `t6_app` with `alpha` swapped for `account`, its Usage pane selected; the
+/// detail pane's rows and its outer width at 100 columns.
+fn counted_pool_pane(account: crate::gateway_admin::PoolAccount) -> (Vec<String>, usize) {
+    let mut app = t6_app();
+    let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool else {
+        panic!("t6_app reads its pool");
+    };
+    providers[0].accounts[0] = account;
+    t6_down(&mut app);
+    t6_down(&mut app);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let top: Vec<char> = crate::testutil::buffer_rows(term.backend().buffer())[0]
+        .chars()
+        .collect();
+    let split = top
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    (t6_panes(&app).1, top.len() - split)
+}
+
+/// The counters take one `requests` row under the read age: the attempted
+/// count, then the failed and cancelled counts, then the mean latency in whole
+/// milliseconds (839.6 rounds to 840), counts grouped by thousands as a detail
+/// pane's are.
+#[test]
+fn a_pool_pane_shows_the_request_counters_under_its_read_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, _) = counted_pool_pane(counted_alpha(1204, 12, 3, Some(839.6)));
+    assert_eq!(
+        detail
+            .iter()
+            .take(7)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "type      shunt",
+            "family    claude",
+            "provider  claude-main",
+            "plan      —",
+            "read      2m ago",
+            "requests  1,204 · 12 failed · 3 cancelled · 840 ms avg",
+            "",
+        ],
+        "{detail:?}"
+    );
+}
+
+/// A zero failed or cancelled count leaves its part out, and so does a latency
+/// shunt has not measured yet; the attempted count stays, at 0 too.
+#[test]
+fn a_pool_pane_leaves_out_zero_counts_and_an_unmeasured_latency() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (account, row) in [
+        (
+            counted_alpha(7, 0, 0, Some(52.0)),
+            "requests  7 · 52 ms avg",
+        ),
+        (
+            counted_alpha(9, 0, 2, Some(1.0)),
+            "requests  9 · 2 cancelled · 1 ms avg",
+        ),
+        (counted_alpha(5, 5, 0, None), "requests  5 · 5 failed"),
+        (counted_alpha(0, 0, 0, None), "requests  0"),
+    ] {
+        let (detail, _) = counted_pool_pane(account);
+        assert_eq!(
+            detail
+                .iter()
+                .skip(4)
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["read      2m ago", row, ""],
+            "{detail:?}"
+        );
+    }
+}
+
+/// A row too wide for the pane sheds whole parts from the right, never cuts
+/// one: here the latency goes and the cancelled count stays.
+#[test]
+fn a_pool_pane_sheds_request_parts_whole_from_the_right() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, pane_width) =
+        counted_pool_pane(counted_alpha(1_204_567, 12_345, 3_456, Some(12_345.0)));
+    // The whole row is 69 cells and the row without its latency 53, so a pane
+    // whose content width (its outer width less two border and two padding
+    // cells) lies in 53..69 must shed the latency part alone.
+    let content = pane_width - 4;
+    assert!(
+        (53..69).contains(&content),
+        "the fixture's pane must force exactly one shed: {content} cells"
+    );
+    assert_eq!(
+        detail.get(5).map(String::as_str),
+        Some("requests  1,204,567 · 12,345 failed · 3,456 cancelled"),
+        "{detail:?}"
+    );
+}
+
+/// A mean latency of a second or more is grouped by thousands like the counts.
+#[test]
+fn a_pool_pane_groups_a_long_latency_by_thousands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, _) = counted_pool_pane(counted_alpha(1204, 0, 0, Some(12_345.4)));
+    assert_eq!(
+        detail.get(5).map(String::as_str),
+        Some("requests  1,204 · 12,345 ms avg"),
+        "{detail:?}"
+    );
+}
+
+/// The `requests` row's key and value text and their styles, off the row
+/// builder at a given content width.
+fn requests_row(account: &crate::gateway_admin::PoolAccount, inner_w: u16) -> (String, String) {
+    let line = pool_requests_line(account, inner_w).expect("a counted row draws");
+    assert_eq!(line.spans.len(), 2, "{line:?}");
+    assert_eq!(line.spans[0].style, theme::label(), "the key: {line:?}");
+    assert_eq!(line.spans[1].style, theme::accent(), "the value: {line:?}");
+    (
+        line.spans[0].content.to_string(),
+        line.spans[1].content.to_string(),
+    )
+}
+
+/// The row sheds one whole part at a time as the content width falls, keeps a
+/// value that fits to the cell, and never sheds the attempted count. The full
+/// value is 44 cells, 31 without the latency, 17 without the cancelled count;
+/// the key column is 10.
+#[test]
+fn the_requests_row_sheds_one_part_per_missing_width_down_to_the_count() {
+    let account = counted_alpha(1204, 12, 3, Some(839.6));
+    for (inner_w, value) in [
+        (54, "1,204 · 12 failed · 3 cancelled · 840 ms avg"),
+        (53, "1,204 · 12 failed · 3 cancelled"),
+        (41, "1,204 · 12 failed · 3 cancelled"),
+        (40, "1,204 · 12 failed"),
+        (27, "1,204 · 12 failed"),
+        (26, "1,204"),
+        (12, "1,204"),
+    ] {
+        assert_eq!(
+            requests_row(&account, inner_w),
+            ("requests  ".to_string(), value.to_string()),
+            "at {inner_w} cells"
+        );
+    }
+}
+
+/// A mean latency that is negative or not finite is no measurement: the row
+/// reads as if shunt had measured none.
+#[test]
+fn the_requests_row_leaves_out_a_latency_that_is_no_measurement() {
+    for ms in [-123.0, -0.4, -0.0, f64::NAN, f64::INFINITY] {
+        let account = crate::gateway_admin::PoolAccount {
+            mean_latency_ms: Some(ms),
+            ..counted_alpha(7, 0, 0, None)
+        };
+        assert_eq!(
+            requests_row(&account, 66),
+            ("requests  ".to_string(), "7".to_string()),
+            "a mean of {ms}"
+        );
+    }
+}
+
+/// A measured mean under half a millisecond, zero included, is still a
+/// measurement: it draws `0 ms avg`.
+#[test]
+fn the_requests_row_keeps_a_sub_millisecond_latency() {
+    for ms in [0.0, 0.4] {
+        let account = crate::gateway_admin::PoolAccount {
+            mean_latency_ms: Some(ms),
+            ..counted_alpha(7, 0, 0, None)
+        };
+        assert_eq!(
+            requests_row(&account, 66),
+            ("requests  ".to_string(), "7 · 0 ms avg".to_string()),
+            "a mean of {ms}"
+        );
+    }
 }
 
 /// The footer offers `n note` on a claude row only: codex and pool accounts

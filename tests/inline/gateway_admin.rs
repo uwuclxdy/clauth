@@ -306,6 +306,10 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_7d_oi: None,
             plan: Some("max".to_string()),
             status: Some("healthy".to_string()),
+            requests_attempted: Some(1),
+            requests_failed: Some(0),
+            requests_cancelled: Some(0),
+            mean_latency_ms: None,
         }
     );
     assert_eq!(
@@ -326,6 +330,10 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_7d_oi: None,
             plan: None,
             status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
         }
     );
     assert_eq!(providers[1].name, "codex");
@@ -338,6 +346,45 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
     assert_eq!(
         providers[4].auth,
         PoolAuth::Unknown("future_oauth".to_string())
+    );
+}
+
+/// Two pool rows as shunt v0.61.0+ serializes them: one carrying the request
+/// counters and a measured mean latency (the values shunt's own
+/// `tests/admin_surface.rs` reads), one with zero counts and `null` latency.
+const COUNTED_POOL_BODY: &str = r#"{"providers":[
+  {"provider":"claude","auth":"claude_oauth","accounts":[
+    {"name":"a1","available":true,"near_quota":false,"cooldown_secs_remaining":null,"needs_relogin":false,"paused":false,"disabled":false,"utilization_5h":null,"reset_5h":null,"utilization_7d":null,"reset_7d":null,"utilization_7d_oi":null,"reset_7d_oi":null,"status":null,"requests_attempted":4,"requests_succeeded":1,"requests_failed":2,"requests_cancelled":1,"mean_latency_ms":200.0},
+    {"name":"a2","available":true,"near_quota":false,"cooldown_secs_remaining":null,"needs_relogin":false,"paused":false,"disabled":false,"utilization_5h":null,"reset_5h":null,"utilization_7d":null,"reset_7d":null,"utilization_7d_oi":null,"reset_7d_oi":null,"status":null,"requests_attempted":0,"requests_succeeded":0,"requests_failed":0,"requests_cancelled":0,"mean_latency_ms":null}
+  ]}
+]}"#;
+
+#[test]
+fn the_pool_listing_parses_request_counters_and_a_null_latency() {
+    let home = HomeSandbox::new();
+    write_token(&home, TOKEN);
+    let (base, seen) = serve_endpoints_raw(1, |_, _| (200, COUNTED_POOL_BODY.to_string()));
+    let record = record_at(&home, listener_addr(&base));
+    let providers = list_pool(&record).expect("a v0.61.0 pool row parses");
+    seen.join().expect("listener");
+    let counters = providers[0]
+        .accounts
+        .iter()
+        .map(|a| {
+            (
+                a.requests_attempted,
+                a.requests_failed,
+                a.requests_cancelled,
+                a.mean_latency_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        counters,
+        [
+            (Some(4), Some(2), Some(1), Some(200.0)),
+            (Some(0), Some(0), Some(0), None),
+        ]
     );
 }
 
@@ -379,6 +426,10 @@ fn a_floor_version_pool_row_without_paused_parses_as_unpaused() {
             reset_7d_oi: None,
             plan: None,
             status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
         }]
     );
 }

@@ -1575,6 +1575,10 @@ fn the_usage_help_rows_derive_per_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     let mut app = app_on(
         Tab::Usage,
@@ -1663,6 +1667,10 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
 
     let global_section = |app: &App| -> Vec<String> {
