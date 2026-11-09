@@ -229,7 +229,7 @@ clauth edits `config.toml` in place: a save changes only the keys whose setting 
 | `auto_start` | bool | `false` | the 1-token window-opening ping (alias `kick_timer`); a plan with no 5h limit gets none |
 | `usage_probe` | bool | `false` | read a setup-token account with no OAuth pair through a 1-token Haiku request; may start its 5h window (a plan with no 5h limit has none to start) |
 | `usage_probe_interval_ms` | integer | `90000` | how often the usage probe runs, 60000 to 450000, a value outside clamped into it; the Setup tab's `probe every` row steps it by 30s |
-| `disabled` | bool | `false` | hide from auto-switch, polling, the status feed and the plugin's startup roster, where the active account stays listed in both (with `disabled: true` in the status feed) and a shared `clauth start` session's own account stays on its roster; the TUI's divergence resolver will not save the live login into it |
+| `disabled` | bool | `false` | hide from auto-switch, polling, the status feed and the plugin's startup roster, where the active account stays listed in both (with `disabled: true` in the status feed) and a shared `clauth start` session's own account stays on its roster (the roster marks either one `disabled`); the TUI's divergence resolver will not save the live login into it |
 | `fallback_threshold` | float | `95.0` | 5h utilization % that switches away from this account |
 | `weekly_threshold` | float | chain value | per-account override of the 7d line (a monthly-only account's 30d quota gates on it instead), 50-100 |
 | `check_weekly` | bool | `true` | count the aggregate weekly window against this account |
