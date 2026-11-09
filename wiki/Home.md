@@ -24,7 +24,7 @@ The [README](https://github.com/uwuclxdy/clauth#readme) is the tour. This wiki i
 
 ## Quick answers
 
-- Settings live in `~/.clauth/profiles.toml` (global), `~/.clauth/codex-profiles.toml` (the codex roster) and `~/.clauth/profiles/<name>/config.toml` (per account). All three are hand-editable, and clauth edits `config.toml` in place, so your comments and any key it does not model stay ([Configuration](Configuration#configtoml)).
+- Settings live in `~/.clauth/profiles.toml` (global), `~/.clauth/codex-profiles.toml` (the codex roster) and `~/.clauth/profiles/<name>/config.toml` (per account). All three are hand-editable, and clauth edits every one in place, so your comments, key order and any key it does not model stay ([Configuration](Configuration#profilestoml)).
 - Most settings in the Claude Code files are editable in the TUI too: `clauth`, then the Setup / Fallback / Config / Services tabs; the codex file's chain keys have no TUI equivalent, while Setup creates and deletes its profiles.
 - A switch rewrites `~/.claude/.credentials.json`, parts of `~/.claude/settings.json`, and the stale identity block in `~/.claude.json`. Nothing else in `~/.claude/` moves.
 - `clauth start <profile>` runs a session in its own config dir, so it never disturbs the account your global `claude` is on.
