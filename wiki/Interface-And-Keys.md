@@ -166,8 +166,8 @@ A saved Claude Code account's rows:
 | `auto-update` | checks for updates when the TUI opens, unless `CLAUTH_NO_UPDATE=1` | on |
 | `weekly limit` | chain-wide 7d exhaustion line (a monthly-only account's 30d quota gates on it instead), 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
-| `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
-| `burn horizon` | how far ahead burn-aware projects | `60s` |
+| `burn floor` | lowest projected-switch point, no effect at or above an account's threshold: 97 / 98 / 99 / 100% | `98%` |
+| `burn horizon` | how far ahead burn-aware projects, never past the next usage reading | `60s` |
 | `walk order` | `chain`, `soonest weekly reset`, `most weekly headroom` | `chain` |
 | `quota spent` | `stay on active`, `switch off all` | `stay on active` |
 | `allow extra usage` | `off`, `pay-as-you-go` | `off` |

@@ -90,14 +90,14 @@ With no `last resort` member, the chain-global `quota spent` setting decides:
 
 Config tab `switch mode`, default `static`.
 
-`static` compares utilization to the threshold. `burn-aware` instead projects utilization forward from your recent burn rate and switches once the projection would cross 100% before the next refresh. Heavy burn moves you early; light burn rides past the threshold toward 100%.
+`static` compares utilization to the threshold. `burn-aware` keeps that check and can switch earlier: from the `burn floor` up, it switches once your recent burn rate projects utilization to 100% within the `burn horizon`. The floor only counts below the threshold, so with the defaults (floor `98%`, threshold `95%`) burn-aware switches exactly like `static`; set an account's `rotate at` above the floor (say `100%`) and heavy burn switches it from `98%` while light burn runs on to the threshold. An API-key account judged on its provider's windows always switches like `static`.
 
 | Knob | Default | Effect |
 |------|---------|--------|
-| `burn floor` | `98%` | the earliest utilization burn-aware may switch at |
+| `burn floor` | `98%` | the lowest utilization the burn projection may switch at; no effect at or above an account's threshold |
 | `burn horizon` | `60s` | how far ahead it projects, capped by the refresh interval, or by the probe interval on an active account the usage probe reads |
 
-The rate is a recency-weighted fit over the last hour of samples in `usage_history.jsonl`, ignoring idle gaps and reset boundaries. It needs three samples to compute anything; an account without them falls back to its static threshold. Burn-aware can only switch earlier than static, never later.
+The rate is a recency-weighted fit over the last hour of samples in `usage_history.jsonl`, ignoring idle gaps and reset boundaries. It needs three samples to compute anything; an account without them falls back to its static threshold.
 
 ## Extra usage (real money)
 
