@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::daemon::api::http::sanitize_for_log;
 use crate::logline::logline;
@@ -399,6 +399,14 @@ pub(crate) enum AskOutcome {
     /// The ask is open but the instance's queue is at [`MAX_QUEUED_COMMANDS`]:
     /// refused 503, the ask stays open for a retry (A#1).
     Busy,
+    /// A `decision` sent to a question ask, or `answers` sent to any other
+    /// ask: refused, nothing queued, the ask stays open.
+    WrongForm,
+    /// An answer or note key is not byte-equal to one of the open ask's
+    /// question texts: refused, nothing queued, the ask stays open.
+    UnknownQuestion,
+    /// An answer is empty: refused, nothing queued, the ask stays open.
+    EmptyAnswer,
     /// The ask was answered (or closed at the desk) already.
     AskClosed,
     /// The instance never held that ask id.
@@ -1526,7 +1534,9 @@ impl Hub {
     }
 
     /// Answer a held ask on the named session's live mod instance: the first
-    /// answer wins and closes the ask, whatever its form.
+    /// answer [`answer_refusal`] takes with room left in the queue wins and
+    /// closes the ask; every other outcome leaves the ask open and queues
+    /// nothing.
     pub(crate) fn answer(&self, session: &str, ask: &str, command: Value) -> AskOutcome {
         let records: Vec<(u32, String, String)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1562,6 +1572,9 @@ impl Hub {
                         // whatever the device state at answer time.
                         if !info.held {
                             return AskOutcome::AskNotFound;
+                        }
+                        if let Some(refusal) = answer_refusal(&info.tool, &info.input, &command) {
+                            return refusal;
                         }
                         if live.owned() >= MAX_QUEUED_COMMANDS {
                             return AskOutcome::Busy;
@@ -1797,6 +1810,56 @@ fn answer_value(command: &Value) -> Value {
     stripped.remove("kind");
     stripped.remove("ask");
     Value::Object(stripped)
+}
+
+/// The question texts an `AskUserQuestion` ask holds: its `input` is the
+/// tool's `questions` array, each entry naming its text under `question`.
+/// `input` alone never makes an ask a question ask; one whose input yields no
+/// text refuses every `answers` key as unknown.
+fn ask_questions(input: &Value) -> Vec<&str> {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("question").and_then(Value::as_str))
+        .collect()
+}
+
+/// Why an answer the model could not use is refused, or `None` to take it.
+/// The ask's kind comes from its `tool`, never its `input`'s shape: a
+/// `decision` sent to a question ask, or `answers` sent to any other, is the
+/// wrong form. For a question ask every `answers` and `notes` key must be
+/// byte-equal to one of its question texts (a key matching none would reach
+/// the model as no answer at all), then every answer must be a non-empty
+/// string. A question left unanswered is allowed, a note on it included.
+fn answer_refusal(tool: &Value, input: &Value, command: &Value) -> Option<AskOutcome> {
+    let answers = command.get("answers").and_then(Value::as_object);
+    let question_ask = tool.as_str() == Some("AskUserQuestion");
+    if question_ask != answers.is_some() {
+        return Some(AskOutcome::WrongForm);
+    }
+    // A permission ask's decision is the form it takes: nothing to check.
+    let answers = answers?;
+    let no_notes = Map::new();
+    let notes = command
+        .get("notes")
+        .and_then(Value::as_object)
+        .unwrap_or(&no_notes);
+    let questions = ask_questions(input);
+    if !answers
+        .keys()
+        .chain(notes.keys())
+        .all(|key| questions.contains(&key.as_str()))
+    {
+        return Some(AskOutcome::UnknownQuestion);
+    }
+    if !answers
+        .values()
+        .all(|answer| answer.as_str().is_some_and(|text| !text.is_empty()))
+    {
+        return Some(AskOutcome::EmptyAnswer);
+    }
+    None
 }
 
 /// Release a parked wait's slot, only when the instance it parked on is still

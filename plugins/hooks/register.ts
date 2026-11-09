@@ -54,7 +54,7 @@ const encoder = new TextEncoder()
 
 type HoldOutcome =
   | { type: 'allow' | 'deny'; from: 'desk' | 'device' }
-  | { type: 'answers'; answers: Record<string, string> }
+  | { type: 'answers'; answers: Record<string, string>; notes: Record<string, string> }
   | { type: 'loss' }
 
 type HeldEntry = {
@@ -308,13 +308,22 @@ async function handleAnswer($: EngineInterface, ask: string, cmd: Record<string,
   // An AskUserQuestion releases only on answers, each value a string, and at
   // least one answer: an empty map holds nothing the engine can use.
   if (cmd.answers === null || typeof cmd.answers !== 'object') return
-  const answers: Record<string, string> = {}
-  for (const [k, v] of Object.entries(cmd.answers as Record<string, unknown>)) {
-    if (typeof v !== 'string') return
-    answers[k] = v
-  }
-  if (Object.keys(answers).length === 0) return
-  await answerFromDevice($, ask, { type: 'answers', answers })
+  const pairs = Object.entries(cmd.answers as Record<string, unknown>)
+  if (pairs.length === 0) return
+  if (!pairs.every(([, v]) => typeof v === 'string')) return
+  // Built with `fromEntries`, never by assignment: a question whose exact text
+  // is `__proto__` must survive as an own key.
+  const answers = Object.fromEntries(pairs) as Record<string, string>
+  // A note is optional: one that is not a non-empty string is dropped, never a
+  // reason to hold back the answers beside it.
+  const notePairs =
+    cmd.notes !== null && typeof cmd.notes === 'object'
+      ? Object.entries(cmd.notes as Record<string, unknown>).filter(
+          ([, v]) => typeof v === 'string' && v !== '',
+        )
+      : []
+  const notes = Object.fromEntries(notePairs) as Record<string, string>
+  await answerFromDevice($, ask, { type: 'answers', answers, notes })
 }
 
 async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): Promise<void> {
@@ -440,10 +449,10 @@ async function waitOnce($: EngineInterface, ask: string): Promise<void> {
     // A device answer, form-matched exactly as a poll answer is.
     await handleAnswer($, ask, reply.answer)
     if (helds.has(ask)) {
-      // The answer's form did not match this hold (a decision for a held
-      // question, a non-string or empty `answers`, ...): the daemon already
-      // closed the ask, so resolve it as a loss rather than re-waiting on a
-      // closed ask forever.
+      // The answer's form did not match this hold, which only a daemon or mod
+      // of another version delivers: the daemon refuses the wrong form and
+      // empty or non-string answers. The daemon already closed the ask, so
+      // resolve it as a loss rather than re-waiting on a closed ask forever.
       await resolveHold($, ask, { type: 'loss' }, true)
     }
     return
@@ -742,8 +751,13 @@ export const register: Register = on => {
       )
       if (outcome.type === 'answers') {
         // The engine's output-shape check refuses a result without the
-        // tool's own `questions` (measured 2026-11-06, 2.1.319).
-        return { result: { questions: e.questions, answers: outcome.answers } }
+        // tool's own `questions` (measured 2026-11-06, 2.1.319). A note reaches
+        // the model only as its question's `annotations` entry (same run).
+        const noted = Object.entries(outcome.notes)
+        const result = { questions: e.questions, answers: outcome.answers }
+        if (noted.length === 0) return { result }
+        const annotations = Object.fromEntries(noted.map(([q, notes]) => [q, { notes }]))
+        return { result: { ...result, annotations } }
       }
       return next(e)
     },

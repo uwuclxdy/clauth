@@ -320,6 +320,13 @@ const SESSION_BUSY: &str = "the mod's command queue is full; retry after its nex
 const ASK_CLOSED: &str = "that ask is already answered or closed";
 #[cfg(unix)]
 const ASK_NOT_FOUND: &str = "no open ask with that id on that session";
+#[cfg(unix)]
+const ANSWER_WRONG_FORM: &str = "a question takes answers, and a permission ask takes a decision.";
+#[cfg(unix)]
+const ANSWER_UNKNOWN_QUESTION: &str =
+    "each answer and note must name one of the ask's questions by its exact text.";
+#[cfg(unix)]
+const ANSWER_EMPTY: &str = "each answer must be a non-empty string.";
 
 /// Where the herdr fallback landed for one session id.
 enum PaneFallback {
@@ -583,18 +590,33 @@ impl Decision {
     }
 }
 
-/// One answer body: exactly one of `decision` (`allow` or `deny`) or `answers`
-/// (an object), never both, never neither.
+/// One answer body: exactly one of `decision` (`allow` or `deny`) or `answers`,
+/// never both, never neither; `notes` rides only beside `answers`.
 #[derive(Deserialize, ToSchema)]
 struct AnswerBody {
     #[serde(default)]
     decision: Option<Decision>,
+    /// Each answered question's exact text to its answer, at least one entry,
+    /// each a non-empty string. A question left out reads as unanswered.
     #[serde(default)]
-    answers: Option<serde_json::Value>,
+    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
+    answers: Option<serde_json::Map<String, serde_json::Value>>,
+    /// A question's exact text to a note on it, answered or not; sent only
+    /// beside `answers`. An empty note, or a `null` map, counts as none.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
+    notes: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Every value of an answer-body map is a string, the one shape the mod
+/// accepts.
+fn all_strings(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.values().all(serde_json::Value::is_string)
 }
 
 /// `POST /api/v1/sessions/{id}/asks/{ask}` — answer a mod-held ask. The first
-/// answer wins and closes the ask, desk or device alike (SB-7, SB-19).
+/// answer wins and closes the ask, desk or device alike (SB-7, SB-19); a
+/// refused answer leaves it open.
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{id}/asks/{ask}",
@@ -605,7 +627,7 @@ struct AnswerBody {
     request_body = AnswerBody,
     responses(
         (status = 200, description = "the answer reached the session's live mod and closes the ask", body = AnswerOk),
-        (status = 400, description = "the body names neither, or both, of decision and answers, or a decision other than allow or deny (`bad_request`)", body = ErrorBody),
+        (status = 400, description = "the body names neither, or both, of decision and answers (a null names neither), a decision other than allow or deny, notes without answers or beside a decision, an answers or notes that is neither an object nor null, an answers object with no entry, or an answer or note that is not a string (`bad_request`); a decision sent to a question ask, or answers sent to any other ask (`answer_wrong_form`); an answer or non-empty note keyed by anything but one of the ask's questions' exact texts, byte for byte (`answer_unknown_question`); an empty answer (`answer_empty`). Nothing is queued and the ask stays open", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no live session with that id (`session_not_live`), or no open ask with that id (`ask_not_found`)", body = ErrorBody),
@@ -625,19 +647,36 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
     let Ok(body) = serde_json::from_slice::<AnswerBody>(&req.body) else {
         return Response::error(400, "bad_request");
     };
-    // Exactly one form, and its value the one shape the mod accepts.
-    let (command, audit_tail) = match (body.decision.as_ref(), body.answers) {
-        (Some(decision), None) => (
+    // A `null` `decision`, `answers` or `notes` reads as absent: the app's
+    // generated client writes every unset field as `null`.
+    // Exactly one form, and its values the one shape the mod accepts. An empty
+    // note is no note: only the others are queued, and the audit line counts
+    // them, never their text.
+    let (command, audit_tail) = match (body.decision.as_ref(), body.answers, body.notes) {
+        (Some(decision), None, None) => (
             json!({ "kind": "answer", "ask": ask, "decision": decision }),
             format!("decision={}", decision.as_str()),
         ),
-        (None, Some(answers)) if answers.is_object() => (
-            json!({ "kind": "answer", "ask": ask, "answers": answers }),
-            format!(
-                "answers={}",
-                answers.as_object().map_or(0, |object| object.len())
-            ),
-        ),
+        (None, Some(answers), notes)
+            if !answers.is_empty()
+                && all_strings(&answers)
+                && notes.as_ref().is_none_or(all_strings) =>
+        {
+            let notes: serde_json::Map<String, serde_json::Value> = notes
+                .into_iter()
+                .flatten()
+                .filter(|(_, note)| note.as_str() != Some(""))
+                .collect();
+            let answered = answers.len();
+            let mut command = json!({ "kind": "answer", "ask": ask, "answers": answers });
+            if notes.is_empty() {
+                (command, format!("answers={answered}"))
+            } else {
+                let noted = notes.len();
+                command["notes"] = serde_json::Value::Object(notes);
+                (command, format!("answers={answered} notes={noted}"))
+            }
+        }
         _ => return Response::error(400, "bad_request"),
     };
     #[cfg(unix)]
@@ -669,6 +708,19 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                         sanitize_for_log(id)
                     );
                     return Response::refused(503, "session_busy", SESSION_BUSY);
+                }
+                crate::daemon::bridge::AskOutcome::WrongForm => {
+                    return Response::refused(400, "answer_wrong_form", ANSWER_WRONG_FORM);
+                }
+                crate::daemon::bridge::AskOutcome::UnknownQuestion => {
+                    return Response::refused(
+                        400,
+                        "answer_unknown_question",
+                        ANSWER_UNKNOWN_QUESTION,
+                    );
+                }
+                crate::daemon::bridge::AskOutcome::EmptyAnswer => {
+                    return Response::refused(400, "answer_empty", ANSWER_EMPTY);
                 }
                 crate::daemon::bridge::AskOutcome::AskClosed => {
                     return Response::refused(409, "ask_closed", ASK_CLOSED);

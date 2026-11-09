@@ -1674,6 +1674,43 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             &mut driven,
             &mut produced,
         );
+        // An open question ask refuses a decision (the wrong form), an answer
+        // naming none of its questions, then an empty one, keeping the ask
+        // open for all three.
+        let question = serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "ask_opened", "ask": "q2", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
+        assert_eq!(
+            ctx_bridge
+                .bridge
+                .as_ref()
+                .unwrap()
+                .event(100, question.to_string().as_bytes())
+                .0,
+            200
+        );
+        for body in [
+            r#"{"decision":"allow"}"#,
+            r#"{"answers":{"Which color?":"blue"}}"#,
+            r#"{"answers":{"Which colour?":""}}"#,
+        ] {
+            let refused = call(
+                &ctx_bridge,
+                &req(
+                    "POST",
+                    &format!("{API_PREFIX}/sessions/{FIXTURE_ID}/asks/q2"),
+                    Some(TOKEN),
+                    body,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/asks/{ask}",
+                400,
+                &refused,
+                &mut driven,
+                &mut produced,
+            );
+        }
     }
 
     // The bridge queue cap's 503: a live mod instance whose queue is full

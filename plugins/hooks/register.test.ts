@@ -765,6 +765,104 @@ test('C2: AskUserQuestion held answers from the phone without next', async ($, o
   expect(nextRan).toBe(false)
 })
 
+test('C2n: a phone note reaches the tool result as its annotation', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' }, notes: { 'Which lib?': 'the small one' } })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions: QUESTION,
+      answers: { 'Which lib?': 'date-fns' },
+      annotations: { 'Which lib?': { notes: 'the small one' } },
+    },
+  })
+})
+
+test('C2o: an answer with no notes carries no annotations', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' }, notes: {} })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
+})
+
+test('C2p: a __proto__ question keeps its answer and its note', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const questions = [
+    {
+      question: '__proto__',
+      header: 'Proto',
+      options: [{ label: 'Red', description: '' }],
+      multiSelect: false,
+    },
+  ]
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, {
+    answers: JSON.parse('{"__proto__":"Red"}') as Record<string, unknown>,
+    notes: JSON.parse('{"__proto__":"the darker one"}') as Record<string, unknown>,
+  })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions,
+      answers: JSON.parse('{"__proto__":"Red"}'),
+      annotations: JSON.parse('{"__proto__":{"notes":"the darker one"}}'),
+    },
+  })
+})
+
+test('C2q: a note on an unanswered question reaches the tool result as its annotation', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const questions = [
+    {
+      question: 'Which lib?',
+      header: 'Lib',
+      options: [{ label: 'date-fns', description: '' }],
+      multiSelect: false,
+    },
+    {
+      question: 'Which format?',
+      header: 'Format',
+      options: [{ label: 'ISO', description: '' }],
+      multiSelect: false,
+    },
+  ]
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, {
+    answers: { 'Which lib?': 'date-fns' },
+    notes: { 'Which format?': 'pick for me' },
+  })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions,
+      answers: { 'Which lib?': 'date-fns' },
+      annotations: { 'Which format?': { notes: 'pick for me' } },
+    },
+  })
+})
+
 test('C2b: AskUserQuestion hold:false runs next so the engine draws its dialog', async ($, on) => {
   const { bridge } = setup(on, { HOME: '/home/u' }, false)
   let nextRan = false
