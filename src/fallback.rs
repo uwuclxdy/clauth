@@ -73,6 +73,54 @@ pub(crate) fn threshold_in_range(value: f64) -> bool {
     value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
 }
 
+/// The log line a chain move of the global account leaves behind: the account
+/// it landed on, the one it left (`from`, when it still resolves), and what
+/// that one last read (`from_usage`) against its 5h and weekly lines
+/// (`chain_weekly` is the chain-wide weekly line). A toast vanishes with the
+/// TUI, so without this line a window that still ran out leaves no trace of
+/// when (or whether) the chain moved off it. `role` is the process prefix
+/// ([`crate::logline::role`]); `returning` names a move onto the home account.
+pub(crate) fn auto_switch_log_line(
+    role: &str,
+    from: Option<&Profile>,
+    to: &str,
+    returning: bool,
+    from_usage: Option<&UsageInfo>,
+    chain_weekly: f64,
+) -> String {
+    let moved = if returning {
+        "returned to preferred account"
+    } else {
+        "auto-switched to"
+    };
+    let Some(from) = from else {
+        return format!("{role}: {moved} '{to}'");
+    };
+    let five = from_usage.and_then(|u| u.five_hour.as_ref()).map(|w| {
+        format!(
+            "5h {:.0}% (line {:.0}%)",
+            w.utilization,
+            threshold_for(from)
+        )
+    });
+    let long = from_usage
+        .and_then(UsageInfo::long_window)
+        .map(|(label, w)| {
+            let line = member_weekly_line(from, chain_weekly);
+            format!("{label} {:.0}% (line {line:.0}%)", w.utilization)
+        });
+    let read: Vec<String> = five.into_iter().chain(long).collect();
+    let read = if read.is_empty() {
+        "nothing".to_string()
+    } else {
+        read.join(", ")
+    };
+    format!(
+        "{role}: {moved} '{to}' from '{0}'; '{0}' read {read}",
+        from.name
+    )
+}
+
 /// Parse a typed threshold, valid only inside [`threshold_in_range`].
 pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
     raw.parse::<f64>().ok().filter(|v| threshold_in_range(*v))

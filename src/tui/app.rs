@@ -7768,6 +7768,8 @@ impl App {
         // risks acting on a window the account no longer has. Stale profiles
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
+        // The account the one-shot may move off, for its log line.
+        let before = self.config().state.active_profile.as_ref().cloned();
         let switched = {
             let (active_fresh, rate) = self.active_bootstrap_state();
             // The one-shot may switch or switch off under its own locks, over
@@ -7814,6 +7816,7 @@ impl App {
                 } else {
                     format!("auto-switched to '{target}'")
                 };
+                log_auto_switch(self, before.as_ref(), &ProfileName::from(target.clone()));
                 self.toast(ToastKind::Warning, msg);
             }
             Some(SwitchAction::Off) => {
@@ -20177,9 +20180,9 @@ fn finalize_switch(
         );
         return;
     }
-    if let Some(active) = outgoing
-        && active != *name
-        && active_diverged_unsaved(&active)
+    if let Some(active) = outgoing.as_ref()
+        && active != name
+        && active_diverged_unsaved(active)
     {
         clear_activity(&app.activity, name);
         prompt_divergence(app, active.to_string(), "switching");
@@ -20190,6 +20193,11 @@ fn finalize_switch(
     clear_activity(&app.activity, name);
     match result {
         Ok(_switched) => {
+            // A queued switch is the chain's own move: leave its line in
+            // clauth.log, which outlives the toast below.
+            if queued {
+                log_auto_switch(app, outgoing.as_ref(), name);
+            }
             app.refresh_tokens();
             app.apply_forgets();
             app.refresh_unsaved_live_login();
@@ -20206,6 +20214,49 @@ fn finalize_switch(
             ),
         },
     }
+}
+
+/// Log an auto-switch the chain made from `from` to `to`
+/// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading. A
+/// move onto the account already active logs nothing. The usage stores are
+/// read and released before the config guard is taken, as they rank below it.
+fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
+    if from == Some(to) {
+        return;
+    }
+    let oauth = from.and_then(|f| {
+        app.usage_store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(f.as_str()).cloned())
+    });
+    let stats = from.and_then(|f| {
+        app.third_party_usage_store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(f.as_str()).cloned())
+    });
+    let key_rejected = app.key_rejected_names();
+    let line = {
+        let cfg = app.config();
+        let from_profile = from.and_then(|f| cfg.find(f));
+        let from_usage = from_profile.and_then(|p| {
+            crate::fallback::picked_usage(
+                p.usage_cache_is_third_party(),
+                oauth.as_ref(),
+                stats.as_ref(),
+            )
+        });
+        crate::fallback::auto_switch_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            from_profile,
+            to.as_str(),
+            cfg.is_home_today(to, &key_rejected),
+            from_usage.as_ref(),
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
 }
 
 /// Turn off all accounts on the UI thread. Mirrors `finalize_switch`'s

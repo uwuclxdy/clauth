@@ -599,6 +599,51 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
     );
 }
 
+/// The daemon's switch line names the account it left and that account's
+/// reading against its lines, not just the target.
+#[test]
+fn drain_pending_switch_logs_the_left_account_and_its_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 97.0,
+                resets_at: None,
+            }),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "beta");
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("beta"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'beta' from 'alpha'; 'alpha' read 5h 97% (line 95%)"),
+        "the daemon names the left account and its reading: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A queued switch must not execute once the daemon lost the fetch lease:
 /// the decision was queued under a ticket the watchdog then released, and
 /// the holder that took over owns every switch decision. The record clears

@@ -3002,6 +3002,71 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
     );
 }
 
+/// The chain's own move leaves a line in clauth.log: the toast vanishes with
+/// the TUI, so without the line nothing tells when (or whether) the chain
+/// moved off an account whose window still ran out.
+#[test]
+fn on_tick_logs_a_queued_auto_switch_with_the_left_reading() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            seven_day: Some(boot_window(70.0)),
+            ..UsageInfo::default()
+        },
+    );
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // First tick dispatches (posts the gate); the second completes it.
+        super::on_tick(&mut app);
+        super::on_tick(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 92% (line 90%), 7d 70% (line 98%)"),
+        "the landed auto-switch is logged with what the left account read: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A queued switch must not execute once the TUI lost the fetch lease: the
 /// decision was queued under a ticket the watchdog then released, and the
 /// holder that took over decides. The record clears with the skip.
@@ -23104,6 +23169,30 @@ fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
         toast_bodies(&app),
         vec!["auto-switched to 'spare'".to_string()],
         "the landed switch announces its target",
+    );
+}
+
+#[test]
+fn bootstrap_one_shot_logs_the_switch_off_a_fresh_exhausted_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_app(&_home, FetchStatus::Fresh)
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPARE),
+        "precondition: the startup switch lands",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'spare' from 'spent'; 'spent' read 5h 100% (line 95%)"),
+        "the startup switch is logged with what the left account read: {:?}",
+        lines.snapshot()
     );
 }
 

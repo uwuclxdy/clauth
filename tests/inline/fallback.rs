@@ -11589,3 +11589,86 @@ fn a_refused_setup_token_beside_an_env_key_clears_on_a_remint() {
         "a re-minted token clears the dead login"
     );
 }
+
+// ── auto-switch log line ─────────────────────────────────────────────────────
+
+fn log_window(utilization: f64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at: None,
+    }
+}
+
+#[test]
+fn auto_switch_log_line_names_both_accounts_and_the_reading_against_its_lines() {
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.fallback_threshold = Some(90.0);
+    let usage = UsageInfo {
+        five_hour: Some(log_window(91.4)),
+        seven_day: Some(log_window(70.0)),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        auto_switch_log_line("clauth", Some(&work), "perso", false, Some(&usage), 98.0),
+        "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 91% (line 90%), 7d 70% (line 98%)",
+    );
+}
+
+#[test]
+fn auto_switch_log_line_reads_the_member_weekly_override_and_default_threshold() {
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.weekly_threshold = Some(85.0);
+    let usage = UsageInfo {
+        seven_day: Some(log_window(86.0)),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth daemon",
+            Some(&work),
+            "perso",
+            false,
+            Some(&usage),
+            98.0
+        ),
+        "clauth daemon: auto-switched to 'perso' from 'work'; 'work' read 7d 86% (line 85%)",
+    );
+    let five = UsageInfo {
+        five_hour: Some(log_window(96.0)),
+        ..UsageInfo::default()
+    };
+    let plain = Profile::new("plain".to_string(), None, None);
+    assert_eq!(
+        auto_switch_log_line("clauth", Some(&plain), "b", false, Some(&five), 98.0),
+        "clauth: auto-switched to 'b' from 'plain'; 'plain' read 5h 96% (line 95%)",
+        "an account with no override is judged at the default 5h line",
+    );
+}
+
+#[test]
+fn auto_switch_log_line_names_a_return_home_and_missing_readings() {
+    let perso = Profile::new("perso".to_string(), None, None);
+    assert_eq!(
+        auto_switch_log_line("clauth", Some(&perso), "work", true, None, 98.0),
+        "clauth: returned to preferred account 'work' from 'perso'; 'perso' read nothing",
+    );
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some(&perso),
+            "work",
+            false,
+            Some(&UsageInfo::default()),
+            98.0
+        ),
+        "clauth: auto-switched to 'work' from 'perso'; 'perso' read nothing",
+    );
+    assert_eq!(
+        auto_switch_log_line("clauth", None, "work", true, None, 98.0),
+        "clauth: returned to preferred account 'work'",
+    );
+    assert_eq!(
+        auto_switch_log_line("clauth", None, "work", false, None, 98.0),
+        "clauth: auto-switched to 'work'",
+    );
+}

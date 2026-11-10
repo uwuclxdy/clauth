@@ -631,6 +631,8 @@ impl super::Daemon {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // The account the switch moves off, for its log line.
+        let mut switched_from = None;
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -665,6 +667,13 @@ impl super::Daemon {
             // log names the two apart without threading the cause through the
             // switch action.
             let returning = cfg.is_home_today(&target, &key_rejected);
+            let from = cfg.state.active_profile.as_ref();
+            if from != Some(&target) {
+                switched_from = Some((
+                    from.and_then(|f| cfg.find(f)).cloned(),
+                    cfg.state.weekly_switch_threshold_pct(),
+                ));
+            }
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
@@ -689,10 +698,20 @@ impl super::Daemon {
                 // landed on another profile is picked up instead of swallowed.
                 self.apply_forgets();
                 self.switch_backoff = None;
-                if returning {
-                    logline!("clauth daemon: returned to preferred account '{target}'");
-                } else {
-                    logline!("clauth daemon: switched to '{target}'");
+                match switched_from {
+                    Some((from, chain_weekly)) => {
+                        let line = self.auto_switch_log_line(
+                            from.as_ref(),
+                            &target,
+                            returning,
+                            chain_weekly,
+                        );
+                        logline!("{line}");
+                    }
+                    None if returning => {
+                        logline!("clauth daemon: returned to preferred account '{target}'");
+                    }
+                    None => logline!("clauth daemon: switched to '{target}'"),
                 }
                 // The `cfg` guard is dropped at the block's end above, so this
                 // republish holds no config lock. A no-op switch (target already
@@ -717,6 +736,44 @@ impl super::Daemon {
     /// gate owns (the gate's give-up branch is the one that closes it). A change
     /// of target resets the backoff. The decision (target + cause) is re-queued
     /// whole so a later repair still invalidates it at dispatch.
+    /// The log line of an auto-switch from `from` onto `target`
+    /// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last
+    /// reading. Called with no config guard held: the usage stores rank
+    /// below it.
+    fn auto_switch_log_line(
+        &self,
+        from: Option<&crate::profile::Profile>,
+        target: &ProfileName,
+        returning: bool,
+        chain_weekly: f64,
+    ) -> String {
+        let from_usage = from.and_then(|p| {
+            let oauth = self
+                .usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(p.name.as_str()).cloned());
+            let stats = self
+                .third_party_usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(p.name.as_str()).cloned());
+            crate::fallback::picked_usage(
+                p.usage_cache_is_third_party(),
+                oauth.as_ref(),
+                stats.as_ref(),
+            )
+        });
+        crate::fallback::auto_switch_log_line(
+            "clauth daemon",
+            from,
+            target.as_str(),
+            returning,
+            from_usage.as_ref(),
+            chain_weekly,
+        )
+    }
+
     fn fail_switch(&mut self, decision: &PendingSwitchTarget, now: u64, reason: &str) {
         let target = decision.target.as_str();
         let (attempts, retry_until) = match &self.switch_backoff {
