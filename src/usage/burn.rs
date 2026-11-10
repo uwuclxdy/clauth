@@ -361,9 +361,9 @@ fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f
 /// can't produce NaN/overflow at the caller's `>= 100` comparison.
 ///
 /// Drives the opt-in burn-aware auto-switch decision (issue #8 follow-up b,
-/// `fallback::is_exhausted_projected`): switch the ACTIVE profile when the
-/// projected value crosses the 100% cap, instead of waiting for the static
-/// per-profile threshold.
+/// `fallback::is_exhausted_projected`): switch the ACTIVE profile early when
+/// the projected value crosses the 100% cap, beside the static per-profile
+/// threshold, which still applies.
 pub(crate) fn project_utilization(util_pct: f64, burn_pct_per_hour: f64, interval_ms: u64) -> f64 {
     let hours = interval_ms as f64 / 3_600_000.0;
     let projected = util_pct + burn_pct_per_hour.max(0.0) * hours;

@@ -725,7 +725,7 @@ pub(crate) enum ActiveBurnRate {
 /// with none) leaves only that static check — never uncovers an account for
 /// lack of data. With a rate, the projection ADDS an earlier trip inside the
 /// `floor_pct.min(threshold)..threshold` band: a heavier burn crosses the 100%
-/// cap before the next poll and switches sooner, a light one runs on since it
+/// cap within the look-ahead and switches sooner, a light one runs on since it
 /// won't blow the cap in time. (Above `threshold` the static check has already
 /// fired, so the band's upper bound is `threshold`; a `floor_pct` set above
 /// `threshold` — the stock default 98 over 95 — just clamps to `threshold` and
@@ -1223,7 +1223,7 @@ pub(crate) struct ChainSnapshot {
     pub(crate) broken: Vec<ProfileName>,
     /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
     /// gates whether the ACTIVE-side check in `next_auto_switch_target`
-    /// projects ahead of the next poll instead of using the static threshold.
+    /// also projects ahead, beside the static threshold, which still applies.
     pub(crate) burn_aware: bool,
     /// Snapshot of `AppState::walk_order()` (issue #86) — which member each
     /// accept pass lands on. `Chain` is the default and today's walk byte for

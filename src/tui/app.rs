@@ -847,12 +847,13 @@ pub(crate) fn preferred_days_at(index: usize) -> Vec<Weekday> {
 }
 
 /// Presets for the burn-aware early-switch floor (percent). The projection may
-/// not switch below the chosen value, so wasted headroom is capped at
-/// `100 - floor`. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
+/// not switch below `min(floor, threshold)`, so wasted headroom is capped at
+/// `100 - min(floor, threshold)`; a floor at or above the threshold does
+/// nothing. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
 pub(crate) const BURN_FLOOR_PRESETS: [f64; 4] = [97.0, 98.0, 99.0, 100.0];
 
 /// Presets for the burn-aware projection horizon cap (ms). The projection looks
-/// ahead by `min(refresh_interval, this)`; a shorter cap keeps the switch
+/// ahead by `min(poll interval, this)`; a shorter cap keeps the switch
 /// nearer 100. Default 60 s (see [`crate::profile::DEFAULT_BURN_HORIZON_MS`]).
 pub(crate) const BURN_HORIZON_PRESETS: [u64; 4] = [30_000, 45_000, 60_000, 90_000];
 
@@ -906,8 +907,8 @@ pub(crate) enum GlobalConfigRow {
     /// and the next swap hand-off. ENUMERATED on/off, ⏎ mirrors space.
     SyncMcpLogins,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
-    /// follow-up b) — off by default, projects the ACTIVE profile's
-    /// utilization ahead of the next poll instead of the static threshold.
+    /// follow-up b) — off by default, also projects the ACTIVE profile's
+    /// utilization ahead, beside the static threshold, which still applies.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
     /// today's chain-position walk) / `soonest weekly reset` / `most weekly

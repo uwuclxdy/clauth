@@ -1652,11 +1652,11 @@ fn value_row_hints_state_what_the_setting_does() {
             ),
             (
                 GlobalConfigRow::BurnFloor,
-                "never switch away before this share is used, however fast the burn",
+                "the burn projection never switches below this share; it does nothing at or above an account's threshold",
             ),
             (
                 GlobalConfigRow::BurnHorizon,
-                "how far ahead to look when guessing the next switch",
+                "how far ahead to look, never past the next usage reading",
             ),
         ] {
             assert_eq!(
@@ -1678,6 +1678,26 @@ fn value_row_hints_state_what_the_setting_does() {
     assert_eq!(
         row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
         Some("no context nudge is sent")
+    );
+}
+
+/// The burn-aware hint names the threshold check that still applies with the
+/// mode on, so the projection reads as an earlier switch, never a later one.
+#[test]
+fn burn_aware_hints_keep_the_threshold_check() {
+    let mut on = toggles();
+    on.burn_aware = true;
+    let mut off = toggles();
+    off.burn_aware = false;
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, on, tunables()).as_deref(),
+        Some(
+            "switch the active account away at its threshold, or sooner once its burn would reach 100% within the look-ahead"
+        )
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, off, tunables()).as_deref(),
+        Some("switch the active account away once its usage crosses its threshold")
     );
 }
 
