@@ -6988,7 +6988,8 @@ struct AwaitOutcome {
     /// The ids still running.
     pending: Vec<String>,
     /// The jobs whose server died with their result: reported as lost, never
-    /// as still running. A wake names each at most once (the session's
+    /// as still running. A wake names each once, and again under a later
+    /// host only while the reporting host never confirmed it (the session's
     /// reported-lost set).
     dead: Vec<LostJob>,
     /// The wait ran out rather than ending on a job or an idle session.
@@ -7097,16 +7098,29 @@ fn turn_end_watch(payload: Option<&crate::hook_note::Payload>) -> Option<AwaitWa
     }
     let now = crate::usage::now_ms();
     let mut adopted = crate::hook_jobs::own_jobs(&payload.session_id, now);
-    if !adopted.is_empty() {
-        // A kept corpse stays in the store for up to the silence window after
-        // the wake already reported it lost; the reported-lost sidecar is what
-        // keeps that report to once. Drop the ids it names here, so a turn end
-        // whose only adopted jobs are already reported ends the hook at once —
-        // no watcher process, no lease — instead of starting a watcher that
-        // would find nothing left to say.
-        let reported = crate::hook_jobs::reported_lost(&payload.session_id);
-        adopted.retain(|id| !reported.contains(id));
+    // A kept corpse stays in the store for up to the silence window after
+    // the wake already reported it lost; the reported-lost sidecar is what
+    // keeps that report to once. A turn end under the host that wrote the
+    // entry confirms it told before deciding what to adopt, whichever turn
+    // that is.
+    let host = crate::hook_jobs::claude_pid();
+    if let Some(pid) = host {
+        crate::hook_jobs::confirm_reported_lost(&payload.session_id, pid);
     }
+    // Drop the ids this turn end must not adopt: a told entry was already
+    // confirmed (a bare id list reads as told), and a pending entry from
+    // this host was just confirmed. A pending entry from another host stays
+    // adopted, so the watcher this turn end arms re-reports it; without a
+    // host pid no entry is confirmed and none re-reported, so every id the
+    // sidecar names is dropped. A turn end whose only adopted jobs fall out
+    // here ends the hook at once — no watcher process, no lease — instead of
+    // starting a watcher that would find nothing left to say.
+    let reports = crate::hook_jobs::lost_reports(&payload.session_id);
+    adopted.retain(|id| {
+        !reports.iter().any(|report| {
+            &report.id == id && (report.told || host.is_none() || report.host == host)
+        })
+    });
     if adopted.is_empty() {
         return None;
     }
@@ -7511,8 +7525,9 @@ fn settle_await(
 /// Poll the watched jobs until the wait can end: a call's whole fan-out is
 /// finished, any adopted job is, nothing remains, a watched job turns silent
 /// past the store's corpse window, a watched job's server dies with its
-/// result (the lost wake, reported once per session), the session has sat
-/// idle past `limits.idle_wake_ms` on a 1 h prompt cache, or
+/// result (the lost wake, once per session and again under a later host only
+/// when the reporting host never confirmed it), the session has sat idle past
+/// `limits.idle_wake_ms` on a 1 h prompt cache, or
 /// `limits.deadline` passes. The idle wake needs the session the payload
 /// named to still be the host's current one (`session_moved`): `/clear`,
 /// `/fork` and `/branch` move the id while the process lives, and a wake then
@@ -7534,8 +7549,22 @@ fn await_job_outcomes(
     // once there too; adoption and the idle wake keep the lease as their
     // gate.
     let report_session = session.or(watch.session.as_deref());
+    // The sidecar ids this wait must stay silent about: a told entry never
+    // wakes again, and a pending entry this host reported is this host's to
+    // confirm, never to repeat. A pending entry from another host is the
+    // wake the other host owed and may never have delivered, so this wait
+    // carries it. Without a host pid no entry can be judged
+    // pending-from-another, so the whole sidecar stays silent, as it always
+    // did.
+    let host = crate::hook_jobs::claude_pid();
     let reported = report_session
-        .map(crate::hook_jobs::reported_lost)
+        .map(|session| {
+            crate::hook_jobs::lost_reports(session)
+                .into_iter()
+                .filter(|report| report.told || host.is_none() || report.host == host)
+                .map(|report| report.id)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let mut held = watch.held.clone();
     let mut adopted = watch.adopted.clone();
@@ -7599,8 +7628,9 @@ fn await_job_outcomes(
         }
 
         // A watched job whose server died ends the wait the same way: the
-        // wake names it as lost once, and the session's reported-lost set
-        // keeps every later wait silent about it.
+        // wake names it as lost, and the session's reported-lost set keeps
+        // this host's later waits silent about it, and every host's once
+        // confirmed.
         if !moved.dead.is_empty() && rearmable {
             return settle_watched(
                 report_session,
@@ -7681,9 +7711,9 @@ fn await_job_outcomes(
 
 /// [`settle_await`] plus the once-record: a lost job the wake reports is
 /// written to the session's reported-lost set before the outcome leaves, so
-/// the next wait over the same session names it never again. Nothing else
-/// writes or claims the job record itself, so `monitor` and the job store
-/// answer exactly as before.
+/// no later wait of this host names it again, nor any once it is told.
+/// Nothing else writes or claims the job record itself, so `monitor` and the
+/// job store answer exactly as before.
 fn settle_watched(
     session: Option<&str>,
     finished: &[String],

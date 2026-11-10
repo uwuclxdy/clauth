@@ -1551,3 +1551,366 @@ fn several_old_lost_jobs_share_one_plural_line_with_no_ages() {
         "{outcome:?}"
     );
 }
+
+/// The hook environment of the `claude` process a turn end runs under.
+fn host_pin<'a>(home: &'a HomeSandbox, claude_pid: &str) -> crate::testutil::EnvPin<'a> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+            ("CLAUDE_PID", Some(std::ffi::OsStr::new(claude_pid))),
+        ],
+    )
+}
+
+/// At exit Claude Code kills `clauth mcp` before its hook shells, so the
+/// watcher still running reports the job lost to a host that never starts a
+/// turn for it. That report is not yet told: the resumed session, under a new
+/// `claude` process, adopts the job at its first turn end and gets the lost
+/// line.
+#[test]
+fn a_lost_report_to_a_host_that_never_ran_another_turn_reaches_the_resumed_session() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+    let lost = "delegate job `d-x` ended with its server; its result is lost. run the task again."
+        .to_string();
+
+    let exiting_host = host_pin(&home, "111111");
+    let watch = turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (2, Some(lost.clone())),
+        "{outcome:?}"
+    );
+    drop(watch);
+    drop(exiting_host);
+
+    let _resumed_host = host_pin(&home, "222222");
+    let resumed = turn_end_watch(Some(&payload("Stop")))
+        .expect("the resumed session adopts the job its old host never showed");
+    assert_eq!(resumed.adopted, ["d-x"]);
+    let again = await_job_outcomes(&resumed, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&again), (2, Some(lost)), "{again:?}");
+}
+
+/// The wake's own turn end, under the host that got the wake, makes the
+/// report told: neither that host's later turn ends nor a resumed session
+/// under a new host wake about the job again.
+#[test]
+fn a_lost_report_its_host_ran_a_turn_after_stays_told_across_a_resume() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+
+    let host = host_pin(&home, "111111");
+    let watch = turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome).0, 2, "{outcome:?}");
+    drop(watch);
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the wake's own turn end under the same host has nothing new to watch"
+    );
+    drop(host);
+
+    let _resumed_host = host_pin(&home, "222222");
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "a report its host ran a turn after stays told"
+    );
+}
+
+/// A pending report a dead host left behind follows the session through every
+/// host that dies before confirming it: the resumed host re-reports the
+/// pending id and its own turn end confirms the entry, so a third host adopts
+/// nothing.
+#[test]
+fn a_resumed_host_re_reports_a_pending_lost_job_then_confirms_it_and_a_third_host_adopts_nothing() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+    let lost = "delegate job `d-x` ended with its server; its result is lost. run the task again."
+        .to_string();
+
+    let first = host_pin(&home, "111111");
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the first host's watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (2, Some(lost.clone())),
+        "{outcome:?}"
+    );
+    drop(watch);
+    drop(first);
+
+    let resumed = host_pin(&home, "222222");
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the resumed host adopts the pending report");
+    assert_eq!(watch.adopted, ["d-x"]);
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome), (2, Some(lost)), "{outcome:?}");
+    drop(watch);
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the wake's own turn end under the resumed host confirms the entry"
+    );
+    drop(resumed);
+
+    let _third = host_pin(&home, "333333");
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "a confirmed entry is never adopted again, by any host"
+    );
+}
+
+/// A re-report re-homes the entry to the host that woke the session, still
+/// pending: a host that dies before its own turn end leaves the entry for the
+/// next host to re-report, so the once survives any number of dead hosts
+/// until one runs a later turn end.
+#[test]
+fn a_re_reporting_host_that_dies_before_confirming_leaves_the_entry_for_the_next_host() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+
+    let first = host_pin(&home, "111111");
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the first host's watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome).0, 2, "{outcome:?}");
+    drop(watch);
+    drop(first);
+
+    let second = host_pin(&home, "222222");
+    let watch =
+        turn_end_watch(Some(&payload("Stop"))).expect("the second host adopts the pending report");
+    assert_eq!(watch.adopted, ["d-x"]);
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome).0, 2, "{outcome:?}");
+    drop(watch);
+    drop(second);
+
+    let third = host_pin(&home, "333333");
+    let watch = turn_end_watch(Some(&payload("Stop")))
+        .expect("the entry stayed pending after the second host died, so the third host adopts it");
+    assert_eq!(watch.adopted, ["d-x"]);
+    drop(watch);
+    drop(third);
+}
+
+/// A lost report written with no host pid to attribute is told at once: no
+/// host is known that could ever confirm it, so a resumed session never
+/// re-reports it.
+#[test]
+fn a_lost_report_written_without_a_host_pid_is_told_at_once() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+
+    let _no_pid = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+            ("CLAUDE_PID", None),
+        ],
+    );
+    let watch = turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome).0, 2, "{outcome:?}");
+    drop(watch);
+    drop(_no_pid);
+
+    let _resumed = host_pin(&home, "222222");
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the pid-less report was told at once, so the resumed host adopts nothing"
+    );
+}
+
+/// A sidecar in the old bare-id format reads as all told: the hosts those
+/// reports were written to can never confirm them, so no host adopts them
+/// again.
+#[test]
+fn an_old_format_lost_sidecar_reads_as_all_told() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+    let sidecar = crate::hook_note::record_path(SESSION, None)
+        .unwrap()
+        .with_extension("lost");
+    let dir = sidecar.parent().unwrap().to_path_buf();
+    crate::profile::mkdir_700(&dir).unwrap();
+    std::fs::write(&sidecar, b"[\"d-x\"]").unwrap();
+
+    let _resumed = host_pin(&home, "222222");
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "a bare id list reads as all told, so the resumed host adopts nothing"
+    );
+}
+
+/// The confirm and the re-report key on the session id the hook payload
+/// names: a turn end whose payload names another session leaves the entry
+/// pending, and a turn end of the named session under another host
+/// re-reports it.
+#[test]
+fn a_turn_end_touches_only_the_sidecar_of_the_session_its_payload_names() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+    let other = Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-peer".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+
+    let first = host_pin(&home, "111111");
+    let watch = turn_end_watch(Some(&payload("Stop"))).expect("the dead job arms the watcher");
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome).0, 2, "{outcome:?}");
+    drop(watch);
+
+    assert!(
+        turn_end_watch(Some(&other)).is_none(),
+        "the moved session's turn end has nothing of its own to watch"
+    );
+    assert_eq!(
+        crate::hook_jobs::reported_lost(SESSION),
+        ["d-x"],
+        "the moved session's turn end neither confirms nor re-reports the old id's entry"
+    );
+    drop(first);
+
+    let _resumed = host_pin(&home, "222222");
+    let watch = turn_end_watch(Some(&payload("Stop"))).expect(
+        "the pending entry outlived the moved session's turn end and reaches the resumed host",
+    );
+    assert_eq!(watch.adopted, ["d-x"]);
+    drop(watch);
+}
+
+/// A told entry stays told whatever a later report writes: a stale re-report
+/// of an id the host already confirmed cannot flip the entry back to
+/// pending, so a resume under another host adopts nothing.
+#[test]
+fn record_lost_never_revives_a_told_entry() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+
+    let host = host_pin(&home, "111111");
+    crate::hook_jobs::record_lost(SESSION, &["d-x".to_string()]);
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the host's own turn end confirms the entry and has nothing left to watch"
+    );
+    crate::hook_jobs::record_lost(SESSION, &["d-x".to_string()]);
+    assert_eq!(
+        crate::hook_jobs::lost_reports(SESSION),
+        [crate::hook_jobs::LostReport {
+            id: "d-x".to_string(),
+            host: Some(111111),
+            told: true,
+        }],
+        "the told entry stays told after the stale re-report under the same host"
+    );
+    drop(host);
+
+    let _resumed = host_pin(&home, "222222");
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "a resume under another host adopts nothing"
+    );
+}
+
+/// A wait whose own host reported the job pending must stay silent about it:
+/// the report is that host's to confirm at its next turn end, never to
+/// repeat, so the wait ends with nothing to say.
+#[test]
+fn a_wait_silences_a_pending_entry_its_own_host_reported() {
+    let home = HomeSandbox::new();
+    write_job("d-x", Some(SESSION), "running", 4242);
+    let sidecar = crate::hook_note::record_path(SESSION, None)
+        .unwrap()
+        .with_extension("lost");
+    let dir = sidecar.parent().unwrap().to_path_buf();
+    crate::profile::mkdir_700(&dir).unwrap();
+    std::fs::write(&sidecar, br#"[{"id":"d-x","host":222222,"told":false}]"#).unwrap();
+
+    let _host = host_pin(&home, "222222");
+    let watch = watcher(&["d-x"], &[], 0);
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+    assert!(
+        outcome.dead.is_empty(),
+        "the wait reports nothing: {outcome:?}"
+    );
+    assert_eq!(await_job_wake(&outcome), (0, None), "{outcome:?}");
+}
+
+/// Both writers of the lost sidecar read and rewrite it under the
+/// conversation's scope flock, so a report and a confirm racing from two hook
+/// processes cannot drop each other's change.
+#[test]
+fn both_lost_sidecar_writers_wait_on_the_scope_flock() {
+    use std::time::Duration;
+    let home = HomeSandbox::new();
+    let _host = host_pin(&home, "111111");
+
+    let park = crate::lock::flock_wait_park::arm();
+    let report = std::thread::spawn(|| {
+        crate::hook_jobs::record_lost(SESSION, &["d-x".to_string()]);
+    });
+    park.parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the report waits on the scope flock before it reads the sidecar");
+    park.release.send(()).expect("release the report");
+    report.join().expect("the report finishes");
+    drop(park);
+
+    let park = crate::lock::flock_wait_park::arm();
+    let confirm = std::thread::spawn(|| {
+        crate::hook_jobs::confirm_reported_lost(SESSION, 111111);
+    });
+    park.parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the confirm waits on the scope flock before it reads the sidecar");
+    park.release.send(()).expect("release the confirm");
+    confirm.join().expect("the confirm finishes");
+
+    assert_eq!(
+        crate::hook_jobs::lost_reports(SESSION),
+        [crate::hook_jobs::LostReport {
+            id: "d-x".to_string(),
+            host: Some(111111),
+            told: true,
+        }]
+    );
+}
+
+/// `record_lost` reads the sidecar only once it holds the scope flock, so a
+/// write landing while it waits for the flock is read, never overwritten.
+#[test]
+fn a_sidecar_write_landing_while_record_lost_waits_on_the_scope_flock_survives() {
+    use std::time::Duration;
+    let home = HomeSandbox::new();
+    let _host = host_pin(&home, "111111");
+    let sidecar = crate::hook_note::record_path(SESSION, None)
+        .unwrap()
+        .with_extension("lost");
+    crate::profile::mkdir_700(sidecar.parent().unwrap()).unwrap();
+
+    let park = crate::lock::flock_wait_park::arm();
+    let report = std::thread::spawn(|| {
+        crate::hook_jobs::record_lost(SESSION, &["d-x".to_string()]);
+    });
+    park.parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the report waits on the scope flock");
+    std::fs::write(&sidecar, br#"[{"id":"d-y","host":222222,"told":false}]"#).unwrap();
+    park.release.send(()).unwrap();
+    report.join().unwrap();
+
+    assert_eq!(
+        crate::hook_jobs::reported_lost(SESSION),
+        ["d-y", "d-x"],
+        "a write landing while record_lost waits on the flock survives"
+    );
+}

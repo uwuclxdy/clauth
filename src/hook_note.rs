@@ -972,8 +972,9 @@ fn touch_record(path: &Path) {
 /// Today there is no such nesting: `note_for_inner`, `nudge_note`,
 /// `gc_conversation_records`, `hook_context::context_note`, the resume-report
 /// leg's seq mint, re-send arm and restore-notice record and take, and
-/// `hook_jobs`'s turn-end stamp and clear and its lease `try_lock` are the only
-/// holders and none reaches another.
+/// `hook_jobs`'s turn-end stamp and clear, its lost-sidecar record and
+/// confirm, and its lease `try_lock` are the only holders and none reaches
+/// another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)

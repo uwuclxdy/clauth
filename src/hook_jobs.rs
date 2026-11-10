@@ -30,7 +30,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_record};
 use crate::mcp::jobs::{self, JobPhase, RecordKind, StoredJob};
@@ -568,34 +568,156 @@ impl CacheView {
     }
 }
 
-/// The lost-job ids this conversation's watcher has already reported, read
-/// from the sidecar beside the record. A file that cannot be read (never
+/// One lost-job report in the sidecar: the id, the pid of the `claude` host
+/// the reporting hook ran under, and whether a later turn end of that host
+/// has confirmed it told (or no host could: a pid-less or old-format report).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LostReport {
+    pub(crate) id: String,
+    pub(crate) host: Option<u32>,
+    pub(crate) told: bool,
+}
+
+/// The sidecar's two on-disk shapes: the current entry list, and the bare id
+/// list older versions wrote.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LostSidecar {
+    Entries(Vec<LostReport>),
+    Ids(Vec<String>),
+}
+
+/// Every lost-job report of this conversation, read from the sidecar beside
+/// the record. A bare id list reads as all told: the host those reports were
+/// written to can never confirm them. A file that cannot be read (never
 /// written, or not a file at all) reads as none.
-pub(crate) fn reported_lost(session_id: &str) -> Vec<String> {
+pub(crate) fn lost_reports(session_id: &str) -> Vec<LostReport> {
     let Ok(path) = record_path(session_id, None) else {
         return Vec::new();
     };
-    std::fs::read(path.with_extension(REPORTED_LOST_EXTENSION))
+    let bytes = match std::fs::read(path.with_extension(REPORTED_LOST_EXTENSION)) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(LostSidecar::Entries(entries)) => entries,
+        Ok(LostSidecar::Ids(ids)) => ids
+            .into_iter()
+            .map(|id| LostReport {
+                id,
+                host: None,
+                told: true,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The lost-job ids the sidecar names, told or pending: what the sweep's reap
+/// checks to know whether any record they guard still exists.
+pub(crate) fn reported_lost(session_id: &str) -> Vec<String> {
+    lost_reports(session_id)
+        .into_iter()
+        .map(|report| report.id)
+        .collect()
+}
+
+/// The pid of the `claude` process this hook command runs under (`CLAUDE_PID`,
+/// set for hook commands), or `None` when unset or unparsable.
+pub(crate) fn claude_pid() -> Option<u32> {
+    std::env::var("CLAUDE_PID")
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .and_then(|v| v.parse::<u32>().ok())
 }
 
 /// Record the lost-job ids a wake just reported, so no later wait of this
-/// session names them again. Lives in a sidecar beside the conversation's
+/// host names them again. Lives in a sidecar beside the conversation's
 /// record, written atomically; the sweep reaps it with the lease. A write
 /// that fails degrades the once to the process, which still ends after the
 /// wake.
+///
+/// Each entry carries the reporting host and stays pending until a later
+/// turn end of that host confirms it: the host that got the wake owes the
+/// confirm, and a host that dies before running one still owes the session
+/// the wake, which the resumed host re-reports under its own pid, still
+/// pending. A report written with no pid to attribute is told at once, since
+/// no host is known that could confirm it. A told entry stays told: no later
+/// report of any host revives it, so a stale re-report cannot flip it back
+/// to pending.
 pub(crate) fn record_lost(session_id: &str, ids: &[String]) {
     let Ok(path) = record_path(session_id, None) else {
         return;
     };
     let path = path.with_extension(REPORTED_LOST_EXTENSION);
-    let mut reported = reported_lost(session_id);
+    let host = claude_pid();
+    // The read-modify-write runs under ScopeLock, the serialization every
+    // writer of this conversation's record takes, so while it is held a
+    // concurrent confirm cannot land its write on a stale copy of this one,
+    // nor this one on a stale copy of the confirm. An acquisition that times
+    // out proceeds unlocked, as every holder's does.
+    let _hold = ScopeLock::acquire();
+    let mut reports = lost_reports(session_id);
     let mut changed = false;
     for id in ids {
-        if !reported.contains(id) {
-            reported.push(id.clone());
+        match reports.iter_mut().find(|report| report.id == *id) {
+            Some(report) => {
+                if report.told {
+                    continue;
+                }
+                // A re-report re-homes the entry to the host that just woke
+                // the session, still pending until that host's own turn end;
+                // with no pid to attribute it is told at once, since no host
+                // is known that could confirm it.
+                if report.host != host {
+                    report.host = host;
+                    changed = true;
+                }
+                if host.is_none() {
+                    report.told = true;
+                    changed = true;
+                }
+            }
+            None => {
+                reports.push(LostReport {
+                    id: id.clone(),
+                    host,
+                    told: host.is_none(),
+                });
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return;
+    }
+    if let Err(e) =
+        crate::profile::atomic_write_600(&path, serde_json::to_vec(&reports).unwrap_or_default())
+    {
+        crate::logline::to_logfile(format_args!(
+            "await-job: cannot record the lost jobs of {session_id} on {}: {e:#}",
+            path.display()
+        ));
+    }
+}
+
+/// A turn end under host `pid` confirms every pending report that host wrote,
+/// whichever turn that is: a confirmed entry is never re-reported, whatever
+/// host runs a later turn end. A pending report from another host stays
+/// pending for that host's turn end — or, when the host never runs one, for
+/// a resumed host to re-report.
+pub(crate) fn confirm_reported_lost(session_id: &str, pid: u32) {
+    let Ok(path) = record_path(session_id, None) else {
+        return;
+    };
+    let path = path.with_extension(REPORTED_LOST_EXTENSION);
+    // Same serialization as record_lost: the confirm's read-modify-write
+    // must not lose a concurrent re-report, nor a re-report lose it.
+    let _hold = ScopeLock::acquire();
+    let mut reports = lost_reports(session_id);
+    let mut changed = false;
+    for report in &mut reports {
+        if !report.told && report.host == Some(pid) {
+            report.told = true;
             changed = true;
         }
     }
@@ -603,10 +725,10 @@ pub(crate) fn record_lost(session_id: &str, ids: &[String]) {
         return;
     }
     if let Err(e) =
-        crate::profile::atomic_write_600(&path, serde_json::to_vec(&reported).unwrap_or_default())
+        crate::profile::atomic_write_600(&path, serde_json::to_vec(&reports).unwrap_or_default())
     {
         crate::logline::to_logfile(format_args!(
-            "await-job: cannot record the lost jobs of {session_id} on {}: {e:#}",
+            "await-job: cannot confirm the lost jobs of {session_id} on {}: {e:#}",
             path.display()
         ));
     }
@@ -619,10 +741,7 @@ pub(crate) fn record_lost(session_id: &str, ids: &[String]) {
 /// or unparsable pid and an unreadable record read as not moved, so the idle
 /// wake then behaves as before.
 pub(crate) fn host_session_moved(session_id: &str) -> bool {
-    let Some(pid) = std::env::var("CLAUDE_PID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    else {
+    let Some(pid) = claude_pid() else {
         return false;
     };
     let Some(dir) = crate::which::session_config_dir_or_global().map(|dir| dir.join("sessions"))
