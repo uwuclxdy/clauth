@@ -6,9 +6,9 @@
 //! `non-login keys`, `refresh` cadence, `refresh spent` toggle, `context
 //! nudge`, `auto-start queue`, `rotation`, `auto-update`), auto-switch
 //! (`weekly limit`,
-//! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
+//! `switch mode` = burn-aware, `walk order`, the burn-aware
 //! `burn floor`/`burn horizon`
-//! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
+//! tunables it gates, then the `quota spent` halt), then
 //! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
 //! default — real money).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the

@@ -1331,7 +1331,7 @@ pub(crate) struct AppState {
     /// `min(poll interval, burn_horizon_cap_ms)`, the poll interval being the
     /// active's usage-probe interval where the probe reads it) beside the static
     /// per-profile threshold check, which always applies — switching early
-    /// when the projection would cross 100%, never later than static. With no
+    /// when the projection would reach 100%, never later than static. With no
     /// burn rate yet, or on a third-party provider window, the static check
     /// alone decides. Off by default. Candidate selection and `soonest_resume`
     /// are unaffected either way — the ACTIVE-side check is the walk's own.
@@ -1510,7 +1510,7 @@ pub(crate) struct AppState {
     pub(crate) weekly_switch_threshold: Option<f64>,
     /// Burn-aware floor: the lowest 5h utilization at which a projected switch
     /// may fire (`burn_aware_switching` only). The projection adds "would
-    /// cross 100% within the look-ahead" beside the static threshold, and on a
+    /// reach 100% within the look-ahead" beside the static threshold, and on a
     /// small window (Pro) the window-relative burn %/h reads high, so the
     /// projection trips from well below 100 — this caps the wasted headroom at
     /// `100 - min(floor, threshold)` on every tier, and a floor at or above
@@ -1524,8 +1524,8 @@ pub(crate) struct AppState {
     /// refresh interval, or the active's usage-probe interval where the probe
     /// reads it), so a long poll cadence can't balloon the early-switch margin
     /// (it scales linearly with the look-ahead). `None` =
-    /// [`DEFAULT_BURN_HORIZON_MS`]. Read
-    /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
+    /// [`DEFAULT_BURN_HORIZON_MS`]. Read through
+    /// [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_horizon_cap_ms: Option<u64>,
     /// The `[herdr]` table: the herdr-plugin knobs plus the first-landing
@@ -1678,8 +1678,9 @@ impl AppState {
 
     /// The effective burn-aware horizon cap (ms), resetting an out-of-band
     /// hand-edit to the default. Shares the refresh-interval band since the cap
-    /// is only ever compared against — and floored by — the poll interval (the
-    /// refresh interval, or a probe-read active's usage-probe interval).
+    /// only ever bounds the look-ahead from above together with the poll
+    /// interval (`min(poll interval, cap)`; the poll interval being the refresh
+    /// interval, or a probe-read active's usage-probe interval).
     pub(crate) fn burn_horizon_cap_ms(&self) -> u64 {
         self.burn_horizon_cap_ms
             .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
@@ -1813,8 +1814,8 @@ pub(crate) const MIN_BURN_FLOOR_PCT: f64 = 90.0;
 pub(crate) const MAX_BURN_FLOOR_PCT: f64 = 100.0;
 
 /// Default burn-aware horizon cap (60 s). Under the default 90 s cadence this
-/// shrinks the projected look-ahead below the full interval, reclaiming most of
-/// the early-switch margin while keeping a poll-lag cushion. Bounded by the
+/// cuts the projected look-ahead, and with it the early-switch margin, by a
+/// third, while keeping a poll-lag cushion. Bounded by the
 /// poll interval either way (`min(interval, cap)`; the usage-probe interval on
 /// a probe-read active).
 pub(crate) const DEFAULT_BURN_HORIZON_MS: u64 = 60_000;

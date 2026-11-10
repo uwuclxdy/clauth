@@ -14456,7 +14456,7 @@ fn divergence_default_row_is_reachable_by_cursor() {
     assert_eq!(app.global_config_cursor, pos);
 }
 
-// ── burn-aware switching (issue #8 follow-up b) ─────────────────────────────
+// ── burn-aware switching ────────────────────────────────────────────────────
 
 #[test]
 fn burn_aware_row_is_reachable_by_cursor() {
@@ -46265,7 +46265,7 @@ mod usage_picker {
 
     /// The startup one-shot's rate step refuses a hybrid's OAuth burn history:
     /// its store reading is the provider windows, so no cross-pool projection
-    /// reaches `auto_switch_if_needed` (maintainer ruling 2026-09-10).
+    /// reaches `auto_switch_if_needed`.
     #[test]
     fn the_startup_one_shots_rate_step_refuses_a_hybrid() {
         let _home = crate::testutil::HomeSandbox::new();

@@ -7100,7 +7100,7 @@ fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
 
 /// A hybrid active has no projected-switch ETA: its provider window has no OAuth
 /// burn history to pair with, so `projected_switch` renders nothing even when a
-/// burn series exists under the name (maintainer ruling 2026-09-10).
+/// burn series exists under the name.
 #[test]
 fn a_hybrid_has_no_projected_switch_eta() {
     let _home = crate::testutil::HomeSandbox::new();

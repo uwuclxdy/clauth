@@ -906,9 +906,9 @@ pub(crate) enum GlobalConfigRow {
     /// Read off disk where it is used, so a flip applies to the next sync pass
     /// and the next swap hand-off. ENUMERATED on/off, ⏎ mirrors space.
     SyncMcpLogins,
-    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
-    /// follow-up b) — off by default, also projects the ACTIVE profile's
-    /// utilization ahead, beside the static threshold, which still applies.
+    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`) — off by
+    /// default, also projects the ACTIVE profile's utilization ahead, beside
+    /// the static threshold, which still applies.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
     /// today's chain-position walk) / `soonest weekly reset` / `most weekly
@@ -7090,7 +7090,7 @@ impl App {
     /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
     /// `usage_store` paired with the in-memory `history_cache`; `None` for a
     /// third-party-classified active, whose provider window never pairs with the
-    /// OAuth burn history (maintainer ruling 2026-09-10).
+    /// OAuth burn history.
     fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
         let (name, third_party) = {
             let cfg = self.config();
@@ -7191,7 +7191,7 @@ impl App {
             .map(|m| m.threshold)
             .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
         // A third-party-classified active has no burn history to pair with its
-        // provider window (maintainer ruling 2026-09-10), so no rate.
+        // provider window, so no rate.
         let active_rate = if third_party_names.contains(&active) {
             None
         } else {
@@ -20527,11 +20527,10 @@ fn toggle_wrap_off(app: &mut App) {
     app.apply_forgets();
 }
 
-/// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
-/// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `update_app_state`, drain forgets — no separate propagation to the
-/// scheduler is needed since `next_auto_switch_target` reads the flag straight
-/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// Flip the opt-in burn-aware auto-switch mode through `save_state_delta`,
+/// then drain forgets — no separate propagation to the scheduler is needed
+/// since `next_auto_switch_target` reads the flag straight off the same shared
+/// `config` (`snapshot_chain` copies it into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     let next = !app.config().state.burn_aware_switching;
     app.save_state_delta(|s, _held| s.burn_aware_switching = next);

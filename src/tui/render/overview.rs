@@ -2340,8 +2340,8 @@ fn projected_switch(app: &App, key_rejected: &HashSet<ProfileName>) -> Option<(S
     let action = projection.action?;
     let usage = projection.active_usage.as_ref()?.five_hour.as_ref()?;
     // In-memory rate (`history_cache`) — no disk read under any guard. A
-    // third-party member has no burn history to pair with its provider window
-    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    // third-party member has no burn history to pair with its provider window,
+    // so no rate and no projection.
     let eta_secs = burn_rate_eta(
         projection.active_rate,
         usage.utilization,
