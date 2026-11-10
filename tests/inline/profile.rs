@@ -10765,8 +10765,8 @@ fn a_reorder_landing_a_noted_name_last_in_a_compact_list_keeps_the_close() {
 type SweepCase<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
 
 /// Every edit of every list shape keeps the file loadable, every comment
-/// line, and every after-comma note on its owner's line while that owner's
-/// copies all survive.
+/// line, every after-comma note on its owner's line while that owner's
+/// copies all survive, and a bracket-line comment on the bracket's line.
 #[test]
 fn list_edits_keep_every_comment_and_every_note_on_its_owner() {
     let _home = HomeSandbox::new();
@@ -10827,6 +10827,7 @@ fn list_edits_keep_every_comment_and_every_note_on_its_owner() {
             &["solo"],
             &[("solo", "# only")],
         ),
+        ("profiles = [ # open\n  \"a\"]\n", &["a"], &[]),
     ];
     let mut wrong = Vec::new();
     for &(fixture, names, notes) in corpus {
@@ -10870,6 +10871,25 @@ fn list_edits_keep_every_comment_and_every_note_on_its_owner() {
             if comment_texts(fixture) != comment_texts(&after) {
                 wrong.push(format!(
                     "{edit} of {fixture:?}: a comment line was lost or gained\n  got  {after:?}"
+                ));
+            }
+            // A comment on the open bracket's line is the list's: it stays
+            // on that line, never on a name's.
+            let bracket_note = |text: &str| -> Option<String> {
+                let line = text.lines().find(|l| l.contains('['))?;
+                let head = &line[line.find('[')? + 1..];
+                match (head.find('#'), head.find('"')) {
+                    (Some(hash), Some(quote)) if hash < quote => Some(head[hash..].trim().into()),
+                    (Some(hash), None) => Some(head[hash..].trim().into()),
+                    _ => None,
+                }
+            };
+            if let Some(note) = bracket_note(fixture)
+                && bracket_note(&after).as_deref() != Some(note.as_str())
+            {
+                wrong.push(format!(
+                    "{edit} of {fixture:?}: the bracket comment {note:?} left \
+                     the bracket's line\n  got  {after:?}"
                 ));
             }
             for &(owner, note) in notes {
@@ -11198,4 +11218,236 @@ fn a_crlf_config_holding_a_multiline_string_survives_a_record_write() {
         Some(proxy_account("stub", "acct-1")),
         "the file still parses"
     );
+}
+
+/// A comment after a list's `[` labels the whole list: whichever name ends
+/// up first, the comment stays on the bracket's line and never becomes that
+/// name's note.
+#[test]
+fn a_comment_on_a_lists_open_bracket_line_stays_on_that_line_through_every_edit() {
+    let _home = HomeSandbox::new();
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "profiles = [ # tried in order\n  \"work\",\n  \"home\",\n]\n",
+            &["home", "work"],
+            "profiles = [ # tried in order\n  \"home\",\n  \"work\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+            &["c", "a", "b"],
+            "profiles = [ # accounts\n  \"c\",\n  \"a\",\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+            &["b", "a", "c"],
+            "profiles = [ # accounts\n  \"b\",\n  \"a\",\n  \"c\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n  \"b\", # B\n]\n",
+            &["b", "a"],
+            "profiles = [ # accounts\n  \"b\", # B\n  \"a\", # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n]\n",
+            &["a", "b", "c"],
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n  \"b\",\n]\n",
+            &["b"],
+            "profiles = [ # accounts\n  # A\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n]\n",
+            &[],
+            "profiles = [ # accounts\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n]\n",
+            &["z", "b"],
+            "profiles = [ # accounts\n  \"z\",\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # open\r\n  \"a\", # A\r\n  \"b\",\r\n]\r\n",
+            &["b", "a"],
+            "profiles = [ # open\r\n  \"b\",\r\n  \"a\", # A\r\n]\r\n",
+        ),
+        (
+            "profiles = [ \"a\", # A\n  \"b\", # B\n]\n",
+            &["b", "a"],
+            "profiles = [ \"b\", # B\n  \"a\", # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n]\n",
+            &[],
+            "profiles = [ # accounts\n  # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\"]\n",
+            &["b", "a"],
+            "profiles = [ # accounts\n  \"b\",\n  \"a\"]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for &(fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!(
+                "{fixture:?} -> {target:?}\n  got  {after:?}\n  want {expected:?}"
+            ));
+        }
+        if load_app_state()
+            .map(|s| s.profiles != state.profiles)
+            .unwrap_or(true)
+        {
+            wrong.push(format!("{fixture:?}: reload failed or names moved"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The Fallback tab's swap reaches the same editor through the chain: the
+/// bracket comment stays put there too.
+#[test]
+fn a_chain_swap_keeps_the_open_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [ # tried in order\n  \"work\", # day job\n  \"home\",\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.fallback_chain = ["home", "work"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [ # tried in order\n  \"home\",\n  \"work\", # day job\n]\n"
+    );
+}
+
+/// An unpaired removal of the first name under a bracket comment: the
+/// comment stays on the bracket's line and the comment block above the
+/// removed name carries onto the next one.
+#[test]
+fn a_bracket_comment_rides_out_an_unpaired_removal_of_the_first_name() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  # above\n  \"a\",\n  \"b\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # above\n  \"b\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b"].map(ProfileName::from).to_vec());
+}
+
+/// The list emptied by a save while `auth_broken` still names the removed
+/// account: the bracket comment stays on the bracket's line and the
+/// quarantine key beside it keeps its bytes.
+#[test]
+fn an_auth_broken_save_keeps_the_bracket_comment_when_the_list_empties() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n]\n");
+    crate::profile::set_auth_broken_persisted(&ProfileName::from("a"), true)
+        .expect("flag the quarantine");
+    crate::profile::update_app_state(|state, _held| {
+        state.profiles.clear();
+    })
+    .expect("empty the list");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n]\nauth_broken = [\"a\"]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, Vec::<ProfileName>::new(), "the list emptied");
+    assert_eq!(
+        back.auth_broken,
+        ["a"].map(ProfileName::from).to_vec(),
+        "the quarantine stayed"
+    );
+}
+
+/// The first name moving down: the next name takes the first slot with its
+/// own comment block, and the bracket comment stays on the bracket's line.
+#[test]
+fn a_moved_name_with_its_own_comment_keeps_the_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n  # moves\n  \"b\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # moves\n  \"b\",\n  \"a\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b", "a"].map(ProfileName::from).to_vec());
+}
+
+/// A name moved to the top of a longer list takes its own comment block
+/// into the first slot, below the bracket comment, which stays on the
+/// bracket's line.
+#[test]
+fn a_name_moved_to_the_top_with_its_own_comment_leaves_the_bracket_comment_in_place() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n  \"b\",\n  # top\n  \"c\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["c", "a", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # top\n  \"c\",\n  \"a\",\n  \"b\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(
+        back.profiles,
+        ["c", "a", "b"].map(ProfileName::from).to_vec()
+    );
+}
+
+/// Appending the first name to an empty bracket-comment list: the comment
+/// stays right after `[` and never reads as the name's note.
+#[test]
+fn appending_to_an_empty_bracket_comment_list_keeps_the_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n\"a\"\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["a"].map(ProfileName::from).to_vec());
+}
+
+/// The codex roster's own save reaches the same editor: a removal there
+/// keeps the bracket comment on the bracket's line.
+#[test]
+fn a_codex_roster_edit_keeps_the_open_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_state("profiles = [ # open\n  \"work\",\n  \"home\",\n]\n");
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    crate::codex_profiles::CodexState::update(|state| {
+        state.remove_profile("work");
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  \"home\",\n]\n"
+    );
+    let back = crate::codex_profiles::CodexState::load().expect("reload");
+    assert_eq!(back.profiles(), [ProfileName::from("home")].as_slice());
 }

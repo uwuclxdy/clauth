@@ -4369,6 +4369,10 @@ fn strip_head_note(text: &str) -> Option<(CommaNote, &str)> {
 /// comma, or the last element's suffix when there is no trailing comma): each
 /// such note is lifted off before the decor moves and put back right after
 /// its owner's comma wherever the owner lands.
+///
+/// A comment on the open bracket's line is the list's, though toml_edit parks
+/// it in the first element's prefix (or the trailing of an empty list): it is
+/// lifted the same way and put back right after `[`.
 fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
     let cur: Vec<String> = arr
         .iter()
@@ -4428,6 +4432,27 @@ fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
             }
         }
     }
+    // A comment on the open bracket's line labels the list, though toml_edit
+    // parks it in the first element's prefix head (or the trailing of an
+    // empty list): held apart, it stays on the bracket's line whichever
+    // element ends up first.
+    let open_note = arr
+        .get_mut(0)
+        .and_then(|v| {
+            let prefix = decor_prefix(v.decor()).to_string();
+            strip_head_note(&prefix).map(|(note, rest)| {
+                v.decor_mut()
+                    .set_prefix(format!("{}{}", note.line_break, rest));
+                note
+            })
+        })
+        .or_else(|| {
+            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+            strip_head_note(&trailing).map(|(note, rest)| {
+                arr.set_trailing(format!("{}{}", note.line_break, rest));
+                note
+            })
+        });
     // The whitespace closing a list with no trailing comma rides the last
     // element's suffix, and so does a comment line after the last element:
     // held as the list's trailing text, both stay at the end whichever
@@ -4635,6 +4660,33 @@ fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
                     v.decor_mut()
                         .set_suffix(format!("{}{}{}", note.text, line_break, suffix));
                 }
+            }
+        }
+    }
+    // The held-apart bracket comment goes back right after `[`: onto the
+    // first element's prefix head, minting a line break when the list grew
+    // out of an empty one, or onto the trailing when the list emptied.
+    if let Some(note) = open_note {
+        match arr.get_mut(0) {
+            Some(first) => {
+                let prefix = decor_prefix(first.decor()).to_string();
+                let line_break = if prefix.starts_with('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                first
+                    .decor_mut()
+                    .set_prefix(format!("{}{}{}", note.text, line_break, prefix));
+            }
+            None => {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                let line_break = if trailing.starts_with('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                arr.set_trailing(format!("{}{}{}", note.text, line_break, trailing));
             }
         }
     }
