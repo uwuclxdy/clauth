@@ -165,14 +165,14 @@ impl Grant {
         self.ends_at.as_deref()
     }
 
-    /// The server's label, or the generic name; control characters dropped,
-    /// cut to the same 40 the window names use (this text reaches a terminal).
+    /// The server's label whole, or the generic name; control characters
+    /// dropped, since this text reaches a terminal. The prompt cuts it to 40.
     fn label(&self) -> String {
         let label = terminal_safe(&self.label);
         if shows_nothing(&label) {
             "limit reset".to_string()
         } else {
-            cap_drawn(trim_padding(&label), 40)
+            trim_padding(&label).to_string()
         }
     }
 
@@ -362,14 +362,16 @@ pub(crate) fn new_request_id() -> anyhow::Result<String> {
 // ── the operator-facing text ────────────────────────────────────────────────
 
 /// A cleared-window name as the terminal reads it: the short labels Claude
-/// Code's own copy uses, any other name as sent with its control characters
-/// dropped and cut to 40. Shared by `--list` and the TUI's resets row, so the
-/// two surfaces never spell a label apart.
+/// Code's own copy uses, `7d fable` for the weekly window Fable counts into
+/// (the name the usage bars give it), any other name as sent with its control
+/// characters dropped and cut to 40. Shared by `--list` and the TUI's resets
+/// row, so the two surfaces never spell a label apart.
 pub(crate) fn window_label(name: &str) -> String {
     match name {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
         "seven_day_opus" => "7d opus".to_string(),
+        "seven_day_overage_included" => "7d fable".to_string(),
         "seven_day_sonnet" => "7d sonnet".to_string(),
         other => cap_drawn(&terminal_safe(other), 40),
     }
@@ -559,7 +561,7 @@ pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> S
     } else {
         format!(
             "clauth: use the limit reset \"{}\" on '{name}'?",
-            grant.label()
+            cap_drawn(&grant.label(), 40)
         )
     };
     let mut prompt = format!(

@@ -107,12 +107,14 @@ fn each_grant_row_names_its_own_end() {
     );
 }
 
-/// The server's label is cut to 40 cells on both surfaces that print it.
+/// `--list` prints the server's label whole; the spend prompt cuts it to 40
+/// cells.
 #[test]
-fn a_long_server_label_is_cut_on_both_surfaces() {
+fn a_long_server_label_is_whole_in_the_list_and_cut_in_the_prompt() {
+    let long = "x".repeat(500);
     let body = THREE_GRANTS.replacen(
         r#""label": "Weekly reset""#,
-        &format!(r#""label": "{}""#, "x".repeat(500)),
+        &format!(r#""label": "{long}""#),
         1,
     );
     let status = status(&body);
@@ -120,10 +122,49 @@ fn a_long_server_label_is_cut_on_both_surfaces() {
     let cut = format!("{}...", "x".repeat(37));
     assert!(prompt.contains(&format!("\"{cut}\" on 'cl1'")), "{prompt}");
     let lines = describe_grants("cl1", &status);
+    assert_eq!(
+        lines[2],
+        format!("  * {long}: 1 of 2 available, resets 5h and 7d  (used next)")
+    );
+}
+
+/// A whole label still drops the blanks around it on both surfaces.
+#[test]
+fn a_padded_server_label_prints_trimmed() {
+    let body = THREE_GRANTS.replacen(
+        r#""label": "Weekly reset""#,
+        r#""label": "  Weekly reset  ""#,
+        1,
+    );
+    assert_ne!(body, THREE_GRANTS, "the padded label applied");
+    let status = status(&body);
+    assert_eq!(
+        describe_grants("cl1", &status)[2],
+        "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)"
+    );
+    let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
     assert!(
-        lines[2].starts_with(&format!("  * {cut}: 1 of 2")),
-        "{}",
-        lines[2]
+        prompt.starts_with("clauth: use the limit reset \"Weekly reset\" on 'cl1'?"),
+        "{prompt}"
+    );
+}
+
+/// The window Fable counts into reads `7d fable` on every reset surface, the
+/// name the usage bars and MCP `profiles` give the same window.
+#[test]
+fn the_fable_weekly_reads_7d_fable() {
+    assert_eq!(window_label("seven_day_overage_included"), "7d fable");
+    let body = THREE_GRANTS.replacen(
+        r#""clears": ["five_hour", "seven_day"]"#,
+        r#""clears": ["seven_day_overage_included"]"#,
+        1,
+    );
+    let status = status(&body);
+    let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
+    assert!(prompt.contains("It resets 7d fable now"), "{prompt}");
+    assert_eq!(
+        describe_grants("cl1", &status)[2],
+        "  * Weekly reset: 1 of 2 available, resets 7d fable  (used next)"
     );
 }
 
@@ -503,8 +544,8 @@ fn a_null_or_absent_reset_block_reads_as_no_grant() {
 }
 
 /// Server text reaches the `[y/N]` line and `--list` without format
-/// characters (a right-to-left override would reorder the confirm line) and
-/// cut to a bounded length.
+/// characters (a right-to-left override would reorder the confirm line), and
+/// a server reason cut to a bounded length.
 #[test]
 fn server_text_drops_format_characters_and_is_bounded() {
     let long = "x".repeat(500);

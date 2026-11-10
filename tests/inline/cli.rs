@@ -7286,12 +7286,12 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
         [
             "clauth: 'cl2' has 2 limit resets available.".to_string(),
             format!(
-                "  * New model launch: one Fable reset for...: 1 of 1 available, resets \
-                 seven_day_overage_included, ends {ends}  (used next)"
+                "  * New model launch: one Fable reset for Max, Team Premium and Enterprise \
+                 Premium: 1 of 1 available, resets 7d fable, ends {ends}  (used next)"
             ),
             format!(
-                "    New model launch: one more Fable rese...: 1 of 1 available, resets \
-                 seven_day_overage_included, ends {ends}"
+                "    New model launch: one more Fable reset at 6 months' tenure: 1 of 1 \
+                 available, resets 7d fable, ends {ends}"
             ),
         ]
     );

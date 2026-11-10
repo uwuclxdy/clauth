@@ -6135,6 +6135,27 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     );
 }
 
+/// The window Fable counts into reads `7d fable` in the resets row, as the
+/// pane's own bar names it.
+#[test]
+fn the_claude_resets_row_names_the_fable_weekly_7d_fable() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets_banked(
+        "cl1",
+        1,
+        1,
+        &["seven_day_overage_included"],
+        now,
+    );
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 of 1 available · resets 7d fable"],
+        "{detail:?}"
+    );
+}
+
 /// A reading that carries the banked total says how many of them a spend can
 /// use now, and keeps the row at 0 so a cooldown hides no banked reset.
 #[test]
