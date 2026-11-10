@@ -335,7 +335,7 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
           pendingPrompt = { text: cmd.text }
         } else {
           try {
-            await $.prompt.submit({ text: cmd.text })
+            await submitPhonePrompt($, cmd.text)
           } catch {
             // A refused submit while idle must not drop the prompt: the device
             // already got 200, so keep it for the next turn.complete.
@@ -360,6 +360,17 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
         await handleAnswer($, cmd.ask, cmd)
       }
       break
+  }
+}
+
+// A phone prompt is the person's own words, so `asUser` has the model read it
+// bare rather than framed as a plugin's message. A build refusing the option
+// still delivers the prompt, framed, through one bare retry.
+async function submitPhonePrompt($: EngineInterface, text: string): Promise<void> {
+  try {
+    await $.prompt.submit({ text, asUser: true })
+  } catch {
+    await $.prompt.submit({ text })
   }
 }
 
@@ -654,7 +665,7 @@ export const register: Register = on => {
       if (pendingPrompt) {
         const p = pendingPrompt
         try {
-          await $.prompt.submit(p)
+          await submitPhonePrompt($, p.text)
           pendingPrompt = null
         } catch {
           // The submit was refused; keep the prompt for the next turn.complete.

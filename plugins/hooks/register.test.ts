@@ -1034,6 +1034,96 @@ test('C3b: a refused prompt command does not drop the command behind it', async 
   expect(submissions).toEqual(['ok'])
 })
 
+test('C3d: a phone prompt reaches the model as the user, idle or queued', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const sent: Array<{ text: string; origin: unknown }> = []
+  on('prompt.submit', ($, e, next) => {
+    sent.push({ text: e.text, origin: e.origin })
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+
+  expect(sent.map(s => s.text)).toEqual(['idle', 'queued'])
+  expect(sent.map(s => (s.origin as { asUser?: unknown } | undefined)?.asUser)).toEqual([true, true])
+})
+
+test('C3e: a Claude Code refusing asUser gets each phone prompt once without it, idle or queued', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const attempts: Array<{ text: string; asUser: unknown }> = []
+  on('prompt.submit', ($, e, next) => {
+    const asUser = (e.origin as { asUser?: unknown } | undefined)?.asUser
+    attempts.push({ text: e.text, asUser })
+    if (asUser !== undefined) throw new Error('unknown option asUser')
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't2' })
+
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+    { text: 'queued', asUser: true },
+    { text: 'queued', asUser: undefined },
+  ])
+})
+
+test('C3f: a Claude Code refusing both shapes gets two calls per delivery attempt, then the prompt once', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let refuse = true
+  const attempts: Array<{ text: string; asUser: unknown }> = []
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    const asUser = (e.origin as { asUser?: unknown } | undefined)?.asUser
+    attempts.push({ text: e.text, asUser })
+    if (refuse) throw new Error('submit refused')
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // Idle: two calls refused, so the prompt waits for turn.complete.
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+  ])
+  expect(deliveries).toEqual([])
+
+  // Queued: the retry is two calls again, and the prompt is not dropped.
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+  ])
+  expect(deliveries).toEqual([])
+
+  // The refusals stop: the next turn.complete delivers it once.
+  refuse = false
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't2' })
+  expect(deliveries).toEqual(['idle'])
+  expect(attempts).toHaveLength(5)
+})
+
 test('C3c: a prompt refused while idle is queued for the next turn.complete', async ($, on) => {
   const { clock, bridge } = setup(on)
   let refuse = true
