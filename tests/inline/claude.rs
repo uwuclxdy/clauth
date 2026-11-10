@@ -9487,6 +9487,7 @@ fn a_proxy_claim_landing_before_the_stamps_hold_stamps_no_sidecar() {
     );
 }
 
+#[cfg(unix)]
 /// Two stores stamped with one mtime, the case a global switch used to lose:
 /// the link moved and every running session stayed on the account it had left.
 fn seed_two_stores_with_equal_mtime() -> (
@@ -9525,6 +9526,7 @@ fn seed_two_stores_with_equal_mtime() -> (
     (a, b, same)
 }
 
+#[cfg(unix)]
 fn live_mtime() -> std::time::SystemTime {
     fs::metadata(claude_credentials_path().expect("creds path"))
         .expect("live metadata")
