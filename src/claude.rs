@@ -5971,6 +5971,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
         if linkable {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
@@ -7904,12 +7905,50 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
         if linkable {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         Ok(())
     })
+}
+
+/// Keep a repoint of `.credentials.json` visible to the Claude Code sessions
+/// already running on it.
+///
+/// Claude Code re-reads its login only when the mtime of what the link resolves
+/// to is not EQUAL to the one it memoized (see `runtime::touch_store`). The
+/// per-session swap moves the incoming store's mtime before it repoints; the
+/// global relinks did not, so a switch between two stores carrying the same
+/// mtime moved the link, reported success, and left every running session on
+/// the account it had just been switched off.
+///
+/// Only that case is stamped: a live path resolving to a DIFFERENT store with
+/// an EQUAL mtime. A relink onto the same store, a first link, and a switch
+/// between stores whose mtimes already differ are left as they were. The stamp
+/// is the swap's own ([`crate::runtime::stamp_store`], receipt included), keyed
+/// the way a swap keys it: the `load_profile` first lands a legacy `.pending`
+/// sidecar, which a stamp ahead of it would discard. Runs after the Keychain
+/// mirror and before the repoint, so a failure moves nothing.
+fn keep_repoint_visible(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
+    let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let (Ok(live), Ok(incoming)) = (
+        crate::canonical::identity(link),
+        crate::canonical::identity(target),
+    ) else {
+        return Ok(());
+    };
+    if live == incoming {
+        return Ok(());
+    }
+    match (mtime(&live), mtime(&incoming)) {
+        (Some(memoized), Some(next)) if memoized == next => {
+            crate::profile::load_profile(name)?;
+            crate::runtime::stamp_store(name, target, Some(memoized))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Replace the symlink at `.credentials.json` with a regular file (same bytes).

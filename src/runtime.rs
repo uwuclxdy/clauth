@@ -5345,8 +5345,14 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 /// ([`SessionSwap::retouch_after_item_leg`]), which only follows a stamp a
 /// [`SwapPlan`] already keyed: the `.pending` resolution the plan stands for
 /// ran before that first stamp, and the receipt it left resolves the
-/// re-stamp's displaced value back to the store's real write time.
-fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>) -> Result<()> {
+/// re-stamp's displaced value back to the store's real write time. Also
+/// reached by the global switch's relinks
+/// (`claude::keep_repoint_visible`), which run the same `load_profile` first.
+pub(crate) fn stamp_store(
+    member: &ProfileName,
+    store: &Path,
+    memoized: Option<SystemTime>,
+) -> Result<()> {
     // Through the resolver, not the raw mtime: on a swap BACK onto a member the
     // value being displaced is that member's own earlier stamp, and a receipt
     // recording a stamp as a write time hands the readers the exact answer this
