@@ -8,8 +8,11 @@
 //! [`Instance`] through the [`PeerResolver`] — never taking a session id off the
 //! wire — and keys the session per `(pid, procStart, sessionId)` so a recycled
 //! pid, a `/clear` or a second live process cannot cross sessions or swallow
-//! another session's commands. Linux and macOS only: the whole module is
-//! `#[cfg(unix)]` at its declaration in `mod.rs`.
+//! another session's commands. The one fallback is an `end` the resolver no
+//! longer knows the peer for, taken under the instance the hub already holds
+//! for that pid ([`Hub::held_for_end`]) and only when it names that instance's
+//! own session. Linux and macOS only: the whole module is `#[cfg(unix)]` at
+//! its declaration in `mod.rs`.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -621,6 +624,9 @@ impl Hub {
     }
 
     /// One event from the mod at `peer_pid`, resolved to a session and handled.
+    /// The session comes from the resolver; only an `end` from a peer it no
+    /// longer knows falls back to the instance the hub holds for that pid
+    /// ([`Hub::held_for_end`]), then runs the same `end` path.
     pub(crate) fn event(&self, peer_pid: u32, body: &[u8]) -> (u16, Value) {
         if body.len() > BODY_LIMIT {
             logline!(
@@ -629,11 +635,18 @@ impl Hub {
             );
             return (413, error_value("body_too_large"));
         }
-        let Some(resolved) = (self.resolver)(peer_pid) else {
+        let parsed = serde_json::from_slice::<Value>(body).ok();
+        let resolved = (self.resolver)(peer_pid);
+        let fallback = resolved.is_none();
+        let Some(resolved) = resolved.or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| self.held_for_end(peer_pid, value))
+        }) else {
             self.log_unknown_peer(peer_pid);
             return (403, error_value("unknown_peer"));
         };
-        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        let Some(value) = parsed else {
             return (400, error_value("bad_request"));
         };
         let Some(named) = value.get("session").and_then(Value::as_str) else {
@@ -673,13 +686,26 @@ impl Hub {
         self.close_silent(&mut inner, now);
 
         // `end` goes through the same reconcile path so a moved record closes
-        // the old instance before the sequence is judged (A#14). The final
+        // the old instance before the sequence is judged (A#14); an end taken
+        // under the held instance reconciles onto that same instance. The final
         // transcript tail runs between the judge and the removal, with every
         // read off the hub lock, so the rows no wake reached relay before the
         // `end` status closes the stream's view. An `end` for a pid whose
         // instance this call just minted emits nothing: no `start` was ever
         // broadcast for it.
         if kind == "end" {
+            // The fallback identity was read before this lock: if the instance
+            // it named was replaced since, the end stays an unknown peer rather
+            // than reconciling onto the successor.
+            if fallback
+                && !inner.instances.get(&peer_pid).is_some_and(|live| {
+                    live.session_id == resolved.session_id && live.proc_start == resolved.proc_start
+                })
+            {
+                drop(inner);
+                self.log_unknown_peer(peer_pid);
+                return (403, error_value("unknown_peer"));
+            }
             let generation = {
                 let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
                 if seq <= live.seq_high {
@@ -1633,6 +1659,35 @@ impl Hub {
     /// control-tier device is paired, read fresh on every call (SB-9, MB-1).
     fn remote_flag(&self) -> bool {
         self.listening && crate::daemon::api::devices::has_control_device()
+    }
+
+    /// The identity an `end` from a peer the resolver no longer knows is taken
+    /// under: at `/exit` the resolver already answers `None` for the peer when
+    /// the mod posts `end` (observed 2/2 in a sandbox, 2026-11-07). Only an
+    /// `end` naming the very session the hub already holds for `peer_pid` and
+    /// carrying the `seq` the end path judges qualifies; anything else stays an
+    /// unknown peer. No process-start check of its own: the pid is the
+    /// connecting process's own (`SO_PEERCRED` / `LOCAL_PEERPID`), so the poster
+    /// is the held instance's process or one that took its pid after it died.
+    /// A recycled pid keeps its predecessor's instance until a re-resolve
+    /// ([`process_gone_or_moved`]: linux by start time, macOS by liveness alone)
+    /// or the silence sweep closes it, and can end it first: the end frame that
+    /// dead instance gets anyway, sent early.
+    fn held_for_end(&self, peer_pid: u32, value: &Value) -> Option<Instance> {
+        if value.get("kind").and_then(Value::as_str) != Some("end") {
+            return None;
+        }
+        let named = value.get("session").and_then(Value::as_str)?;
+        value.get("seq").and_then(Value::as_u64)?;
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let live = inner
+            .instances
+            .get(&peer_pid)
+            .filter(|live| live.session_id == named)?;
+        Some(Instance {
+            session_id: live.session_id.clone(),
+            proc_start: live.proc_start.clone(),
+        })
     }
 
     /// Log the SB-3 "not registered, logged once" line for `peer_pid`.
