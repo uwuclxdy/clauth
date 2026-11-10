@@ -1086,8 +1086,13 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
-    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache, |_, _| {});
-    merge_topup(&mut base, &cache, lcd.as_deref(), &today);
+    let cutoff = match lcd.as_deref() {
+        Some(date) => TopUpCutoff::After(date),
+        // A rollup with no computed date already holds days we cannot locate.
+        None => TopUpCutoff::Skip,
+    };
+    refresh_topup_cache(claude_dir, cutoff, &mut cache, |_, _| {});
+    merge_topup(&mut base, &cache, cutoff, &today);
     Some(base)
 }
 
@@ -1362,6 +1367,27 @@ struct FileContrib {
     recs: Vec<LineRec>,
 }
 
+/// How far a transcript sweep may read. A missing rollup is not the same as a
+/// dateless one: with no stats cache nothing is counted yet, so the sweep has
+/// to read every transcript; a rollup that exists but carries no
+/// `lastComputedDate` already holds days the sweep cannot locate, so counting
+/// everything would double count them. A datable boundary reads only past it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopUpCutoff<'a> {
+    All,
+    After(&'a str),
+    Skip,
+}
+
+impl TopUpCutoff<'_> {
+    /// Whether this sweep accounts for every day up to today: the whole history
+    /// (`All`), or past a boundary that the base/ledger already cover (`After`).
+    /// `Skip` reads nothing, so the ledger watermark must not advance across it.
+    fn covers_all_days(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+}
+
 /// Per-file transcript contributions persisted across the loader's 90s sweeps.
 /// Only files whose mtime advanced (or are new) get re-read; everything else is
 /// re-merged from memory, so the multi-hundred-MB full re-read that the old sweep
@@ -1379,16 +1405,20 @@ struct TopUpCache {
 /// now runs only for what actually changed between ticks.
 fn refresh_topup_cache(
     claude_dir: &Path,
-    last_computed_date: Option<&str>,
+    cutoff: TopUpCutoff<'_>,
     cache: &mut TopUpCache,
     mut progress: impl FnMut(usize, usize),
 ) {
-    let Some(cutoff_date) = last_computed_date else {
-        cache.files.clear();
-        return;
-    };
-    let Some(cutoff_st) = date_to_cutoff(cutoff_date) else {
-        return;
+    let cutoff_st = match cutoff {
+        TopUpCutoff::Skip => {
+            cache.files.clear();
+            return;
+        }
+        TopUpCutoff::All => None,
+        TopUpCutoff::After(date) => match date_to_cutoff(date) {
+            Some(st) => Some(st),
+            None => return,
+        },
     };
     let projects_dir = claude_dir.join("projects");
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1413,8 +1443,8 @@ fn refresh_topup_cache(
         };
         // mtime guard: a file untouched since the cutoff can hold no post-cutoff
         // lines, so it never enters the cache (and its today lines, if any, would
-        // also predate the cutoff day).
-        if mtime <= cutoff_st {
+        // also predate the cutoff day). A full sweep has no cutoff to guard against.
+        if cutoff_st.is_some_and(|st| mtime <= st) {
             cache.files.remove(&path);
             continue;
         }
@@ -1440,11 +1470,15 @@ fn refresh_topup_cache(
 fn merge_topup(
     base: &mut TokenStats,
     cache: &TopUpCache,
-    last_computed_date: Option<&str>,
+    cutoff: TopUpCutoff<'_>,
     today_date: &str,
 ) {
-    let Some(cutoff_date) = last_computed_date else {
-        return; // no safe boundary
+    // An empty boundary sorts before every real date, so `All` counts every
+    // transcript line; `Skip` counts none of them.
+    let cutoff_date = match cutoff {
+        TopUpCutoff::Skip => return,
+        TopUpCutoff::All => "",
+        TopUpCutoff::After(date) => date,
     };
 
     // Token aggregates seeded from base so post-cutoff days extend, never replace.
@@ -2097,9 +2131,10 @@ fn persist_ledger(
     dir: &Path,
     base: &TokenStats,
     today: &str,
+    sweep_covers_all_days: bool,
     mut progress: impl FnMut(usize, usize),
 ) {
-    if ledger.record(base, today) {
+    if ledger.record_covering(base, today, sweep_covers_all_days) {
         ledger.save(dir);
     }
     // The speed ledger is written by the producer at day rollover; the tokens
@@ -2166,6 +2201,7 @@ pub(crate) fn spawn(
                 Some(dir) => load_frozen_base(&claude_dir, dir),
                 None => load_base(&claude_dir),
             };
+            let mut rollup_missing = false;
             let mut base = match loaded {
                 Ok(base) => base,
                 // No rollup on disk yet — a fresh machine, a wiped `~/.claude`,
@@ -2173,7 +2209,10 @@ pub(crate) fn spawn(
                 // the transcripts are still there, so an absent cache is an
                 // empty base, never a failed tab. A cache that exists and cannot
                 // be read still reports its cause.
-                Err(TokensLoadError::Missing) => TokenStats::default(),
+                Err(TokensLoadError::Missing) => {
+                    rollup_missing = true;
+                    TokenStats::default()
+                }
                 Err(cause) => {
                     let _ = tx.send(TokensEvent::Failed(cause));
                     return;
@@ -2198,29 +2237,46 @@ pub(crate) fn spawn(
             // Sweep only past the ledger watermark, so a frozen `lastComputedDate`
             // can't keep the cold-start read growing.
             let today = today_date();
-            let cutoff = ledger
+            let cutoff_date = ledger
                 .as_ref()
                 .and_then(|l| l.effective_cutoff(lcd.as_deref()))
                 .or_else(|| lcd.clone());
+            // Three states: a datable boundary (base or ledger) bounds the read;
+            // with no rollup at all a first launch must sweep every transcript
+            // because nothing is counted yet; a dateless rollup keeps the skip
+            // path, where counting everything would double count its days.
+            let cutoff = match cutoff_date.as_deref() {
+                Some(date) => TopUpCutoff::After(date),
+                None if rollup_missing => TopUpCutoff::All,
+                None => TopUpCutoff::Skip,
+            };
             // Throttled progress: every 25th file plus the final one, so a
             // several-hundred-file sweep paints a moving count at ~1/25 the
             // per-file send volume (warm cycles still emit; render ignores
             // them — see `App::tokens_progress`).
-            refresh_topup_cache(&claude_dir, cutoff.as_deref(), cache, |done, total| {
+            refresh_topup_cache(&claude_dir, cutoff, cache, |done, total| {
                 if done % 25 == 0 || done == total {
                     let _ = tx.send(TokensEvent::Progress { done, total });
                 }
             });
-            merge_topup(&mut base, cache, cutoff.as_deref(), &today);
+            merge_topup(&mut base, cache, cutoff, &today);
             // Persist: newly-finalized days first, then the one-shot passes.
             // All run inside this one tick, so no sweep overlaps another or
             // the next 90s cycle's.
             if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
-                persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
-                    if done % 25 == 0 || done == total {
-                        let _ = tx.send(TokensEvent::Progress { done, total });
-                    }
-                });
+                persist_ledger(
+                    &claude_dir,
+                    l,
+                    dir,
+                    &base,
+                    &today,
+                    cutoff.covers_all_days(),
+                    |done, total| {
+                        if done % 25 == 0 || done == total {
+                            let _ = tx.send(TokensEvent::Progress { done, total });
+                        }
+                    },
+                );
                 // Re-read the producer's latest folds so the Loaded event
                 // carries the fresh day sums.
                 apply_speed_ledger(&mut base, crate::token_ledger::SpeedLedger::load(dir));
