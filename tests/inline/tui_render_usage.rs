@@ -2600,6 +2600,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             streaks: StreakCounts {
                 rate_limit: 3,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -2683,6 +2684,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -2945,6 +2947,7 @@ fn rate_limited_suffix_counts_the_retry() {
         streaks: StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
         kick_block: None,
         queue_slot: None,
@@ -2990,6 +2993,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
         streaks: StreakCounts {
             rate_limit: 0,
             refresh_fail,
+            last_fetch_failed: false,
         },
         kick_block: None,
         queue_slot: None,
@@ -3063,11 +3067,13 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             (|n| StreakCounts {
                 rate_limit: n,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             }) as fn(u32) -> StreakCounts,
         ),
         (FetchStatus::Cached, |n| StreakCounts {
             rate_limit: 0,
             refresh_fail: n,
+            last_fetch_failed: false,
         }),
     ] {
         let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -3164,6 +3170,262 @@ fn spent_skipped_account_pill_is_bare() {
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"
+    );
+}
+
+/// A spent account the poll skips still carries a `Cached` status when the
+/// TUI seeds it off the aged cache (a stood-down TUI, or the boot seed). With
+/// no refresh scheduled, no refresh streak and no failed-fetch mark, nothing
+/// failed: the row is the same bare `[ spent ]` pill, never `[ cached ]` with
+/// "last usage check failed". A spent account WITH a countdown is still
+/// polled, so its `Cached` stays the honest serving-old-numbers state.
+#[test]
+fn a_skipped_spent_account_seeded_cached_reads_spent() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = |next_refresh_ms: Option<u64>| HeaderState {
+        fetches_here: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let skipped = text(status_lines(&p, &header(None), 120, &readings));
+    assert!(
+        skipped.contains("[ spent ]"),
+        "a skipped spent account reads spent: {skipped}"
+    );
+    assert!(
+        !skipped.contains("[ cached ]"),
+        "nothing failed, so no cached pill: {skipped}"
+    );
+    assert!(
+        !skipped.contains("last usage check failed"),
+        "a skipped poll is no failed check: {skipped}"
+    );
+
+    let polled = text(status_lines(
+        &p,
+        &header(Some(crate::usage::now_ms() + 60_000)),
+        120,
+        &readings,
+    ));
+    assert!(
+        polled.contains("[ cached ]"),
+        "a spent account still on the schedule keeps its cached state: {polled}"
+    );
+}
+
+/// A skipped spent account whose last fetch attempt failed keeps the honest
+/// `[ cached ]` pill: the failure mark outranks the spent pill exactly as a
+/// refresh streak does, so a failed forced `r` stays visible after the next
+/// tick drops the countdown. Only the seeded `Cached` (no streak, no mark) is
+/// the bare `[ spent ]` pill, the case the test above pins.
+#[test]
+fn a_skipped_spent_account_whose_last_fetch_failed_reads_cached() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts {
+            last_fetch_failed: true,
+            ..StreakCounts::default()
+        },
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let rendered = text(status_lines(&p, &header, 120, &readings));
+    assert!(
+        rendered.contains("[ cached ]"),
+        "a failed fetch on a skipped spent account reads cached: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[ spent ]"),
+        "a failed fetch is never hidden as the spent pill: {rendered}"
+    );
+}
+
+/// The Usage pane draws the failed-fetch mark from `app.poll_streaks` itself:
+/// a skipped spent account whose `Cached` reading follows a failed attempt
+/// keeps `[ cached ]`, never the seeded `[ spent ]` pill.
+#[test]
+fn the_usage_pane_draws_the_failed_fetch_mark_from_the_streak_store() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+    use crate::usage::{FetchStatus, StreakCounts, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let name = ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    app.usage_store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), FetchStatus::Cached);
+    app.poll_streaks.lock().unwrap().insert(
+        "a".to_string(),
+        StreakCounts {
+            last_fetch_failed: true,
+            ..StreakCounts::default()
+        },
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("[ cached ]")),
+        "the mark travels from poll_streaks to the pane's cached pill: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("[ spent ]")),
+        "a failed attempt is never hidden as the spent pill: {rows:#?}"
+    );
+}
+
+/// A skipped spent account that carries a run of failed token refreshes stays
+/// on `[ auth failing ]`, never `[ spent ]`: a refresh failure is never hidden
+/// as a spent pill. The seeded `Cached` is the only record a refresh is
+/// failing, so the guard keeps it live even though the poll skips the account
+/// — as the failed-fetch mark does for a failed fetch, the case the test above
+/// pins.
+#[test]
+fn a_skipped_spent_account_with_a_refresh_streak_reads_auth_failing() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = HeaderState {
+        fetches_here: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts {
+            refresh_fail: 2,
+            ..StreakCounts::default()
+        },
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let rendered = text(status_lines(&p, &header, 120, &readings));
+    assert!(
+        rendered.contains("[ auth failing ]"),
+        "a refresh-failure streak outranks the spent pill: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[ spent ]"),
+        "a refresh-failure streak outranks the spent pill: {rendered}"
     );
 }
 
@@ -4505,6 +4767,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -4815,6 +5078,7 @@ fn effective_rate_limit_is_oauth_first_with_a_third_party_fallback() {
         StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )]);
     let third_party = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1)]);
@@ -4933,6 +5197,7 @@ fn a_hybrid_stuck_hint_names_the_winning_reading_source() {
         StreakCounts {
             rate_limit: deep,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )]);
     let healthy_tp = HashMap::from([("hybrid".to_string(), 1u32)]);
@@ -6128,7 +6393,7 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     assert_eq!(
         claude_resets_rows(&detail),
         [format!(
-            "resets 1 available · resets 5h, 7d · until {}",
+            "resets 1 available · resets 5h, 7d · expires {}",
             local_day(ends)
         )],
         "{detail:?}"
@@ -6151,7 +6416,7 @@ fn the_claude_resets_row_names_the_fable_weekly_7d_fable() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 of 1 available · resets 7d fable"],
+        ["resets 1 available · resets 7d fable"],
         "{detail:?}"
     );
 }
@@ -6166,7 +6431,7 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 of 3 available · resets 5h"],
+        ["resets 2/3 available · resets 5h"],
         "{detail:?}"
     );
 
@@ -6174,7 +6439,17 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 0 of 3 available"],
+        ["resets 0/3 available"],
+        "{detail:?}"
+    );
+
+    // Every banked reset usable: the total adds nothing, so the row reads the
+    // bare count.
+    crate::testutil::write_claude_limit_resets_banked("cl1", 2, 2, &["five_hour"], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2 available · resets 5h"],
         "{detail:?}"
     );
 
@@ -6831,9 +7106,9 @@ fn the_resets_row_says_its_age_only_past_75_minutes() {
     );
 }
 
-/// A row too wide for its pane ends on `…`: a bare clip turned `until Nov 26`
-/// into a false `until Nov 2`. At 55 columns the pane holds 51 cells, 41 of
-/// them after the key, one short of this 42-cell value. A row that fits keeps
+/// A row too wide for its pane ends on `…`: a bare clip turned `expires Nov 26`
+/// into a false `expires Nov 2`. At 57 columns the pane holds 53 cells, 43 of
+/// them after the key, one short of this 44-cell value. A row that fits keeps
 /// every part, the exact fit included.
 #[test]
 fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
@@ -6870,13 +7145,13 @@ fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
     let app = t6_app();
 
     assert_eq!(
-        row_at(&app, 55),
-        "resets 1 available · resets 5h, 7d · until Nov …"
+        row_at(&app, 57),
+        "resets 1 available · resets 5h, 7d · expires Nov …"
     );
     assert_eq!(
-        row_at(&app, 56),
-        "resets 1 available · resets 5h, 7d · until Nov 26",
-        "42 cells in a 42-cell budget fit"
+        row_at(&app, 58),
+        "resets 1 available · resets 5h, 7d · expires Nov 26",
+        "44 cells in a 44-cell budget fit"
     );
 }
 

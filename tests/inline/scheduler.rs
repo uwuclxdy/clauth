@@ -902,6 +902,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail,
+                last_fetch_failed: false,
             },
         )])
     };
@@ -985,6 +986,7 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1027,6 +1029,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     );
 
@@ -1038,6 +1041,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -1120,6 +1124,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1162,6 +1167,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
         super::StreakCounts {
             rate_limit: 5,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1211,6 +1217,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1236,6 +1243,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 2,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1266,6 +1274,7 @@ fn partition_due_clamp_leaves_third_party_untouched() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1679,42 +1688,46 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
 /// The two streak axes must move independently, because every other reader
 /// means only one of them: `rate_limit` feeds `is_stuck_rate_limited`, the
 /// auto-switch freshness bypass and `status.json`'s `stale` — none of which a
-/// refresh failure may ever claim. A live body clears both.
+/// refresh failure may ever claim. The `last_fetch_failed` mark is not an axis:
+/// a failed attempt sets it without touching either ladder, a no-op outcome
+/// holds it, and a live body clears all of it.
 #[test]
 fn streak_axes_move_independently_and_a_live_body_clears_both() {
     use super::FetchStatus;
 
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let update = |status: FetchStatus, refresh_failed: bool| {
+    let update = |status: FetchStatus, refresh_failed: bool, fetch_failed: bool| {
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("a"),
             status,
             refresh_failed,
+            fetch_failed,
         )
     };
 
     // A transient refresh failure bails to `Cached` — it must NOT touch the 429
     // axis, or a client-side bug would report a stuck throttle and let the
     // auto-switch rotate the chain away on it.
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 1));
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 2));
 
     // A 429 bumps only its own axis and leaves the refresh count standing.
-    let counts = update(FetchStatus::RateLimited, false);
+    let counts = update(FetchStatus::RateLimited, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
 
     // A status that says nothing about either axis holds both — and must not
     // conjure an entry for a profile that has none.
-    let counts = update(FetchStatus::Failed, false);
+    let counts = update(FetchStatus::Failed, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
     assert_eq!(
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("never-seen"),
             FetchStatus::Failed,
+            false,
             false
         ),
         super::StreakCounts::default(),
@@ -1727,9 +1740,481 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
     // A live body clears both: whatever went wrong, the profile is serving. This
     // is also the preemptive-rotation case — a refresh can fail while the still
     // valid access token fetches fine, and nothing is degraded yet.
-    let counts = update(FetchStatus::Fresh, true);
+    let counts = update(FetchStatus::Fresh, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 0));
     assert!(!streaks.lock().unwrap().contains_key("a"));
+
+    // A failed fetch attempt sets the mark without touching either ladder
+    // axis, and a later no-op outcome (a seeded reading) holds it until a
+    // live body clears it.
+    let counts = update(FetchStatus::Cached, false, true);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, true),
+        "a failed attempt sets the mark and bumps neither axis"
+    );
+    let counts = update(FetchStatus::Failed, false, false);
+    assert!(
+        counts.last_fetch_failed,
+        "a no-op outcome holds the mark, never clears it"
+    );
+    let counts = update(FetchStatus::Fresh, false, false);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, false),
+        "a live body clears the mark with the entry"
+    );
+}
+
+/// A `/usage` fetch that errors lands the per-account failure mark: the
+/// fail-serving outcome carries it to `update_streaks`, which sets it without
+/// bumping either ladder axis. A live body clears it with the entry.
+#[test]
+fn a_failed_fetch_lands_a_per_account_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-fetch-fail";
+    let (base, server) = crate::testutil::serve_endpoints(1, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the failed fetch must attempt /usage: {seen:?}"
+    );
+    assert_eq!(
+        outcome.status,
+        super::FetchStatus::Cached,
+        "a failed fetch with a cache on disk serves Cached"
+    );
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("a failed fetch lands a per-account failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "the mark is the last-fetch-failed signal, never a ladder axis: {mark:?}"
+    );
+    assert_eq!(
+        (mark.rate_limit, mark.refresh_fail),
+        (0, 0),
+        "a plain failed fetch bumps neither ladder axis: {mark:?}"
+    );
+
+    // The account's next live read clears the mark with the rest of the entry.
+    land_outcome_onto(
+        &store,
+        fresh_outcome(name, crate::usage::UsageInfo::default()),
+        &streaks,
+    );
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "a live body clears the failure mark"
+    );
+}
+
+/// The reactive rotation bail: a 401 sends the plain fetch into the rotation
+/// leg, and an entry holding no refresh token has nothing to spend there, so
+/// the refusal is the tick's only request. The failed attempt lands the mark.
+#[test]
+fn a_reactive_rotation_bail_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-bail-mark";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        refresh_token: None,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 must come from the plain fetch: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "no refresh token, so the leg must spend nothing: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive bail lands the failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive rotation bail is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive arm's plain-fetch failure: an account inside the rotation
+/// lead runs the plain usage poll instead of spending the chain (a standing
+/// quarantine refuses the refresh), and that poll's error is a failed attempt.
+#[test]
+fn a_proactive_plain_fetch_error_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-plain-fail";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window (floor 15 min), so the leg takes the
+        // proactive arm: no plain fetch runs before the rotation leg.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        auth_broken: true,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the proactive arm's live poll must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the quarantined refresh must not be spent: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive plain fetch's error lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a proactive plain-fetch error is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive rotation's retry dying: inside the lead window the leg spends
+/// the rotation first and only then polls, so the retry's error is a failed
+/// attempt of a tick that sent the rotation. The mark lands with the pair.
+#[test]
+fn a_proactive_rotation_whose_retry_fails_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-retry-fail";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the proactive arm must spend the rotation first: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the rotated token's retry must still run: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the minted pair survives a failed retry"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive rotation's failed retry lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a failed retry after a sent rotation is a failed attempt: {mark:?}"
+    );
+}
+
+/// Every probe answer that served no usage body marks the account (a failed
+/// request, a 429, a rejected token), while the organization refusal — a live
+/// verdict whose plan the row shows — leaves the mark alone.
+#[test]
+fn a_failed_probe_lands_the_failure_mark_and_an_org_refusal_does_not() {
+    use super::{UsageStore, probe_outcome};
+    use crate::usage::inference::anthropic::ProbeAnswer;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed-failed-mark");
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    for (answer, label) in [
+        (ProbeAnswer::Failed, "a failed probe"),
+        (
+            ProbeAnswer::RateLimited { retry_after: None },
+            "a rate-limited probe",
+        ),
+        (ProbeAnswer::Rejected, "a rejected probe"),
+    ] {
+        let streaks = land_outcome_with_streaks(&store, probe_outcome(&name, answer));
+        let mark = streaks
+            .lock()
+            .unwrap()
+            .get(name.as_str())
+            .copied()
+            .unwrap_or_else(|| panic!("{label} lands a streak entry"));
+        assert!(
+            mark.last_fetch_failed,
+            "{label} served no usage body, so it is a failed attempt: {mark:?}"
+        );
+    }
+
+    let refused = land_outcome_with_streaks(
+        &store,
+        probe_outcome(&name, ProbeAnswer::OrgRefused { canceled: false }),
+    );
+    assert!(
+        !refused.lock().unwrap().contains_key(name.as_str()),
+        "an org refusal is a live verdict, never a failed attempt"
+    );
+}
+
+/// The failed-fetch mark records this instance's own attempt. Once the
+/// instance stands down it sends nothing, and the instance that fetches may
+/// have served the account since, so a stand-down tick drops the mark: a
+/// skipped spent account the hydrate seeds `Cached` then reads `[ spent ]`, not
+/// a failure that is no longer the last attempt.
+#[test]
+fn a_stand_down_tick_drops_the_instances_own_failed_fetch_mark() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["kitty"]);
+    // The fetching instance's last live body: the week spent, dated two
+    // intervals back, so the hydrate seeds `Cached`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 2 * REFRESH_INTERVAL_MS),
+            ..UsageInfo::default()
+        },
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+    // This instance's own failed attempt, landed while it held the lease.
+    let mut failed = cached_outcome("kitty");
+    failed.fetch_failed = true;
+    super::apply_outcome_to(&state, failed);
+    assert!(
+        state
+            .poll_streaks
+            .lock()
+            .unwrap()
+            .get("kitty")
+            .is_some_and(|c| c.last_fetch_failed),
+        "the landing set the mark"
+    );
+    // A second account carrying a refresh streak beside its mark: the tick
+    // drops the mark only, never the counts the mirror's cadence reads.
+    state.poll_streaks.lock().unwrap().insert(
+        "tabby".to_string(),
+        super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: true,
+        },
+    );
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let status = state.status.lock().unwrap().get("kitty").copied();
+    let mark = state.poll_streaks.lock().unwrap().get("kitty").copied();
+    let next = state
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .get(&oauth_key("kitty"))
+        .copied();
+    assert_eq!(
+        status,
+        Some(super::FetchStatus::Cached),
+        "the hydrate seeds Cached"
+    );
+    assert_eq!(next, None, "the spent skip blanks the countdown");
+    assert!(
+        !mark.is_some_and(|c| c.last_fetch_failed),
+        "a stood-down instance holds no failed-fetch mark of its own: {mark:?}"
+    );
+    assert_eq!(
+        state.poll_streaks.lock().unwrap().get("tabby").copied(),
+        Some(super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: false,
+        }),
+        "a stand-down tick keeps every count and drops only the mark"
+    );
 }
 
 /// Forced (manual `r`) refetches skip a mid-switch profile for the same
@@ -1810,6 +2295,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -1999,6 +2485,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2041,6 +2528,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2390,6 +2878,7 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2601,17 +3090,38 @@ fn fresh_outcome(name: &str, info: crate::usage::UsageInfo) -> super::FetchOutco
 /// Land one outcome through the real landing (`apply_outcome`) with empty
 /// status/cadence stores, so a test reads only what the store then holds.
 fn land_outcome(store: &super::UsageStore, outcome: super::FetchOutcome) {
+    land_outcome_with_streaks(store, outcome);
+}
+
+/// [`land_outcome`] handing back the per-profile streak map the landing wrote,
+/// for a test that reads the failed-fetch mark.
+fn land_outcome_with_streaks(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+) -> super::PollStreaks {
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    land_outcome_onto(store, outcome, &streaks);
+    streaks
+}
+
+/// [`land_outcome_with_streaks`] landing into a caller-held streak map, so a
+/// test can land a second outcome over the first and read what the map then
+/// holds.
+fn land_outcome_onto(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+    streaks: &super::PollStreaks,
+) {
     use super::{StatusStore, apply_outcome};
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
     apply_outcome(
         outcome,
         store,
         &status,
         &last_fetched,
-        &streaks,
+        streaks,
         REFRESH_INTERVAL_MS,
         false,
         false,
@@ -2999,6 +3509,7 @@ fn reading_dead_names_never_flags_a_plan_with_no_five_hour_limit() {
         StreakCounts {
             rate_limit: ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -3283,6 +3794,7 @@ fn midstorm_kick_fires_for_a_member_hosting_a_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     // The persistent-429 shape: a plan-only, windowless store entry.
@@ -3324,6 +3836,7 @@ fn midstorm_kick_stays_gated_for_a_member_hosting_no_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3363,6 +3876,7 @@ fn midstorm_kick_keeps_the_block_ladder_for_a_hosting_member() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3424,6 +3938,7 @@ fn chain_session_hosts_reads_rows_the_decision_leg_would_move() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])))
     };
@@ -3601,6 +4116,7 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -3792,6 +4308,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         StreakCounts {
             rate_limit: 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
     let _ = super::run_fetch(
@@ -3996,6 +4513,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4067,6 +4585,7 @@ fn the_drain_arms_no_weekly_reset_mark_for_a_proxy_account() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4143,6 +4662,7 @@ fn the_drain_arms_no_weekly_reset_mark_for_a_record_the_memory_lags() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4232,6 +4752,7 @@ fn the_drain_arms_no_weekly_reset_mark_over_a_config_it_cannot_classify() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4931,6 +5452,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         let activity = crate::testutil::fresh_activity();
@@ -12375,6 +12897,7 @@ fn a_session_on_a_distrusted_member_gets_no_decision_unless_that_member_is_broke
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         scan_sessions_with_streaks(&config, &frozen_store(), &frozen_status(), &streaks);
@@ -13070,6 +13593,7 @@ fn retry_after_defers_next_fetch_slot() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -13241,6 +13765,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         name: crate::profile::ProfileName::from("a"),
@@ -13358,6 +13883,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
@@ -13428,6 +13954,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -17114,6 +17641,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
     let at_five = super::StreakCounts {
         rate_limit: 5,
         refresh_fail: 0,
+        last_fetch_failed: false,
     };
     streaks.lock().unwrap().insert("act".to_string(), at_five);
     streaks.lock().unwrap().insert("idle".to_string(), at_five);
@@ -17126,6 +17654,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -17250,6 +17779,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -20904,6 +21434,20 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
         vec![&name.to_string()],
         "this tick serves cache; the next one polls with the adopted token"
     );
+    // The 401 that drove the adopt was this tick's own request, so the
+    // fail-serving outcome lands the mark with the adopted pair.
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive adopt's tick sent the 401, so it lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive adopt still followed a failed fetch: {mark:?}"
+    );
 }
 
 /// The retry adopt, after the refresh comes back terminally rejected. The
@@ -20975,6 +21519,87 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
     assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// A proactive adopt that sends nothing is no failed attempt: the rotation lead
+/// only queues the adopt, and once the mirror token's identity is memoized the
+/// adopt sends no request at all, so the tick's outcome carries no failure
+/// mark.
+#[test]
+fn a_proactive_adopt_that_sends_nothing_lands_no_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-proactive-mute";
+    // The other replies only make a request the leg must not send visible to
+    // the assertion below.
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/api/oauth/profile") {
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (200, r#"{"object":"list","data":[]}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window: the leg takes the proactive arm, where no
+        // usage fetch runs before the adopt.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror("at-mirror-mute", crate::usage::now_ms() as i64 + 90_000_000);
+    let identity =
+        super::memoized_identity(&|_| Some(crate::profile::AccountId::from("uuid-anchor")));
+    assert_eq!(
+        identity("at-mirror-mute").as_deref(),
+        Some("uuid-anchor"),
+        "fixture control: the mirror token's identity is memoized without HTTP"
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "an adopt that sends nothing must make no request: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-mirror-mute".to_string(),
+            Some("at-mirror-mute-refresh".to_string())
+        )),
+        "the proactive adopt must carry the mirror's pair"
+    );
+    assert!(!outcome.from_fetch);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "an adopt that sent nothing lands no failure mark"
+    );
 }
 
 /// CLA-ROLL: a rolling-token profile forces the preemptive leg regardless of the global
@@ -23678,6 +24303,7 @@ fn issue83_inputs(
         super::StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     (store, status, streaks)
@@ -24410,6 +25036,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
         super::StreakCounts {
             rate_limit: super::ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
@@ -34930,6 +35557,7 @@ fn land_five_hour(state: &super::SchedulerState, name: &str, util: f64, token: &
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -35251,6 +35879,7 @@ fn land_windows_resetting(
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -36441,6 +37070,7 @@ fn land_reading_after_a_reset_under(
         from_fetch: fresh,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,

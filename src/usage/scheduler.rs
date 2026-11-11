@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -242,11 +243,16 @@ pub(crate) struct LegKey {
 /// plus the ladder deferral baked into it.
 pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<LegKey, FetchStamp>, rank::LastFetched>>;
 
-/// One profile's consecutive-failure counters. Both ladder off
-/// [`rate_limit_backoff_ms`] and both clear on the next live fetch, but they stay
+/// One profile's poll-health record. The two counters both ladder off
+/// [`rate_limit_backoff_ms`] and clear on the next live fetch, but they stay
 /// separate counters because every other reader means only one of them: a 429
 /// streak feeds [`is_stuck_rate_limited`], the auto-switch freshness bypass and
-/// `status.json`'s `stale`, none of which a refresh failure may claim.
+/// `status.json`'s `stale`, none of which a refresh failure may claim. The mark
+/// beside them is no counter: it is set by an attempt this instance sends — a
+/// `/usage` fetch, a token rotation or a usage probe answer other than the
+/// organization refusal — that serves no live body. A live body or a stand-down
+/// tick clears it; an organization refusal neither sets nor clears it, the
+/// `/profile` identity request never counts, and it ladders nothing.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct StreakCounts {
     /// Consecutive 429s from `/usage`.
@@ -255,6 +261,15 @@ pub(crate) struct StreakCounts {
     /// token is dead ([`crate::oauth::RefreshError::Transient`]). A confirmed
     /// dead token quarantines instead and carries its own, wider backoff.
     pub(crate) refresh_fail: u32,
+    /// Set by an attempt this instance sends for this account — a `/usage`
+    /// fetch, a token rotation or a usage probe answer other than the
+    /// organization refusal — that serves no live body. Cleared by the next live
+    /// body and by a stand-down tick; an organization refusal neither sets nor
+    /// clears it, and the `/profile` identity request never counts. Not a ladder
+    /// axis: the usage pane's skipped-spent guard reads it so a failed fetch
+    /// keeps its `Cached` pill where a seeded `Cached` (a boot seed, a
+    /// stand-down hydrate) falls through to `[ spent ]`.
+    pub(crate) last_fetch_failed: bool,
 }
 
 /// Per-profile poll-health streaks, driving exponential backoff in
@@ -1582,6 +1597,14 @@ fn tick_seam_reached(seam: TickSeam) {
 /// The rotation runs under a [`SchedulerSpend`] claim held through the land of
 /// the minted pair; a refusing `spend_gate` (the shutdown flag set, or the
 /// tick's lease ticket spent) bails unrotated, nothing sent.
+///
+/// The outcome carries [`FetchOutcome::fetch_failed`] when this tick sent a
+/// request for the account and served no live body. Only three sends count: the
+/// pre-rotation `/usage` fetch, the proactive plain poll in `bail_unrotated`,
+/// and the token exchange. A `/profile` identity request (an adopt resolving
+/// which account a pair belongs to) sends nothing counted, so a tick that only
+/// adopted never marks; a reactive bail after the pre-rotation fetch is marked,
+/// because that fetch already sent.
 fn fetch_with_rotation<'g>(
     config: &crate::profile::ConfigHandle,
     entry: &TokenEntry,
@@ -1590,7 +1613,38 @@ fn fetch_with_rotation<'g>(
     activity: &ActivityStore,
     spend_gate: impl Into<SpendGate<'g>>,
 ) -> FetchOutcome {
-    let spend_gate = spend_gate.into();
+    let sent = Cell::new(false);
+    let outcome = fetch_with_rotation_inner(
+        config,
+        entry,
+        prev_plan,
+        refetch,
+        activity,
+        spend_gate.into(),
+        &sent,
+    );
+    if sent.get() && !outcome.from_fetch {
+        outcome.with_fetch_failed()
+    } else {
+        outcome
+    }
+}
+
+/// [`fetch_with_rotation`]'s body. `sent` records that this tick sent a request
+/// of the account's own — the `/usage` fetch or the token rotation the rule
+/// counts — because every non-live outcome after one is a failed attempt. Each
+/// path sets it at its FIRST request; every later request in the same tick
+/// follows one of those, so a set per call would only record the same tick
+/// twice.
+fn fetch_with_rotation_inner<'g>(
+    config: &crate::profile::ConfigHandle,
+    entry: &TokenEntry,
+    prev_plan: Option<PlanInfo>,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+    spend_gate: SpendGate<'g>,
+    sent: &Cell<bool>,
+) -> FetchOutcome {
     let name = &entry.name;
     let access_token = entry.access_token.as_str();
     let refresh_token = entry.refresh_token.as_deref();
@@ -1658,6 +1712,7 @@ fn fetch_with_rotation<'g>(
             Some(activity),
             &mut profile_fetch,
         );
+        sent.set(true);
         // Read the clock AFTER the fetch resolves — `fetch_raw` is a blocking
         // HTTP round-trip, so reading it earlier would classify a token whose
         // expiry falls inside that window against a stale `now`. Read once,
@@ -1698,14 +1753,16 @@ fn fetch_with_rotation<'g>(
     // the refresh race must never cost a live usage poll.
     let bail_unrotated = |profile_fetch: &mut crate::usage::ProfileFetchDecision| {
         if proactive {
-            match fetch_raw(
+            let result = fetch_raw(
                 name,
                 access_token,
                 prev_plan.clone(),
                 false,
                 Some(activity),
                 profile_fetch,
-            ) {
+            );
+            sent.set(true);
+            match result {
                 Ok(info) => FetchOutcome::live(name, info, None).with_profile_fetch(profile_fetch),
                 Err(FetchError::RateLimited { retry_after, plan }) => {
                     FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
@@ -1716,6 +1773,9 @@ fn fetch_with_rotation<'g>(
                     .with_profile_fetch(profile_fetch),
             }
         } else {
+            // Reactive: the plain fetch above already ran and was refused (a
+            // 401, or a 429 on a clock-expired token), so this bail's failure
+            // mark rides that tick's request.
             bail_cached(profile_fetch)
         }
     };
@@ -1838,6 +1898,8 @@ fn fetch_with_rotation<'g>(
     run_claimed_rotation_hook(name);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
+    // The exchange is this tick's request: the retry below follows it.
+    sent.set(true);
     let rotation = crate::oauth::settle_refresh_answer(
         config,
         name,
@@ -1992,6 +2054,14 @@ struct FetchOutcome {
     /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
+    /// This tick sent a request for the account (a `/usage` fetch, a token
+    /// rotation, or a usage probe answered with anything but the organization
+    /// refusal) and served no live body. Folded into the profile's
+    /// `last_fetch_failed` mark by [`apply_outcome`] -> [`update_streaks`]; a
+    /// live body or a stand-down tick clears the mark, and a tick that sent
+    /// nothing never carries this flag.
+    /// Render-only — no cadence or backoff reads it.
+    fetch_failed: bool,
     /// A rotation's persist refused because the store holds no login any more
     /// (a logout landed mid-rotation): the drain drops this profile's
     /// `TokenList` entry rather than poll one more tick on a gone login.
@@ -2033,6 +2103,7 @@ impl FetchOutcome {
             from_headers: false,
             retry_after: None,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             oauth_identity: crate::usage::OAuthIdentity::default(),
@@ -2068,6 +2139,12 @@ impl FetchOutcome {
         self
     }
 
+    /// Mark this outcome as a tick that sent a request and served no live body.
+    fn with_fetch_failed(mut self) -> Self {
+        self.fetch_failed = true;
+        self
+    }
+
     /// Mark this outcome as carrying a refused persist whose store holds no
     /// login: the drain drops the profile's `TokenList` entry.
     fn with_login_gone(mut self) -> Self {
@@ -2093,6 +2170,7 @@ impl FetchOutcome {
             from_headers: false,
             retry_after,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             oauth_identity: crate::usage::OAuthIdentity::default(),
@@ -3334,34 +3412,38 @@ fn deadline_spread(name: &ProfileName, now: EpochMs, interval_ms: u64) -> Interv
     IntervalMs::from_millis(h.finish() % span)
 }
 
-/// Update `name`'s failure counters from a fetch `status` (plus whether its
-/// refresh leg just failed transiently), returning the post-update counts.
-/// `Fresh` clears both (a live body breaks the storm). Otherwise `RateLimited`
-/// bumps the 429 axis and a transient refresh failure bumps its own; a status
-/// that says nothing about either — a network-blip `Cached`/`Failed` mid-storm —
-/// leaves both as is so the ramp is not reset. Leaf lock, taken and released
-/// before the caller writes `last_fetched`/`status`.
+/// Update `name`'s failure records from a fetch `status` (plus whether its
+/// refresh leg just failed transiently and whether the attempt served no live
+/// body), returning the post-update counts. `Fresh` clears all of it (a live
+/// body breaks the storm). Otherwise `RateLimited` bumps the 429 axis and a
+/// transient refresh failure bumps its own; `fetch_failed` sets the
+/// `last_fetch_failed` mark. A status that says nothing about any of them — a
+/// seeded `Cached`/`Failed` that rode no attempt — leaves the entry as is so the
+/// ramp is not reset. Leaf lock, taken and released before the caller writes
+/// `last_fetched`/`status`.
 fn update_streaks(
     streaks: &PollStreaks,
     name: &ProfileName,
     status: FetchStatus,
     refresh_failed: bool,
+    fetch_failed: bool,
 ) -> StreakCounts {
     let Ok(mut m) = streaks.lock() else {
         return StreakCounts::default();
     };
-    // A live body clears BOTH axes: whatever went wrong, this profile is serving
-    // again. That also covers the preemptive-rotation case, where a refresh can
-    // fail while the still-valid access token fetches fine — nothing is degraded
-    // yet, so nothing should ladder or light up the row.
+    // A live body clears both axes AND the failure mark: whatever went wrong,
+    // this profile is serving again. That also covers the preemptive-rotation
+    // case, where a refresh can fail while the still-valid access token fetches
+    // fine — nothing is degraded yet, so nothing should ladder or light up the
+    // row.
     if matches!(status, FetchStatus::Fresh) {
         m.remove(name.as_str());
         return StreakCounts::default();
     }
     let rate_limited = matches!(status, FetchStatus::RateLimited);
-    if !rate_limited && !refresh_failed {
-        // Says nothing about either axis — leave both counters (and, when this
-        // profile has none, the empty map) untouched.
+    if !rate_limited && !refresh_failed && !fetch_failed {
+        // Says nothing about either axis or the mark — leave the entry (and,
+        // when this profile has none, the empty map) untouched.
         return m.get(name.as_str()).copied().unwrap_or_default();
     }
     let counts = m.entry(name.to_string()).or_default();
@@ -3370,6 +3452,9 @@ fn update_streaks(
     }
     if refresh_failed {
         counts.refresh_fail = counts.refresh_fail.saturating_add(1);
+    }
+    if fetch_failed {
+        counts.last_fetch_failed = true;
     }
     *counts
 }
@@ -3722,6 +3807,7 @@ fn apply_outcome_flagged(
         &outcome.name,
         outcome.status,
         outcome.refresh_failed,
+        outcome.fetch_failed,
     );
     let defer = next_slot_deferral(
         rate_limited,
@@ -7508,7 +7594,12 @@ fn probe_outcome(
     answer: super::inference::anthropic::ProbeAnswer,
 ) -> FetchOutcome {
     use super::inference::anthropic::ProbeAnswer;
-    match answer {
+    // An org refusal is a live verdict — the plan it lands is what the row
+    // shows — so it is no failed attempt. Every other answer that serves no
+    // usage body followed a probe this tick sent, and marks the account for the
+    // pane's skipped-spent guard.
+    let org_refused = matches!(answer, ProbeAnswer::OrgRefused { .. });
+    let outcome = match answer {
         ProbeAnswer::Reading {
             info, retry_after, ..
         } => {
@@ -7552,6 +7643,11 @@ fn probe_outcome(
             ..PlanInfo::default()
         })),
         ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
+    };
+    if org_refused || outcome.from_fetch {
+        outcome
+    } else {
+        outcome.with_fetch_failed()
     }
 }
 
@@ -9201,6 +9297,15 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     sync_kick_blocks_from_cache(&state.kick_blocks, &kick_names);
 
     let now = now_ms();
+    // The mark records this instance's own attempts; a stood-down instance
+    // sends none, so its mark may be stale — the fetching instance may
+    // have served the account since.
+    if let Ok(mut streaks) = state.poll_streaks.lock() {
+        streaks.retain(|_, counts| {
+            counts.last_fetch_failed = false;
+            *counts != StreakCounts::default()
+        });
+    }
     let streaks = streak_snapshot(&state.poll_streaks);
     let (_, mut oauth_next) = partition_due(
         &oauth_snapshot,

@@ -9410,8 +9410,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if app.tab == Tab::Usage {
                 usage_refresh(app);
             } else {
-                app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing every account");
+                refresh_every_account(app);
             }
             return;
         }
@@ -22870,6 +22869,9 @@ fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
 fn refresh_usage_account(app: &mut App, name: &ProfileName) {
     match account_by_name(app, name) {
         Some((name, true, _)) | Some((name, _, true)) => {
+            if refresh_stood_down(app, Some(&name)) {
+                return;
+            }
             app.manual_refresh_one(&name);
             app.toast(ToastKind::Info, format!("refreshing '{name}'"));
         }
@@ -22878,6 +22880,35 @@ fn refresh_usage_account(app: &mut App, name: &ProfileName) {
         }
         None => {}
     }
+}
+
+/// Queue every account for a refetch (Overview `r`, the menu's refresh-all),
+/// or toast why not.
+fn refresh_every_account(app: &mut App) {
+    if refresh_stood_down(app, None) {
+        return;
+    }
+    app.manual_refresh();
+    app.toast(ToastKind::Info, "refreshing every account");
+}
+
+/// The gate every manual usage refresh passes: while another instance holds
+/// the usage-fetch lease this one fetches nothing, and its stand-down tick
+/// drains the refetch queue unread. A refresh then queues nothing and toasts
+/// who refreshes instead, scoped to `name` when it asked for one account;
+/// `true` when it stood down. The toast names the daemon in every case, a
+/// lease another clauth TUI holds with no daemon running included, so its
+/// copy never splits by who holds the lease.
+fn refresh_stood_down(app: &mut App, name: Option<&ProfileName>) -> bool {
+    if app.fetch_lease.fetches_here() {
+        return false;
+    }
+    let subject = name.map_or_else(|| "usage".to_string(), |name| format!("'{name}'"));
+    app.toast(
+        ToastKind::Info,
+        format!("the daemon refreshes {subject} on its own schedule; r can't force it"),
+    );
+    true
 }
 
 /// Queue a usage refetch for the account under the cursor, or toast why not.
@@ -23045,10 +23076,7 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::ApplyPreset => apply_preset_identity(app, row_identity),
         // Tab-global actions: no row identity.
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshAll => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing every account");
-        }
+        ActionMenuAction::RefreshAll => refresh_every_account(app),
         ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {

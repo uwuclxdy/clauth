@@ -95,9 +95,10 @@ struct HeaderState {
     /// [`crate::usage::display_activity`]); a stood-down mirror reads `false`.
     fetches_here: bool,
     tick: u64,
-    /// Consecutive-failure counts for the shown profile (zeroed when absent).
-    /// The retry suffix names which retry the countdown leads to, so a deep slot
-    /// reads as stuck from the count alone, no judgment label.
+    /// The shown profile's poll-health record (defaulted when absent): the
+    /// consecutive-failure counts whose depth the retry suffix reads, and the
+    /// failed-fetch mark the skipped-spent guard consults. A deep slot reads as
+    /// stuck from the count alone, no judgment label.
     streaks: StreakCounts,
     /// The reading source behind `streaks.rate_limit` — OAuth-first, so the
     /// stuck hint names the endpoint that actually throttled, never the row's
@@ -803,7 +804,7 @@ const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
 /// The claude pane's `resets` row off the account's limit-reset reading (the
 /// scheduler's hourly side read or the CLI's post-spend refresh): `N available`,
-/// or `N of M available` against the banked total when the reading carries one;
+/// or `N/M available` against a banked total the count falls short of;
 /// the windows the next grant resets, its end as the local month/day, and the
 /// reading's age once it passes 75 min. Each `· …` part drops when its field
 /// is absent; a zero count draws no row unless the reading carries a banked
@@ -814,10 +815,10 @@ fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Optio
     if resets.usable == 0 && banked.unwrap_or(0) == 0 {
         return None;
     }
-    let mut parts = vec![match banked {
-        Some(total) => format!("{} of {total} available", resets.usable),
-        None => format!("{} available", resets.usable),
-    }];
+    let mut parts = vec![crate::usage::claude_reset::available_of(
+        resets.usable,
+        banked.unwrap_or(resets.usable),
+    )];
     if !resets.clears.is_empty() {
         let labels = resets
             .clears
@@ -828,7 +829,7 @@ fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Optio
         parts.push(format!("resets {labels}"));
     }
     if let Some(ends) = local_day(&resets.ends_at) {
-        parts.push(format!("until {ends}"));
+        parts.push(format!("expires {ends}"));
     }
     if let Some(stamp) = resets
         .fetched_at
@@ -1937,6 +1938,13 @@ fn status_lines(
         let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
         format!("{secs}s")
     });
+    // No scheduled refresh and a window maxed: the poll skips this account
+    // until its window resets, so no fetch is lined up to serve it.
+    let skipped_spent = countdown.is_none()
+        && readings
+            .usage_of(&profile.name)
+            .and_then(|u| crate::usage::spent_resume_in_secs(u, now))
+            .is_some();
 
     // 5. The fetch row, always last. Its own fix hint (if any) rides beneath it,
     //    connected into the same rail as the rows above once 2+ hints stack.
@@ -1986,7 +1994,15 @@ fn status_lines(
                 spans.push(Span::styled(format!("  retry in {c}"), theme::faint()));
             }
         }
-        Some(FetchStatus::Cached) => {
+        // A skipped spent account's `Cached` falls through to the spent pill
+        // below only while nothing failed: a seeded reading (a stood-down
+        // mirror, the boot seed) carries no refresh streak and no failed-fetch
+        // mark, but a failed attempt sets the mark and stays visible here.
+        Some(FetchStatus::Cached)
+            if header.streaks.refresh_fail > 0
+                || header.streaks.last_fetch_failed
+                || !skipped_spent =>
+        {
             // A run of failed token refreshes lands here — we ARE serving
             // last-known numbers, so `Cached` is honest — but "cached" alone
             // names the symptom and not the cause, and nothing else on the row
@@ -2073,44 +2089,34 @@ fn status_lines(
                 Span::styled(format!("{} ", theme::WAITING), theme::accent()),
                 Span::styled(format!("refresh in {c}"), theme::dim()),
             ]),
-            None => {
-                // No scheduled refresh means `refresh_spent_accounts` is OFF and
-                // this account is spent — skipped until its window resets. Render
-                // it as a status pill like the fetch states above so the blank
-                // overview timer reads as intent; the binding reset is already on
-                // the maxed window's own bar line, so the pill stays bare. A
-                // genuinely quiet account with no maxed window falls through to
-                // "up to date".
-                let resumes = readings
-                    .usage_of(&profile.name)
-                    .and_then(|u| crate::usage::spent_resume_in_secs(u, now));
-                match resumes {
-                    Some(_) => {
-                        spans.extend([
-                            Span::styled("[ ", theme::dim()),
-                            Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
-                            Span::styled(" ]", theme::dim()),
-                        ]);
-                        // Only the weekly cap earns the teach — the domain fact
-                        // that a live-looking 5h window can't serve while the week
-                        // is spent. A 5h-only spend is self-evident from the reset.
-                        if header.diag.weekly_hard {
-                            let monthly = readings
-                                .usage_of(&profile.name)
-                                .and_then(|u| u.long_window())
-                                .is_some_and(|(label, _)| label == crate::usage::LABEL_30D);
-                            fetch_hint = Some(UsageDiag::WeeklyHard { monthly });
-                        }
-                    }
-                    // Nothing pending and nothing maxed — the `idle` dot, which
-                    // differs from `queued` above by color alone, so the label
-                    // carries the meaning on a monochrome read.
-                    None => spans.extend([
-                        Span::styled(format!("{} ", theme::WAITING), theme::dim()),
-                        Span::styled("up to date", theme::dim()),
-                    ]),
+            // A skipped spent account renders as a status pill like the fetch
+            // states above so the blank overview timer reads as intent; the
+            // binding reset is already on the maxed window's own bar line, so
+            // the pill stays bare.
+            None if skipped_spent => {
+                spans.extend([
+                    Span::styled("[ ", theme::dim()),
+                    Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
+                    Span::styled(" ]", theme::dim()),
+                ]);
+                // Only the weekly cap earns the teach — the domain fact that a
+                // live-looking 5h window can't serve while the week is spent.
+                // A 5h-only spend is self-evident from the reset.
+                if header.diag.weekly_hard {
+                    let monthly = readings
+                        .usage_of(&profile.name)
+                        .and_then(|u| u.long_window())
+                        .is_some_and(|(label, _)| label == crate::usage::LABEL_30D);
+                    fetch_hint = Some(UsageDiag::WeeklyHard { monthly });
                 }
             }
+            // Nothing pending and nothing maxed — the `idle` dot, which differs
+            // from `queued` above by color alone, so the label carries the
+            // meaning on a monochrome read.
+            None => spans.extend([
+                Span::styled(format!("{} ", theme::WAITING), theme::dim()),
+                Span::styled("up to date", theme::dim()),
+            ]),
         },
     }
     // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to

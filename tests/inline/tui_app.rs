@@ -10455,6 +10455,65 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 }
 
+/// While another instance (the daemon) holds the usage-fetch lease, this TUI
+/// fetches nothing: its refetch queue is drained unread by the stood-down
+/// tick. Every manual refresh entry then says so instead of lighting a
+/// spinner that clears with no fetch, and queues nothing.
+#[test]
+fn a_stood_down_refresh_says_the_daemon_owns_it() {
+    use super::{KeyCode, Tab, handle_key};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("oauth".to_string(), None, None)]);
+    // The competing instance's lease must stay alive for the whole test.
+    let daemon = crate::daemon::FetchLease::new();
+    assert!(daemon.acquire(), "the competing instance wins the lease");
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+
+    let queued = |app: &App| -> usize { app.refetch_queue.lock().expect("queue lock").len() };
+    // Each step starts from no toasts and must push exactly its own: a step
+    // that toasts nothing must not pass on the toast the step before left.
+    let toasts = |app: &App| -> Vec<String> { app.toasts.iter().map(|t| t.body.clone()).collect() };
+    // A queued refetch lights a `Queued` mark on the account; nothing here may.
+    let marked = |app: &App| -> bool {
+        app.activity
+            .lock()
+            .expect("activity lock")
+            .contains_key("oauth")
+    };
+    let all = "the daemon refreshes usage on its own schedule; r can't force it";
+    let one = "the daemon refreshes 'oauth' on its own schedule; r can't force it";
+
+    app.tab = Tab::Usage;
+    app.profile_cursor.set(0);
+    app.toasts.clear();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert_eq!(toasts(&app), [one]);
+    assert_eq!(queued(&app), 0, "Usage `r` queues nothing");
+    assert!(!marked(&app), "Usage `r` marks nothing queued");
+
+    app.toasts.clear();
+    pick_menu_entry(&mut app, "refresh usage");
+    assert_eq!(toasts(&app), [one]);
+    assert_eq!(queued(&app), 0, "the menu's refresh queues nothing");
+    assert!(!marked(&app), "the menu's refresh marks nothing queued");
+
+    app.tab = Tab::Overview;
+    app.toasts.clear();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert_eq!(toasts(&app), [all]);
+    assert_eq!(queued(&app), 0, "Overview `r` queues nothing");
+    assert!(!marked(&app), "Overview `r` marks nothing queued");
+
+    // The action menu's refresh-all entry rides the same gate.
+    app.toasts.clear();
+    pick_menu_entry(&mut app, "refresh all accounts");
+    assert_eq!(toasts(&app), [all]);
+    assert_eq!(queued(&app), 0, "the menu's refresh-all queues nothing");
+    assert!(!marked(&app), "the menu's refresh-all marks nothing queued");
+}
+
 /// The console link is offered for exactly the accounts clauth knows a page
 /// for. An OAuth account has none, so the entry is absent above rather than
 /// present-and-inert — the assertions there are the other direction of this one.
@@ -37212,6 +37271,7 @@ fn turning_the_probe_off_clears_what_the_probe_left() {
         crate::usage::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
     super::handle_key(&mut app, key(KeyCode::Char(' ')));

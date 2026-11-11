@@ -293,12 +293,14 @@ struct OverviewWidths {
     /// `TPS_W` when the per-account speed column fits, `0` when it is dropped
     /// (the fill restores it whole once the slack covers its slot).
     tps: usize,
-    /// The rows' trailing `↺ N` chip slot (gap + the widest visible chip text
-    /// across codex and claude rows), charged whenever a visible row of either
-    /// kind carries a banked reset and the row has room for it; `0` when none
-    /// does or the chip sheds whole, so the renderer drops the chip instead of
-    /// clipping it mid-glyph. One shared slot: a chip never clips and sheds
-    /// the same way on both kinds.
+    /// The `↺ N` chip slot right behind the last usage column, ahead of `live`
+    /// and `t/s` (gap + the widest visible chip text across codex and claude
+    /// rows), charged whenever a visible row of either kind carries a banked
+    /// reset and the row has room for it; `0` when none does or the chip
+    /// sheds whole, so the renderer drops the chip instead of clipping it
+    /// mid-glyph. One shared slot every row kind and the header pad: a chip
+    /// never clips, sheds the same way on both kinds, and the columns after
+    /// it stay aligned.
     chip_w: usize,
     /// Name cells the chip's charge took at the laid-out width (the uncharged
     /// name minus the laid-out one). Past [`OVERVIEW_MAX_W`] the slack restores
@@ -463,7 +465,7 @@ const GAP_MIN: usize = 2;
 const OVERVIEW_MAX_W: u16 = 122;
 
 /// The gaps of a table row, each named by the column it opens. The `↺ N`
-/// chip's gap is not one: the chip trails the row at its laid-out width.
+/// chip's gap is not one: the chip slot keeps its laid-out width.
 #[derive(Debug, Clone, Copy)]
 enum Gap {
     Kind,
@@ -497,8 +499,9 @@ impl OverviewWidths {
     /// t/s columns come back whole, once the slack covers each one's slot
     /// (its gap plus the column), live before t/s, and the split waits for
     /// them — a pending slot withholds everything past the name and the
-    /// stamps, so no bar or gap ever shrinks. The deferred chip comes
-    /// back the same way, after t/s. What is left then splits a third to the
+    /// stamps, so no bar or gap ever shrinks. The deferred chip slot comes
+    /// back the same way, after t/s, into its place behind the last usage
+    /// column. What is left then splits a third to the
     /// 5h and 7d bars that actually draw (a lone bar takes the whole third,
     /// none the whole slack) and the rest over the gaps, the leftmost gaps
     /// taking a cell each where it does not divide evenly. The row then
@@ -878,7 +881,8 @@ impl OverviewWidths {
     /// The width the table's widest row draws at these columns, before the
     /// `↺ N` chip: the cursor and bell prefix, every column and its gap, and
     /// the timer slot. The widest row the layout can draw is this plus
-    /// [`Self::chip_w`], since the chip rides past the row's last column.
+    /// [`Self::chip_w`], the chip slot every row carries behind its last
+    /// usage column.
     fn row_width(&self) -> usize {
         fixed_overview_width_cols(
             self.name,
@@ -1200,6 +1204,7 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
             theme::label(),
         ));
     }
+    push_chip_slot(&mut spans, widths, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
@@ -1209,6 +1214,28 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
         spans.push(Span::styled(fixed("t/s", widths.tps), theme::label()));
     }
     Line::from(spans)
+}
+
+/// The `↺ N` banked-reset chip slot, right behind the last usage column drawn
+/// and ahead of `live` and `t/s`: the same [`OverviewWidths::chip_w`] cells on
+/// every row kind and the header, so the columns after it line up whether a
+/// row carries a chip or not, and a reset count never sits under `live` or
+/// `t/s`. `count` is the row's banked reset count, `None` for a blank slot;
+/// nothing while the slot is not charged.
+fn push_chip_slot(spans: &mut Vec<Span<'static>>, widths: &OverviewWidths, count: Option<i64>) {
+    if widths.chip_w == 0 {
+        return;
+    }
+    let text_w = widths.chip_w.saturating_sub(widths.gap);
+    spans.push(Span::raw(" ".repeat(widths.gap)));
+    match count {
+        Some(count) => {
+            let (chip, pad) = fixed_split(&format!("↺ {count}"), text_w);
+            spans.push(Span::styled(chip, theme::dim()));
+            spans.push(Span::raw(pad));
+        }
+        None => spans.push(Span::raw(" ".repeat(text_w))),
+    }
 }
 
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
@@ -1286,10 +1313,7 @@ fn render_codex_row(
         spans.push(gap(widths, Gap::SevenDay));
         spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
-    // The chip trails the columns — after the live slot's width, so a dim
-    // reset count can never sit under `live` and read as a session count, and
-    // after the t/s slot's width when that column is present, so it can never
-    // sit under `t/s` and read as that row's speed.
+    push_chip_slot(&mut spans, widths, row.resets);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1297,12 +1321,6 @@ fn render_codex_row(
     if widths.tps > 0 {
         spans.push(gap(widths, Gap::Tps));
         spans.push(Span::raw(" ".repeat(widths.tps)));
-    }
-    if widths.chip_w > 0
-        && let Some(count) = row.resets
-    {
-        spans.push(Span::raw(" ".repeat(widths.gap)));
-        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
 }
@@ -1425,6 +1443,7 @@ fn render_pool_row(
             " ".repeat(widths.seven_day.saturating_sub(seven_len)),
         ));
     }
+    push_chip_slot(&mut spans, widths, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1784,6 +1803,12 @@ fn render_overview_row(
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
+    let resets = app
+        .claude_resets
+        .get(profile.name.as_str())
+        .map(|r| i64::from(r.usable))
+        .filter(|n| *n > 0);
+    push_chip_slot(&mut spans, widths, resets);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(live_cell(
@@ -1794,19 +1819,6 @@ fn render_overview_row(
     if widths.tps > 0 {
         spans.push(gap(widths, Gap::Tps));
         spans.push(tps_cell(app, &profile.name, widths.tps));
-    }
-    // The banked-reset chip trails the columns on claude rows exactly as it
-    // does on codex rows: the shared slot above, so it sheds the same way and
-    // never sits under `live` or `t/s`.
-    if widths.chip_w > 0
-        && let Some(count) = app
-            .claude_resets
-            .get(profile.name.as_str())
-            .map(|r| r.usable)
-            .filter(|n| *n > 0)
-    {
-        spans.push(Span::raw(" ".repeat(widths.gap)));
-        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
 
     Line::from(spans)

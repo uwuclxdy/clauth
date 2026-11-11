@@ -7271,9 +7271,9 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
         listed,
         [
             "clauth: 'cl2' has 2 limit resets available.",
-            "    Old reset: 1 of 1 available, resets 5h",
-            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 1 available, resets 5h",
+            "  * Weekly reset: 1 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     // 2027-03-09T07:59:00Z, the fixture's `ends_at` on both grants.
@@ -7287,11 +7287,11 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
             "clauth: 'cl2' has 2 limit resets available.".to_string(),
             format!(
                 "  * New model launch: one Fable reset for Max, Team Premium and Enterprise \
-                 Premium: 1 of 1 available, resets 7d fable, ends {ends}  (used next)"
+                 Premium: 1 available, resets 7d fable, expires {ends}  (used next)"
             ),
             format!(
-                "    New model launch: one more Fable reset at 6 months' tenure: 1 of 1 \
-                 available, resets 7d fable, ends {ends}"
+                "    New model launch: one more Fable reset at 6 months' tenure: 1 available, \
+                 resets 7d fable, expires {ends}"
             ),
         ]
     );
@@ -7351,7 +7351,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     assert_eq!(
         asked,
         "clauth: use the limit reset \"Weekly reset\" on 'cl2'? It resets 5h and 7d now and \
-         cannot be undone; 1 of 2 available on it."
+         cannot be undone; 1 available on it."
     );
     assert_eq!(declined, ["clauth: aborted. no reset was used on 'cl2'."]);
 

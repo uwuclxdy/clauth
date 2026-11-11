@@ -131,8 +131,6 @@ pub(crate) struct Grant {
     #[serde(default)]
     label: String,
     #[serde(default)]
-    resets_total: u32,
-    #[serde(default)]
     resets_left: u32,
     #[serde(default)]
     ends_at: Option<String>,
@@ -386,6 +384,17 @@ pub(crate) fn window_label(name: &str) -> String {
     }
 }
 
+/// `N available` when a spend can use every reset still held, else
+/// `usable/held available`. Shared by `--list` and the TUI's resets row, so
+/// both count against what is held, never a grant's original size.
+pub(crate) fn available_of(usable: u32, held: u32) -> String {
+    if usable == held {
+        format!("{usable} available")
+    } else {
+        format!("{usable}/{held} available")
+    }
+}
+
 /// `5h`, `5h and 7d`, `5h, 7d and 7d opus` — a comma list with the last pair
 /// joined by `and`.
 fn join_windows(clears: &[String]) -> String {
@@ -539,11 +548,12 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .ends_at
             .as_deref()
             .filter(|e| !shows_nothing(&terminal_safe(e)))
-            .map(|e| format!(", ends {}", stamp(e)))
+            .map(|e| format!(", expires {}", stamp(e)))
             .unwrap_or_default();
         let suffix = if marked { "  (used next)" } else { "" };
-        // The row counts only what a spend would use now: with no spendable
-        // next grant, the header says 0 and every row reads 0 too.
+        // The row counts the grant's resets the server marks usable now,
+        // against the ones it still holds; with no spendable next grant the
+        // header counts none and every row reads 0 too.
         let count = if grant.usable_now && spendable.is_some() {
             grant.resets_left
         } else {
@@ -553,10 +563,10 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .map(|state| format!(", {state}"))
             .unwrap_or_default();
         lines.push(format!(
-            "  {} {}: {count} of {} available, resets {}{tail}{ends}{suffix}",
+            "  {} {}: {}, resets {}{tail}{ends}{suffix}",
             if marked { "*" } else { " " },
             grant.label(),
-            grant.resets_total,
+            available_of(count, grant.resets_left),
             clears_summary(&grant.clears),
         ));
     }
@@ -564,6 +574,8 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
+/// Only the spendable next grant is asked about, so every reset it holds is
+/// usable and the count reads bare.
 pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> String {
     let head = if grant.is_untitled() {
         format!("clauth: use a limit reset on '{name}'?")
@@ -574,10 +586,9 @@ pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> S
         )
     };
     let mut prompt = format!(
-        "{head} It resets {} now and cannot be undone; {} of {} available on it.",
+        "{head} It resets {} now and cannot be undone; {} available on it.",
         clears_summary(&grant.clears),
         grant.resets_left,
-        grant.resets_total,
     );
     if !status.at_limit
         && let Some(warning) = not_at_limit_warning(name, grant)
