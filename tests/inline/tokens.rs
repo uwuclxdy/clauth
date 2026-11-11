@@ -3011,8 +3011,8 @@ fn backfill_persists_when_record_has_nothing_new() {
     let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
     let base = TokenStats::default(); // nothing mergeable
     assert!(
-        !ledger.record(&base, &today),
-        "fixture: record() must have nothing to do"
+        !ledger.record_covering(&base, &today, true),
+        "fixture: record_covering() must have nothing to do"
     );
     persist_ledger(
         &claude_dir,

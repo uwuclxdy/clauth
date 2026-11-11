@@ -323,18 +323,12 @@ impl Ledger {
 
     /// Record every finalized day the merged `base` carries a split for, then
     /// advance `recorded_through` to yesterday **when the sweep covered every
-    /// day up to it**. A finalized day is any day after the current watermark
-    /// and strictly before `today`; the watermark only moves over days a sweep
-    /// actually covered — a skipped sweep leaves it alone, so a later launch
-    /// cannot mistake the unswept history for counted days. The watermark is
-    /// monotonic, so a day is recorded exactly once. Returns whether anything
-    /// changed (worth a `save`).
-    pub(crate) fn record(&mut self, base: &TokenStats, today: &str) -> bool {
-        self.record_covering(base, today, true)
-    }
-
-    /// [`record`](Self::record) for a caller that knows how far the sweep read:
-    /// only a sweep covering every day up to `today` may advance the watermark.
+    /// day up to it** (`sweep_covers_all_days`). A finalized day is any day
+    /// after the current watermark and strictly before `today`; the watermark
+    /// only moves over days a sweep actually covered — a skipped sweep leaves
+    /// it alone, so a later launch cannot mistake the unswept history for
+    /// counted days. The watermark is monotonic, so a day is recorded exactly
+    /// once. Returns whether anything changed (worth a `save`).
     pub(crate) fn record_covering(
         &mut self,
         base: &TokenStats,

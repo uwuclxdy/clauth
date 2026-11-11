@@ -3453,10 +3453,21 @@ fn a_dateless_rollup_skips_the_sweep() {
         }
     }
     drop(refresh_tx);
+    // Nothing was swept, so the ledger may stay absent — but a saved ledger
+    // must hold no transcript day and leave the watermark unset, or a later
+    // launch would mistake the unswept history for counted days.
     if let Ok(raw) = std::fs::read_to_string(clauth.join("token_ledger.json")) {
         assert!(
             !raw.contains("2026-06-11"),
             "a skipped sweep must not record transcript days: {raw}"
+        );
+        let ledger: serde_json::Value =
+            serde_json::from_str(&raw).expect("the saved ledger parses");
+        assert!(
+            ledger
+                .get("recorded_through")
+                .map_or(true, |v| v.is_null()),
+            "a skipped sweep must not advance the watermark: {raw}"
         );
     }
 }
