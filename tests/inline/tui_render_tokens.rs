@@ -3388,10 +3388,7 @@ fn a_first_launch_counts_every_transcript() {
         match rx.recv_timeout(std::time::Duration::from_secs(60)) {
             Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
             Ok(crate::tokens::TokensEvent::Failed(cause)) => {
-                panic!(
-                    "a first launch failed the tab: {}",
-                    cause.cause_line()
-                )
+                panic!("a first launch failed the tab: {}", cause.cause_line())
             }
             Ok(_) => {}
             Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
@@ -3464,9 +3461,7 @@ fn a_dateless_rollup_skips_the_sweep() {
         let ledger: serde_json::Value =
             serde_json::from_str(&raw).expect("the saved ledger parses");
         assert!(
-            ledger
-                .get("recorded_through")
-                .map_or(true, |v| v.is_null()),
+            ledger.get("recorded_through").is_none_or(|v| v.is_null()),
             "a skipped sweep must not advance the watermark: {raw}"
         );
     }
