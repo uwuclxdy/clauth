@@ -18,8 +18,8 @@ use serde::Deserialize;
 
 use super::codex_reset::{
     FailureVoice, cap_drawn, quoted_escaped, re_send_deadline, re_send_hint,
-    read_failure as shared_read_failure, read_reply, spend_failure as shared_spend_failure, stamp,
-    trim_padding,
+    read_failure as shared_read_failure, read_reply, read_reply_hinted,
+    spend_failure as shared_spend_failure, stamp, trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
 use super::fetch::{AuthClient, LimitResets};
@@ -199,7 +199,7 @@ impl CedarEmberBody {
 }
 
 /// Parse the `cedar_ember` block off a raw usage body. Test-only: the wire
-/// read ([`read_status_at`]) parses the typed body through [`read_reply`], and
+/// read ([`read_status_at`]) parses the typed body through [`read_reply_hinted`], and
 /// this seam lets tests drive fixture bytes straight into the parser.
 #[cfg(test)]
 pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
@@ -210,7 +210,16 @@ pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
 
 /// GET the account's reset grants. Spends nothing.
 pub(crate) fn read_status_at(url: &str, access_token: &str) -> Result<ResetStatus, ResetCallError> {
-    read_reply::<CedarEmberBody>(
+    read_status_hinted_at(url, access_token).map_err(|(err, _)| err)
+}
+
+/// [`read_status_at`] carrying a non-2xx reply's `retry-after` beside its
+/// error (see [`read_reply_hinted`]), for the scheduler's side read.
+pub(crate) fn read_status_hinted_at(
+    url: &str,
+    access_token: &str,
+) -> Result<ResetStatus, (ResetCallError, Option<Duration>)> {
+    read_reply_hinted::<CedarEmberBody>(
         super::fetch::apply_auth_headers(
             super::fetch::http_agent().get(url),
             access_token,

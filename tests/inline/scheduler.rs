@@ -36622,6 +36622,86 @@ fn a_resets_read_under_a_spent_ticket_writes_no_limit_resets_file() {
     let _ = server.join().expect("listener");
 }
 
+/// A refused side read whose tick lost the lease on the wire raises no line,
+/// since only the holder speaks, yet still stamps its retry on the ladder's
+/// first rung (90 s interval + 10 s). Control: the retry under a re-taken
+/// ticket says so, on the second rung.
+#[test]
+fn a_refused_resets_read_under_a_spent_ticket_stamps_its_retry_without_a_line() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = save_unanchored_login("lr-lease2", "lr-lease2-tok");
+    crate::testutil::register_names(&["lr-lease2"]);
+    let state = resets_state(vec![profile]);
+    let released = Arc::new(AtomicBool::new(false));
+    let lease = Arc::clone(&state.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, {
+        let released = Arc::clone(&released);
+        let lease = Arc::clone(&lease);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ && !released.swap(true, Ordering::SeqCst) {
+                assert!(
+                    lease.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+            }
+            resets_429(Some(0))
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let t = RESETS_T;
+    let named = |lines: &crate::logline::LogLines| -> Vec<String> {
+        lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains("'lr-lease2'"))
+            .collect()
+    };
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        Vec::<String>::new(),
+        "a tick that lost the lease says nothing"
+    );
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert_eq!(memo.last_read_at.get("lr-lease2"), Some(&t));
+        assert_eq!(
+            memo.retry.get("lr-lease2"),
+            Some(&(t + 100_000, 1)),
+            "the refusal still stamps its retry on the first rung"
+        );
+    }
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t + 100_000, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        vec![refused_line("lr-lease2", 429, Some(0), 120)],
+        "control: the holder's retry says so, on the second rung"
+    );
+    let _ = server.join().expect("listener");
+}
+
 /// While a read is left running its account gets no second one, whatever marks
 /// it due; the mark waits and fires once the read has exited.
 #[test]
@@ -36954,6 +37034,549 @@ fn a_resets_read_that_cannot_start_dates_the_hour_with_one_line() {
 
     assert_resets_attempt_dated(&state, "lrs1", t, &lines, &stub);
     drop(endpoints);
+}
+
+// ── a failed side read says so once; a refusal retries on the poll's ladder ──
+
+/// One side-read reply: status, response headers, body.
+type ResetsReply = (u16, Vec<(String, String)>, String);
+
+/// The edge refusal's shape: a 429 carrying `retry-after` (seconds) when set.
+fn resets_429(retry_after: Option<u64>) -> ResetsReply {
+    let headers = retry_after
+        .map(|secs| vec![("retry-after".to_string(), secs.to_string())])
+        .unwrap_or_default();
+    (
+        429,
+        headers,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}"#
+            .to_string(),
+    )
+}
+
+/// What [`drive_resets_reads`] saw: per tick, the side reads sent so far and
+/// the lines naming the account that pass raised; then whether a reading
+/// landed.
+type ResetsRun = (Vec<(usize, Vec<String>)>, bool);
+
+/// Drives `name`'s side read at each instant of `ticks` (virtual epoch ms)
+/// against `base`, each pass under its own log capture.
+fn drive_resets_ticks(
+    home: &crate::testutil::HomeSandbox,
+    name: &str,
+    base: &str,
+    ticks: &[u64],
+    reads: impl Fn() -> usize,
+) -> ResetsRun {
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(home, base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for &at in ticks {
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads(), named));
+    }
+    let landed = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("path")
+    .exists();
+    drop(endpoints);
+    (seen, landed)
+}
+
+/// [`drive_resets_ticks`] against a stub answering the `i`-th side read with
+/// `reply(i)`. The stub's budget sits one above the reads the ticks can send,
+/// so a read past the expected ones is counted rather than refused.
+fn drive_resets_reads(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+) -> ResetsRun {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let run = drive_resets_ticks(&home, name, &base, ticks, || reads.load(Ordering::SeqCst));
+    let _ = server.join().expect("listener");
+    run
+}
+
+/// The line a side read refused on the poll's ladder raises.
+fn refused_line(name: &str, status: u16, retry_after: Option<u64>, next_secs: u64) -> String {
+    let hint = retry_after.map_or_else(
+        || "no Retry-After".to_string(),
+        |s| format!("Retry-After {s}s"),
+    );
+    format!(
+        "clauth: '{name}': the limit reset read got HTTP {status} ({hint}); next read in {next_secs}s"
+    )
+}
+
+const RESETS_T: u64 = 1_900_000_000_000;
+
+/// A 429 on the side read says so in one line naming the account, the status
+/// and the server's Retry-After, lands no reading, and its next read waits
+/// out that Retry-After (754 s, above the ladder's first 100 s rung).
+#[test]
+fn a_refused_side_read_names_the_account_status_and_retry_after_once() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf1", &[t, t + 753_999, t + 754_000], |_| {
+        resets_429(Some(754))
+    });
+    assert_eq!(
+        seen,
+        vec![
+            (1, vec![refused_line("lrf1", 429, Some(754), 754)]),
+            (1, vec![]),
+            (2, vec![refused_line("lrf1", 429, Some(754), 754)]),
+        ]
+    );
+    assert!(!landed, "a refused read lands no reading");
+}
+
+/// A 429 whose Retry-After names no wait (`/usage` sends `0` on every 429)
+/// retries on the poll's own ladder at the poll's 90 s interval, never the
+/// hour: `next_slot_deferral` gives a gap of interval + 10 s, 30 s, 90 s, then
+/// the #74 floor's 300 s, rung by consecutive refusal.
+#[test]
+fn a_refused_side_read_retries_on_the_polls_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,
+        t + 99_999,
+        t + 100_000,
+        t + 219_999,
+        t + 220_000,
+        t + 399_999,
+        t + 400_000,
+        t + 699_999,
+        t + 700_000,
+    ];
+    let (seen, landed) = drive_resets_reads("lrf2", &ticks, |_| resets_429(Some(0)));
+    let line = |next| vec![refused_line("lrf2", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(100)),
+            (1, vec![]),
+            (2, line(120)),
+            (2, vec![]),
+            (3, line(180)),
+            (3, vec![]),
+            (4, line(300)),
+            (4, vec![]),
+            (5, line(300)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// A Retry-After longer than the ladder's rung sets the gap, up to the poll's
+/// 15-minute `MAX_RETRY_AFTER_MS` cap. The line prints the hint as the poll's
+/// parser reads it, so a header past the cap prints the cap.
+#[test]
+fn a_long_retry_after_sets_the_next_side_read_up_to_the_cap() {
+    let t = RESETS_T;
+    let (seen, _) = drive_resets_reads("lrf3", &[t, t + 599_999, t + 600_000], |_| {
+        resets_429(Some(600))
+    });
+    let line = vec![refused_line("lrf3", 429, Some(600), 600)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+
+    let (seen, _) = drive_resets_reads("lrf4", &[t, t + 899_999, t + 900_000], |_| {
+        resets_429(Some(3600))
+    });
+    let line = vec![refused_line("lrf4", 429, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+}
+
+/// A 5xx is a refusal too: it retries on the same ladder, and its line says
+/// when the server named no Retry-After.
+#[test]
+fn a_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf5", &[t, t + 99_999, t + 100_000], |_| {
+        (503, Vec::new(), "upstream unavailable".to_string())
+    });
+    let line = vec![refused_line("lrf5", 503, None, 100)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A side read that gets no answer (here a refused connect) retries on the
+/// ladder like a 429, naming no status.
+#[test]
+fn an_unanswered_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lrf6", &base, &[t, t + 99_999, t + 100_000], || 0);
+    let line =
+        vec!["clauth: 'lrf6': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(
+        seen,
+        vec![(0, line.clone()), (0, vec![]), (0, line)],
+        "one line per attempt, the second on the ladder's first rung"
+    );
+    assert!(!landed);
+}
+
+/// A 401, any other 4xx and a body clauth cannot read are no refusal: each
+/// says so in one line and keeps the full hour.
+#[test]
+fn a_rejected_or_unreadable_side_read_keeps_the_hour_with_one_line() {
+    let t = RESETS_T;
+    let ticks = [t, t + 3_599_999, t + 3_600_000];
+    let cases: [(&str, ResetsReply, &str); 3] = [
+        (
+            "lrh1",
+            (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+            "the limit reset read got HTTP 401",
+        ),
+        (
+            "lrh2",
+            (
+                403,
+                vec![("retry-after".to_string(), "5".to_string())],
+                String::new(),
+            ),
+            "the limit reset read got HTTP 403",
+        ),
+        (
+            "lrh3",
+            (200, Vec::new(), "not json".to_string()),
+            "the limit reset read answered in a shape clauth does not read",
+        ),
+    ];
+    for (name, reply, what) in cases {
+        let (seen, landed) = drive_resets_reads(name, &ticks, move |_| reply.clone());
+        let line = vec![format!("clauth: '{name}': {what}; next read in 3600s")];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// The ladder's rung counts consecutive refusals: a landed read, or a failure
+/// that keeps the hour, starts the next refusal back on the first rung.
+#[test]
+fn a_landed_or_hour_keeping_read_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,             // 429: rung 1, 100 s
+        t + 100_000,   // 429: rung 2, 120 s
+        t + 220_000,   // 200: lands, the hour
+        t + 3_820_000, // 429: rung 1 again
+        t + 3_920_000, // 429: rung 2
+        t + 4_040_000, // 401: the hour
+        t + 7_640_000, // 429: rung 1 again
+        t + 7_739_999,
+        t + 7_740_000, // 429: rung 2
+    ];
+    let (seen, landed) = drive_resets_reads("lrl1", &ticks, |i| match i {
+        2 => (200, Vec::new(), CEDAR_EMBER_THREE_GRANTS.to_string()),
+        5 => (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+        _ => resets_429(Some(0)),
+    });
+    let refused = |next| vec![refused_line("lrl1", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![]),
+            (4, refused(100)),
+            (5, refused(120)),
+            (
+                6,
+                vec![
+                    "clauth: 'lrl1': the limit reset read got HTTP 401; next read in 3600s"
+                        .to_string()
+                ]
+            ),
+            (7, refused(100)),
+            (7, vec![]),
+            (8, refused(120)),
+        ]
+    );
+    assert!(landed, "the 200 landed its reading");
+}
+
+// ── a refusal's retry: the cases the ladder's own rules leave open ──
+
+/// [`drive_resets_reads`] with `before(state, i)` run ahead of the `i`-th
+/// tick, so a case can set or forget the memo between passes.
+fn drive_resets_reads_with(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+    before: impl Fn(&super::SchedulerState, usize),
+) -> Vec<(usize, Vec<String>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for (i, &at) in ticks.iter().enumerate() {
+        before(&state, i);
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads.load(Ordering::SeqCst), named));
+    }
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    seen
+}
+
+/// A 401's Retry-After is no refusal's hint: the hour holds, and the line
+/// names no Retry-After.
+#[test]
+fn a_401_carrying_a_retry_after_still_keeps_the_hour() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro1", &[t, t + 3_599_999, t + 3_600_000], |_| {
+        (
+            401,
+            vec![("retry-after".to_string(), "5".to_string())],
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )
+    });
+    let line =
+        vec!["clauth: 'lro1': the limit reset read got HTTP 401; next read in 3600s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A 5xx whose Retry-After asks past the poll's 15-minute cap retries at the
+/// cap, its line printing the hint as the poll's parser reads it.
+#[test]
+fn a_server_error_asking_past_the_cap_retries_at_the_cap() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro2", &[t, t + 899_999, t + 900_000], |_| {
+        (
+            503,
+            vec![("retry-after".to_string(), "3600".to_string())],
+            "upstream unavailable".to_string(),
+        )
+    });
+    let line = vec![refused_line("lro2", 503, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A refused read a due mark brought forward consumes the mark like any
+/// attempt, and its retry waits for the ladder's rung, not the next pass.
+#[test]
+fn a_refused_due_marked_read_consumes_the_mark_and_waits_for_its_rung() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro3",
+        &[t, t + 99_999, t + 100_000],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 0 {
+                let mut memo = state.claude_resets_memo.lock().unwrap();
+                memo.last_read_at.insert("lro3".to_string(), t - 60_000);
+                memo.due.insert("lro3".to_string());
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro3", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (1, vec![]), (2, line(120))]);
+}
+
+/// A memo forget drops a pending retry with its rung: the account reads on
+/// the next pass, and a refusal there starts on the ladder's first rung.
+#[test]
+fn a_forget_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro4",
+        &[t, t + 100_000, t + 100_001],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 2 {
+                state.claude_resets_memo.lock().unwrap().forget("lro4");
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro4", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (2, line(120)), (3, line(100))]);
+}
+
+/// Only a 429 moves the side read up a rung, as only a 429 moves the poll's:
+/// a 5xx between two 429s retries on the rung as it stands, and the 429 after
+/// it climbs from there.
+#[test]
+fn a_server_error_between_429s_holds_the_rung() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads(
+        "lro5",
+        &[t, t + 100_000, t + 220_000, t + 339_999, t + 340_000],
+        |i| match i {
+            2 => (503, Vec::new(), "upstream unavailable".to_string()),
+            _ => resets_429(Some(0)),
+        },
+    );
+    let refused = |next| vec![refused_line("lro5", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![refused_line("lro5", 503, None, 120)]),
+            (3, vec![]),
+            (4, refused(180)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// Every 5xx is a refusal: the range's ends and the edge's own 502 retry on
+/// the ladder's first rung like the 503 above.
+#[test]
+fn every_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    for (name, status) in [("lro6", 500u16), ("lro7", 502), ("lro8", 599)] {
+        let (seen, landed) = drive_resets_reads(name, &[t, t + 99_999, t + 100_000], move |_| {
+            (status, Vec::new(), String::new())
+        });
+        let line = vec![refused_line(name, status, None, 100)];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// A 200 whose body is cut off mid-read got no whole answer: it retries on
+/// the ladder like a refused connect.
+#[test]
+fn a_side_read_cut_off_mid_body_retries_on_the_ladder() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server = std::thread::spawn({
+        let reads = Arc::clone(&reads);
+        move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                crate::testutil::read_request_head(&mut sock);
+                reads.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"cedar",
+                );
+            }
+        }
+    });
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lro9", &base, &[t, t + 99_999, t + 100_000], || {
+            reads.load(Ordering::SeqCst)
+        });
+    let line =
+        vec!["clauth: 'lro9': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+    server.join().expect("listener");
+}
+
+/// The ladder rides the poll's own `refresh_interval`, never the default: at
+/// 10 s the rungs are 20 s, 40 s, 100 s and 280 s (interval + 10 s, 30 s,
+/// 90 s, 270 s, under the #74 floor's 300 s); at 30 min, past the 15-minute
+/// cap, a refusal waits exactly one interval.
+#[test]
+fn a_refused_side_read_rides_the_polls_own_refresh_interval() {
+    use std::sync::atomic::Ordering;
+    let t = RESETS_T;
+    let at = |interval: u64| {
+        move |state: &super::SchedulerState, i: usize| {
+            if i == 0 {
+                state.refresh_interval.store(interval, Ordering::Relaxed);
+            }
+        }
+    };
+
+    let seen = drive_resets_reads_with(
+        "lro10",
+        &[t, t + 19_999, t + 20_000, t + 60_000, t + 160_000],
+        |_| resets_429(Some(0)),
+        at(10_000),
+    );
+    let line = |next| vec![refused_line("lro10", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(20)),
+            (1, vec![]),
+            (2, line(40)),
+            (3, line(100)),
+            (4, line(280))
+        ]
+    );
+
+    let seen = drive_resets_reads_with(
+        "lro11",
+        &[t, t + 1_799_999, t + 1_800_000],
+        |_| resets_429(Some(0)),
+        at(1_800_000),
+    );
+    let line = |next| vec![refused_line("lro11", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(1800)), (1, vec![]), (2, line(1800))]);
 }
 
 // ── a tick that resumes after its instance lost the lease applies nothing ────

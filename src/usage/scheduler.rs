@@ -4992,6 +4992,34 @@ fn log_resets_left_running(name: &ProfileName) {
     );
 }
 
+/// The line a failed banked-reset side read gets: what came back, the hint a
+/// laddered status was honoured under, and the gap `stamp_resets` set, in
+/// whole seconds. No body text: it may echo account data.
+fn log_resets_failure(
+    name: &ProfileName,
+    err: &claude_reset::ResetCallError,
+    next: &ResetsNext,
+    gap_ms: u64,
+) {
+    use claude_reset::ResetCallError;
+    let what = match (err, next) {
+        (ResetCallError::Unauthorized, _) => "got HTTP 401".to_string(),
+        (ResetCallError::Status(status), ResetsNext::Ladder { retry_after, .. }) => {
+            match retry_after {
+                Some(hint) => format!("got HTTP {status} (Retry-After {}s)", hint.as_secs()),
+                None => format!("got HTTP {status} (no Retry-After)"),
+            }
+        }
+        (ResetCallError::Status(status), ResetsNext::Hour) => format!("got HTTP {status}"),
+        (ResetCallError::Transport, _) => "got no answer".to_string(),
+        (ResetCallError::Parse, _) => "answered in a shape clauth does not read".to_string(),
+    };
+    logline!(
+        "clauth: '{name}': the limit reset read {what}; next read in {}s",
+        gap_ms / 1000
+    );
+}
+
 /// What one fan-out worker and its drain share: the worker's request clock and
 /// the exit/abandon handshake. `exited` and `abandoned` are written only under
 /// the activity-store lock, by [`WorkerExit`] and [`abandon_worker`], so of a
@@ -6038,9 +6066,10 @@ pub(crate) struct SchedulerState {
     /// Pending weekly-reset re-test kicks (see [`weekly_reset_pending`]).
     weekly_reset_kicks: WeeklyResetKicks,
     /// The claude banked-reset side read's cadence memo (see
-    /// [`ClaudeResetsMemo`]): last read per account, plus the due marks a
-    /// 100% crossing sets. One per scheduler, so two schedulers sharing one
-    /// process each run their own hour.
+    /// [`ClaudeResetsMemo`]): last read per account, a refused read's retry,
+    /// plus the due marks a 100% crossing or a fall before its reset sets. One
+    /// per scheduler, so two schedulers sharing one process each run their own
+    /// hour.
     claude_resets_memo: ClaudeResetsMemoLock,
     /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
     /// queue spaces against, plus per-profile election health.
@@ -7313,9 +7342,10 @@ pub(crate) fn tick(state: &SchedulerState) {
     // and the switch scans, inside the lease-holder path: the scans decide
     // switches off the stores the landings just wrote and must not wait behind
     // the read's request spacing, while a due mark a landing set is still read
-    // in this tick. One read per account an hour, at most one account a tick,
-    // so a pass costs the tick at most one request slot, one fetch deadline
-    // and the tick's one flock wait.
+    // in this tick. One read per account an hour (sooner after a refused or
+    // unanswered read, on the poll's ladder), at most one account a tick, so a
+    // pass costs the tick at most one request slot, one fetch deadline and the
+    // tick's one flock wait.
     claude_resets_tick(state, Some(timed_out.as_ref()), lease);
 
     // tps producer leg, lease holder only (a stood-down tick returned above,
@@ -8010,12 +8040,17 @@ pub(crate) fn forget_codex_polled(name: &str) {
 const CLAUDE_RESETS_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 /// Per-scheduler cadence memo for the claude banked-reset side read: epoch ms
-/// of each account's last read attempt (the tick's `now`), plus the names a
-/// fresh landing marked due for a window that crossed to 100% or fell before
-/// its reset. A plain struct built empty, as `weekly_reset_kicks` is a plain set.
+/// of each account's last read attempt (the tick's `now`), the names a fresh
+/// landing marked due for a window that crossed to 100% or fell before its
+/// reset, and, for an account whose last read was refused (a 429, a 5xx, no
+/// answer), the epoch ms its retry falls due beside its count of 429s since
+/// the last landed read, hour-keeping failure or forget, which picks the rung
+/// of the poll's deferral ladder. A plain struct built empty, as
+/// `weekly_reset_kicks` is a plain set.
 pub(crate) struct ClaudeResetsMemo {
     last_read_at: HashMap<String, u64>,
     due: HashSet<String>,
+    retry: HashMap<String, (u64, u32)>,
 }
 
 impl ClaudeResetsMemo {
@@ -8023,16 +8058,18 @@ impl ClaudeResetsMemo {
         Self {
             last_read_at: HashMap::new(),
             due: HashSet::new(),
+            retry: HashMap::new(),
         }
     }
 
     /// Drop `name` — `clear_memory`'s OAuth arm and the rename path. A
     /// re-login removes the account's reading with `forget_disk`, so the next
     /// pass reads at once; a rename carries the reading to the new name, whose
-    /// seed dates the hour there.
+    /// seed dates the hour there. A pending retry and its rung go too.
     pub(crate) fn forget(&mut self, name: &str) {
         self.last_read_at.remove(name);
         self.due.remove(name);
+        self.retry.remove(name);
     }
 }
 
@@ -8164,9 +8201,12 @@ pub(crate) fn claude_resets_tick(
 /// read an hour, and once more inside the hour when a fresh landing marked it
 /// due (a window crossed to 100% or fell before its reset). A successful read
 /// lands the usable count, the banked total, the next grant's windows and end,
-/// and the read's stamp in the account's own `limit_resets.json`; a 401 or any failure writes
-/// nothing and still stamps the memo, so a broken account is not re-read every
-/// tick (the codex leg's rule). Each read runs on its own worker, and one
+/// and the read's stamp in the account's own `limit_resets.json`. A failure
+/// writes nothing, says so in one line and still stamps the memo: a refusal
+/// (a 429, a 5xx, no answer) retries on the poll's deferral ladder, honouring
+/// the server's Retry-After, while a 401, any other status or a body clauth
+/// cannot read keeps the hour, so a broken account is not re-read every tick
+/// (the codex leg's rule). Each read runs on its own worker, and one
 /// still out at the tick fetch deadline, or one that never ran, counts as a
 /// failure: it is left running, its late answer lands nothing, and its
 /// account gets no second read until it exits.
@@ -8336,6 +8376,10 @@ fn claude_resets_tick_flagged(
                     }
                 };
                 let due_now = memo.due.contains(name.as_str())
+                    || memo
+                        .retry
+                        .get(name.as_str())
+                        .is_some_and(|(retry_at, _)| now >= *retry_at)
                     || last
                         .is_none_or(|last| now.saturating_sub(last) >= CLAUDE_RESETS_INTERVAL_MS);
                 due_now.then_some((name, access_token, epoch_at_spawn))
@@ -8389,7 +8433,7 @@ fn claude_resets_tick_flagged(
                     #[cfg(test)]
                     probe_panic::hit(name.as_str());
                     await_request_slot(ANTHROPIC_ORIGIN);
-                    let read = claude_reset::read_status_at(&url, &access_token);
+                    let read = claude_reset::read_status_hinted_at(&url, &access_token);
                     // A drain that stopped waiting on this worker drops this
                     // send; harmless. A panicking worker never reaches here.
                     let _ = tx.send((
@@ -8439,31 +8483,43 @@ fn claude_resets_tick_flagged(
         // Residual, as at the landing and the kick: a forget in the window
         // between this check and the write lands the old count; a re-login on
         // disk still fails the identity compare below.
-        if let Ok(status) = read {
-            let reading = claude_reset::status_reading(&status);
-            // A login another process installed (a CLI `clauth login`) moves
-            // no epoch here, so the write and the stamp are gated on the
-            // stored identity under the state flock: a readable moved login
-            // keeps its own (absent) reading and reads on the next pass under
-            // the reload's memo drop, instead of the old login's count
-            // re-creating the file under a fresh hour. An unreadable store or
-            // a flock timeout lands no reading either, but the reload never
-            // forgets an unreadable half, so the stamp keeps such an attempt
-            // an hour away instead of a request-spacing pass.
-            let landed = crate::lock::with_state_lock_flag(timed_out, |_held| {
-                if !lease_is_current(lease) {
-                    return Ok::<(bool, bool), anyhow::Error>((false, false));
+        let status = match read {
+            Ok(status) => status,
+            Err((err, retry_after)) => {
+                // Stamped whatever the lease says, as every failure is; only
+                // the holder says so, and only once the stamp names the gap.
+                let next = ResetsNext::after_failure(&err, retry_after);
+                if let Some(gap_ms) = stamp_resets(state, &name, epoch_at_spawn, now, &next)
+                    && lease_is_current(lease)
+                {
+                    log_resets_failure(&name, &err, &next, gap_ms);
                 }
-                let (disk, unreadable) = crate::usage::read_oauth_for_compare(&name);
-                let ok = !unreadable && !crate::usage::oauth_changed(&identity, &disk);
-                if ok {
-                    write_profile_cache_for(Harness::Claude, &name, LIMIT_RESETS_FILE, &reading);
-                }
-                Ok::<(bool, bool), anyhow::Error>((ok, unreadable))
-            });
-            if matches!(landed, Ok((false, false))) {
                 continue;
             }
+        };
+        let reading = claude_reset::status_reading(&status);
+        // A login another process installed (a CLI `clauth login`) moves
+        // no epoch here, so the write and the stamp are gated on the
+        // stored identity under the state flock: a readable moved login
+        // keeps its own (absent) reading and reads on the next pass under
+        // the reload's memo drop, instead of the old login's count
+        // re-creating the file under a fresh hour. An unreadable store or
+        // a flock timeout lands no reading either, but the reload never
+        // forgets an unreadable half, so the stamp keeps such an attempt
+        // an hour away instead of a request-spacing pass.
+        let landed = crate::lock::with_state_lock_flag(timed_out, |_held| {
+            if !lease_is_current(lease) {
+                return Ok::<(bool, bool), anyhow::Error>((false, false));
+            }
+            let (disk, unreadable) = crate::usage::read_oauth_for_compare(&name);
+            let ok = !unreadable && !crate::usage::oauth_changed(&identity, &disk);
+            if ok {
+                write_profile_cache_for(Harness::Claude, &name, LIMIT_RESETS_FILE, &reading);
+            }
+            Ok::<(bool, bool), anyhow::Error>((ok, unreadable))
+        });
+        if matches!(landed, Ok((false, false))) {
+            continue;
         }
         stamp_resets_attempt(state, &name, epoch_at_spawn, now);
     }
@@ -8492,24 +8548,97 @@ struct ClaudeResetsRead {
     name: ProfileName,
     epoch_at_spawn: u64,
     identity: crate::usage::OAuthIdentity,
-    read: Result<claude_reset::ResetStatus, claude_reset::ResetCallError>,
+    read: Result<claude_reset::ResetStatus, (claude_reset::ResetCallError, Option<Duration>)>,
 }
 
-/// Date a side-read attempt. The memo stamps on success and every failure, and
-/// the attempt consumes the due mark either way: the trigger fired, and the
-/// hour now runs from it. Epoch-gated here, past the read and any flock wait, so
-/// a forget that landed meanwhile leaves the name unstamped, as the landing's
-/// pre-check does.
+/// How a side-read attempt sets its account's next read.
+enum ResetsNext {
+    /// The full hour: a landing, a rejected or unreadable answer, and a read
+    /// that never started, panicked or was left running.
+    Hour,
+    /// A refusal (a 429, a 5xx, no answer) is no broken account: the retry
+    /// rides the poll's own deferral ladder, honouring the server's hint.
+    /// `climbs` is set for a 429 alone, which moves the account up a rung, as
+    /// only a 429 moves the poll's (`update_streaks`).
+    Ladder {
+        retry_after: Option<Duration>,
+        climbs: bool,
+    },
+}
+
+impl ResetsNext {
+    /// The next read a failed side read gets: a 429, a 5xx or no answer is a
+    /// refusal; a 401, any other status and a body clauth cannot read keep
+    /// the hour.
+    fn after_failure(err: &claude_reset::ResetCallError, retry_after: Option<Duration>) -> Self {
+        use claude_reset::ResetCallError;
+        match err {
+            ResetCallError::Status(429) => Self::Ladder {
+                retry_after,
+                climbs: true,
+            },
+            ResetCallError::Status(500..=599) | ResetCallError::Transport => Self::Ladder {
+                retry_after,
+                climbs: false,
+            },
+            ResetCallError::Unauthorized | ResetCallError::Status(_) | ResetCallError::Parse => {
+                Self::Hour
+            }
+        }
+    }
+}
+
+/// Date a side-read attempt that keeps the hour: [`stamp_resets`] with
+/// [`ResetsNext::Hour`].
 fn stamp_resets_attempt(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64, now: u64) {
-    let Some(_epoch) =
-        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)
-    else {
-        return;
-    };
-    if let Ok(mut guard) = state.claude_resets_memo.lock() {
-        let memo = &mut *guard;
-        memo.due.remove(name.as_str());
-        memo.last_read_at.insert(name.to_string(), now);
+    let _ = stamp_resets(state, name, epoch_at_spawn, now, &ResetsNext::Hour);
+}
+
+/// Date a side-read attempt and set its account's next read; returns the gap
+/// to it (ms). The memo stamps on success and every failure, and the attempt
+/// consumes the due mark either way: the trigger fired, and the next read now
+/// runs from it. [`ResetsNext::Ladder`] sets the retry `interval +`
+/// [`next_slot_deferral`] out, the slot math the poll's own landing uses, on
+/// the rung its 429s have climbed: a 5xx or no answer retries on
+/// the rung as it stands and leaves the count alone. Anything else drops the
+/// retry, so the next refusal starts on the first rung. Epoch-gated here, past
+/// the read and any flock wait, so a forget that landed meanwhile leaves the
+/// name unstamped (`None`), as the landing's pre-check does.
+fn stamp_resets(
+    state: &SchedulerState,
+    name: &ProfileName,
+    epoch_at_spawn: u64,
+    now: u64,
+    next: &ResetsNext,
+) -> Option<u64> {
+    let _epoch =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)?;
+    let mut guard = state.claude_resets_memo.lock().ok()?;
+    let memo = &mut *guard;
+    memo.due.remove(name.as_str());
+    memo.last_read_at.insert(name.to_string(), now);
+    match next {
+        ResetsNext::Hour => {
+            memo.retry.remove(name.as_str());
+            Some(CLAUDE_RESETS_INTERVAL_MS)
+        }
+        ResetsNext::Ladder {
+            retry_after,
+            climbs,
+        } => {
+            let streak = memo
+                .retry
+                .get(name.as_str())
+                .map_or(0, |(_, streak)| *streak)
+                .saturating_add(u32::from(*climbs));
+            let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+            let gap_ms = interval_ms.saturating_add(
+                next_slot_deferral(true, *retry_after, streak, interval_ms, false).as_millis(),
+            );
+            memo.retry
+                .insert(name.to_string(), (now.saturating_add(gap_ms), streak));
+            Some(gap_ms)
+        }
     }
 }
 
