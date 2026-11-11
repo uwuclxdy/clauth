@@ -9525,7 +9525,9 @@ fn the_setup_card_space_and_step_rows_follow_the_focused_row() {
 
 /// A Services detail that only scrolls names its arrows `scroll`, the
 /// footer's own word there; a detail that walks rows keeps
-/// `move between rows`.
+/// `move between rows`. The plugin card's lone option row keeps its toggle
+/// pair while the arrows scroll, so its list joins the one `↵ open or act`
+/// row the footer's `space/↵` offers.
 #[test]
 fn the_services_detail_arrows_row_follows_the_footers_sense() {
     use crate::tui::app::{Check, Health, Problem, ServiceFix};
@@ -9551,13 +9553,25 @@ fn the_services_detail_arrows_row_follows_the_footers_sense() {
         ("r", "re-run all checks"),
         ("esc", "back to the list · close the editor"),
     ];
-    for label in ["rex", "plugin", "shunt"] {
+    for label in ["rex", "shunt"] {
         assert_eq!(
             help_of(&detail(label, Vec::new(), 4)),
             scroll_only,
             "{label}: a detail that only scrolls"
         );
     }
+    let plugin_scroll = vec![
+        ("\u{2191} \u{2193}", "scroll"),
+        ("pgup/pgdn", "scroll a page"),
+        ("\u{21b5}", "open or act on the focused row"),
+        ("r", "re-run all checks"),
+        ("esc", "back to the list · close the editor"),
+    ];
+    assert_eq!(
+        help_of(&detail("plugin", Vec::new(), 4)),
+        plugin_scroll,
+        "plugin: scrolls, plus the lone option row's toggle pair"
+    );
     let problem = |line| Problem {
         line,
         fix: ServiceFix::MoveStoresIn,

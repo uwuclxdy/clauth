@@ -45,8 +45,8 @@ use super::panes::{
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
     follow_scroll_offset, footnote_height, footnote_lines, footnote_split, head_cols,
     help_tooltip_lines, help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell,
-    label_style, master_detail, place_caret, section_box, select_line, toggle_value, value_caret,
-    with_bg, wrap_words,
+    label_style, master_detail, place_caret, scroll_offset, section_box, select_line, toggle_value,
+    value_caret, with_bg, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -282,7 +282,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     let problem_focus = if app.services.diagnostic_focus || check.problems.is_empty() {
         None
     } else if check.label == "plugin" {
-        Some(app.services.problem_cursor)
+        (!app.services.plugin_on_option()).then_some(app.services.problem_cursor)
     } else if check.label == "herdr" && app.services.herdr_fix_focus {
         Some(0)
     } else {
@@ -339,8 +339,78 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
         return;
     }
 
+    // The plugin detail closes on its OPTIONS section, the walk's last stop.
+    let option_block = if check.label == "plugin" {
+        let on_row = app.services.plugin_on_option() && !app.services.diagnostic_focus;
+        let selected = focused && on_row;
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "OPTIONS",
+            if selected {
+                theme::label_active()
+            } else {
+                theme::label()
+            },
+        )));
+        let row = plugin_option_row(app.config().state.plugin.idle_wake, selected);
+        lines.push(if on_row && (focused || detail_entered) {
+            highlight_row(row, inner.width as usize)
+        } else {
+            row
+        });
+        let row_idx = lines.len() - 1;
+        // While the cursor rests on the row, its explanation follows as the
+        // house tooltip.
+        if selected && let Some(tooltip) = app.services.plugin_idle_wake_tooltip.as_deref() {
+            lines.extend(help_tooltip_lines(tooltip, inner.width as usize));
+        }
+        let span = (row_idx, lines.len());
+        app.services.plugin_option_row.set(Some(row_idx));
+        // What the next replacement's clamp reads as its "before" side: the
+        // frame the user saw. A card with no problem publishes `false`, so a
+        // plain refresh of it never arms the one-shot below.
+        app.services
+            .plugin_problem_shown
+            .set(!check.problems.is_empty());
+        // The one-shot scroll into view: armed by a list `↵` descend whose
+        // walk rests on the row, or by the cursor clamp after a replacement
+        // clears the last problem the previous frame showed; consumed here by
+        // the first render that knows the pane height. The problem card's
+        // follow below already brings the block in while focused, so only the
+        // free-scroll path consumes the offset.
+        let pending = app.services.plugin_option_scroll_pending.replace(false);
+        if pending && on_row && check.problems.is_empty() {
+            let offset = scroll_offset(lines.len(), inner.height as usize, span);
+            app.services
+                .plugin_option_scroll_adopt
+                .set(Some(offset.min(u16::MAX as usize) as u16));
+        }
+        Some(span)
+    } else {
+        None
+    };
+
     if check.label == "plugin" && app.services.diagnostic_focus {
         draw_diagnostic_lines(frame, inner, app, lines);
+        return;
+    }
+
+    // A walked-to option row keeps its block (the row and its explanation) on
+    // screen; a no-problem card scrolls freely through the path below.
+    if let Some((row, end)) = option_block
+        && focused
+        && app.services.plugin_on_option()
+        && !check.problems.is_empty()
+    {
+        app.services.detail_viewport.set(inner.height);
+        app.services.detail_max_scroll.set(
+            lines
+                .len()
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+        let offset = draw_scrolled_lines(frame, inner, lines, (row, end), None);
+        app.services.displayed_scroll.set(offset as u16);
         return;
     }
 
@@ -372,7 +442,19 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.services.detail_viewport.set(inner.height);
     app.services.detail_max_scroll.set(max_scroll);
-    let scroll = app.services.detail_scroll.min(max_scroll);
+    // While a one-shot offset stands unadopted by a key, the plugin free path
+    // keeps drawing it, so no frame between the scroll and the next key jumps.
+    // A generic detail never reads it.
+    let scroll = if check.label == "plugin" {
+        app.services
+            .plugin_option_scroll_adopt
+            .get()
+            .map(usize::from)
+            .unwrap_or_else(|| usize::from(app.services.detail_scroll.min(max_scroll)))
+            .min(usize::from(max_scroll)) as u16
+    } else {
+        app.services.detail_scroll.min(max_scroll)
+    };
     app.services.displayed_scroll.set(scroll);
 
     frame.render_widget(
@@ -2364,6 +2446,19 @@ fn option_row(
         HerdrOption::RestoreNotice => spans.extend(toggle_value(settings.restore_notice, inert)),
     }
     vec![Line::from(spans)]
+}
+
+/// The plugin detail's `idle wake` option row, in [`option_row`]'s caret
+/// gutter + label + 2-space gap + toggle layout.
+fn plugin_option_row(idle_wake: bool, selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let mut spans = vec![arrow, Span::styled("idle wake  ", label_style(selected))];
+    spans.extend(toggle_value(idle_wake, false));
+    Line::from(spans)
 }
 
 /// Sub-line under the tag-refresh field while typing: the floor, DANGER when

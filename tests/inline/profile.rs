@@ -990,6 +990,38 @@ fn save_app_state_keeps_an_unknown_nested_key_in_place_when_the_table_returns_to
     );
 }
 
+// `[plugin] idle_wake` round-trips through the in-place writer beside other
+// tables: off writes the table, the load reads it back, and back on removes
+// the key and the emptied table, the `[update]` and `[herdr]` keys untouched.
+#[test]
+fn save_app_state_writes_the_plugin_table_only_while_the_idle_wake_is_off() {
+    let _home = HomeSandbox::new();
+    let before = "profiles = []\n\n[update]\nauto_update = false\n\n[herdr]\npane_tag = false\n";
+    let path = write_state_file(before);
+
+    let mut state = load_app_state().expect("load");
+    assert!(state.plugin.idle_wake, "an absent table reads on");
+    state.plugin.idle_wake = false;
+    save_app_state(&state).expect("save off");
+    let off = std::fs::read_to_string(&path).expect("read off");
+    assert_eq!(
+        off,
+        format!("{before}\n[plugin]\nidle_wake = false\n"),
+        "off appends the table, the other tables kept byte for byte"
+    );
+
+    let mut state = load_app_state().expect("reload");
+    assert!(!state.plugin.idle_wake, "the saved off loads");
+    assert!(!state.update.auto_update && !state.herdr.pane_tag);
+    state.plugin.idle_wake = true;
+    save_app_state(&state).expect("save on");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read on"),
+        before,
+        "back on removes the key and its emptied table"
+    );
+}
+
 // A table holding only a key this clauth does not model gains a modelled key:
 // the new key lands at the table's end, the unknown one stays where it was.
 #[test]

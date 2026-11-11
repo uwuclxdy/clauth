@@ -3211,8 +3211,9 @@ const AWAIT_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// The `mcp-await-job` hook's wait limit: a safety net, never the delivery
 /// bound — the job's own end ends the wait, whatever it takes. A live job
 /// reaches it only where nothing else ended the wait first (no idle wake on a
-/// non-1 h prompt cache or a busy session, no silence window): the limit line
-/// then wakes the model with a nudge to call `monitor`.
+/// non-1 h prompt cache, a busy session or `[plugin] idle_wake = false`, no
+/// silence window): the limit line then wakes the model with a nudge to call
+/// `monitor`.
 ///
 /// `plugins/hooks/hooks.json` carries the outer `timeout` at 86460 s on both
 /// events running the hook, and this must stay under it: the host kills the hook
@@ -7527,7 +7528,8 @@ fn settle_await(
 /// past the store's corpse window, a watched job's server dies with its
 /// result (the lost wake, once per session and again under a later host only
 /// when the reporting host never confirmed it), the session has sat idle past
-/// `limits.idle_wake_ms` on a 1 h prompt cache, or
+/// `limits.idle_wake_ms` on a 1 h prompt cache with `[plugin] idle_wake` on
+/// (read before the TTL, once per idle stretch), or
 /// `limits.deadline` passes. The idle wake needs the session the payload
 /// named to still be the host's current one (`session_moved`): `/clear`,
 /// `/fork` and `/branch` move the id while the process lives, and a wake then
@@ -7680,7 +7682,7 @@ fn await_job_outcomes(
                 && crate::hook_jobs::idle_wake_due(turn_end, now, limits.idle_wake_ms)
                 && !session_moved(session)
             {
-                if cache_is_1h() {
+                if crate::profile::idle_wake_enabled() && cache_is_1h() {
                     return settle_watched(
                         report_session,
                         &moved.finished,

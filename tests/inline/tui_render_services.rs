@@ -484,16 +484,17 @@ fn the_services_footer_hints_pin_each_focus_state() {
         "a healthy herdr row offers no fix verb"
     );
 
-    // Plugin detail, focused problem 0 and 1: the verb follows the focus.
+    // Plugin detail, focused problem 0 and 1: the verb follows the focus, and
+    // the focused row's own key leads so a narrow footer sheds the walk first.
     let mut app = app_with(plugin_check_with_problems());
     app.services.focus = ServicesFocus::Detail;
     app.services.problem_cursor = 0;
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "install plugin"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
@@ -504,14 +505,36 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "wire mcp server"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
         ],
         "the wire problem names its verb"
+    );
+    app.services.plugin_option_focus = true;
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("space/↵", "toggle"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("f", "next fix"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the option row offers its toggle and no fix verb"
+    );
+    let mut one = plugin_check_with_problems();
+    one.problems.truncate(1);
+    let mut app = app_with(one);
+    app.services.focus = ServicesFocus::Detail;
+    assert!(
+        hints(&app).contains(&("↑↓", "row")),
+        "one problem still walks onto the option row: {:?}",
+        hints(&app)
     );
 
     // Herdr detail: the options row keys, no `f` on a healthy check.
@@ -592,6 +615,8 @@ fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
             "claude      press r to probe",
             "path        /usr/local/bin/clauth",
             "data        /home/u/.clauth",
+            "OPTIONS",
+            "idle wake  ─●",
         ],
         "every readout in order, by equality"
     );
@@ -649,6 +674,7 @@ fn plugin_detail_over_completions() -> Check {
         None,
         crate::completions::detected_installed_script(),
         crate::hook_jobs::CacheView::default(),
+        true,
     )
 }
 
@@ -673,6 +699,12 @@ fn plugin_base_rows(pad: usize) -> Vec<String> {
     ]
 }
 
+/// The OPTIONS section closing every plugin detail, its `idle wake` row at
+/// the default (on) and unfocused.
+fn plugin_options_rows() -> [String; 2] {
+    ["OPTIONS".to_string(), "idle wake  ─●".to_string()]
+}
+
 /// The plugin detail's rows with the `data` row cut to its key: its value is
 /// the sandbox home's path, which the pane truncates at a width that depends on
 /// how long the temp dir's path is.
@@ -689,26 +721,47 @@ fn plugin_rows(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The three cache-TTL rows of one plugin card, off the production builder
-/// and the real detail path, with the card's key column at `pad`.
-fn cache_rows_at(pad: usize, lines: [&str; 3]) -> Vec<String> {
-    let spaces = |key_w: usize| " ".repeat(pad.saturating_sub(key_w) + 2);
-    vec![
-        format!("cache{}{}", spaces(5), lines[0]),
-        format!("agent cache{}{}", spaces(11), lines[1]),
-        format!("idle wake{}{}", spaces(9), lines[2]),
-    ]
+/// The cache-TTL rows of one plugin card, off the production builder
+/// and the real detail path, with the card's key column at `pad`, then the
+/// OPTIONS `idle wake` row the same filter keeps, at the default (on).
+fn cache_rows_at(pad: usize, lines: &[&str]) -> Vec<String> {
+    cache_rows_toggled_at(pad, lines, "─●")
 }
 
-/// Render one plugin card over `view` and return its three cache rows.
+/// [`cache_rows_at`] with the OPTIONS row's toggle glyph `toggle`. The
+/// readout rows are the visible ones: three while the key is on, two (no
+/// `idle wake` line) while it is off.
+fn cache_rows_toggled_at(pad: usize, lines: &[&str], toggle: &str) -> Vec<String> {
+    let spaces = |key_w: usize| " ".repeat(pad.saturating_sub(key_w) + 2);
+    let mut rows = vec![
+        format!("cache{}{}", spaces(5), lines[0]),
+        format!("agent cache{}{}", spaces(11), lines[1]),
+    ];
+    if let Some(wake) = lines.get(2) {
+        rows.push(format!("idle wake{}{}", spaces(9), wake));
+    }
+    rows.push(format!("idle wake  {toggle}"));
+    rows
+}
+
+/// Render one plugin card over `view` and return its three cache rows and
+/// its OPTIONS `idle wake` row.
 fn cache_rows(view: crate::hook_jobs::CacheView) -> Vec<String> {
+    cache_rows_with(view, true)
+}
+
+/// [`cache_rows`] with `[plugin] idle_wake` at `idle_wake`, in the app state
+/// the OPTIONS row reads and in the card the recompute would build.
+fn cache_rows_with(view: crate::hook_jobs::CacheView, idle_wake: bool) -> Vec<String> {
     let app = app_with(crate::tui::app::plugin_check(
         Some(std::path::Path::new("/usr/bin/clauth")),
         None,
         None,
         None,
         view,
+        idle_wake,
     ));
+    app.config().state.plugin.idle_wake = idle_wake;
     let (rows, _) = render(&app);
     detail_rows(&rows)
         .into_iter()
@@ -732,7 +785,7 @@ fn the_cache_rows_name_a_setting() {
         cache_rows(view),
         cache_rows_at(
             11,
-            [
+            &[
                 "1h, promptCacheTtl",
                 "1h, subagentPromptCacheTtl",
                 "55 min idle with a delegate",
@@ -752,7 +805,7 @@ fn the_cache_rows_name_the_env_var() {
         }),
         cache_rows_at(
             11,
-            [
+            &[
                 "5m, FORCE_PROMPT_CACHING_5M",
                 "5m, FORCE_PROMPT_CACHING_5M",
                 "off: a 5 min cache expires first",
@@ -767,7 +820,7 @@ fn the_cache_rows_name_the_env_var() {
         }),
         cache_rows_at(
             11,
-            [
+            &[
                 "1h, CLAUDE_CODE_PROMPT_CACHE_TTL",
                 "1h, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
                 "55 min idle with a delegate",
@@ -781,7 +834,7 @@ fn the_cache_rows_name_the_env_var() {
         }),
         cache_rows_at(
             11,
-            [
+            &[
                 "1h, ENABLE_PROMPT_CACHING_1H",
                 "1h, ENABLE_PROMPT_CACHING_1H",
                 "55 min idle with a delegate",
@@ -799,7 +852,7 @@ fn the_cache_rows_read_automatic_when_nothing_is_set() {
         cache_rows(crate::hook_jobs::CacheView::default()),
         cache_rows_at(
             11,
-            [
+            &[
                 "auto: 1h subscription, 5m api key",
                 "auto: 5m",
                 "55 min idle with a delegate, 1h only",
@@ -819,7 +872,7 @@ fn a_5m_main_cache_turns_the_wake_off() {
         }),
         cache_rows_at(
             11,
-            [
+            &[
                 "5m, CLAUDE_CODE_PROMPT_CACHE_TTL",
                 "auto: 5m",
                 "off: a 5 min cache expires first",
@@ -857,6 +910,7 @@ fn the_cache_rows_render_whole_at_80_columns() {
             None,
             None,
             view,
+            true,
         ));
         let mut term = Terminal::new(TestBackend::new(80, H)).unwrap();
         term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
@@ -896,6 +950,7 @@ fn the_cache_keys_do_not_widen_the_key_column() {
         None,
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     let fresh_key_w = fresh
         .detail
@@ -930,6 +985,7 @@ fn the_cache_keys_do_not_widen_the_key_column() {
         None,
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     let key_w = check
         .detail
@@ -971,6 +1027,7 @@ fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
         "bash script differs from this clauth's".to_string(),
         "f  update completions".to_string(),
     ]);
+    expected.extend(plugin_options_rows());
     assert_eq!(
         plugin_rows(&rows),
         expected,
@@ -982,7 +1039,7 @@ fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
     let (rows, _) = render(&current);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(11),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "a current script shows no completions line and no fix, by equality"
     );
 }
@@ -1004,6 +1061,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
         "bash script not installed".to_string(),
         "f  install completions".to_string(),
     ]);
+    expected.extend(plugin_options_rows());
     assert_eq!(
         plugin_rows(&rows),
         expected,
@@ -1017,7 +1075,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     let (rows, _) = render(&unknown);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(11),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "an unknown shell renders the card without any completions row"
     );
     drop(_tcsh);
@@ -1033,7 +1091,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     );
     assert_eq!(
         detail,
-        plugin_base_rows(11),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "an unset $SHELL renders the card without any completions row"
     );
 }
@@ -2414,9 +2472,9 @@ fn the_footer_names_enter_for_the_focused_fix_and_f_for_the_next() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "install plugin"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
@@ -11209,8 +11267,9 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
                 "{wide} cols: glyph {i} of the line"
             );
         }
-        // The line closes the card: past it the pane is blank down to its
-        // bottom border, so no fix line sits under a wrapped row.
+        // Past the line only the OPTIONS section follows, then the pane is
+        // blank down to its bottom border, so no fix line sits under a
+        // wrapped row.
         let bottom = rows
             .iter()
             .enumerate()
@@ -11218,11 +11277,24 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
             .find(|(_, chars)| chars[col0..right].iter().all(|c| *c == '─'))
             .map(|(row, _)| row)
             .expect("the pane's bottom border");
+        // Only the OPTIONS section, the walk's last stop, sits between them.
+        let section: Vec<String> = rows
+            .iter()
+            .take(bottom)
+            .skip(first + joined.len())
+            .take(3)
+            .map(|chars| text(&chars[col0..right]).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            section,
+            ["", "OPTIONS", "  idle wake  ─●"],
+            "{wide} cols: the OPTIONS section follows the line"
+        );
         for (row, chars) in rows
             .iter()
             .enumerate()
             .take(bottom)
-            .skip(first + joined.len())
+            .skip(first + joined.len() + 3)
         {
             assert!(
                 chars[col0..right].iter().all(|c| *c == ' '),
@@ -12764,4 +12836,824 @@ fn the_tag_refresh_stepper_offers_each_step_key_only_while_its_direction_moves()
             "{start} s: {dead:?} changes no frame"
         );
     }
+}
+
+/// The plugin detail's rows at a height that shows the whole card.
+fn plugin_detail_rows(app: &App) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(W, 120)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+    detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+}
+
+/// Unsets the prompt-cache env vars the plugin card reads, so a box running
+/// with a 5 min cache forced cannot flip the card's copy under a test.
+fn cache_env_pin(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+            ("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL", None),
+        ],
+    )
+}
+
+/// The plugin detail ends on an OPTIONS section holding one `idle wake`
+/// toggle: `↑` from the first problem wraps onto it, the focused row explains
+/// itself on the line below, `space` flips it and persists `[plugin]
+/// idle_wake` (written only while off, the table removed once it is back
+/// on), and the cache group's `idle wake` readout shows only while it is on.
+#[test]
+fn the_plugin_idle_wake_row_toggles_and_persists() {
+    use crate::tui::app::{ServicesFocus, ShuntRefresh, Tab, recompute_services_checks};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let profiles = home.home().join(".clauth").join("profiles.toml");
+    let on_disk =
+        || std::fs::read_to_string(&profiles).expect("profiles.toml reads after a toggle");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    assert!(
+        !app.services.checks[app.services.cursor].problems.is_empty(),
+        "the sandbox card holds a problem, so `↑` wraps from it onto the row"
+    );
+    app.services.focus = ServicesFocus::Detail;
+    let option_row = |rows: &[String]| {
+        rows.iter()
+            .find(|r| r.contains("idle wake") && (r.ends_with("─●") || r.ends_with("○─")))
+            .cloned()
+            .unwrap_or_else(|| panic!("no `idle wake` option row:\n{}", rows.join("\n")))
+    };
+    let readouts = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.starts_with("idle wake") && !r.ends_with("─●") && !r.ends_with("○─"))
+            .cloned()
+            .collect()
+    };
+    let explains = |rows: &[String], opening: &str| rows.iter().any(|r| r.starts_with(opening));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter().any(|r| r == "OPTIONS"),
+        "the eyebrow renders:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        option_row(&rows),
+        "❯ idle wake  ─●",
+        "on by default, focused"
+    );
+    assert_eq!(
+        readouts(&rows).len(),
+        1,
+        "one readout while on:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        readouts(&rows)[0].ends_with("55 min idle with a delegate, 1h only"),
+        "{}",
+        readouts(&rows)[0]
+    );
+    assert!(
+        explains(&rows, "└ sends a short no-op keepalive"),
+        "the focused row explains itself:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        on_disk().contains("[plugin]\nidle_wake = false"),
+        "space writes the key off:\n{}",
+        on_disk()
+    );
+    let same_frame = plugin_detail_rows(&app);
+    assert_eq!(
+        (option_row(&same_frame), readouts(&same_frame)),
+        ("❯ idle wake  ○─".to_string(), Vec::<String>::new()),
+        "the toggle rebuilds the card before any recompute:\n{}",
+        same_frame.join("\n")
+    );
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    let rows = plugin_detail_rows(&app);
+    assert_eq!(option_row(&rows), "❯ idle wake  ○─");
+    assert_eq!(
+        readouts(&rows),
+        Vec::<String>::new(),
+        "no readout while off:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        explains(&rows, "└ a delegate may wake a session"),
+        "the focused row explains the off state:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !on_disk().contains("idle_wake") && !on_disk().contains("[plugin]"),
+        "back on writes nothing:\n{}",
+        on_disk()
+    );
+}
+
+/// `space` writes the flip of the value the row SHOWS: when another process
+/// turned the key off after this TUI last read it, the row still shows on, so
+/// `space` means off and off lands, never the disk value's flip.
+#[test]
+fn the_idle_wake_toggle_writes_the_flip_of_what_the_row_shows() {
+    use crate::tui::app::{ServicesFocus, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&home);
+    let mut app = app_with(plugin_check_with_problems());
+    app.tab = Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
+    app.services.plugin_option_focus = true;
+    assert!(app.config().state.plugin.idle_wake, "the row shows on");
+    let profiles = home.home().join(".clauth").join("profiles.toml");
+    std::fs::create_dir_all(profiles.parent().unwrap()).unwrap();
+    std::fs::write(&profiles, "profiles = []\n\n[plugin]\nidle_wake = false\n").unwrap();
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+
+    let on_disk = std::fs::read_to_string(&profiles).expect("profiles.toml reads");
+    assert!(
+        on_disk.contains("[plugin]\nidle_wake = false"),
+        "space on a row showing on writes off:\n{on_disk}"
+    );
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "the row now shows off"
+    );
+}
+
+/// `[plugin] idle_wake = false` drops the `idle wake` readout whatever the
+/// TTL view: automatic, a 1h setting and a 5m env alike — the two cache rows
+/// stay, and the OPTIONS row still shows off.
+#[test]
+fn the_idle_wake_readout_is_absent_while_off_on_every_ttl_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), false),
+        cache_rows_toggled_at(11, &["auto: 1h subscription, 5m api key", "auto: 5m"], "○─"),
+    );
+    assert_eq!(
+        cache_rows_with(
+            crate::hook_jobs::CacheView {
+                main_setting: Some("1h".to_string()),
+                ..Default::default()
+            },
+            false
+        ),
+        cache_rows_toggled_at(11, &["1h, promptCacheTtl", "auto: 5m"], "○─"),
+    );
+    assert_eq!(
+        cache_rows_with(
+            crate::hook_jobs::CacheView {
+                main_env: Some("5m".to_string()),
+                ..Default::default()
+            },
+            false
+        ),
+        cache_rows_toggled_at(11, &["5m, CLAUDE_CODE_PROMPT_CACHE_TTL", "auto: 5m"], "○─"),
+    );
+}
+
+/// The compatible tier spells the `idle wake` toggle `[on]` / `[off]`.
+#[test]
+fn the_idle_wake_row_brackets_its_state_on_the_compatible_tier() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let lines = [
+        "auto: 1h subscription, 5m api key",
+        "auto: 5m",
+        "55 min idle with a delegate, 1h only",
+    ];
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), true),
+        cache_rows_toggled_at(11, &lines, "[on]"),
+    );
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), false),
+        cache_rows_toggled_at(11, &[lines[0], lines[1]], "[off]"),
+    );
+}
+
+/// The plugin detail's walk: `↓` from the last problem lands on the OPTIONS
+/// row and wraps on to problem 0; `f` walks the fixes alone, from the option
+/// row to problem 0; `↵` on the option row flips the key while `↵` on a
+/// problem still names its fix; with no problem the walk rests on the row.
+#[test]
+fn the_plugin_walk_wraps_through_the_option_row_and_f_skips_it() {
+    use crate::tui::app::ServicesFocus;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let press = |app: &mut App, code: KeyCode| handle_key(app, crate::testutil::key(code));
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.focus = ServicesFocus::Detail;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::WireMcpServers)
+    );
+    press(&mut app, KeyCode::Down);
+    assert!(app.services.plugin_on_option(), "↓ from the last problem");
+    assert_eq!(app.services.focused_fix(), None);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "↓ from the option row wraps to problem 0"
+    );
+    press(&mut app, KeyCode::Up);
+    assert!(app.services.plugin_on_option(), "↑ from problem 0");
+
+    press(&mut app, KeyCode::Char('f'));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f from the option row lands on the first fix"
+    );
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Char('f'));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f wraps over the fixes alone, never onto the option row"
+    );
+
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "↵ on the option row turns the key off"
+    );
+    assert!(
+        app.modals.is_empty(),
+        "↵ on the option row opens no fix confirm"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "a second ↵ turns it on"
+    );
+    // The toggle rebuilt the card from the sandbox; the walk below runs on the
+    // fixture this test built, so its first problem is the install fix.
+    app.services.checks[app.services.cursor] = plugin_check_with_problems();
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(crate::tui::app::Modal::Confirm(state))
+                if matches!(state.on_confirm, crate::tui::app::ConfirmAction::InstallPlugin)
+        ),
+        "↵ on a problem still opens its fix confirm"
+    );
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "and leaves the key alone"
+    );
+
+    let mut app = app_with(Check {
+        fix: None,
+        problems: Vec::new(),
+        ..plugin_check_with_problems()
+    });
+    app.services.focus = ServicesFocus::Detail;
+    assert!(
+        app.services.plugin_on_option(),
+        "no problem: the walk rests on the row"
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Up);
+    assert!(app.services.plugin_on_option());
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "space on the lone option row flips it"
+    );
+}
+
+/// The focused `idle wake` row's explanation, by state, by equality: on with
+/// a 1 h main cache set (a setting or an env var), on with the automatic
+/// length (which the card cannot resolve to 1 h or 5 m, so the text names the
+/// 1 h condition), on with a 5 m main cache, and off.
+#[test]
+fn the_idle_wake_tooltip_reads_each_state_by_equality() {
+    let tooltip = crate::tui::app::plugin_idle_wake_tooltip;
+    for view in [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("1h".to_string()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            tooltip(&view, true),
+            "sends a short no-op keepalive after 55 idle minutes while delegates run to keep prompt cache warm",
+        );
+    }
+    assert_eq!(
+        tooltip(&crate::hook_jobs::CacheView::default(), true),
+        "sends a short no-op keepalive after 55 idle minutes while delegates run to keep a 1h prompt cache warm",
+    );
+    for view in [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("5m".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            tooltip(&view, true),
+            "on, but a 5 min prompt cache expires first, so it never fires",
+        );
+    }
+    assert_eq!(
+        tooltip(&crate::hook_jobs::CacheView::default(), false),
+        "a delegate may wake a session with an expired prompt cache",
+    );
+}
+
+/// The focused `idle wake` row's explanation renders only while the cursor
+/// rests on it: focused it wraps dim under the row, unfocused no line holds
+/// it.
+#[test]
+fn the_idle_wake_explanation_shows_only_while_the_row_is_focused() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "focused, the explanation renders:\n{}",
+        rows.join("\n")
+    );
+    app.services.focus = ServicesFocus::List;
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        !rows
+            .iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "unfocused, no explanation line:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The focused row's explanation is the house tooltip: the `└ ` leader renders
+/// in LINE and the text in TEXT_FAINT, read off the buffer cells.
+#[test]
+fn the_idle_wake_explanation_wears_the_house_tooltip_styles() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let mut term = Terminal::new(TestBackend::new(W, 120)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("└ sends a short no-op keepalive"))
+        .unwrap_or_else(|| panic!("the tooltip leader renders:\n{}", rows.join("\n")));
+    let row = &rows[y];
+    let lead_x = row[..row.find('└').expect("the leader glyph renders")]
+        .chars()
+        .count();
+    let cell = |x: usize| &buf.content[y * W as usize + x];
+    assert_eq!(cell(lead_x).symbol(), "└", "leader cell:\n{row}");
+    assert_eq!(
+        Some(cell(lead_x).fg),
+        super::theme::line().fg,
+        "the leader wears LINE:\n{row}"
+    );
+    let text_x = lead_x + 2;
+    assert_eq!(cell(text_x).symbol(), "s", "text cell:\n{row}");
+    assert_eq!(
+        Some(cell(text_x).fg),
+        super::theme::faint().fg,
+        "the text wears TEXT_FAINT:\n{row}"
+    );
+}
+
+/// A no-problem plugin card taller than its pane opens (`↵` from the list)
+/// with the lone option row and its explanation in view; the arrows still
+/// scroll the text, and while the row is scrolled out of view `space` and `↵`
+/// leave the key alone and the footer offers no toggle, until the row is back
+/// in view.
+#[test]
+fn a_tall_no_problem_plugin_card_opens_on_its_option_row_and_acts_only_in_view() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut check = plugin_check_with_problems();
+    check.problems.clear();
+    check.fix = None;
+    check.detail = (0..40).map(|i| format!("filler {i}")).collect();
+    let mut app = app_with(check);
+    // The recompute resolves the row's explanation; this card is built by
+    // hand, so the fixture does what the recompute would.
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let hints = |app: &App| super::super::footer::services_hints(app);
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    let row_shown = |rows: &[String]| rows.iter().any(|r| r.starts_with("❯ idle wake"));
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let opened = visible(&app);
+    assert!(
+        row_shown(&opened),
+        "the first frame shows the option row:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        opened
+            .iter()
+            .any(|r| r.starts_with("└ sends a short no-op keepalive")),
+        "and its explanation's first line:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        opened
+            .last()
+            .is_some_and(|r| r.ends_with("prompt cache warm")),
+        "and its explanation's last line:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        hints(&app).contains(&("space/↵", "toggle")),
+        "in view, the footer offers the toggle: {:?}",
+        hints(&app)
+    );
+    assert_eq!(
+        visible(&app),
+        opened,
+        "a redraw with no key keeps the scrolled frame"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let up_one = visible(&app);
+    assert_ne!(up_one, opened, "↑ scrolls the text:\n{}", up_one.join("\n"));
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    let top = visible(&app);
+    assert_eq!(
+        top.first().map(String::as_str),
+        Some("filler 0"),
+        "↑ scrolls to the card's top:\n{}",
+        top.join("\n")
+    );
+    assert!(
+        !row_shown(&top),
+        "the option row is out of view:\n{}",
+        top.join("\n")
+    );
+    assert!(
+        app.services.plugin_on_option(),
+        "the cursor still rests on the lone option row"
+    );
+    assert!(
+        !hints(&app).contains(&("space/↵", "toggle")),
+        "out of view, the footer offers no toggle: {:?}",
+        hints(&app)
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "space leaves an out-of-view row alone"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "↵ leaves an out-of-view row alone"
+    );
+    assert_eq!(visible(&app), top, "neither key moved the card");
+
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let bottom = visible(&app);
+    assert!(
+        row_shown(&bottom),
+        "↓ scrolls the row back into view:\n{}",
+        bottom.join("\n")
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "back in view, space flips the key"
+    );
+}
+
+/// The scroll that brought the option row into view belongs to that visit of
+/// the detail: once the user ascends and the list moves to another row and
+/// back, or the tab is left and re-entered, the plugin preview opens at the
+/// card's top like every other row's, with no key pressed in the detail first.
+#[test]
+fn leaving_the_plugin_detail_drops_the_option_row_scroll() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut plugin = plugin_check_with_problems();
+    plugin.problems.clear();
+    plugin.fix = None;
+    plugin.detail = (0..40).map(|i| format!("filler {i}")).collect();
+    let mut other = plugin.clone();
+    other.label = "rex";
+    other.detail = vec!["rex line".to_string()];
+    let checks = vec![plugin, other];
+    let mut app = app_with_checks(checks.clone());
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    let descend_onto_the_row = |app: &mut App| {
+        visible(app);
+        handle_key(app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+        let opened = visible(app);
+        assert_ne!(
+            opened.first().map(String::as_str),
+            Some("filler 0"),
+            "the descend scrolled the row into view:\n{}",
+            opened.join("\n")
+        );
+    };
+
+    descend_onto_the_row(&mut app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.services.cursor, 1, "the list moves to the other row");
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.services.cursor, 0, "and back to the plugin row");
+    let back = visible(&app);
+    assert_eq!(
+        back.first().map(String::as_str),
+        Some("filler 0"),
+        "after a list move the preview opens at the card's top:\n{}",
+        back.join("\n")
+    );
+
+    descend_onto_the_row(&mut app);
+    // The descended plugin detail traps `tab` like any editable pane, so the
+    // user ascends first.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
+    assert_ne!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "tab leaves the Services tab"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::BackTab));
+    assert_eq!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "⇧tab re-enters the Services tab"
+    );
+    // The re-entry recomputes the checks off the sandbox; put the tall card
+    // back so the frame can show where the preview opens.
+    app.services.checks = checks;
+    app.services.cursor = 0;
+    let reentered = visible(&app);
+    assert_eq!(
+        reentered.first().map(String::as_str),
+        Some("filler 0"),
+        "after leaving the tab the preview opens at the card's top:\n{}",
+        reentered.join("\n")
+    );
+}
+
+/// At 80 columns the plugin footer sheds other hints before the focused
+/// row's own key: on a problem its `↵ <verb>`, on the option row its toggle,
+/// stays in the frame.
+#[test]
+fn an_80_column_plugin_footer_keeps_the_focused_rows_own_key() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    // Taller than the pane, so the page keys act and their hint competes for
+    // the footer's width too.
+    let mut check = plugin_check_with_problems();
+    check.detail.extend((0..40).map(|i| format!("filler {i}")));
+    let mut app = app_with(check);
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let footer = |app: &App| -> String {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| super::super::draw(f, app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        rows.iter()
+            .rfind(|r| r.contains("? help"))
+            .cloned()
+            .unwrap_or_else(|| panic!("a footer row renders:\n{}", rows.join("\n")))
+    };
+    footer(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let on_problem = footer(&app);
+    assert!(
+        on_problem.contains("↵ install plugin"),
+        "on a problem the footer keeps its fix verb: {on_problem}"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.plugin_on_option(),
+        "↑ wraps onto the option row"
+    );
+    let on_row = footer(&app);
+    assert!(
+        on_row.contains("space/↵ toggle"),
+        "on the option row the footer keeps its toggle: {on_row}"
+    );
+}
+
+/// On a plugin card with problems taller than its pane, `↑` from the first
+/// problem wraps onto the option row and the next frame shows it, so the
+/// toggle the footer offers is one the user can see.
+#[test]
+fn the_problem_walk_onto_the_option_row_brings_it_into_view() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut check = plugin_check_with_problems();
+    check.detail.extend((0..40).map(|i| format!("filler {i}")));
+    let mut app = app_with(check);
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let opened = visible(&app);
+    assert!(
+        opened.iter().any(|r| r.contains("install plugin")),
+        "the walk opens on the first problem, in view:\n{}",
+        opened.join("\n")
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.plugin_on_option(),
+        "↑ wraps onto the option row"
+    );
+    let on_row = visible(&app);
+    assert!(
+        on_row.iter().any(|r| r.starts_with("❯ idle wake")),
+        "the frame shows the focused option row:\n{}",
+        on_row.join("\n")
+    );
+    assert!(
+        super::super::footer::services_hints(&app).contains(&("space/↵", "toggle")),
+        "and the footer offers its toggle"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "space flips the row it shows"
+    );
+}
+
+/// With a problem present ↓ still walks to the option row (never scrolls):
+/// the caret rests on it and the focused explanation renders below.
+#[test]
+fn with_a_problem_the_down_walk_still_lands_on_the_option_row() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0);
+    assert!(
+        problems > 0,
+        "the sandbox card holds a problem to walk past"
+    );
+    for _ in 0..problems {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert!(
+        app.services.plugin_on_option(),
+        "↓ walked to the option row"
+    );
+    assert_eq!(app.services.focused_fix(), None);
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter().any(|r| r == "❯ idle wake  ─●"),
+        "the caret rests on the row:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "the focused row explains itself:\n{}",
+        rows.join("\n")
+    );
 }

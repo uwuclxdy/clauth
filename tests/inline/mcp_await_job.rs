@@ -1914,3 +1914,93 @@ fn a_sidecar_write_landing_while_record_lost_waits_on_the_scope_flock_survives()
         "a write landing while record_lost waits on the flock survives"
     );
 }
+
+/// Writes the sandbox's `~/.clauth/profiles.toml` as a hand edit would.
+fn write_profiles_toml(home: &HomeSandbox, text: &str) {
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("profiles.toml"), text).unwrap();
+}
+
+/// A session idle past the count with one job running, a 1 h cache, and the
+/// job finishing 60 ms into the wait.
+fn idle_wait_with_a_late_finish() -> AwaitOutcome {
+    running("d-a");
+    let watch = watcher(&[], &["d-a"], 56 * MINUTE_MS);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(60));
+            finish("d-a");
+        });
+        await_job_outcomes(&watch, &patient(), &|| true, &|_| false)
+    })
+}
+
+/// `[plugin] idle_wake = false` turns the idle wake off: past the count on a
+/// 1 h cache the watcher keeps waiting, and the job's end still delivers.
+#[test]
+fn the_idle_wake_turned_off_skips_the_wake_and_still_delivers() {
+    let home = HomeSandbox::new();
+    write_profiles_toml(&home, "[plugin]\nidle_wake = false\n");
+
+    let outcome = idle_wait_with_a_late_finish();
+
+    assert_eq!(results(&outcome), ["d-a"], "{outcome:?}");
+    assert_eq!(outcome.pending, Vec::<String>::new());
+    assert!(!outcome.at_limit, "{outcome:?}");
+}
+
+/// The key set to its default, and a `profiles.toml` clauth cannot parse,
+/// both keep the wake: only a readable `false` turns it off.
+#[test]
+fn the_idle_wake_stays_on_unless_the_key_reads_false() {
+    for text in [
+        "[plugin]\nidle_wake = true\n",
+        "[plugin\nidle_wake = false\n",
+    ] {
+        let home = HomeSandbox::new();
+        write_profiles_toml(&home, text);
+
+        let outcome = idle_wait_with_a_late_finish();
+
+        assert_eq!(
+            outcome.delivered,
+            Vec::<serde_json::Value>::new(),
+            "{text:?}"
+        );
+        assert_eq!(outcome.pending, ["d-a"], "{text:?}");
+        drop(home);
+    }
+}
+
+/// An off key is read before the TTL: the idle stretch is judged without the
+/// settings read behind `cache_is_1h`.
+#[test]
+fn the_idle_wake_turned_off_reads_no_ttl() {
+    let home = HomeSandbox::new();
+    write_profiles_toml(&home, "[plugin]\nidle_wake = false\n");
+    let ttl_reads = std::sync::atomic::AtomicUsize::new(0);
+    running("d-a");
+    let watch = watcher(&[], &["d-a"], 56 * MINUTE_MS);
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(60));
+            finish("d-a");
+        });
+        await_job_outcomes(
+            &watch,
+            &patient(),
+            &|| {
+                ttl_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+            &|_| false,
+        )
+    });
+    assert_eq!(results(&outcome), ["d-a"], "{outcome:?}");
+    assert_eq!(
+        ttl_reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no TTL read"
+    );
+}

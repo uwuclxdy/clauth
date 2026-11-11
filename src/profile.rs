@@ -1271,6 +1271,24 @@ impl Default for UpdateSettings {
     }
 }
 
+/// The Claude Code plugin's knobs, persisted under `[plugin]` in profiles.toml
+/// and edited from the Services tab's plugin card. Like [`UpdateSettings`],
+/// the table may be absent (defaults) or partial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PluginSettings {
+    /// The one wake `clauth mcp-await-job` sends a session idle
+    /// `AWAIT_IDLE_WAKE_SECS` on a 1 h prompt cache while a delegate of its
+    /// own still runs (default on). Off, the wait runs on to the job's end.
+    pub(crate) idle_wake: bool,
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self { idle_wake: true }
+    }
+}
+
 /// How the fallback-chain walk orders the candidates WITHIN one accept pass
 /// (`AppState.walk_order`, issue #86). `Chain` (the default) is today's walk
 /// byte for byte: first accept in chain position, starting one slot after the
@@ -1543,6 +1561,10 @@ pub(crate) struct AppState {
     /// block on the next save; an explicit `auto_update = false` serializes.
     #[serde(default, skip_serializing_if = "update_is_default")]
     pub(crate) update: UpdateSettings,
+    /// The `[plugin]` table: the delegate idle-wake toggle. Omitted from the
+    /// file while at its default, like `[update]`.
+    #[serde(default, skip_serializing_if = "plugin_is_default")]
+    pub(crate) plugin: PluginSettings,
     /// The built-in bind-table digest the TUI last offered to move accounts
     /// onto. `None` = never offered, so the next TUI launch with a non-empty
     /// offer list re-offers. The CLI never reads or writes it.
@@ -1566,6 +1588,10 @@ fn serve_is_default(serve: &ServeSettings) -> bool {
 
 fn update_is_default(update: &UpdateSettings) -> bool {
     *update == UpdateSettings::default()
+}
+
+fn plugin_is_default(plugin: &PluginSettings) -> bool {
+    *plugin == PluginSettings::default()
 }
 
 impl AppState {
@@ -1854,6 +1880,7 @@ impl Default for AppState {
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
+            plugin: PluginSettings::default(),
             preset_binds_offered: None,
             active_moved: false,
         }
@@ -3744,6 +3771,21 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
     load_app_state()
         .ok()
         .and_then(|s| s.active_profile.into_inner())
+}
+
+/// `[plugin] idle_wake`, read lock-free from `profiles.toml`'s `[plugin]` table
+/// alone, for the await hook's idle-wake decision: a hand-written file holding
+/// only that table reads too. A file or table that does not read keeps the
+/// wake on: only a readable `false` turns it off.
+pub(crate) fn idle_wake_enabled() -> bool {
+    #[derive(Deserialize)]
+    struct PluginTable {
+        #[serde(default)]
+        plugin: PluginSettings,
+    }
+    app_state_path()
+        .and_then(|path| read_toml_file::<PluginTable>(&path))
+        .map_or(true, |t| t.plugin.idle_wake)
 }
 
 /// Whether the on-disk profile list still carries `name`, read from

@@ -546,6 +546,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Danger);
 
@@ -557,6 +558,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         None,
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Warn);
     assert_eq!(check.fix, Some(super::ServiceFix::InstallPlugin));
@@ -569,6 +571,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(check.fix.is_none());
@@ -583,6 +586,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
             state: ScriptState::Stale,
         }),
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Warn);
     assert_eq!(
@@ -609,6 +613,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
             state: ScriptState::Missing,
         }),
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(
         check.health,
@@ -635,6 +640,7 @@ fn the_plugin_check_health_is_the_worst_of_its_groups() {
         Some(McpProbe::Failed("refused".to_string())),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Danger);
 }
@@ -658,6 +664,7 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
 
     let data_line = format!(
@@ -726,6 +733,7 @@ fn the_plugin_check_reads_a_global_wire_as_wired() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert!(
         check.detail.iter().any(|l| l == "mcp entry: registered"),
@@ -762,6 +770,7 @@ fn the_plugin_check_reads_a_user_install_as_healthy() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(check.health, super::Health::Ok);
     assert!(
@@ -794,6 +803,7 @@ fn the_plugin_check_warns_on_a_user_install_older_than_this_clauth() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     let data_line = format!(
         "data: {}",
@@ -880,6 +890,7 @@ fn the_plugin_check_reads_a_user_install_that_is_not_older_as_healthy() {
             Some(McpProbe::Ok),
             None,
             crate::hook_jobs::CacheView::default(),
+            true,
         );
         assert_eq!(
             check.health,
@@ -916,6 +927,7 @@ fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
         None,
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     let data_line = format!(
         "data: {}",
@@ -1952,6 +1964,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
         None,
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert_eq!(
         check.health,
@@ -25886,6 +25899,7 @@ fn the_plugin_row_escapes_markers_in_fields_read_off_the_registry() {
         Some(McpProbe::Ok),
         None,
         crate::hook_jobs::CacheView::default(),
+        true,
     );
     assert!(
         check.detail.iter().any(|l| l == "commit: abc\\u{e000}def"),
@@ -74039,5 +74053,141 @@ fn a_divergence_picker_with_no_listable_target_opens_the_name_prompt() {
         form.from_divergence.as_deref(),
         Some("work"),
         "the prompt carries its divergence"
+    );
+}
+
+/// A plugin card taller than a 100x24 pane: one install problem near its top
+/// and 40 filler lines above the OPTIONS row, or the same card with no
+/// problem.
+fn tall_plugin_check(with_problem: bool) -> super::Check {
+    let fix = super::ServiceFix::InstallPlugin;
+    let mut detail = vec![
+        "installed: no (marketplace known)".to_string(),
+        "f  install plugin".to_string(),
+    ];
+    detail.extend((0..40).map(|i| format!("filler {i}")));
+    super::Check {
+        label: "plugin",
+        health: if with_problem {
+            super::Health::Warn
+        } else {
+            super::Health::Ok
+        },
+        detail,
+        fix: with_problem.then(|| fix.clone()),
+        problems: if with_problem {
+            vec![super::Problem { line: 1, fix }]
+        } else {
+            Vec::new()
+        },
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    }
+}
+
+/// The whole 100x24 frame as text.
+fn services_frame(app: &App) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+}
+
+/// The Services tab on the tall plugin card with its problem, the tooltip
+/// resolved as the recompute would, descended with `↵` onto the problem.
+fn descended_on_a_tall_plugin_problem() -> App {
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![tall_plugin_check(true)];
+    app.services.cursor = 0;
+    app.services.plugin_idle_wake_tooltip = Some(super::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    services_frame(&app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app
+}
+
+/// A card replacement that clears the plugin card's last problem while its
+/// detail is focused (a fix landing, a refresh) leaves the walk resting on
+/// the option row, and the next frame scrolls that row into view once; a
+/// later replacement of the already problem-free card leaves the user's own
+/// scroll alone.
+#[test]
+fn clearing_the_last_plugin_problem_brings_the_option_row_into_view_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let tall = tall_plugin_check;
+    let frame = services_frame;
+    let mut app = descended_on_a_tall_plugin_problem();
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::Detail,
+        "↵ descends"
+    );
+    assert!(
+        !app.services.plugin_on_option(),
+        "the walk opens on the problem"
+    );
+    frame(&app);
+
+    // What a landed fix's refresh does: the card is replaced, then the walk
+    // settles over the new card.
+    app.services.checks[0] = tall(false);
+    super::clamp_problem_cursor(&mut app);
+    let landed = frame(&app);
+    assert!(
+        landed.contains("❯ idle wake"),
+        "the frame after the last fix shows the option row:\n{landed}"
+    );
+    assert!(
+        app.services.plugin_option_acts(),
+        "and the toggle acts on it"
+    );
+
+    for _ in 0..60 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    let scrolled = frame(&app);
+    assert!(
+        !scrolled.contains("❯ idle wake"),
+        "↑ scrolls the row out of view:\n{scrolled}"
+    );
+    app.services.checks[0] = tall(false);
+    super::clamp_problem_cursor(&mut app);
+    let refreshed = frame(&app);
+    assert!(
+        !refreshed.contains("❯ idle wake"),
+        "a refresh of a card that already had no problem keeps the user's scroll:\n{refreshed}"
+    );
+}
+
+/// The same scroll-in holds when the walk already rests on the option row as
+/// the last problem clears: what the user saw is the row, so the frame after
+/// the replacement still shows it and the toggle still acts.
+#[test]
+fn clearing_the_last_plugin_problem_while_on_the_option_row_keeps_it_in_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = descended_on_a_tall_plugin_problem();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.plugin_on_option(),
+        "↑ wraps onto the option row"
+    );
+    let on_row = services_frame(&app);
+    assert!(
+        on_row.contains("❯ idle wake"),
+        "the walk shows the row before the replacement:\n{on_row}"
+    );
+
+    app.services.checks[0] = tall_plugin_check(false);
+    super::clamp_problem_cursor(&mut app);
+    let landed = services_frame(&app);
+    assert!(
+        landed.contains("❯ idle wake"),
+        "the frame after the last fix still shows the option row:\n{landed}"
+    );
+    assert!(
+        app.services.plugin_option_acts(),
+        "and the toggle acts on it"
     );
 }

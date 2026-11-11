@@ -1224,30 +1224,38 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             .selected_check()
             .filter(|c| c.label == "plugin")
             .map_or(0, |c| c.problems.len());
-        let walks_problems = problems > 0;
-        // The problem walk moves past one problem, or returns from a page's
-        // hidden action focus; a scroll-only detail scrolls only while its
-        // published bound leaves somewhere to go.
+        // The plugin walk runs over its problems and the OPTIONS row.
+        let walks_problems = label == Some("plugin");
         let mut hints = Vec::new();
-        if walks_problems {
-            if walk_moves(problems) || app.services.diagnostic_focus {
-                hints.push(("↑↓", "problem"));
+        // The focused row's own key leads — the option row's toggle, a
+        // problem's `↵ <verb>` — so the narrow-width trim sheds the shared
+        // hints before the key the shown row acts on.
+        if app.services.plugin_option_acts() {
+            hints.push(("space/↵", "toggle"));
+        } else if services_fix_keys_act(app)
+            && let Some(v) = verb
+        {
+            hints.push(("↵", v));
+        }
+        // The problem walk moves past one stop, or returns from a page's
+        // hidden action focus; a scroll-only detail (a no-problem plugin card
+        // included — its cursor rests on the lone option row) scrolls only
+        // while its published bound leaves somewhere to go.
+        if walks_problems && problems > 0 {
+            if walk_moves(problems + 1) || app.services.diagnostic_focus {
+                hints.push(("↑↓", "row"));
             }
         } else if detail_scrolls(app) {
             hints.push(("↑↓", "scroll"));
         }
-        if walks_problems && page_keys_act(app).is_some() {
+        if walks_problems && problems > 0 && page_keys_act(app).is_some() {
             hints.push(("pgup/pgdn", "read"));
         }
         hints.push(("r", "refresh"));
-        // A fix line's `↵` and the `f` walk act only inside a keymap that
-        // binds them — the plugin problems walk here; a scroll-only detail
-        // (any other check) advertises neither, the predicate its handler
-        // routing consults.
+        // The `f` walk acts only inside a keymap that binds it — the plugin
+        // problems walk here; a scroll-only detail (any other check)
+        // advertises neither, the predicate its handler routing consults.
         if services_fix_keys_act(app) {
-            if let Some(v) = verb {
-                hints.push(("↵", v));
-            }
             hints.extend(next_fix);
         }
         hints.extend([("a", "actions"), ("?", "help")]);
