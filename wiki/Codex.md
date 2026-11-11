@@ -145,7 +145,7 @@ No refresh revives a dead chain; a new login is the only exit, and the browser f
 
 ## Use a usage-limit reset
 
-A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. A Claude Code account's resets are [below](Codex#a-claude-code-account). The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
 
 ```sh
 clauth limit-reset work --list   # the account's resets; spends nothing
@@ -185,6 +185,25 @@ clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reope
 | an answer clauth cannot read | ``codex answered the reset request for 'work' in a shape clauth does not read, so the reset may or may not have gone through; a re-run before <time> re-sends the same request`` | 1 |
 
 Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose outcome stays unknown (no answer, a 5xx, or a reply clauth cannot read or that leaves the outcome open) leaves a record, `--list` names it (``clauth: a usage-limit reset sent at <time> got no answer; run `clauth limit-reset work` again before <time> to re-send it.``), and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. Two runs on one account never spend at once, whichever roster the account is on: a second `clauth limit-reset` on that account prints `clauth: another limit-reset on 'work' is running; waiting for it.` and waits, even while the first sits at its `[y/N]`; it then decides on what the first left, so a record still inside its 10 minutes is offered for a re-send (behind its own `[y/N]` unless `--yes`) instead of spending another reset. `--list` never waits, and neither does a run refused before the lock (no `--yes` on a non-TTY stdin or stdout, no login, a quarantined chain). The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
+
+### A Claude Code account
+
+The samples above are a codex account's. A Claude Code account's resets go through the same command, and a spend uses the grant the server names next, the row `--list` marks `*` and `(used next)`. Each `--list` row opens on the grant's label, printed whole with control characters dropped, and counts the grant's resets the server marks usable now against the ones it still holds, spent ones left out: `1 available` when every one is usable, `0/1 available` when none is, and every row reads 0 while the server's next reset cannot be spent. It then names the windows the grant resets (`5h`, `7d`, `7d opus`, `7d sonnet`, `7d fable`, any other as the server sends it, control characters dropped, cut to 40 cells; `nothing` when it names none), then any state the server gives and `, expires <time>` when the grant ends:
+
+```
+clauth: 'home' has 2 limit resets available.
+    Old reset: 1 available, resets 5h
+  * Weekly reset: 1 available, resets 5h and 7d  (used next)
+    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown
+```
+
+When the server names no next grant, `--list` prints `clauth: no limit resets available on 'home'.`, with the server's reason in parentheses before the period when it gives one (`clauth: no limit resets available on 'home' (no_grant).`). A next grant the server does not mark usable now refuses the spend and uses nothing: `Error: the limit reset 'home' would use next is unavailable (cooldown), so no reset was used`.
+
+A spend's question names the grant, its label cut to 40 cells (an untitled one asks `use a limit reset on 'home'?`) and the same count; short of a limit it adds the most headroom left in a window it resets (`'home' still has 60% of its 7d left.`), and when the server names the weekly reset it closes on `The weekly reset stays <time>.`:
+
+```
+clauth: use the limit reset "Weekly reset" on 'home'? It resets 5h and 7d now and cannot be undone; 1 available on it. [y/N]
+```
 
 ## Managed config
 
