@@ -2043,18 +2043,27 @@ fn stat_row(label: &str, value: String) -> crate::providers::StatRow {
     }
 }
 
-/// One balance pool: every `balance` figure of one `id`, summed.
+/// How a balance amount is spelled: a token count compacts (`205M`); every
+/// other amount keeps its exact value through
+/// [`crate::format::format_amount`] and names the unit its figure spells.
+#[derive(Default, PartialEq)]
+enum BalanceUnit {
+    #[default]
+    Tokens,
+    Named(Option<String>),
+}
+
+/// One balance pool: every `balance` figure of one `id` that carries the
+/// first-seen figure's unit and the grant and left it was read with.
 #[derive(Default)]
 struct BalancePool {
     label: String,
-    /// The word a non-token bar spells beside its amounts; `None` compacts
-    /// both sides as a token count.
-    unit: Option<String>,
+    /// The first-seen figure's unit owns the pool: a figure of another unit
+    /// names another balance and never enters this bar's figures.
+    unit: BalanceUnit,
     granted: f64,
-    /// The summed `remaining` of the figures that also published a grant.
-    /// `None` once such a figure carries none: a partial sum would claim a
-    /// left no read produced.
-    left: Option<f64>,
+    /// The summed `remaining` of the same figures that published a grant.
+    left: f64,
     spent: f64,
     expiry: Option<(i64, String)>,
 }
@@ -2062,8 +2071,9 @@ struct BalancePool {
 /// One bar per balance pool, in the order the pools first appear. A pool with
 /// no finite granted total (or a non-positive one) gets no bar: its share is
 /// not a figure the proxy published. Grant, left and spent come from one set —
-/// the figures carrying a finite `limit` — so no side of the bar names a
-/// figure another side did not read.
+/// the figures carrying a finite `limit` AND a finite `remaining`, of the
+/// first-seen unit — so no side of the bar names a figure another side did not
+/// read.
 fn balance_bars(
     accounts: &[PoolAccount<'_>],
     text: &dyn Fn(&str) -> String,
@@ -2084,8 +2094,7 @@ fn balance_bars(
                     id.to_string(),
                     BalancePool {
                         label: balance_label(figure, text),
-                        unit: balance_unit_word(figure, text),
-                        left: Some(0.0),
+                        unit: balance_unit(figure, text),
                         ..BalancePool::default()
                     },
                 ));
@@ -2093,36 +2102,10 @@ fn balance_bars(
             }
         };
         let pool = &mut pools[index].1;
-        let limit = figure
-            .get("limit")
-            .and_then(Value::as_f64)
-            .filter(|limit| limit.is_finite());
-        let remaining = figure
-            .get("remaining")
-            .and_then(Value::as_f64)
-            .filter(|remaining| remaining.is_finite());
-        if let Some(limit) = limit {
-            pool.granted += limit;
-            match remaining {
-                Some(remaining) => {
-                    if let Some(left) = pool.left.as_mut() {
-                        *left += remaining;
-                    }
-                }
-                None => pool.left = None,
-            }
-            match figure
-                .get("used")
-                .and_then(Value::as_f64)
-                .filter(|used| used.is_finite())
-            {
-                Some(used) => pool.spent += used,
-                None => {
-                    if let Some(remaining) = remaining {
-                        pool.spent += limit - remaining;
-                    }
-                }
-            }
+        // Another unit's figure keeps its own account line and never enters
+        // this bar's figures.
+        if balance_unit(figure, text) != pool.unit {
+            continue;
         }
         if let Some((epoch, stamp)) = figure
             .get("expires_at")
@@ -2135,6 +2118,27 @@ fn balance_bars(
         {
             pool.expiry = Some((epoch, stamp.to_string()));
         }
+        // A figure naming only one side of the bar is no member of its set:
+        // the grant and the left must both be figures this read produced.
+        let (Some(limit), Some(remaining)) = (
+            figure
+                .get("limit")
+                .and_then(Value::as_f64)
+                .filter(|limit| limit.is_finite()),
+            figure
+                .get("remaining")
+                .and_then(Value::as_f64)
+                .filter(|remaining| remaining.is_finite()),
+        ) else {
+            continue;
+        };
+        pool.granted += limit;
+        pool.left += remaining;
+        pool.spent += figure
+            .get("used")
+            .and_then(Value::as_f64)
+            .filter(|used| used.is_finite())
+            .unwrap_or(limit - remaining);
     }
     pools
         .into_iter()
@@ -2142,15 +2146,12 @@ fn balance_bars(
             if !(pool.granted.is_finite() && pool.granted > 0.0) {
                 return None;
             }
-            let label = match pool.left {
-                Some(left) => format!(
-                    "{} | {} left of {}",
-                    pool.label,
-                    pool_amount(left, pool.unit.as_deref()),
-                    pool_amount(pool.granted, pool.unit.as_deref()),
-                ),
-                None => pool.label,
-            };
+            let label = format!(
+                "{} | {} left of {}",
+                pool.label,
+                balance_amount(pool.left, &pool.unit),
+                balance_amount(pool.granted, &pool.unit),
+            );
             Some(crate::providers::UsageBar {
                 label,
                 pct: (pool.spent / pool.granted * 100.0).clamp(0.0, 100.0),
@@ -2180,32 +2181,42 @@ fn balance_label(figure: &Value, text: &dyn Fn(&str) -> String) -> String {
     }
 }
 
-/// The word a non-token balance spells beside its amounts: the currency code, a
-/// custom unit's label, or the unit's own name. `None` for a token count (which
-/// compacts) and for a figure naming no unit.
-fn balance_unit_word(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String> {
-    match figure.get("unit").and_then(Value::as_str) {
-        Some("tokens") | Some("") | None => None,
-        Some("currency") => figure
-            .get("currency")
-            .and_then(Value::as_str)
-            .filter(|word| !word.is_empty())
-            .map(text),
-        Some("custom") => figure
-            .get("unit_label")
-            .and_then(Value::as_str)
-            .filter(|word| !word.is_empty())
-            .map(text),
-        Some(unit) => Some(text(unit)),
+/// A balance figure's amount unit: its currency code, a non-empty
+/// `unit_label`, else the unit's own name. [`BalanceUnit::Tokens`] for a token
+/// count (which compacts); [`BalanceUnit::Named`]`(None)` for a figure naming
+/// no unit at all.
+fn balance_unit(figure: &Value, text: &dyn Fn(&str) -> String) -> BalanceUnit {
+    let unit = figure
+        .get("unit")
+        .and_then(Value::as_str)
+        .filter(|unit| !unit.is_empty());
+    if unit == Some("tokens") {
+        return BalanceUnit::Tokens;
     }
+    let word = |key: &str| {
+        figure
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|word| !word.is_empty())
+    };
+    BalanceUnit::Named(
+        word("currency")
+            .or_else(|| word("unit_label"))
+            .or(unit)
+            .map(text),
+    )
 }
 
-/// One side of a pool bar's `left of` phrase: a token count compacts, every
-/// other unit keeps its amount and names the unit it counts.
-fn pool_amount(amount: f64, unit: Option<&str>) -> String {
+/// One side of a pool bar's `left of` phrase or a balance line's `left`: a
+/// token count compacts, every other amount keeps its exact value and names
+/// the unit word its figure spells.
+fn balance_amount(amount: f64, unit: &BalanceUnit) -> String {
     match unit {
-        None => crate::format::format_compact(amount),
-        Some(unit) => format!("{} {}", crate::format::format_amount(amount), unit),
+        BalanceUnit::Tokens => crate::format::format_compact(amount),
+        BalanceUnit::Named(Some(word)) => {
+            format!("{} {word}", crate::format::format_amount(amount))
+        }
+        BalanceUnit::Named(None) => crate::format::format_amount(amount),
     }
 }
 
@@ -2276,28 +2287,17 @@ fn window_pct(figure: &Value) -> Option<String> {
     ))
 }
 
-/// A balance figure's `... left` phrase: a token amount compacts, every other
-/// unit keeps its amount and names the unit it counts.
+/// A balance figure's `... left` phrase: the same amount spelling the pool
+/// bar uses, so the line and the bar cannot disagree about one figure.
 fn balance_part(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String> {
     let remaining = figure
         .get("remaining")
         .and_then(Value::as_f64)
         .filter(|remaining| remaining.is_finite())?;
-    let unit = figure.get("unit").and_then(Value::as_str);
-    if unit == Some("tokens") {
-        return Some(format!("{} left", crate::format::format_compact(remaining)));
-    }
-    let amount = crate::format::format_amount(remaining);
-    let unit = figure
-        .get("currency")
-        .and_then(Value::as_str)
-        .or_else(|| figure.get("unit_label").and_then(Value::as_str))
-        .or(unit)
-        .filter(|unit| !unit.is_empty());
-    Some(match unit {
-        Some(unit) => format!("{amount} {} left", text(unit)),
-        None => format!("{amount} left"),
-    })
+    Some(format!(
+        "{} left",
+        balance_amount(remaining, &balance_unit(figure, text))
+    ))
 }
 
 /// A channel figure's phrase: its summary when it carries one, else its open
@@ -2320,7 +2320,7 @@ fn channel_part(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String>
 /// balance pool, the pool's totals, then one line per account in source order,
 /// with the [`ReadDates`] of the stalest figure it keeps. Every proxy-supplied
 /// string passes through `text` ([`Control::printable`]).
-fn pool_stats(
+pub(crate) fn pool_stats(
     accounts: &[Value],
     text: &dyn Fn(&str) -> String,
 ) -> std::result::Result<

@@ -10997,10 +10997,10 @@ fn a_balance_label_that_names_a_chain_window_never_reads_as_one() {
     let stats = pool_stats_on(json!({"accounts": [
         pool_account("acct-1", json!([
             figure(json!({"kind": "balance", "id": "credit", "label": "5h",
-                "limit": 100.0, "used": 10.0, "unit": "tokens"})),
+                "remaining": 90.0, "limit": 100.0, "used": 10.0, "unit": "tokens"})),
         ])),
     ]}));
-    assert_eq!(stats.bars[0].label, "5h balance");
+    assert_eq!(stats.bars[0].label, "5h balance | 90 left of 100");
     assert!(
         stats.windows_info().is_none(),
         "no chain window off a balance label"
@@ -11114,5 +11114,94 @@ fn a_pool_with_no_grant_or_no_available_account_keeps_its_guards() {
     assert!(
         !stats.is_available,
         "no available account makes the pool unavailable"
+    );
+}
+
+/// One pool id carrying two different units never sums them: the first-seen
+/// unit owns the bar, the other figure stays on its own account line.
+#[test]
+fn a_pool_never_sums_two_units_under_one_grant() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 1_000_000.0, "limit": 2_000_000.0, "used": 1_000_000.0,
+                "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "one bar, the first-seen unit's");
+    assert_eq!(stats.bars[0].label, "credit | 1M left of 2M");
+    assert!(
+        (stats.bars[0].pct - 50.0).abs() < 1e-6,
+        "the USD figure never enters the token pool: {}",
+        stats.bars[0].pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("5 USD left")),
+        "the other unit keeps its own line: {:?}",
+        stats.rows
+    );
+}
+
+/// A granted figure with no remaining reading never counts as unspent: the
+/// bar's grant comes from the figures that also carried a left.
+#[test]
+fn a_grant_without_a_remaining_never_counts_as_unspent() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "limit": 100.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "limit": 50.0, "used": 0.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 50 left of 50");
+}
+
+/// A currency unit with no code falls back to the unit's own word rather than
+/// compacting like a token count.
+#[test]
+fn a_unit_word_that_cannot_be_named_is_still_spelled() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "wallet",
+                "remaining": 5.25, "limit": 10.0, "used": 4.75, "unit": "currency"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "wallet | 5.25 currency left of 10 currency"
+    );
+}
+
+/// The whole-pool read paces on the registered bind's origin, the same key a
+/// per-account read of that proxy takes.
+#[test]
+fn the_pool_read_paces_on_the_proxys_bind_origin() {
+    let service = crate::proxy::Service::parse("stub").unwrap();
+    let base = "http://127.0.0.1:9101".to_string();
+    let pool = crate::providers::ThirdPartyTarget::ProxyPool {
+        service: service.clone(),
+        base_url: base.clone(),
+    };
+    let account = crate::providers::ThirdPartyTarget::Proxy {
+        service,
+        account: ACCOUNT.to_string(),
+        base_url: base,
+    };
+    assert_eq!(pool.throttle_key(), "http://127.0.0.1:9101");
+    assert_eq!(
+        pool.throttle_key(),
+        account.throttle_key(),
+        "both arms serialize on one proxy's requests"
     );
 }

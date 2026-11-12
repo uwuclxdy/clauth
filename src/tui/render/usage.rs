@@ -2610,13 +2610,21 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
+                // A ` | `-joined composite drops whole parts from the right
+                // (the shunt `requests` row's rule) and a last part still too
+                // wide ends on `…`; the column left is what the pane holds
+                // after this row's own key cell, which widens past TP_KEY_W.
+                let key_lead = 2 + Span::raw(key_cell(&row.label, TP_KEY_W, KEY_GUTTER)).width();
+                let value_width = usize::from(inner_w).saturating_sub(key_lead);
                 let (lead, tail) = row_parts(row);
+                let lead = fit_row_value(&lead, value_width);
                 let pad = if matches!(
                     row.kind,
                     StatRowKind::Body | StatRowKind::Danger | StatRowKind::Faint
                 ) && is_row_figure(row)
                 {
-                    value_w
+                    // Never wider than this row's own value column.
+                    value_w.min(value_width)
                 } else {
                     0
                 };
@@ -2791,6 +2799,22 @@ fn is_figure(value: &str) -> bool {
     };
     // A ` | `-joined composite is text, never a right-aligned figure column.
     digit_led && !value.contains('·') && !value.contains('(') && !value.contains(" | ")
+}
+
+/// Fit a labelled row's value to the value column: a ` | `-joined composite
+/// drops whole parts from the right (the shunt `requests` row's rule), and a
+/// single part still wider than the column ends on `…`.
+fn fit_row_value(value: &str, value_width: usize) -> String {
+    let mut parts: Vec<&str> = value.split(" | ").collect();
+    while parts.len() > 1 && Span::raw(parts.join(" | ")).width() > value_width {
+        parts.pop();
+    }
+    let kept = parts.join(" | ");
+    if Span::raw(kept.as_str()).width() > value_width {
+        truncate(&kept, value_width)
+    } else {
+        kept
+    }
 }
 
 fn key_value_span(

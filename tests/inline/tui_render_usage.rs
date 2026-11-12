@@ -8286,59 +8286,104 @@ fn a_probed_accounts_overdue_fetch_row_derives_from_its_probe_interval() {
     );
 }
 
-/// A pool reading renders its rows inside a narrow pane: the composite rows
-/// (`2 ready | 1 unread`, an account line) are text, never right-aligned figure
-/// columns, so a drawn line keeps its value. The pane does not wrap, so a row
-/// padded to the widest figure would read blank at 41 cells.
+/// The pool reading's rows render exactly and fit the pane: every row is its
+/// key cell plus its whole value at a wide interior, and at 41 cells a value's
+/// parts pop WHOLE from the right (never a mid-word clip), the composite rows
+/// starting at the value column like every other text row.
 #[test]
-fn pool_rows_keep_their_values_at_a_narrow_interior() {
+fn pool_rows_render_exactly_and_fit_a_narrow_interior() {
     let profile = crate::profile::Profile::new(
         "px".to_string(),
         Some("http://127.0.0.1:9101".to_string()),
         Some("clp_stub-key-0".to_string()),
     );
-    let stats = crate::providers::ThirdPartyStats {
-        is_available: true,
-        rows: vec![
-            crate::providers::StatRow {
-                label: "accounts".to_string(),
-                value: "2 ready | 1 unread".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-                raw: None,
-            },
-            crate::providers::StatRow {
-                label: "requests".to_string(),
-                value: "12,345 (1 failed)".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-                raw: None,
-            },
-            crate::providers::StatRow {
-                label: "acct-1".to_string(),
-                value: "5h 10% | 7d 100% | 205M left | off-peak open".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-                raw: None,
-            },
-            crate::providers::StatRow {
-                label: "acct-2".to_string(),
-                value: "5h - | 7d - | 80M left".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-                raw: None,
-            },
-        ],
-        bars: vec![crate::providers::UsageBar {
-            label: "credit | 285M left of 400M".to_string(),
-            pct: 28.76,
-            resets_at: None,
-            used: None,
-            total: None,
-            inference_quota: false,
-        }],
-        plan: None,
-        endpoint: None,
-        best_effort: false,
-    };
+    let body = serde_json::json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": [
+            {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 10.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 18000,
+             "resets_at": null, "chain": "5h", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 604800,
+             "resets_at": null, "chain": "7d", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 204977981.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+        {"account": "acct-2", "state": "ready", "available": true, "figures": [
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 79999980.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
     let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
-    let lines: Vec<String> = build_tp_rows(
+    let render = |width: u16| -> Vec<String> {
+        build_tp_rows(
+            &profile,
+            width,
+            &readings,
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect()
+    };
+    let row = |label: &str, value: &str| format!("  {label:<13}{value}");
+
+    assert_eq!(
+        render(120),
+        vec![
+            row("accounts", "2 ready | 0 unread"),
+            row("acct-1", "5h 10% | 7d 100% | 205M left"),
+            row("acct-2", "5h - | 7d - | 80M left"),
+        ],
+        "every row carries its whole value at a wide interior"
+    );
+    assert_eq!(
+        render(41),
+        vec![
+            row("accounts", "2 ready | 0 unread"),
+            row("acct-1", "5h 10% | 7d 100%"),
+            row("acct-2", "5h - | 7d - | 80M left"),
+        ],
+        "a long value pops whole parts from the right, never a mid-word clip"
+    );
+}
+
+/// A proxy account id wider than the key column still fits: the value column
+/// is measured from the row's own drawn key cell, so an id over `TP_KEY_W`
+/// cells never pushes its value past the pane.
+#[test]
+fn a_pool_account_id_wider_than_the_key_column_still_fits_its_value() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let body = serde_json::json!({"accounts": [
+        {"account": "wc5cdzkad0ps", "state": "ready", "available": true, "figures": [
+            {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 18000,
+             "resets_at": null, "chain": "5h", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 604800,
+             "resets_at": null, "chain": "7d", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 1.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let rows: Vec<String> = build_tp_rows(
         &profile,
         41,
         &readings,
@@ -8350,20 +8395,12 @@ fn pool_rows_keep_their_values_at_a_narrow_interior() {
     .iter()
     .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
     .collect();
-    let drawn: Vec<String> = lines
-        .iter()
-        .map(|line| line.chars().take(41).collect())
-        .collect();
-    for value in [
-        "2 ready",
-        "12,345",
-        "5h 10%",
-        "acct-2",
-        "5h - | 7d - | 80M left",
-    ] {
-        assert!(
-            drawn.iter().any(|line| line.contains(value)),
-            "{value:?} is drawn inside 41 cells: {drawn:#?}"
-        );
-    }
+    assert_eq!(
+        rows,
+        vec![
+            "  accounts     1 ready | 0 unread".to_string(),
+            "  wc5cdzkad0ps  5h 100% | 7d 100%".to_string(),
+        ],
+        "a 12-cell id fits its value: the last whole part that fits the row's column"
+    );
 }
