@@ -4455,8 +4455,7 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
             "{filter:?}: the gap dash takes no title or slot styling"
         );
 
-        for x in start..start + name.len() {
-            let cell = &buf.content[x];
+        for (x, cell) in (start..).zip(&buf.content[start..start + name.len()]) {
             assert_eq!(
                 cell.fg,
                 theme::text_dim_color(),
@@ -4472,8 +4471,7 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
             );
         }
 
-        for x in eyebrow..eyebrow + "ACCOUNTS".len() {
-            let cell = &buf.content[x];
+        for (x, cell) in (eyebrow..).zip(&buf.content[eyebrow..eyebrow + "ACCOUNTS".len()]) {
             assert_eq!(
                 cell.fg,
                 theme::accent_2_color(),

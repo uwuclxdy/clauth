@@ -2916,8 +2916,9 @@ impl<'a> Ctx<'a> {
                         };
                         for (run, (first, last)) in self.table_runs(table).into_iter().enumerate() {
                             let last = self.tail_end(last, next_entry(&lines, first));
-                            for line in self.owned_top(first, None, run > 0)..=last {
-                                if let Some(at) = self.src.lines[line].comment {
+                            let top = self.owned_top(first, None, run > 0);
+                            for line in &self.src.lines[top..=last] {
+                                if let Some(at) = line.comment {
                                     out.insert(at, Owner::Entry(id, Ident::Position(i)));
                                 }
                             }
