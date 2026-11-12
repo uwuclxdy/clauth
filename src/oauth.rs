@@ -3816,6 +3816,10 @@ fn rolling_install_gate(
     held: Option<RotationGuard>,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
+    // Whether THIS call healed a mis-fill onto the mint: a scan that just
+    // wrote the sidecar answers Ready so its live-slot followers carry the
+    // write, even where the roll below then refuses.
+    let mut healed = false;
     // The heal writes the sidecar, so it runs only on an account that claims
     // no proxy account on disk; a claimed one falls to the table below, where
     // [`roll_from_stored_chain`] reads the same claim and stamps nothing. This
@@ -3828,10 +3832,13 @@ fn rolling_install_gate(
         == crate::profile::ProxyClaim::None
     {
         match crate::claude::heal_misfilled_sidecar(name) {
-            Ok(crate::claude::HealOutcome::Healed) => logline!(
-                "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
-                 (the rolling token re-arms on the next rotation)"
-            ),
+            Ok(crate::claude::HealOutcome::Healed) => {
+                healed = true;
+                logline!(
+                    "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
+                     (the rolling token re-arms on the next rotation)"
+                );
+            }
             // A concurrent repair — or whatever writes the sidecar — already
             // resolved the mis-fill. Fall through to the normal rolling table,
             // which re-reads the sidecar as it now is. (The old bool folded
@@ -3964,8 +3971,17 @@ fn rolling_install_gate(
         // chain shape reached `stamp_rolling_token`'s bail and the WriteFailed
         // arm's `sidecar_live` fallback served the mint; losing that turned a
         // profile with a perfectly installable mint into a hard switch refusal
-        // (verification fleet, round 3).
+        // (verification fleet, round 3). The scheduler's re-stamp leg
+        // (`NoWait`) has no install to make, and the live sidecar there is a
+        // mint the scan keeps reading as due: answering Ready would rerun this
+        // gate on the 15-minute hold until the re-login. It gets the
+        // re-login-shaped cause instead, which the scan paces on its long,
+        // credential-watched hold, unless this call healed a mis-fill, whose
+        // write the scan's Ready followers still have to carry.
         RollAttempt::GrantUnusable => {
+            if matches!(wait, LockWait::NoWait) && !healed {
+                return AuthGate::Transient(rolling_grant_unrecorded(name));
+            }
             return if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
                     "clauth: '{name}' usage chain's recorded grant cannot mint a rolling \
@@ -4185,9 +4201,13 @@ pub(crate) const ROLLING_RESTAMP_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
 /// healthy backup sat unrepaired forever on any profile nobody switched to.
 /// A static MINT in the sidecar is due too (the scheduler asks only for
 /// rolling-token profiles): it is the fallback a dead or unreachable chain
-/// degraded to, and only this leg brings the rolling bearer back once the
-/// chain answers (the gate supersedes a mint whenever it can stamp). Absent
-/// sidecars (arming is switch/rotation work) and exp-less claims stay not-due.
+/// degraded to, and this leg brings the rolling bearer back once the chain
+/// answers without waiting for a rotation (the gate supersedes a mint whenever
+/// it can stamp; a rotation that lands re-stamps it too). A mint beside a
+/// grant that can never stamp stays due as well, and the gate answers the
+/// scan with the re-login cause, so the scheduler paces it on the re-login
+/// hold. Absent sidecars (arming is switch/rotation work) and exp-less claims
+/// stay not-due.
 pub(crate) fn rolling_sidecar_restamp_due(name: &ProfileName, now: i64) -> bool {
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {

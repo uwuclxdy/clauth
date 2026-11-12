@@ -11215,8 +11215,10 @@ const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
 /// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
 /// nothing while avoiding per-scan log spam.
 const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
-// The gate's degrade-to-mint lead must outlast one transient retry, or a bearer
-// can die between two failed re-stamps without ever degrading.
+// The gate's degrade-to-mint lead must outlast one transient retry, so the
+// degrade lands before the bearer dies. (A bearer that died between two failed
+// re-stamps would still degrade on the next one, but sessions would have sat
+// on an expired bearer in between.)
 const _: () = assert!(crate::oauth::ROLLING_DEGRADE_LEAD_MS as u64 > ROLLING_RETRY_MS);
 /// A Broken verdict (dead chain, no mint to degrade to) and the re-login-shaped
 /// transients change only when the operator acts, so retrying them on the

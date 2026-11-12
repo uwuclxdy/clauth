@@ -22025,6 +22025,97 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
     );
 }
 
+/// The same leash end to end, through the real re-stamp gate: a rolling
+/// profile whose sidecar holds a live mint (due, so the rolling bearer can
+/// come back) beside a chain whose recorded grant can never stamp one. Only a
+/// re-login changes that, so the scan must not rerun the gate, or relog its
+/// refusal, on the 15-minute hold.
+#[test]
+fn claude_rolling_tick_paces_an_unrecorded_grant_beside_a_mint_on_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-grant");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-live".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 6 * 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec![name.clone()],
+            ..Default::default()
+        },
+        profiles: vec![profile],
+    }));
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let gate = |n: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::restamp_rolling_token(&config, n, |_: &str, _: Option<&str>| {
+            panic!("a live chain with an unusable grant must not spend a refresh")
+        })
+    };
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &gate,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &gate,
+    );
+
+    drop(capture);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unrecorded grant beside a mint is not retried on the transient cadence"
+    );
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|l| l.contains("cannot mint a rolling bearer"))
+            .count(),
+        0,
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|l| l.contains("re-stamp for 'cl-mint-grant' failed"))
+            .count(),
+        1,
+        "{snapshot:?}"
+    );
+}
+
 /// The long leash's exit is the OPERATOR'S FIX, not the clock: a re-login
 /// writes `credentials.json` and stamps nothing scheduler-side, so a hold that
 /// only time releases would sit on the prescribed recovery for up to six
