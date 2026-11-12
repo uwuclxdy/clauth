@@ -7212,7 +7212,9 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The profile's effort rides
+/// previous profile's model routing. With `keep_unset_models` on in
+/// `profiles.toml`, an unset slot keeps the value `base` holds instead
+/// ([`keep_unset_models`]). The profile's effort rides
 /// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
 /// profile's own `[env]` entry outranking the `effort` field
 /// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
@@ -7247,6 +7249,16 @@ fn session_env(profile: &Profile) -> std::borrow::Cow<'_, BTreeMap<String, Strin
     }
 }
 
+/// Whether a model slot the landing profile leaves unset keeps the value the
+/// settings file holds (`keep_unset_models` in profiles.toml, default off).
+/// Read off disk where it is used, like [`preserve_non_login_keys`], and only
+/// when [`build_settings`] would otherwise remove such a value, so a build with
+/// nothing to lose never reads the state file. A profiles.toml that does not
+/// load reads OFF, the build the file had before the key existed.
+fn keep_unset_models() -> bool {
+    crate::profile::load_app_state().is_ok_and(|state| state.keep_unset_models)
+}
+
 /// [`build_claude_settings_json`]'s body. `live` is `Some` when the build lands
 /// in `~/.claude/settings.json` itself ([`settle_custom_env`]).
 fn build_settings(
@@ -7265,6 +7277,11 @@ fn build_settings(
     if settings.get("env").is_none() {
         settings["env"] = serde_json::json!({});
     }
+
+    // The top-level model slots `profile` leaves unset whose key `base` holds:
+    // with the env ones below, the only values the removals can cost.
+    let unset_top_level = (profile.models.default.is_none() && settings.get("model").is_some())
+        || (profile.models.advisor.is_none() && settings.get("advisorModel").is_some());
 
     let env = settings["env"]
         .as_object_mut()
@@ -7288,7 +7305,8 @@ fn build_settings(
     env.remove("ANTHROPIC_AUTH_TOKEN");
 
     // Model-tier and subagent overrides — clauth-owned env keys, always set or
-    // cleared deterministically so a switch never inherits the prior profile's.
+    // cleared deterministically so a switch never inherits the prior profile's,
+    // unless `keep_unset_models` keeps an unset one as `base` holds it.
     let model_env = [
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", &profile.models.opus),
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", &profile.models.sonnet),
@@ -7296,11 +7314,17 @@ fn build_settings(
         ("ANTHROPIC_DEFAULT_FABLE_MODEL", &profile.models.fable),
         ("CLAUDE_CODE_SUBAGENT_MODEL", &profile.models.subagent),
     ];
+    let keep_unset = (unset_top_level
+        || model_env
+            .iter()
+            .any(|(key, value)| value.is_none() && env.contains_key(*key)))
+        && keep_unset_models();
     for (key, value) in model_env {
         match value {
             Some(v) => {
                 env.insert(key.into(), v.clone().into());
             }
+            None if keep_unset => {}
             None => {
                 env.remove(key);
             }
@@ -7334,6 +7358,7 @@ fn build_settings(
         Some(model) => {
             obj.insert("model".into(), model.into());
         }
+        None if keep_unset => {}
         None => {
             obj.remove("model");
         }
@@ -7341,11 +7366,13 @@ fn build_settings(
     // `advisorModel` is clauth-owned the same way `model` is: set when the
     // profile has an `advisor` row, removed when it has none, so a profile
     // without the row runs with the advisor off instead of inheriting the
-    // previous profile's (or a hand-set global) value.
+    // previous profile's (or a hand-set global) value. `keep_unset_models`
+    // keeps it as for `model`.
     match profile.models.advisor.as_deref() {
         Some(model) => {
             obj.insert("advisorModel".into(), model.into());
         }
+        None if keep_unset => {}
         None => {
             obj.remove("advisorModel");
         }

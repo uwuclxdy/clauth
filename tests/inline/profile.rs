@@ -5258,6 +5258,35 @@ fn app_state_bell_command_round_trips_through_a_save() {
     );
 }
 
+// `keep_unset_models` is a hand-edited key: a save that moves another key
+// keeps the operator's line byte for byte, and a save at the default (off)
+// writes no line for it.
+#[test]
+fn app_state_keep_unset_models_survives_a_save_and_is_omitted_when_off() {
+    let _home = HomeSandbox::new();
+    let before = "profiles = []\n# keep my /model pick\nkeep_unset_models = true   # by hand\n";
+    let path = write_state_file(before);
+
+    let mut state = load_app_state().expect("load");
+    assert!(state.keep_unset_models, "the hand-typed true loads");
+    state.show_pace = true;
+    save_app_state(&state).expect("save another key");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after"),
+        format!("{before}show_pace = true\n"),
+        "the hand-typed line stays as written"
+    );
+    assert!(load_app_state().expect("reload").keep_unset_models);
+
+    std::fs::remove_file(&path).expect("remove profiles.toml");
+    save_app_state(&AppState::default()).expect("save a default state");
+    let fresh = std::fs::read_to_string(&path).expect("read fresh");
+    assert!(
+        !fresh.contains("keep_unset_models"),
+        "off (default) must be omitted, got:\n{fresh}"
+    );
+}
+
 // ── the refresh chain's stage, from the loader's side ────────────────────────
 
 use crate::testutil::hold_state_flock;
