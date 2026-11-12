@@ -77,7 +77,7 @@ clauth reads that item before every write (to carry your MCP-server logins acros
 
 ## Network activity
 
-Every request clauth makes, and what rides along with it:
+Every request clauth makes, and what rides along with it, except requests to a shunt gateway or a clauth proxy: a proxy listens on `127.0.0.1`, the gateway on the address `SHUNT_SERVER__BIND` or shunt's config names (shunt's default `127.0.0.1:3001` when neither is set; clauth also probes that address when it cannot read the one shunt would use), and `clauth proxy check <url>` sends to the URL you give it, with the token and key files you name.
 
 | Endpoint | When | Carries |
 |----------|------|---------|
@@ -103,7 +103,7 @@ Every request clauth makes, and what rides along with it:
 | `fcm.googleapis.com`, `web.push.apple.com`, `updates.push.services.mozilla.com` | `clauth daemon --listen`, when a paired device registered for Web Push and an event it asked for fires | a VAPID JWT signed with the daemon's key and a payload encrypted to that device: the event kind and the account name, never a credential |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort scan for a usage endpoint on that same origin | whatever you configured |
 
-Your stored Claude access tokens go to `api.anthropic.com` and nowhere else; a codex profile's tokens go to `auth.openai.com` and `chatgpt.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or showing you the same link to open on any device) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored Claude access tokens go to `api.anthropic.com` and nowhere else; a codex profile's tokens go to `auth.openai.com` and `chatgpt.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or showing you the same link to open on any device) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above, plus those addresses, and no others.
 
 ### Listening sockets
 
