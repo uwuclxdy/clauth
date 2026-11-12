@@ -8285,3 +8285,85 @@ fn a_probed_accounts_overdue_fetch_row_derives_from_its_probe_interval() {
         "the probe's 90 s cadence dates the reading, not the 300 s base"
     );
 }
+
+/// A pool reading renders its rows inside a narrow pane: the composite rows
+/// (`2 ready | 1 unread`, an account line) are text, never right-aligned figure
+/// columns, so a drawn line keeps its value. The pane does not wrap, so a row
+/// padded to the widest figure would read blank at 41 cells.
+#[test]
+fn pool_rows_keep_their_values_at_a_narrow_interior() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![
+            crate::providers::StatRow {
+                label: "accounts".to_string(),
+                value: "2 ready | 1 unread".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+                raw: None,
+            },
+            crate::providers::StatRow {
+                label: "requests".to_string(),
+                value: "12,345 (1 failed)".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+                raw: None,
+            },
+            crate::providers::StatRow {
+                label: "acct-1".to_string(),
+                value: "5h 10% | 7d 100% | 205M left | off-peak open".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+                raw: None,
+            },
+            crate::providers::StatRow {
+                label: "acct-2".to_string(),
+                value: "5h - | 7d - | 80M left".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+                raw: None,
+            },
+        ],
+        bars: vec![crate::providers::UsageBar {
+            label: "credit | 285M left of 400M".to_string(),
+            pct: 28.76,
+            resets_at: None,
+            used: None,
+            total: None,
+            inference_quota: false,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let lines: Vec<String> = build_tp_rows(
+        &profile,
+        41,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+    .collect();
+    let drawn: Vec<String> = lines
+        .iter()
+        .map(|line| line.chars().take(41).collect())
+        .collect();
+    for value in [
+        "2 ready",
+        "12,345",
+        "5h 10%",
+        "acct-2",
+        "5h - | 7d - | 80M left",
+    ] {
+        assert!(
+            drawn.iter().any(|line| line.contains(value)),
+            "{value:?} is drawn inside 41 cells: {drawn:#?}"
+        );
+    }
+}

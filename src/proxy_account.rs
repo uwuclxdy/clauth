@@ -1904,6 +1904,8 @@ struct PoolTotals {
     attempted: i64,
     failed: i64,
     has_stats: bool,
+    /// A proxy-published negative count the sum may not include.
+    negative_stats: bool,
     oldest_read_at: Option<i64>,
 }
 
@@ -1943,8 +1945,13 @@ impl PoolTotals {
         if !matches!(id, Some("reset-5h" | "reset-7d")) {
             return;
         }
+        // A channel without its `open` verdict is no count clauth read: its row
+        // stays out rather than printing a fabricated `0 open`.
+        let Some(open) = figure.get("open").and_then(Value::as_bool) else {
+            return;
+        };
         self.has_reset = true;
-        if figure.get("open").and_then(Value::as_bool) == Some(true) {
+        if open {
             if id == Some("reset-5h") {
                 self.reset_5h += 1;
             } else {
@@ -1954,13 +1961,12 @@ impl PoolTotals {
     }
 
     fn add_offer(&mut self, figure: &Value) {
+        // An offer without its `items` array states no claim clauth read.
+        let Some(items) = figure.get("items").and_then(Value::as_array) else {
+            return;
+        };
         self.has_offer = true;
-        for item in figure
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        for item in items {
             match item.get("state").and_then(Value::as_str) {
                 Some("available") => self.claimable += 1,
                 Some("claimed") => self.held += 1,
@@ -1970,20 +1976,25 @@ impl PoolTotals {
     }
 
     fn add_stats(&mut self, figure: &Value) {
+        // Both counters must be integers clauth can add up, and one negative
+        // count poisons the whole sum: the row never prints a total that a
+        // junk count made nonsense.
+        let Some(requests) = figure.get("requests").and_then(Value::as_object) else {
+            return;
+        };
+        let (Some(attempted), Some(failed)) = (
+            requests.get("attempted").and_then(Value::as_i64),
+            requests.get("failed").and_then(Value::as_i64),
+        ) else {
+            return;
+        };
         self.has_stats = true;
-        let requests = figure.get("requests");
-        if let Some(attempted) = requests
-            .and_then(|requests| requests.get("attempted"))
-            .and_then(Value::as_i64)
-        {
-            self.attempted += attempted;
+        if attempted < 0 || failed < 0 {
+            self.negative_stats = true;
+            return;
         }
-        if let Some(failed) = requests
-            .and_then(|requests| requests.get("failed"))
-            .and_then(Value::as_i64)
-        {
-            self.failed += failed;
-        }
+        self.attempted = self.attempted.saturating_add(attempted);
+        self.failed = self.failed.saturating_add(failed);
     }
 
     fn rows(&self) -> Vec<crate::providers::StatRow> {
@@ -2000,7 +2011,7 @@ impl PoolTotals {
                 format!("{} claimable | {} held", self.claimable, self.held),
             ));
         }
-        if self.has_stats {
+        if self.has_stats && !self.negative_stats {
             rows.push(stat_row(
                 "requests",
                 format!(
@@ -2036,15 +2047,23 @@ fn stat_row(label: &str, value: String) -> crate::providers::StatRow {
 #[derive(Default)]
 struct BalancePool {
     label: String,
+    /// The word a non-token bar spells beside its amounts; `None` compacts
+    /// both sides as a token count.
+    unit: Option<String>,
     granted: f64,
-    remaining: Option<f64>,
+    /// The summed `remaining` of the figures that also published a grant.
+    /// `None` once such a figure carries none: a partial sum would claim a
+    /// left no read produced.
+    left: Option<f64>,
     spent: f64,
     expiry: Option<(i64, String)>,
 }
 
 /// One bar per balance pool, in the order the pools first appear. A pool with
 /// no finite granted total (or a non-positive one) gets no bar: its share is
-/// not a figure the proxy published.
+/// not a figure the proxy published. Grant, left and spent come from one set —
+/// the figures carrying a finite `limit` — so no side of the bar names a
+/// figure another side did not read.
 fn balance_bars(
     accounts: &[PoolAccount<'_>],
     text: &dyn Fn(&str) -> String,
@@ -2064,12 +2083,9 @@ fn balance_bars(
                 pools.push((
                     id.to_string(),
                     BalancePool {
-                        label: text(
-                            figure
-                                .get("label")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
+                        label: balance_label(figure, text),
+                        unit: balance_unit_word(figure, text),
+                        left: Some(0.0),
                         ..BalancePool::default()
                     },
                 ));
@@ -2087,14 +2103,26 @@ fn balance_bars(
             .filter(|remaining| remaining.is_finite());
         if let Some(limit) = limit {
             pool.granted += limit;
-        }
-        if let Some(remaining) = remaining {
-            pool.remaining = Some(pool.remaining.unwrap_or_default() + remaining);
-        }
-        match (figure.get("used").and_then(Value::as_f64), limit, remaining) {
-            (Some(used), _, _) if used.is_finite() => pool.spent += used,
-            (_, Some(limit), Some(remaining)) => pool.spent += limit - remaining,
-            _ => {}
+            match remaining {
+                Some(remaining) => {
+                    if let Some(left) = pool.left.as_mut() {
+                        *left += remaining;
+                    }
+                }
+                None => pool.left = None,
+            }
+            match figure
+                .get("used")
+                .and_then(Value::as_f64)
+                .filter(|used| used.is_finite())
+            {
+                Some(used) => pool.spent += used,
+                None => {
+                    if let Some(remaining) = remaining {
+                        pool.spent += limit - remaining;
+                    }
+                }
+            }
         }
         if let Some((epoch, stamp)) = figure
             .get("expires_at")
@@ -2114,12 +2142,12 @@ fn balance_bars(
             if !(pool.granted.is_finite() && pool.granted > 0.0) {
                 return None;
             }
-            let label = match pool.remaining {
+            let label = match pool.left {
                 Some(left) => format!(
                     "{} | {} left of {}",
                     pool.label,
-                    crate::format::format_compact(left),
-                    crate::format::format_compact(pool.granted),
+                    pool_amount(left, pool.unit.as_deref()),
+                    pool_amount(pool.granted, pool.unit.as_deref()),
                 ),
                 None => pool.label,
             };
@@ -2133,6 +2161,52 @@ fn balance_bars(
             })
         })
         .collect()
+}
+
+/// A pool bar's label: a bare chain label gains a word so
+/// [`crate::providers::ThirdPartyStats::windows_info`] never reads a balance
+/// as a `5h`/`7d` window and steers the auto-switch with it.
+fn balance_label(figure: &Value, text: &dyn Fn(&str) -> String) -> String {
+    let label = text(
+        figure
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if is_chain_label(&label) {
+        format!("{label} balance")
+    } else {
+        label
+    }
+}
+
+/// The word a non-token balance spells beside its amounts: the currency code, a
+/// custom unit's label, or the unit's own name. `None` for a token count (which
+/// compacts) and for a figure naming no unit.
+fn balance_unit_word(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String> {
+    match figure.get("unit").and_then(Value::as_str) {
+        Some("tokens") | Some("") | None => None,
+        Some("currency") => figure
+            .get("currency")
+            .and_then(Value::as_str)
+            .filter(|word| !word.is_empty())
+            .map(text),
+        Some("custom") => figure
+            .get("unit_label")
+            .and_then(Value::as_str)
+            .filter(|word| !word.is_empty())
+            .map(text),
+        Some(unit) => Some(text(unit)),
+    }
+}
+
+/// One side of a pool bar's `left of` phrase: a token count compacts, every
+/// other unit keeps its amount and names the unit it counts.
+fn pool_amount(amount: f64, unit: Option<&str>) -> String {
+    match unit {
+        None => crate::format::format_compact(amount),
+        Some(unit) => format!("{} {}", crate::format::format_amount(amount), unit),
+    }
 }
 
 /// One account's line: its two chain windows always, then every other window,
@@ -2192,14 +2266,14 @@ fn pool_account_value(account: &PoolAccount<'_>, text: &dyn Fn(&str) -> String) 
     parts.join(" | ")
 }
 
-/// A window figure's used share, `None` when either side is not finite or the
-/// share itself is not (a zero limit).
+/// A window figure's used share, `None` when it draws no bar: both sides must
+/// map ([`window_use`], which demands a positive limit) and the share is
+/// clamped like the per-account pane's bars.
 fn window_pct(figure: &Value) -> Option<String> {
-    let used = figure.get("used").and_then(Value::as_f64)?;
-    let limit = figure.get("limit").and_then(Value::as_f64)?;
-    let pct = used / limit * 100.0;
-    (used.is_finite() && limit.is_finite() && pct.is_finite())
-        .then(|| crate::format::format_pct(pct))
+    let (used, limit) = window_use(figure)?;
+    Some(crate::format::format_pct(
+        (used / limit * 100.0).clamp(0.0, 100.0),
+    ))
 }
 
 /// A balance figure's `... left` phrase: a token amount compacts, every other

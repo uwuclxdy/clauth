@@ -10879,3 +10879,240 @@ fn a_pool_with_no_figures_reports_no_totals_instead_of_zero() {
         ]
     );
 }
+
+/// The whole-pool read over `body`, as the funnel profile's cache holds it.
+fn pool_stats_on(body: Value) -> crate::providers::ThirdPartyStats {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+    crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed")
+}
+
+/// One account holding exactly `figures`, ready and available.
+fn pool_account(id: &str, figures: Value) -> Value {
+    json!({"account": id, "state": "ready", "available": true, "figures": figures})
+}
+
+fn figure(value: Value) -> Value {
+    let mut figure = value;
+    figure["read_at"] = json!("2030-01-01T00:00:00Z");
+    figure
+}
+
+/// The bar's left is summed only over the figures that also carried a grant:
+/// an account whose upstream omits its total never makes the bar read a left
+/// no read produced, and the spent share takes `used` over `limit - remaining`.
+#[test]
+fn a_pool_bar_sums_left_only_where_the_grant_was_read() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 100.0, "limit": 100.0, "used": 30.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 150.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "credit | 100 left of 100");
+    assert!(
+        (bar.pct - 30.0).abs() < 1e-6,
+        "spent takes used (30), not limit - remaining (0): {}",
+        bar.pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("150 left")),
+        "the grantless account still names its own left: {:?}",
+        stats.rows
+    );
+}
+
+/// A non-token pool bar spells its unit word beside both amounts, the same
+/// unit its account line names.
+#[test]
+fn a_pool_bar_spells_a_non_token_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "wallet",
+                "remaining": 5.25, "limit": 10.0, "used": 4.75, "unit": "currency",
+                "currency": "CNY"})),
+        ])),
+    ]}));
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "wallet | 5.25 CNY left of 10 CNY");
+    assert!((bar.pct - 47.5).abs() < 1e-6, "spent/granted: {}", bar.pct);
+}
+
+/// A figure missing the counters its row prints (a `stats` without `requests`,
+/// a reset channel without `open`, an offer without `items`) never prints a
+/// fabricated zero total.
+#[test]
+fn a_pool_total_without_its_counters_reads_no_row() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "stats", "id": "request-stats", "label": "stats",
+                "since": "2030-01-01T00:00:00Z", "mean_latency_ms": null,
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}})),
+            figure(json!({"kind": "channel", "id": "reset-5h", "label": "5h resets"})),
+            figure(json!({"kind": "offer", "id": "claim-offers", "label": "offers"})),
+        ])),
+    ]}));
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "1 ready | 0 unread"),
+            ("acct-1", "5h - | 7d -")
+        ]
+    );
+}
+
+/// A balance whose bare label names a chain window never becomes one: the
+/// auto-switch reads windows by the exact `5h`/`7d` label, so the pool bar
+/// keeps a word beside it.
+#[test]
+fn a_balance_label_that_names_a_chain_window_never_reads_as_one() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "5h",
+                "limit": 100.0, "used": 10.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "5h balance");
+    assert!(
+        stats.windows_info().is_none(),
+        "no chain window off a balance label"
+    );
+}
+
+/// The account line's window share is clamped and ignores a zero limit, like
+/// the per-account pane's bars.
+#[test]
+fn a_pool_window_percentage_is_clamped() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "window", "id": "quota-5h", "label": "5h window",
+                "used": 150.0, "limit": 100.0, "unit": "percent", "window_secs": 18000,
+                "resets_at": null, "chain": "5h"})),
+            figure(json!({"kind": "window", "id": "quota-7d", "label": "7d window",
+                "used": 10.0, "limit": 0.0, "unit": "percent", "window_secs": 604800,
+                "resets_at": null, "chain": "7d"})),
+        ])),
+    ]}));
+    let line = stats
+        .rows
+        .iter()
+        .find(|row| row.label == "acct-1")
+        .expect("the account line");
+    assert_eq!(line.value, "5h 100% | 7d -");
+}
+
+/// A negative proxy count reads no total rather than a nonsense one.
+#[test]
+fn a_pool_stats_with_a_negative_count_reads_no_row() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "stats", "id": "request-stats", "label": "stats",
+                "since": "2030-01-01T00:00:00Z", "mean_latency_ms": null,
+                "requests": {"attempted": -1500, "succeeded": 0, "failed": -2, "cancelled": 0},
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}})),
+            figure(json!({"kind": "offer", "id": "claim-offers", "label": "offers",
+                "items": [{"id": "p1", "label": "plan", "state": "claimed", "grants": []}]})),
+        ])),
+    ]}));
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "1 ready | 0 unread"),
+            ("offers", "0 claimable | 1 held"),
+            ("acct-1", "5h - | 7d -"),
+        ],
+        "no requests row from a negative count; a claimed item counts as held"
+    );
+}
+
+/// An account block without the contract's `available` verdict lands no copy:
+/// a missing verdict is never read as funded.
+#[test]
+fn an_account_block_without_available_lands_no_copy() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let body = json!({"accounts": [{
+        "account": "acct-1", "state": "ready",
+        "figures": [],
+    }]});
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+            &ProfileName::from("px"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+        .is_none(),
+        "nothing landed from a block without `available`"
+    );
+}
+
+/// A remaining with no grant draws no bar, and a pool with no available
+/// account reports itself unavailable: the two guard arms the bars and the
+/// totals hang off.
+#[test]
+fn a_pool_with_no_grant_or_no_available_account_keeps_its_guards() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 500.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert!(stats.bars.is_empty(), "no grant, no bar: {:?}", stats.bars);
+    assert!(
+        stats.is_available,
+        "one available account makes the pool available"
+    );
+
+    let down = json!({"accounts": [
+        {"account": "acct-1", "state": "login_required", "available": false, "figures": []},
+        {"account": "acct-2", "state": "suspended", "available": false, "figures": []},
+    ]});
+    let stats = pool_stats_on(down);
+    assert!(
+        !stats.is_available,
+        "no available account makes the pool unavailable"
+    );
+}

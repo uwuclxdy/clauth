@@ -446,7 +446,7 @@ impl ThirdPartyEntry {
                 crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
                 crate::usage::hash_field(&mut hasher, account.as_bytes());
             }
-            crate::providers::ThirdPartyTarget::ProxyPool { service } => {
+            crate::providers::ThirdPartyTarget::ProxyPool { service, .. } => {
                 crate::usage::hash_field(&mut hasher, b"proxy-pool");
                 crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
             }
@@ -4501,6 +4501,7 @@ fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::Thi
     match crate::profile::stored_proxy_claim_failing_closed(&p.name) {
         crate::profile::ProxyClaim::None => Some(crate::providers::ThirdPartyTarget::ProxyPool {
             service: service.clone(),
+            base_url: format!("http://{}", crate::proxy::bind(port)),
         }),
         crate::profile::ProxyClaim::Account(record) => {
             let row = registry.get(&record.service)?;

@@ -2776,11 +2776,12 @@ fn is_row_figure(row: &StatRow) -> bool {
 
 /// Whether a stat-row value reads as a figure — one number (optionally signed)
 /// with an optional unit/currency word — rather than a word (`valid`) or a
-/// no-data glyph (`-`, `—`), or a `·`-joined / parenthesized composite. Figure
-/// rows left-pad to the block's widest figure; everything else starts at the
-/// value column unpadded. Residuals the predicate cannot separate without a
-/// producer to distinguish them: a leading-currency `$5` reads as a word and an
-/// ISO date (`2026-10-01`) as a figure; no current producer emits either shape.
+/// no-data glyph (`-`, `—`), or a `·`- or ` | `-joined / parenthesized
+/// composite. Figure rows left-pad to the block's widest figure; everything
+/// else starts at the value column unpadded. Residuals the predicate cannot
+/// separate without a producer to distinguish them: a leading-currency `$5`
+/// reads as a word and an ISO date (`2026-10-01`) as a figure; no current
+/// producer emits either shape.
 fn is_figure(value: &str) -> bool {
     let mut chars = value.chars();
     let digit_led = match chars.next() {
@@ -2788,7 +2789,8 @@ fn is_figure(value: &str) -> bool {
         Some('-') => chars.next().is_some_and(|c| c.is_ascii_digit()),
         _ => false,
     };
-    digit_led && !value.contains('·') && !value.contains('(')
+    // A ` | `-joined composite is text, never a right-aligned figure column.
+    digit_led && !value.contains('·') && !value.contains('(') && !value.contains(" | ")
 }
 
 fn key_value_span(

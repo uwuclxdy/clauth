@@ -267,7 +267,10 @@ pub(crate) enum ThirdPartyTarget {
     /// funnel profile an auto-route setup points sessions at. It reads the
     /// whole pool, `GET /clauth/v1/usage` with no account filter, so the
     /// profile's api key never rides the read.
-    ProxyPool { service: crate::proxy::Service },
+    ProxyPool {
+        service: crate::proxy::Service,
+        base_url: String,
+    },
 }
 
 impl ThirdPartyTarget {
@@ -288,19 +291,9 @@ impl ThirdPartyTarget {
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
             // Accounts of one proxy share its bind, so they serialize against
             // it and against nothing else.
-            Self::Proxy { base_url, .. } => {
+            Self::Proxy { base_url, .. } | Self::ProxyPool { base_url, .. } => {
                 api_origin(base_url).unwrap_or_else(|| base_url.clone())
             }
-            // The pool read lands on the service's registered bind, so it
-            // paces against the same origin a per-account read of that proxy
-            // derives. A registry read that fails leaves the service name —
-            // still a stable key, and one no origin-shaped key can collide
-            // with.
-            Self::ProxyPool { service } => crate::proxy::Registry::load()
-                .ok()
-                .and_then(|registry| registry.get(service).map(|row| row.port))
-                .map(|port| format!("http://{}", crate::proxy::bind(port)))
-                .unwrap_or_else(|| service.as_str().to_string()),
         }
     }
 }
@@ -374,7 +367,9 @@ pub(crate) fn fetch_third_party_usage(
         } => crate::proxy_account::fetch_usage(service, account),
         // One read of the service's whole pool; `api_key` never rides it for
         // the same reason the per-account arm's does not.
-        ThirdPartyTarget::ProxyPool { service } => crate::proxy_account::fetch_pool_usage(service),
+        ThirdPartyTarget::ProxyPool { service, .. } => {
+            crate::proxy_account::fetch_pool_usage(service)
+        }
     }
 }
 
