@@ -446,6 +446,10 @@ impl ThirdPartyEntry {
                 crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
                 crate::usage::hash_field(&mut hasher, account.as_bytes());
             }
+            crate::providers::ThirdPartyTarget::ProxyPool { service } => {
+                crate::usage::hash_field(&mut hasher, b"proxy-pool");
+                crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
+            }
         }
         let digest = hasher.finalize();
         let mut head = [0u8; 8];
@@ -463,9 +467,10 @@ impl ThirdPartyEntry {
                 provider: crate::providers::Provider::Alibaba,
                 ..
             } => None,
-            // The proxy read authenticates with clauth's admin token: the
-            // profile's key never rides it.
-            crate::providers::ThirdPartyTarget::Proxy { .. } => None,
+            // The proxy reads authenticate with clauth's admin token: the
+            // profile's key never rides them.
+            crate::providers::ThirdPartyTarget::Proxy { .. }
+            | crate::providers::ThirdPartyTarget::ProxyPool { .. } => None,
             crate::providers::ThirdPartyTarget::Known { .. }
             | crate::providers::ThirdPartyTarget::Generic { .. } => {
                 crate::usage::inference_key_fingerprint(Some(&self.api_key), None)
@@ -4471,12 +4476,12 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
     })
 }
 
-/// The proxy arm's target for `p`, keyed on the REGISTRY: the profile's
-/// `base_url` must be the registered bind of the service its `[proxy]` record
-/// names, and the admin token and account id the read needs come from that
-/// registry and the record. A registry clauth cannot read, a service with no
-/// row, or a `base_url` that stopped matching leaves the profile to today's
-/// generic arm.
+/// The proxy arm's target for `p`, keyed on the REGISTRY: a profile whose
+/// `base_url` is a registered bind reads through that service. A `[proxy]`
+/// record names one account of it — the per-account read — while its absence
+/// is the funnel profile an auto-route setup points sessions at, which reads
+/// the whole pool. A registry clauth cannot read, or a bind no row holds,
+/// leaves the profile to today's generic arm.
 fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::ThirdPartyTarget> {
     // Pure pre-gate: a non-loopback endpoint is the generic arm's business and
     // must never cost a registry or config read — the entry constructor runs
@@ -4485,27 +4490,36 @@ fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::Thi
     // home its callers may not hold.
     let port = crate::proxy::loopback_port(p.base_url.as_deref()?)?;
     let registry = crate::proxy::Registry::load().ok()?;
-    registry.holder(port)?;
+    // The row holding the profile's port is the bind check both arms share.
+    let service = registry.holder(port)?;
     // The record rides the profile's config.toml as an unmodelled key, and the
     // runtime Profile holds it as it loaded (`Profile::proxy`, the cache
-    // selector's read). This arm reads it fresh, the lock-free way
-    // (`profile::stored_proxy_record`), past the bind check above, so only a
-    // profile on a registered proxy bind pays the read.
-    let record = crate::profile::stored_proxy_record(&p.name)?;
-    let row = registry.get(&record.service)?;
-    if row.port != port
-        || !p
-            .base_url
-            .as_deref()
-            .is_some_and(|url| crate::proxy::is_loopback_url_on(url, row.port))
-    {
-        return None;
+    // selector's read). This arm reads it fresh, lock-free, past the bind check
+    // above, so only a profile on a registered proxy bind pays the read. A
+    // record clauth cannot read fails closed as a proxy account; only an absent
+    // record takes the whole-pool arm.
+    match crate::profile::stored_proxy_claim_failing_closed(&p.name) {
+        crate::profile::ProxyClaim::None => Some(crate::providers::ThirdPartyTarget::ProxyPool {
+            service: service.clone(),
+        }),
+        crate::profile::ProxyClaim::Account(record) => {
+            let row = registry.get(&record.service)?;
+            if row.port != port
+                || !p
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| crate::proxy::is_loopback_url_on(url, row.port))
+            {
+                return None;
+            }
+            Some(crate::providers::ThirdPartyTarget::Proxy {
+                service: record.service.clone(),
+                account: record.account.clone(),
+                base_url: format!("http://{}", crate::proxy::bind(row.port)),
+            })
+        }
+        crate::profile::ProxyClaim::Unreadable | crate::profile::ProxyClaim::Unclassifiable => None,
     }
-    Some(crate::providers::ThirdPartyTarget::Proxy {
-        service: record.service.clone(),
-        account: record.account.clone(),
-        base_url: format!("http://{}", crate::proxy::bind(row.port)),
-    })
 }
 
 /// Fingerprint of the credential `p` would fetch with. Deliberately NOT gated on

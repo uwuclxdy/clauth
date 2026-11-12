@@ -89,6 +89,9 @@ struct StubState {
     paste_answer: Value,
     /// The `GET /clauth/v1/usage` body; tests mutate it between legs.
     usage: Value,
+    /// The `account` query every usage read carried, in order: an empty string
+    /// for a whole-pool read.
+    usage_queries: Vec<String>,
     patches: Vec<(String, Value)>,
     deleted: Vec<String>,
     cancelled: bool,
@@ -168,6 +171,7 @@ impl StubState {
             pastes_seen: Vec::new(),
             paste_answer: core(CORE_PENDING),
             usage,
+            usage_queries: Vec::new(),
             patches: Vec::new(),
             deleted: Vec::new(),
             cancelled: false,
@@ -352,7 +356,8 @@ fn handle(
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("account="))
                     .unwrap_or_default();
-                if want != ACCOUNT {
+                s.usage_queries.push(want.to_string());
+                if !want.is_empty() && want != ACCOUNT {
                     return err_body(404, "not_found");
                 }
                 reply(200, s.usage.clone())
@@ -10617,5 +10622,260 @@ fn the_entry_returns_when_the_slot_key_goes() {
         live_session_auth_after_apply(&keyless),
         (Some("env-key".to_string()), None, false),
         "the env-only arm sends the entry alone"
+    );
+}
+
+// ── pin 12: the pool read ───────────────────────────────────────────────────
+
+/// A whole-pool `/usage` body: two accounts the proxy has figures for and one
+/// it has read nothing for, every figure stamped `read_at`.
+fn pool_usage_body(read_at: &str) -> Value {
+    json!({"accounts": [
+        {
+            "account": "acct-1", "state": "ready", "available": true,
+            "figures": [
+                {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 10.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 18000,
+                 "resets_at": "2030-01-01T05:00:00Z", "chain": "5h", "read_at": read_at},
+                {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 604800,
+                 "resets_at": "2030-01-05T00:00:00Z", "chain": "7d", "read_at": read_at},
+                {"kind": "window", "id": "quota-30d", "label": "30d window", "used": 25.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 2592000,
+                 "resets_at": null, "read_at": read_at},
+                {"kind": "balance", "id": "credit", "label": "credit",
+                 "remaining": 204_977_981.0, "limit": 300_000_000.0, "used": 95_022_019.0,
+                 "unit": "tokens", "expires_at": "2030-01-02T01:00:00Z", "read_at": read_at},
+                {"kind": "channel", "id": "off-peak", "label": "off-peak", "open": true,
+                 "read_at": read_at},
+                {"kind": "channel", "id": "coding-plan-renewal", "label": "coding plan renewal",
+                 "open": true, "summary": "renews 2030-02-01", "read_at": read_at},
+                {"kind": "channel", "id": "reset-5h", "label": "5h resets", "open": false,
+                 "summary": "0 available", "read_at": read_at},
+                {"kind": "channel", "id": "reset-7d", "label": "7d resets", "open": true,
+                 "summary": "1 available", "read_at": read_at},
+                {"kind": "stats", "id": "request-stats", "label": "request stats",
+                 "since": "2030-01-01T00:00:00Z",
+                 "requests": {"attempted": 10000, "succeeded": 10000, "failed": 0, "cancelled": 0},
+                 "mean_latency_ms": 840,
+                 "tokens": {"input": 1, "output": 2, "cache_read": 3, "cache_creation": 4},
+                 "read_at": read_at},
+                {"kind": "offer", "id": "claim-offers", "label": "offers", "read_at": read_at,
+                 "items": [{"id": "plan-a", "label": "plan a", "state": "available",
+                            "grants": [{"label": "tokens", "amount": 5.0, "unit": "tokens"}]}]},
+            ],
+        },
+        {
+            "account": "acct-2", "state": "ready", "available": true,
+            "figures": [
+                {"kind": "balance", "id": "credit", "label": "credit",
+                 "remaining": 79_999_980.0, "limit": 100_000_000.0, "used": 20_000_020.0,
+                 "unit": "tokens", "expires_at": "2030-01-03T01:00:00Z", "read_at": read_at},
+                {"kind": "channel", "id": "off-peak", "label": "off-peak", "open": false,
+                 "read_at": read_at},
+                {"kind": "channel", "id": "reset-5h", "label": "5h resets", "open": false,
+                 "summary": "0 available", "read_at": read_at},
+                {"kind": "channel", "id": "reset-7d", "label": "7d resets", "open": false,
+                 "read_at": read_at},
+                {"kind": "stats", "id": "request-stats", "label": "request stats",
+                 "since": "2030-01-01T00:00:00Z",
+                 "requests": {"attempted": 2345, "succeeded": 2344, "failed": 1, "cancelled": 0},
+                 "mean_latency_ms": null,
+                 "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+                 "read_at": read_at},
+            ],
+        },
+        {"account": "acct-3", "state": "ready", "available": true, "figures": []},
+    ]})
+}
+
+/// A profile on the stub's bind with no `[proxy]` record: the funnel profile
+/// an auto-route setup points sessions at.
+fn create_bare_profile_on_disk(config: &mut crate::profile::AppConfig, name: &str, base: &str) {
+    let profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some(base.to_string()),
+        Some(KEY.to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    config.add(profile);
+    crate::profile::save_app_state(&config.state).expect("save state");
+}
+
+/// A profile on a registered proxy's bind with no `[proxy]` record reads the
+/// whole pool: one bar per balance pool carrying the compact grant-versus-left
+/// figure, the pool's totals, one line per account, and a copy dated by its
+/// stalest figure. The admin token authenticates the read; the profile's own
+/// key never rides it.
+#[test]
+fn a_bare_profile_on_a_proxy_bind_reads_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let read_epoch = crate::usage::now_epoch_secs() - 3 * 3600;
+    let read_at = chrono::DateTime::from_timestamp(read_epoch, 0)
+        .unwrap()
+        .to_rfc3339();
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, pool_usage_body(&read_at));
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed");
+    assert!(
+        stats.is_available,
+        "one ready account makes the pool available"
+    );
+
+    assert_eq!(stats.bars.len(), 1, "one bar per declared balance pool");
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "credit | 285M left of 400M");
+    assert!(
+        (bar.pct - 28.755_509_75).abs() < 1e-6,
+        "spent/granted is 28.75550975%, got {}",
+        bar.pct
+    );
+    assert_eq!(
+        bar.resets_at.as_deref(),
+        Some("2030-01-02T01:00:00Z"),
+        "the pool's earliest expiry"
+    );
+    assert_eq!(
+        (bar.used, bar.total),
+        (None, None),
+        "the compact detail replaces the raw amount column"
+    );
+
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "2 ready | 1 unread"),
+            ("resets", "0 open (5h) | 1 open (7d)"),
+            ("offers", "1 claimable | 0 held"),
+            ("requests", "12,345 (1 failed)"),
+            (
+                "acct-1",
+                "5h 10% | 7d 100% | 30d window 25% | 205M left | off-peak open | coding plan renewal renews 2030-02-01 | 5h resets 0 available | 7d resets 1 available"
+            ),
+            (
+                "acct-2",
+                "5h - | 7d - | 80M left | off-peak closed | 5h resets 0 available | 7d resets closed"
+            ),
+            ("acct-3", "no figures"),
+        ]
+    );
+
+    let age = crate::profile_json::cache_age_secs(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("a dated copy");
+    let expected = u64::try_from(crate::usage::now_epoch_secs() - read_epoch).unwrap();
+    assert!(
+        age.abs_diff(expected) <= 1,
+        "the copy is {age} s old, its stalest figure {expected} s"
+    );
+
+    assert_eq!(
+        stub.state().usage_queries,
+        vec![String::new()],
+        "one whole-pool read, no account filter"
+    );
+    assert!(
+        stub.state()
+            .bearered
+            .iter()
+            .any(|line| line == "GET /clauth/v1/usage"),
+        "the admin token carried the read"
+    );
+}
+
+/// A profile carrying a `[proxy]` record keeps its per-account read: the pool
+/// arm answers only a bare endpoint profile on the same bind.
+#[test]
+fn a_recorded_proxy_profile_reads_only_its_own_account() {
+    let (_home, stub, config) = proxy_profile_on_stub(pool_usage_body("2030-01-01T00:00:00Z"));
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    assert_eq!(
+        stub.state().usage_queries,
+        vec![ACCOUNT.to_string()],
+        "the account filter every per-account read carries"
+    );
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the read landed");
+    assert_eq!(
+        stats
+            .bars
+            .iter()
+            .map(|bar| bar.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5h", "7d", "30d window"],
+        "the recorded profile's own account's windows"
+    );
+}
+
+/// A pool with nothing read for it reports no totals rather than a row of
+/// zeros, and an unavailable account reads as its own state.
+#[test]
+fn a_pool_with_no_figures_reports_no_totals_instead_of_zero() {
+    let body = json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": []},
+        {"account": "acct-2", "state": "login_required", "available": false, "figures": []},
+    ]});
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed");
+    assert!(stats.bars.is_empty(), "no granted total, no bar");
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "0 ready | 1 not ready | 1 unread"),
+            ("acct-1", "no figures"),
+            ("acct-2", "login required"),
+        ]
     );
 }

@@ -14995,6 +14995,51 @@ fn land_on_a_dead_key(
     )
 }
 
+/// A `[proxy]` table clauth cannot read is still a proxy account to the
+/// scheduler: its usage entry keeps today's generic arm, never the whole-pool
+/// read a profile with no table at all takes on the same bind.
+#[test]
+fn an_unreadable_proxy_record_never_targets_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a free port");
+    let port = listener.local_addr().expect("local addr").port();
+    let registry = crate::proxy::registry_path().expect("registry path");
+    std::fs::create_dir_all(registry.parent().expect("registry dir")).expect("registry dir");
+    std::fs::write(
+        &registry,
+        format!("[stub]\nport = {port}\nenabled = true\n"),
+    )
+    .expect("write the registry");
+    let name = crate::profile::ProfileName::from("px");
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("clp_stub-key-0".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    let mut text = std::fs::read_to_string(&path).expect("config text");
+    text.push_str("\n[proxy]\nservice = \"stub\"\naccount = \"\"\n");
+    std::fs::write(&path, text).expect("write the broken record");
+    assert!(
+        matches!(
+            crate::profile::stored_proxy_claim(&name),
+            crate::profile::ProxyClaim::Unreadable
+        ),
+        "fixture control: the record is unreadable"
+    );
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    let entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+    assert!(
+        matches!(
+            entry.target,
+            crate::providers::ThirdPartyTarget::Generic { .. }
+        ),
+        "an unreadable record keeps today's generic arm"
+    );
+}
+
 /// Alibaba's usage fetch reads the console session alone, so a live console
 /// body proves nothing about the api key: a dead key stays rejected.
 #[test]

@@ -1046,6 +1046,22 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
     }
 }
 
+/// A token amount as the pool bar's compact figure: `7.5B`, `285M`, `12k`.
+pub(crate) fn format_compact(n: f64) -> String {
+    let trim = |scaled: String| {
+        scaled
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    match n.abs() {
+        magnitude if magnitude >= 1e9 => format!("{}B", trim(format!("{:.2}", n / 1e9))),
+        magnitude if magnitude >= 1e6 => format!("{}M", trim(format!("{:.1}", n / 1e6))),
+        magnitude if magnitude >= 1e3 => format!("{:.0}k", n / 1e3),
+        _ => format!("{n:.0}"),
+    }
+}
+
 /// Group the integer part of non-negative `n` with `,` thousands separators,
 /// keeping `decimals` fractional digits: `(12345.6, 2)` → `12,345.60`. The one
 /// shared grouping helper behind every full-precision detail-pane count.
