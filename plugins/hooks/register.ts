@@ -883,7 +883,13 @@ export const register: Register = on => {
   on(
     'tool.check',
     async ($, e, next) => {
-      if (inert) return next(e)
+      // AskUserQuestion's own permission check runs inside its tool call's
+      // `next`, after the AskUserQuestion `tool.call` hook below let the call
+      // through; the check's `ask` is the question dialog
+      // itself, which a hook's `allow` cannot dismiss (the 2.1.322 types).
+      // Holding it here would put the same question to the person twice
+      // (measured 2026-11-11 at the desk).
+      if (inert || e.tool === 'AskUserQuestion') return next(e)
       const v = await next(e)
       if (v.decision !== 'ask') return v
       if (!interactive) return v
@@ -914,7 +920,7 @@ export const register: Register = on => {
       if (inert || !interactive) return next(e)
       const ask = mintAskId()
       const turn = turnId
-      const heldNow = await postAskOpened($, ask, 'AskUserQuestion', e.questions, undefined)
+      const heldNow = await postAskOpened($, ask, 'AskUserQuestion', e.questions, e.agentId)
       if (heldNow !== true) return next(e)
       const outcome = await holdUntilSettled(
         $,

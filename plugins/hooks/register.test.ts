@@ -1036,6 +1036,48 @@ test('C2h: an answers value that is not a string resolves the question as a loss
   expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
 })
 
+for (const agentId of [undefined, 'sub-1']) {
+  const scope = agentId === undefined ? 'the main loop' : 'a subagent'
+  test(`C2i: an AskUserQuestion in ${scope} taken back at the desk draws the engine dialog with no second hold`, async ($, on) => {
+    const { clock, bridge } = setup(on)
+    // Claude Code answers its own permission check for AskUserQuestion `ask`
+    // (the dialog is the question itself) and runs that check inside the tool
+    // call's `next` (measured 2026-11-11 at the desk); the test kit turns an
+    // unanswered `ask` into a denied call, which stands here for Claude Code
+    // drawing its dialog.
+    const checks: string[] = []
+    on('tool.check', ($, e, next) => {
+      checks.push(e.tool)
+      return ASK
+    })
+    await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+    const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION, ...(agentId === undefined ? {} : { agentId }) })
+    await clock.settle()
+    const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+    await ui.press({ key: 'answer-here' })
+    await clock.settle()
+    expect(await ui.find({ key: 'allow' })).toBeUndefined()
+    const r = await p
+    expect(r.isError).toBe(true)
+    expect(checks).toEqual(['AskUserQuestion'])
+    const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+    expect(opened).toHaveLength(1)
+    expect(opened[0]!.agent_id).toBe(agentId)
+    await ui.unmount()
+  })
+}
+
+test('C2j: a direct permission check for AskUserQuestion posts no ask_opened and returns the verdict as is', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const verdict = { decision: 'ask' as const, reason: 'the question itself' }
+  on('tool.check', ($, e, next) => verdict)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'AskUserQuestion', input: { questions: QUESTION } })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+  expect(await p).toEqual(verdict)
+})
+
 test('C3: a prompt command submits once, queued when it arrives mid-turn', async ($, on) => {
   const { clock, bridge } = setup(on)
   const submissions: string[] = []
