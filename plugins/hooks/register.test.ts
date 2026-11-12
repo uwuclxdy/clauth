@@ -44,6 +44,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     remote: true,
     fail: null as null | 'error' | 'reject',
   }
+  // A `start` naming this id answers 403 `session_mismatch`, as the daemon
+  // does while the pid's session record still names another id.
+  const start = { refuse: null as string | null }
   // A device answer: the daemon closes the ask and keeps the answer for its
   // wait. An ask already closed refuses (the device got `ask_closed`).
   const answer = (ask: string, payload: Record<string, unknown>): void => {
@@ -93,6 +96,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
       if (poll.commands.length > 0) return deliver()
       return clock.sleep(PARK_MS).then(deliver)
     }
+    if (body !== undefined && body.kind === 'start' && body.session === start.refuse) {
+      return res(403, JSON.stringify({ error: 'session_mismatch' }))
+    }
     if (body !== undefined && body.kind === 'ask_opened') {
       lastAsk = body.ask as string
       asks.set(body.ask as string, { answer: null, closed: false })
@@ -105,19 +111,20 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     }
     return res(200, JSON.stringify({ ok: true }))
   })
-  return { fetches, events, lastAsk: () => lastAsk, poll, wait, answer }
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, answer }
 }
 
 function installBoilerplate(
   on: On,
   env: Record<string, string> = { HOME: '/home/u' },
-  session: { down: boolean } = { down: false },
+  session: { down: boolean; id?: string } = { down: false },
 ) {
   const clock = mock.clock(on)
   mock.env(on, env)
+  // `id` moves the way a `/clear` moves the process's session id.
   on('session.id', ($, e, next) => {
     if (session.down) throw new Error('session down')
-    return { value: 'sid-1' }
+    return { value: session.id ?? 'sid-1' }
   })
   on('session.start', ($, e, next) => ({ cwd: e.cwd }))
   on('session.end', ($, e, next) => ({ sessionId: e.sessionId }))
@@ -133,7 +140,7 @@ function setup(
   on: On,
   env: Record<string, string> = { HOME: '/home/u' },
   hold = true,
-  session?: { down: boolean },
+  session?: { down: boolean; id?: string },
 ) {
   const { clock } = installBoilerplate(on, env, session)
   const bridge = installBridge(on, clock, hold)
@@ -1382,6 +1389,301 @@ for (const drop of [REMOVED_DROP, 'an earlier prompt in the batch failed']) {
     ])
   })
 }
+
+// A `/clear` ends the conversation and fires no `session.start`, while the
+// process goes on under a new session id: the bridge registers that id and
+// keeps polling under it, so the phone still reaches the process.
+// A `/resume` inside a running process ends the conversation the same way: the
+// process goes on under another id.
+for (const reason of ['clear', 'resume'] as const) {
+  test(`CL1: after a /${reason} the bridge registers the new session id and a phone prompt still arrives`, async ($, on) => {
+    const session = { down: false, id: 'sid-1' }
+    const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+    const calls: string[] = []
+    on('prompt.submit', ($, e, next) => {
+      calls.push(e.text)
+      return { text: e.text }
+    })
+    await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+    await clock.advance(PARK_MS)
+    await $.session.end({ sessionId: 'sid-1', reason })
+    session.id = 'sid-2'
+    const fetchesAtClear = bridge.fetches.length
+    for (let i = 0; i < 5; i++) await clock.advance(PARK_MS)
+    const starts = bridge.events.filter(b => b.kind === 'start')
+    expect(starts.map(b => b.session)).toEqual(['sid-1', 'sid-2'])
+    const pollsAfter = bridge.fetches.slice(fetchesAtClear).filter(f => f.url.includes('/poll?'))
+    expect(pollsAfter.length).toBeGreaterThan(0)
+    for (const f of pollsAfter) expect(f.url).toContain('/poll?session=sid-2')
+    bridge.poll.commands = [{ kind: 'prompt', text: 'after clear', prompt: 'p1' }]
+    for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+    await clock.settle()
+    expect(calls).toEqual(['after clear'])
+  })
+}
+
+test('CL3: the clear end goes out under the ended id, and the new id start carries the session.start fields', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'end').map(b => b.session)).toEqual(['sid-1'])
+  const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, ...rest }) => rest)
+  expect(starts).toEqual([
+    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
+    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
+  ])
+})
+
+// Should `$.session.id()` still read the ended id for a while after a `/clear`,
+// the mod waits for it to move.
+test('CL4: while the id still reads the cleared one nothing polls or posts, and no second start goes out', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await clock.settle()
+  const at = bridge.fetches.length
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  for (let i = 0; i < 4; i++) await clock.advance(PARK_MS)
+  expect(bridge.fetches.slice(at)).toEqual([])
+  expect(bridge.events.filter(b => b.kind === 'start')).toHaveLength(1)
+})
+
+test('CL5: a refused start keeps the new id unpolled and retries after the backoff', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  bridge.start.refuse = 'sid-2'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(bridge.fetches.filter(f => f.url.includes('/poll?session=sid-2'))).toHaveLength(0)
+  expect(bridge.events.filter(b => b.kind === 'start' && b.session === 'sid-2')).toHaveLength(1)
+  bridge.start.refuse = null
+  for (let i = 0; i < 8; i++) await clock.advance(PARK_MS)
+  expect(bridge.fetches.filter(f => f.url.includes('/poll?session=sid-2')).length).toBeGreaterThan(0)
+})
+
+test('CL6: an end with no session.start before it posts nothing', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await clock.settle()
+  expect(bridge.fetches).toEqual([])
+})
+
+// A check held across a `/clear` waits under the session it was opened in (the
+// real daemon has closed that session, so there the wait settles the hold as a
+// loss; this fake keeps the ask open and the test reads only the URLs).
+test('CL7: a held check waits under the session it opened in, across a /clear', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  void $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 4; i++) await clock.advance(PARK_MS)
+  const waits = bridge.fetches.filter(f => f.url.includes('/wait?'))
+  expect(waits.length).toBeGreaterThan(1)
+  for (const f of waits) expect(f.url).toContain('/wait?session=sid-1&')
+})
+
+// Any other end is the process leaving: the poll loop stops for good.
+for (const reason of ['prompt_input_exit', 'logout', 'other'] as const) {
+  test(`CL2: a session end for ${reason} stops polling`, async ($, on) => {
+    const session = { down: false, id: 'sid-1' }
+    const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+    await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+    await clock.advance(PARK_MS)
+    await $.session.end({ sessionId: 'sid-1', reason })
+    // Even a moved id is no next conversation once the process is leaving.
+    session.id = 'sid-2'
+    const fetchesAtEnd = bridge.fetches.length
+    for (let i = 0; i < 5; i++) await clock.advance(PARK_MS)
+    expect(bridge.fetches.slice(fetchesAtEnd).filter(f => f.url.includes('/poll?'))).toHaveLength(0)
+    expect(bridge.events.filter(b => b.kind === 'start').map(b => b.session)).toEqual(['sid-1'])
+  })
+}
+
+// A read of the session id that fails is no conversation change: the poll goes
+// on under the id it registered.
+test('CL8: a session id read that throws keeps polling under the registered id', async ($, on) => {
+  const session = { down: false }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  session.down = true
+  const at = bridge.fetches.length
+  for (let i = 0; i < 2; i++) await clock.advance(PARK_MS)
+  const polls = bridge.fetches.slice(at).filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(0)
+  for (const f of polls) expect(f.url).toContain('/poll?session=sid-1&')
+})
+
+// An ask held across a `/clear` belongs to the session it opened in, its close
+// too, even once the poll re-registered the next one.
+test('CL9: a held ask closed at the desk after the re-register closes under the session it opened in', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'start').map(b => b.session)).toEqual(['sid-1', 'sid-2'])
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'deny' })
+  await p
+  await ui.unmount()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => b.session)).toEqual(['sid-1'])
+})
+
+// A daemon fake keyed on the pid's session record, as the daemon resolves each
+// request: an event, poll or wait naming another id answers 403
+// `session_mismatch`. `gate` holds one session's `start` open until released.
+function recordBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }) {
+  const st = {
+    record: 'sid-1',
+    fetches: [] as string[],
+    events: [] as EventBody[],
+    pending: {} as Record<string, unknown[]>,
+    gate: null as null | { session: string; release: (() => void) | null },
+  }
+  const sessionOf = (url: string) => decodeURIComponent((url.split('session=')[1] ?? '').split('&')[0] ?? '')
+  on('http.fetch', async ($, e, next) => {
+    st.fetches.push(e.url)
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined) st.events.push(body)
+    if (e.url.includes('/poll')) {
+      const s = sessionOf(e.url)
+      if (s !== st.record) return res(403, JSON.stringify({ error: 'session_mismatch' }))
+      const take = () => {
+        const commands = st.pending[s] ?? []
+        st.pending[s] = []
+        return res(200, JSON.stringify({ remote: true, commands }))
+      }
+      if ((st.pending[s] ?? []).length > 0) return take()
+      await clock.sleep(PARK_MS)
+      return take()
+    }
+    const gate = st.gate
+    if (body !== undefined && body.kind === 'start' && gate !== null && body.session === gate.session) {
+      await new Promise<void>(release => {
+        gate.release = release
+      })
+    }
+    if (e.url.includes('/wait')) {
+      if (sessionOf(e.url) !== st.record) return res(403, JSON.stringify({ error: 'session_mismatch' }))
+      await clock.sleep(PARK_MS)
+      return res(200, JSON.stringify({ remote: true, answer: null, closed: false }))
+    }
+    if (body !== undefined && body.session !== st.record) {
+      return res(403, JSON.stringify({ error: 'session_mismatch' }))
+    }
+    if (body !== undefined && body.kind === 'ask_opened') {
+      return res(200, JSON.stringify({ ok: true, remote: true, hold: true }))
+    }
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  return st
+}
+
+// Two `/clear`s inside one start round trip: the id the second one ended never
+// becomes the id the poll speaks for, so its phone prompt reaches no later
+// conversation.
+test('CL10: an id that ended while its start was out is not adopted', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock } = installBoilerplate(on, { HOME: '/home/u' }, session)
+  const st = recordBridge(on, clock)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  st.record = 'sid-2'
+  const gate = { session: 'sid-2', release: null as (() => void) | null }
+  st.gate = gate
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  expect(gate.release).not.toBeNull()
+  // The second /clear lands while start(sid-2) is still out; the record lags.
+  await $.session.end({ sessionId: 'sid-2', reason: 'clear' })
+  session.id = 'sid-3'
+  st.pending['sid-2'] = [{ kind: 'prompt', text: 'meant for sid-2', prompt: 'p2' }]
+  gate.release!()
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(calls).toEqual([])
+  const polled = st.fetches.filter(f => f.includes('/poll?')).map(f => f.split('session=')[1]?.split('&')[0])
+  expect(polled).not.toContain('sid-2')
+})
+
+// Should the id move before `session.end` fires, the poll registers the next
+// id first and its start round trip spans the end: that poll's commands belong
+// to the next conversation and still run.
+test('CL11: commands for the next id survive an end landing while its start is out', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock } = installBoilerplate(on, { HOME: '/home/u' }, session)
+  const st = recordBridge(on, clock)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  session.id = 'sid-2'
+  st.record = 'sid-2'
+  const gate = { session: 'sid-2', release: null as (() => void) | null }
+  st.gate = gate
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  expect(gate.release).not.toBeNull()
+  const ending = $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await clock.settle()
+  st.pending['sid-2'] = [{ kind: 'prompt', text: 'for sid-2', prompt: 'p2' }]
+  gate.release!()
+  await ending
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(calls).toEqual(['for sid-2'])
+})
+
+// The daemon refuses a held ask's `/wait` once the record moved: the hold
+// settles as a loss and the check falls back to Claude Code's own ask.
+test('CL12: a check held across a /clear settles as a loss once the record moves', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock } = installBoilerplate(on, { HOME: '/home/u' }, session)
+  const st = recordBridge(on, clock)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  let verdict: unknown = 'pending'
+  void $.tool.check({ tool: 'Bash', input: { command: 'ls' } }).then(v => {
+    verdict = v
+  })
+  await clock.settle()
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  st.record = 'sid-2'
+  for (let i = 0; i < 4; i++) await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(st.events.filter(b => b.kind === 'ask_opened').map(b => b.session)).toEqual(['sid-1'])
+  expect(verdict).toEqual(ASK)
+  expect(st.events.filter(b => b.kind === 'ask_closed').map(b => b.session)).toEqual(['sid-1'])
+})
 
 // A `/clear` ends the conversation and fires no `session.start`: the next
 // conversation's turns reach the same module directly.

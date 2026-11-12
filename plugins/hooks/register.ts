@@ -61,6 +61,9 @@ const HELD_INPUT_DROPS: readonly unknown[] = [
 // Tries a prompt gets before it is reported dropped, so one Claude Code always
 // refuses never holds the prompts behind it forever.
 const MAX_PROMPT_TRIES = 3
+// The `session.end` reasons the process survives: 2.1.322's types give both
+// `clear` and `resume` as the process going on under another session id.
+const CONTINUING_ENDS = new Set(['clear', 'resume'])
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
@@ -83,6 +86,9 @@ type HeldEntry = {
   tool: string
   desc: string
   turn: string | null
+  // The session the ask opened in, which its close must go out under even once
+  // a `/clear` moved the module's own id on.
+  session: string
   resolve: (o: HoldOutcome) => void
 }
 
@@ -93,6 +99,12 @@ type HeldEntry = {
 let inert = false
 let socketPath: string | null = null
 let sessionId: string | null = null
+// The id a continuing end (CONTINUING_ENDS) left behind: the process stays and
+// `$.session.id()` moves on with no `session.start`, so the poll waits for it
+// to leave this id, then registers the new one with the last `session.start`'s
+// fields.
+let endedSessionId: string | null = null
+let startFields: Record<string, unknown> = {}
 let interactive = false
 let pollStarted = false
 let pollCancel: Timer | null = null
@@ -271,35 +283,41 @@ function enqueueSend<T>(fn: () => Promise<T>): Promise<T> {
   return link
 }
 
+// Posts one event under `session`, the id current at the call, and answers
+// whether the daemon took it.
 async function postEvent(
   $: EngineInterface,
   kind: string,
   fields: Record<string, unknown> = {},
-): Promise<void> {
-  if (inert || sessionId === null) return
-  await enqueueSend(async () => {
+  session: string | null = sessionId,
+): Promise<boolean> {
+  if (inert || session === null) return false
+  return enqueueSend(async () => {
     const seq = await nextSeq($)
-    const body = JSON.stringify({ session: sessionId, seq, kind, ...fields })
-    if (bodyBytes(body) > BODY_LIMIT) return
+    const body = JSON.stringify({ session, seq, kind, ...fields })
+    if (bodyBytes(body) > BODY_LIMIT) return false
     try {
-      await fetchBridge($, '/event', 'POST', body)
+      return (await fetchBridge($, '/event', 'POST', body)).ok
     } catch {
       // A refused or unreachable daemon must not stall the session: the event
       // is best-effort, the daemon re-syncs from its own state.
+      return false
     }
-  }).catch(() => {})
+  }).catch(() => false)
 }
 
-// Posts `ask_opened` and reads the daemon's hold answer; null means the ask
-// must not be held (over-bound body, unreachable socket, or a non-ok reply).
+// Posts `ask_opened` and reads the daemon's hold answer; answers the session
+// the ask opened under when the daemon holds it, null when the ask must not be
+// held (over-bound body, unreachable socket, a non-ok reply, or no hold).
 async function postAskOpened(
   $: EngineInterface,
   ask: string,
   tool: string,
   input: unknown,
   agentId: string | undefined,
-): Promise<boolean | null> {
-  if (sessionId === null) return null
+): Promise<{ session: string } | null> {
+  const session = sessionId
+  if (session === null) return null
   // Started here and awaited in the link: a slow read ahead of a quick one
   // must not swap their asks in the send order.
   const startLine = tool === 'Edit' ? editStartLine($, input) : undefined
@@ -308,13 +326,13 @@ async function postAskOpened(
     if (agentId !== undefined) fields.agent_id = agentId
     if (startLine !== undefined) fields.start_line = await startLine
     const seq = await nextSeq($)
-    const body = JSON.stringify({ session: sessionId, seq, kind: 'ask_opened', ...fields })
+    const body = JSON.stringify({ session, seq, kind: 'ask_opened', ...fields })
     if (bodyBytes(body) > BODY_LIMIT) return null
     try {
       const res = await fetchBridge($, '/event', 'POST', body)
       if (!res.ok) return null
       const parsed = JSON.parse(res.text) as { hold?: boolean }
-      return parsed.hold === true
+      return parsed.hold === true ? { session } : null
     } catch {
       return null
     }
@@ -348,7 +366,7 @@ async function resolveHold(
     // The drawing read is best-effort; the hold itself is over.
   }
   if (postClose) {
-    await postEvent($, 'ask_closed', { ask, by })
+    await postEvent($, 'ask_closed', { ask, by }, entry.session)
   }
   entry.resolve(outcome)
 }
@@ -535,6 +553,8 @@ async function onPollError($: EngineInterface): Promise<void> {
 // own `/wait` — so a poll error or a dropped remote flag here touches no hold.
 async function doPoll($: EngineInterface): Promise<void> {
   try {
+    const session = await pollSession($)
+    if (session === null) return
     // Captured at issue: a reply that lands after the conversation ended must
     // not dispatch its commands into the next one.
     const epoch = promptEpoch
@@ -542,7 +562,7 @@ async function doPoll($: EngineInterface): Promise<void> {
     try {
       res = await fetchBridge(
         $,
-        `/poll?session=${encodeURIComponent(sessionId as string)}&prompt_reports=1`,
+        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1`,
         'GET',
       )
     } catch {
@@ -578,6 +598,37 @@ async function doPoll($: EngineInterface): Promise<void> {
   }
 }
 
+// The id this poll runs under, null to skip the tick. An id `$.session.id()`
+// names that is neither the registered nor the ended one is the process's
+// next conversation: its `start` goes out first, and it is polled under only
+// once the daemon took that `start`. A read that fails keeps the registered id.
+async function pollSession($: EngineInterface): Promise<string | null> {
+  let current: string
+  try {
+    current = await $.session.id()
+  } catch {
+    return sessionId
+  }
+  if (current === sessionId || current === endedSessionId) return sessionId
+  if (!(await postEvent($, 'start', startFields, current))) {
+    await onPollError($)
+    return null
+  }
+  // A continuing end can land while that `start` was out and end this very id:
+  // the next tick waits for the id after it.
+  if (current === endedSessionId) return null
+  sessionId = current
+  endedSessionId = null
+  return current
+}
+
+// The session a continuing end left behind stops being spoken for here, unless
+// the poll already moved to the next one.
+function leaveEndedSession(ended: string): void {
+  endedSessionId = ended
+  if (sessionId === ended) sessionId = null
+}
+
 // The timer's single in-flight poll: at most one timer poll parks at a time.
 function pollOnce($: EngineInterface): Promise<void> {
   if (pollInFlight) return pollInFlight
@@ -587,15 +638,18 @@ function pollOnce($: EngineInterface): Promise<void> {
   return pollInFlight
 }
 
-// One wait on one ask: a single `/wait` fetch, parked at the daemon until that
-// ask settles. The awaited fetch pauses the hook budget, so a hold outlives the
-// 10 s bound. Every non-settle reads as a loss for this ask alone.
-async function waitOnce($: EngineInterface, ask: string): Promise<void> {
+// One wait on one ask: a single `/wait` fetch under the session the ask opened
+// in, parked at the daemon until that ask settles. The module's own id may have
+// moved on (a `/clear` keeps the process under another), and the ask still
+// belongs to the session that opened it. The awaited fetch pauses the hook
+// budget, so a hold outlives the 10 s bound. Every non-settle reads as a loss
+// for this ask alone.
+async function waitOnce($: EngineInterface, ask: string, session: string): Promise<void> {
   let res
   try {
     res = await fetchBridge(
       $,
-      `/wait?session=${encodeURIComponent(sessionId as string)}&ask=${encodeURIComponent(ask)}`,
+      `/wait?session=${encodeURIComponent(session)}&ask=${encodeURIComponent(ask)}`,
       'GET',
     )
   } catch {
@@ -639,13 +693,15 @@ async function waitOnce($: EngineInterface, ask: string): Promise<void> {
   // The bound elapsed with the ask still open: wait again.
 }
 
-// Holds `ask` until it resolves (desk, phone, loss, or an abort), waiting on
-// that ask's own `/wait` so the hook budget stays paused on an awaited fetch.
-// The race against the outcome promise makes a desk press or an abort end the
-// wait without waiting out the parked fetch; its later reply is then ignored.
+// Holds `ask` under the session it opened in until it resolves (desk, phone,
+// loss, or an abort), waiting on that ask's own `/wait` so the hook budget stays
+// paused on an awaited fetch. The race against the outcome promise makes a desk
+// press or an abort end the wait without waiting out the parked fetch; its
+// later reply is then ignored.
 async function holdUntilSettled(
   $: EngineInterface,
   ask: string,
+  session: string,
   kind: HeldEntry['kind'],
   tool: string,
   desc: string,
@@ -665,6 +721,7 @@ async function holdUntilSettled(
       tool,
       desc,
       turn,
+      session,
       resolve: o => {
         settled = true
         signal?.removeEventListener('abort', onAbort)
@@ -682,7 +739,7 @@ async function holdUntilSettled(
     // The row is a convenience; the hold stands even when it cannot draw.
   }
   while (!settled && !signal?.aborted) {
-    await Promise.race([hp, waitOnce($, ask)])
+    await Promise.race([hp, waitOnce($, ask, session)])
   }
   return hp
 }
@@ -781,11 +838,8 @@ export const register: Register = on => {
     interruptedTurn = null
     await loadPrompts($)
     await $.state.set(HELD, null)
-    void postEvent($, 'start', {
-      cwd: e.cwd,
-      interactive: e.isInteractive,
-      prompt_reports: true,
-    })
+    startFields = { cwd: e.cwd, interactive: e.isInteractive, prompt_reports: true }
+    void postEvent($, 'start', startFields)
     startPollLoop($)
     return next(e)
   })
@@ -798,12 +852,19 @@ export const register: Register = on => {
     // saves finds an epoch already past and runs none of its commands.
     promptQueue = []
     promptEpoch += 1
+    // The ending id is the engine's, since the poll may already speak for the
+    // next one; with none registered there is nothing to end.
+    const ended = sessionId === null ? null : e.sessionId
+    // A continuing end keeps the process, so the poll goes on to register its
+    // next id; any other end is the process leaving.
+    const processContinues = CONTINUING_ENDS.has(e.reason)
+    if (processContinues) leaveEndedSession(e.sessionId)
     await savePrompts($)
     if (!inert) {
-      stopPollLoop()
+      if (!processContinues) stopPollLoop()
       // Await the `end` post alone (the engine's own short bound caps it), so
       // the daemon learns the end now rather than from its silence sweep.
-      await postEvent($, 'end')
+      await postEvent($, 'end', {}, ended)
     }
     return next(e)
   })
@@ -895,11 +956,12 @@ export const register: Register = on => {
       if (!interactive) return v
       const ask = mintAskId()
       const turn = turnId
-      const heldNow = await postAskOpened($, ask, e.tool, e.input, e.agentId)
-      if (heldNow !== true) return v
+      const opened = await postAskOpened($, ask, e.tool, e.input, e.agentId)
+      if (opened === null) return v
       const outcome = await holdUntilSettled(
         $,
         ask,
+        opened.session,
         'decision',
         e.tool,
         describeInput(e.tool, e.input),
@@ -920,11 +982,12 @@ export const register: Register = on => {
       if (inert || !interactive) return next(e)
       const ask = mintAskId()
       const turn = turnId
-      const heldNow = await postAskOpened($, ask, 'AskUserQuestion', e.questions, e.agentId)
-      if (heldNow !== true) return next(e)
+      const opened = await postAskOpened($, ask, 'AskUserQuestion', e.questions, e.agentId)
+      if (opened === null) return next(e)
       const outcome = await holdUntilSettled(
         $,
         ask,
+        opened.session,
         'answers',
         'AskUserQuestion',
         firstQuestion(e.questions),
