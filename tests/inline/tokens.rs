@@ -2963,7 +2963,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
     assert_eq!(bytes_after_first, bytes_after_second);
 }
 
-/// The backfill's save is independent of `record`'s: on an idle cycle
+/// The backfill's save is independent of `record_covering`'s: on an idle cycle
 /// (watermark already at yesterday, nothing new to record) the done flag and
 /// filled hours must still persist — otherwise the pass re-sweeps the whole
 /// corpus every 90s until a day records.
@@ -2977,8 +2977,8 @@ fn backfill_persists_when_record_has_nothing_new() {
         let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
         iso.get(..10).map(str::to_owned).unwrap_or(iso)
     };
-    // A v1 ledger whose watermark is ALREADY at yesterday: record() has
-    // nothing to advance or write, so its own save never fires.
+    // A v1 ledger whose watermark is ALREADY at yesterday: record_covering()
+    // has nothing to advance or write, so its own save never fires.
     write_v1_ledger(
         &clauth_dir,
         &yesterday,

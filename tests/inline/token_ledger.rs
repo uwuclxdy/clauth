@@ -17,7 +17,7 @@ fn split(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u6
 }
 
 /// A merged base carrying transcript-derived (split-bearing) per-day rows — the
-/// shape `merge_topup` hands to [`Ledger::record`]. The rows carry no hourly
+/// shape `merge_topup` hands to [`Ledger::record_covering`]. The rows carry no hourly
 /// buckets (the v1-ledger path).
 fn base_with(days: &[(&str, ModelTokens)]) -> TokenStats {
     let mut b = TokenStats::default();

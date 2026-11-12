@@ -2060,8 +2060,9 @@ fn backfill_corpus(
 /// [`crate::token_ledger::Ledger::backfill_hours`] (exact-or-absent fill),
 /// which also marks the pass done. Returns whether the pass ran — i.e.
 /// whether a save should follow. Called by the tokens worker after
-/// `record`, so the watermark is already at yesterday and the sweep's
-/// line-date bound is the finalized-day boundary. Runs synchronously inside the
+/// `record_covering`, so the watermark sits at yesterday only after a sweep
+/// that covered every day, and the sweep's line-date bound is the
+/// finalized-day boundary. Runs synchronously inside the
 /// worker's single tick, so the pass never overlaps the next 90s cycle —
 /// the polling loop serializes ticks by construction. The filled hours
 /// reach the UI on the NEXT tick: the current run's merged base was built
@@ -2123,8 +2124,8 @@ fn run_remap(
 /// Persist the ledger after a merge: record newly-finalized days, then run
 /// the one-shot v1→v2 backfill, the one-shot shape re-derive and the
 /// one-shot served-model re-derive. Each save is independent of whether
-/// `record` changed anything — a done flag must persist even on an idle
-/// cycle, or the corpus re-sweeps every 90s.
+/// `record_covering` changed anything — a done flag must persist even on an
+/// idle cycle, or the corpus re-sweeps every 90s.
 fn persist_ledger(
     claude_dir: &Path,
     ledger: &mut crate::token_ledger::Ledger,
