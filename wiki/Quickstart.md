@@ -171,7 +171,7 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
   - Arming widens what a session's credential can reach, and the command says so.
   - It needs the daemon running: the bearer dies in hours, and the daemon's scan is what re-stamps it before then.
   - The mint it supersedes is preserved at `session-token.static.json`; the bare `clauth static-token <profile>` — or a terminally dead usage chain — restores it rather than signing sessions out.
-  - A chain that only cannot be reached for now (no network, a laptop asleep through its re-stamps) gets the same restore once the rolling bearer is within 20 minutes of expiry, and the daemon's scan puts the rolling token back as soon as the chain answers.
+  - A chain that only cannot be reached for now (no network, a laptop asleep through its re-stamps) gets the same restore once the rolling bearer is within 20 minutes of expiry, and the daemon's scan puts the rolling token back within 15 minutes of the chain answering.
   - The Setup tab's `token` row switches to an hours-scale `rolling · re-stamps in ~Nh` countdown and reads `rolling token stalled` if the re-stamping ever stops.
 - **`static-token --clear`** is the way back out. A stored long-lived token is what every switch installs, so a plain `clauth login <profile>` refreshes only the OAuth pair clauth polls usage with, and never reaches a session — unless the profile has `rolling_token` set, when every rotation re-stamps the token from that pair, so the sessions move onto the new login at the next rotation. The login prints a note saying which case applies.
   - Clearing is the FULL exit: it drops the token, the preserved mint backup, and the `rolling_token` flag together.
