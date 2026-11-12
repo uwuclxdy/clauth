@@ -180,6 +180,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
 | `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `services`; a saved `plugin` loads as `services`. edited from the Config tab's `home tab` row. the first herdr launch lands on `services` with the herdr row open instead |
+| `reduce_motion` | bool | `false` | keep the header mascot and the Overview's provider shimmer still; spinners and saving marks keep moving. edited from the Config tab's `reduce motion` row |
 | `show_estimates` | bool | `true` | burn estimates on the Usage tab |
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
@@ -323,7 +324,7 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
   mcp-sync-state.json      # the MCP login sync's memory: which login each store, live file and Keychain item held per MCP server (a truncated SHA-256 of its token, never the token) and which logins were signed out (0600); one that does not parse is renamed mcp-sync-state.json.corrupt-<epoch_ms> (0600) before the next save, and the sync then only fills gaps
   .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
-  jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
+  jobs/<id>.live.json      # a blocking delegate's run while its caller is attached, then its done record until the 24 h sweep
   jobs/<id>.json.delivered # exactly-once delivery ledger after collection
   keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session

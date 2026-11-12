@@ -29,7 +29,7 @@ The TUI's Services tab writes exactly that entry for you, into `~/.claude.json` 
 | `profiles` | `names` (optional, case-insensitive), `scope` (`all` default, or `session`) | every profile with live cached 5h / 7d percentages or a provider's own live bars (a lapsed window drops), provider, tier, endpoint host, active flag; `scope: "session"` returns the one account this session runs on and how it resolved | none, reads the disk cache |
 | `switch_profile` | `name` | relinks the global active profile; the reply says what the switch does to THIS session | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
-| `monitor` | `job_ids` (optional list, capped at 256), `cancel` (needs `job_ids`) | with `job_ids`: a backgrounded job's envelope, its running status, or a named reason for a dead or absent id, one result per id; with none: the delegates clauth is holding, live runs first | none |
+| `monitor` | `job_ids` (optional list, capped at 256), `cancel` (needs `job_ids`) | with `job_ids`: a backgrounded job's envelope, its running status, or a named reason for a dead or absent id, one result per id; with none: the delegates clauth is holding, live runs first; an id whose run finished while its caller waited answers `job_id <id>: the run finished, its result went back through the call that started it` | none |
 
 Every reply reads as prose; there is no format parameter.
 
