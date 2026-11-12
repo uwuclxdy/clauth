@@ -8943,17 +8943,21 @@ fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
             .expect("mkdir the record-less dir");
 
         let jobs = crate::claude_jobs::job_trees();
-        let store = match jobs.unfinished_under(&profiles.join("anyaccount")) {
-            Err(store) => store,
+        let refusal = match jobs.unfinished_under(&profiles.join("anyaccount")) {
+            Err(refusal) => refusal,
             Ok(trees) => panic!(
                 "a global mid-create store must fail the rotation term closed, got {trees:?}"
             ),
         };
         assert_eq!(
-            store,
+            refusal.store,
             std::path::PathBuf::from("~/.claude/jobs"),
             "the refusal names the conventional global store, as every other \
              global-store refusal spells it"
+        );
+        assert_eq!(
+            refusal.stuck_dir, None,
+            "a mid-create dir clears on its own"
         );
     });
 }
@@ -9029,7 +9033,10 @@ fn a_fresh_staged_record_in_an_old_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a record staged inside the grace is still a creation in flight"
         );
         assert!(
@@ -9057,7 +9064,10 @@ fn a_minute_old_empty_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a minute-old mid-create dir is a creation in flight and fails closed"
         );
         assert!(
@@ -9117,7 +9127,10 @@ fn a_future_dated_empty_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a future-dated mid-create dir cannot prove it is old and must fail closed"
         );
         assert!(

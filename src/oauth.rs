@@ -1047,8 +1047,10 @@ fn sidecar_repair_transient(name: &ProfileName, e: &anyhow::Error) -> crate::for
 }
 
 /// CLA-ROLL: a macOS rotation is refused. One arm per cause, since each names a
-/// different operator next step — wait, `claude stop`, or retry once the job
-/// store clears. See [`crate::runtime::RotationBlock`].
+/// different operator next step — wait, `claude stop`, retry once the job
+/// store clears, or delete the stuck job dir. The paths render home-relative
+/// here, not in [`crate::format::Cause::text`], which reads no home. See
+/// [`crate::runtime::RotationBlock`].
 fn rotation_block_transient(
     name: &ProfileName,
     block: crate::runtime::RotationBlock,
@@ -1063,7 +1065,13 @@ fn rotation_block_transient(
         crate::runtime::RotationBlock::UnreadableJobStore(store) => {
             crate::format::Cause::UnreadableJobStoreOnRotatingChain {
                 profile: name.to_string(),
-                store: store.display().to_string(),
+                store: crate::jsonsync::shorten_home(&store),
+            }
+        }
+        crate::runtime::RotationBlock::UnreadableJobDir(dir) => {
+            crate::format::Cause::UnreadableJobDirOnRotatingChain {
+                profile: name.to_string(),
+                dir: crate::jsonsync::shorten_home(&dir),
             }
         }
     };

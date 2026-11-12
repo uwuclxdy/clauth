@@ -1507,9 +1507,10 @@ fn fanout_warning(
 }
 
 /// What blocks a macOS rotation, and therefore which refusal line the caller
-/// renders. The three causes are distinct operator next-steps: retry a moment
-/// (a launcher's own session), `claude stop` (a background job), or retry once
-/// the named store clears (clauth cannot read it).
+/// renders. The four causes are distinct operator next-steps: retry a moment
+/// (a launcher's own session), `claude stop` (a background job), retry once
+/// the named store clears (clauth cannot read it), or delete the named job dir
+/// (it never clears on its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RotationBlock {
     /// A live `clauth start` marker session holds a store with a refresh token.
@@ -1520,6 +1521,10 @@ pub(crate) enum RotationBlock {
     /// Carries the store dir the refusal names (the global store, or the
     /// account's own tree-local store).
     UnreadableJobStore(PathBuf),
+    /// The job store holds a job dir that never clears on its own, so no
+    /// profile's chain can be judged until it is deleted. Carries that job dir:
+    /// the global store's, or the account's own tree-local one.
+    UnreadableJobDir(PathBuf),
 }
 
 /// [`rotation_blocked_by_live_session`] over the two things that strand a
@@ -1608,7 +1613,12 @@ fn job_block(name: &ProfileName) -> Option<RotationBlock> {
     };
     let trees = match jobs.unfinished_under(&dir) {
         Ok(trees) => trees,
-        Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
+        Err(refusal) => {
+            return Some(match refusal.stuck_dir {
+                Some(job_dir) => RotationBlock::UnreadableJobDir(job_dir),
+                None => RotationBlock::UnreadableJobStore(refusal.store),
+            });
+        }
     };
     let rows = crate::live_sessions::list();
     let chain_trees: HashSet<PathBuf> = rows
@@ -1782,10 +1792,10 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-// Test seam posing WHICH cause blocks, so the three refusal lines' rendering
+// Test seam posing WHICH cause blocks, so the four refusal lines' rendering
 // paths are drivable from a Linux host. The bool seam above keeps its arms on
-// [`RotationBlock::LiveSession`]; this one covers the two job-store causes the
-// host can only reach on macOS.
+// [`RotationBlock::LiveSession`]; this one covers the job-store causes the host
+// can only reach on macOS.
 #[cfg(test)]
 thread_local! {
     static ROTATION_BLOCK_CAUSE_OVERRIDE: std::cell::RefCell<Option<RotationBlock>> =

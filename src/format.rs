@@ -164,6 +164,13 @@ pub(crate) enum Cause {
     /// `store` is the dir the refusal names (the global store or the account's
     /// own `jobs/`).
     UnreadableJobStoreOnRotatingChain { profile: String, store: String },
+    /// The job store holds a job dir that never clears on its own — a
+    /// record-less dir of no known shape, or a record that no longer parses —
+    /// so clauth cannot rule out an unfinished job on a rotatable tree. Split
+    /// from [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
+    /// help: only deleting the named dir lets the rotation through. The `dir`
+    /// is the job dir, rendered home-relative by the caller.
+    UnreadableJobDirOnRotatingChain { profile: String, dir: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -262,6 +269,11 @@ impl Cause {
             Self::UnreadableJobStoreOnRotatingChain { profile, store } => {
                 format!(
                     "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
+                )
+            }
+            Self::UnreadableJobDirOnRotatingChain { profile, dir } => {
+                format!(
+                    "can't read claude code's background job ({dir}), so '{profile}' is not rotated; delete that dir to rotate"
                 )
             }
             Self::RotationLockHeld(profile) => {

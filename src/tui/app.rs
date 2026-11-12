@@ -2712,7 +2712,8 @@ fn rotate_blocked_message(name: &str, block: crate::runtime::RotationBlock) -> S
     let suffix = match block {
         crate::runtime::RotationBlock::LiveSession => ROTATE_LIVE_SESSION_MSG,
         crate::runtime::RotationBlock::BackgroundJob => ROTATE_BACKGROUND_SESSION_MSG,
-        crate::runtime::RotationBlock::UnreadableJobStore(_) => ROTATE_UNREADABLE_JOBS_MSG,
+        crate::runtime::RotationBlock::UnreadableJobStore(_)
+        | crate::runtime::RotationBlock::UnreadableJobDir(_) => ROTATE_UNREADABLE_JOBS_MSG,
     };
     format!("'{name}' {suffix}")
 }
