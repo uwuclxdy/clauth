@@ -3,6 +3,7 @@
 // it without owning the desk's keystrokes.
 import { update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { ClauthQueuedPrompt } from '../types/index'
 
 // One event body, in bytes: past it the daemon refuses 413, so an ask whose
 // body would exceed it is never held (the engine's own dialog draws instead).
@@ -47,8 +48,23 @@ const START_LINE_READ_BOUND_MS = 1000
 // wake or at the session's end.
 const APPEND_DOORS = ['prompt', 'command', 'response', 'tool-result', 'delivery', 'notice', 'queue'] as const
 
+// The drops `$.prompt.submit` resolves before it accepts a prompt, while plugin
+// input is held: the prompt never entered Claude Code's queue, so a later try
+// can still land it. Every other drop value is final. The four texts were read
+// from the Claude Code 2.1.322 binary on 2026-11-10.
+const HELD_INPUT_DROPS: readonly unknown[] = [
+  'the session was stopped and nobody has sent input since',
+  'the host has ended its input',
+  'the run is past its --max-budget-usd limit',
+  'the run reached its --max-turns limit',
+]
+// Tries a prompt gets before it is reported dropped, so one Claude Code always
+// refuses never holds the prompts behind it forever.
+const MAX_PROMPT_TRIES = 3
+
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
+const PROMPTS = { plugin: 'clauth', key: 'prompts' } as const
 
 const encoder = new TextEncoder()
 
@@ -56,6 +72,11 @@ type HoldOutcome =
   | { type: 'allow' | 'deny'; from: 'desk' | 'device' }
   | { type: 'answers'; answers: Record<string, string>; notes: Record<string, string> }
   | { type: 'loss' }
+
+// The stored prompt's one contract lives in `types/index.d.ts`.
+type QueuedPrompt = ClauthQueuedPrompt
+
+type PromptOutcome = 'delivered' | 'held' | 'removed'
 
 type HeldEntry = {
   kind: 'decision' | 'answers'
@@ -65,9 +86,10 @@ type HeldEntry = {
   resolve: (o: HoldOutcome) => void
 }
 
-// Per-load runtime state. The only value a hot reload must keep, the event
-// sequence number, lives in `$.state` (SEQ); everything here is re-established
-// by the `session.start` that fires again on a reload.
+// Per-load runtime state. The values a hot reload must keep, the event
+// sequence number and the prompt queue, live in `$.state` (SEQ, PROMPTS);
+// everything here is re-established by the `session.start` that fires again on
+// a reload.
 let inert = false
 let socketPath: string | null = null
 let sessionId: string | null = null
@@ -78,7 +100,17 @@ let pollInFlight: Promise<void> | null = null
 let sendChain: Promise<unknown> = Promise.resolve()
 let nextPollAfter = 0
 let turnId: string | null = null
-let pendingPrompt: { text: string } | null = null
+// Phone prompts oldest first; only the head is ever tried. The same array is
+// kept in `$.state` (PROMPTS), which `session.start` loads as the authority.
+let promptQueue: QueuedPrompt[] = []
+// Bumped at each session end: an attempt that settles under an older epoch
+// belongs to a conversation that is gone.
+let promptEpoch = 0
+// The epoch whose drain is running, null when none is.
+let drainEpoch: number | null = null
+// A drain attempt that found one already running, so the running drain starts
+// one more when it releases the flag and the session is still idle.
+let drainAgain = false
 let helds = new Map<string, HeldEntry>()
 let interruptedTurn: string | null = null
 let askCounter = 0
@@ -183,6 +215,47 @@ function fetchBridge($: EngineInterface, path: string, method: string, body?: st
 
 function nextSeq($: EngineInterface): Promise<number> {
   return update($, SEQ, cur => (cur ?? 0) + 1)
+}
+
+// Keeps the prompt queue in `$.state` the way SEQ is kept: every change writes
+// the whole array, so a fresh load resumes the queue a dead module left.
+async function savePrompts($: EngineInterface): Promise<void> {
+  await update($, PROMPTS, () => promptQueue)
+}
+
+// Loads the stored queue at a fresh `session.start`: the state is the
+// authority over the empty module state. An entry marked `submitting` was
+// handed to Claude Code by the dead module and may already be in its queue, so
+// it is reported dropped and never resubmitted.
+async function loadPrompts($: EngineInterface): Promise<void> {
+  const stored = (await $.state.get(PROMPTS)).value as unknown
+  promptQueue = []
+  if (!Array.isArray(stored)) return
+  let changed = false
+  for (const raw of stored) {
+    if (typeof raw !== 'object' || raw === null) {
+      changed = true
+      continue
+    }
+    const entry = raw as { text?: unknown; id?: unknown; tries?: unknown; submitting?: unknown }
+    if (typeof entry.text !== 'string') {
+      changed = true
+      continue
+    }
+    if (entry.submitting === true) {
+      changed = true
+      if (typeof entry.id === 'string') {
+        void postEvent($, 'prompt', { prompt: entry.id, state: 'dropped', reason: 'unknown' })
+      }
+      continue
+    }
+    promptQueue.push({
+      text: entry.text,
+      ...(typeof entry.id === 'string' ? { id: entry.id } : {}),
+      tries: typeof entry.tries === 'number' ? entry.tries : 0,
+    })
+  }
+  if (changed) await savePrompts($)
 }
 
 // Runs `fn` as the next link of one ordered send chain: a link allocates its
@@ -331,17 +404,15 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
   switch (cmd.kind) {
     case 'prompt':
       if (typeof cmd.text === 'string') {
-        if (turnId !== null) {
-          pendingPrompt = { text: cmd.text }
-        } else {
-          try {
-            await submitPhonePrompt($, cmd.text)
-          } catch {
-            // A refused submit while idle must not drop the prompt: the device
-            // already got 200, so keep it for the next turn.complete.
-            pendingPrompt = { text: cmd.text }
-          }
-        }
+        // It joins the tail; an idle arrival starts the drain, which always
+        // takes the head, so it never overtakes an older prompt.
+        promptQueue.push({
+          text: cmd.text,
+          ...(typeof cmd.prompt === 'string' ? { id: cmd.prompt } : {}),
+          tries: 0,
+        })
+        await savePrompts($)
+        if (turnId === null) void drainPrompts($)
       }
       break
     case 'interrupt':
@@ -363,14 +434,94 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
   }
 }
 
+// Submits the queue's prompts oldest first while the session is idle. One drain
+// runs at a time, so a turn.complete landing while a submit is in flight never
+// submits the same head twice; a drain attempt that finds one running is
+// recorded and retried once the running drain releases its flag, so a
+// completion landing during its final save is not lost. A delivery ends the
+// drain: the delivered prompt's own turn.complete drains the next one, so this
+// hook never holds the next turn open waiting on a prompt that only that turn
+// can finish.
+async function drainPrompts($: EngineInterface): Promise<void> {
+  if (drainEpoch === promptEpoch) {
+    drainAgain = true
+    return
+  }
+  const epoch = promptEpoch
+  drainEpoch = epoch
+  drainAgain = false
+  try {
+    while (turnId === null && promptQueue.length > 0) {
+      const head = promptQueue[0]
+      if (head === undefined) break
+      // Marked in flight before the submit, so a reload mid-submit sees it and
+      // never resubmits a prompt Claude Code may already hold.
+      head.submitting = true
+      await savePrompts($)
+      const outcome = await tryPrompt($, head.text)
+      if (epoch !== promptEpoch) return
+      if (outcome === 'held') {
+        delete head.submitting
+        head.tries += 1
+        await savePrompts($)
+        if (head.tries < MAX_PROMPT_TRIES) return
+        await settleHead($, 'dropped', 'refused')
+      } else if (outcome === 'delivered') {
+        // A call that came while this submit was out is covered by the
+        // delivered prompt's own turn.complete; replaying it now would submit
+        // the next prompt before that turn starts.
+        drainAgain = false
+        await settleHead($, 'delivered')
+        return
+      } else {
+        await settleHead($, 'dropped', 'removed')
+      }
+    }
+  } catch {
+    // A poll starts its drain unawaited, so a rejection here would land with no
+    // handler; the queue keeps its head for the next turn.complete to retry.
+  } finally {
+    if (drainEpoch === epoch) drainEpoch = null
+    if (drainAgain && epoch === promptEpoch && turnId === null) {
+      drainAgain = false
+      void drainPrompts($)
+    }
+  }
+}
+
+async function tryPrompt($: EngineInterface, text: string): Promise<PromptOutcome> {
+  let result: unknown
+  try {
+    result = await submitPhonePrompt($, text)
+  } catch {
+    return 'held'
+  }
+  const drop = typeof result === 'object' && result !== null && 'drop' in result ? result.drop : undefined
+  if (drop === undefined) return 'delivered'
+  return HELD_INPUT_DROPS.includes(drop) ? 'held' : 'removed'
+}
+
+async function settleHead(
+  $: EngineInterface,
+  state: 'delivered' | 'dropped',
+  reason?: 'refused' | 'removed',
+): Promise<void> {
+  const head = promptQueue.shift()
+  if (head === undefined) return
+  await savePrompts($)
+  if (head.id === undefined) return
+  void postEvent($, 'prompt', { prompt: head.id, state, ...(reason !== undefined ? { reason } : {}) })
+}
+
 // A phone prompt is the person's own words, so `asUser` has the model read it
 // bare rather than framed as a plugin's message. A build refusing the option
-// still delivers the prompt, framed, through one bare retry.
-async function submitPhonePrompt($: EngineInterface, text: string): Promise<void> {
+// still delivers the prompt, framed, through one bare retry; a resolved drop is
+// Claude Code's answer, so it gets none.
+async function submitPhonePrompt($: EngineInterface, text: string): Promise<unknown> {
   try {
-    await $.prompt.submit({ text, asUser: true })
+    return await $.prompt.submit({ text, asUser: true })
   } catch {
-    await $.prompt.submit({ text })
+    return await $.prompt.submit({ text })
   }
 }
 
@@ -384,9 +535,16 @@ async function onPollError($: EngineInterface): Promise<void> {
 // own `/wait` — so a poll error or a dropped remote flag here touches no hold.
 async function doPoll($: EngineInterface): Promise<void> {
   try {
+    // Captured at issue: a reply that lands after the conversation ended must
+    // not dispatch its commands into the next one.
+    const epoch = promptEpoch
     let res
     try {
-      res = await fetchBridge($, `/poll?session=${encodeURIComponent(sessionId as string)}`, 'GET')
+      res = await fetchBridge(
+        $,
+        `/poll?session=${encodeURIComponent(sessionId as string)}&prompt_reports=1`,
+        'GET',
+      )
     } catch {
       await onPollError($)
       return
@@ -405,6 +563,9 @@ async function doPoll($: EngineInterface): Promise<void> {
     nextPollAfter = 0
     if (reply.remote !== true) return
     for (const cmd of reply.commands ?? []) {
+      // Checked per command: an earlier command can wait while the
+      // conversation ends, and none after it belongs to the next one.
+      if (epoch !== promptEpoch) return
       try {
         await handleCommand($, cmd)
       } catch {
@@ -618,14 +779,26 @@ export const register: Register = on => {
     interactive = e.isInteractive && e.surface !== null
     sessionId = await $.session.id()
     interruptedTurn = null
+    await loadPrompts($)
     await $.state.set(HELD, null)
-    void postEvent($, 'start', { cwd: e.cwd, interactive: e.isInteractive })
+    void postEvent($, 'start', {
+      cwd: e.cwd,
+      interactive: e.isInteractive,
+      prompt_reports: true,
+    })
     startPollLoop($)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     lastNoteAt.clear()
+    // A prompt queued for this conversation must not reach the next one. The
+    // daemon reports each dropped prompt itself once it takes the end. The
+    // epoch moves before the state write, so a poll reply landing while it
+    // saves finds an epoch already past and runs none of its commands.
+    promptQueue = []
+    promptEpoch += 1
+    await savePrompts($)
     if (!inert) {
       stopPollLoop()
       // Await the `end` post alone (the engine's own short bound caps it), so
@@ -662,15 +835,7 @@ export const register: Register = on => {
       turnId = null
       interruptedTurn = null
       void postEvent($, 'turn_end', { turn: e.turnId })
-      if (pendingPrompt) {
-        const p = pendingPrompt
-        try {
-          await submitPhonePrompt($, p.text)
-          pendingPrompt = null
-        } catch {
-          // The submit was refused; keep the prompt for the next turn.complete.
-        }
-      }
+      await drainPrompts($)
     }
     return next(e)
   })

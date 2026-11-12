@@ -99,7 +99,7 @@ fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool 
     get,
     path = "/api/v1/events",
     responses(
-        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then, when the mod bridge is live, an `event: session.snapshot` frame carrying every live mod session and its open asks, and `event: session.status` / `event: session.record` / `event: session.ask` frames relaying each live session's state, transcript rows and asks; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, `event: terminal_contention` frames (`{\"pane_id\":…,\"devices\":[…]}`) when one pane changed hands between devices 3 times in 5 minutes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects, and it ends within seconds of its device's revoke (its row is re-read every 5 s; a client slow to read what the stream writes delays its own close), the reconnect then answering 401", content_type = "text/event-stream", body = String),
+        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then, when the mod bridge is live, an `event: session.snapshot` frame carrying every live mod session, its open asks and its prompts (every queued prompt and each session's last 16 outcomes, for sessions whose mod reports outcomes), and `event: session.status` / `event: session.record` / `event: session.ask` frames relaying each live session's state, transcript rows and asks, plus `event: session.prompt` frames (`{\"session\":…,\"prompt\":…,\"state\":\"queued\"|\"delivered\"|\"dropped\"}`, the drop's `reason` being `refused`, `removed`, `unknown` or `session_end`); then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, `event: terminal_contention` frames (`{\"pane_id\":…,\"devices\":[…]}`) when one pane changed hands between devices 3 times in 5 minutes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects, and it ends within seconds of its device's revoke (its row is re-read every 5 s; a client slow to read what the stream writes delays its own close), the reconnect then answering 401", content_type = "text/event-stream", body = String),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
@@ -484,7 +484,11 @@ fn write_pane_agent_status(sink: &mut dyn Write, line: &[u8]) -> std::io::Result
 }
 
 /// `event: session.snapshot`, carrying the mod bridge's snapshot on every
-/// (re)connect: every live session and every open ask, as one JSON line.
+/// (re)connect: every live session, every open ask, and the `prompts` array
+/// naming every queued prompt and each session's last 16 outcomes for a
+/// session whose mod reports them (each entry shaped like its
+/// `session.prompt` frame, a drop's `reason` being `refused`, `removed`,
+/// `unknown` or `session_end`), as one JSON line.
 #[cfg(unix)]
 fn write_snapshot(sink: &mut dyn Write, snapshot: &serde_json::Value) -> std::io::Result<()> {
     let data = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;

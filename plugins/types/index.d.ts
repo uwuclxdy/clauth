@@ -1,6 +1,6 @@
-// The clauth mod's `$.state` contract: values the desk row's drawing reads
-// and the event sequence counter, each held by the host so a hot reload of the
-// module keeps them.
+// The clauth mod's `$.state` contract: values the desk row's drawing reads,
+// the event sequence counter and the phone-prompt queue, each held by the host
+// so a hot reload of the module keeps them.
 export type ClauthHeldRow = {
   /** The ask id the held check was posted under. */
   ask: string
@@ -14,6 +14,18 @@ export type ClauthHeldRow = {
   desc: string
 }
 
+export type ClauthQueuedPrompt = {
+  /** The phone prompt's text. */
+  text: string
+  /** The daemon's id for it; absent from an older daemon. */
+  id?: string
+  /** Refused tries so far. */
+  tries: number
+  /** Present only while this prompt's submit is out: a fresh load finds it
+   *  and reports its fate unknown rather than sending it twice. */
+  submitting?: true
+}
+
 declare module 'claude-code' {
   interface PluginState {
     clauth: {
@@ -23,6 +35,8 @@ declare module 'claude-code' {
       /** The desk row shown above the prompt while a check is held, null when
        *  nothing is held. */
       heldRow: ClauthHeldRow | null
+      /** Phone prompts waiting their turn, oldest first. */
+      prompts: ClauthQueuedPrompt[]
     }
   }
 }

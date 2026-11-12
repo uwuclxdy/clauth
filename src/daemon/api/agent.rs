@@ -19,6 +19,8 @@ use super::panes::{
     HerdrOut, HerdrProbeOut, NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND, listed_panes,
 };
 use super::routes::{ApiContext, Caller, ErrorBody};
+#[cfg(unix)]
+use crate::daemon::bridge::{PromptDelivery, PromptRefusal};
 use crate::logline::logline;
 
 /// The one field `POST /api/v1/panes/{id}/prompt` accepts.
@@ -291,6 +293,12 @@ mod tests;
 pub(crate) struct SessionDriveOk {
     ok: bool,
     via: &'static str,
+    /// A prompt handed to a mod that reports outcomes: the id its
+    /// `session.prompt` frames carry on the events stream, unique for the
+    /// daemon's run. Absent on the herdr fallback, on an interrupt, and on a
+    /// mod that predates the reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
 }
 
 /// The answer the ask route carries once the answer reached a live mod.
@@ -315,7 +323,14 @@ const ASK_NOT_LIVE: &str = "no live mod instance with that id";
 const SESSION_AMBIGUOUS: &str =
     "two live sessions share that id; refused rather than handed to either";
 #[cfg(unix)]
+const PROMPT_COMMAND: &str = "Claude Code reads a prompt starting with / as a command and refuses it from the phone; type it at the session's terminal";
+#[cfg(unix)]
+const PROMPT_BLANK: &str = "the prompt holds only whitespace";
+#[cfg(unix)]
 const SESSION_BUSY: &str = "the mod's command queue is full; retry after its next poll";
+#[cfg(unix)]
+const SESSION_PROMPTS_BUSY: &str =
+    "the session holds too many prompts that have not run yet; retry once some of them run";
 #[cfg(unix)]
 const ASK_CLOSED: &str = "that ask is already answered or closed";
 #[cfg(unix)]
@@ -367,14 +382,14 @@ fn session_pane(ctx: &ApiContext, id: &str) -> PaneFallback {
     ),
     request_body = PromptBody,
     responses(
-        (status = 200, description = "the prompt reached the session's mod, or the herdr pane joined on the session id", body = SessionDriveOk),
-        (status = 400, description = "the body held no non-empty text, or a text carrying a NUL (`bad_request`)", body = ErrorBody),
+        (status = 200, description = "the prompt reached the session's mod, with the `prompt` id its `session.prompt` frames carry from queued to delivered or dropped when the mod reports outcomes (absent for a mod that predates them), or the herdr pane joined on the session id, with no id", body = SessionDriveOk),
+        (status = 400, description = "the body held no non-empty text, or a text carrying a NUL (`bad_request`); on a session with a live mod, a text whose first non-whitespace character is a slash (`prompt_command`) or one holding only whitespace (`prompt_blank`), both judged by JavaScript's whitespace set, which Claude Code always refuses; nothing is queued", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no live session with that id (`session_not_live`), or the herdr fallback's pane is gone (`pane_not_found`)", body = ErrorBody),
         (status = 409, description = "two live sessions share that id (`session_ambiguous`), or the herdr fallback's agent is blocked (`agent_blocked`)", body = ErrorBody),
         (status = 502, description = "herdr refused the fallback prompt for another reason, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
-        (status = 503, description = "the herdr fallback's pane list answered, but no herdr server answered the prompt (`herdr_unavailable`), or the mod's command queue is full (`session_busy`)", body = ErrorBody),
+        (status = 503, description = "the herdr fallback's pane list answered, but no herdr server answered the prompt (`herdr_unavailable`), or the mod's command queue is full, or the session holds 8192 prompts with no outcome yet (`session_busy`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["control"]))
@@ -392,10 +407,14 @@ pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_
     #[cfg(unix)]
     {
         if let Some(hub) = &ctx.bridge {
-            match hub.deliver(id, json!({ "kind": "prompt", "text": body.text })) {
-                crate::daemon::bridge::ModDelivery::Delivered => {
+            match hub.deliver_prompt(id, &body.text) {
+                PromptDelivery::Queued { prompt } => {
+                    let minted = prompt
+                        .as_deref()
+                        .map(|prompt| format!(" prompt={prompt}"))
+                        .unwrap_or_default();
                     logline!(
-                        "clauth api: device '{}' prompted session '{}' via mod text_len={}",
+                        "clauth api: device '{}' prompted session '{}' via mod text_len={}{minted}",
                         caller.device_for_log(),
                         sanitize_for_log(id),
                         body.text.len()
@@ -405,10 +424,27 @@ pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                         &SessionDriveOk {
                             ok: true,
                             via: "mod",
+                            prompt,
                         },
                     );
                 }
-                crate::daemon::bridge::ModDelivery::Ambiguous => {
+                PromptDelivery::Refused(PromptRefusal::Command) => {
+                    logline!(
+                        "clauth api: device '{}' refused on session '{}': prompt_command",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(400, "prompt_command", PROMPT_COMMAND);
+                }
+                PromptDelivery::Refused(PromptRefusal::Blank) => {
+                    logline!(
+                        "clauth api: device '{}' refused on session '{}': prompt_blank",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(400, "prompt_blank", PROMPT_BLANK);
+                }
+                PromptDelivery::Ambiguous => {
                     logline!(
                         "clauth api: device '{}' refused on session '{}': ambiguous",
                         caller.device_for_log(),
@@ -416,7 +452,7 @@ pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS);
                 }
-                crate::daemon::bridge::ModDelivery::Busy => {
+                PromptDelivery::Busy => {
                     logline!(
                         "clauth api: device '{}' refused on session '{}': busy",
                         caller.device_for_log(),
@@ -424,7 +460,15 @@ pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::refused(503, "session_busy", SESSION_BUSY);
                 }
-                crate::daemon::bridge::ModDelivery::NoMod => {}
+                PromptDelivery::PromptsBusy => {
+                    logline!(
+                        "clauth api: device '{}' refused on session '{}': prompts busy",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(503, "session_busy", SESSION_PROMPTS_BUSY);
+                }
+                PromptDelivery::NoMod => {}
             }
         }
     }
@@ -452,6 +496,7 @@ pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                         &SessionDriveOk {
                             ok: true,
                             via: "herdr",
+                            prompt: None,
                         },
                     )
                 }
@@ -511,6 +556,7 @@ pub(crate) fn session_interrupt(ctx: &ApiContext, req: &Request, caller: &Caller
                         &SessionDriveOk {
                             ok: true,
                             via: "mod",
+                            prompt: None,
                         },
                     );
                 }
@@ -557,6 +603,7 @@ pub(crate) fn session_interrupt(ctx: &ApiContext, req: &Request, caller: &Caller
                         &SessionDriveOk {
                             ok: true,
                             via: "herdr",
+                            prompt: None,
                         },
                     )
                 }

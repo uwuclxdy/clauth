@@ -1062,7 +1062,8 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
             ],
             "asks": [
                 {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null}
-            ]
+            ],
+            "prompts": []
         })
     );
 }
@@ -1182,7 +1183,7 @@ fn a_cleared_session_ends_for_subscribers() {
     );
     assert_eq!(
         hub.snapshot(),
-        serde_json::json!({"sessions": [], "asks": []})
+        serde_json::json!({"sessions": [], "asks": [], "prompts": []})
     );
 }
 

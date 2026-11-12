@@ -140,6 +140,46 @@ function setup(
   return { clock, bridge }
 }
 
+// One whole main turn: its start, then its complete.
+type TurnDriver = {
+  turn: {
+    start(e: { text: string; turnId: string }): Promise<unknown>
+    complete(e: {
+      reason: 'answer'
+      answer: string
+      durationMs: number
+      isAborted: boolean
+      turnId: string
+    }): Promise<unknown>
+  }
+}
+
+async function turn($: TurnDriver, turnId: string) {
+  await $.turn.start({ text: 'x', turnId })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId })
+}
+
+// The prompt outcomes the mod reported, in post order, as the daemon reads them.
+function promptReports(bridge: { events: EventBody[] }) {
+  return bridge.events
+    .filter(e => e.kind === 'prompt')
+    .map(e => ({
+      prompt: e.prompt,
+      state: e.state,
+      ...(e.reason !== undefined ? { reason: e.reason } : {}),
+    }))
+}
+
+// The texts Claude Code 2.1.322 drops a prompt with before accepting it, while
+// plugin input is held; a drop with any other value is final.
+const HELD_DROPS = [
+  'the session was stopped and nobody has sent input since',
+  'the host has ended its input',
+  'the run is past its --max-budget-usd limit',
+  'the run reached its --max-turns limit',
+]
+const REMOVED_DROP = 'the prompt was removed from the queue before it ran'
+
 function band(bodyColumns: number) {
   return {
     hasSurvey: false,
@@ -1017,7 +1057,7 @@ test('C3: a prompt command submits once, queued when it arrives mid-turn', async
   expect(submissions).toEqual(['hello', 'mid'])
 })
 
-test('C3b: a refused prompt command does not drop the command behind it', async ($, on) => {
+test('C3b: a refused prompt holds the one behind it until its third refused try drops it', async ($, on) => {
   const { clock, bridge } = setup(on)
   const submissions: string[] = []
   on('prompt.submit', ($, e, next) => {
@@ -1027,11 +1067,20 @@ test('C3b: a refused prompt command does not drop the command behind it', async 
   })
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   bridge.poll.commands = [
-    { kind: 'prompt', text: 'boom' },
-    { kind: 'prompt', text: 'ok' },
+    { kind: 'prompt', text: 'boom', prompt: 'p1' },
+    { kind: 'prompt', text: 'ok', prompt: 'p2' },
   ]
+  // Its own arrival is boom's first try, ok's idle arrival its second.
   await clock.advance(PARK_MS)
+  expect(submissions).toEqual([])
+
+  await turn($, 't1')
   expect(submissions).toEqual(['ok'])
+  await clock.settle()
+  expect(promptReports(bridge)).toEqual([
+    { prompt: 'p1', state: 'dropped', reason: 'refused' },
+    { prompt: 'p2', state: 'delivered' },
+  ])
 })
 
 test('C3d: a phone prompt reaches the model as the user, idle or queued', async ($, on) => {
@@ -1145,6 +1194,489 @@ test('C3c: a prompt refused while idle is queued for the next turn.complete', as
   await $.turn.start({ text: 'x', turnId: 't1' })
   await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
   expect(submissions).toEqual(['later'])
+})
+
+test('PQ1: a prompt refused every try is dropped on its third and the ones behind it still arrive', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    if (e.text.startsWith('/')) throw new Error('a text beginning with / would run a command as the user')
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: '/compact', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'mid', prompt: 'p2' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(deliveries).toEqual([])
+  await turn($, 't2')
+  expect(deliveries).toEqual(['mid'])
+  await turn($, 't3')
+  expect(deliveries).toEqual(['mid'])
+})
+
+test('PQ2: a newer idle prompt does not overtake an older queued one', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let refuse = true
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    if (refuse) return { drop: HELD_DROPS[0] }
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'A', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  refuse = false
+  // B's idle arrival drains the head: A goes first, B waits for A's turn.
+  bridge.poll.commands = [{ kind: 'prompt', text: 'B', prompt: 'p2' }]
+  await clock.advance(PARK_MS)
+  expect(deliveries).toEqual(['A'])
+  await turn($, 't1')
+  expect(deliveries).toEqual(['A', 'B'])
+})
+
+test('PQ3: a turn.complete while the head submit waits behind a desk turn delivers each prompt once', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', async ($, e, next) => {
+    if (e.text === 'A') await clock.sleep(2 * PARK_MS)
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [
+    { kind: 'prompt', text: 'A', prompt: 'p1' },
+    { kind: 'prompt', text: 'B', prompt: 'p2' },
+  ]
+  await clock.advance(PARK_MS)
+  const first = $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+  await clock.settle()
+  await $.turn.start({ text: 'desk', turnId: 't1' })
+  const second = $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await clock.settle()
+  await clock.advance(3 * PARK_MS)
+  await first
+  await second
+  await turn($, 't2')
+  expect(deliveries).toEqual(['A', 'B'])
+})
+
+test('PQ4: overlapping main turn.completes deliver the waiting prompt once', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', async ($, e, next) => {
+    await clock.sleep(2 * PARK_MS)
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'A', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  const first = $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+  await clock.settle()
+  await $.turn.start({ text: 'desk', turnId: 't1' })
+  const second = $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await clock.settle()
+  await clock.advance(3 * PARK_MS)
+  await first
+  await second
+  expect(deliveries).toEqual(['A'])
+})
+
+for (const reason of HELD_DROPS) {
+  test(`PQ5: a ${JSON.stringify(reason)} drop is a refused try, one call each, and the third drops the prompt`, async ($, on) => {
+    const { clock, bridge } = setup(on)
+    const calls: string[] = []
+    on('prompt.submit', ($, e, next) => {
+      calls.push(e.text)
+      return { drop: reason }
+    })
+    await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+    bridge.poll.commands = [{ kind: 'prompt', text: 'x', prompt: 'p1' }]
+    await clock.advance(PARK_MS)
+    await turn($, 't1')
+    await clock.settle()
+    expect(promptReports(bridge)).toEqual([])
+    await turn($, 't2')
+    await clock.settle()
+    expect(calls).toEqual(['x', 'x', 'x'])
+    expect(promptReports(bridge)).toEqual([{ prompt: 'p1', state: 'dropped', reason: 'refused' }])
+    await turn($, 't3')
+    expect(calls).toHaveLength(3)
+  })
+}
+
+// The kit refuses a hook returning a non-string drop, so the engine's `true`
+// drop during teardown has no case here.
+for (const drop of [REMOVED_DROP, 'an earlier prompt in the batch failed']) {
+  test(`PQ6: a ${JSON.stringify(drop)} drop is final at once, never resent, and the next prompt goes in the same drain`, async ($, on) => {
+    const { clock, bridge } = setup(on)
+    const calls: string[] = []
+    on('prompt.submit', ($, e, next) => {
+      calls.push(e.text)
+      if (e.text === 'gone') return { drop }
+      return { text: e.text }
+    })
+    await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+    await $.turn.start({ text: 'x', turnId: 't0' })
+    bridge.poll.commands = [
+      { kind: 'prompt', text: 'gone', prompt: 'p1' },
+      { kind: 'prompt', text: 'next', prompt: 'p2' },
+    ]
+    await clock.advance(PARK_MS)
+    await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+    await turn($, 't1')
+    await clock.settle()
+    expect(calls).toEqual(['gone', 'next'])
+    expect(promptReports(bridge)).toEqual([
+      { prompt: 'p1', state: 'dropped', reason: 'removed' },
+      { prompt: 'p2', state: 'delivered' },
+    ])
+  })
+}
+
+// A `/clear` ends the conversation and fires no `session.start`: the next
+// conversation's turns reach the same module directly.
+test('PQ7: a conversation end clears the queue, so nothing queued reaches the next conversation', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [
+    { kind: 'prompt', text: 'old-a', prompt: 'p1' },
+    { kind: 'prompt', text: 'old-b', prompt: 'p2' },
+  ]
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await turn($, 't1')
+  await clock.settle()
+  expect(calls).toEqual([])
+  // The daemon reports the dropped prompts itself once it takes the end.
+  expect(promptReports(bridge)).toEqual([])
+})
+
+test('PQ8: a delivered prompt is reported by its id, and one with no id reports nothing', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'old-daemon' }]
+  await clock.advance(PARK_MS)
+  await turn($, 't1')
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle', prompt: 'p7' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(calls).toEqual(['old-daemon', 'idle'])
+  expect(promptReports(bridge)).toEqual([{ prompt: 'p7', state: 'delivered' }])
+})
+
+test('PQ9: the start event tells the daemon this mod reports prompt outcomes', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const starts = bridge.events.filter(e => e.kind === 'start')
+  expect(starts.map(({ seq, ...rest }) => rest)).toEqual([
+    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true },
+  ])
+})
+
+test('PQ14: a drain stops at each delivery, so the next prompt waits for that prompt own turn', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const calls: string[] = []
+  const aborts: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  on('turn.abort', ($, e, next) => {
+    aborts.push(e.turnId)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [
+    { kind: 'prompt', text: 'A', prompt: 'p1' },
+    { kind: 'prompt', text: 'B', prompt: 'p2' },
+  ]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+  expect(calls).toEqual(['A'])
+  // A's turn runs: the mod sees it, so a phone interrupt reaches it.
+  await $.turn.start({ text: 'A', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  expect(aborts).toEqual(['t1'])
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  expect(calls).toEqual(['A', 'B'])
+})
+
+test('PQ15: every poll tells the daemon this mod reports prompt outcomes', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(1)
+  for (const f of polls) {
+    expect(f.url).toContain('prompt_reports=1')
+  }
+})
+
+// A fresh load of the module (a hooks-worker respawn or a reload) starts with
+// empty module state; the queue it resumes is the one in `$.state`.
+const PROMPTS = { plugin: 'clauth', key: 'prompts' }
+
+function seedPrompts(on: On, stored: unknown) {
+  on('state.get', async ($, e, next) => {
+    const r = (await next(e)) as { value?: { value?: unknown; version: number } }
+    if (e.plugin === PROMPTS.plugin && e.key === PROMPTS.key && r?.value?.value === undefined) {
+      return { value: { value: stored, version: r!.value!.version } }
+    }
+    return r as never
+  })
+}
+
+test('PQ16: a fresh load resumes the stored queue in order at the next turn.complete', async ($, on) => {
+  seedPrompts(on, [
+    { text: 'kept-a', id: 'p1', tries: 0 },
+    { text: 'kept-b', id: 'p2', tries: 1 },
+  ])
+  const { clock, bridge } = setup(on)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(calls).toEqual([])
+  await turn($, 't1')
+  expect(calls).toEqual(['kept-a'])
+  await turn($, 't2')
+  await clock.settle()
+  expect(calls).toEqual(['kept-a', 'kept-b'])
+  expect(promptReports(bridge)).toEqual([
+    { prompt: 'p1', state: 'delivered' },
+    { prompt: 'p2', state: 'delivered' },
+  ])
+})
+
+test('PQ17: a prompt that was mid-submit at the reload is reported unknown, never resent', async ($, on) => {
+  seedPrompts(on, [
+    { text: 'half', id: 'p1', tries: 0, submitting: true },
+    { text: 'next', id: 'p2', tries: 0 },
+  ])
+  const { clock, bridge } = setup(on)
+  const calls: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    calls.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await turn($, 't1')
+  await clock.settle()
+  expect(calls).toEqual(['next'])
+  expect(promptReports(bridge)).toEqual([
+    { prompt: 'p1', state: 'dropped', reason: 'unknown' },
+    { prompt: 'p2', state: 'delivered' },
+  ])
+})
+
+test('PQ19: a poll reply landing while the end saves the cleared queue runs none of its commands', async ($, on) => {
+  let slowClear = false
+  let wait: (ms: number) => Promise<void> = async () => {}
+  on('state.set', async ($, e, next) => {
+    const cleared = Array.isArray(e.value) && e.value.length === 0
+    if (slowClear && e.plugin === PROMPTS.plugin && e.key === PROMPTS.key && cleared) await wait(2 * PARK_MS)
+    return next(e)
+  })
+  const { clock, bridge } = setup(on)
+  wait = ms => clock.sleep(ms)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  // The first poll answers empty; the next one parks and answers mid-end.
+  await clock.advance(PARK_MS)
+  bridge.poll.commands = [{ kind: 'prompt', text: 'stale', prompt: 'p1' }]
+  slowClear = true
+  const ending = $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  for (let n = 0; n < 6; n++) {
+    await clock.settle()
+    await clock.advance(PARK_MS)
+  }
+  await clock.settle()
+  expect(deliveries).toEqual([])
+  expect(promptReports(bridge)).toEqual([])
+  await ending
+})
+
+test('PQ20: a turn.complete landing while a drain saves after a delivery still drains the next prompt', async ($, on) => {
+  let wait: (ms: number) => Promise<void> = async () => {}
+  on('state.set', async ($, e, next) => {
+    const v = e.value as { text?: string; submitting?: true }[] | undefined
+    const onlyB = Array.isArray(v) && v.length === 1 && v[0].text === 'B' && v[0].submitting === undefined
+    if (e.plugin === PROMPTS.plugin && e.key === PROMPTS.key && onlyB) await wait(2 * PARK_MS)
+    return next(e)
+  })
+  const { clock, bridge } = setup(on)
+  wait = ms => clock.sleep(ms)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [
+    { kind: 'prompt', text: 'A', prompt: 'p1' },
+    { kind: 'prompt', text: 'B', prompt: 'p2' },
+  ]
+  await clock.advance(PARK_MS)
+  // A is delivered, and its whole turn runs while the drain still saves [B].
+  const first = $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+  await clock.settle()
+  await turn($, 'tA')
+  await clock.advance(3 * PARK_MS)
+  await first
+  await clock.settle()
+  expect(deliveries).toEqual(['A', 'B'])
+})
+
+test('PQ22: a prompt arriving while the head submit is out waits for the delivered prompt own turn', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', async ($, e, next) => {
+    if (e.text === 'A') await clock.sleep(2 * PARK_MS)
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'A', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  bridge.poll.commands = [{ kind: 'prompt', text: 'B', prompt: 'p2' }]
+  await clock.advance(PARK_MS)
+  await clock.advance(2 * PARK_MS)
+  await clock.settle()
+  expect(deliveries).toEqual(['A'])
+  await turn($, 'tA')
+  await clock.settle()
+  expect(deliveries).toEqual(['A', 'B'])
+})
+
+test('PQ21: after a fresh load an idle phone prompt starts the drain, oldest stored prompt first', async ($, on) => {
+  seedPrompts(on, [{ text: 'kept', id: 'p1', tries: 0 }])
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'new', prompt: 'p2' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(deliveries).toEqual(['kept'])
+  await turn($, 't1')
+  expect(deliveries).toEqual(['kept', 'new'])
+})
+
+test('PQ18: the queue is written to $.state as it changes, so a fresh load finds it', async ($, on) => {
+  const writes: unknown[] = []
+  on('state.set', async ($, e, next) => {
+    if (e.plugin === PROMPTS.plugin && e.key === PROMPTS.key) writes.push(e.value)
+    return next(e)
+  })
+  const { clock, bridge } = setup(on)
+  on('prompt.submit', ($, e, next) => ({ text: e.text }))
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't0' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'w', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(writes.at(-1)).toEqual([{ text: 'w', id: 'p1', tries: 0 }])
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't0' })
+  await clock.settle()
+  expect(writes.at(-1)).toEqual([])
+})
+
+test('PQ11: a slow prompt submit never holds the commands of the polls after it', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const aborts: string[] = []
+  on('prompt.submit', async ($, e, next) => {
+    if (e.text === 'slow') await clock.sleep(3 * PARK_MS)
+    return { text: e.text }
+  })
+  on('turn.abort', ($, e, next) => {
+    aborts.push(e.turnId)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'slow', prompt: 'p1' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  expect(aborts).toEqual(['t1'])
+  await clock.advance(3 * PARK_MS)
+})
+
+test('PQ12: a poll reply that lands after the conversation ended runs none of its commands', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  // The first poll parks; its reply is still on the way when the conversation ends.
+  await clock.advance(PARK_MS)
+  bridge.poll.commands = [{ kind: 'prompt', text: 'stale', prompt: 'p1' }]
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(deliveries).toEqual([])
+  expect(promptReports(bridge)).toEqual([])
+})
+
+test('PQ13: a conversation ending while a reply command waits runs none of the commands after it', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  on('turn.abort', async ($, e, next) => {
+    await clock.sleep(3 * PARK_MS)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'interrupt' }, { kind: 'prompt', text: 'late', prompt: 'p9' }]
+  await clock.advance(PARK_MS)
+  // The interrupted turn ends while its abort call is still out, then the
+  // person clears the idle session.
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  await clock.advance(3 * PARK_MS)
+  await clock.settle()
+  expect(deliveries).toEqual([])
+  expect(promptReports(bridge)).toEqual([])
 })
 
 test('C4: an interrupt aborts the running turn, and does nothing with none running', async ($, on) => {

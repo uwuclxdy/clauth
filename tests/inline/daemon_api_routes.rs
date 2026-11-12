@@ -1577,7 +1577,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         let resolver: crate::daemon::bridge::PeerResolver =
             Box::new(move |pid| read.lock().unwrap().get(&pid).cloned());
         let hub = crate::daemon::bridge::Hub::new(true, resolver);
-        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
+        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "prompt_reports": true});
         assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
         let opened = serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "ask_opened", "ask": FIXTURE_ASK_ID, "tool": "Bash", "input": {"command": "ls"}});
         assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
@@ -1638,6 +1638,51 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             "/sessions/{id}/asks/{ask}",
             200,
             &answer_ok,
+            &mut driven,
+            &mut produced,
+        );
+        // One live instance: the mod path refuses what Claude Code always
+        // refuses, each by its own code.
+        for text in ["/compact", "   "] {
+            let refused = call(
+                &ctx_bridge,
+                &req(
+                    "POST",
+                    &concrete("/sessions/{id}/prompt"),
+                    Some(TOKEN),
+                    &serde_json::json!({ "text": text }).to_string(),
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/prompt",
+                400,
+                &refused,
+                &mut driven,
+                &mut produced,
+            );
+        }
+        // A reporting mod's 200 carries the minted id the schema names.
+        let queued = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/prompt"),
+                Some(TOKEN),
+                r#"{"text":"fix it"}"#,
+            ),
+        );
+        assert!(
+            body_json(&queued)["prompt"].is_string(),
+            "a reporting mod's 200 carries an id"
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/prompt",
+            200,
+            &queued,
             &mut driven,
             &mut produced,
         );
