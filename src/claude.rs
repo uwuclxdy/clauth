@@ -7918,21 +7918,30 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
 /// already running on it.
 ///
 /// Claude Code re-reads its login only when the mtime of what the link resolves
-/// to is not EQUAL to the one it memoized (see `runtime::touch_store`). The
-/// per-session swap moves the incoming store's mtime before it repoints; the
-/// global relinks did not, so a switch between two stores carrying the same
-/// mtime moved the link, reported success, and left every running session on
-/// the account it had just been switched off.
+/// to is not EQUAL to the one it memoized at its last request (see
+/// `runtime::touch_store`). The per-session swap moves the incoming store's
+/// mtime before it repoints; the global relinks did not, so a switch onto a
+/// store carrying a session's memoized mtime moved the link, reported success,
+/// and left that session on the account it had just been switched off.
 ///
-/// Only that case is stamped: a live path resolving to a DIFFERENT store with
-/// an EQUAL mtime. A relink onto the same store, a first link, and a switch
-/// between stores whose mtimes already differ are left as they were. The stamp
-/// is the swap's own ([`crate::runtime::stamp_store`], receipt included), keyed
-/// the way a swap keys it: the `load_profile` first lands a legacy `.pending`
-/// sidecar, which a stamp ahead of it would discard. Runs after the Keychain
-/// mirror and before the repoint, so a failure moves nothing.
+/// The two stores' current mtimes cannot tell that case apart: a session idle
+/// across a write to the outgoing store still holds the value it saw before the
+/// write, and the incoming store can carry it while the two current mtimes
+/// differ. So every relink onto a DIFFERENT store is stamped, as the swap
+/// stamps every move. A relink onto the same store and a first link (a live
+/// path that resolves to nothing yet) are left as they were. The stamp is the
+/// swap's own ([`crate::runtime::stamp_store`], receipt included), keyed the
+/// way a swap keys it: a legacy `.pending` sidecar beside the incoming store,
+/// which a stamp ahead of it would discard, is landed by a `load_profile`
+/// first. Only then, unlike the swap, which refuses an unreadable profile
+/// before it gets here: the relinks also serve an account whose `config.toml`
+/// cannot be read (the TUI's divergence overwrite relinks one on purpose), and
+/// that load would fail them.
+///
+/// Runs after the Keychain mirror and before the repoint. A failed load or
+/// stamp fails the relink with the link unmoved; on macOS the Keychain item
+/// has already moved to the incoming account by then.
 fn keep_repoint_visible(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
-    let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
     let (Ok(live), Ok(incoming)) = (
         crate::canonical::identity(link),
         crate::canonical::identity(target),
@@ -7942,13 +7951,15 @@ fn keep_repoint_visible(link: &Path, target: &Path, name: &ProfileName) -> Resul
     if live == incoming {
         return Ok(());
     }
-    match (mtime(&live), mtime(&incoming)) {
-        (Some(memoized), Some(next)) if memoized == next => {
-            crate::profile::load_profile(name)?;
-            crate::runtime::stamp_store(name, target, Some(memoized))
-        }
-        _ => Ok(()),
+    // The outgoing store's mtime, as the swap passes it: what a session that
+    // read it last memoized, for the stamp's coarse-tick fallback.
+    let outgoing = std::fs::metadata(&live)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    if crate::profile::rotation_staged_beside(target) {
+        crate::profile::load_profile(name)?;
     }
+    crate::runtime::stamp_store(name, target, outgoing)
 }
 
 /// Replace the symlink at `.credentials.json` with a regular file (same bytes).

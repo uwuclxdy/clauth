@@ -13936,7 +13936,7 @@ fn a_truncating_filesystem_gets_no_receipt_at_all() {
 /// written after the sidecar and the next load discards the rotation for good.
 #[cfg(unix)]
 #[test]
-fn global_switch_settles_a_pending_sidecar_before_its_equal_mtime_stamp() {
+fn global_switch_settles_a_pending_sidecar_before_its_stamp() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         let a = member("pend-a");
@@ -13961,13 +13961,8 @@ fn global_switch_settles_a_pending_sidecar_before_its_equal_mtime_stamp() {
             crate::claude::force_link_profile_credentials(&name("pend-b")).expect("switch to b");
         });
 
-        let stored = crate::profile::load_profile(&name("pend-b")).expect("load b");
-        assert_eq!(
-            stored.credentials.as_ref().and_then(|c| c.refresh_token()),
-            Some("rt-rotated"),
-            "the sidecar's rotation must survive the switch's stamp"
-        );
-        assert!(!pending.exists(), "the settled sidecar is removed");
+        // Read before the load below, which would land a sidecar the switch
+        // left behind and move the mtime itself.
         let link = crate::claude::claude_credentials_path().expect("creds path");
         assert_eq!(
             crate::canonical::identity(&link).expect("resolve link"),
@@ -13978,6 +13973,14 @@ fn global_switch_settles_a_pending_sidecar_before_its_equal_mtime_stamp() {
             Some(same),
             "a running session memoized a's mtime; b must not resolve to the same one"
         );
+
+        let stored = crate::profile::load_profile(&name("pend-b")).expect("load b");
+        assert_eq!(
+            stored.credentials.as_ref().and_then(|c| c.refresh_token()),
+            Some("rt-rotated"),
+            "the sidecar's rotation must survive the switch's stamp"
+        );
+        assert!(!pending.exists(), "the settled sidecar is removed");
     });
 }
 

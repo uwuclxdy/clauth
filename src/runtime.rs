@@ -5347,7 +5347,8 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 /// ran before that first stamp, and the receipt it left resolves the
 /// re-stamp's displaced value back to the store's real write time. Also
 /// reached by the global switch's relinks
-/// (`claude::keep_repoint_visible`), which run the same `load_profile` first.
+/// (`claude::keep_repoint_visible`), which run the same `load_profile` first
+/// when a `.pending` stands beside the store.
 pub(crate) fn stamp_store(
     member: &ProfileName,
     store: &Path,
