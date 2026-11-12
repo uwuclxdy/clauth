@@ -584,6 +584,113 @@ fn long_config_pane_follows_selection_without_repinning() {
     );
 }
 
+/// A form whose view is derived from the frame alone (the smallest offset
+/// showing the row, or a follow seeded at the bottom or at the row) puts a
+/// mid-form row back at offset 1 after the pane grows, or loses the view after
+/// a move or a resize; the saved viewport only clamps to the new maximum, and
+/// an adjacent move or a resize that still fits leaves the row where it was
+/// drawn, at the maximum and below it.
+#[test]
+fn a_grown_config_pane_clamps_its_saved_viewport_instead_of_recomputing_it() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        23,
+        "the last row stops at the 80x14 pane's maximum, 31 - 8"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+        .unwrap();
+    term.backend_mut().resize(80, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 80x24 the form draws 31 lines (22 rows, 4 band headers, 3 spacers,
+    // the wrapped home-tab row's second line and the focused row's hint) in an
+    // 18-row pane, so the saved offset from 80x14 clamps to 31 - 18; the row's
+    // line 15 sits on 13 + 2, the band's edge, so the follow leaves it there.
+    assert_eq!(
+        app.global_config_offset.get(),
+        13,
+        "the saved viewport clamps to the grown pane's maximum"
+    );
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = rows
+        .iter()
+        .position(|row| row.contains("auto-start queue"))
+        .unwrap();
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        rows.iter().position(|row| row.contains("auto-start queue")),
+        Some(before),
+        "an adjacent move does not repin the grown pane"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::ContextNudge)
+        .unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // ContextNudge's line 14 falls inside the 13 + 2 band, so the follow lifts
+    // the view to 14 - 2, below the maximum; a view seeded at the bottom on
+    // every draw reads 12 here too, then drops back to 13 on the next move.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an upward move follows the row"
+    );
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an adjacent move keeps a viewport below the maximum"
+    );
+    // The row's lines 15-16 keep two lines either side inside an 8-row pane
+    // at offset 12, and 12 stays under the 80x24 maximum of 13, so neither
+    // resize moves the view; a view reseeded at the bottom or at the row on
+    // a resize reads 13 in both.
+    for (height, label) in [(14, "a shrunk pane"), (24, "a regrown pane")] {
+        term.backend_mut().resize(80, height);
+        term.autoresize().unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        assert_eq!(
+            app.global_config_offset.get(),
+            12,
+            "{label} keeps a saved view that still fits"
+        );
+    }
+    term.backend_mut().resize(70, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 70 columns one more line wraps below the row, so the form grows to
+    // 32 lines and its maximum to 14 while the row keeps lines 15-16: the
+    // saved 12 still fits and holds; a view reseeded on a width or length
+    // change reads 13 from the bottom or the row and 1 from the top.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "a narrower pane keeps a saved view that still fits"
+    );
+    app.global_config_cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        0,
+        "first row restores the top"
+    );
+}
+
 #[test]
 fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
     use crate::tui::app::{Check, Health, Tab};

@@ -4330,6 +4330,61 @@ fn herdr_form_keeps_its_selected_row_in_view_across_adjacent_moves_and_resize() 
         .position(|r| r.contains("delegate row text"))
         .unwrap();
     assert_eq!(after_row, before_row, "last option stays at its screen row");
+    app.services.herdr_options_cursor = 0;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // The first option sits on line 6 (4 detail lines, a blank, `OPTIONS`):
+    // following it up from the bottom offset keeps two lines of context, 6 - 2.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "top herdr option keeps nearby content when it remains visible"
+    );
+    let top = crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .position(|r| r.contains("pane tag"))
+        .unwrap();
+    app.services.herdr_options_cursor = 1;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // At offset 4 the second option's line 7 keeps at least two lines either
+    // side on screen, so the saved view stays; a follow seeded at the bottom
+    // offset 5 would keep 5.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "the next option down keeps the viewport below the bottom"
+    );
+    // The screen holds too, not only the saved number: a view drawn from the
+    // frame alone beside a saved offset shows `pane tag` one row higher here.
+    assert_eq!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .iter()
+            .position(|r| r.contains("pane tag")),
+        Some(top),
+        "the drawn herdr form stays on its saved offset"
+    );
+    term.backend_mut().resize(70, 14);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // At 70 columns the popup-width row wraps, so the form grows to 14 lines
+    // and the option moves to line 8, which keeps two lines either side at
+    // offset 4; a view reseeded on a width or length change reads 6 from the
+    // bottom or the row and 3 from the top.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "a narrower herdr form keeps a saved view that still fits"
+    );
+    term.backend_mut().resize(80, 15);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // Back at 80 columns and one row taller, the bottom offset is 13 - 9 = 4,
+    // where the saved view already sits, so it holds; a view reseeded at the
+    // top on a resize follows the option down to 7 + 1 + 2 - 9 = 1.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "a grown herdr form keeps a saved view at its new bottom"
+    );
     term.backend_mut().resize(80, 45);
     term.autoresize().unwrap();
     term.draw(|f| super::super::draw(f, &app)).unwrap();
@@ -4337,6 +4392,26 @@ fn herdr_form_keeps_its_selected_row_in_view_across_adjacent_moves_and_resize() 
         app.services.form_offset.get(),
         0,
         "fitting herdr form resets the offset"
+    );
+    term.backend_mut().resize(80, 14);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // Back at 80x14 the saved 0 follows the second option (line 7) down to
+    // 7 + 1 + 2 - 8; the same cursor and size read 4 above, so no view
+    // derived from the frame alone meets both.
+    assert_eq!(
+        app.services.form_offset.get(),
+        2,
+        "a shrunk herdr form follows down from the saved top"
+    );
+    app.services.herdr_options_cursor = 2;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // The third option's line 8 needs 8 + 1 + 2 - 8 = 3 from the saved 2; a
+    // view reseeded one row above the bottom on a move keeps 4.
+    assert_eq!(
+        app.services.form_offset.get(),
+        3,
+        "an adjacent move follows down from the saved view"
     );
 }
 
