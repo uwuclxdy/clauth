@@ -136,9 +136,11 @@ function installBoilerplate(
   on('session.end', ($, e, next) => ({ sessionId: e.sessionId }))
   on('turn.start', ($, e, next) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e, next) => ({ text: '' }))
-  // The engine's own band, beneath the mod's: `$.ui.mount` needs something to
-  // answer ui.render when the mod passes it on (nothing is held).
-  on('ui.render', ($, e, next) => ({ type: 'Box' }))
+  // No ui.render hook here: with nothing held the mod passes it on and the
+  // kit's own bottom answers (Claude Code 2.1.319's kit has none, 2.1.321's
+  // has one, so this suite needs 2.1.321 or later). From 2.1.323 a test's
+  // AbovePrompt hook is asked as plugin `test`'s own band row, which no session
+  // draws, stacked with the mod's (measured 2026-11-13).
   return { clock }
 }
 
