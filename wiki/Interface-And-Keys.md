@@ -155,7 +155,7 @@ A saved Claude Code account's rows:
 | `reset display` | `relative`, `clock`, `both` | `relative` |
 | `clock` | `24h`, `12h` | `24h` |
 | `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services` | `overview` |
-| `on mismatch` | `ask`, `overwrite` (skipped on a proxy account, which asks instead), `new`, `discard` | `ask` |
+| `on mismatch` | `ask`, `overwrite` (skipped on a proxy account or an account running on a long-lived token; the launch shows the resolver banner instead), `new`, `discard` | `ask` |
 | `non-login keys` | keep a `/design-login` with the account it was made on | on |
 | `sync MCP logins` | every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; off, each account keeps its own MCP server logins | on |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |

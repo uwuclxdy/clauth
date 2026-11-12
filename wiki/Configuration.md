@@ -175,7 +175,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
-| `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard`; on an account running on a long-lived token, `Overwrite` is skipped: the launch asks instead, and a headless switch (the plugin, the API) refuses. `Overwrite` never saves into a proxy account: the launch asks instead, picking overwrite in the resolver is refused, and a headless switch away goes ahead and drops the live login |
+| `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard`. On an account running on a long-lived token, `Overwrite` is skipped: the launch shows the resolver banner instead of acting, the resolver does not list `Overwrite`, and a headless `Overwrite` switch (the plugin, the API) refuses. `Overwrite` never saves into a proxy account: the launch shows the resolver banner instead, picking overwrite in the resolver is refused, and a headless switch away goes ahead and drops the live login |
 | `[theme] name` | string | auto | the TUI color depth: `"full"` (24-bit) or `"compatible"` (nearest xterm-256, with every surface fill left unpainted so the terminal's own background shows). a theme pick writes the `[theme]` table; an older scalar `theme = "full"` still reads |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
