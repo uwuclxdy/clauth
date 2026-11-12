@@ -47,6 +47,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
   // A `start` naming this id answers 403 `session_mismatch`, as the daemon
   // does while the pid's session record still names another id.
   const start = { refuse: null as string | null }
+  // An `ask_opened` the daemon refuses (a 403/409 the event route answers
+  // before it records the ask).
+  const opened = { refuse: false }
   // A device answer: the daemon closes the ask and keeps the answer for its
   // wait. An ask already closed refuses (the device got `ask_closed`).
   const answer = (ask: string, payload: Record<string, unknown>): void => {
@@ -99,6 +102,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     if (body !== undefined && body.kind === 'start' && body.session === start.refuse) {
       return res(403, JSON.stringify({ error: 'session_mismatch' }))
     }
+    if (body !== undefined && body.kind === 'ask_opened' && opened.refuse) {
+      return res(409, JSON.stringify({ error: 'stale_sequence' }))
+    }
     if (body !== undefined && body.kind === 'ask_opened') {
       lastAsk = body.ask as string
       asks.set(body.ask as string, { answer: null, closed: false })
@@ -111,7 +117,7 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     }
     return res(200, JSON.stringify({ ok: true }))
   })
-  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, answer }
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, answer }
 }
 
 function installBoilerplate(
@@ -439,7 +445,7 @@ test('A2: a held check resolves allow or deny from a phone answer', async ($, on
   expect(await p2).toEqual({ decision: 'deny' })
 })
 
-test('A3: hold:false returns the ask verdict, no hold, no ask_closed', async ($, on) => {
+test('A3: hold:false returns the ask verdict, no hold, and closes the unheld ask by desk', async ($, on) => {
   const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
   on('tool.check', ($, e, next) => ASK)
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
@@ -450,7 +456,11 @@ test('A3: hold:false returns the ask verdict, no hold, no ask_closed', async ($,
   expect(await ui.find({ key: 'allow' })).toBeUndefined()
   await ui.unmount()
   expect(await p).toEqual({ decision: 'ask' })
-  expect(bridge.events.filter(e => e.kind === 'ask_closed')).toHaveLength(0)
+  await clock.settle()
+  // No hold to settle: the query's unheld ask is closed so the daemon stops
+  // listing it.
+  const closes = bridge.events.filter(e => e.kind === 'ask_closed')
+  expect(closes.map(e => e.by)).toEqual(['desk'])
 })
 
 test('A4: a non-interactive session never holds and posts no ask_opened', async ($, on) => {
@@ -1683,6 +1693,182 @@ test('CL12: a check held across a /clear settles as a loss once the record moves
   expect(st.events.filter(b => b.kind === 'ask_opened').map(b => b.session)).toEqual(['sid-1'])
   expect(verdict).toEqual(ASK)
   expect(st.events.filter(b => b.kind === 'ask_closed').map(b => b.session)).toEqual(['sid-1'])
+})
+
+// An ask the daemon did not hold goes to Claude Code's own dialog: it closes
+// once the desk settled it, so the daemon's open asks (and the once-per-wait
+// `blocked` push they gate) do not keep it forever.
+for (const agentId of [undefined, 'agent-1']) {
+  const scope = agentId === undefined ? 'the main loop' : 'a subagent'
+  test(`U1: an unheld permission ask in ${scope} closes by desk once its tool call settles`, async ($, on) => {
+    const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+    on('tool.check', ($, e, next) => ASK)
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await $.tool.call({ ...toolCall(agentId), tool_use_id: 'tu-1' })
+    await clock.settle()
+    const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+    expect(opened).toHaveLength(1)
+    const closed = bridge.events.filter(b => b.kind === 'ask_closed')
+    expect(closed.map(b => ({ ask: b.ask, by: b.by, session: b.session }))).toEqual([
+      { ask: opened[0]!.ask, by: 'desk', session: 'sid-1' },
+    ])
+  })
+}
+
+test('U2: an unheld AskUserQuestion closes by desk once the desk answered it', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => ({ result: { answers: { q: 'engine' } } }))
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  expect(r).toEqual({ result: { answers: { q: 'engine' } } })
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  const closed = bridge.events.filter(b => b.kind === 'ask_closed')
+  expect(closed.map(b => ({ ask: b.ask, by: b.by }))).toEqual([{ ask: opened[0]!.ask, by: 'desk' }])
+})
+
+// A permission query (no tool call behind it) shows no dialog to wait on.
+test('U3: an unheld check with no tool call behind it closes at once', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  expect(v).toEqual(ASK)
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => b.ask)).toEqual([opened[0]!.ask])
+})
+
+// A held ask the phone answered was closed by the daemon on that answer: the
+// mod posts no close for it, from its hold or from the unheld path.
+test('U4: a held ask that the phone answered posts no close', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-2' })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { decision: 'deny' })
+  await clock.advance(PARK_MS)
+  await p
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+})
+
+// The unheld question stays open while Claude Code's own dialog is up, and its
+// close goes under the session it opened in even once a `/clear` moved the
+// module on to the next one.
+test('U5: an unheld question answered after a /clear closes then, under the session it opened in', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false, session)
+  let answerDesk: (() => void) | null = null
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    await new Promise<void>(release => {
+      answerDesk = release
+    })
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  expect(answerDesk).not.toBeNull()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'start').map(b => b.session)).toEqual(['sid-1', 'sid-2'])
+  answerDesk!()
+  await p
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.by, b.session])).toEqual([['desk', 'sid-1']])
+})
+
+// An `ask_opened` the daemon refused recorded nothing: there is no ask to close.
+test('U6: a refused ask_opened posts no close', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  bridge.opened.refuse = true
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await $.tool.call({ ...toolCall(), tool_use_id: 'tu-3' })
+  await clock.settle()
+  expect(v).toEqual(ASK)
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(2)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+})
+
+// Claude Code's own permission dialog, as the test kit lets a test answer an
+// ask: a classic PermissionRequest hook, held open until the test answers it.
+function gatedDialog(on: On) {
+  const answers: Array<(behavior: 'allow' | 'deny') => void> = []
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const behavior = await new Promise<'allow' | 'deny'>(answer => answers.push(answer))
+    return { decision: behavior === 'allow' ? { behavior } : { behavior, message: 'no' } }
+  })
+  return answers
+}
+
+test('U7: an unheld permission ask stays open while the desk dialog is up, closes once answered', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-1' })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(1)
+  expect(dialog).toHaveLength(1)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+  dialog[0]!('allow')
+  expect(await p).toEqual({ result: 'ok' })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => b.by)).toEqual(['desk'])
+})
+
+// Each unheld ask closes with its own call: a subagent's dialog answered
+// first closes only its own ask.
+test('U8: concurrent unheld asks close per call, the second answered first', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const pa = $.tool.call({ ...toolCall(), tool_use_id: 'tu-a' })
+  await clock.settle()
+  const pb = $.tool.call({ ...toolCall('agent-1'), tool_use_id: 'tu-b' })
+  await clock.settle()
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened.map(o => o.agent_id ?? null)).toEqual([null, 'agent-1'])
+  expect(dialog).toHaveLength(2)
+  dialog[1]!('deny')
+  await pb
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => b.ask)).toEqual([opened[1]!.ask])
+  dialog[0]!('allow')
+  await pa
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => b.ask)).toEqual([opened[1]!.ask, opened[0]!.ask])
+})
+
+test('U9: an unheld permission ask answered after a /clear closes under the session it opened in', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false, session)
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-1' })
+  await clock.settle()
+  expect(dialog).toHaveLength(1)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'start').map(b => b.session)).toEqual(['sid-1', 'sid-2'])
+  dialog[0]!('allow')
+  await p
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.by, b.session])).toEqual([['desk', 'sid-1']])
 })
 
 // A `/clear` ends the conversation and fires no `session.start`: the next

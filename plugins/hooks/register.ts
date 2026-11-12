@@ -124,6 +124,9 @@ let drainEpoch: number | null = null
 // one more when it releases the flag and the session is still idle.
 let drainAgain = false
 let helds = new Map<string, HeldEntry>()
+// Asks the daemon took but did not hold, by ask id, each with the session it
+// opened in and the tool call (`tool_use_id`) whose settling closes it.
+let unheldAsks = new Map<string, { session: string; call: string }>()
 let interruptedTurn: string | null = null
 let askCounter = 0
 // The last cadence run per scope, keyed by agent id, the main thread's key empty.
@@ -306,16 +309,18 @@ async function postEvent(
   }).catch(() => false)
 }
 
-// Posts `ask_opened` and reads the daemon's hold answer; answers the session
-// the ask opened under when the daemon holds it, null when the ask must not be
-// held (over-bound body, unreachable socket, a non-ok reply, or no hold).
+// Posts `ask_opened` and reads the daemon's hold answer: the session the ask
+// opened under and whether the daemon holds it, once the daemon took the ask,
+// which every ok reply means (`ask_opened` arm in `src/daemon/bridge.rs`); null
+// when it never did (no session, over-bound body, unreachable socket, a non-ok
+// reply). A reply that does not parse holds nothing.
 async function postAskOpened(
   $: EngineInterface,
   ask: string,
   tool: string,
   input: unknown,
   agentId: string | undefined,
-): Promise<{ session: string } | null> {
+): Promise<{ session: string; held: boolean } | null> {
   const session = sessionId
   if (session === null) return null
   // Started here and awaited in the link: a slow read ahead of a quick one
@@ -328,15 +333,52 @@ async function postAskOpened(
     const seq = await nextSeq($)
     const body = JSON.stringify({ session, seq, kind: 'ask_opened', ...fields })
     if (bodyBytes(body) > BODY_LIMIT) return null
+    let res
     try {
-      const res = await fetchBridge($, '/event', 'POST', body)
-      if (!res.ok) return null
-      const parsed = JSON.parse(res.text) as { hold?: boolean }
-      return parsed.hold === true ? { session } : null
+      res = await fetchBridge($, '/event', 'POST', body)
     } catch {
       return null
     }
+    if (!res.ok) return null
+    return { session, held: holdAnswer(res.text) }
   }).catch(() => null)
+}
+
+function holdAnswer(reply: string): boolean {
+  try {
+    return (JSON.parse(reply) as { hold?: boolean }).hold === true
+  } catch {
+    return false
+  }
+}
+
+// An ask the daemon took but did not hold goes to Claude Code's own dialog, so
+// only the desk settles it, and the daemon lists it until it is closed or the
+// session ends. A query opens no dialog and closes at once; a real call's ask
+// closes once that call settles (`closeUnheldAsks`).
+function closeUnheldAskWhenSettled(
+  $: EngineInterface,
+  ask: string,
+  session: string,
+  call: string | undefined,
+): void {
+  if (call === undefined) closeUnheldAsk($, ask, session)
+  else unheldAsks.set(ask, { session, call })
+}
+
+function closeUnheldAsk($: EngineInterface, ask: string, session: string): void {
+  void postEvent($, 'ask_closed', { ask, by: 'desk' }, session)
+}
+
+// The engine raises `tool.check` inside the `tool.call` chain's `next`, so a
+// call settling has settled every check it raised (the 2.1.322 types).
+function closeUnheldAsks($: EngineInterface, call: string | undefined): void {
+  if (call === undefined) return
+  for (const [ask, unheld] of unheldAsks) {
+    if (unheld.call !== call) continue
+    unheldAsks.delete(ask)
+    closeUnheldAsk($, ask, unheld.session)
+  }
 }
 
 // The oldest held ask, the one the desk row shows; its buttons answer that ask.
@@ -907,7 +949,7 @@ export const register: Register = on => {
   // A result's `context` reaches the model as a PostToolUse hook's
   // `additionalContext` did, one reminder after the result.
   on('tool.call', async ($, e, next) => {
-    const settled = await next(e)
+    const settled = await next(e).finally(() => closeUnheldAsks($, e.tool_use_id))
     // PostToolUse fired for an answered call alone: a refusal or an error
     // carries no note and spends no window.
     if (settled.deny !== undefined || settled.isError === true) return settled
@@ -958,6 +1000,10 @@ export const register: Register = on => {
       const turn = turnId
       const opened = await postAskOpened($, ask, e.tool, e.input, e.agentId)
       if (opened === null) return v
+      if (!opened.held) {
+        closeUnheldAskWhenSettled($, ask, opened.session, e.tool_use_id)
+        return v
+      }
       const outcome = await holdUntilSettled(
         $,
         ask,
@@ -984,6 +1030,10 @@ export const register: Register = on => {
       const turn = turnId
       const opened = await postAskOpened($, ask, 'AskUserQuestion', e.questions, e.agentId)
       if (opened === null) return next(e)
+      if (!opened.held) {
+        // The engine's own question dialog runs inside `next`.
+        return next(e).finally(() => closeUnheldAsk($, ask, opened.session))
+      }
       const outcome = await holdUntilSettled(
         $,
         ask,
