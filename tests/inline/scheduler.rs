@@ -21602,6 +21602,178 @@ fn a_proactive_adopt_that_sends_nothing_lands_no_failure_mark() {
     );
 }
 
+/// A stored pair the adopt-race install fixture moves in under the identity
+/// probe: its own refresh token, so the store differs from the adopt's
+/// pre-probe snapshot — the store-moved stand-down's input.
+fn adopt_race_store(access: &str, expires_at: i64) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: Some(expires_at),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// A peer's install landing inside the adopt's identity probe. The adopt must
+/// write nothing (the store moved under it), and the caller's carry leg hands
+/// the installed pair back with no token request — the tick spends no refresh
+/// token on a chain another writer just advanced. Deleting the adopt's
+/// store-moved stand-down makes it overwrite the install and this test reds.
+#[test]
+fn an_install_landing_inside_the_adopts_identity_probe_is_carried_with_no_token_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-install-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    let installed_expiry = crate::usage::now_ms() as i64 + 95_000_000;
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // install lands as it is served) → anything else would be the token request
+    // this tick must never make.
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::write(
+                &store_for_server,
+                serde_json::to_vec(&adopt_race_store("at-installed", installed_expiry))
+                    .expect("serialize the install"),
+            )
+            .expect("land the install");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-probe",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the install the adopt stood down for is carried, never spent against: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-installed".to_string(),
+            Some("at-installed-refresh".to_string())
+        )),
+        "the peer's install must reach the TokenList, or the next poll spends the superseded token"
+    );
+    let on_disk: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        on_disk.refresh_token(),
+        Some("at-installed-refresh"),
+        "the adopt overwrote the peer's install"
+    );
+    assert_eq!(
+        refetch.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec![&name.to_string()],
+        "the next tick polls with the carried pair"
+    );
+}
+
+/// A peer's log-out landing inside the adopt's identity probe. The deleted
+/// store stays deleted (the adopt writes nothing into it), and the leg spends
+/// the dead chain once and quarantines the profile until a new login. Deleting
+/// the adopt's store-moved stand-down makes it resurrect the store and this
+/// test reds.
+#[test]
+fn a_peer_log_out_inside_the_adopts_identity_probe_leaves_the_store_deleted() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-logout-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // log-out deletes the store as it is served) → the spent chain's terminal
+    // 400.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::remove_file(&store_for_server).expect("log the account out");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-logout",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    let token_requests = seen
+        .iter()
+        .filter(|p| p.starts_with("/v1/oauth/token"))
+        .count();
+    assert_eq!(
+        token_requests, 1,
+        "the logged-out chain is spent once, then quarantined: {seen:?}"
+    );
+    assert!(
+        !store.exists(),
+        "the adopt recreated a store a peer logged out"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "a terminally rejected chain quarantines the profile until a new login"
+    );
+    assert_eq!(outcome.rotated, None, "nothing was adopted");
+}
+
 /// CLA-ROLL: a rolling-token profile forces the preemptive leg regardless of the global
 /// toggle, because here the rotation is not only about the chain — its persist
 /// re-stamps the fed session token, and a stale sidecar has a live claude

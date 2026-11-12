@@ -2954,8 +2954,8 @@ fn the_perms_sweep_keeps_an_executables_owner_exec_bit() {
 /// Each of the 512 modes is posed on a file and on an empty dir directly under
 /// the root, which pins the per-bit rule there; a 0o755 root, two 0o755
 /// non-empty dirs below it and a 0o644 file at the bottom pin that the walk
-/// reads the root and descends. A rule that differs only at another depth is
-/// not pinned here.
+/// reads the root and descends. A per-bit rule that differs only at another
+/// depth is not pinned here.
 #[cfg(unix)]
 #[test]
 fn the_owner_only_checker_names_every_mode_but_0600_files_and_0700_dirs() {
