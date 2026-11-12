@@ -12258,8 +12258,8 @@ fn a_blocking_run_is_cancellable_from_its_spawn_and_the_entry_travels_with_the_c
 }
 
 /// The attached half of the same lifecycle: a blocking run whose caller is
-/// still waiting drops the liveness record and the registry entry together at
-/// the finalize, in that order, so the id stops reading held the moment the
+/// still waiting settles its liveness record and retires the registry entry
+/// together at the finalize, so the id stops reading held the moment the
 /// record stops reading live.
 #[test]
 fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_record() {
@@ -12274,10 +12274,92 @@ fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_r
         !super::cancel_job(&id),
         "the entry retires with the liveness record it guarded"
     );
-    assert!(
-        job_files().is_empty(),
-        "and the record itself is gone too: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "the record stays under its liveness spelling only, settled"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
+    );
+}
+
+/// An attached run's finish leaves its outcome on the liveness record it
+/// already owns, and never its result: the caller took that through the join.
+#[test]
+fn an_attached_finish_leaves_its_outcome_on_its_liveness_record() {
+    for (envelope, failed) in [
+        (
+            serde_json::json!({"profile": "work", "result": "the caller got this"}),
+            false,
+        ),
+        (
+            serde_json::json!({"profile": "work", "is_error": true, "result": "refused"}),
+            true,
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        let handoff = super::Handoff::blocking(mint_spec("work"));
+        handoff.mark_spawned();
+        let id = handoff.spec().expect("liveness record").job_id;
+        handoff.finalize(&envelope);
+
+        let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+        let job = listed
+            .iter()
+            .find(|job| job.record.job_id == id)
+            .unwrap_or_else(|| panic!("the finished run is still listed: {envelope}"));
+        assert_eq!(job.kind, jobs::RecordKind::Liveness, "{envelope}");
+        assert!(
+            matches!(job.liveness, jobs::JobLiveness::Done),
+            "the record reads done: {envelope}"
+        );
+        assert!(
+            job.record.envelope.is_none() || job.record.envelope == Some(serde_json::Value::Null),
+            "no result rides the settled record: {envelope}"
+        );
+        assert_eq!(super::done_job_failed(&job.record), failed, "{envelope}");
+    }
+}
+
+/// The settled record keeps the session id the run's envelope names, as a
+/// background finish's done record does, so its row keeps the handle.
+#[test]
+fn an_attached_finish_keeps_its_session_id_on_the_settled_record() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({
+        "profile": "work",
+        "session_id": "5e55-0",
+        "result": "the caller got this",
+    }));
+
+    let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+    let job = listed
+        .iter()
+        .find(|job| job.record.job_id == id)
+        .expect("the finished run is still listed");
+    assert_eq!(job.record.session_id.as_deref(), Some("5e55-0"));
+}
+
+/// `monitor` asked for an attached run that already finished says so, rather
+/// than calling it still running or unknown.
+#[test]
+fn monitor_on_a_finished_attached_run_says_its_result_went_back_through_the_call() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
+
+    assert_eq!(
+        unknown_job_reason(&id, crate::usage::now_ms()),
+        format!(
+            "job_id {id}: the run finished, its result went back through the call that started it"
+        ),
     );
 }
 
@@ -12372,26 +12454,31 @@ fn an_abandoned_run_with_no_child_yet_mints_nothing_and_stops_instead() {
 /// finalize. The mint sits outside the state lock (so both leaves stay leaves),
 /// which is exactly what makes this window exist.
 #[test]
-fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
+fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_nothing_collectable() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "landed first"}));
-    assert!(
-        job_files().is_empty(),
-        "a run still attached to its caller writes nothing: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "a run still attached to its caller leaves only its settled liveness record"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
     );
 
     assert!(
         matches!(handoff.hand_off(), super::Abandoned::Kept),
         "and a hand-off reaching a finished run reports nothing to collect",
     );
-    assert!(
-        job_files().is_empty(),
-        "leaving no orphan behind either: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "leaving no collectable orphan behind either"
     );
 
     // The true race — the run landing while its reservation is being minted —
@@ -12479,13 +12566,13 @@ fn monitor_cannot_collect_a_blocking_run_under_either_spelling() {
 
 /// M9's half of the seam: a blocking run gets a LIVENESS record at its spawn, so
 /// an operator can watch a delegate whose caller is still holding the line — and
-/// the record goes away when that caller takes the envelope, because a record
-/// left behind promises a result nobody will ever collect.
+/// when that caller takes the envelope the record settles as done without it,
+/// under the spelling no `monitor` id reaches, so it promises no second result.
 ///
 /// The mint sits at the spawn rather than at construction because that is the
 /// boundary a child exists at; the pre-spawn arm below is what that buys.
 #[test]
-fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes() {
+fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_collectable_when_it_finishes() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     assert!(
@@ -12526,11 +12613,15 @@ fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes(
     assert_eq!(listed[0].kind, jobs::RecordKind::Liveness);
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
-    assert!(
-        job_files().is_empty(),
-        "the caller took the envelope from the join, so the record retires with \
-         it rather than offering a second delivery: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{}.live.json", spec.job_id)],
+        "the caller took the envelope from the join, so the record settles under \
+         its liveness spelling rather than offering a second delivery"
+    );
+    assert!(
+        jobs::read(&spec.job_id).is_none(),
+        "and the id still collects nothing"
     );
 }
 

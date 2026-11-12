@@ -75,6 +75,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
             reset_display: state.reset_display(),
             clock_format: state.clock_format(),
             home_tab: state.home_tab(),
+            reduce_motion: state.reduce_motion,
         }
     };
     let tunables = {
@@ -258,6 +259,7 @@ struct RowState {
     reset_display: ResetDisplay,
     clock_format: ClockFormat,
     home_tab: HomeTab,
+    reduce_motion: bool,
 }
 
 /// The numeric tunables the Config tab's rows render, gathered once per draw.
@@ -298,6 +300,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         GlobalConfigRow::HomeTab => String::from(
             "the tab clauth opens on; the first herdr launch opens the services tab with the herdr row selected",
         ),
+        GlobalConfigRow::ReduceMotion => String::from(if rows.reduce_motion {
+            "the mascot and provider names stay still; spinners keep turning"
+        } else {
+            "the mascot reacts to events and provider names shimmer"
+        }),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
             Some(DivergenceChoice::Overwrite) => {
@@ -464,6 +471,12 @@ fn detail_row(
                 .collect();
             cycle_row(arrow, "home tab", &options, selected, width)
         }
+        GlobalConfigRow::ReduceMotion => vec![toggle_row(
+            arrow,
+            "reduce motion",
+            rows.reduce_motion,
+            selected,
+        )],
         GlobalConfigRow::RefreshInterval => match editing {
             Some(input) => vec![refresh_edit_line(arrow, input, width)],
             None => refresh_cycle_lines(arrow, refresh_interval_ms, selected, width),

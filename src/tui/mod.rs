@@ -3,6 +3,7 @@
 
 mod app;
 mod clawd;
+mod mascot;
 mod render;
 pub(crate) mod theme;
 

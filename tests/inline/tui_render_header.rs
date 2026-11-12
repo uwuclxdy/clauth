@@ -1725,7 +1725,7 @@ fn the_header_logo_rests_on_the_clawd_default_pose() {
 fn the_wink_frame_paints_its_cut_outs_black() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1782,7 +1782,7 @@ fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     // Frame index = elapsed / 80 ms, so frame 2 draws 160 ms in.
     const FRAME_MS: u64 = 80;
-    app.clawd.play(crate::tui::clawd::Anim::CoinHop, 0);
+    app.mascot.play(crate::tui::clawd::Anim::CoinHop, 0);
     app.anim_phase_ms = Some(FRAME_MS * 2);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1895,7 +1895,7 @@ fn the_simplified_sprite_arm_replaces_the_full_one() {
 fn the_turned_pose_paints_its_facing_cut_black() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Turn, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Turn, 0);
     app.anim_phase_ms = Some(0);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1984,7 +1984,7 @@ fn the_cut_outs_stay_black_on_the_compatible_tier() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
     let bg = Color::Reset;
     let body = Color::Indexed(173);
@@ -2153,4 +2153,29 @@ fn the_drawn_row_keeps_the_emoji_name_whole_mid_sweep() {
         rows[1], rows[2],
         "the sweep must not move a cell between 450ms and 675ms"
     );
+}
+
+/// A row held still samples its rest phase: at every list position, for every
+/// provider, the wave draws the plain dim label there, while the same position
+/// crests somewhere else in its cycle.
+#[test]
+fn the_identity_waves_rest_phase_draws_the_plain_label_at_every_position() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let label = "Ultra";
+    let plain = vec![Span::styled(label.to_string(), theme::dim())];
+    for provider in theme::CrestProvider::ALL {
+        for position in 0..64 {
+            assert_eq!(
+                identity_wave_spans(label, provider, position, identity_wave_rest_ms(position)),
+                plain,
+                "{provider:?} at position {position}"
+            );
+            assert!(
+                (0..PULSE_CYCLE_MS)
+                    .step_by(50)
+                    .any(|ms| identity_wave_spans(label, provider, position, ms) != plain),
+                "control: {provider:?} at position {position} never crests"
+            );
+        }
+    }
 }

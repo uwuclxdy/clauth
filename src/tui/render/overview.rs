@@ -17,7 +17,7 @@ use super::format::{
     reset_resume, reset_room, reset_suffix_worst, spinner_frame, spinner_style, truncate,
     window_label, window_summary_spans_bracketed,
 };
-use super::header::identity_wave_spans;
+use super::header::{identity_wave_rest_ms, identity_wave_spans};
 use super::panes::{
     bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
     select_line, wrap_words,
@@ -209,7 +209,10 @@ fn draw_overview_accounts(
     let items = app.main_items();
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
-    let reset_fmt = ResetFmt::from_state(&app.config().state);
+    let (reset_fmt, still) = {
+        let cfg = app.config();
+        (ResetFmt::from_state(&cfg.state), cfg.state.reduce_motion)
+    };
     let entries = app.band_entries(app.harness_filter);
     let ranges = App::heading_ranges(&entries);
 
@@ -248,9 +251,13 @@ fn draw_overview_accounts(
                     MainItemKind::Profile(_) => {
                         render_overview_row(app, flat, &widths, flat == sel, focused, readings)
                     }
-                    MainItemKind::Codex(idx) => {
-                        render_codex_row(&codex[idx], flat, &widths, flat == sel, app.anim_ms())
-                    }
+                    MainItemKind::Codex(idx) => render_codex_row(
+                        &codex[idx],
+                        flat,
+                        &widths,
+                        flat == sel,
+                        wave_phase_ms(still, app.anim_ms(), flat),
+                    ),
                     MainItemKind::Shunt(pi, ai) => {
                         let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
                             rows.push(ListItem::new(Line::from("")));
@@ -1238,6 +1245,17 @@ fn push_chip_slot(spans: &mut Vec<Span<'static>>, widths: &OverviewWidths, count
     }
 }
 
+/// The phase a row's identity wave samples: the animation clock, or under
+/// `reduce_motion` the row's rest gap, where the wave draws the plain label.
+/// Only the wave stills: the clock keeps running for spinners and gauges.
+fn wave_phase_ms(still: bool, anim_ms: u64, position: usize) -> u64 {
+    if still {
+        identity_wave_rest_ms(position)
+    } else {
+        anim_ms
+    }
+}
+
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
 /// `clauth limit-reset` spends). The timer slot stays blank and no live cell
@@ -1249,7 +1267,7 @@ fn render_codex_row(
     position: usize,
     widths: &OverviewWidths,
     selected: bool,
-    anim_ms: u64,
+    wave_ms: u64,
 ) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
@@ -1287,7 +1305,7 @@ fn render_codex_row(
                 &clamped,
                 CrestProvider::Codex,
                 position,
-                anim_ms,
+                wave_ms,
             ));
             spans.push(Span::raw(pad));
         }
@@ -1693,7 +1711,8 @@ fn render_overview_row(
         && !no_tier
     {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        spans.extend(identity_wave_spans(&clamped, provider, idx, app.anim_ms()));
+        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), idx);
+        spans.extend(identity_wave_spans(&clamped, provider, idx, wave_ms));
         spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the

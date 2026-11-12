@@ -2213,6 +2213,71 @@ fn disabled_row_type_cell_does_not_pulse() {
     );
 }
 
+/// `reduce_motion` holds the provider wave still at every phase, while a
+/// spinner on the same row keeps turning with the tick.
+#[test]
+fn reduce_motion_stills_the_provider_wave_but_not_the_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    b.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
+
+    let colors = |still: bool, elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
+        let mut config = config.clone();
+        config.state.reduce_motion = still;
+        let mut app = App::new(config);
+        app.anim_phase_ms = Some(elapsed_ms);
+        let widths = OverviewWidths::new(110, &app, &readings);
+        render_overview_row(&app, 1, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .map(|s| s.style.fg)
+            .collect()
+    };
+    // Row 1's sweep: 994ms is its flat first frame, 1444ms its crest.
+    assert_ne!(
+        colors(false, 994),
+        colors(false, 1444),
+        "control: the row's type cell animates with motion on"
+    );
+    assert_eq!(
+        colors(true, 994),
+        colors(true, 1444),
+        "the wave moved under reduce_motion"
+    );
+    // At 0ms row 1 sits in its rest gap: the plain, uncrested label.
+    assert_eq!(
+        colors(true, 1444),
+        colors(false, 0),
+        "a still wave draws the plain label"
+    );
+
+    let mut config = config.clone();
+    config.state.reduce_motion = true;
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("b"));
+    let widths = OverviewWidths::new(110, &app, &readings);
+    app.tick_count = 0;
+    let first = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+    app.tick_count = 1;
+    let next = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+    assert!(
+        first.split_whitespace().take(2).eq(["⠋", "b"]),
+        "the spinner leads the name: {first:?}"
+    );
+    assert!(
+        next.split_whitespace().take(2).eq(["⠙", "b"]),
+        "the spinner turns under reduce_motion: {next:?}"
+    );
+}
+
 /// The type cell's index in a row's span list: cursor, marker, name, name pad,
 /// gap, then the cell. Read positionally on purpose — identifying it by content
 /// would collide with the 5h/7d cells, which render the same `—` whenever a
@@ -11353,4 +11418,62 @@ fn the_filled_layout_holds_still_as_a_countdown_ticks() {
             );
         }
     }
+}
+
+/// The codex plan cell samples the identity wave through the same
+/// `reduce_motion` gate as the claude type cell: with the key on, two
+/// animation phases render identical plain cells, and with it off the same
+/// two phases differ because the crest reached the cell.
+#[test]
+fn the_codex_plan_cell_stills_under_reduce_motion() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    let plan_cells = |app: &mut App, still: bool, phase_ms: u64| -> Vec<ratatui::style::Color> {
+        app.config().state.reduce_motion = still;
+        app.anim_phase_ms = Some(phase_ms);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let rows = crate::testutil::buffer_rows(buf);
+        let y = rows
+            .iter()
+            .position(|row| row.contains("cx1"))
+            .expect("the codex row draws") as u16;
+        // `find` answers a byte offset; the border glyphs before the plan are
+        // multi-byte, so map it onto the cell column the buffer indexes by.
+        let byte = rows[y as usize].find("pro").expect("the plan draws");
+        let x = rows[y as usize][..byte].chars().count() as u16;
+        (x..x + 3)
+            .map(|x| buf.cell((x, y)).expect("cell").fg)
+            .collect()
+    };
+    assert_eq!(
+        plan_cells(&mut app, true, 0),
+        plan_cells(&mut app, true, 450),
+        "the codex plan cell moved under reduce_motion"
+    );
+    assert_eq!(
+        plan_cells(&mut app, true, 0),
+        vec![theme::text_dim_color(); 3],
+        "a still codex plan cell draws the plain dim label"
+    );
+    assert_ne!(
+        plan_cells(&mut app, false, 0),
+        plan_cells(&mut app, false, 450),
+        "control: the codex plan cell crests with motion on"
+    );
 }

@@ -430,7 +430,7 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         let viewport = app.global_config_viewport.get();
         assert!(viewport >= 4, "config publishes its viewport at {w}x{h}");
         let starts: Vec<usize> = app.global_config_row_starts.borrow().clone();
-        assert_eq!(starts.len(), 21, "one start line per config row");
+        assert_eq!(starts.len(), 22, "one start line per config row");
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
         let target = starts[0] + viewport - 1;
         let expected = (0..starts.len())

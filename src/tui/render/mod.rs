@@ -15,6 +15,7 @@ mod footer;
 mod format;
 mod global_config;
 mod header;
+pub(crate) use header::art_fits;
 mod modals;
 mod overview;
 mod panes;
@@ -61,9 +62,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     // renders a reading reads this snapshot alone.
     let readings = app.readings_snapshot();
 
-    // Content frame's top border doubles as the header/content separator; the
-    // header is 3 rows with the art (brand / live+gauge+status / tabs), 2
-    // without it (brand+tabs / live+gauge+status).
+    // Content frame's top border doubles as the header/content separator; with
+    // the art the header is the mascot's own rows (brand / live+gauge+status /
+    // any blank rows / tabs), without it 2 (brand+tabs / live+gauge+status).
     let [_, content_area, footer_area] = Layout::vertical([
         Constraint::Length(header::header_height(area)),
         Constraint::Min(5),

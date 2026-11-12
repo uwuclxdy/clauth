@@ -85,6 +85,32 @@ fn a_resume_names_this_sessions_uncollected_results_newest_first() {
     assert_eq!(note_at(&resume(), NOW).as_deref(), Some(TWO));
 }
 
+/// An attached run's settled liveness record is done but holds no result: the
+/// note never names it as one waiting to be collected.
+#[test]
+fn a_finished_attached_run_is_never_named_as_uncollected() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-att-0.live.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-att-0",
+            "profile": "DS1",
+            "state": "done",
+            "started_at": NOW - 2_500,
+            "done_at": NOW - 2_000,
+            "host_session": SESSION,
+            "outcome": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_done("d-b", "glm1", Some(SESSION), 1_000);
+
+    assert_eq!(note_at(&resume(), NOW), Some(one("d-b", "glm1")));
+}
+
 #[test]
 fn one_result_reads_in_the_singular() {
     let _home = HomeSandbox::new();

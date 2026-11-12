@@ -21,7 +21,7 @@
 //! and the id is recovered afterwards by ENUMERATION rather than by delivery:
 //! `monitor` with no `job_ids` lists it, `clauth jobs` prints it, and the TUI's
 //! delegates detail draws it. All three go through [`list_banded`], and so through
-//! [`list`] beneath it.
+//! [`list_readable`], the one store walk both listings share.
 //!
 //! A blocking delegate that is STILL attached to its caller keeps a second
 //! spelling here, `<job_id>.live.json` ([`RecordKind::Liveness`]) — the same
@@ -29,10 +29,16 @@
 //! an operator can see a run whose model-facing result is still travelling back
 //! through the join. [`RecordKind`] documents why no id resolves that
 //! spelling, so nothing collects the liveness file itself. It ends one of
-//! three ways. Renamed to the collectable spelling when the caller walks away.
-//! Deleted when the run finishes with its caller still there. Converted to a
-//! tombstone when the server dies with the caller gone; the tombstone is a
-//! collectable record `monitor` then answers and removes.
+//! four ways. Renamed to the collectable spelling when the caller walks away.
+//! Settled in place when the run finishes with its caller still attached:
+//! `done`, no envelope — the join was the one delivery — and an `outcome` the
+//! TUI mascot and `monitor`'s reason arm read; the startup sweep reaps it past
+//! [`DONE_TTL_MS`] like every other done record. Converted to a tombstone when
+//! the server dies with the caller gone; the tombstone is a collectable record
+//! `monitor` then answers and removes. Deleted when a leftover stands beside a
+//! finished record: the finalize clears the spelling a racing beat recreated
+//! after a hand-off, and the sweep drops one beside a collectable record that
+//! already carries its envelope.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -156,7 +162,10 @@ pub(crate) enum RecordKind {
     /// `<id>.json` — a result a `monitor` call may collect.
     Collectable,
     /// `<id>.live.json` — liveness only, for a blocking run whose caller still
-    /// holds the join and takes the envelope from there.
+    /// holds the join and takes the envelope from there. The same file settles
+    /// at the run's finish: `done` with the run's `outcome` and no envelope,
+    /// still unreachable by id, until the Done TTL reaps it (see
+    /// [`write_done_liveness`]).
     Liveness,
 }
 
@@ -297,6 +306,14 @@ pub(crate) struct JobRecord {
     /// older server wrote, so the default keeps those parseable.
     #[serde(default)]
     pub(crate) crashed: bool,
+    /// Whether a `done` record's run finished ok. The settled `Liveness`
+    /// record of an attached run is the one shape that writes it — its
+    /// envelope went back through the join, so the outcome is all the finish
+    /// left to read, and `done_job_failed` reads it exactly there. `false` on
+    /// a record an older server wrote and on a collectable finish, whose
+    /// envelope's `is_error` is the verdict.
+    #[serde(default)]
+    pub(crate) outcome: bool,
     /// Which `clauth mcp` server process minted this record — its liveness
     /// marker pid, held by that server for its whole life, so a later server
     /// reads "owner alive" by probing one flock instead of waiting out the
@@ -507,6 +524,7 @@ pub(crate) fn write_heartbeat_with_session(
             tail: tail.to_string(),
             done_at: 0,
             crashed: false,
+            outcome: false,
             owner_pid: spec.owner_pid,
             owner_started_at: spec.owner_started_at,
         },
@@ -519,10 +537,10 @@ pub(crate) fn write_heartbeat_with_session(
 ///
 /// A rename rather than a fresh mint, so one run keeps ONE identity across the
 /// crossing — the id its own heartbeats already carry — and no reader ever sees
-/// the id resolve to nothing. The write fallback covers the two ways the source
-/// can be missing: the liveness write has not landed yet, or the run finished
-/// and [`remove_liveness`] got there first. In the second case the caller's own
-/// install hands the record straight back, so the fallback cannot strand one.
+/// the id resolve to nothing. The write fallback covers the one way the source
+/// can be missing: the spawn's own liveness write has not landed yet. A run
+/// that already finished is `Finished`, so `hand_off` never reaches the
+/// rename — its settled record stays put.
 ///
 /// What this does NOT do is stop the liveness spelling coming back. The rename
 /// is atomic; the concurrent writer is not bounded by it, and a heartbeat that
@@ -575,15 +593,63 @@ pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Res
             tail: String::new(),
             done_at: crate::usage::now_ms(),
             crashed: false,
+            outcome: false,
             // A finished record is final: no owner liveness is read from it.
             owner_pid: 0,
             owner_started_at: 0,
         },
         // A result is always collectable: the one run that finalizes with a
         // liveness record still open is a blocking one, and its caller already
-        // took the envelope from the join, so `Handoff::finalize` deletes that
-        // record rather than writing a second delivery into it.
+        // took the envelope from the join, so `Handoff::finalize` settles that
+        // record ([`write_done_liveness`]: done + outcome, no envelope) rather
+        // than writing a second delivery into it.
         RecordKind::Collectable,
+    )
+}
+
+/// Settle a blocking run's liveness record at its finish: the same spelling,
+/// `done` state, no envelope — the caller's join was the one delivery — and
+/// the run's outcome off the envelope's error flag, which is all the finish
+/// leaves for the mascot's cue and `monitor`'s reason arm to read. The
+/// `done_at` stamp is what the startup sweep reaps by [`DONE_TTL_MS`],
+/// exactly like every other done record, so no new sweep arm exists for it.
+/// The record stays under the `Liveness` spelling, so no caller-supplied id
+/// can resolve it (see [`RecordKind`]) and the result is never delivered
+/// twice. Mirrors [`write_done`]'s field choices: the run's session id rides
+/// the record off the envelope's own `session_id` key, the running-only
+/// fields default away and the owner marker zeroes, since no owner liveness
+/// is read from a finished record.
+pub(crate) fn write_done_liveness(spec: &RunningSpec, envelope: &serde_json::Value) -> Result<()> {
+    write_atomic(
+        &JobRecord {
+            job_id: spec.job_id.clone(),
+            profile: spec.profile.clone(),
+            state: JobState::Done,
+            started_at: spec.started_at,
+            envelope: None,
+            endpoint: spec.endpoint.clone(),
+            provider: spec.provider.clone(),
+            isolated: spec.isolated,
+            cwd: spec.cwd.clone(),
+            spawned_by: spec.spawned_by.clone(),
+            host_session: spec.host_session.clone(),
+            host_pid: spec.host_pid,
+            session_id: envelope
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            timeout_secs: 0,
+            idle_secs: None,
+            last_output_at: 0,
+            recorded_at: 0,
+            tail: String::new(),
+            done_at: crate::usage::now_ms(),
+            crashed: false,
+            outcome: !crate::mcp::envelope_reports_failure(envelope),
+            owner_pid: 0,
+            owner_started_at: 0,
+        },
+        RecordKind::Liveness,
     )
 }
 
@@ -679,7 +745,7 @@ impl Claimant {
 }
 
 /// The durable record a claim leaves behind: which path delivered the job and
-/// when. Lives at `<id>.json.delivered`, invisible to every reader (its
+/// when. Lives at `<id>.json.delivered`, outside the store listing (its
 /// extension is not `json`) and reaped by the startup sweep once the unknown
 /// answer it feeds stops mattering ([`DONE_TTL_MS`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,6 +757,11 @@ pub(crate) struct DeliveryLedger {
     pub(crate) at: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) profile: String,
+    /// Whether the delivered job had failed, judged at the claim by the same
+    /// rule every stored-record delivery folds. `#[serde(default)]`, so a
+    /// ledger an older build wrote reads as a successful finish.
+    #[serde(default)]
+    pub(crate) failed: bool,
 }
 
 /// The ledger path for `job_id`. Guarded by [`is_safe_job_id`] at every caller
@@ -731,6 +802,7 @@ pub(crate) fn write_delivery_ledger_for_test_with_by(job_id: &str, by: &str, at:
         by: by.to_string(),
         at,
         profile: "work".to_string(),
+        failed: false,
     }) else {
         return;
     };
@@ -762,6 +834,7 @@ fn write_delivery_ledger(record: &JobRecord, claimant: Claimant) {
         by: claimant.label().to_string(),
         at: crate::usage::now_ms(),
         profile: record.profile.clone(),
+        failed: crate::mcp::done_job_failed(record),
     }) else {
         return;
     };
@@ -844,12 +917,28 @@ pub(crate) fn liveness_exists(job_id: &str) -> bool {
     is_safe_job_id(job_id) && job_path(job_id, RecordKind::Liveness).is_ok_and(|path| path.exists())
 }
 
+/// Whether a blocking run's liveness record reads `done`: the run finished
+/// with its caller still attached, so the record settled
+/// ([`write_done_liveness`]) and the result went back through the join. Still
+/// a bool, never the record's result for an id — the same [`RecordKind`]
+/// contract [`liveness_exists`] holds; `state` alone is read, to tell the
+/// live shapes apart. `false` on an absent or unreadable record, which the
+/// caller's live-shape answer still covers.
+pub(crate) fn liveness_is_done(job_id: &str) -> bool {
+    is_safe_job_id(job_id)
+        && job_path(job_id, RecordKind::Liveness)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<JobRecord>(&bytes).ok())
+            .is_some_and(|record| record.state == JobState::Done)
+}
+
 /// Delete a blocking run's liveness record (best-effort).
 ///
 /// Its own function rather than a `kind` argument on [`remove`], because the two
 /// answer different questions: `remove` evicts a result a caller has just taken
-/// delivery of, this one retracts an offer of visibility for a run whose result
-/// went back through the join.
+/// delivery of, this one clears the liveness spelling a racing beat recreated
+/// after a hand-off, so no orphan stands beside the collectable finish.
 pub(crate) fn remove_liveness(job_id: &str) {
     if let Ok(path) = job_path(job_id, RecordKind::Liveness) {
         let _ = std::fs::remove_file(path);
@@ -1260,8 +1349,10 @@ pub(crate) enum JobPhase {
     /// A blocking run whose caller still holds the join. Nothing can collect it:
     /// the envelope goes back through the call that started it.
     Blocking,
-    /// Finished, with its envelope on disk, until someone collects it or the
-    /// Done TTL reaps it.
+    /// Finished. A background run carries its envelope on disk until someone
+    /// collects it or the Done TTL reaps it; an attached run's settled
+    /// liveness record reads the same phase with no envelope — its caller took
+    /// it — and no collect, reaped by the same TTL.
     Done,
     /// `running` on disk whose server is gone — silent past
     /// [`RUNNING_TTL_MS`] (an ownerless record an older server wrote), or owned
@@ -1287,7 +1378,9 @@ impl JobPhase {
     /// orphan whose collectable record still sits on disk, is the exception:
     /// `monitor` naming its id answers it with the crash copy and then removes
     /// it. `collectable: false` there names the absence of a result, never the
-    /// absence of an answer.
+    /// absence of an answer. A settled liveness record (the `Done` a blocking
+    /// run's finish leaves) answers true here but no id reaches the spelling —
+    /// the row flag in `jobs_cli` consults the record's kind for it.
     pub(crate) fn is_collectable(self) -> bool {
         matches!(self, Self::Running | Self::Done)
     }
@@ -1345,13 +1438,16 @@ impl StoredJob {
     /// none of them can answer differently about one file.
     ///
     /// The spelling on disk is the whole difference between the two live ones:
-    /// a [`RecordKind::Liveness`] file exists only while its caller holds the
-    /// join, so no second field is needed to say which situation a `running`
-    /// record is in.
+    /// a [`RecordKind::Liveness`] file that is still `running` exists only
+    /// while its caller holds the join (a finished one is the settled record,
+    /// read as `Done` above), so no second field is needed to say which
+    /// situation a `running` record is in.
     pub(crate) fn phase(&self) -> JobPhase {
         match self.liveness {
             // A crashed blocking run's record is `Done` on disk but carries no
             // envelope; it is the sweep's tombstone, not a result to collect.
+            // The settled liveness record is the same shape with `crashed`
+            // false and the run's `outcome` on it — a done row, not an orphan.
             JobLiveness::Done if self.record.crashed => JobPhase::Orphaned,
             JobLiveness::Done => JobPhase::Done,
             JobLiveness::Corpse => JobPhase::Orphaned,
@@ -1393,11 +1489,20 @@ impl StoredJob {
 /// one millisecond. Neither can reorder records with different anchors, and both
 /// are stable — which is the property this is for.
 pub(crate) fn list(now: u64) -> Vec<StoredJob> {
-    let Ok(dir) = jobs_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+    list_readable(now).unwrap_or_default()
+}
+
+/// [`list`] for a caller that must tell an empty store from one it could not
+/// read: `None` when the jobs directory cannot be resolved or read (or its
+/// path is not a directory), `Some` — possibly empty — otherwise. A missing
+/// directory is an empty store; a record file that will not read is still
+/// skipped, never an unreadable store.
+pub(crate) fn list_readable(now: u64) -> Option<Vec<StoredJob>> {
+    let dir = jobs_dir().ok()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
     let mut found: Vec<(u64, StoredJob)> = Vec::new();
     for entry in entries.flatten() {
@@ -1435,7 +1540,38 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
         b.0.cmp(&a.0)
             .then_with(|| b.1.record.job_id.cmp(&a.1.record.job_id))
     });
-    found.into_iter().map(|(_, job)| job).collect()
+    Some(found.into_iter().map(|(_, job)| job).collect())
+}
+
+/// Every delivery ledger the claims left behind, newest delivery first — the
+/// record a finish keeps once its done file is consumed, so a reader that
+/// polls the store still sees finishes claimed between two of its reads. The
+/// same unreadable-vs-empty rule as [`list_readable`]: `None` when the jobs
+/// directory cannot be resolved or read, `Some` — possibly empty — otherwise;
+/// a ledger that will not read is still skipped, never an unreadable store.
+pub(crate) fn list_ledgers_readable() -> Option<Vec<DeliveryLedger>> {
+    let dir = jobs_dir().ok()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let mut ledgers: Vec<DeliveryLedger> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_ledger_path(&path) {
+            continue;
+        }
+        let Some(ledger) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<DeliveryLedger>(&b).ok())
+        else {
+            continue;
+        };
+        ledgers.push(ledger);
+    }
+    ledgers.sort_by_key(|ledger| std::cmp::Reverse(ledger.at));
+    Some(ledgers)
 }
 
 /// [`list`] banded for a READER: live rows first, each band still in `list`'s
@@ -1455,9 +1591,16 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
 /// `src/tui/render/services.rs` renders the delegates detail straight from this
 /// order — its `delegate_cells` sorts nothing — so the banding lives here alone.
 pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
-    let mut jobs = list(now);
+    list_banded_readable(now).unwrap_or_default()
+}
+
+/// [`list_banded`] keeping the readability answer: `None` when the store
+/// could not be read, so a consumer seeding off it never mistakes an
+/// unreadable read for an empty one.
+pub(crate) fn list_banded_readable(now: u64) -> Option<Vec<StoredJob>> {
+    let mut jobs = list_readable(now)?;
     jobs.sort_by_key(|job| job.phase().rank());
-    jobs
+    Some(jobs)
 }
 
 /// Every liveness figure a `running` record yields at one instant.

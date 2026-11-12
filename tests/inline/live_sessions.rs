@@ -1833,3 +1833,20 @@ fn a_failing_registry_listing_leaves_the_tally_unread() {
         "an entry the OS fails to yield leaves the fleet total unread"
     );
 }
+
+/// The tally keeps each registry row's id with the account the row runs on —
+/// the row's `current_member`, else its start account — so a reader can tell
+/// a session starting from one moving accounts; an unread tally names none,
+/// so a failed read never reads as every session ending.
+#[test]
+fn the_tally_names_each_rows_member_and_an_unread_one_names_none() {
+    let mut moved = row("4242-1", "a");
+    moved.current_member = Some("b".to_string());
+    let rows = [row("4242-0", "a"), moved];
+    let want = std::collections::BTreeMap::from([
+        ("4242-0".to_string(), "a".to_string()),
+        ("4242-1".to_string(), "b".to_string()),
+    ]);
+    assert_eq!(LiveTally::of(rows.clone()).session_members(), Some(&want));
+    assert_eq!(LiveTally::partly_read(rows).session_members(), None);
+}

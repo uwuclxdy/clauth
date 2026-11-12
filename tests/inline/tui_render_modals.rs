@@ -977,8 +977,8 @@ fn a_modal_with_no_room_to_draw_publishes_no_scroll_range() {
 ///
 /// It also pins the THIS MODAL section that documents the scroll itself, whole:
 /// the row cannot go in `global`, since `draw_help` drops any global row whose
-/// key the current tab redefines and all eight tabs bind ↑↓ — and hanging it
-/// off another section would put two ↑↓ rows with different senses a few lines
+/// key the current tab redefines, so every tab binding ↑↓ would lose it — and
+/// hanging it off another section would put two ↑↓ rows with different senses a few lines
 /// apart, which is what that filter exists to prevent.
 #[test]
 fn a_help_modal_that_fits_renders_without_a_scrollbar() {

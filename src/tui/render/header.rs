@@ -1,19 +1,24 @@
-//! Top bar: the Clawd mascot on the left; brand, usage gauge and status source
-//! in the text column to the right. The art header is three rows; when the
-//! frame cannot hold the art it falls back to two, carrying the tab bar on the
-//! brand row. [`header_height`] keeps `render::draw`'s layout in step.
+//! Top bar: the mascot on the left; brand, usage gauge and status source in
+//! the text column to the right. The art header is the mascot's own rows;
+//! when the frame cannot hold the art it falls back to two, carrying the tab
+//! bar on the brand row. [`header_height`] keeps `render::draw`'s layout in
+//! step.
 //!
-//! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
-//! and the `[ shunt ]  [ daemon ]` service chips on the right edge. The art
-//! row sheds the tag first, then the shunt chip, then the daemon chip; the
-//! no-art row also carries the tab bar, which collapses to its overflow form
-//! between the tag and the chips. Row 1 carries
-//! the fleet's live-session chip, the tok/s chip, the active-profile usage
-//! gauge with its speed suffix and the status indicator: the account counts
-//! and the harness filter live on the accounts panel's title row, as meta
-//! slots beside the bare `ACCOUNTS` title. Row 1 sheds the tok/s chip first,
-//! then the live chip, then the speed suffix; the gauge's ladder drops the
-//! usage bar before the name.
+//! The info column reads top-down from the mascot's own rows: the brand row
+//! on the first, the status row on the second, the tabs on the last, and any
+//! rows between left blank. The brand row reads `clauth vX.Y.Z` on the left
+//! with the herdr tag between them, and the `[ shunt ]  [ daemon ]` service
+//! chips on the right edge. The brand row sheds the tag first, then the shunt
+//! chip, then the daemon chip; the no-art row also carries the tab bar, which
+//! collapses to its overflow form between the tag and the chips. The status
+//! row carries the fleet's live-session chip, the tok/s chip, the
+//! active-profile usage gauge with its speed suffix and the status indicator:
+//! the account counts and the harness filter live on the accounts panel's
+//! title row, as meta slots beside the bare `ACCOUNTS` title. The status row
+//! sheds the tok/s chip first, then the live chip, then the speed suffix; the
+//! gauge's ladder drops the usage bar before the name.
+
+use std::rc::Rc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -22,7 +27,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health};
-use super::super::clawd::{self, CellKind};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 use super::services::health_color;
@@ -236,15 +240,27 @@ pub(super) fn identity_wave_spans(
     position: usize,
     elapsed_ms: u64,
 ) -> Vec<Span<'static>> {
-    let fraction = (position as f64 * PULSE_STAGGER_FRACTION).fract();
-    let offset = (fraction * PULSE_CYCLE_MS as f64).round() as u64;
     crest_spans(
         label,
         theme::dim(),
         theme::crest_color(provider),
         IDENTITY_DEPTH,
-        elapsed_ms % PULSE_CYCLE_MS + offset,
+        elapsed_ms % PULSE_CYCLE_MS + identity_wave_offset_ms(position),
     )
+}
+
+/// A phase at which `position`'s identity wave sits at the start of its rest
+/// gap, so [`identity_wave_spans`] draws the plain label there. A row held
+/// still under `reduce_motion` samples it.
+pub(super) fn identity_wave_rest_ms(position: usize) -> u64 {
+    (PULSE_SWEEP_MS + PULSE_CYCLE_MS - identity_wave_offset_ms(position) % PULSE_CYCLE_MS)
+        % PULSE_CYCLE_MS
+}
+
+/// One golden-ratio step of the cycle per list position.
+fn identity_wave_offset_ms(position: usize) -> u64 {
+    let fraction = (position as f64 * PULSE_STAGGER_FRACTION).fract();
+    (fraction * PULSE_CYCLE_MS as f64).round() as u64
 }
 
 fn crest_spans(
@@ -294,25 +310,34 @@ fn crest_spans(
 
 // ── Height ───────────────────────────────────────────────────────────────
 
-/// The art's own columns.
-const LOGO_COLS: u16 = 10;
-/// Rows the art header needs: the art's three plus a usable body.
-const ART_MIN_ROWS: u16 = 14;
+/// The columns the header gives the art on top of the mascot's own width:
+/// one padding column before the info column.
+const LOGO_PAD: u16 = 1;
+/// Body rows the art header must leave for a usable body, on top of the
+/// mascot's own rows.
+const ART_BODY_ROWS: u16 = 11;
 
-/// Whether `area` holds the art header: enough rows for the art and a usable
-/// body, and enough columns for the logo slot, the brand, the version and the
-/// daemon chip with the content gap.
-fn art_fits(area: Rect) -> bool {
+/// Whether `area` holds the art header: enough rows for the mascot and a
+/// usable body, and enough columns for the logo slot, the brand, the version
+/// and the daemon chip with the content gap. The mascot reads it too, so it
+/// plays only while the art is drawn.
+pub(crate) fn art_fits(area: Rect) -> bool {
+    let (mascot_cols, mascot_rows) = App::MASCOT_SIZE;
     let brand = BRAND.chars().count();
     let ver = version_label().chars().count();
     let daemon = spans_width(&service_chip("daemon", ratatui::style::Color::Reset));
-    area.height >= ART_MIN_ROWS
-        && usize::from(area.width) >= usize::from(LOGO_COLS) + brand + ver + CONTENT_GAP + daemon
+    area.height >= mascot_rows as u16 + ART_BODY_ROWS
+        && usize::from(area.width)
+            >= mascot_cols + usize::from(LOGO_PAD) + brand + ver + CONTENT_GAP + daemon
 }
 
-/// Header rows `area` gets: three with the art, two without it.
+/// Header rows `area` gets: the mascot's own with the art, two without it.
 pub(super) fn header_height(area: Rect) -> u16 {
-    if art_fits(area) { 3 } else { 2 }
+    if art_fits(area) {
+        App::MASCOT_SIZE.1 as u16
+    } else {
+        2
+    }
 }
 
 // ── Draw ─────────────────────────────────────────────────────────────────
@@ -326,19 +351,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         ..area
     };
     let info_area = if art {
-        let cols: [Rect; 2] =
-            Layout::horizontal([Constraint::Length(LOGO_COLS), Constraint::Min(20)]).areas(header);
+        let cols: [Rect; 2] = Layout::horizontal([
+            Constraint::Length(App::MASCOT_SIZE.0 as u16 + LOGO_PAD),
+            Constraint::Min(20),
+        ])
+        .areas(header);
         draw_logo(frame, cols[0], app);
         cols[1]
     } else {
         header
     };
 
-    let rows: [Rect; 3] = if art {
-        Layout::vertical([Constraint::Length(1); 3]).areas(info_area)
+    // The info column follows the mascot's own rows: the brand row first, the
+    // status row second, the tabs on the last, any rows between left blank.
+    let rows: Rc<[Rect]> = if art {
+        Layout::vertical([Constraint::Length(1); App::MASCOT_SIZE.1]).split(info_area)
     } else {
         let two: [Rect; 2] = Layout::vertical([Constraint::Length(1); 2]).areas(info_area);
-        [two[0], two[1], Rect::default()]
+        Rc::from([two[0], two[1], Rect::default()])
     };
 
     let info_width = rows[0].width as usize;
@@ -488,9 +518,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         rows[1],
     );
 
-    // ── Row 2: tabs (the art header only; without the art they ride row 0) ──
+    // ── Last row: tabs (the art header only; without the art they ride row 0) ──
     if art {
-        super::tabs::draw(frame, rows[2], app);
+        super::tabs::draw(frame, rows[rows.len() - 1], app);
     }
 }
 
@@ -780,43 +810,9 @@ fn shunt_chip_color(app: &App) -> ratatui::style::Color {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let full_sprite = app.clawd.full_sprite;
-    let art = match app.clawd.frame(app.anim_ms()) {
-        Some(current) => clawd::render(current, full_sprite),
-        None => clawd::rest_art(full_sprite),
-    };
-    let lines: Vec<Line<'static>> = art.iter().map(|row| Line::from(row_spans(row))).collect();
+    let lines = app.mascot.draw(app.anim_ms());
     let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, area);
-}
-
-fn row_spans(row: &[(char, CellKind); clawd::COLS]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut glyphs = String::new();
-    let mut run_kind = row[0].1;
-    for &(glyph, kind) in row {
-        if kind != run_kind {
-            spans.push(Span::styled(
-                std::mem::take(&mut glyphs),
-                cell_style(run_kind),
-            ));
-            run_kind = kind;
-        }
-        glyphs.push(glyph);
-    }
-    spans.push(Span::styled(glyphs, cell_style(run_kind)));
-    spans
-}
-
-fn cell_style(kind: CellKind) -> Style {
-    let body = theme::accent_2_color();
-    match kind {
-        CellKind::Empty => Style::default(),
-        CellKind::Body => Style::default().fg(body),
-        CellKind::CutOut => Style::default().fg(body).bg(theme::clawd_cutout_color()),
-        CellKind::Lid => Style::default().fg(theme::clawd_cutout_color()).bg(body),
-        CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
-    }
 }
 
 #[cfg(test)]

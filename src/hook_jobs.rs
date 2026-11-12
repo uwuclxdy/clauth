@@ -53,7 +53,11 @@ fn note_at(payload: &Payload, now: u64) -> Option<String> {
     let waiting: Vec<(String, String)> = jobs::list(now)
         .into_iter()
         .filter(|job| {
-            job.phase() == JobPhase::Done
+            // A settled liveness record reads done but holds no result — its
+            // caller took it through the join — so only the collectable
+            // spelling is ever named as waiting.
+            job.kind == RecordKind::Collectable
+                && job.phase() == JobPhase::Done
                 && !jobs::done_is_expired(&job.record, now)
                 && job.record.host_session.as_deref() == Some(payload.session_id.as_str())
         })

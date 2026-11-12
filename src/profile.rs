@@ -1489,6 +1489,12 @@ pub(crate) struct AppState {
     /// through [`AppState::home_tab`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) home_tab: Option<HomeTab>,
+    /// Holds the header mascot on its rest pose and the Overview's provider
+    /// names flat (the Config tab's `reduce motion` row); spinners and the
+    /// saving shimmers keep moving, since they mark work in flight. `false` is
+    /// skipped, so an untouched profiles.toml carries no key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) reduce_motion: bool,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
@@ -1868,6 +1874,7 @@ impl Default for AppState {
             reset_display: None,
             clock_format: None,
             home_tab: None,
+            reduce_motion: false,
             show_estimates: true,
             show_pace: false,
             count_cache: false,
@@ -5196,7 +5203,7 @@ fn read_profile_config_text(name: &ProfileName) -> Option<String> {
 }
 
 /// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
-fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
+pub(crate) fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
     profile_id_at(&profile_config_path(name).ok()?)
 }
 

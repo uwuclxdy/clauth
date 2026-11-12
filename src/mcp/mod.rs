@@ -2026,10 +2026,7 @@ across accounts."
             now_epoch_secs(),
             delegate_digest_mode(&self.digest, abandoned),
         );
-        let is_error = payload
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_error = envelope_reports_failure(&payload);
         if result_file {
             // The blocking run mints no job file on the happy path, so mint a
             // result id from the same start time the hand-off would. A failed
@@ -2777,7 +2774,7 @@ const LISTING_MAX: usize = 10;
 ///
 /// **This is safe to return a blocking run's content from, and the reason is
 /// structural**: [`jobs::list_banded`] takes NO id, and neither does the
-/// [`jobs::list`] it sorts. They enumerate the directory and return what they
+/// [`jobs::list_readable`] walk it sorts. They enumerate the directory and return what they
 /// find, so nothing a caller spells selects a file, which is
 /// what [`jobs::RecordKind`] documents as the condition a new reader has to
 /// meet. Filtering this listing by a caller-supplied id would be the exact
@@ -3131,6 +3128,7 @@ fn fold_done_envelope(
     record: &jobs::JobRecord,
     digest: DigestMode<'_>,
 ) -> (serde_json::Value, bool) {
+    let is_error = done_job_failed(record);
     // A crashed tombstone renders the owner's copy raw, never the envelope
     // fallback: the run's lifetime ended, just with no result to collect.
     if record.crashed
@@ -3138,7 +3136,7 @@ fn fold_done_envelope(
     {
         return (
             serde_json::json!({ "crashed": true, "result": reason }),
-            true,
+            is_error,
         );
     }
     // A shared tombstone with no session id has no handle to promise, so
@@ -3161,11 +3159,40 @@ fn fold_done_envelope(
         now_epoch_secs(),
         digest,
     );
-    let is_error = payload
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     (payload, is_error)
+}
+
+/// Whether an envelope reports the run failed: `is_error: true`, false for
+/// every other shape. The one spelling of the rule, so the blocking reply, the
+/// settled liveness record and the stored-envelope delivery never split their
+/// verdicts.
+pub(crate) fn envelope_reports_failure(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a finished job failed: a crashed tombstone that names its end, a
+/// settled liveness record whose `outcome` the finalize stamped, or an
+/// envelope reporting `is_error: true`. The one rule every stored-record
+/// delivery's error flag and the TUI's delegate-finish cue read; the fold's
+/// live-usage footer never touches the flag, so it is judged off the stored
+/// envelope.
+pub(crate) fn done_job_failed(record: &jobs::JobRecord) -> bool {
+    if record.crashed && crashed_job_reason(&record.job_id, record).is_some() {
+        return true;
+    }
+    // The settled liveness record: the join was the delivery, so the outcome
+    // the finalize stamped is the verdict. A record an older server wrote
+    // carries no `outcome` and reads failed here, the old rule's verdict.
+    if record.envelope.is_none() && !record.crashed {
+        return !record.outcome;
+    }
+    record
+        .envelope
+        .as_ref()
+        .is_none_or(envelope_reports_failure)
 }
 
 /// Render a finished job's envelope into its response blocks and error flag.
@@ -3467,7 +3494,14 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // never collected, never dropped, and certainly minted — and answering an id
     // clauth is holding a live run under with "clauth may never have minted it"
     // is the mirror of the M5 defect where it asserted a mint it could not know.
+    // A run already finished with its caller attached left its settled record,
+    // which answers with the finished fact instead of the live one.
     if jobs::liveness_exists(job_id) {
+        if jobs::liveness_is_done(job_id) {
+            return format!(
+                "job_id {job_id}: the run finished, its result went back through the call that started it"
+            );
+        }
         return format!(
             "job_id {job_id} names a blocking `delegate` that is still running: \
              its result goes back through the call that started it, so there is \
@@ -5970,13 +6004,14 @@ impl Handoff {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// The run is over: write its envelope into the job file, if it owns one.
+    /// The run is over: write its envelope into the job file when it owns one,
+    /// or settle the blocking run's liveness record with its outcome.
     ///
     /// `Finished` is set under the state lock before anything else, so every
     /// beat resolving its destination from here writes nothing; the in-flight
     /// count is then drained before any of the IO below, so no beat write can
     /// land after it — recreating the liveness file or overwriting the
-    /// `write_done` a beat would otherwise race.
+    /// settle/`write_done` a beat would otherwise race.
     ///
     /// Inline result mode, test-only: the production spawn passes its own
     /// `result_file` through [`Self::finalize_with`].
@@ -6008,15 +6043,14 @@ impl Handoff {
         let owned = match previous {
             HandoffState::Converted(job) => Some(job),
             // A caller is still holding the join and takes the envelope from
-            // there, so this run's liveness record has no result left to offer.
-            // Leaving it would advertise a job nothing will ever collect, and
-            // writing a `done` record into it would deliver one result twice.
-            // The record goes first — it is what makes the id visible as a
-            // blocking run at all — then the registry entry, both outside the
-            // lock like every other write here.
+            // there, so the liveness record settles with the run's outcome and
+            // nothing else: writing the envelope into it would deliver one
+            // result twice. The record settles first — it is what makes the id
+            // visible as a blocking run at all — then the registry entry
+            // retires, both outside the lock like every other write here.
             HandoffState::Attached(mut run) => {
                 if let Some(spec) = run.live {
-                    jobs::remove_liveness(&spec.job_id);
+                    let _ = jobs::write_done_liveness(&spec, envelope);
                 }
                 drop(run.cancel_guard.take());
                 None

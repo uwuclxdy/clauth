@@ -64,6 +64,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::clawd;
+use crate::tui::mascot;
 use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
@@ -877,6 +878,9 @@ pub(crate) enum GlobalConfigRow {
     /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
+    /// `AppState.reduce_motion`: space/⏎ stills the header mascot and the
+    /// Overview's provider wave, or lets them move again.
+    ReduceMotion,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     SwitchOffWhenSpent,
@@ -5127,15 +5131,40 @@ pub(crate) struct CodexRow {
     pub(crate) fetched_at: Option<u64>,
 }
 
-/// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
-/// roster is one small TOML and each reading is the profile's own cache file
-/// plus the small files beside its store (the quarantine record, and the store
-/// itself on a cache miss for the plan), the same set `status --json` reads
-/// with no daemon running.
+/// [`codex_rows_landed`]'s rows, for the tests that only need the snapshot.
+#[cfg(test)]
 pub(crate) fn codex_rows() -> Vec<CodexRow> {
-    crate::codex_profiles::CodexState::load()
-        .map(|state| codex_rows_from(&state))
-        .unwrap_or_default()
+    codex_rows_landed().0
+}
+
+/// Read the codex roster into the [`App::codex_rows`] snapshot, naming
+/// whether the read landed: construction seeds the mascot's codex edges only
+/// off a landed read, so a roster unreadable then seeds on its first landed
+/// refresh instead of reading as edges. Lock-free: the roster is one small
+/// TOML and each reading is the profile's own cache file plus the small files
+/// beside its store (the quarantine record, and the store itself on a cache
+/// miss for the plan), the same set `status --json` reads with no daemon
+/// running.
+fn codex_rows_landed() -> (Vec<CodexRow>, bool) {
+    match crate::codex_profiles::CodexState::load() {
+        Ok(state) => (codex_rows_from(&state), true),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+/// A window's reset instant, parsed the way every reset compare reads it.
+fn window_reset_instant(window: Option<&crate::usage::UsageWindow>) -> Option<i64> {
+    window
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(crate::usage::iso_to_epoch_secs)
+}
+
+/// One codex row's 5h and 7d reset instants, for the codex reset compare.
+fn window_instants(row: &CodexRow) -> [Option<i64>; 2] {
+    [
+        window_reset_instant(row.five_hour.as_ref()),
+        window_reset_instant(row.seven_day.as_ref()),
+    ]
 }
 
 /// [`codex_rows`] over a roster already read.
@@ -5405,6 +5434,81 @@ impl AutoSwitchProjection {
         }
     }
 }
+
+/// The last reading of each producer field a mascot cue is an edge of. Each
+/// starts from the first reading (construction's, where it takes one), so a
+/// launch is never an event, and a reading that could not be taken leaves the
+/// last one standing rather than reading as a change.
+#[derive(Default)]
+struct MascotSeen {
+    active: Option<SeenAccount>,
+    auth_broken: Vec<SeenAccount>,
+    /// Session id -> the account the row last read ran on, off the last tally
+    /// that read.
+    sessions: Option<std::collections::BTreeMap<String, String>>,
+    /// Per account, each window's 5h and 7d boundary as a `(last named,
+    /// highest named)` pair: the reset test reads the first, the "later"
+    /// test the second.
+    resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Every delegate job id seen finished; `None` before the first read. Ids
+    /// are minted unique and a finish is final, so the set only grows: a read
+    /// that misses a record cannot make it finish twice.
+    delegates_done: Option<HashSet<String>>,
+    /// The codex roster's active name at the last landed reading.
+    codex_active: Option<String>,
+    /// The codex roster's broken names at the last landed reading.
+    codex_broken: Vec<String>,
+    /// Per codex account, each window's 5h and 7d boundary as a `(last
+    /// named, highest named)` pair, the same shape [`Self::resets`] holds.
+    codex_resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Whether a codex reading has landed yet: the first landing seeds, so a
+    /// roster unreadable at construction cannot read as an edge once it lands.
+    codex_seeded: bool,
+}
+
+/// One account as a name-keyed producer field names it, with the stored id
+/// under the name: a rename moves the name but keeps the id, so an id that
+/// matches across a move is the same account, never an event.
+#[derive(Clone)]
+struct SeenAccount {
+    name: ProfileName,
+    id: Option<crate::profile::ProfileId>,
+}
+
+impl SeenAccount {
+    /// The reading under `name` now, with the id the disk holds for it.
+    fn read(name: &ProfileName) -> Self {
+        Self {
+            name: name.clone(),
+            id: crate::profile::stored_profile_id(name),
+        }
+    }
+}
+
+impl MascotSeen {
+    /// The seed a fresh app reads: every name-keyed field with the id the disk
+    /// holds under it.
+    fn seeded(active: Option<&ProfileName>, auth_broken: &[ProfileName]) -> Self {
+        Self {
+            active: active.map(SeenAccount::read),
+            auth_broken: auth_broken.iter().map(SeenAccount::read).collect(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The one mascot slot's concrete type, named here alone: the slot field,
+/// the header's size read and the row floor below all follow it, so swapping
+/// the mascot is a one-site edit.
+type SlotMascot = clawd::Clawd;
+
+/// The art header's info column needs a row for the brand, one for the
+/// status line and one for the tabs: a mascot shorter than three rows cannot
+/// carry them, so the slot mascot's height floors at three.
+const _: () = assert!(
+    <SlotMascot as mascot::Mascot>::SIZE.1 >= 3,
+    "the mascot must stand at least 3 rows tall to carry the header's info column"
+);
 
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
@@ -5879,9 +5983,12 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
-    /// Header mascot playback: a random big animation at launch and every 30
-    /// minutes, a subtler one every 10 seconds.
-    pub(crate) clawd: clawd::Clawd,
+    /// Header mascot playback: one big animation at launch, then a
+    /// [`mascot::Cue`] a producer raises or a quiet key's hello, under the
+    /// slot rules in [`mascot::Stage`].
+    pub(crate) mascot: mascot::Stage<SlotMascot>,
+    /// The readings the per-tick mascot cues compare against.
+    mascot_seen: MascotSeen,
     /// Pinned animation phase for render tests that must sample a specific point
     /// of the wave. Backdating `started_at` instead would subtract from
     /// `Instant::now()`, which panics on a host whose uptime is shorter than the
@@ -6009,6 +6116,8 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// When [`poll_delegate_jobs`] last read the job store; `None` = due.
+    last_delegate_poll: Option<Instant>,
     /// The job-store snapshot the Setup detail's live-session field reads from,
     /// so a frame never walks `~/.claude/jobs`. Cached like `live_sessions`:
     /// refreshed by [`poll_live_sessions`] on its own tick, never on a config
@@ -6532,6 +6641,35 @@ impl App {
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
+        let (codex, codex_landed) = codex_rows_landed();
+        let mascot_seen = MascotSeen {
+            sessions: live_sessions.session_members().cloned(),
+            codex_seeded: codex_landed,
+            codex_active: codex
+                .iter()
+                .find(|row| row.active)
+                .map(|row| row.name.to_string()),
+            codex_broken: codex
+                .iter()
+                .filter(|row| row.broken)
+                .map(|row| row.name.to_string())
+                .collect(),
+            codex_resets: codex
+                .iter()
+                .map(|row| {
+                    (
+                        row.name.to_string(),
+                        Self::seed_windows(window_instants(row)),
+                    )
+                })
+                .collect(),
+            ..MascotSeen::seeded(
+                config.state.active_profile.as_ref(),
+                &config.state.auth_broken,
+            )
+        };
+        let mut mascot = mascot::Stage::new(SlotMascot::new());
+        mascot.set_reduce_motion(config.state.reduce_motion);
 
         let config: ConfigHandle = Arc::new(RankedMutex::new(config));
         let switch_gates = Arc::new(SwitchGates(std::sync::Mutex::new(switch_gates)));
@@ -6738,7 +6876,8 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
-            clawd: clawd::Clawd::new(),
+            mascot,
+            mascot_seen,
             #[cfg(test)]
             anim_phase_ms: None,
             #[cfg(test)]
@@ -6772,6 +6911,7 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            last_delegate_poll: None,
             job_trees,
             handed_off,
             tps,
@@ -6782,7 +6922,7 @@ impl App {
             #[cfg(test)]
             delegate_speed_walks: 0,
             last_finished_speeds_refresh: Instant::now(),
-            codex_rows: codex_rows(),
+            codex_rows: codex,
             claude_resets,
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
@@ -6948,12 +7088,31 @@ impl App {
     /// `false` paints Claude Code's simplified mascot, the one it draws on
     /// Apple's Terminal.app.
     pub(crate) fn with_full_sprite(mut self, full_sprite: bool) -> Self {
-        self.clawd.full_sprite = full_sprite;
+        self.mascot.set_full_sprite(full_sprite);
         self
     }
 
-    /// The production write path for the tally after construction.
+    /// The production write path for the tally after construction. A session
+    /// id the last read tally lacked is a session starting; one whose account
+    /// (the member it runs on) changed has moved, whatever its swap stamp. An
+    /// unread tally is no reading.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        if let Some(now) = tally.session_members() {
+            let mut cues = Vec::new();
+            if let Some(before) = &self.mascot_seen.sessions {
+                for (id, member) in now {
+                    match before.get(id) {
+                        None => cues.push(mascot::Cue::SessionStarted),
+                        Some(was) if was != member => cues.push(mascot::Cue::SessionMoved),
+                        Some(_) => {}
+                    }
+                }
+            }
+            self.mascot_seen.sessions = Some(now.clone());
+            for cue in cues {
+                self.cue_mascot(cue);
+            }
+        }
         self.live_sessions = tally;
     }
 
@@ -7627,18 +7786,66 @@ impl App {
         }
     }
 
+    /// A window resets when a fresh reading names a later boundary and the
+    /// boundary it last named has passed. "Later" compares against the
+    /// highest boundary ever named and "passed" against the one last named:
+    /// a rollover spike reports `now + 5h` for a while before settling onto
+    /// the boundary the window really ends on, so the highest instant alone
+    /// would keep the next rollover from counting once the settled boundary
+    /// passed. Compared as an instant, so the same reset spelled in another
+    /// offset is none, and the highest instant outlives a lapsed window, so
+    /// a window reopening on a later reset still counts.
+    fn observe_window_resets(&mut self, readings: Vec<(String, [Option<i64>; 2])>) {
+        let now = crate::usage::now_epoch_secs();
+        if Self::reset_windows(&mut self.mascot_seen.resets, readings, now) {
+            self.cue_mascot(mascot::Cue::WindowReset);
+        }
+    }
+
+    /// The per-boundary reset compare shared by the claude and codex arms: a
+    /// fresh reading that names a later boundary than the highest one ever named
+    /// resets once the boundary LAST named has passed. The pair keeps both facts —
+    /// a rollover spike reports `now + 5h` for a while before settling, so the
+    /// highest instant alone would keep the next rollover from counting long
+    /// after the settled boundary passed.
+    fn reset_windows(
+        seen: &mut HashMap<String, [Option<(i64, i64)>; 2]>,
+        readings: impl IntoIterator<Item = (String, [Option<i64>; 2])>,
+        now: i64,
+    ) -> bool {
+        let mut reset = false;
+        for (name, instants) in readings {
+            let slot = seen.entry(name).or_default();
+            for (seen, read) in slot.iter_mut().zip(instants) {
+                let Some(read) = read else {
+                    continue;
+                };
+                reset |= seen.is_some_and(|(last, max)| last <= now && read > max);
+                *seen = Some((read, seen.map_or(read, |(_, max)| max.max(read))));
+            }
+        }
+        reset
+    }
+
+    /// The first stored reading of a window pair: the boundary last named and the
+    /// highest one are the same instant, so no reset can fire off it.
+    fn seed_windows(instants: [Option<i64>; 2]) -> [Option<(i64, i64)>; 2] {
+        instants.map(|instant| instant.map(|instant| (instant, instant)))
+    }
+
     pub(crate) fn apply_usage(&mut self) {
         // The per-frame snapshot builder doubles as the per-tick reader: the
         // bell, history/wallet re-read sets and the stale map all derive from
         // its one picker pass, never a second one.
         let readings = self.readings_snapshot();
-        let (bells, history_names, wallet_names, stale_map) = {
+        let (bells, resets, history_names, wallet_names, stale_map) = {
             let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             let mut stale_map = HashMap::new();
             let mut bells = Vec::new();
+            let mut resets = Vec::new();
             let mut history_names = Vec::new();
             let mut wallet_names = Vec::new();
             for p in &cfg.profiles {
@@ -7702,7 +7909,17 @@ impl App {
                         .is_none_or(|age| stale && age > stale_after_ms(interval_ms)),
                     None => stale,
                 };
-                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !bell_stale;
+                let fetched_fresh = readings.status_of(&name) == Some(FetchStatus::Fresh);
+                if fetched_fresh && let Some(usage) = readings.usage_of(&name) {
+                    resets.push((
+                        name.clone(),
+                        [
+                            window_reset_instant(usage.five_hour.as_ref()),
+                            window_reset_instant(usage.seven_day.as_ref()),
+                        ],
+                    ));
+                }
+                let fresh = fetched_fresh && !bell_stale;
                 bells.push((name.clone(), p.bell_threshold, util, fresh));
                 if readings.usage.contains_key(&name) {
                     history_names.push(name.clone());
@@ -7711,7 +7928,7 @@ impl App {
                     wallet_names.push(name);
                 }
             }
-            (bells, history_names, wallet_names, stale_map)
+            (bells, resets, history_names, wallet_names, stale_map)
         };
         self.stale_cues = stale_map;
         // `bells` is the full profile set this pass observed, so an account
@@ -7720,13 +7937,18 @@ impl App {
             let present: HashSet<&str> =
                 bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
             self.bell_fired.forget_absent(&present);
+            self.mascot_seen
+                .resets
+                .retain(|name, _| present.contains(name.as_str()));
         }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);
                 self.set_tab_activity(Tab::Overview, ToastKind::Warning);
+                self.cue_mascot(mascot::Cue::BellCrossed);
             }
         }
+        self.observe_window_resets(resets);
 
         // Re-read any history log that changed on disk. The file is written by
         // whichever process holds the fetch lease — this one or a headless
@@ -8114,13 +8336,28 @@ impl App {
     /// binding surface.
     const WIDTH_FLOOR: u16 = 34;
 
+    /// The one mascot slot's cell size, `(columns, rows)`: the header's art
+    /// fit, its height and its logo column read it, and it follows the slot's
+    /// type ([`SlotMascot`]), so a new mascot re-sizes the header from the
+    /// one place its type is named.
+    pub(crate) const MASCOT_SIZE: (usize, usize) = <SlotMascot as mascot::Mascot>::SIZE;
+
     /// Called each frame with the current terminal size. Tracks compact
     /// state and the width floor; the matching warning banner is recomputed
     /// from these flags in `update_banner` each tick, so it self-clears on
-    /// resize (no toast).
+    /// resize (no toast). The mascot plays only while the header draws its art.
     pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
         self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
+        let frame = ratatui::layout::Rect::new(0, 0, terminal_width, terminal_height);
+        self.mascot.set_shown(crate::tui::render::art_fits(frame));
+    }
+
+    /// The one seam every mascot cue goes through, stamped on the clock the
+    /// mascot draws by.
+    pub(crate) fn cue_mascot(&mut self, cue: mascot::Cue) {
+        let now_ms = self.anim_ms();
+        self.mascot.cue(cue, now_ms);
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -9313,6 +9550,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
+    let now_ms = app.anim_ms();
+    app.mascot.key_pressed(now_ms);
 
     // The offset a one-shot scroll rendered becomes the key state on the next
     // key, whatever it is, ahead of every handler: a reset then acts on the
@@ -20228,11 +20467,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 21] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 22] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
+    GlobalConfigRow::ReduceMotion,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::SyncMcpLogins,
@@ -20262,7 +20502,8 @@ impl GlobalConfigRow {
             GlobalConfigRow::Theme
             | GlobalConfigRow::ResetShape
             | GlobalConfigRow::ClockNotation
-            | GlobalConfigRow::HomeTab => "appearance",
+            | GlobalConfigRow::HomeTab
+            | GlobalConfigRow::ReduceMotion => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::SyncMcpLogins
@@ -20379,6 +20620,7 @@ pub(crate) fn global_config_row_live(app: &App, row: GlobalConfigRow) -> bool {
         GlobalConfigRow::Theme
         | GlobalConfigRow::ResetShape
         | GlobalConfigRow::HomeTab
+        | GlobalConfigRow::ReduceMotion
         | GlobalConfigRow::DivergenceDefault
         | GlobalConfigRow::SwitchOffWhenSpent
         | GlobalConfigRow::WeeklyThreshold
@@ -20407,6 +20649,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::ResetShape => cycle_reset_display(app),
         GlobalConfigRow::HomeTab => cycle_home_tab(app),
+        GlobalConfigRow::ReduceMotion => toggle_reduce_motion(app),
         GlobalConfigRow::ClockNotation => cycle_clock_format(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
@@ -20706,6 +20949,16 @@ fn cycle_home_tab(app: &mut App) {
     let next = next.next();
     app.save_state_delta(|s, _held| s.home_tab = Some(next.into()));
     app.apply_forgets();
+}
+
+/// Flip `reduce_motion` (default off). The mascot stills at once rather than
+/// at the next tick's compare, so no frame of motion follows the press.
+fn toggle_reduce_motion(app: &mut App) {
+    let next = !app.config().state.reduce_motion;
+    app.save_state_delta(|s, _held| s.reduce_motion = next);
+    app.apply_forgets();
+    let still = app.config().state.reduce_motion;
+    app.mascot.set_reduce_motion(still);
 }
 
 fn cycle_divergence_default(app: &mut App) {
@@ -23594,11 +23847,24 @@ fn drain_daemon_control(app: &mut App) {
     }
 }
 
+/// Land one probe's health: the one place `daemon_health` moves, so the
+/// throttled poll and a TUI-issued stop/start tell the same edge. A held lock,
+/// fed or not, is a running daemon; only losing it is the daemon going down,
+/// and a start is no event.
+fn land_daemon_health(app: &mut App, health: crate::daemon::DaemonHealth) {
+    let went_down = app.daemon_health != crate::daemon::DaemonHealth::Absent
+        && health == crate::daemon::DaemonHealth::Absent;
+    app.daemon_health = health;
+    if went_down {
+        app.cue_mascot(mascot::Cue::DaemonDown);
+    }
+}
+
 /// Re-probe the header chip and the menu's verb at once rather than at the
 /// next throttled probe.
 fn reprobe_daemon(app: &mut App) {
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     app.last_daemon_probe = Instant::now();
@@ -24142,6 +24408,7 @@ fn drain_codex_login(app: &mut App) {
             Ok(canonical) => {
                 refresh_codex_rows(app);
                 app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
@@ -26514,7 +26781,8 @@ fn drain_codex_new_login(app: &mut App) {
             Ok(outcome) => {
                 match stash_new_form_login(app, DraftLogin::CodexMint(Box::new(outcome))) {
                     StashOutcome::Staged => {
-                        app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                        app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                        app.cue_mascot(mascot::Cue::LoginGained);
                     }
                     StashOutcome::FormClosed => app.toast(
                         ToastKind::Warning,
@@ -31698,6 +31966,7 @@ fn apply_status_incidents(
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }
+            app.cue_mascot(mascot::Cue::NewIncident);
         }
         app.status.seen_latest = newest_id.clone();
     }
@@ -31914,7 +32183,8 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // so the profile this login belongs to has no final name yet.
         match stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome))) {
             StashOutcome::Staged => {
-                app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             StashOutcome::FormClosed => app.toast(
                 ToastKind::Warning,
@@ -32041,6 +32311,7 @@ fn apply_login_snapshot(
             app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{name}'"));
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -32098,6 +32369,7 @@ fn apply_console_login(
                     "console session captured for '{name}'\nit expires 48h after your aliyun sign-in, not after this login"
                 ),
             );
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -32112,7 +32384,7 @@ fn apply_console_login(
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
     let now_ms = app.anim_ms();
-    app.clawd.tick(now_ms);
+    app.mascot.tick(now_ms);
     // Safety net: a forget noted without an immediate drain still lands before
     // the next frame reads the stores; the per-site drains keep this a no-op.
     app.apply_forgets();
@@ -32124,6 +32396,7 @@ pub(crate) fn on_tick(app: &mut App) {
                     ToastKind::Success,
                     format!("updated to v{v}\nrestart to apply"),
                 );
+                app.cue_mascot(mascot::Cue::UpdateInstalled);
             }
             UpdateEvent::Available(v) => {
                 app.toast(
@@ -32188,6 +32461,7 @@ pub(crate) fn on_tick(app: &mut App) {
             app.usage_detail_scroll = 0;
         }
     }
+    observe_mascot_state(app);
     app.apply_usage();
 
     drain_switch_gates(app);
@@ -32278,6 +32552,7 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
     poll_live_sessions(app);
+    poll_delegate_jobs(app);
     sync_broken_verdicts(app);
     sync_credit_refusals(app);
     poll_codex_rows(app);
@@ -32389,6 +32664,7 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     if refresh_codex_rows(app) {
+        observe_codex_state(app);
         app.place_overview_cursor();
     }
     let names: Vec<crate::profile::ProfileName> = app
@@ -32398,6 +32674,82 @@ fn poll_codex_rows(app: &mut App) {
         .map(|p| p.name.clone())
         .collect();
     app.claude_resets = claude_resets(&names);
+}
+
+/// The codex roster's mascot edges, compared right after each landed refresh
+/// off the snapshot the refresh already took (never a per-tick disk read): the
+/// active name changing is a switch, a name entering `broken` is a quarantine
+/// (one leaving it is none), and a 5h or 7d window rolls over under the same
+/// rule [`App::observe_window_resets`] applies to the claude windows — a
+/// fresh reading names a later boundary than the highest one ever named, once
+/// the boundary last named has passed. An unreadable roster keeps the
+/// previous rows, so it never reads as an edge, and the first landed reading
+/// only seeds.
+fn observe_codex_state(app: &mut App) {
+    let active = app
+        .codex_rows
+        .iter()
+        .find(|row| row.active)
+        .map(|row| row.name.to_string());
+    let broken: Vec<String> = app
+        .codex_rows
+        .iter()
+        .filter(|row| row.broken)
+        .map(|row| row.name.to_string())
+        .collect();
+    let resets: HashMap<String, [Option<i64>; 2]> = app
+        .codex_rows
+        .iter()
+        .map(|row| (row.name.to_string(), window_instants(row)))
+        .collect();
+
+    if !app.mascot_seen.codex_seeded {
+        app.mascot_seen.codex_seeded = true;
+        app.mascot_seen.codex_active = active;
+        app.mascot_seen.codex_broken = broken;
+        app.mascot_seen.codex_resets = resets
+            .into_iter()
+            .map(|(name, instants)| (name, App::seed_windows(instants)))
+            .collect();
+        return;
+    }
+
+    let switched = match (&app.mascot_seen.codex_active, &active) {
+        (Some(seen), Some(next)) => *seen != *next,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.codex_active = active;
+
+    let quarantined = broken
+        .iter()
+        .any(|name| !app.mascot_seen.codex_broken.contains(name));
+    app.mascot_seen.codex_broken = broken;
+
+    let now = crate::usage::now_epoch_secs();
+    let reset = App::reset_windows(
+        &mut app.mascot_seen.codex_resets,
+        resets
+            .iter()
+            .map(|(name, instants)| (name.clone(), *instants)),
+        now,
+    );
+    // A dropped codex profile forgets its boundaries, so a re-created one
+    // seeds again, the way the claude arm's retain does.
+    let present: HashSet<&str> = resets.keys().map(String::as_str).collect();
+    app.mascot_seen
+        .codex_resets
+        .retain(|name, _| present.contains(name.as_str()));
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+    if reset {
+        app.cue_mascot(mascot::Cue::WindowReset);
+    }
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
@@ -32411,7 +32763,7 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     // The image this process runs never comes back, so each kind's toast
@@ -32536,6 +32888,7 @@ fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
         if app.daemon_toasted_kinds.latch(change) {
             app.toast(ToastKind::Warning, daemon_binary_toast(change));
         }
+        app.cue_mascot(mascot::Cue::DaemonReplaced);
     }
     refresh_plugin_check(app);
 }
@@ -32746,6 +33099,150 @@ fn poll_live_sessions(app: &mut App) {
     app.set_live_sessions(tally);
     app.handed_off = crate::runtime::handed_off_live_members(&jobs);
     app.job_trees = jobs;
+}
+
+/// Read the delegate job store at most once a second on every tab, so a
+/// delegate finishing while the Services tab is out of view still reaches the
+/// mascot: each job seen finished for the first time cues a finish, failed by
+/// the same error flag every stored-record delivery folds. A finish claimed
+/// between two reads left its delivery ledger, which cues by the verdict the
+/// claim stamped, so a claimed finish reaches the mascot exactly like an
+/// unclaimed one. One id cues once, whichever spelling it is first seen as.
+/// The first read only seeds, ledgers included, so a finish from before the
+/// launch is no event; a store that could not be read is no reading, so it
+/// neither seeds nor cues.
+fn poll_delegate_jobs(app: &mut App) {
+    const DELEGATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_delegate_poll
+        .is_some_and(|t| t.elapsed() < DELEGATE_POLL_INTERVAL)
+    {
+        return;
+    }
+    app.last_delegate_poll = Some(Instant::now());
+    let Some(jobs) = crate::mcp::jobs::list_banded_readable(crate::usage::now_ms()) else {
+        return;
+    };
+    let finished = jobs
+        .iter()
+        .filter(|job| matches!(job.liveness, crate::mcp::jobs::JobLiveness::Done));
+    let Some(ledgers) = crate::mcp::jobs::list_ledgers_readable() else {
+        return;
+    };
+    let Some(seen) = app.mascot_seen.delegates_done.as_mut() else {
+        app.mascot_seen.delegates_done = Some(
+            finished
+                .map(|job| job.record.job_id.clone())
+                .chain(ledgers.into_iter().map(|ledger| ledger.job_id))
+                .collect(),
+        );
+        return;
+    };
+    let mut cues: Vec<mascot::Cue> = finished
+        .filter(|job| seen.insert(job.record.job_id.clone()))
+        .map(|job| {
+            if crate::mcp::done_job_failed(&job.record) {
+                mascot::Cue::DelegateFailed
+            } else {
+                mascot::Cue::DelegateDone
+            }
+        })
+        .collect();
+    cues.extend(
+        ledgers
+            .into_iter()
+            .filter(|ledger| seen.insert(ledger.job_id.clone()))
+            .map(|ledger| {
+                if ledger.failed {
+                    mascot::Cue::DelegateFailed
+                } else {
+                    mascot::Cue::DelegateDone
+                }
+            }),
+    );
+    for cue in cues {
+        app.cue_mascot(cue);
+    }
+}
+
+/// The mascot's config-held edges, compared each tick after the reload so one
+/// compare covers an in-TUI write and another process's alike: the active
+/// account changing is a switch, and a name entering `auth_broken` is a
+/// quarantine (one leaving it is none). A rename moves a name but keeps the
+/// account's stored id under it, so an id matching across the move is no cue;
+/// a name whose id cannot be read falls back to the name answer. A reload that
+/// flips `reduce_motion` applies it here. An id is read only when its name is
+/// new to the reading, never per tick.
+fn observe_mascot_state(app: &mut App) {
+    let (active, auth_broken, still) = {
+        let cfg = app.config();
+        (
+            cfg.state.active_profile.as_ref().cloned(),
+            cfg.state.auth_broken.clone(),
+            cfg.state.reduce_motion,
+        )
+    };
+    app.mascot.set_reduce_motion(still);
+
+    let before = app.mascot_seen.active.clone();
+    let now = active.as_ref().map(|name| match &before {
+        Some(seen) if seen.name == *name => seen.clone(),
+        _ => SeenAccount::read(name),
+    });
+    let switched = match (&before, &now) {
+        (Some(seen), Some(next)) => {
+            seen.name != next.name && !same_account(seen.id.as_ref(), next.id.as_ref())
+        }
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.active = now;
+
+    let before = std::mem::take(&mut app.mascot_seen.auth_broken);
+    let mut departed: Vec<crate::profile::ProfileId> = before
+        .iter()
+        .filter(|seen| !auth_broken.contains(&seen.name))
+        .filter_map(|seen| seen.id.clone())
+        .collect();
+    let mut quarantined = false;
+    let mut now = Vec::with_capacity(auth_broken.len());
+    for name in &auth_broken {
+        if let Some(seen) = before.iter().find(|seen| seen.name == *name) {
+            now.push(seen.clone());
+            continue;
+        }
+        let seen = SeenAccount::read(name);
+        let renamed =
+            seen.id
+                .as_ref()
+                .is_some_and(|id| match departed.iter().position(|old| old == id) {
+                    Some(pos) => {
+                        departed.remove(pos);
+                        true
+                    }
+                    None => false,
+                });
+        if !renamed {
+            quarantined = true;
+        }
+        now.push(seen);
+    }
+    app.mascot_seen.auth_broken = now;
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+}
+
+/// Whether two names answer for one account: both stored ids read and equal.
+fn same_account(
+    old: Option<&crate::profile::ProfileId>,
+    new: Option<&crate::profile::ProfileId>,
+) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old == new)
 }
 
 /// Re-sync the durable dead-login verdicts into the live `ThirdPartyBroken`
@@ -33080,6 +33577,7 @@ fn drain_op_results(app: &mut App) {
                     ),
                 );
                 app.set_tab_activity(Tab::Usage, ToastKind::Danger);
+                app.cue_mascot(mascot::Cue::RefreshFailed);
             }
         }
     }
@@ -33361,6 +33859,7 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
