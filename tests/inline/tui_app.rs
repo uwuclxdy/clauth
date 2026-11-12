@@ -14930,7 +14930,11 @@ fn saved_off_update_leaves_new_app_with_no_update_handle() {
         profiles: Vec::new(),
     });
     assert!(
-        app.update_handle.is_none(),
+        app.shutdown
+            .update_handle
+            .lock()
+            .expect("the update slot")
+            .is_none(),
         "saved off → no update thread at startup"
     );
 }
@@ -14951,7 +14955,11 @@ fn a_saved_on_app_spawns_a_check_that_ends_at_once_in_a_test_build() {
         profiles: Vec::new(),
     });
     assert!(
-        app.update_handle.is_some(),
+        app.shutdown
+            .update_handle
+            .lock()
+            .expect("the update slot")
+            .is_some(),
         "saved on → the update thread spawns"
     );
     assert_eq!(
@@ -59244,6 +59252,43 @@ fn shutdown_returns_at_once_over_an_answered_switch_gate() {
     );
 }
 
+/// Once the shared shutdown began (the stop-signal watcher can run it while a
+/// frame loop held past its grace is still live), a switch gate answered
+/// after it is drained and its marker cleared, with nothing completed:
+/// completing a `Ready` answer would relink credentials after the shutdown's
+/// detach. A completed `Broken` answer raises a toast, so it reads as one.
+#[test]
+fn a_switch_gate_answered_after_the_shutdown_began_completes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::shutdown(&mut app).expect("shutdown");
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Switching);
+    app.switch_gate_tx
+        .send(super::SwitchGateResult::gated(
+            work,
+            crate::oauth::AuthGate::Broken,
+        ))
+        .expect("queue");
+    let toasts = app.toasts.len();
+
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the answer is drained"
+    );
+    assert!(
+        !super::token_spend_in_flight(&app.activity),
+        "the answer's marker is cleared"
+    );
+    assert_eq!(
+        app.toasts.len(),
+        toasts,
+        "an answer drained after the shutdown began completes nothing"
+    );
+}
+
 /// The exit wait stores the shutdown flag, so the scheduler stops ticking and
 /// the spend gate refuses fresh spends while the wait runs.
 #[test]
@@ -74189,5 +74234,518 @@ fn clearing_the_last_plugin_problem_while_on_the_option_row_keeps_it_in_view() {
     assert!(
         app.services.plugin_option_acts(),
         "and the toggle acts on it"
+    );
+}
+
+/// A bootstrapped TUI hands its scheduler tick thread to `shutdown`; the
+/// handle is never leaked.
+#[test]
+fn a_bootstrapped_tui_hands_its_tick_thread_to_shutdown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _gamma_store, _readable) = unreadable_middle_member_app();
+    app.finish_bootstrap();
+    assert!(
+        app.shutdown
+            .scheduler
+            .lock()
+            .expect("the tick slot")
+            .is_some(),
+        "finish_bootstrap stores the tick thread the scheduler start returned"
+    );
+    super::shutdown(&mut app).expect("shutdown");
+    assert!(
+        app.shutdown
+            .scheduler
+            .lock()
+            .expect("the tick slot")
+            .is_none(),
+        "shutdown takes the tick thread"
+    );
+}
+
+/// `shutdown` wakes the scheduler's tick thread and waits for it to end, not
+/// merely dropping the handle: the tick thread ends only after a watcher,
+/// 300 ms past the stop, has read whether `shutdown` returned. A `shutdown`
+/// that does not wait has returned by then; one that waits has not, unless
+/// the watcher stalls past the quit's 4 s window.
+#[test]
+fn shutdown_wakes_and_waits_for_the_tick_thread() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _gamma_store, _readable) = unreadable_middle_member_app();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let returned = Arc::new(AtomicBool::new(false));
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let flag = Arc::clone(&app.shutting_down);
+    let seen = Arc::clone(&stopped);
+    let sleeper = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::park_timeout(std::time::Duration::from_secs(60));
+        }
+        let _ = released.recv_timeout(std::time::Duration::from_secs(60));
+        seen.store(true, Ordering::SeqCst);
+    });
+    let flag = Arc::clone(&app.shutting_down);
+    let done = Arc::clone(&returned);
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let early = done.load(Ordering::SeqCst);
+        let _ = release.send(());
+        early
+    });
+    app.shutdown.adopt_scheduler(crate::daemon::TickThread::new(
+        Some(sleeper),
+        Arc::clone(&app.shutting_down),
+    ));
+
+    super::shutdown(&mut app).expect("shutdown");
+    returned.store(true, Ordering::SeqCst);
+
+    let returned_early = watcher.join().expect("the watcher thread");
+    assert!(
+        !returned_early,
+        "shutdown returned while the tick thread was still running"
+    );
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "shutdown woke and waited for the tick thread"
+    );
+    assert!(
+        app.shutdown
+            .scheduler
+            .lock()
+            .expect("the tick slot")
+            .is_none(),
+        "shutdown took the handle"
+    );
+}
+
+/// A quit abandons a tick that outlasts its window: `shutdown` returns once
+/// 4 s passed, never waiting out the daemon's 20 s drain bound.
+#[test]
+fn shutdown_abandons_a_tick_that_outlasts_the_quit_window() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _gamma_store, _readable) = unreadable_middle_member_app();
+    let release = Arc::new(AtomicBool::new(false));
+    let released = Arc::clone(&release);
+    let stuck = std::thread::spawn(move || {
+        while !released.load(Ordering::SeqCst) {
+            std::thread::park_timeout(std::time::Duration::from_millis(50));
+        }
+    });
+    app.shutdown.adopt_scheduler(crate::daemon::TickThread::new(
+        Some(stuck),
+        Arc::clone(&app.shutting_down),
+    ));
+
+    let started = std::time::Instant::now();
+    super::shutdown(&mut app).expect("shutdown");
+    let waited = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+
+    assert!(
+        waited >= std::time::Duration::from_secs(4) && waited < std::time::Duration::from_secs(6),
+        "a quit waits 4 s for a stuck tick and no longer: {waited:?}"
+    );
+}
+
+/// A terminal whose every write fails, as a closed one does, over a fixed
+/// viewport so building it reads no real terminal.
+#[cfg(unix)]
+fn closed_terminal() -> ratatui::Terminal<ratatui::backend::CrosstermBackend<ClosedOutput>> {
+    ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(ClosedOutput),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+        },
+    )
+    .expect("a fixed viewport needs no terminal")
+}
+
+/// Output that fails every write and flush with `EIO`.
+#[cfg(unix)]
+struct ClosedOutput;
+
+#[cfg(unix)]
+impl std::io::Write for ClosedOutput {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+}
+
+/// A pending stop signal ends the frame loop before the next draw, and the
+/// exit still runs `shutdown` and answers `Interrupted`: a SIGHUP or SIGTERM
+/// quits through the clean shutdown and its exit save, never the default
+/// action.
+#[cfg(unix)]
+#[test]
+fn a_pending_stop_signal_ends_the_frame_loop_and_shutdown_still_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _gamma_store, _readable) = unreadable_middle_member_app();
+    let ended = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&ended);
+    let flag = Arc::clone(&app.shutting_down);
+    let sleeper = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::park_timeout(std::time::Duration::from_secs(60));
+        }
+        seen.store(true, Ordering::SeqCst);
+    });
+    app.shutdown.adopt_scheduler(crate::daemon::TickThread::new(
+        Some(sleeper),
+        Arc::clone(&app.shutting_down),
+    ));
+
+    // Never drawn: the loop ends on the fed signal before its first frame. A
+    // draw would fail at once on this terminal, so a loop that skips its stop
+    // check returns that error rather than running on.
+    let mut terminal = closed_terminal();
+    let stop_signal = std::sync::OnceLock::from(signal_hook::consts::signal::SIGHUP);
+    let frames =
+        super::super::run_frames(&mut terminal, &mut app, &mut || stop_signal.get().is_some());
+    assert!(
+        frames.is_ok(),
+        "the stop request ends the loop before its first draw: {frames:?}"
+    );
+    let shutdown = super::shutdown(&mut app);
+    let outcome = super::super::exit_outcome(frames, stop_signal.get().copied(), shutdown);
+
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "shutdown stopped and waited for the tick thread on the signal path"
+    );
+    match outcome {
+        Err(e) => match e.downcast_ref::<crate::Interrupted>() {
+            Some(crate::Interrupted(signal)) => assert_eq!(
+                *signal,
+                signal_hook::consts::signal::SIGHUP,
+                "the stop signal rides out to the 128 + signal exit"
+            ),
+            None => panic!("the signal path's exit reads as Interrupted: {e:?}"),
+        },
+        Ok(()) => panic!("a loop ended by a stop signal is not a clean quit"),
+    }
+}
+
+/// A hangup can fail the frame it lands in before its signal arrives: a stop
+/// signal recorded by the time the shutdown returned decides the exit
+/// (`Interrupted`, so `128 + signal` with no `Error:` line), and a failure
+/// with no signal recorded keeps its own error.
+#[cfg(unix)]
+#[test]
+fn a_frame_error_with_a_pending_stop_signal_exits_as_that_signal() {
+    let hangup = signal_hook::consts::signal::SIGHUP;
+    let outcome = super::super::exit_outcome(
+        Err(anyhow::anyhow!("the input reader is gone")),
+        Some(hangup),
+        Ok(()),
+    );
+    match outcome {
+        Err(e) => match e.downcast_ref::<crate::Interrupted>() {
+            Some(crate::Interrupted(signal)) => assert_eq!(
+                *signal, hangup,
+                "the pending signal decides the exit, not the frame error"
+            ),
+            None => {
+                panic!("a frame error beside a pending stop signal reads as Interrupted: {e:?}")
+            }
+        },
+        Ok(()) => panic!("a failed loop is not a clean quit"),
+    }
+
+    let outcome = super::super::exit_outcome(
+        Err(anyhow::anyhow!("the input reader is gone")),
+        None,
+        Ok(()),
+    );
+    match outcome {
+        Err(e) => assert_eq!(
+            e.to_string(),
+            "the input reader is gone",
+            "with no signal pending, the loop's own error is the exit"
+        ),
+        Ok(()) => panic!("a failed loop is not a clean quit"),
+    }
+}
+
+/// Two concurrent shutdowns, as the stop-signal watcher's and the frame
+/// loop's can be, run the body once, and the second returns only once the
+/// first finished: the first is held on a tick thread released 300 ms after
+/// the second started, so a second that returned before the first finished
+/// reads that tick unreleased.
+#[test]
+fn a_second_concurrent_shutdown_runs_nothing_and_waits_for_the_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, _gamma_store, _readable) = unreadable_middle_member_app();
+    let released = Arc::new(AtomicBool::new(false));
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let flag = Arc::clone(&app.shutting_down);
+    let tick_released = Arc::clone(&released);
+    let tick = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::park_timeout(std::time::Duration::from_secs(60));
+        }
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(60));
+        tick_released.store(true, Ordering::SeqCst);
+    });
+    app.shutdown.adopt_scheduler(crate::daemon::TickThread::new(
+        Some(tick),
+        Arc::clone(&app.shutting_down),
+    ));
+
+    let shutdown = Arc::clone(&app.shutdown);
+    let first = std::thread::spawn(move || shutdown.run());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.shutting_down.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !app.shutting_down.load(Ordering::SeqCst) {
+        // Released and joined before the red, so neither the body nor the
+        // tick thread outlives the sandbox: the stop raises the tick's flag
+        // and wakes it, and the wait joins it.
+        let _ = release.send(());
+        let _ = first.join();
+        let tick = app.shutdown.scheduler.lock().expect("the tick slot").take();
+        let tick_ended = tick.is_none_or(|tick| {
+            tick.stop();
+            tick.wait_stopped(
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(10),
+            )
+        });
+        panic!("the first shutdown started within 10 s (tick thread ended: {tick_ended})");
+    }
+    let shutdown = Arc::clone(&app.shutdown);
+    let seen = Arc::clone(&released);
+    let second = std::thread::spawn(move || {
+        shutdown.run();
+        seen.load(Ordering::SeqCst)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = release.send(());
+
+    first.join().expect("the first shutdown");
+    let finished_first = second.join().expect("the second shutdown");
+    assert!(
+        finished_first,
+        "the second shutdown returned while the first still waited on its tick thread"
+    );
+    assert_eq!(
+        app.shutdown.runs.load(Ordering::SeqCst),
+        1,
+        "two concurrent shutdowns ran the body once"
+    );
+}
+
+/// A frame loop that returns within the stop grace never sees the watcher's
+/// fallback: the shutdown and the exit stay on the frame loop's thread.
+#[cfg(unix)]
+#[test]
+fn a_frame_loop_returning_within_the_stop_grace_never_sees_the_fallback() {
+    let (frames_running, frames_left) = std::sync::mpsc::channel::<()>();
+    let returns = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(frames_running);
+    });
+    let mut fired = None;
+    let started = std::time::Instant::now();
+    super::super::end_unless_frames_left(
+        signal_hook::consts::signal::SIGTERM,
+        &frames_left,
+        std::time::Duration::from_secs(5),
+        |signal| fired = Some(signal),
+    );
+    let waited = started.elapsed();
+    returns.join().expect("the frame loop's stand-in");
+    assert_eq!(fired, None, "a loop that returned in time got the fallback");
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the watcher waited out its grace for a loop that had returned: {waited:?}"
+    );
+}
+
+/// A frame loop still running when the stop grace ends gets the watcher's
+/// fallback, with the signal that arrived and never before the grace.
+#[cfg(unix)]
+#[test]
+fn a_frame_loop_held_past_the_stop_grace_gets_the_fallback_with_its_signal() {
+    let (frames_running, frames_left) = std::sync::mpsc::channel::<()>();
+    let mut fired = None;
+    let started = std::time::Instant::now();
+    super::super::end_unless_frames_left(
+        signal_hook::consts::signal::SIGHUP,
+        &frames_left,
+        std::time::Duration::from_millis(300),
+        |signal| fired = Some((signal, started.elapsed())),
+    );
+    drop(frames_running);
+    let (signal, at) = fired.expect("a loop held past the grace got no fallback");
+    assert_eq!(
+        signal,
+        signal_hook::consts::signal::SIGHUP,
+        "the fallback exits as the signal that arrived"
+    );
+    assert!(
+        at >= std::time::Duration::from_millis(300),
+        "the fallback fired {at:?} after the signal, inside its 300 ms grace"
+    );
+}
+
+/// A watcher fallback whose shutdown panics still exits as its signal: a
+/// watcher that died there would leave the stop signals caught and unread.
+/// The shutdown panics on its config lock, poisoned beforehand.
+#[cfg(unix)]
+#[test]
+fn a_stop_fallback_whose_shutdown_panics_still_exits_as_its_signal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = bare_app();
+    let config = Arc::clone(&app.config);
+    let poisoner = std::thread::spawn(move || {
+        let _held = App::lock_config(&config);
+        panic!("a panic under the config lock poisons it");
+    });
+    assert!(
+        poisoner.join().is_err(),
+        "precondition: the config lock is poisoned"
+    );
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::super::EXIT_CODES.with(|codes| *codes.borrow_mut() = Some(Vec::new()));
+    super::super::stop_fallback(signal_hook::consts::signal::SIGHUP, &app.shutdown);
+    let exits = super::super::EXIT_CODES.with(|codes| codes.borrow_mut().take());
+    drop(capture);
+
+    assert!(
+        !app.shutdown.ran.is_completed(),
+        "precondition: the shutdown panicked rather than finishing"
+    );
+    assert_eq!(
+        exits,
+        Some(vec![129]),
+        "a fallback whose shutdown panicked still exits as 128 + SIGHUP"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: the TUI's shutdown on signal 1 panicked; exiting without the rest of it"
+                .to_string()
+        ],
+        "a fallback whose shutdown panicked logs one line naming its signal"
+    );
+}
+
+/// A stop signal reaches the frame loop through the watch's record, and a
+/// loop that returns leaves the shutdown and the exit to its own thread: with
+/// a 2 s grace, the watcher never falls back during a 4 s shutdown, so only a
+/// stall of the test thread longer than the grace could red a correct system.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_ends_the_frame_loop_through_its_watch_and_leaves_it_the_exit() {
+    let grace = std::time::Duration::from_secs(2);
+    let (watch, recorded, frames_left) = super::super::StopWatch::new();
+    let (arrive, arrivals) = std::sync::mpsc::channel::<i32>();
+    let (fell_back, fallbacks) = std::sync::mpsc::channel::<i32>();
+    let watcher = std::thread::spawn(move || {
+        super::super::watch_stop_signals(
+            arrivals.into_iter(),
+            &recorded,
+            &frames_left,
+            grace,
+            |signal| {
+                let _ = fell_back.send(signal);
+            },
+        );
+    });
+    arrive
+        .send(signal_hook::consts::signal::SIGTERM)
+        .expect("the watcher takes the signal");
+
+    let mut fallback_during_shutdown = None;
+    let outcome = super::super::frames_then_exit(
+        watch,
+        |stop_requested| {
+            let deadline = std::time::Instant::now() + grace * 2;
+            while !stop_requested() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!("the stop never reached the frame loop"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        },
+        || {
+            fallback_during_shutdown = fallbacks.recv_timeout(grace * 2).ok();
+            Ok(())
+        },
+    );
+    drop(arrive);
+    watcher.join().expect("the watcher thread");
+
+    assert_eq!(
+        outcome
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<crate::Interrupted>())
+            .map(|interrupted| interrupted.0),
+        Some(signal_hook::consts::signal::SIGTERM),
+        "the loop ended by the stop exits as that signal: {outcome:?}"
+    );
+    assert_eq!(
+        fallback_during_shutdown, None,
+        "the watcher fell back while the frame loop's thread ran the shutdown"
+    );
+}
+
+/// A stop signal that arrives while the shutdown runs, after the frame loop
+/// failed, still decides the exit: a hangup's signal can trail the frame error
+/// it caused.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_arriving_during_the_shutdown_still_decides_the_exit() {
+    let (watch, recorded, frames_left) = super::super::StopWatch::new();
+    let seen = Arc::clone(&recorded);
+    let (arrive, arrivals) = std::sync::mpsc::channel::<i32>();
+    let watcher = std::thread::spawn(move || {
+        super::super::watch_stop_signals(
+            arrivals.into_iter(),
+            &recorded,
+            &frames_left,
+            std::time::Duration::from_secs(5),
+            |_| {},
+        );
+    });
+
+    let outcome = super::super::frames_then_exit(
+        watch,
+        |_| Err(anyhow::anyhow!("the draw failed")),
+        move || {
+            arrive
+                .send(signal_hook::consts::signal::SIGHUP)
+                .expect("the watcher takes the signal");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while seen.get().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        },
+    );
+    watcher.join().expect("the watcher thread");
+
+    assert_eq!(
+        outcome
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<crate::Interrupted>())
+            .map(|interrupted| interrupted.0),
+        Some(signal_hook::consts::signal::SIGHUP),
+        "a signal recorded during the shutdown decides the exit over the frame error: {outcome:?}"
     );
 }

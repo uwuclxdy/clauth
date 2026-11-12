@@ -50,8 +50,8 @@ pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -394,18 +394,100 @@ pub(crate) fn await_start(
 pub(crate) const SPEND_DRAIN_BOUND: Duration =
     crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(Duration::from_secs(1));
 
+/// The scheduler's tick thread as a clean stop sees it: what
+/// `usage::spawn_refresher` returns. The thread saves the tps producer's
+/// unsaved attribution (applied proxy token records included) as its last act,
+/// and the producer lives on that thread alone, so a stop wakes it and waits
+/// for it to end.
+#[derive(Clone, Debug)]
+pub(crate) struct TickThread {
+    /// `None` where no thread was spawned (a test build's skip). The join
+    /// handle sits in a shared slot so a finished thread can be taken out and
+    /// joined: the join is the only reader of a panic, which ends the thread
+    /// without running its exit save.
+    thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl TickThread {
+    pub(crate) fn new(
+        thread: Option<std::thread::JoinHandle<()>>,
+        shutting_down: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            thread: thread.map(|handle| Arc::new(Mutex::new(Some(handle)))),
+            shutting_down,
+        }
+    }
+
+    /// Raise the stop flag and cut the thread's sleep short. Returns at once:
+    /// a tick in flight finishes first, then the thread saves and ends.
+    pub(crate) fn stop(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(thread) = &self.thread
+            && let Ok(guard) = thread.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.thread().unpark();
+        }
+    }
+
+    /// Wait until the thread ended, or `bound` past `started` — `true` when
+    /// it ended. A tick still running then is abandoned with its unsaved
+    /// records, as a crash would lose them, and says so once. A panic ends
+    /// the thread but skips the exit save; the join reads it and says so
+    /// once.
+    pub(crate) fn wait_stopped(&self, started: Instant, bound: Duration) -> bool {
+        let Some(thread) = &self.thread else {
+            return true;
+        };
+        while !thread
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(std::thread::JoinHandle::is_finished))
+            .unwrap_or(true)
+        {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                logline!(
+                    "clauth: the usage tick was still running after {} s; exiting without its last tps save",
+                    bound.as_secs()
+                );
+                return false;
+            }
+            std::thread::sleep(gateway::stop_sleep(remaining));
+        }
+        if let Ok(mut guard) = thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            drop(guard);
+            if handle.join().is_err() {
+                logline!(
+                    "clauth: the usage tick thread panicked; exiting without its last tps save"
+                );
+            }
+        }
+        true
+    }
+}
+
 /// The daemon's stop gate for a token spend: the store the scheduler claims
-/// spends in and the flag that refuses new ones. [`serve`] builds it once and
-/// every signal watcher carries it, the `(Err, Err)` start arm included, so a
-/// stop signal waits the spend in flight out before the process exits. What it
-/// does not cover: a stop that lands before that watcher is installed (the
-/// scheduler starts in `boot()`), and a process left with no watcher at all
-/// because signal registration failed.
+/// spends in and the flag that refuses new ones, plus the tick thread whose
+/// exit save the stop waits for. [`serve`] builds it once and every signal
+/// watcher carries it, the `(Err, Err)` start arm included, so a stop signal
+/// waits the spend in flight out before the process exits. What it does not
+/// cover: a stop that lands before that watcher is installed — the scheduler
+/// starts in `boot()`, and until the watcher exists a SIGTERM keeps the
+/// default action, so the process dies and the span is lost like a crash —
+/// and a process left with no watcher at all because signal registration
+/// failed.
 pub(crate) struct SpendDrain {
     #[cfg(unix)]
     activity: ActivityStore,
     #[cfg(unix)]
     shutting_down: Arc<AtomicBool>,
+    #[cfg(unix)]
+    scheduler: Option<TickThread>,
 }
 
 impl SpendDrain {
@@ -417,18 +499,57 @@ impl SpendDrain {
             activity,
             #[cfg(unix)]
             shutting_down,
+            #[cfg(unix)]
+            scheduler: None,
         }
     }
 
-    /// Refuse every scheduler token spend that has not started, then wait until
-    /// the one already in flight saves, or `bound` elapses — `true` when it
-    /// cleared. The flag goes up FIRST: a spend claiming the gap before a
-    /// check could otherwise run past the drain and die unsaved, so the claim
-    /// re-tests the flag under the store's lock. One log line when it actually
-    /// waited, one when it gives up, none when nothing ran.
+    /// The same gate, also stopping `scheduler` and waiting for its exit save.
+    pub(crate) fn with_scheduler(self, scheduler: TickThread) -> Self {
+        #[cfg(not(unix))]
+        let _ = scheduler;
+        Self {
+            #[cfg(unix)]
+            activity: self.activity,
+            #[cfg(unix)]
+            shutting_down: self.shutting_down,
+            #[cfg(unix)]
+            scheduler: Some(scheduler),
+        }
+    }
+
+    /// Refuse every scheduler token spend that has not started and wake the
+    /// tick thread, then wait until the spend already in flight saves or
+    /// `bound` elapses — `true` when it cleared — and then for the tick
+    /// thread's exit save. The flag goes up FIRST: a spend claiming the gap
+    /// before a check could otherwise run past the drain and die unsaved, so
+    /// the claim re-tests the flag under the store's lock. One log line when
+    /// the spend wait actually waited, one when it gives up, none when nothing
+    /// ran.
+    ///
+    /// The tick thread gets until `bound` past the drain's start — the same
+    /// window as the spend wait, so the two waits never add. The drain ends
+    /// within `SPEND_DRAIN_BOUND` (20 s) whatever the tick does, and
+    /// `REPLACE_WAIT` (that plus 5 s) still lets the stop finish before
+    /// `--replace` force-kills it. A clean stop loses the unsaved records
+    /// only when the last tick outruns that window.
     #[cfg(unix)]
     pub(crate) fn drain(&self, bound: Duration) -> bool {
         self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.stop();
+        }
+        let started = Instant::now();
+        let cleared = self.wait_spend(started, bound);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wait_stopped(started, bound);
+        }
+        cleared
+    }
+
+    /// The spend half of [`Self::drain`], its flag already raised.
+    #[cfg(unix)]
+    fn wait_spend(&self, started: Instant, bound: Duration) -> bool {
         if !crate::usage::token_spend_in_flight(&self.activity) {
             return true;
         }
@@ -442,7 +563,6 @@ impl SpendDrain {
                 bound.as_secs()
             ),
         }
-        let started = Instant::now();
         while crate::usage::token_spend_in_flight(&self.activity) {
             let remaining = bound.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -564,13 +684,26 @@ pub(crate) fn serve(
         logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
     }
     if let Some(prepared) = prepared {
-        let ctx = api::serve_prepared(
+        let ctx = match api::serve_prepared(
             prepared,
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
             daemon.memory_stores(),
-        )?;
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // `boot` started the tick thread before this last start step
+                // that can fail; stop it and wait for its exit save, as the
+                // signal path would, or the records applied since the last
+                // save are lost like a crash.
+                if let Some(scheduler) = daemon.scheduler.get() {
+                    scheduler.stop();
+                    let _ = scheduler.wait_stopped(Instant::now(), SPEND_DRAIN_BOUND);
+                }
+                return Err(e);
+            }
+        };
         daemon.push = api::start_push(&ctx);
     }
 
@@ -1774,6 +1907,9 @@ struct Daemon {
     /// switch-off does not execute once the watchdog released the lease (the
     /// holder that took over decides).
     fetch_lease: Arc<FetchLease>,
+    /// The scheduler's tick thread once `boot` started it: the stop gate
+    /// ([`Self::spend_drain`]) carries it, so a stop waits for its exit save.
+    scheduler: std::sync::OnceLock<TickThread>,
     /// Last-seen reload fingerprint — drives external-change reload. Set only
     /// by a successful reload (which re-read disk); a self-initiated write
     /// never moves it, so the next tick re-reads, rebuilds and logs.
@@ -1896,13 +2032,15 @@ impl Daemon {
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             claude_resets_memo: new_claude_resets_memo(),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
-            // Raised by [`SpendDrain::drain`] when a stop signal arrives: from
-            // then on the scheduler refuses every new token spend
+            // Raised by [`SpendDrain::drain`] when a stop signal arrives, and
+            // by `serve` when its API fails to start after `boot`: from then
+            // on the scheduler refuses every new token spend
             // (`spawn_refresher` and the rotation gate read it), while the
             // spend already in flight saves. The TUI's quit path is the flag's
             // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
             fetch_lease: Arc::new(FetchLease::new()),
+            scheduler: std::sync::OnceLock::new(),
             last_reload_fp,
             last_reload_error: None,
             snapshot,
@@ -2017,13 +2155,17 @@ impl Daemon {
     /// what a signal watcher carries, so the drain sees exactly the token
     /// spends claimed in this store and refuses the ones that have not started.
     fn spend_drain(&self) -> SpendDrain {
-        SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down))
+        let drain = SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down));
+        match self.scheduler.get() {
+            Some(scheduler) => drain.with_scheduler(scheduler.clone()),
+            None => drain,
+        }
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
-        spawn_refresher(
+        let scheduler = spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
@@ -2066,6 +2208,8 @@ impl Daemon {
             false,
             Arc::clone(&self.snapshot),
         );
+        // `boot` runs once per daemon, so the cell is empty here.
+        let _ = self.scheduler.set(scheduler);
     }
 
     /// Main loop. Writes an initial `status.json` immediately (so a reader that

@@ -4193,13 +4193,24 @@ pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
     .expect("write daemon.status.json");
 }
 
+/// The hang bound `reap_bounded` gives a stop-test child to die of the
+/// SIGTERM its stop sent: the daemon's drain can wait up to
+/// [`crate::daemon::SPEND_DRAIN_BOUND`] in all, its token spend and the tick
+/// thread's exit save sharing that window, plus a margin for the loopback
+/// saves and the process's own exit. A hang detector, not a race bound:
+/// raising it weakens nothing.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const SERVE_STOP_REAP_BOUND: std::time::Duration =
+    crate::daemon::SPEND_DRAIN_BOUND.saturating_add(std::time::Duration::from_secs(10));
+
 /// Wait for a fake supervisor the code under test should have SIGTERMed to
-/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
-/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
-/// the exit status on success, which the caller asserts is SIGTERM.
+/// exit, BOUNDED by [`SERVE_STOP_REAP_BOUND`]: a red (no SIGTERM came) kills +
+/// reaps the child and panics with an assertion, never hangs the suite on an
+/// unbounded `wait`. Returns the exit status on success, which the caller
+/// asserts is SIGTERM.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + SERVE_STOP_REAP_BOUND;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status,

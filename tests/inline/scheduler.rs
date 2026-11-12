@@ -18598,9 +18598,10 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
 }
 
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
-/// inside the spawned tick worker: nothing joins that worker, so a home-
-/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
-/// the operator's real home — live the moment the seed grows a write leg.
+/// inside the spawned tick worker: only a clean stop waits for that thread,
+/// up to its bound, so a home-derived path resolved on it could outlive a
+/// test's `HOME_OVERRIDE` and read the operator's real home — live the moment
+/// the seed grows a write leg.
 /// Entering through
 /// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
 /// the only way to pin WHERE the seed runs; asserting immediately after return,

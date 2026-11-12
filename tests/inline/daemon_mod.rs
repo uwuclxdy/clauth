@@ -11690,3 +11690,102 @@ fn a_daemon_reload_seeds_a_dead_login_another_process_recorded() {
         );
     }
 }
+
+// ── stop-gate wiring pin ─────────────────────────────────────────────────────
+
+/// The stop gate a daemon builds carries the tick thread its scheduler start
+/// returned, so the drain's wake and wait reach that thread.
+#[cfg(unix)]
+#[test]
+fn a_daemons_stop_gate_carries_its_scheduler_tick_thread() {
+    let _home = HomeSandbox::new();
+    let daemon = daemon_for(persist(vec![], None, 60_000));
+    daemon.spawn_scheduler();
+    let drain = daemon.spend_drain();
+    let scheduler = drain
+        .scheduler
+        .as_ref()
+        .expect("the stop gate carries the scheduler's tick thread");
+    assert!(
+        std::sync::Arc::ptr_eq(&scheduler.shutting_down, &daemon.shutting_down),
+        "the gate must wake the same flag the tick thread reads"
+    );
+}
+
+/// A daemon stop waits for a tick that outlasts the children's stop budget
+/// but ends inside the drain's bound, so that tick's exit save still runs.
+#[cfg(unix)]
+#[test]
+fn a_daemon_stop_waits_for_a_tick_longer_than_the_child_stop_budget() {
+    // The give-up line a red logs stays out of the real home.
+    let _home = HomeSandbox::new();
+    let tick = crate::daemon::gateway::DAEMON_STOP_BUDGET + Duration::from_secs(1);
+    assert!(
+        tick < crate::daemon::SPEND_DRAIN_BOUND,
+        "fixture: the tick must end inside the drain's bound"
+    );
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raised = std::sync::Arc::clone(&flag);
+    let seen = std::sync::Arc::clone(&ended);
+    let sleeper = std::thread::spawn(move || {
+        while !raised.load(Ordering::SeqCst) {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+        std::thread::sleep(tick);
+        seen.store(true, Ordering::SeqCst);
+    });
+    let thread = crate::daemon::TickThread::new(Some(sleeper), std::sync::Arc::clone(&flag));
+    let spends = crate::daemon::SpendDrain::new(crate::testutil::fresh_activity(), flag)
+        .with_scheduler(thread);
+
+    spends.drain(crate::daemon::SPEND_DRAIN_BOUND);
+
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "the drain abandoned a tick that ends inside its bound"
+    );
+}
+
+/// A stop whose token spend and tick both outrun the drain's bound ends at
+/// that one bound: the tick thread's wait shares the spend wait's window, so
+/// the two never add and `--replace`'s force kill still lands after the
+/// drain.
+#[cfg(unix)]
+#[test]
+fn a_stop_with_a_stuck_spend_and_a_stuck_tick_ends_at_one_bound() {
+    // The give-up lines a stop logs stay out of the real home.
+    let _home = HomeSandbox::new();
+    let bound = Duration::from_secs(2);
+    let activity = crate::testutil::fresh_activity();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let name = crate::profile::ProfileName::from("stuck-spend");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, flag.as_ref())
+            .expect("an unset flag admits the spend");
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = std::sync::Arc::clone(&release);
+    let stuck = std::thread::spawn(move || {
+        while !released.load(Ordering::SeqCst) {
+            std::thread::park_timeout(Duration::from_millis(50));
+        }
+    });
+    let thread = crate::daemon::TickThread::new(Some(stuck), std::sync::Arc::clone(&flag));
+    let spends = crate::daemon::SpendDrain::new(std::sync::Arc::clone(&activity), flag)
+        .with_scheduler(thread);
+
+    let started = std::time::Instant::now();
+    let cleared = spends.drain(bound);
+    let waited = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+    drop(held);
+
+    assert!(
+        !cleared,
+        "a spend still in flight at the bound reads as not cleared"
+    );
+    assert!(
+        waited >= bound && waited < bound + bound / 2,
+        "the spend and the tick share one bound: {waited:?}"
+    );
+}

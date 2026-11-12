@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::daemon::LeaseTicket;
 use crate::lockorder::{RankedMutex, rank};
@@ -6353,6 +6353,12 @@ const SPEND_CAP_IN_FLIGHT_GRACE_MS: u64 = 30_000;
 thread_local! {
     static TPS_PRODUCER: std::cell::RefCell<crate::tps::Producer> =
         std::cell::RefCell::new(crate::tps::Producer::new());
+    /// The lease generation the producer's last leased pass ran under: the
+    /// exit save's ticket. A watchdog release moves the lease's generation, so
+    /// a life that lost the lease, or re-took it with no producer pass since
+    /// (the pass that runs `rejoin_files` first), saves nothing at exit.
+    static TPS_LEASE_GENERATION: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
     /// (last write ms, last written bytes with `generated_at` blanked).
     static TPS_LAST_WRITE: std::cell::RefCell<(u64, Option<Vec<u8>>)> =
         const { std::cell::RefCell::new((0, None)) };
@@ -6943,6 +6949,9 @@ fn tps_producer_tick(now_ms: u64) {
 /// shared tps files. Neither check is a lock shared with the release: the
 /// check-to-write window it cannot close is stated on `Producer::tick_leased`.
 fn tps_producer_tick_leased(now_ms: u64, lease: Option<LeaseTicket<'_>>) {
+    if let Some(ticket) = lease {
+        TPS_LEASE_GENERATION.with(|g| g.set(Some(ticket.generation())));
+    }
     let snap = TPS_PRODUCER.with(|p| p.borrow_mut().tick_leased(now_ms, lease));
     if !lease_is_current(lease) {
         return;
@@ -6981,6 +6990,17 @@ fn tps_producer_tick_leased(now_ms: u64, lease: Option<LeaseTicket<'_>>) {
         c.0 = now_ms;
         c.1 = Some(slow_bytes);
     });
+}
+
+/// The tick thread's last act on a clean stop: the producer's pending
+/// attribution save, under the ticket of its last leased pass, so a life
+/// that never ran one, or whose lease moved since, writes nothing.
+fn tps_exit_save(lease: &crate::daemon::FetchLease) {
+    let Some(generation) = TPS_LEASE_GENERATION.with(std::cell::Cell::get) else {
+        return;
+    };
+    let ticket = lease.ticket_at(generation);
+    TPS_PRODUCER.with(|p| p.borrow_mut().save_before_exit(now_ms(), Some(ticket)));
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -9486,12 +9506,13 @@ pub(crate) fn spawn_refresher(
     fetch_lease: Arc<crate::daemon::FetchLease>,
     display_reader: bool,
     snapshot: Arc<RankedMutex<crate::usage::SnapshotMap, rank::Snapshot>>,
-) {
+) -> crate::daemon::TickThread {
     // Seed kick blocks from the per-profile cache files on the CALLING thread
     // so a restart mid-outage resumes the decayed retry clock instead of
     // hammering. Must happen here, not inside the spawned closure below:
-    // nothing joins that thread, so a home-derived path resolved on it could
-    // outlive a test's `HOME_OVERRIDE` and read the operator's real home.
+    // only a clean stop waits for that thread, so a home-derived path
+    // resolved on it could outlive a test's `HOME_OVERRIDE` and read the
+    // operator's real home.
     let mut names: Vec<String> = tokens
         .lock()
         .map(|t| t.iter().map(|e| e.name.to_string()).collect())
@@ -9571,24 +9592,24 @@ pub(crate) fn spawn_refresher(
         *slot.borrow_mut() = Some(Arc::clone(&state.skipped_unreadable));
     });
     let watchdog_lease = Arc::clone(&state.fetch_lease);
-    start_refresher_workers(state, watchdog_lease, tick_and_stamp);
+    start_refresher_workers(state, watchdog_lease, tick_and_stamp)
 }
 
 /// The only place the lease watchdog and the tick thread are spawned, so the
 /// test-only wiring pin can record the arguments the spawns actually use: no
-/// in-process test may start either thread, so the pin reads them before the
-/// spawn-skip.
+/// in-process test may start either thread through here, so the pin reads them
+/// before the spawn-skip.
 fn start_refresher_workers(
     state: SchedulerState,
     watchdog_lease: Arc<crate::daemon::FetchLease>,
     tick_body: fn(&SchedulerState),
-) {
+) -> crate::daemon::TickThread {
     #[cfg(test)]
     LAST_REFRESHER_START.with(|slot| {
         *slot.borrow_mut() = Some((Arc::clone(&watchdog_lease), tick_body));
     });
     // Same test-skip rationale as the status/tokens/pricing workers in
-    // `tui/app.rs`: a detached tick thread is never joined, so it could run
+    // `tui/app.rs`: a tick thread no test stops could run
     // `tick()` — which itself resolves home-derived paths and makes network
     // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound. The
     // one caller that must run it is the re-entered E2E `serve` stop test: a
@@ -9598,25 +9619,49 @@ fn start_refresher_workers(
     // leaves the suppression in place.
     #[cfg(test)]
     if std::env::var_os(CLAUTH_TEST_RUN_SCHEDULER).is_none() {
-        return;
+        return crate::daemon::TickThread::new(None, Arc::clone(&state.shutting_down));
     }
     crate::daemon::spawn_lease_watchdog(watchdog_lease, Arc::clone(&state.shutting_down));
+    spawn_tick_thread(state, tick_body)
+}
+
+/// The tick thread: `tick_body` once per [`TICK_INTERVAL`] until the stop
+/// flag rises, then the producer's exit save. The interval is slept on the
+/// thread's park token, so a [`crate::daemon::TickThread::stop`] ends the
+/// sleep at once instead of leaving the process to exit mid-sleep.
+fn spawn_tick_thread(
+    state: SchedulerState,
+    tick_body: fn(&SchedulerState),
+) -> crate::daemon::TickThread {
+    let shutting_down = Arc::clone(&state.shutting_down);
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("clauth-tick".into())
         .spawn(move || {
-            loop {
-                if state.shutting_down.load(Ordering::SeqCst) {
-                    break;
-                }
-                std::thread::sleep(TICK_INTERVAL);
+            while !state.shutting_down.load(Ordering::SeqCst) {
+                sleep_unless_stopped(&state.shutting_down, TICK_INTERVAL);
                 if state.shutting_down.load(Ordering::SeqCst) {
                     break;
                 }
                 tick_body(&state);
             }
+            tps_exit_save(&state.fetch_lease);
         })
         .expect("failed to spawn scheduler tick thread");
+    crate::daemon::TickThread::new(Some(thread), shutting_down)
+}
+
+/// Park for `interval`, or until the stop flag rises and an unpark lands; a
+/// spurious wake parks again for the rest.
+fn sleep_unless_stopped(shutting_down: &AtomicBool, interval: Duration) {
+    let started = Instant::now();
+    while !shutting_down.load(Ordering::SeqCst) {
+        let remaining = interval.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::park_timeout(remaining);
+    }
 }
 
 /// Evaluate the fallback chain and queue an auto-switch target.
@@ -11439,6 +11484,10 @@ mod proxy_p6_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/inline/scheduler_exit_save.rs"]
+mod exit_save_tests;
 
 /// CLA-ROLL cadence for the rolling-sidecar freshness scan. The due predicate is
 /// stateless against the wall clock ([`crate::oauth::rolling_sidecar_restamp_due`]),

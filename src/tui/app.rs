@@ -5424,7 +5424,7 @@ pub(crate) struct App {
     pub(crate) op_sender: OpResultSender,
     /// Off-thread AUTH-1 switch-gate answers; drained in `on_tick` by
     /// `drain_switch_gates`, which completes or refuses the pending switch.
-    pub(crate) switch_gates: std::sync::mpsc::Receiver<SwitchGateResult>,
+    pub(crate) switch_gates: Arc<SwitchGates>,
     /// Sender side; cloned into each switch-gate worker.
     pub(crate) switch_gate_tx: std::sync::mpsc::Sender<SwitchGateResult>,
     /// Startup signals from reconcile/bootstrap workers; drained in `on_tick`.
@@ -5655,8 +5655,6 @@ pub(crate) struct App {
     pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
-    /// Update check thread handle; awaited on TUI exit for clean shutdown.
-    pub(crate) update_handle: Option<update::UpdateThread>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
@@ -5965,6 +5963,8 @@ pub(crate) struct App {
     pub(crate) bootstrap_active: Arc<AtomicBool>,
     /// Signal to the scheduler thread that the UI is shutting down.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The terminal-free shutdown, shared with the stop-signal watcher.
+    pub(crate) shutdown: Arc<Shutdown>,
     /// Per-tab background-event indicator; `None` = no pending activity.
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
@@ -6533,8 +6533,23 @@ impl App {
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
 
+        let config: ConfigHandle = Arc::new(RankedMutex::new(config));
+        let switch_gates = Arc::new(SwitchGates(std::sync::Mutex::new(switch_gates)));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Shutdown {
+            ran: std::sync::Once::new(),
+            began: AtomicBool::new(false),
+            shutting_down: Arc::clone(&shutting_down),
+            activity: Arc::clone(&activity),
+            switch_gates: Arc::clone(&switch_gates),
+            config: Arc::clone(&config),
+            scheduler: std::sync::Mutex::new(None),
+            update_handle: std::sync::Mutex::new(update_handle),
+            #[cfg(test)]
+            runs: AtomicUsize::new(0),
+        });
         let mut app = Self {
-            config: Arc::new(RankedMutex::new(config)),
+            config,
             usage_store,
             usage_status,
             usage_tokens,
@@ -6639,7 +6654,6 @@ impl App {
             compact: false,
             below_width_floor: false,
             update_results,
-            update_handle,
             login: None,
             shunt_paste: None,
             shunt_add_committed: None,
@@ -6747,7 +6761,8 @@ impl App {
             startup_seeded: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
+            shutdown,
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: crate::bell::BellLatch::default(),
             history_cache,
@@ -7356,7 +7371,7 @@ impl App {
             return;
         }
         self.refresh_tokens();
-        self.start_scheduler();
+        self.shutdown.adopt_scheduler(self.start_scheduler());
         self.apply_usage();
         // Single-fetcher lease (#27): the startup switch one-shot is a switch
         // DECISION, so it may run only if THIS instance is the fetcher. Acquire
@@ -7432,7 +7447,7 @@ impl App {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher.
-    fn start_scheduler(&self) {
+    fn start_scheduler(&self) -> crate::daemon::TickThread {
         let h = WorkerHandles::from_app(self);
         spawn_refresher(
             h.config,
@@ -7469,7 +7484,7 @@ impl App {
             // Pinned by construction, not a test: a TUI test drives this call site but never reads the provider store this flag shapes.
             true,
             h.snapshot,
-        );
+        )
     }
 
     /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
@@ -33088,8 +33103,17 @@ fn blocking_modal_open(app: &App) -> bool {
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
 /// stack under an open modal — except during the exit wait, which must drain
-/// the answered gate's `Switching` marker or the quit strands on it.
+/// the answered gate's `Switching` marker or the quit strands on it. Once the
+/// shared shutdown began, an answer is drained and its marker cleared with no
+/// relink, as the shutdown's own spend wait does: its credential detach must
+/// stay the last word at exit.
 fn drain_switch_gates(app: &mut App) {
+    if app.shutdown.began() {
+        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
+            clear_activity(&app.activity, &name);
+        }
+        return;
+    }
     if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
@@ -33620,43 +33644,144 @@ where
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
-/// Snapshot active credentials and detach the symlink. After shutdown, external
-/// writes to `.credentials.json` land in the standalone file, not the profile.
-///
-/// The bounded wait covers only a running token spend, as the backstop for an
-/// exit that skipped the exit wait (a second quit, or a quit while a checking
-/// save holds it): a process that dies between the token endpoint's answer and
-/// the stage write loses the minted pair. A usage read, a queued fetch or a
-/// third-party leg may be abandoned, so none of them delays the exit.
+/// The one receiver of switch-gate answers, shared by the frame loop's drain
+/// and the shutdown's spend wait, which may run on the stop-signal watcher.
+pub(crate) struct SwitchGates(std::sync::Mutex<std::sync::mpsc::Receiver<SwitchGateResult>>);
+
+impl SwitchGates {
+    /// The next queued answer; the lock is released before it returns.
+    pub(crate) fn try_recv(&self) -> Result<SwitchGateResult, std::sync::mpsc::TryRecvError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+    }
+}
+
+/// The TUI's terminal-free shutdown, reachable from the frame loop's thread
+/// and from the stop-signal watcher, which runs it when a stop signal finds the
+/// frame loop unable to return.
+pub(crate) struct Shutdown {
+    ran: std::sync::Once,
+    /// Raised first in the body: from then on [`drain_switch_gates`] clears an
+    /// answered gate with no relink, so a gate answered while the watcher runs
+    /// the shutdown cannot undo the body's detach. A frame held past the grace
+    /// can still relink through a confirm or a rolling switch, which do not
+    /// read it.
+    began: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    activity: ActivityStore,
+    switch_gates: Arc<SwitchGates>,
+    config: ConfigHandle,
+    /// The scheduler's tick thread once bootstrap started it.
+    scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
+    /// The update check thread; `None` when the saved toggle is off.
+    update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
+    /// How many times the shutdown's body started.
+    #[cfg(test)]
+    runs: AtomicUsize,
+}
+
+impl Shutdown {
+    /// Run the shutdown body unless a run of it already finished. A caller
+    /// arriving while another runs it waits for that run: once it finishes,
+    /// the caller returns; if it panicked, the caller runs the body itself. So
+    /// no caller returns, and none can exit the process, while a run is
+    /// mid-save.
+    pub(crate) fn run(&self) {
+        self.ran.call_once_force(|_| self.run_body());
+    }
+
+    /// Hand bootstrap's tick thread to the shutdown that waits for it.
+    fn adopt_scheduler(&self, scheduler: crate::daemon::TickThread) {
+        *self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler);
+    }
+
+    /// Whether the body has started: the stop-signal watcher can run it while
+    /// the frame loop is still live, held past its grace.
+    fn began(&self) -> bool {
+        self.began.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot active credentials and detach the symlink. After shutdown,
+    /// external writes to `.credentials.json` land in the standalone file, not
+    /// the profile.
+    ///
+    /// The bounded wait covers only a running token spend, as the backstop for
+    /// an exit that skipped the exit wait (a second quit, a quit while a
+    /// checking save holds it, or a stop signal): a process that dies between
+    /// the token endpoint's answer and the stage write loses the minted pair. A
+    /// usage read, a queued fetch or a third-party leg may be abandoned, so
+    /// none of them delays the exit.
+    ///
+    /// The scheduler's tick thread is woken first and waited for last, so its
+    /// exit save of the tps producer's unsaved records overlaps the waits
+    /// between. It gets until the later of the waits' end and the daemon's
+    /// child stop budget past the start of shutdown, so a quit stays quick —
+    /// the daemon waits its full drain bound instead; a tick still running then
+    /// is abandoned and its records lost, as a crash loses them.
+    fn run_body(&self) {
+        self.began.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(scheduler) = &scheduler {
+            scheduler.stop();
+        }
+        let wait_start = Instant::now();
+        while wait_start.elapsed() < Duration::from_millis(2000) {
+            // Drain answered switch gates each iteration without relinking: the
+            // gate already landed its pair (staged/landed), and relinking during
+            // shutdown would re-point credentials after the user quit. Clearing
+            // the marker is what frees the spend wait — an answered gate that
+            // stays queued would otherwise burn the whole bound.
+            while let Ok(SwitchGateResult { name, .. }) = self.switch_gates.try_recv() {
+                clear_activity(&self.activity, &name);
+            }
+            if !token_spend_in_flight(&self.activity) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Wait up to 5 s for the update check to finish, detaching a
+        // still-running check after that (a slow download shouldn't delay TUI
+        // exit) — but a running replace step is waited for, up to
+        // `update::REPLACE_WAIT_CAP` (60 s) past those 5 s, so this shutdown
+        // path strands the self-replace's staged file beside the binary only
+        // behind a replace that outlasts that cap.
+        let update_handle = self
+            .update_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = update_handle {
+            handle.wait_on_exit(Duration::from_secs(5));
+        }
+        if let Some(scheduler) = &scheduler {
+            let window = wait_start
+                .elapsed()
+                .max(crate::daemon::gateway::DAEMON_STOP_BUDGET);
+            scheduler.wait_stopped(wait_start, window);
+        }
+        {
+            let mut cfg = App::lock_config(&self.config);
+            let _ = snapshot_active_credentials(&mut cfg);
+        }
+        let _ = detach_credentials_link();
+    }
+}
+
+/// The frame loop's call into the shared [`Shutdown::run`].
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
-    app.shutting_down.store(true, Ordering::SeqCst);
-    let wait_start = Instant::now();
-    while wait_start.elapsed() < Duration::from_millis(2000) {
-        // Drain answered switch gates each iteration without relinking: the
-        // gate already landed its pair (staged/landed), and relinking during
-        // shutdown would re-point credentials after the user quit. Clearing the
-        // marker is what frees the spend wait — an answered gate that stays
-        // queued would otherwise burn the whole bound.
-        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
-            clear_activity(&app.activity, &name);
-        }
-        if !token_spend_in_flight(&app.activity) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Wait up to 5 s for the update check to finish, detaching a still-running
-    // check after that (a slow download shouldn't delay TUI exit) — but never
-    // while the replace step runs, so this shutdown path can't strand the
-    // self-replace's staged file beside the binary.
-    if let Some(handle) = app.update_handle.take() {
-        handle.wait_on_exit(Duration::from_secs(5));
-    }
-    {
-        let mut cfg = app.config();
-        let _ = snapshot_active_credentials(&mut cfg);
-    }
-    let _ = detach_credentials_link();
+    app.shutdown.run();
     Ok(())
 }
 

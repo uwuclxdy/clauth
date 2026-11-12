@@ -541,10 +541,11 @@ fn service_of(file_name: &str, suffixes: &[&str]) -> Option<(Service, usize)> {
 pub(crate) const SPOKEN_MAJOR: u64 = 1;
 
 /// The contract minor this clauth speaks, beside [`SPOKEN_MAJOR`]: 1.1 adds
-/// an optional `model` to a figure declaration, and nothing else. A proxy on a
+/// an optional `model` to a figure declaration; 1.2 adds the `token_stats`
+/// capability, `GET /clauth/v1/tokens` and the `token` event. A proxy on a
 /// later minor is checked as far as this one, and the rest is reported as
 /// skipped.
-pub(crate) const SPOKEN_MINOR: u64 = 1;
+pub(crate) const SPOKEN_MINOR: u64 = 2;
 
 /// The control-route prefix every contract v1 route sits under. Shared by the
 /// checker (`proxy_check.rs`) and the client (`proxy_account.rs`), which must

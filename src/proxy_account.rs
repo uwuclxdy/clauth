@@ -347,7 +347,7 @@ impl Control {
 /// when it is. A `/health` whose `status` is not `ok` still names the proxy:
 /// an unhealthy proxy is the expected one, and its control routes answer for
 /// themselves.
-fn foreign_answer(service: &Service, addr: std::net::SocketAddr) -> Option<String> {
+pub(crate) fn foreign_answer(service: &Service, addr: std::net::SocketAddr) -> Option<String> {
     use crate::gateway::ProxyProbe;
     // The quotes bound a foreign value, so a `"` inside it is escaped too.
     let quote = |text: &str| {

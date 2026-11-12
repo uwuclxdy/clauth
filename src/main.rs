@@ -57,6 +57,7 @@ mod proxy;
 mod proxy_account;
 mod proxy_check;
 mod proxy_list;
+mod proxy_tokens;
 mod push;
 mod rex;
 mod runtime;
@@ -253,9 +254,9 @@ fn usage_error(msg: impl Into<String>) -> anyhow::Error {
 /// [`ReaderLeft`] one, 1 for any other failure. Prints the error exactly as
 /// anyhow's `Result` `Termination` did (`Error: {:?}`) — an
 /// [`InterruptedAfter`] its failure — except the [`HelpRendered`],
-/// [`Interrupted`] and [`ReaderLeft`] arms, whose commands already said what
-/// happened on stderr or have no reader left — so the message surface is
-/// unchanged now that `main` maps the code itself.
+/// [`Interrupted`], [`FailureReported`] and [`ReaderLeft`] arms, whose
+/// commands already said what happened on stderr or have no reader left — so
+/// the message surface is unchanged now that `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     // Through `errln!`, so a test's stderr capture takes the line too.
     let mut line = Vec::new();
@@ -727,7 +728,8 @@ impl std::fmt::Display for RebindPartial {
 impl std::error::Error for RebindPartial {}
 
 /// The failure's lines were already printed to stderr (a re-bind's, one per
-/// failed account; a refused bare-item settle's `clauth:` line);
+/// failed account; a refused bare-item settle's `clauth:` line; the TUI's
+/// `Error:` line, dropped when stderr cannot take it);
 /// [`exit_code`] maps this to exit 1 with no `Error:` line, the way
 /// [`HelpRendered`] maps to 2 after help already printed.
 #[derive(Debug)]

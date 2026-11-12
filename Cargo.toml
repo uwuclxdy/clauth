@@ -160,9 +160,11 @@ strip = true
 # is shared with the bridge's `parent_pid`); `stderr_file_mode`'s
 # `fcntl`/`fstat` in `daemon/log_rotate.rs`;
 # the inherited signal disposition read in `daemon/gateway.rs`; the test
-# sandbox's env mutation, which Rust 2024 made unsafe; and the mod bridge's
-# socket and process reads in `daemon/bridge.rs` (`SO_PEERCRED` on linux;
-# `LOCAL_PEERPID` and `proc_pidpath` on macOS).
+# sandbox's env mutation, which Rust 2024 made unsafe, and the tests' other
+# raw calls (a held flock, a pty's setup, an euid read, raw sockets, a raw
+# pointer write); and the mod bridge's socket and process reads in
+# `daemon/bridge.rs` (`SO_PEERCRED` on linux; `LOCAL_PEERPID` and
+# `proc_pidpath` on macOS).
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
