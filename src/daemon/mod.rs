@@ -1209,6 +1209,10 @@ pub(crate) struct LiveStores {
     /// The daemon's shutdown flag, which the same claim refuses once a stop
     /// signal has raised it.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The usage-fetch lease, so every feed writer's snapshot carries whether
+    /// THIS daemon runs the fetches: a stood-down daemon publishes
+    /// `next_refresh_at: null` rather than the mirror's derived stamps.
+    pub(crate) fetch_lease: Arc<FetchLease>,
 }
 
 #[cfg(test)]
@@ -1230,6 +1234,7 @@ impl Default for LiveStores {
             proxies: proxies::new_slots(),
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
         }
     }
 }
@@ -1248,6 +1253,10 @@ pub(crate) struct LiveSnapshot {
     usage: HashMap<String, UsageInfo>,
     gateway: Option<gateway::GatewaySlot>,
     proxies: Vec<proxies::ProxySlot>,
+    /// Whether this daemon held the usage-fetch lease when the snapshot was
+    /// taken — the flag every feed writer reads to null a stood-down
+    /// daemon's countdowns.
+    fetches_here: bool,
 }
 
 impl LiveStores {
@@ -1322,6 +1331,7 @@ impl LiveStores {
             usage,
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
+            fetches_here: self.fetch_lease.fetches_here(),
         }
     }
 }
@@ -1329,6 +1339,7 @@ impl LiveStores {
 impl LiveSnapshot {
     pub(crate) fn signals(&self) -> LiveSignals<'_> {
         LiveSignals {
+            fetches_here: self.fetches_here,
             status: &self.status,
             third_party_status: &self.third_party_status,
             third_party_streaks: &self.third_party_streaks,
@@ -2318,6 +2329,7 @@ impl Daemon {
             proxies: Arc::clone(&self.proxies),
             activity: Arc::clone(&self.activity),
             shutting_down: Arc::clone(&self.shutting_down),
+            fetch_lease: Arc::clone(&self.fetch_lease),
         }
     }
 

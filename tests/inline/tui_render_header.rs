@@ -10,7 +10,13 @@ use ratatui::style::Color;
 /// Tall enough that the art header renders at the widths these pins use, so a
 /// width-only pin still exercises the art rows.
 const HEADER_TEST_ROWS: u16 = 24;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+/// The art header's logo slot: the mascot's own columns plus its pad, the
+/// width `draw` gives the logo before the info column starts.
+fn logo_slot_cols() -> usize {
+    App::MASCOT_SIZE.0 + usize::from(LOGO_PAD)
+}
 
 fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
     (
@@ -223,6 +229,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
         GaugeFit {
             name_w: 8,
             bar_cells: 10,
+            age_w: 0,
             visible: true,
         }
     );
@@ -274,6 +281,7 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         GaugeFit {
             name_w: 10,
             bar_cells: 0,
+            age_w: 0,
             visible: true
         }
     );
@@ -341,6 +349,200 @@ fn row1_is_the_live_count_the_gauge_and_the_status_indicator_when_wide() {
         "the elastic gap carries whitespace alone: {gap:?}"
     );
     assert_eq!(dot, "● status.claude.ai", "the indicator closes the row");
+}
+
+/// Once the active account's refresh is overdue on an instance that runs no
+/// countdown, the gauge dates its figure between the percent and the bar.
+#[test]
+fn row1_gauge_dates_an_overdue_reading_between_the_percent_and_the_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 4m ago [████░░░░░░]",
+        "the age rides inside the gauge, before the bar"
+    );
+}
+
+/// A reading whose refresh is still ahead carries no age, overdue-only.
+#[test]
+fn row1_gauge_carries_no_age_before_the_refresh_is_due() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 30_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() + 60_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]");
+}
+
+/// A past-due reading whose leg the scheduler deliberately blanked (a spent
+/// skip, a suppressed credential) carries no gauge age: the absent deadline
+/// is not a stuck worker's, so the gauge must not date the figure as overdue.
+#[test]
+fn row1_gauge_carries_no_age_for_a_blanked_countdown_leg() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    crate::usage::publish_blanked_countdowns(
+        &app.activity,
+        &HashSet::from([crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy"))]),
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]");
+}
+
+/// A late worker's withdrawn countdown publishes no deadline, and the
+/// reading is past its own cadence: the gauge dates the reading — the
+/// no-deadline arm's positive case, beside the blanked negative twin.
+#[test]
+fn row1_gauge_dates_a_late_workers_reading_with_no_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "a late worker belongs to the instance that fetches"
+    );
+    // The left slice the frozen dated pin derives: the two chips, their gap,
+    // the separator, the name, the percent, the age's 9 cells and the full
+    // bar's 13 — 60 display cells.
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 6m ago [████░░░░░░]",
+        "the reading dates itself: the 90 s interval plus the 270 s reading age"
+    );
+}
+
+/// Between the bootstrap's Queued marks and the first publish, a due
+/// reading has a fetch coming: the no-deadline arm must not date it as
+/// overdue (the Overview spins `queued` for it), so the age draws only
+/// once the account reads idle again.
+#[test]
+fn row1_gauge_dates_no_reading_while_its_leg_reads_queued() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    crate::usage::mark_fetch_activity(
+        &app.activity,
+        &crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::ProfileActivity::Queued,
+    );
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "a queued leg has a fetch coming: no overdue age until it reads idle"
+    );
+}
+
+/// A body with no `fetched_at` stamp has no date clauth read: the gauge
+/// draws no age for it, even where the cache mtime's due time reads past —
+/// the mtime dates the due time, never the read.
+#[test]
+fn row1_gauge_draws_no_age_for_an_undated_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: None,
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    // The undated body's cache, dated far past its refresh: the per-tick
+    // clock map falls back to its mtime (the production `apply_usage` pass).
+    crate::testutil::register_names(&["uwuclxdy"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("uwuclxdy"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("uwuclxdy"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(360_000),
+    );
+    app.apply_usage();
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "an undated reading draws no age even past its deadline"
+    );
 }
 
 /// The ladder's first rung on the buffer: the bar gives a cell before the name
@@ -1415,9 +1617,10 @@ fn the_header_gauge_label_keeps_two_rounded_decimals() {
             let fit = GaugeFit {
                 name_w: 0,
                 bar_cells,
+                age_w: 0,
                 visible: true,
             };
-            let spans = gauge_spans(fit, "", Some(pct), 0);
+            let spans = gauge_spans(fit, "", Some(pct), None, 0);
             let labels: Vec<&str> = spans
                 .iter()
                 .map(|s| s.content.as_ref())
@@ -2094,9 +2297,10 @@ fn the_gauge_name_pulse_keeps_whole_graphemes_across_sweep_frames() {
         let fit = GaugeFit {
             name_w: 8,
             bar_cells: 0,
+            age_w: 0,
             visible: true,
         };
-        let mut spans = gauge_spans(fit, name, None, elapsed_ms);
+        let mut spans = gauge_spans(fit, name, None, None, elapsed_ms);
         spans.pop();
         spans
     });
@@ -2178,4 +2382,266 @@ fn the_identity_waves_rest_phase_draws_the_plain_label_at_every_position() {
             );
         }
     }
+}
+
+/// The age rides only while the full gauge plus it fits the text column: it
+/// sheds first, whole, so an overdue reading never shrinks the bar (the
+/// gauge's own ladder is untouched, and a deadline passing never reflows a
+/// gauge that already fit). The row counts the full gauge at 26 cells (the
+/// percent's 4-cell budget, `42%` rendering in 3), and the age's ` · ` + 6
+/// cells of `4m ago` draw only in what is left of the budget, so they need
+/// 35 cells in all: at `W = 66` the text column holds them, at `W = 65` the
+/// age drops and the bar stays full.
+#[test]
+fn row1_overdue_age_sheds_whole_before_the_bar_shrinks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    assert_eq!(
+        row_content(&app, 65, 1).trim_end(),
+        "uwuclxdy 42% [████░░░░░░]            ● status.claude.ai",
+        "one cell short of the aged gauge, the age sheds and the bar stays full"
+    );
+    assert_eq!(
+        row_content(&app, 66, 1).trim_end(),
+        "uwuclxdy 42% · 4m ago [████░░░░░░]    ● status.claude.ai",
+        "the aged gauge fits whole once the budget reaches 35"
+    );
+}
+
+/// Row 1 of a stood-down mirror whose published deadline is `deadline_ago_ms`
+/// past, its reading 5m30s old (the `5m ago` label holds 30 s from either
+/// minute boundary).
+fn mirror_gauge_row_at_deadline(deadline_ago_ms: u64) -> String {
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 330_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - deadline_ago_ms,
+    );
+    row_content(&app, 120, 1)
+}
+
+/// A mirror's published deadline dates the gauge only past the tick's fetch
+/// deadline (90 s): 89 s past due (one second inside the grace) carries no
+/// age, 91 s (one second past it) dates the figure. The fixtures sit one
+/// second either side of the grace boundary, the margin this pin holds
+/// against the wall clock moving between stamp and render.
+#[test]
+fn row1_gauge_dates_a_mirrors_deadline_only_past_the_tick_deadline_grace() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let chars: Vec<char> = mirror_gauge_row_at_deadline(89_000).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "inside the grace the gauge carries no age"
+    );
+
+    let chars: Vec<char> = mirror_gauge_row_at_deadline(91_000).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 5m ago [████░░░░░░]",
+        "past the grace the gauge dates the figure"
+    );
+}
+
+/// An overdue age rides only in the slack the chips' own ceilings and the
+/// speed suffix leave beside the gauge: at the width where every chip fits but
+/// the slack does not hold the age, the chips draw and the age sheds; one
+/// cell wider than the dated header's drawn width, the age draws. Every width
+/// below derives from the spans' display cells, never a char count. The
+/// reading's stamp sits 31 days back, one day past the 30-day flip where
+/// `relative_age` switches to the 10-cell local ISO date — the age's widest
+/// form, the one this pin needs.
+#[test]
+fn row1_overdue_age_rides_only_in_the_chips_leftover_slack() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let stamp = crate::usage::now_ms() - 31 * 86_400_000;
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(stamp),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(999, 999));
+    app.set_tps(Some(tps_snapshot(1_000, 9_999.0, Some(67.2))));
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+    let date = chrono::DateTime::from_timestamp((stamp / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .naive_local()
+        .date()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let readings = app.readings_snapshot();
+    let gauge = active_gauge(&app, &readings).expect("the gauge renders");
+    let live_w: usize = live_chip_spans(&app).iter().map(|s| s.width()).sum();
+    let tps_w: usize = tps_chip_spans(&app).iter().map(|s| s.width()).sum();
+    let gap_w = Span::raw(CHIP_GAP).width();
+    let sep_w = Span::raw(" · ").width();
+    let status_w = Span::raw(format!("{} status.claude.ai", theme::DOT_ON)).width();
+    let suffix_w: usize = speed_suffix_spans(&app, Some(&gauge))
+        .iter()
+        .map(|s| s.width())
+        .sum();
+    let aged_fit = GaugeFit {
+        age_w: gauge_age_w(gauge.age.as_deref()),
+        ..gauge_fit(
+            usize::MAX,
+            Span::raw(gauge.name.as_str()).width(),
+            gauge.pct,
+        )
+    };
+    let aged_spans = gauge_spans(aged_fit, &gauge.name, gauge.pct, gauge.age.as_deref(), 0);
+    let aged_w: usize = aged_spans.iter().map(|s| s.width()).sum();
+    // logo + chips + separator + gauge + suffix + content gap + indicator.
+    let dated_w = logo_slot_cols()
+        + live_w
+        + gap_w
+        + tps_w
+        + sep_w
+        + aged_w
+        + suffix_w
+        + CONTENT_GAP
+        + status_w;
+
+    let short = row_content(&app, dated_w as u16, 1);
+    assert_eq!(
+        short.trim_end(),
+        format!(
+            "[ 999+999 live ]  [ 9999 tok/s ] · uwuclxdy 42% [████░░░░░░] (67 t/s){}● status.claude.ai",
+            " ".repeat(16)
+        ),
+        "every chip fits, so the chips draw and the age sheds whole"
+    );
+    assert!(
+        !short.contains(&format!(" · {date}")),
+        "no age renders beside the chips: {short:?}"
+    );
+
+    let fit = row_content(&app, (dated_w + 1) as u16, 1);
+    assert_eq!(
+        fit.trim_end(),
+        format!(
+            "[ 999+999 live ]  [ 9999 tok/s ] · uwuclxdy 42% · {date} [████░░░░░░] (67 t/s){}● status.claude.ai",
+            " ".repeat(4)
+        ),
+        "one cell wider, the age draws in the slack the chips leave"
+    );
+}
+
+/// The overdue age takes only what the age-less row leaves, so it sheds before
+/// the speed suffix: at the width where the gauge's charged rung plus the
+/// suffix fits the text column exactly, the suffix draws and the age is
+/// absent; the age's own width wider, both draw.
+#[test]
+fn row1_overdue_age_sheds_before_the_speed_suffix() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_tps(Some(tps_snapshot(1_000, 12.0, Some(12.0))));
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let readings = app.readings_snapshot();
+    let gauge = active_gauge(&app, &readings).expect("the gauge renders");
+    let age = gauge
+        .age
+        .as_deref()
+        .expect("fixture: the reading is overdue");
+    let suffix_w: usize = speed_suffix_spans(&app, Some(&gauge))
+        .iter()
+        .map(Span::width)
+        .sum();
+    assert!(suffix_w > 0, "fixture: the account has a fresh live speed");
+    let bare = gauge_fit(
+        usize::MAX,
+        Span::raw(gauge.name.as_str()).width(),
+        gauge.pct,
+    );
+    // The cells the layout charges: the age-less gauge's rung plus the suffix.
+    let row_cells = gauge_total_w(bare.name_w, bare.bar_cells, gauge.pct) + suffix_w;
+    let status_w = Span::raw(format!("{} status.claude.ai", theme::DOT_ON)).width();
+    let width =
+        u16::try_from(logo_slot_cols() + row_cells + CONTENT_GAP + status_w).expect("narrow");
+
+    assert_eq!(
+        row_content(&app, width, 1).trim_end(),
+        "uwuclxdy 42% [████░░░░░░] (12 t/s)    ● status.claude.ai",
+        "the age-less gauge and the suffix fit exactly, so the suffix keeps its place"
+    );
+    let age_w = u16::try_from(gauge_age_w(Some(age))).expect("narrow");
+    assert_eq!(
+        row_content(&app, width + age_w, 1).trim_end(),
+        "uwuclxdy 42% · 4m ago [████░░░░░░] (12 t/s)    ● status.claude.ai",
+        "one age wider, the age draws beside the kept suffix"
+    );
 }

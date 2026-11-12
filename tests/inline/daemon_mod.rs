@@ -11789,3 +11789,131 @@ fn a_stop_with_a_stuck_spend_and_a_stuck_tick_ends_at_one_bound() {
         "the spend and the tick share one bound: {waited:?}"
     );
 }
+
+/// The `next_refresh_at` the daemon's last `status.json` write published for
+/// `name`.
+fn published_next_refresh(daemon: &Daemon, name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(&daemon.status_path).expect("status.json written");
+    let feed: serde_json::Value = serde_json::from_str(&raw).expect("status.json parses");
+    feed["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} entry in {feed}"))["next_refresh_at"]
+        .clone()
+}
+
+/// A daemon that stood down from the usage-fetch lease runs no countdown, so
+/// the feed publishes `next_refresh_at: null` for it rather than a stamp its
+/// mirror derived from another instance's cache clock; the holder's own armed
+/// stamp is published as before.
+#[test]
+fn a_stood_down_daemon_publishes_no_next_refresh_and_a_holder_keeps_its_stamp() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+
+    daemon.tick();
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder publishes its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    daemon.tick();
+
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down instance publishes no countdown it does not run"
+    );
+}
+
+/// The feed's API republish path takes the daemon's live snapshot, so it must
+/// publish the same stood-down null the tick's writer does: the flag rides
+/// the snapshot, and no writer that passes it can forget it.
+#[test]
+fn a_republish_from_a_stood_down_daemon_publishes_no_next_refresh() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let daemon = daemon_for(config.clone());
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+    // The context's live stores share the daemon's lease `Arc`, so one context
+    // sees the holder's state now and the stood-down state after the release.
+    let ctx = std::sync::Arc::new(crate::daemon::api::routes::ApiContext::for_tests(
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config)),
+        daemon.status_path.clone(),
+        Some(daemon.live_stores()),
+        crate::daemon::api::panes::absent_probe(),
+    ));
+
+    crate::daemon::api::routes::republish(&ctx);
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder's republish keeps its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    crate::daemon::api::routes::republish(&ctx);
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down republish publishes no countdown it does not run"
+    );
+}

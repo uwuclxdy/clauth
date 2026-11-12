@@ -499,6 +499,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     assert!(none["pending_switch"].is_null());
 
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -546,6 +547,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     let empty_streaks = std::collections::HashMap::new();
     let anchor = 1_780_000_000i64;
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -666,6 +668,7 @@ fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() 
     let empty_next = HashMap::new();
     let empty_streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -762,6 +765,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1047,6 +1051,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
     let empty_status = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1119,6 +1124,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     ]);
     let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1148,6 +1154,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
     let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1334,6 +1341,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     config.state.refresh_spent_accounts = true;
     write(42.0, threshold_secs + 60);
     let live = LiveSignals {
+        fetches_here: true,
         status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1381,6 +1389,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // derivation has nothing — the live third-party store is the only source.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1406,6 +1415,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // cache mtime said, which is a freshness claim about a rejected poll.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1439,6 +1449,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1472,6 +1483,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1938,7 +1950,7 @@ fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let by_name = |name: &str| {
         entries
             .iter()
@@ -2002,6 +2014,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
     let anchor = 1_780_000_000i64;
     let blocked = [crate::profile::ProfileName::from("b")];
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -2739,6 +2752,7 @@ fn status_body_never_leaks_a_credential() {
     let streaks_map = HashMap::from([("canary-oauth".to_string(), u32::MAX)]);
     let blocked: Vec<ProfileName> = vec!["canary-api".into()];
     let live = LiveSignals {
+        fetches_here: true,
         status: &status_map,
         third_party_status: &third_party_map,
         third_party_streaks: &Default::default(),
@@ -3311,6 +3325,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let empty_status = HashMap::new();
     let empty_streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3333,6 +3348,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     // Exactly the cap → not yet distrusted.
     let tp_streaks = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3357,6 +3373,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let oauth_status = HashMap::from([("zai".to_string(), FetchStatus::Cached)]);
     let tp_streaks = HashMap::from([("zai".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &oauth_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3452,6 +3469,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -4052,7 +4070,7 @@ fn a_codex_entry_publishes_the_banked_resets_its_poll_read() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let count = |name: &str| {
         entries
             .iter()
@@ -4203,7 +4221,7 @@ fn a_codex_entry_dates_its_banked_resets_by_its_poll() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4262,7 +4280,7 @@ fn a_codex_count_and_its_age_come_from_one_read_of_one_file() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4322,7 +4340,7 @@ fn a_poll_landing_during_a_codex_entrys_build_changes_nothing_in_that_entry() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = &entries.as_array().unwrap()[0];
     assert_eq!(row["limit_resets"], 3);
     assert_eq!(row["limit_resets_read_at"], "2026-09-21T14:13:20+00:00");
@@ -4360,7 +4378,7 @@ fn a_codex_entrys_freshness_reads_the_polls_stamp_over_the_mtime() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let status = |name: &str| {
         entries
             .iter()
@@ -4408,7 +4426,7 @@ fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
     std::fs::write(&garbled_path, "not json").expect("garbled cache");
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4436,4 +4454,151 @@ fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
             "garbled's {key} dates nothing"
         );
     }
+}
+
+/// A live snapshot whose daemon stood down from the fetch lease publishes
+/// `next_refresh_at: null` even when its live countdown map carries an armed
+/// stamp: the stamp is a mirror's cache-clock estimate, not a countdown this
+/// daemon runs. The holder's arm (the flag true) keeps publishing its live
+/// stamp verbatim — the split the tick's writer and the API republish share.
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_live_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let mut next = std::collections::HashMap::new();
+    next.insert(
+        crate::usage::FetchLeg::OAuth.key(crate::profile::ProfileName::from("work")),
+        crate::usage::now_ms() + interval_ms,
+    );
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    let p = &held["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_string(),
+        "control: the holder publishes its armed stamp, got {p}"
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    let p = &stood["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no countdown it does not run, got {p}"
+    );
+}
+
+/// The codex half of `profiles[]` follows the claude half's null rule: a
+/// stood-down daemon runs no codex poll, so its cache-derived stamp
+/// publishes as `null`, and a holder keeps its own — the split the
+/// single-shot and daemonless writers never join (they keep the derived
+/// stamp).
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_codex_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    crate::testutil::write_codex_roster(&["polled"]);
+    crate::testutil::write_codex_store(
+        "polled",
+        r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("polled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::map_codex_usage(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps"),
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+    };
+    let codex_entry = |v: &serde_json::Value| {
+        v["profiles"]
+            .as_array()
+            .expect("profiles publish")
+            .iter()
+            .find(|e| e["harness"] == "codex")
+            .expect("the codex entry publishes")
+            .clone()
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    assert!(
+        codex_entry(&held)["next_refresh_at"].is_string(),
+        "control: the holder publishes its derived stamp, got {}",
+        codex_entry(&held)
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    assert!(
+        codex_entry(&stood)["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no codex countdown it does not run, got {}",
+        codex_entry(&stood)
+    );
+
+    // No live feed at all: the single-shot writer runs no poll either way, so
+    // it keeps the cache-derived stamp instead of publishing a null no daemon
+    // asked for.
+    let single = status_value(&config, interval_ms, None, false);
+    assert!(
+        codex_entry(&single)["next_refresh_at"].is_string(),
+        "a single-shot body keeps the codex entry's derived stamp, got {}",
+        codex_entry(&single)
+    );
 }

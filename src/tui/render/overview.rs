@@ -13,9 +13,10 @@ use super::super::theme::{self, CrestProvider};
 use super::chain::reason_marker;
 use super::format::{
     NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, bar_fits, cue_style, duration_label,
-    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_in_secs,
-    reset_resume, reset_room, reset_suffix_worst, spinner_frame, spinner_style, truncate,
-    window_label, window_summary_spans_bracketed,
+    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, overdue_label,
+    past_deadline_age, reading_due_age, reset_in_secs, reset_resume, reset_room,
+    reset_suffix_worst, spinner_frame, spinner_style, truncate, window_label,
+    window_summary_spans_bracketed,
 };
 use super::header::{identity_wave_rest_ms, identity_wave_spans};
 use super::panes::{
@@ -29,8 +30,8 @@ use crate::format::format_pct;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
-    LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs,
-    now_ms, selected_next_refresh, switch_grade_kick_lifts,
+    FetchStatus, LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration,
+    now_epoch_secs, now_ms, selected_next_refresh, switch_grade_kick_lifts, usage_interval_ms,
 };
 use std::collections::HashSet;
 
@@ -1589,13 +1590,28 @@ fn render_overview_row(
         Span::raw(" ".repeat(TIMER_SLOT))
     } else if token_refused {
         Span::raw(" ".repeat(TIMER_SLOT))
+    } else if !app.fetch_lease.fetches_here()
+        && readings.status_of(&profile.name) == Some(FetchStatus::AuthExpired)
+    {
+        // A dead credential the holder suppresses blanks its countdown there;
+        // this instance's work list still holds the entry and derives a stamp
+        // of its own, which must not draw one either — the suppressed account
+        // has no next attempt to count down to, so the slot stays blank on a
+        // stood-down mirror alike.
+        Span::raw(" ".repeat(TIMER_SLOT))
     } else {
-        let activity = app
+        let (activity, blanked) = app
             .activity
             .lock()
             .ok()
-            .map(|activity| crate::usage::selected_activity(&activity, profile))
-            .unwrap_or(ProfileActivity::Idle);
+            .map(|states| {
+                let key = crate::usage::FetchLeg::for_profile(profile).key(profile.name.clone());
+                (
+                    crate::usage::selected_activity(&states, profile),
+                    crate::usage::countdown_blanked(&states, &key),
+                )
+            })
+            .unwrap_or((ProfileActivity::Idle, false));
         let next_refresh = app
             .next_refresh_per_profile
             .lock()
@@ -1608,17 +1624,59 @@ fn render_overview_row(
             let style = spinner_style(activity);
             Span::styled(format!("{frame:>inner$} ", inner = inner), style)
         } else {
-            let secs_str = next_refresh.map(|next_ms| {
-                let now = now_ms();
-                let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
-                format!("{secs}s")
-            });
-            match secs_str {
-                Some(s) => Span::styled(
-                    format!("{:>inner$} ", s, inner = inner),
-                    cue_style(cue, theme::faint()),
+            // The reading clock the no-deadline arm derives its due time from:
+            // the reading's own stamp (OAuth), else the per-tick cache clock
+            // (third-party's mtime, an undatable OAuth body's mtime).
+            let reading_clock = readings.clock_of(&profile.name);
+            let overdue_age = match next_refresh {
+                // A published deadline past on this instance: on a fetching
+                // one the spinner above already took it, so only a stood-down
+                // mirror reaches here, and its stamp is a cache estimate —
+                // nothing is coming, so the slot reads how far past due the
+                // reading is instead of a countdown frozen at `0s`.
+                Some(next) => past_deadline_age(app.fetch_lease.fetches_here(), next),
+                // No deadline published and the scheduler published no
+                // deliberate blank: a stuck worker holds the leg, so the
+                // reading dates its own refresh and the slot reads the age
+                // past `clock + interval`. A deliberately blanked leg (a
+                // spent-skip, a suppressed credential, a selected leg on no
+                // work list) keeps its blank slot.
+                None if !blanked => reading_due_age(
+                    reading_clock,
+                    usage_interval_ms(profile, cfg.state.refresh_interval_ms),
                 ),
-                None => Span::raw(" ".repeat(TIMER_SLOT)),
+                None => None,
+            };
+            if let Some(age) = overdue_age {
+                // Red while the account's last fetch failed or its credential
+                // is dead, amber otherwise. Read the status directly: the
+                // bars' fetch cue gates on the OAuth shape, which would amber
+                // a failed endpoint account's overdue age.
+                let style = if matches!(
+                    readings.status_of(&profile.name),
+                    Some(FetchStatus::Failed | FetchStatus::AuthExpired)
+                ) {
+                    theme::danger()
+                } else {
+                    theme::warning()
+                };
+                Span::styled(
+                    format!("{:>inner$} ", overdue_label(age), inner = inner),
+                    style,
+                )
+            } else {
+                let secs_str = next_refresh.map(|next_ms| {
+                    let now = now_ms();
+                    let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
+                    format!("{secs}s")
+                });
+                match secs_str {
+                    Some(s) => Span::styled(
+                        format!("{:>inner$} ", s, inner = inner),
+                        cue_style(cue, theme::faint()),
+                    ),
+                    None => Span::raw(" ".repeat(TIMER_SLOT)),
+                }
             }
         }
     };

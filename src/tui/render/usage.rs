@@ -17,14 +17,15 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{
-    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset, relative_age,
-    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
+    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset,
+    overdue_phrase, past_deadline_age, reading_due_age, relative_age, reset_in_secs_at,
+    reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
     FIX_ORG_REFUSED, QueueView, cells_window, draw_scrollbar, edit_slot_block, empty_state,
     follow_window, grapheme_cells_before, key_cell, master_detail, pill, place_caret,
-    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
+    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, spans_cells, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
@@ -34,7 +35,7 @@ use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
     UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
     kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
-    switch_grade_kick_lifts,
+    switch_grade_kick_lifts, usage_interval_ms,
 };
 
 const KEY_W: usize = 8;
@@ -58,10 +59,12 @@ fn keyless_fix(profile_name: &str, proxy: Option<&crate::proxy::Service>) -> Cow
 /// a figure clauth never read.
 const NO_FIVE_HOUR_LIMIT: &str = "no limit on this plan";
 
-/// Config-derived diagnostic flags for the shown profile, gathered under the
-/// config guard in [`draw_usage_detail`] so [`status_lines`] stays lock-free.
-/// Each maps to a `└` fix hint (see [`diag_fix`]); render-only, no decision
-/// consumes them — the same invariant `fallback::blocked_reason` holds.
+/// Per-frame facts for the shown profile, gathered once under the guards in
+/// [`draw_usage_detail`] so [`status_lines`] stays lock-free: the
+/// config-derived diagnostic flags (each maps to a `└` fix hint, see
+/// [`diag_fix`]), plus the countdown blank and the poll interval the fetch
+/// row's overdue arm reads. Render-only, no decision consumes them — the same
+/// invariant `fallback::blocked_reason` holds.
 #[derive(Clone, Copy, Default)]
 struct DiagFlags {
     /// AUTH-1 quarantine (`AppConfig::is_auth_broken`).
@@ -85,6 +88,13 @@ struct DiagFlags {
     /// for a demand that may need credits, and nothing else on the card says
     /// so.
     credit_refused_at: Option<u64>,
+    /// The scheduler deliberately publishes no countdown for the shown leg
+    /// this tick ([`crate::usage::countdown_blanked`]): the fetch row keeps
+    /// its blank instead of dating the absent deadline as a stuck worker's.
+    blanked: bool,
+    /// The base poll interval the no-deadline overdue arm derives the
+    /// reading's due time from ([`crate::usage::usage_interval_ms`]).
+    interval_ms: u64,
 }
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
@@ -264,13 +274,22 @@ fn draw_usage_detail(
         &third_party_streaks,
         &oauth_status_has,
     );
+    // The selected activity and the deliberately-blanked flag read off the
+    // same store, in one lock — the same pair the overview's timer slot reads.
+    let (activity, blanked) = app
+        .activity
+        .lock()
+        .ok()
+        .map(|activity| {
+            let key = crate::usage::FetchLeg::for_profile(profile).key(profile.name.clone());
+            (
+                crate::usage::selected_activity(&activity, profile),
+                crate::usage::countdown_blanked(&activity, &key),
+            )
+        })
+        .unwrap_or((ProfileActivity::Idle, false));
     let header = HeaderState {
-        activity: app
-            .activity
-            .lock()
-            .ok()
-            .map(|activity| crate::usage::selected_activity(&activity, profile))
-            .unwrap_or(ProfileActivity::Idle),
+        activity,
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
@@ -310,6 +329,8 @@ fn draw_usage_detail(
                     |n| crate::fallback::refuses_service_from_usage(n, &readings.usage),
                 ),
                 credit_refused_at: app.credit_refusals.get(&profile.name).map(|r| r.at_ms),
+                blanked,
+                interval_ms: cfg.state.refresh_interval_ms,
             }
         },
         queue_slot: QueueView::new(
@@ -1916,8 +1937,8 @@ fn status_lines(
     // window: the profile is due and the next tick on this instance fetches it,
     // so the fetch row reads `queued` like a marked one rather than a countdown
     // frozen at `0s`. Only the instance that fetches draws it — a stood-down
-    // mirror has no fan-out of its own, and `display_activity` leaves its row a
-    // countdown.
+    // mirror has no fan-out of its own, and `display_activity` leaves its row
+    // idle, so a past deadline there reads overdue below.
     let activity = crate::usage::display_activity(
         header.activity,
         header.next_refresh_ms,
@@ -1935,7 +1956,7 @@ fn status_lines(
     }
 
     let countdown = header.next_refresh_ms.map(|next| {
-        let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
+        let secs = next.saturating_sub(now_ms()) / 1000;
         format!("{secs}s")
     });
     // No scheduled refresh and a window maxed: the poll skips this account
@@ -1945,11 +1966,50 @@ fn status_lines(
             .usage_of(&profile.name)
             .and_then(|u| crate::usage::spent_resume_in_secs(u, now))
             .is_some();
+    // The due time derives off the full clock (an undatable OAuth body's
+    // mtime fallback included); the read age dates off the reading's own
+    // stamp only, so an undatable body shows its overdue form undated.
+    let due_clock = readings.clock_of(&profile.name);
+    let reading_clock = readings.read_clock_of(&profile.name);
+    // An overdue refresh reads how far past due it is and dates the reading,
+    // never `refresh in 0s` (the instance that fetches returned above as
+    // `queued`). Two shapes, the overview's own arms: a published deadline
+    // past (a stood-down mirror's stamp is its own cache estimate, nothing
+    // here will fetch it), or no deadline at all with no deliberate blank —
+    // a stuck worker holds the leg, so the reading dates its own refresh
+    // past `clock + interval`. A deliberately blanked leg (a spent skip, a
+    // suppressed credential, a selected leg on no work list) keeps its blank.
+    let overdue_age = match header.next_refresh_ms {
+        Some(next) => past_deadline_age(header.fetches_here, next),
+        None if !header.diag.blanked => reading_due_age(
+            due_clock,
+            usage_interval_ms(profile, header.diag.interval_ms),
+        ),
+        None => None,
+    };
 
     // 5. The fetch row, always last. Its own fix hint (if any) rides beneath it,
     //    connected into the same rail as the rows above once 2+ hints stack.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut fetch_hint: Option<UsageDiag> = None;
+    // The overdue suffix's undated twin, kept beside the dated one so a pane
+    // too narrow for it can drop the ` · read Nm ago` half whole (below).
+    let mut suffix_undated: Option<Span<'static>> = None;
+    // The overdue replacement for an arm's countdown suffix, its leading pad
+    // and verb (with the retry ordinal) kept from the countdown form; the
+    // twin is `None` when the row is already undated (no reading clock).
+    let overdue_suffix =
+        |verb: &str, ordinal: Option<&str>| -> (Span<'static>, Option<Span<'static>>) {
+            let head = ordinal.map_or_else(|| verb.to_string(), |n| format!("{n} {verb}"));
+            let dated = Span::styled(
+                format!("  {}", overdue_phrase(&head, reading_clock)),
+                theme::faint(),
+            );
+            let undated = reading_clock.is_some().then(|| {
+                Span::styled(format!("  {}", overdue_phrase(&head, None)), theme::faint())
+            });
+            (dated, undated)
+        };
     match readings.status_of(&profile.name) {
         _ if (profile.base_url.is_some() || profile.provider.is_some())
             && !crate::usage::third_party_credentialed(profile)
@@ -1968,14 +2028,10 @@ fn status_lines(
             // that account has no key to miss. Figures shown are last-known,
             // and the stale cue can coexist with this pill: age is a fact
             // whether or not a fetch is scheduled.
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(
-                    "no key".to_string(),
-                    theme::warning().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ]", theme::dim()),
-            ]);
+            spans.extend(pill(
+                "no key".to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ));
             // The hint rides only when figures render — without them the body
             // already names the fix, and one pane must not say it twice.
             if readings.stats_of(&profile.name).is_some() {
@@ -1985,12 +2041,15 @@ fn status_lines(
             }
         }
         Some(FetchStatus::Failed) => {
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled("failed", theme::danger().add_modifier(Modifier::BOLD)),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
+            spans.extend(pill(
+                "failed".to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ));
+            if overdue_age.is_some() {
+                let (suffix, undated) = overdue_suffix("retry", None);
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 spans.push(Span::styled(format!("  retry in {c}"), theme::faint()));
             }
         }
@@ -2017,12 +2076,16 @@ fn status_lines(
             } else {
                 theme::warning().add_modifier(Modifier::BOLD)
             };
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(label, style),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
+            spans.extend(pill(label.to_string(), style));
+            if overdue_age.is_some() {
+                let (suffix, undated) = if failing {
+                    overdue_suffix("retry", Some(&ordinal(header.streaks.refresh_fail)))
+                } else {
+                    overdue_suffix("refresh", None)
+                };
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 // The countdown leads to the next REFRESH attempt while failing,
                 // not to a plain usage poll, so it reads as a retry ordinal —
                 // same shape the throttled row uses.
@@ -2042,15 +2105,22 @@ fn status_lines(
             });
         }
         Some(FetchStatus::RateLimited) => {
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled("rate limited", streak_style(header.streaks.rate_limit)),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
-                // The retry ordinal makes slot depth visible — a high count
-                // means the throttle never drained (#40's distrust boundary
-                // sits past the 6th) — without a judgment label.
+            spans.extend(pill(
+                "rate limited".to_string(),
+                streak_style(header.streaks.rate_limit),
+            ));
+            // The retry ordinal makes slot depth visible — a high count
+            // means the throttle never drained (#40's distrust boundary
+            // sits past the 6th) — without a judgment label.
+            if overdue_age.is_some() {
+                let (suffix, undated) = if header.streaks.rate_limit > 0 {
+                    overdue_suffix("retry", Some(&ordinal(header.streaks.rate_limit)))
+                } else {
+                    overdue_suffix("retry", None)
+                };
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 let suffix = if header.streaks.rate_limit > 0 {
                     format!("  {} retry in {c}", ordinal(header.streaks.rate_limit))
                 } else {
@@ -2073,19 +2143,28 @@ fn status_lines(
             // next attempt to count down to. Only a re-login (or a manual
             // refresh, which retries once) moves this.
             let label = crate::format::auth_expired_label(profile);
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
-                Span::styled(" ]", theme::dim()),
-            ]);
+            spans.extend(pill(
+                label.to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ));
             if crate::usage::dead_login_is_setup_token(profile) {
                 fetch_hint = Some(UsageDiag::SetupTokenRefused);
             }
         }
-        _ => match countdown {
+        _ => match (overdue_age, countdown) {
+            // The stood-down mirror's past deadline: nothing is queued, the
+            // refresh is past due, and the reading's own age rides the dot.
+            (Some(_), _) => {
+                let dot = Span::styled(format!("{} ", theme::WAITING), theme::accent());
+                let phrase = Span::styled(overdue_phrase("refresh", reading_clock), theme::dim());
+                suffix_undated = reading_clock
+                    .is_some()
+                    .then(|| Span::styled(overdue_phrase("refresh", None), theme::dim()));
+                spans.extend([dot, phrase]);
+            }
             // A scheduled refresh is work lined up — the `queued` dot (`◌` in
             // ACCENT), not a spinner: nothing is running yet.
-            Some(c) => spans.extend([
+            (None, Some(c)) => spans.extend([
                 Span::styled(format!("{} ", theme::WAITING), theme::accent()),
                 Span::styled(format!("refresh in {c}"), theme::dim()),
             ]),
@@ -2093,12 +2172,11 @@ fn status_lines(
             // states above so the blank overview timer reads as intent; the
             // binding reset is already on the maxed window's own bar line, so
             // the pill stays bare.
-            None if skipped_spent => {
-                spans.extend([
-                    Span::styled("[ ", theme::dim()),
-                    Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
-                    Span::styled(" ]", theme::dim()),
-                ]);
+            (None, None) if skipped_spent => {
+                spans.extend(pill(
+                    "spent".to_string(),
+                    theme::warning().add_modifier(Modifier::BOLD),
+                ));
                 // Only the weekly cap earns the teach — the domain fact that a
                 // live-looking 5h window can't serve while the week is spent.
                 // A 5h-only spend is self-evident from the reset.
@@ -2113,7 +2191,7 @@ fn status_lines(
             // Nothing pending and nothing maxed — the `idle` dot, which differs
             // from `queued` above by color alone, so the label carries the
             // meaning on a monochrome read.
-            None => spans.extend([
+            (None, None) => spans.extend([
                 Span::styled(format!("{} ", theme::WAITING), theme::dim()),
                 Span::styled("up to date", theme::dim()),
             ]),
@@ -2135,6 +2213,18 @@ fn status_lines(
         merged.push(Span::raw(" "));
         merged.extend(spans);
         spans = merged;
+    }
+    // The overdue suffix is 13-17 cells longer than the countdown it
+    // replaced: on a pane it does not fit, the ` · read Nm ago` half drops
+    // whole first — the header gauge draws its age only in the cells the
+    // drawn row leaves, so there it never pushes anything else out — then the
+    // pane's own cut applies: a figure is whole or dropped whole, never cut
+    // mid-word. Every arm that pushes a suffix pushes it last.
+    if let Some(undated) = suffix_undated
+        && KEY_W + KEY_GUTTER + spans_cells(&spans) > w
+        && let Some(last) = spans.last_mut()
+    {
+        *last = undated;
     }
     rows.push(DiagRow {
         content: spans,

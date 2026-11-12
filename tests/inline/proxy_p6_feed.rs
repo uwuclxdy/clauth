@@ -488,6 +488,7 @@ fn the_live_feed_promises_no_refresh_for_a_keyless_proxy_profile() {
         .collect();
     let empty = std::collections::HashMap::new();
     let live = super::status_json::LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -569,6 +570,7 @@ fn the_feed_promises_no_oauth_refresh_for_a_proxy_profile_holding_an_oauth_login
     .collect();
     let empty = std::collections::HashMap::new();
     let live = super::status_json::LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -657,6 +659,7 @@ fn the_feed_promises_no_refresh_for_a_profile_with_an_unreadable_proxy_record() 
     .collect();
     let empty = std::collections::HashMap::new();
     let live = super::status_json::LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),

@@ -2931,6 +2931,186 @@ fn a_failed_fetch_row_with_no_deadline_reads_failed_not_queued() {
     );
 }
 
+/// The fetch row of an account 4 minutes past its refresh on an instance that
+/// runs no countdown, with the account's reading `read_ago_ms` old.
+fn overdue_fetch_row(read_ago_ms: u64, stale: bool) -> Vec<String> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    if stale {
+        readings = snap_with_stale(readings, "a");
+    }
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"));
+    row.split_whitespace().map(str::to_string).collect()
+}
+
+/// An overdue refresh on a stood-down instance says so and dates the reading,
+/// never `refresh in 0s`: the reading is old and nothing here will fetch it.
+#[test]
+fn an_overdue_fetch_row_says_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_fetch_row(330_000, false),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+}
+
+/// The `[ stale ]` pill keeps its own threshold: it prepends the overdue row
+/// only once the reading is past it, never for being overdue alone.
+#[test]
+fn a_stale_overdue_fetch_row_prepends_the_stale_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_fetch_row(13 * 60_000 + 30_000, true),
+        [
+            "status", "[", "stale", "]", "◌", "refresh", "overdue", "·", "read", "13m", "ago"
+        ],
+    );
+}
+
+/// The default and `[ stale ]` arms' joined row text, the same fixture the
+/// frozen `overdue_fetch_row` renders, returned un-tokenized so the spacing
+/// pins byte-exact (the token form collapses whitespace).
+fn overdue_joined_row(read_ago_ms: u64, stale: bool) -> String {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    if stale {
+        readings = snap_with_stale(readings, "a");
+    }
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone()
+}
+
+/// The default and `[ stale ]` arms' joined spacing is pinned byte-exact: the
+/// dot follows the key pad single-spaced, the stale pill prepends with one
+/// raw space, and neither may collapse or widen.
+#[test]
+fn the_overdue_rows_keep_their_join_spacing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_joined_row(330_000, false),
+        "status    ◌ refresh overdue · read 5m ago",
+    );
+    assert_eq!(
+        overdue_joined_row(13 * 60_000 + 30_000, true),
+        "status    [ stale ] ◌ refresh overdue · read 13m ago",
+    );
+}
+
+/// The fetch row of a stood-down mirror whose published deadline is
+/// `deadline_ago_ms` past, with the account's reading `read_ago_ms` old.
+fn mirror_fetch_row_at_deadline(deadline_ago_ms: u64, read_ago_ms: u64) -> Vec<String> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - deadline_ago_ms),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"));
+    row.split_whitespace().map(str::to_string).collect()
+}
+
+/// A mirror's published deadline reads overdue only past the tick's fetch
+/// deadline (90 s): 89 s past still draws the countdown form, 91 s the overdue
+/// wording. The fixtures sit one second either side of the grace
+/// boundary, the margin this pin holds against the wall clock moving between
+/// stamp and render.
+#[test]
+fn a_mirror_fetch_row_reads_overdue_only_past_the_tick_deadline_grace() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        mirror_fetch_row_at_deadline(89_000, 330_000),
+        ["status", "◌", "refresh", "in", "0s"],
+    );
+    assert_eq!(
+        mirror_fetch_row_at_deadline(91_000, 330_000),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+}
+
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
 /// (`HeaderState.streak`) so a deep slot reads as stuck from the count alone;
 /// a zero streak keeps the bare `retry in` suffix.
@@ -7492,5 +7672,616 @@ fn a_proxy_account_holding_a_sidecar_never_reads_the_relogin_line() {
         (true, true, true),
         "(the readable proxy account's empty body row, the unreadable record's, the plain \
          account's): {readable_rows:#?} {unreadable_rows:#?} {plain_rows:#?}"
+    );
+}
+
+/// The fetch row of a stood-down instance 4 minutes past its deadline, in
+/// `status` (its pill and retry ordinal kept), with the reading 5.5 minutes
+/// old so `read 5m ago` lands away from a minute boundary. Returns the token
+/// vector and the row's joined span text — the token pin collapses whitespace,
+/// so the spacing (the double space after a pill) needs the joined form
+/// pinned beside it.
+fn overdue_status_row(status: FetchStatus, rate_limit: u32) -> (Vec<String>, String) {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 330_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", status);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts {
+                rate_limit,
+                ..StreakCounts::default()
+            },
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in") || l.contains("retry in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone();
+    (row.split_whitespace().map(str::to_string).collect(), row)
+}
+
+/// `[ failed ]` overdue: the pill and verb stay, the countdown becomes the
+/// overdue wording dated by the reading.
+#[test]
+fn a_failed_overdue_fetch_row_says_retry_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::Failed, 0);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "failed", "]", "retry", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ failed ]  retry overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// `[ cached ]` overdue keeps its `refresh` verb (a refresh attempt, not a
+/// retry, while the token chain is not failing).
+#[test]
+fn a_cached_overdue_fetch_row_says_refresh_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::Cached, 0);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "cached", "]", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ cached ]  refresh overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// `[ rate limited ]` overdue keeps the retry ordinal: the depth signal
+/// survives the reworded countdown.
+#[test]
+fn a_rate_limited_overdue_fetch_row_keeps_the_retry_ordinal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::RateLimited, 3);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "rate", "limited", "]", "3rd", "retry", "overdue", "·", "read", "5m",
+            "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ rate limited ]  3rd retry overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A fetching instance with a past deadline keeps its `queued` spinner: a
+/// fetch IS coming there, so the stood-down overdue wording never replaces
+/// it (and `refresh in 0s` never appears either).
+#[test]
+fn a_fetching_instance_with_a_past_deadline_keeps_the_queued_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.split_whitespace().any(|w| w == "queued"))
+        .unwrap_or_else(|| panic!("a queued row renders: {lines:?}"));
+    assert!(
+        crate::spinner::SPINNER_FRAMES
+            .iter()
+            .any(|f| row.split_whitespace().any(|w| w.contains(f))),
+        "`queued` follows its spinner frame: {row:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("overdue")),
+        "a fetching instance's past deadline never reads overdue: {lines:?}"
+    );
+}
+
+/// A third-party reading's `read N ago` dates off its cache mtime, which the
+/// snapshot's per-tick clock map carries (its `UsageInfo` holds no
+/// `fetched_at` stamp).
+#[test]
+fn a_third_party_overdue_fetch_row_dates_off_its_cache_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    let reading = crate::usage::UsageInfo::default();
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading);
+    readings.clock.insert("a".to_string(), now_ms() - 330_000);
+    readings.is_third_party.insert("a".to_string(), true);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue"))
+        .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+        "the third-party reading dates off its cache mtime, no fetched_at stamp"
+    );
+}
+
+/// An OAuth body with no `fetched_at` stamp shows its overdue form undated:
+/// the cache mtime that dates its due time is not a stamp clauth read, so
+/// no `read Nm ago` can ride the row — with and without the `[ stale ]`
+/// pill, which keeps its own threshold.
+#[test]
+fn an_undated_overdue_fetch_row_reads_overdue_without_a_read_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for stale in [false, true] {
+        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let mut readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo::default(),
+        );
+        readings = snap_with_oauth_usage(readings, "a", crate::usage::UsageInfo::default());
+        readings.clock.insert("a".to_string(), now_ms() - 330_000);
+        if stale {
+            readings = snap_with_stale(readings, "a");
+        }
+        let lines: Vec<String> = status_lines(
+            &profile,
+            &HeaderState {
+                fetches_here: false,
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() - 240_000),
+                tick: 0,
+                rate_limit_source: super::RateLimitSource::ThirdParty,
+                streaks: StreakCounts::default(),
+                kick_block: None,
+                queue_slot: None,
+                diag: DiagFlags::default(),
+                peak: None,
+            },
+            120,
+            &readings,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+        let row = lines
+            .iter()
+            .find(|l| l.contains("overdue"))
+            .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"))
+            .clone();
+        let expected: Vec<&str> = if stale {
+            vec!["status", "[", "stale", "]", "◌", "refresh", "overdue"]
+        } else {
+            vec!["status", "◌", "refresh", "overdue"]
+        };
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            expected,
+            "no stamp, no read age: the undated form (stale={stale})"
+        );
+    }
+}
+
+/// [`overdue_status_row`] for a body with no `fetched_at`: the due time
+/// derives off the clock map's mtime, but the read age has no stamp to
+/// date.
+fn undated_overdue_status_row(status: FetchStatus, rate_limit: u32) -> (Vec<String>, String) {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let mut readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo::default(),
+    );
+    readings = snap_with_oauth_usage(readings, "a", crate::usage::UsageInfo::default());
+    readings.clock.insert("a".to_string(), now_ms() - 330_000);
+    readings = snap_with_status(readings, "a", status);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts {
+                rate_limit,
+                ..StreakCounts::default()
+            },
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in") || l.contains("retry in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone();
+    (row.split_whitespace().map(str::to_string).collect(), row)
+}
+
+/// The pill arms keep their pill, verb and retry ordinal on an undated
+/// body, dropping only the ` · read Nm ago` half: the due time (the cache
+/// mtime plus the interval) still reads overdue, the read age has no stamp.
+#[test]
+fn the_pill_arms_read_overdue_undated_when_the_body_has_no_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::Failed, 0);
+    assert_eq!(tokens, ["status", "[", "failed", "]", "retry", "overdue"]);
+    assert_eq!(
+        joined, "status    [ failed ]  retry overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::Cached, 0);
+    assert_eq!(tokens, ["status", "[", "cached", "]", "refresh", "overdue"]);
+    assert_eq!(
+        joined, "status    [ cached ]  refresh overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::RateLimited, 3);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "rate", "limited", "]", "3rd", "retry", "overdue"
+        ]
+    );
+    assert_eq!(
+        joined, "status    [ rate limited ]  3rd retry overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A failed account whose leg a left-running fetch worker holds has no
+/// published deadline: the reading's own stamp plus the account's interval
+/// dates when the refresh fell due, so the fetch row reads the overdue
+/// wording on the instance that fetches, never a bare `[ failed ]`.
+#[test]
+fn a_late_workers_failed_fetch_row_says_retry_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let interval = crate::usage::usage_interval_ms(
+        &profile,
+        crate::profile::AppState::default().refresh_interval_ms,
+    );
+    // The 90 s interval + 4m30s lands the stamp exactly 6 m out, and
+    // `spoken_age` floors, so `read 6m ago` holds from the stamp to the 7 m
+    // boundary — a full minute of margin.
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - interval - 270_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", FetchStatus::Failed);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: interval,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue"))
+        .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        [
+            "status", "[", "failed", "]", "retry", "overdue", "·", "read", "6m", "ago"
+        ],
+    );
+    assert_eq!(
+        row, "status    [ failed ]  retry overdue · read 6m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A deliberately blanked leg keeps its blank slot even when its reading
+/// dates an overdue refresh: the blank IS the published fact (a spent skip,
+/// a suppressed credential, a selected leg on no work list), never a stuck
+/// worker's silence, so the fetch row renders the bare `[ spent ]` pill.
+#[test]
+fn a_blanked_spent_row_stays_bare_even_with_a_reading_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let interval = crate::usage::usage_interval_ms(
+        &profile,
+        crate::profile::AppState::default().refresh_interval_ms,
+    );
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 330_000),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    let readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                blanked: true,
+                interval_ms: interval,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let row = lines
+        .iter()
+        .find(|l| l.contains("[ spent ]"))
+        .unwrap_or_else(|| panic!("the spent pill renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        ["status", "[", "spent", "]"],
+        "the deliberate blank keeps the pill bare"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("overdue")),
+        "the blank, not a stuck worker, holds the leg:\n{lines:?}"
+    );
+}
+
+/// The three overdue fetch-row shapes whose reading-age suffix the width
+/// guard sheds: the stale-plus-pill row, the bare queue dot, and the late
+/// worker's failed row.
+#[derive(Clone, Copy, Debug)]
+enum OverdueBoundary {
+    StaleCached,
+    Dot,
+    LateFailed,
+}
+
+/// A stood-down fetch row in [`OverdueBoundary`]'s shape, drawn at `inner_w`.
+fn overdue_boundary_lines(shape: OverdueBoundary, inner_w: u16) -> Vec<Line<'static>> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 13 * 60_000 - 30_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    let (fetches_here, next_refresh_ms, status) = match shape {
+        OverdueBoundary::StaleCached => {
+            (false, Some(now_ms() - 240_000), Some(FetchStatus::Cached))
+        }
+        OverdueBoundary::Dot => (false, Some(now_ms() - 240_000), None),
+        OverdueBoundary::LateFailed => (true, None, Some(FetchStatus::Failed)),
+    };
+    if let Some(status) = status {
+        readings = snap_with_status(readings, "a", status);
+    }
+    if matches!(shape, OverdueBoundary::StaleCached) {
+        readings = snap_with_stale(readings, "a");
+    }
+    status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: crate::profile::DEFAULT_REFRESH_INTERVAL_MS,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        inner_w,
+        &readings,
+    )
+}
+
+/// The fetch row among `lines`, found by its overdue wording.
+fn overdue_boundary_row<'a>(lines: &'a [Line<'static>]) -> &'a Line<'static> {
+    lines
+        .iter()
+        .find(|l| l.spans.iter().any(|s| s.content.contains("overdue")))
+        .unwrap_or_else(|| panic!("the overdue fetch row renders: {lines:?}"))
+}
+
+/// The overdue row sheds its ` · read Nm ago` figure at its own exact display
+/// width: `inner_w` equal to the row's cells keeps the figure, one cell less
+/// drops it whole. A guard that sheds a cell early or late cuts a figure the
+/// eye reads as data, so both sides of the boundary are pinned.
+#[test]
+fn the_overdue_fetch_row_sheds_its_reading_age_at_its_exact_display_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (shape, dated, undated) in [
+        (
+            OverdueBoundary::StaleCached,
+            "status    [ stale ] [ cached ]  refresh overdue · read 13m ago",
+            "status    [ stale ] [ cached ]  refresh overdue",
+        ),
+        (
+            OverdueBoundary::Dot,
+            "status    ◌ refresh overdue · read 13m ago",
+            "status    ◌ refresh overdue",
+        ),
+        (
+            OverdueBoundary::LateFailed,
+            "status    [ failed ]  retry overdue · read 13m ago",
+            "status    [ failed ]  retry overdue",
+        ),
+    ] {
+        let wide = overdue_boundary_lines(shape, 200);
+        let row = overdue_boundary_row(&wide);
+        let text = |l: &Line<'static>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(
+            text(row),
+            dated,
+            "{shape:?}: the row fits whole at 200 cells"
+        );
+        let exact = spans_cells(&row.spans) as u16;
+        assert_eq!(
+            text(overdue_boundary_row(&overdue_boundary_lines(shape, exact))),
+            dated,
+            "{shape:?}: at the row's own {exact} cells the reading age stays",
+        );
+        assert_eq!(
+            text(overdue_boundary_row(&overdue_boundary_lines(
+                shape,
+                exact - 1
+            ))),
+            undated,
+            "{shape:?}: one cell short of {exact} drops the reading age whole",
+        );
+    }
+}
+
+/// A probed account's overdue row derives its due time from the probe
+/// interval, not from the base poll interval the diag flags carry: the
+/// selector runs once, inside the row.
+#[test]
+fn a_probed_accounts_overdue_fetch_row_derives_from_its_probe_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.usage_probe = true;
+    profile.has_long_lived_sidecar = true;
+    profile.usage_probe_interval_ms = 90_000;
+    // Two minutes on the reading is past the probe's 90 s cadence but not the
+    // base 300 s one, so only the probe interval dates it overdue.
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 120_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", FetchStatus::Failed);
+    let lines = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: 300_000,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    );
+    let row = overdue_boundary_row(&lines);
+    assert_eq!(
+        row.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>(),
+        "status    [ failed ]  retry overdue · read 2m ago",
+        "the probe's 90 s cadence dates the reading, not the 300 s base"
     );
 }

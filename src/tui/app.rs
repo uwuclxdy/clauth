@@ -5573,6 +5573,13 @@ pub(crate) struct App {
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
     pub(crate) stale_cues: HashMap<String, bool>,
+    /// The reading clock per profile, written each tick by `apply_usage` beside
+    /// the stale cue and read by the per-frame snapshot: the OAuth arm's
+    /// `fetched_at` (with the cache mtime fallback for an undatable body), the
+    /// third-party arm's cache mtime. The overdue rows derive their due time
+    /// off this, once per tick, never per frame; the read age dates off the
+    /// reading's own stamp ([`ReadingsSnapshot::read_clock_of`]).
+    pub(crate) reading_clocks: HashMap<String, u64>,
     /// Per-name stats of the durable key-rejection records the last time
     /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
     /// per-second stat per profile is cheap, a per-second read of every record
@@ -6433,6 +6440,14 @@ pub(crate) struct ReadingsSnapshot {
     pub(crate) oauth: HashMap<String, UsageInfo>,
     /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
     pub(crate) stale: HashMap<String, bool>,
+    /// The reading clock per profile name, cloned off `App::reading_clocks` —
+    /// the third-party arm's cache mtime (its `UsageInfo` carries no stamp) and
+    /// the mtime fallback for an undatable OAuth body.
+    pub(crate) clock: HashMap<String, u64>,
+    /// Whether each profile's usage cache is third-party-classified, the
+    /// picker's own split: the read age may date a third-party name off its
+    /// mtime (the file's only writer is a fetch outcome), never an OAuth one.
+    pub(crate) is_third_party: HashMap<String, bool>,
 }
 
 impl ReadingsSnapshot {
@@ -6448,6 +6463,27 @@ impl ReadingsSnapshot {
     pub(crate) fn stale_of(&self, name: &str) -> bool {
         self.stale.get(name).copied().unwrap_or(false)
     }
+    /// The clock dating `name`'s reading: its own stamp (`own_stamp`), falling
+    /// back to the per-tick map — the third-party arm's cache mtime and the mtime
+    /// fallback for an undatable OAuth body.
+    pub(crate) fn clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name)
+            .or_else(|| self.clock.get(name).copied())
+    }
+    /// The clock dating the `read Nm ago` phrase — only a stamp the reading
+    /// itself carries: the picked reading's own `fetched_at`, or a third-party
+    /// reading's cache mtime (its stamp; the file's only writer is a fetch
+    /// outcome). An undatable OAuth body's mtime fallback dates the due time
+    /// ([`Self::clock_of`]) only, never the read age: a date the cache mtime
+    /// alone would give is a date clauth did not read.
+    pub(crate) fn read_clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name).or_else(|| {
+            self.clock
+                .get(name)
+                .copied()
+                .filter(|_| self.is_third_party.get(name).is_some_and(|tp| *tp))
+        })
+    }
     /// Whether `name`'s UNPICKED OAuth reading carries the no-5h-limit mark
     /// ([`crate::usage::UsageInfo::no_five_hour_limit`]) — the store the
     /// scheduler's election reads. The picked reading (`usage_of`) is the
@@ -6455,6 +6491,15 @@ impl ReadingsSnapshot {
     /// verdict reads only off the raw OAuth store.
     pub(crate) fn no_five_hour_limit(&self, name: &str) -> bool {
         self.oauth.get(name).is_some_and(|u| u.no_five_hour_limit)
+    }
+    /// The reading's own stamp when it dates the present: only a live fetch
+    /// stamps `fetched_at`, and a future stamp proves the clock moved, not
+    /// that the read is fresh ([`crate::usage::usage_cache_clock_of`]).
+    fn own_stamp(&self, name: &str) -> Option<u64> {
+        self.usage
+            .get(name)
+            .and_then(|u| u.fetched_at)
+            .filter(|at| *at <= crate::usage::now_ms())
     }
 }
 
@@ -6716,6 +6761,7 @@ impl App {
             claude_resets_memo,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
+            reading_clocks: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             credit_refusals: HashMap::new(),
@@ -7783,6 +7829,8 @@ impl App {
             third_party: third_party_usage,
             oauth: usage_store,
             stale: self.stale_cues.clone(),
+            clock: self.reading_clocks.clone(),
+            is_third_party: third_party,
         }
     }
 
@@ -7838,12 +7886,13 @@ impl App {
         // bell, history/wallet re-read sets and the stale map all derive from
         // its one picker pass, never a second one.
         let readings = self.readings_snapshot();
-        let (bells, resets, history_names, wallet_names, stale_map) = {
+        let (bells, resets, history_names, wallet_names, stale_map, clock_map) = {
             let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             let mut stale_map = HashMap::new();
+            let mut clock_map = HashMap::new();
             let mut bells = Vec::new();
             let mut resets = Vec::new();
             let mut history_names = Vec::new();
@@ -7870,9 +7919,14 @@ impl App {
                     && oauth_usage
                         .as_ref()
                         .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                // One mtime stat per third-party profile per pass: the stale
+                // arm and the due-time clock arm share it.
+                let tp_mtime = p
+                    .usage_cache_is_third_party()
+                    .then(|| profile_cache_mtime_ms(&p.name, usage_cache_file(p)))
+                    .flatten();
                 let past_threshold = if p.usage_cache_is_third_party() {
-                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
-                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
+                    tp_mtime.is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
                 } else {
                     crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
                         stale_after_ms(interval_ms),
@@ -7883,6 +7937,21 @@ impl App {
                 };
                 let stale = !spent_skipped && past_threshold;
                 stale_map.insert(name.clone(), stale);
+                // The due-time clock the overdue arms derive their deadline
+                // off: the third-party arm's cache mtime (that file's only
+                // writer is a fetch outcome), the OAuth arm's own stamp with
+                // the mtime fallback for an undatable body. The fallback
+                // dates the due time only — the read age dates off the
+                // reading's own stamp, so an undatable OAuth body shows its
+                // overdue forms undated.
+                let clock = if p.usage_cache_is_third_party() {
+                    tp_mtime
+                } else {
+                    crate::usage::usage_cache_clock_of(&p.name, oauth_usage.as_ref())
+                };
+                if let Some(at) = clock {
+                    clock_map.insert(name.clone(), at);
+                }
                 // The same reading the daemon's bell judges: a lapsed 5h
                 // window is no figure, and an aged one is not fresh.
                 let util = readings
@@ -7928,9 +7997,17 @@ impl App {
                     wallet_names.push(name);
                 }
             }
-            (bells, resets, history_names, wallet_names, stale_map)
+            (
+                bells,
+                resets,
+                history_names,
+                wallet_names,
+                stale_map,
+                clock_map,
+            )
         };
         self.stale_cues = stale_map;
+        self.reading_clocks = clock_map;
         // `bells` is the full profile set this pass observed, so an account
         // deleted while ringing forgets and re-arms if re-created past the line.
         {

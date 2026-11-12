@@ -14411,7 +14411,8 @@ fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
 
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
-/// map (the steady state for healthy profiles) is a no-op fast path.
+/// map (the steady state for healthy profiles) is a no-op fast path. The
+/// dropped entries' leg keys come back for the blanked-countdown publish.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
     let suppressed_auth_expired: SuppressedAuthExpiredStore =
@@ -14423,14 +14424,21 @@ fn filter_suppressed_drops_only_named_entries() {
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed_auth_expired, snap);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
+    assert_eq!(
+        blanked,
+        HashSet::from([tp_key("no-data")]),
+        "the dropped entry's third-party leg key is the blanked publish's input",
+    );
 
-    // Empty map → identity (the fast path).
+    // Empty map → identity (the fast path), nothing blanked.
     let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
-    assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+    let (out, blanked) = filter_suppressed(&empty, snap2);
+    assert_eq!(out.len(), 2);
+    assert!(blanked.is_empty());
 }
 
 /// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
@@ -14449,15 +14457,23 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
+    assert!(
+        filter_suppressed(&suppressed_auth_expired, vec![expired])
+            .0
+            .is_empty()
+    );
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
         "a re-login must re-admit the profile without a restart or a timer",
+    );
+    assert!(
+        blanked.is_empty(),
+        "a re-admitted credential blanks nothing",
     );
 }
 
@@ -14475,7 +14491,9 @@ fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
     assert_eq!(
-        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        filter_suppressed(&suppressed_auth_expired, vec![rotated])
+            .0
+            .len(),
         1
     );
 }
@@ -16100,6 +16118,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         ],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -16176,6 +16196,8 @@ fn standdown_hydrate_removes_a_cacheless_third_party_name() {
         &[],
         &["tp-cacheless".to_string()],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -16218,6 +16240,8 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
             &tp_status,
             &last_fetched,
             seed_names,
+            &[],
+            &[],
             &[],
             &[],
             REFRESH_INTERVAL_MS,
@@ -16293,6 +16317,8 @@ fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
         &tp_status,
         &last_fetched,
         &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
+        &[],
+        &[],
         &[],
         &[],
         REFRESH_INTERVAL_MS,
@@ -16490,6 +16516,533 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
+}
+
+/// A stood-down mirror's only channel for the fetching instance's third-party
+/// verdict is the durable record a refused endpoint credential leaves: the
+/// cache seed derives `Fresh`/`Cached` off the cache clock and this instance
+/// runs no fetch, so nothing else publishes `AuthExpired`. The tick seeds the
+/// verdict from the record, and the Overview row reads it off the app's own
+/// snapshot — the suppressed account's timer cell is blank, as the holder's
+/// is. A cleared record (the holder re-keyed or re-logged the account) drops
+/// the seed at the next tick and the row returns to its derived overdue age.
+#[test]
+fn a_stood_down_mirror_blanks_a_suppressed_endpoint_row_from_its_durable_record() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    // A disabled endpoint of the same credential shape: the seed's scope is
+    // the work list, which never holds a disabled account.
+    let off_name = "off";
+    let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from(off_name));
+    off.base_url = Some("https://disabled.example.com".to_string());
+    off.api_key = Some("off-key".to_string());
+    off.disabled = true;
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::profile::save_profile(&off).expect("save the disabled profile");
+    crate::testutil::register_names(&[name, off_name]);
+    // The holder's last reading, dated far past its refresh so the derived
+    // deadline sits far past the grace and its age form is deterministic.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), off.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The durable verdict, through its own writer.
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(name),
+            fingerprint,
+        ),
+        "the durable record landed"
+    );
+    // The same durable verdict for the disabled endpoint: the record lands,
+    // and only the work-list scope keeps it from seeding a status.
+    let off_fingerprint = crate::usage::profile_credential_fingerprint(&off)
+        .expect("a disabled endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(
+        &crate::profile::ProfileName::from(off_name),
+        off_fingerprint,
+    );
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(off_name),
+            off_fingerprint,
+        ),
+        "the disabled endpoint's durable record landed"
+    );
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::AuthExpired),
+        "the durable verdict reaches the snapshot the Overview renders from"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        !row.split_whitespace().any(|w| w.starts_with('+')),
+        "the suppressed row's timer cell is blank, never an overdue age:\n{row}"
+    );
+    assert_eq!(
+        readings.status_of(off_name),
+        None,
+        "the seed is scoped to the work list: a disabled endpoint's record seeds nothing"
+    );
+    assert!(
+        !app.third_party_status
+            .lock()
+            .unwrap()
+            .contains_key(off_name),
+        "the disabled endpoint's store entry stays unseeded"
+    );
+
+    // The holder re-keyed the account: the record clears, and the next
+    // stand-down tick drops the seed — the row returns to its derived form.
+    crate::profile_cache::clear_auth_expired(&crate::profile::ProfileName::from(name));
+    super::tick(&state);
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::Cached),
+        "a cleared record reverts the seed to the cache-derived status"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        row.split_whitespace().any(|w| w == "+4m"),
+        "the row returns to its derived overdue age:\n{row}"
+    );
+}
+
+/// A stood-down daemon has no display surface, so its feed reads the same
+/// third-party store a TUI mirror does: the tick seeds the durable verdict
+/// there, and `status.json` publishes `AuthExpired` for the suppressed account
+/// rather than the `Cached` the hydrate derived from the cache clock.
+#[test]
+fn a_stood_down_daemon_publishes_the_durable_auth_expired_verdict() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    // A warm cache older than the interval: the hydrate derives `Cached` from
+    // it, and that live entry outranks the durable record in the feed, so only
+    // the seed turns the published verdict into `AuthExpired`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+
+    // The daemon shape: no display reader, and a competing instance holds the
+    // lease, so the public `tick` routes to the stand-down pass.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    assert_eq!(
+        published_fetch_status(&app, name),
+        Some("AuthExpired".to_string()),
+        "a stood-down daemon's feed publishes the durable verdict, not the hydrated cache's form"
+    );
+}
+
+/// A reader sampling the status stores (and the published feed) across many
+/// stand-down ticks never observes a refused name as anything but
+/// `AuthExpired`: the cache-derived hydrate write and the durable-verdict
+/// seed land in one pass, so a frame or a `status.json` write landing
+/// between them cannot show the dead account as fresh or cached.
+#[test]
+fn no_reader_observes_a_refused_name_as_fresh_or_cached_across_standdown_ticks() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // The refused endpoint: a warm cache dated far past its refresh, so the
+    // hydrate derives a status for it each tick.
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    write_profile_cache(
+        &ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(name), THIRD_PARTY_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(name), fingerprint),
+        "the durable record landed"
+    );
+
+    // The refused setup token, the probe seed's own shape, with a usage
+    // cache dated far past its refresh so the OAuth hydrate derives a
+    // status for it too.
+    let probe_name = "probed";
+    let mut probe = crate::testutil::blank_profile(&ProfileName::from(probe_name));
+    probe.usage_probe = true;
+    probe.has_long_lived_sidecar = true;
+    probe.setup_token_digest =
+        crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    crate::profile::save_profile(&probe).expect("save the probed profile");
+    crate::testutil::register_names(&[probe_name]);
+    write_profile_cache(
+        &ProfileName::from(probe_name),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    let probe_cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(probe_name), USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &probe_cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let probe_fp = probe.setup_token_digest.expect("a digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(probe_name), probe_fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(probe_name), probe_fp),
+        "the probe verdict landed"
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), probe.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let iterations = Arc::new(AtomicU64::new(0));
+    let verdict_seen = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // The reader signals one full sampling pass before the ticks and the first
+    // verdict sighting before the window closes: the bounded-work pin below
+    // then holds by construction, never by a scheduling race.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (sampled_tx, sampled_rx) = std::sync::mpsc::channel::<()>();
+    let tp_status = Arc::clone(&app.third_party_status);
+    let oauth_status = Arc::clone(&app.usage_status);
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let config = app.config().clone();
+    let reader = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let iterations = Arc::clone(&iterations);
+        let verdict_seen = Arc::clone(&verdict_seen);
+        let violations = Arc::clone(&violations);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let first_pass = iterations.fetch_add(1, Ordering::Relaxed) == 0;
+                if let Ok(st) = tp_status.lock()
+                    && let Some(seen) = st.get(name).copied()
+                {
+                    if seen == super::FetchStatus::AuthExpired {
+                        if verdict_seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let _ = sampled_tx.send(());
+                        }
+                    } else {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("third-party store: {seen:?}"));
+                    }
+                }
+                if let Ok(st) = oauth_status.lock()
+                    && let Some(seen) = st.get(probe_name).copied()
+                    && seen != super::FetchStatus::AuthExpired
+                {
+                    violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("oauth store: {seen:?}"));
+                }
+                if iterations.load(Ordering::Relaxed).is_multiple_of(16) {
+                    let snapshot = live.snapshot();
+                    let signals = snapshot.signals();
+                    let body = crate::daemon::build_status(
+                        &config,
+                        REFRESH_INTERVAL_MS,
+                        Some(&signals),
+                        false,
+                    );
+                    if let Some(entry) = body.profiles.iter().find(|e| e.name.as_str() == name)
+                        && entry.fetch_status.as_deref() != Some("AuthExpired")
+                    {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("published feed: {:?}", entry.fetch_status));
+                    }
+                }
+                if first_pass {
+                    let _ = started_tx.send(());
+                }
+            }
+        }
+    });
+
+    // The reader proves it sampled before the window opens and that it saw the
+    // verdict before the window closes: both pins below hold by construction
+    // under any scheduling, and a starved reader fails the handshake instead of
+    // this test's own invariant. The reader is stopped and joined on the
+    // failure path too, so a red never leaves it spinning past the test.
+    let wait = std::time::Duration::from_secs(30);
+    let started = started_rx.recv_timeout(wait);
+    if started.is_ok() {
+        for _ in 0..60 {
+            super::tick(&state);
+        }
+    }
+    let sampled = started.is_ok().then(|| sampled_rx.recv_timeout(wait));
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("the reader joins");
+    started.expect("the reader thread sampled the stores before the ticks");
+    sampled
+        .expect("the tick window ran")
+        .expect("the reader saw the refused verdict before the stop");
+    assert!(
+        iterations.load(Ordering::Relaxed) > 0 && verdict_seen.load(Ordering::Relaxed) > 0,
+        "the reader sampled the refused name as AuthExpired across the ticks"
+    );
+    let violations = violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "a refused name never reads as anything but AuthExpired during a tick: {violations:?}"
+    );
+}
+
+/// `name`'s published `fetch_status`, built the way the daemon's own tick
+/// builds it: the live stores' snapshot, then `status.json`'s body.
+fn published_fetch_status(app: &crate::tui::App, name: &str) -> Option<String> {
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let snapshot = live.snapshot();
+    let signals = snapshot.signals();
+    let config = app.config().clone();
+    crate::daemon::build_status(&config, REFRESH_INTERVAL_MS, Some(&signals), false)
+        .profiles
+        .into_iter()
+        .find(|entry| entry.name.as_str() == name)
+        .expect("the profile is published in the feed")
+        .fetch_status
+}
+
+/// The Overview row holding `needle`, as the full frame draws it off the
+/// app's own snapshot.
+fn row_of(app: &crate::tui::App, needle: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("a test terminal");
+    term.draw(|f| crate::tui::draw(f, app))
+        .expect("draw the frame");
+    let buf = term.backend().buffer().clone();
+    crate::testutil::buffer_rows(&buf)
+        .into_iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row holds {needle:?}:\n{}",
+                crate::testutil::buffer_rows(&buf).join("\n")
+            )
+        })
 }
 
 /// A stood-down TUI hydrates the third-party display superset off the daemon's
@@ -32106,6 +32659,265 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
     );
 }
 
+/// The spent skip publishes the deliberate-blank fact beside the blanked
+/// countdown: the leg's activity state carries the flag the renderer reads,
+/// so a past-due reading clock never dates the absent deadline as overdue.
+#[test]
+fn a_spent_skipped_leg_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the spent skip publishes the OAuth leg's blanked flag",
+    );
+}
+
+/// A session-suppressed credential publishes the same blanked flag: the tick
+/// drops the suppressed entry from its work list (no fetch, no countdown) and
+/// flags the leg, so the renderer keeps the row's slot blank.
+#[test]
+fn a_suppressed_credential_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    let fingerprint = state
+        .config
+        .lock()
+        .unwrap()
+        .profiles
+        .first()
+        .and_then(|p| p.setup_token_digest)
+        .expect("the fixture mints a setup token");
+    state
+        .suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the suppressed probe's OAuth leg is flagged blanked",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "the suppressed entry publishes no countdown",
+    );
+}
+
+/// A spent OAuth account that also carries a third-party credential keeps its
+/// third-party countdown: the skip blanks the OAuth leg alone, so a hybrid
+/// row whose figures the third-party cache supplies keeps counting down.
+#[test]
+fn a_spent_hybrid_keeps_its_third_party_countdown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut state = spent_probe_state(false);
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![tp_entry("spent")]));
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("spent"),
+        FetchStamp::at(EpochMs::from_millis(crate::usage::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        next.contains_key(&tp_key("spent")),
+        "the third-party leg's countdown survives the OAuth skip",
+    );
+    assert!(
+        !next.contains_key(&oauth_key("spent")),
+        "the OAuth leg's countdown is blanked",
+    );
+    drop(next);
+    let activity = state.activity.lock().unwrap();
+    assert!(super::countdown_blanked(&activity, &oauth_key("spent")));
+    assert!(
+        !super::countdown_blanked(&activity, &tp_key("spent")),
+        "the third-party leg is not blanked",
+    );
+}
+
+/// The stood-down mirror's spent skip publishes the same blanked flag, so a
+/// stood-down TUI shows a spent row blank exactly as the armed one does, and
+/// nothing else is flagged (the mirror runs no worker, so no leg is late).
+#[test]
+fn a_stood_down_spent_row_publishes_its_blanked_countdown_flag() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    // The hydration seeds the store from the disk cache, so the spent reading
+    // must live there — a store-seeded entry with no cache file is dropped as
+    // stale by the same pass.
+    crate::testutil::register_names(&["kitty"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent_reading(),
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    config.lock().unwrap().state.refresh_spent_accounts = false;
+    let state = chain_state(&config, vec![token("kitty")]);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("kitty")),
+        "the mirror's spent skip publishes the OAuth leg's blanked flag",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("kitty")),
+        "the mirror blanks the spent countdown",
+    );
+}
+
+/// One DeepSeek provider profile, `keyless`, holding no api key: its
+/// selected leg is the third-party one and no work list carries it.
+fn keyless_provider_config() -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState};
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyless"));
+    profile.provider = Some(crate::providers::Provider::DeepSeek);
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            profiles: vec![crate::profile::ProfileName::from("keyless")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    }))
+}
+
+/// A keyless provider profile still displays its cached figures (the
+/// third-party display seed) while nothing polls its selected leg: the tick
+/// publishes the deliberate blank for that leg, so the renderer never dates
+/// the fossil cache as a late worker's overdue refresh.
+#[test]
+fn a_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the unpolled selected leg's blanked flag is published",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("keyless")),
+        "nothing polls the leg, so no countdown",
+    );
+}
+
+/// A leg blanked as unpolled while the account had no key stops reading blank
+/// once the key is back and the account joins the third-party work list: the
+/// publish clears the flag in the same pass, so a worker left running on that
+/// leg later is still dated overdue.
+#[test]
+fn a_keyless_leg_that_gains_its_key_drops_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "control: the keyless selected leg is blanked",
+    );
+    // The key comes back: the account joins the work list, and a fresh stamp
+    // keeps the leg off this tick's fetch.
+    state.config.lock().unwrap().profiles[0].api_key = Some("sk-keyless".to_string());
+    let entries = super::collect_third_party_entries(&state.config.lock().unwrap().profiles);
+    *state.third_party_tokens.lock().unwrap() = entries;
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("keyless"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "the restored key takes the leg off the blank set",
+    );
+}
+
+/// The stood-down mirror publishes the same blank for a selected leg on no
+/// work list, so a stood-down TUI's row keeps the blank slot too.
+#[test]
+fn a_stood_down_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the mirror's publish blanks the unpolled selected leg",
+    );
+}
+
+/// An entry the blanked flag alone keeps alive is dropped in the same pass
+/// that clears it: an account blanked one tick and gone the next leaves no
+/// inert entry behind (the fetching tick has no general idle sweep).
+#[test]
+fn an_account_blanked_one_tick_and_removed_the_next_leaves_no_activity_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &oauth_key("spent")),
+        "control: the first tick blanked the spent probe",
+    );
+    // The profile is gone before the next tick: nothing re-raises its flag.
+    state.config.lock().unwrap().profiles.clear();
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !state.activity.lock().unwrap().contains_key("spent"),
+        "the cleared entry is dropped in the same publish pass",
+    );
+}
+
+/// A polled OAuth leg that is merely not due stays off the blank set: the
+/// blank's work list is the tick's whole snapshot, never the due subset, so
+/// an idle-but-pending leg keeps its published countdown.
+#[test]
+fn a_polled_not_due_oauth_leg_is_not_blanked_after_a_real_tick() {
+    use crate::profile::{AppConfig, AppState};
+    let home = crate::testutil::HomeSandbox::new();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("polled", false)],
+    }));
+    let state = chain_state(&config, vec![token("polled")]);
+    // Just-fetched: the leg falls due a whole interval out, so the armed tick
+    // fetches nothing and the blank decision reads a real, not-due member.
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key("polled"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    // The endpoint stub answers the claude-resets side read (the tick's one
+    // network leg, unrelated to the blank) and records any fetch leak.
+    probe_tick_expecting_none(&home, &state, 1);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        !super::countdown_blanked(&activity, &oauth_key("polled")),
+        "the not-due leg stays off the blank set",
+    );
+    assert!(
+        state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("polled")),
+        "its countdown publishes",
+    );
+}
+
 #[test]
 fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
     let home = crate::testutil::HomeSandbox::new();
@@ -32425,6 +33237,138 @@ fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
             "cached {cached}, recorded {recorded_token}"
         );
     }
+}
+
+/// A refused setup token whose cache holds a plan-only body (a login-plan seed)
+/// still reads as the refusal it is: the plan-only arm leaves the OAuth cadence
+/// unstamped, so the verdict rides its own status insert there.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_a_plan_only_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
+    );
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the plan-only arm carries the verdict with no cadence stamp"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "the plan-only body still fills the reading store"
+    );
+}
+
+/// A refused setup token whose usage cache will not parse keeps the verdict:
+/// the cache seed's no-body arm writes it in the same pass, where the name
+/// would otherwise carry no status at all.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no reading"
+    );
+}
+
+/// A stood-down scheduler state over one refused endpoint `name`: its work
+/// list holds the credential `tp_entry` builds, and the durable record keys
+/// that entry's fingerprint, so the tick's hydrate sees the name as refused.
+fn refused_endpoint_state(name: &str) -> super::SchedulerState {
+    crate::testutil::register_names(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let entry = tp_entry(name);
+    let fingerprint = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&pn, fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&pn, fingerprint),
+        "the durable refusal record landed"
+    );
+    let mut state = completion_order_state();
+    state.tokens = Arc::new(RankedMutex::new(Vec::new()));
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![entry]));
+    state
+}
+
+/// A refused endpoint whose third-party cache will not parse keeps the
+/// verdict: the third-party no-body arm writes it where the cache yields no
+/// copy to seed.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no copy"
+    );
+}
+
+/// A refused endpoint with no cache at all drops its stale reading and keeps
+/// the verdict: the cache-gone arm removes the store entries and writes
+/// `AuthExpired` where the removal alone would leave no status behind.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    state.third_party_usage_store.lock().unwrap().insert(
+        name.to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    state
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), super::FetchStatus::Cached);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the cache-gone arm keeps the verdict"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key(name),
+        "and drops the stale reading whose cache is gone"
+    );
 }
 
 /// A stood-down TUI beside the process that fetches usage, whose probe finds

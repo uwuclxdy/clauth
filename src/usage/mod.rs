@@ -27,7 +27,9 @@ mod scheduler;
 // it (S5) — the same `pub(crate)` + private-mod + cfg(test) re-export pattern
 // `scan_auto_switch` already uses.
 #[cfg(test)]
-pub(crate) use scheduler::{SchedulerState, set_tick_fetch_deadline_override, tick};
+pub(crate) use scheduler::{
+    SchedulerState, publish_blanked_countdowns, set_tick_fetch_deadline_override, tick,
+};
 // Gated like its one caller, the re-entered daemon child.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use scheduler::CLAUTH_TEST_RUN_SCHEDULER;
@@ -68,7 +70,7 @@ pub(crate) use scheduler::{
     any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
     build_token_entries, claim_marked_spend, claim_scheduler_spend_unless_shutting_down,
     clear_activity, collect_oauth_seed_names, collect_probe_seeds, collect_third_party_entries,
-    collect_third_party_seed_names, collect_token_seeds, collect_tokens,
+    collect_third_party_seed_names, collect_token_seeds, collect_tokens, countdown_blanked,
     current_key_rejected_names, dead_login_fingerprint, dead_login_is_setup_token,
     decision_fresh_any, display_activity, end_rotation, fill_chain_snapshot_stores, is_idle,
     is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
@@ -78,8 +80,9 @@ pub(crate) use scheduler::{
     raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
     reseed_keeping_cadence, seed_dead_logins, selected_activity, selected_next_refresh,
     spawn_refresher, spending_account, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
-    switch_grade_kick_lifts, sync_dead_logins, third_party_credentialed, token_spend_in_flight,
-    usage_cache_clock_of, usage_interval_ms, usage_poll_pair, usage_probe_admits,
+    switch_grade_kick_lifts, sync_dead_logins, third_party_credentialed, tick_fetch_deadline,
+    token_spend_in_flight, usage_cache_clock_of, usage_interval_ms, usage_poll_pair,
+    usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

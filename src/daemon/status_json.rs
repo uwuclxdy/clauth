@@ -46,6 +46,12 @@ pub(crate) const SCHEMA_VERSION: u64 = 2;
 /// across those reads would both invert lock order and stall every other config
 /// user for the duration.
 pub(crate) struct LiveSignals<'a> {
+    /// Whether the daemon this snapshot came from holds the usage-fetch lease.
+    /// A stood-down daemon runs no fetch: its live countdown stamps are
+    /// another instance's cache-clock estimates, so the feed publishes
+    /// `next_refresh_at: null` for them rather than a countdown this daemon
+    /// will not run. Part of the snapshot itself, so no writer can forget it.
+    pub(crate) fetches_here: bool,
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
     /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
@@ -574,6 +580,13 @@ pub(crate) fn build_profile_entries(
                 None
             } else {
                 match live {
+                    // A stood-down daemon runs no fetch, so its live stamps
+                    // (re-derived from another instance's cache clocks) must
+                    // not publish as a countdown this daemon will run — null,
+                    // and never the derived form either, which would read as
+                    // a scheduled refresh on the same evidence. The holder's
+                    // arm is unchanged: its own countdown is real.
+                    Some(sig) if !sig.fetches_here => None,
                     Some(sig) => selected_next_refresh(sig.next_refresh, p).or_else(derived_next),
                     None => derived_next(),
                 }
@@ -755,12 +768,15 @@ pub(crate) fn build_profile_entries(
 /// disagree) plus the per-profile usage cache the codex leg writes, and
 /// nothing else: a codex profile has no `Profile` record (the file split
 /// leaves `profiles.toml` untouched), so every claude-only field is its
-/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
-/// — the polled one, else the id_token's claim — never a `Claude <tier>`
-/// label, which is what `tier_label` would produce.
+/// no-data form rather than a fabricated one. `fetches_here` is the claude
+/// half's null rule: a stood-down daemon runs no codex poll, so its derived
+/// stamp publishes as `null`, never a countdown it will not run. `tier`
+/// carries the ChatGPT plan — the polled one, else the id_token's claim —
+/// never a `Claude <tier>` label, which is what `tier_label` would produce.
 pub(crate) fn build_codex_entries(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
+    fetches_here: bool,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     let active = codex.active_profile();
@@ -816,7 +832,11 @@ pub(crate) fn build_codex_entries(
                 stale: false,
                 alert_stale: false,
                 fetched_at: clock_ms.map(ms_to_iso),
-                next_refresh_at: clock_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
+                // A stood-down daemon runs no codex poll: its stamp would be
+                // the holder's cache clock, a countdown it does not run.
+                next_refresh_at: clock_ms
+                    .filter(|_| fetches_here)
+                    .map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
@@ -1054,8 +1074,13 @@ pub(crate) fn build_status_impl(
     let fallback = crate::codex_profiles::CodexState::default();
     let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
-    // prefix it always took.
-    profiles.extend(build_codex_entries(body_codex, interval_ms));
+    // prefix it always took. A single-shot or daemonless writer (`live: None`)
+    // keeps the derived stamp: it vouches for no poll of its own either way.
+    profiles.extend(build_codex_entries(
+        body_codex,
+        interval_ms,
+        live.is_none_or(|sig| sig.fetches_here),
+    ));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
