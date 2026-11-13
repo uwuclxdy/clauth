@@ -9166,9 +9166,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
     }
 }
 
-/// Slice 4: the description names the uncapped contract, the host Task parking
-/// threshold, the cost of a blocking call, and the fan-out guidance. Dropping
-/// any one during a prose edit would otherwise be silent.
+/// The description names the uncapped contract, the host Task parking
+/// threshold, the cost of a blocking call, the fan-out guidance and the
+/// long-queue recipe. Dropping any one during a prose edit would otherwise be
+/// silent.
 #[test]
 fn the_delegate_description_names_the_usage_contract() {
     let text = tool_entry_text("delegate");
@@ -9186,12 +9187,28 @@ fn the_delegate_description_names_the_usage_contract() {
         "distinct prompts",
         "fans the SAME prompt out",
         "pick the account with `profiles` first",
+        // The long-queue recipe, right after the fan-out sentence it extends.
+        "across accounts. A long queue runs the same way: keep a batch of \
+         `background: true` calls in flight and start the next as each result arrives.",
     ] {
         assert!(
             text.contains(phrase),
             "`delegate` description dropped {phrase:?}: {text}",
         );
     }
+
+    // `tool_entry_text` folds every whitespace run to one space; only the raw
+    // description shows the recipe still shares the fan-out paragraph.
+    let tools = ClauthServer::new().tool_router.list_all();
+    let raw = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .and_then(|t| t.description.as_deref())
+        .expect("the delegate tool carries a description");
+    assert!(
+        raw.contains("across accounts. A long queue runs the same way:"),
+        "the long-queue recipe left the fan-out paragraph: {raw:?}",
+    );
 }
 
 /// `which` folded into `profiles({scope: "session"})`, and the old

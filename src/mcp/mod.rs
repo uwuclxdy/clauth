@@ -1293,7 +1293,8 @@ A delegate has no time limit. A long blocking call is parked by the host as a Ta
 its result arrives as a task notification. A blocking call holds this conversation's turn until \
 the delegate returns; use `background: true` plus `monitor` to collect without blocking. To run \
 N distinct prompts, issue N parallel calls; `profiles` with one prompt fans the SAME prompt out \
-across accounts."
+across accounts. A long queue runs the same way: keep a batch of `background: true` calls in \
+flight and start the next as each result arrives."
     )]
     async fn delegate(
         &self,
