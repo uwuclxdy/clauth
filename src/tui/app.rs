@@ -33186,6 +33186,8 @@ fn poll_live_sessions(app: &mut App) {
 /// between two reads left its delivery ledger, which cues by the verdict the
 /// claim stamped, so a claimed finish reaches the mascot exactly like an
 /// unclaimed one. One id cues once, whichever spelling it is first seen as.
+/// A stop cues nothing — the note a resumed session reads names it — and its
+/// id still enters the seen set, so no later read can cue it.
 /// The first read only seeds, ledgers included, so a finish from before the
 /// launch is no event; a store that could not be read is no reading, so it
 /// neither seeds nor cues.
@@ -33218,6 +33220,7 @@ fn poll_delegate_jobs(app: &mut App) {
     };
     let mut cues: Vec<mascot::Cue> = finished
         .filter(|job| seen.insert(job.record.job_id.clone()))
+        .filter(|job| job.phase() != crate::mcp::jobs::JobPhase::Stopped)
         .map(|job| {
             if crate::mcp::done_job_failed(&job.record) {
                 mascot::Cue::DelegateFailed
@@ -33230,6 +33233,7 @@ fn poll_delegate_jobs(app: &mut App) {
         ledgers
             .into_iter()
             .filter(|ledger| seen.insert(ledger.job_id.clone()))
+            .filter(|ledger| !ledger.stopped)
             .map(|ledger| {
                 if ledger.failed {
                     mascot::Cue::DelegateFailed

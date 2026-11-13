@@ -473,13 +473,8 @@ fn several_lost_jobs_share_one_plural_line() {
 fn several_lost_jobs_with_one_isolated_offer_no_resume() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms();
-    write_lost_record("d-shared", Some(SESSION), Some("d-shared-1"), now);
-    write_lost_record("d-iso", Some(SESSION), Some("d-iso-1"), now);
-    let path = jobs::jobs_dir().unwrap().join("d-iso.json");
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["isolated"] = true.into();
-    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    write_lost_tombstone("d-shared", Some(SESSION), Some("d-shared-1"), now, false);
+    write_lost_tombstone("d-iso", Some(SESSION), Some("d-iso-1"), now, true);
     let watch = watcher(&["d-shared", "d-iso"], &[], 0);
 
     let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
@@ -504,8 +499,8 @@ fn several_lost_jobs_with_one_isolated_offer_no_resume() {
 fn several_lost_jobs_with_one_lacking_a_session_id_offer_no_resume() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms();
-    write_lost_record("d-shared", Some(SESSION), Some("d-shared-1"), now);
-    write_lost_record("d-bare", Some(SESSION), None, now);
+    write_lost_tombstone("d-shared", Some(SESSION), Some("d-shared-1"), now, false);
+    write_lost_tombstone("d-bare", Some(SESSION), None, now, false);
     let watch = watcher(&["d-shared", "d-bare"], &[], 0);
 
     let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
@@ -759,7 +754,7 @@ fn an_orphaned_job_wakes_with_the_lost_line_beside_the_still_running_rest() {
         "the live job stays in the store, unclaimed"
     );
     assert_eq!(
-        own_jobs(SESSION, crate::usage::now_ms()),
+        own_jobs(SESSION, crate::usage::now_ms(), None),
         ["d-b", "d-a"],
         "a later turn end adopts the orphan too; the reported set keeps it silent"
     );
@@ -1107,30 +1102,36 @@ fn a_print_mode_untied_orphan_wakes_once() {
     assert_eq!(await_job_wake(&again), (0, None), "{again:?}");
 }
 
-/// One orphaned running record with the fields these lost-copy tests vary:
-/// the record's own session id (the resume handle) and its last-seen stamp,
-/// which the wake's age clause reads. The owner pid names a server that is
-/// gone, so the record reads as a corpse at the next poll.
-fn write_lost_record(
+/// One crashed run's tombstone with the fields these lost-copy tests vary:
+/// the record's own session id (the resume handle) and the `done_at` stamp the
+/// wake's age clause reads. A crashed `done` record reads orphaned whatever
+/// handle it carries — the run's lifetime really ended with no result to
+/// collect — so the lost copy still has a session id to offer.
+fn write_lost_tombstone(
     job_id: &str,
     host_session: Option<&str>,
     session_id: Option<&str>,
-    started_at: u64,
+    done_at: u64,
+    isolated: bool,
 ) {
     let dir = jobs::jobs_dir().unwrap();
     crate::profile::mkdir_700(&dir).unwrap();
     let mut record = serde_json::json!({
         "job_id": job_id,
         "profile": "work",
-        "state": "running",
-        "started_at": started_at,
-        "owner_pid": 4242,
+        "state": "done",
+        "started_at": done_at,
+        "done_at": done_at,
+        "crashed": true,
     });
     if let Some(host) = host_session {
         record["host_session"] = host.into();
     }
     if let Some(sid) = session_id {
         record["session_id"] = sid.into();
+    }
+    if isolated {
+        record["isolated"] = true.into();
     }
     std::fs::write(
         dir.join(format!("{job_id}.json")),
@@ -1145,11 +1146,12 @@ fn write_lost_record(
 #[test]
 fn a_lost_job_whose_record_names_its_session_offers_the_resume() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-sid",
         Some(SESSION),
         Some("d-sid-1"),
         crate::usage::now_ms(),
+        false,
     );
     let watch = watcher(&["d-sid"], &[], 0);
 
@@ -1174,11 +1176,12 @@ fn a_lost_job_whose_record_names_its_session_offers_the_resume() {
 #[test]
 fn a_lost_job_found_late_names_how_long_ago() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-late",
         Some(SESSION),
         Some("d-late-1"),
         crate::usage::now_ms() - 130 * MINUTE_MS,
+        false,
     );
     let watch = watcher(&["d-late"], &[], 0);
 
@@ -1203,17 +1206,13 @@ fn a_lost_job_found_late_names_how_long_ago() {
 #[test]
 fn a_lost_isolated_job_offers_no_resume() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-iso",
         Some(SESSION),
         Some("d-iso-1"),
         crate::usage::now_ms(),
+        true,
     );
-    let path = jobs::jobs_dir().unwrap().join("d-iso.json");
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["isolated"] = true.into();
-    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     let watch = watcher(&["d-iso"], &[], 0);
 
     let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
@@ -1237,17 +1236,13 @@ fn a_lost_isolated_job_offers_no_resume() {
 #[test]
 fn a_lost_isolated_job_found_late_offers_no_resume() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-iso-late",
         Some(SESSION),
         Some("d-iso-late-1"),
         crate::usage::now_ms() - 130 * MINUTE_MS,
+        true,
     );
-    let path = jobs::jobs_dir().unwrap().join("d-iso-late.json");
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["isolated"] = true.into();
-    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     let watch = watcher(&["d-iso-late"], &[], 0);
 
     let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
@@ -1263,6 +1258,130 @@ fn a_lost_isolated_job_found_late_offers_no_resume() {
         ),
         "{outcome:?}"
     );
+}
+
+/// A `running` record a dead server left behind, tied to a session and
+/// carrying its resume handle. `owner_pid` / `owner_started_at` name the dead
+/// server epoch: a pid whose marker was released, or this process's pid under
+/// a different start stamp, which is the pid-reuse arm.
+fn write_dead_owner_record(
+    job_id: &str,
+    host_session: &str,
+    session_id: &str,
+    owner_pid: u32,
+    owner_started_at: u64,
+    started_at: u64,
+) {
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "work",
+        "state": "running",
+        "started_at": started_at,
+        "owner_pid": owner_pid,
+        "owner_started_at": owner_started_at,
+        "host_session": host_session,
+        "session_id": session_id,
+    });
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The SessionStart resume payload the stopped note reads.
+fn session_start() -> Payload {
+    Payload {
+        event: "SessionStart".to_string(),
+        source: Some("resume".to_string()),
+        ..payload("SessionStart")
+    }
+}
+
+/// The note copy for one stopped delegate on the fixture's `work` profile.
+fn stopped_note(job_id: &str, session_id: &str) -> String {
+    format!(
+        "clauth note: a delegate this session started was stopped when the session exited: \
+         `{job_id}` on `work`. `delegate` with `session_id: \"{session_id}\"` and \
+         `profiles: [\"work\"]` resumes it."
+    )
+}
+
+/// A dead server's `running` record that carries a session id is the resume
+/// note's, never the turn-end watcher's: its phase reads stopped, so the turn
+/// end adopts nothing and a watcher already holding the id stays silent,
+/// while the resumed session's first turn names it with its handle.
+#[test]
+fn a_dead_owner_session_id_corpse_is_named_stopped_not_woken() {
+    let home = HomeSandbox::new();
+    let _env = entrypoint_pin(&home, "cli");
+    write_dead_owner_record(
+        "d-stop",
+        SESSION,
+        "d-stop-1",
+        4242,
+        1,
+        crate::usage::now_ms(),
+    );
+
+    assert_eq!(
+        own_jobs(SESSION, crate::usage::now_ms(), None),
+        Vec::<String>::new(),
+        "a stopped record is not a watcher's to carry"
+    );
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the turn end adopts nothing, so no watcher arms"
+    );
+    let watch = watcher(&["d-stop"], &[], 0);
+    let outcome = await_job_outcomes(&watch, &limits(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome), (0, None), "{outcome:?}");
+    assert!(outcome.dead.is_empty(), "{outcome:?}");
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-stop", "d-stop-1"))
+    );
+    assert!(jobs::read("d-stop").is_some(), "the wake claims nothing");
+}
+
+/// The pid-reuse arm of the owner verdict: a record stamped with THIS
+/// process's pid under an older server start stamp is a dead server's corpse,
+/// so it reads stopped like any dead owner's — the turn end adopts nothing and
+/// the note names it — although the pid itself is alive.
+#[test]
+fn a_reused_owner_pid_session_id_corpse_is_named_stopped_not_woken() {
+    let home = HomeSandbox::new();
+    let _marker = hold_server_marker().expect("hold the marker");
+    let _env = entrypoint_pin(&home, "cli");
+    write_dead_owner_record(
+        "d-reuse",
+        SESSION,
+        "d-reuse-1",
+        server_owner_pid(),
+        server_started_at() + 1,
+        crate::usage::now_ms(),
+    );
+
+    assert_eq!(
+        own_jobs(SESSION, crate::usage::now_ms(), None),
+        Vec::<String>::new(),
+        "a stopped record is not a watcher's to carry"
+    );
+    assert!(
+        turn_end_watch(Some(&payload("Stop"))).is_none(),
+        "the turn end adopts nothing, so no watcher arms"
+    );
+    let watch = watcher(&["d-reuse"], &[], 0);
+    let outcome = await_job_outcomes(&watch, &limits(), &|| true, &|_| false);
+    assert_eq!(await_job_wake(&outcome), (0, None), "{outcome:?}");
+    assert!(outcome.dead.is_empty(), "{outcome:?}");
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-reuse", "d-reuse-1"))
+    );
+    assert!(jobs::read("d-reuse").is_some(), "the wake claims nothing");
 }
 
 /// A live-owner job silent past the store's corpse window is hung, not lost:
@@ -1464,11 +1583,12 @@ fn the_deadline_names_the_untied_rest_beside_the_lost_job() {
 #[test]
 fn a_lost_job_on_the_five_minute_edge_names_no_age() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-edge",
         Some(SESSION),
         Some("d-edge-1"),
         crate::usage::now_ms() - 5 * MINUTE_MS,
+        false,
     );
     let watch = watcher(&["d-edge"], &[], 0);
 
@@ -1493,11 +1613,12 @@ fn a_lost_job_on_the_five_minute_edge_names_no_age() {
 #[test]
 fn a_lost_job_past_the_five_minute_edge_names_the_age() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-past",
         Some(SESSION),
         Some("d-past-1"),
         crate::usage::now_ms() - 5 * MINUTE_MS - 1_500,
+        false,
     );
     let watch = watcher(&["d-past"], &[], 0);
 
@@ -1522,17 +1643,19 @@ fn a_lost_job_past_the_five_minute_edge_names_the_age() {
 #[test]
 fn several_old_lost_jobs_share_one_plural_line_with_no_ages() {
     let _home = HomeSandbox::new();
-    write_lost_record(
+    write_lost_tombstone(
         "d-old-a",
         Some(SESSION),
         Some("d-old-a-1"),
         crate::usage::now_ms() - 130 * MINUTE_MS,
+        false,
     );
-    write_lost_record(
+    write_lost_tombstone(
         "d-old-b",
         Some(SESSION),
         Some("d-old-b-1"),
         crate::usage::now_ms() - 130 * MINUTE_MS,
+        false,
     );
     let watch = watcher(&["d-old-a", "d-old-b"], &[], 0);
 
@@ -2002,5 +2125,586 @@ fn the_idle_wake_turned_off_reads_no_ttl() {
         ttl_reads.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "no TTL read"
+    );
+}
+
+/// The watcher's limits for a live-child hold: a long rescan keeps the store
+/// re-listing out of the run, so the probe counter reads the poll arm alone —
+/// the re-scan skips every id the watch already holds, so it probes nothing
+/// even when it fires.
+#[cfg(unix)]
+fn child_alive_patient() -> AwaitLimits {
+    AwaitLimits {
+        deadline: Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: Duration::from_millis(5),
+        rescan: Duration::from_secs(60),
+    }
+}
+
+/// A dead server's corpse whose recorded child is still spending is writing
+/// the transcript no wake may call lost and no surface may offer for a resume:
+/// the watcher holds it silently while the child lives, and once the child is
+/// gone the record reads stopped and the resume note is its one telling.
+#[cfg(unix)]
+#[test]
+fn a_live_recorded_child_keeps_the_wake_silent_until_the_job_reads_stopped() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-livechild.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-livechild",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-livechild-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    crate::mcp::jobs::reset_recorded_child_probe_count();
+    let watch = watcher(&["d-livechild"], &[], 0);
+    let start = Instant::now();
+    // The return instant is captured inside the scope closure, before the
+    // scope joins the killer thread: a watcher that dropped the job at its
+    // first poll returns at once, and this read is what sees it.
+    let (outcome, returned_at) = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let outcome = await_job_outcomes(&watch, &child_alive_patient(), &|| true, &|_| false);
+        (outcome, Instant::now())
+    });
+    assert!(
+        returned_at.duration_since(start) >= Duration::from_millis(400),
+        "the wake held the job while the child lived instead of ending early: {outcome:?}"
+    );
+    // The hold is the watcher's own arm, never a silent drop re-adopting the
+    // record every poll: the child-alive corpse is probed at most once a
+    // second, so a drop bouncing through `own_jobs` probes on every poll and
+    // trips this bound. The bound is derived from the measured return
+    // instant, never a fixed count: a slow box returns one probe later, and
+    // a fixed cap reds on the delay instead of on a defect.
+    let probes = crate::mcp::jobs::recorded_child_probe_count();
+    assert!(
+        probes <= returned_at.duration_since(start).as_millis() as u64 / 1000 + 1,
+        "the watcher held the job through its own arm: {probes} probes"
+    );
+    assert!(outcome.dead.is_empty(), "no lost line: {outcome:?}");
+    assert_eq!(await_job_wake(&outcome), (0, None), "{outcome:?}");
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-livechild", "d-livechild-1")),
+        "the one telling is the stopped note"
+    );
+}
+
+/// A watcher holding a child-alive corpse probes the recorded child at most
+/// once per poll and once per second: each probe forks `ps` on macOS/BSD, so
+/// a two-probes-per-poll shape churned ~10 subprocesses a second for the
+/// whole hold. The run crosses two store re-scans, so a re-scan that probed
+/// the held corpse again would show in the count; the re-scan skips every id
+/// the watch already holds, so it contributes no probe. The first probe still
+/// lands at the first poll — a child already dead ends the hold at that poll.
+/// The bounds are derived from the schedule the seam counts against: one
+/// probe per poll caps the count at `deadline / poll`, and the per-second
+/// rate caps it at one per elapsed second plus the first.
+#[cfg(unix)]
+#[test]
+fn a_held_child_alive_corpse_is_probed_once_per_poll_and_once_per_second() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-holdchild.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-holdchild",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-holdchild-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let limits = AwaitLimits {
+        deadline: Duration::from_millis(5200),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: Duration::from_millis(20),
+        rescan: Duration::from_secs(2),
+    };
+    crate::mcp::jobs::reset_recorded_child_probe_count();
+    let watch = watcher(&["d-holdchild"], &[], 0);
+    let start = Instant::now();
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let probes = crate::mcp::jobs::recorded_child_probe_count();
+    assert!(
+        outcome.at_limit,
+        "the corpse is held to the deadline: {outcome:?}"
+    );
+    assert!(
+        probes <= elapsed_ms / 1000 + 1,
+        "a child-alive corpse is probed at most once per second: {probes} probes over {elapsed_ms} ms"
+    );
+    assert!(
+        probes <= limits.deadline.as_millis() as u64 / limits.poll.as_millis() as u64,
+        "at most one probe per poll: {probes} probes over {} polls",
+        limits.deadline.as_millis() / limits.poll.as_millis()
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The probe ledger counts REAL time: two polls whose wall-clock stamps are a
+/// second apart, inside one real second, probe the child once. A forward
+/// wall-clock step is exactly that pair, so a ledger reading the wall clock
+/// fires a second probe inside one real second.
+#[cfg(unix)]
+#[test]
+fn a_wall_clock_step_does_not_fire_a_second_child_probe() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-stepchild.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stepchild",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-stepchild-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    crate::mcp::jobs::reset_recorded_child_probe_count();
+    let mut probes = std::collections::HashMap::new();
+    let first = poll_job(
+        "d-stepchild",
+        Some(SESSION),
+        Some(SESSION),
+        now,
+        &[],
+        &mut probes,
+    );
+    assert!(
+        matches!(first, WatchedJob::Running { .. }),
+        "the first poll holds the live child"
+    );
+    let second = poll_job(
+        "d-stepchild",
+        Some(SESSION),
+        Some(SESSION),
+        now + 2_000,
+        &[],
+        &mut probes,
+    );
+    assert!(
+        matches!(second, WatchedJob::Running { .. }),
+        "the second poll holds the live child too"
+    );
+    assert_eq!(
+        crate::mcp::jobs::recorded_child_probe_count(),
+        1,
+        "a wall-clock step fires no second probe inside one real second"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// An aged running orphan that still reads orphaned — an ownerless record,
+/// silent past the store's window, whose session id kept it off the stop arm —
+/// wakes with the age read off its running stamps: the "how long ago" clause
+/// the tombstone tests pin on the done stamp comes from `last_seen_ms`'s
+/// running branch here. Every stamp sits past the silence window (the store
+/// anchors on the freshest), and the freshest is `recorded_at`, so a wake age
+/// read off `started_at` or `last_output_at` alone reads a different hour.
+#[test]
+fn an_aged_running_orphan_names_how_long_ago() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-old.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-old",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - jobs::RUNNING_TTL_MS - 5 * 60 * MINUTE_MS,
+            "recorded_at": now - jobs::RUNNING_TTL_MS - 90 * MINUTE_MS,
+            "last_output_at": now - jobs::RUNNING_TTL_MS - 3 * 60 * MINUTE_MS,
+            "host_session": SESSION,
+            "session_id": "d-old-1",
+            "owner_pid": 0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let watch = watcher(&["d-old"], &[], 0);
+
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(
+                "delegate job `d-old` ended with its server 1d 1h ago; its result is lost. \
+                 resume it with `delegate` `session_id: d-old-1`, or run the task again."
+                    .to_string(),
+            ),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A watcher holding a child-alive corpse must not promise the idle wake's
+/// "clauth will wake this session when it finishes": once the child dies the
+/// record reads stopped, the watcher drops it and `own_jobs` excludes
+/// stopped records, so only the resume note ever names it. The idle wake for
+/// such a job ends the wait silently, and the note keeps its one telling.
+#[cfg(unix)]
+#[test]
+fn an_idle_wake_promises_no_wake_for_a_job_the_resume_note_tells() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-idlechild.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-idlechild",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-idlechild-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let watch = watcher(&["d-idlechild"], &[], 55 * MINUTE_MS);
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &|_| false);
+
+    assert!(
+        outcome.pending.is_empty(),
+        "the note-told job leaves the pending set, so nothing promises it a wake: {outcome:?}"
+    );
+    assert_eq!(
+        await_job_wake(&outcome),
+        (0, None),
+        "no wake promises a job only the resume note will tell: {outcome:?}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-idlechild", "d-idlechild-1")),
+        "the one telling is the stopped note"
+    );
+}
+
+/// The same hold as the idle-wake test, but the child is reaped inside the
+/// probe throttle window, between the poll and the settle: the promise is
+/// false for it too, so the settle must drop the id without needing a probe
+/// to know — the note's shape (a running corpse with a session id and a gone
+/// owner) reads the same alive or dead.
+#[cfg(unix)]
+#[test]
+fn an_idle_wake_promises_no_wake_for_a_child_that_died_before_the_settle() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-idledead.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-idledead",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-idledead-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The child is reaped from the wake branch's own gate (`session_moved`,
+    // read on every poll before the settle), never from a thread of its own:
+    // the poll above the branch has already read the child alive, so the
+    // settle is the first reader that sees it dead however late the box
+    // schedules the branch — no probe can end the hold first.
+    let child = std::sync::Mutex::new(child);
+    let reaped = std::sync::atomic::AtomicBool::new(false);
+    let reap_on_the_branch = |_: &str| {
+        if !reaped.swap(true, Ordering::SeqCst) {
+            let mut spawned = child.lock().unwrap();
+            let _ = spawned.kill();
+            let _ = spawned.wait();
+        }
+        false
+    };
+    let watch = watcher(&["d-idledead"], &[], 55 * MINUTE_MS - 600);
+    let outcome = await_job_outcomes(&watch, &patient(), &|| true, &reap_on_the_branch);
+
+    assert!(
+        outcome.pending.is_empty(),
+        "a note-told job whose child died before the settle leaves the pending set: {outcome:?}"
+    );
+    assert_eq!(
+        await_job_wake(&outcome),
+        (0, None),
+        "no wake promises a job only the resume note will tell: {outcome:?}"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-idledead", "d-idledead-1")),
+        "the one telling is the stopped note"
+    );
+}
+
+/// The store scan never forks the recorded-child probe: the one
+/// classification that would — a running corpse carrying a session id whose
+/// owner is gone — is the resume note's shape, alive or dead, so the scan
+/// leaves it to the note and the poll's ledger alone. Adopting it would add a
+/// probe the poll repeats at its first poll, in the same second.
+#[cfg(unix)]
+#[test]
+fn the_store_scan_adopts_no_note_shaped_corpse_and_probes_nothing() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-scancorpse.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-scancorpse",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-scancorpse-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    crate::mcp::jobs::reset_recorded_child_probe_count();
+    let own = own_jobs(SESSION, crate::usage::now_ms(), None);
+    let probes = crate::mcp::jobs::recorded_child_probe_count();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        own.is_empty(),
+        "the resume note's corpse is never the watcher's: {own:?}"
+    );
+    assert_eq!(probes, 0, "the store scan forks no recorded-child probe");
+}
+
+/// The note's other stopped shape — a `Done + stopped` record, the host-exit
+/// finalize — landing between a poll and the idle-wake settle: the record is
+/// the note's to tell, so the settle drops the id instead of promising a
+/// wake that shape never gets.
+#[cfg(unix)]
+#[test]
+fn an_idle_wake_promises_no_wake_for_a_stop_that_lands_at_the_settle() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    std::fs::write(
+        dir.join("d-stoppedone.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stoppedone",
+            "profile": "work",
+            "state": "running",
+            "started_at": now - 60_000,
+            "recorded_at": now - 60_000,
+            "last_output_at": now - 5_000,
+            "host_session": SESSION,
+            "session_id": "d-stoppedone-1",
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The stop lands on the branch's own read: the poll before it kept the
+    // record alive on its child, and the settle is the first reader that sees
+    // the stopped `Done`.
+    let converted = std::sync::atomic::AtomicBool::new(false);
+    let stop_on_the_branch = || {
+        if !converted.swap(true, Ordering::SeqCst) {
+            std::fs::write(
+                dir.join("d-stoppedone.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "job_id": "d-stoppedone",
+                    "profile": "work",
+                    "state": "done",
+                    "started_at": now - 60_000,
+                    "done_at": crate::usage::now_ms(),
+                    "envelope": {"profile": "work", "is_error": false, "result": ""},
+                    "host_session": SESSION,
+                    "session_id": "d-stoppedone-1",
+                    "stopped": true,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        true
+    };
+    let watch = watcher(&["d-stoppedone"], &[], 55 * MINUTE_MS - 600);
+    let outcome = await_job_outcomes(&watch, &patient(), &stop_on_the_branch, &|_| false);
+
+    assert!(
+        outcome.pending.is_empty(),
+        "a note-told job leaves the pending set: {outcome:?}"
+    );
+    assert_eq!(
+        await_job_wake(&outcome),
+        (0, None),
+        "no wake promises a job only the resume note will tell: {outcome:?}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        crate::hook_jobs::note(&session_start()),
+        Some(stopped_note("d-stoppedone", "d-stoppedone-1")),
+        "the one telling is the stopped note"
     );
 }

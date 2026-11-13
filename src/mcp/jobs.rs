@@ -31,17 +31,19 @@
 //! spelling, so nothing collects the liveness file itself. It ends one of
 //! four ways. Renamed to the collectable spelling when the caller walks away.
 //! Settled in place when the run finishes with its caller still attached:
-//! `done`, no envelope — the join was the one delivery — and an `outcome` the
-//! TUI mascot and `monitor`'s reason arm read; the startup sweep reaps it past
-//! [`DONE_TTL_MS`] like every other done record. Converted to a tombstone when
-//! the server dies with the caller gone; the tombstone is a collectable record
-//! `monitor` then answers and removes. Deleted when a leftover stands beside a
-//! finished record: the finalize clears the spelling a racing beat recreated
-//! after a hand-off, and the sweep drops one beside a collectable record that
-//! already carries its envelope.
+//! `done`, no envelope — the join was the one delivery — an `outcome` for the
+//! TUI mascot's cue and a done state for `monitor`'s reason arm; the startup
+//! sweep reaps it past [`DONE_TTL_MS`] like every other done record. Converted
+//! to a tombstone when the server dies with the caller gone; the tombstone is
+//! a collectable record `monitor` then answers and removes. Deleted when a
+//! leftover stands beside a finished record: the finalize clears the spelling
+//! a racing beat recreated after a hand-off, and the sweep drops one beside a
+//! collectable record that already carries its envelope.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -59,6 +61,14 @@ use crate::profile::clauth_dir;
 /// mint-anchored TTL would expire every long run's salvage envelope the instant
 /// it finalizes, since the run's age is already whatever the run cost.
 pub(crate) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+
+/// How often a corpse's recorded child may be probed while it lives: each
+/// probe forks `ps` on macOS/BSD, so the poll's probe ledger caps the
+/// aggregate at one per second. The store re-scan forks none of its own: it
+/// skips every id the watch already holds, and the one classification that
+/// would probe — a corpse carrying a session id whose owner is gone — is the
+/// resume note's shape, which the scan leaves alone.
+pub(crate) const CORPSE_CHILD_PROBE_INTERVAL_MS: u64 = 1000;
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
@@ -299,11 +309,13 @@ pub(crate) struct JobRecord {
     /// behaviour.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) done_at: u64,
-    /// Whether this `done` record is the sweep's tombstone for a blocking run
-    /// whose server died without finishing it: `state` is `Done`, `envelope` is
+    /// Whether this `done` record is the sweep's tombstone for a run whose
+    /// server died without finishing it: `state` is `Done`, `envelope` is
     /// `None`, and the handle `session_id` kept is the only thing a shared run
     /// leaves to resume from. `false` on a normal finish and on a record an
-    /// older server wrote, so the default keeps those parseable.
+    /// older server wrote, so the default keeps those parseable. A stop-at-exit
+    /// tombstone keeps it beside [`Self::stopped`] — the server DID die — and
+    /// [`StoredJob::phase`] reads the stop first.
     #[serde(default)]
     pub(crate) crashed: bool,
     /// Whether a `done` record's run finished ok. The settled `Liveness`
@@ -314,6 +326,27 @@ pub(crate) struct JobRecord {
     /// envelope's `is_error` is the verdict.
     #[serde(default)]
     pub(crate) outcome: bool,
+    /// Whether this `done` record is a stop-at-`/exit` record: the in-process
+    /// stop's finalize (its salvage envelope still rides the record, and an
+    /// isolated run's transcript was rescued) or the sweep's tombstone for a
+    /// run the exit killed before its server could write one (no envelope,
+    /// nothing rescued; the tombstone also carries [`Self::crashed`]).
+    /// `false` on a normal finish, a cancel, and a record an older server
+    /// wrote, so the default keeps those parseable.
+    #[serde(default)]
+    pub(crate) stopped: bool,
+    /// The delegate child's pid, recorded at the spawn so a later server's
+    /// sweep can stop the process tree a killed server left spending. `0`
+    /// before the spawn, on a record an older server wrote, and on Windows,
+    /// where the stop keeps today's behaviour.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) child_pid: u32,
+    /// The token [`crate::daemon::gateway::process_start_time`] returned for
+    /// [`Self::child_pid`] at the spawn, so a sweep about to kill a recorded
+    /// child can tell the run's own process from a pid the OS reused. `None`
+    /// where the pid is unknown or the token could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_start_token: Option<String>,
     /// Which `clauth mcp` server process minted this record — its liveness
     /// marker pid, held by that server for its whole life, so a later server
     /// reads "owner alive" by probing one flock instead of waiting out the
@@ -326,6 +359,58 @@ pub(crate) struct JobRecord {
     /// age. `0` where the owner is unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) owner_started_at: u64,
+}
+
+// The recorded-child probes this thread has run: the test seam a poll-rate
+// test reads, so it can bound how often the watcher re-probes a child-alive
+// corpse. Per-thread so a concurrent test's probes never count against this
+// one.
+#[cfg(test)]
+thread_local! {
+    static RECORDED_CHILD_PROBE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// The readers are unix-only tests, so the accessors take their gate: a
+// Windows build has no caller and `-D dead_code` reds it.
+#[cfg(all(test, unix))]
+pub(crate) fn reset_recorded_child_probe_count() {
+    RECORDED_CHILD_PROBE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn recorded_child_probe_count() -> u64 {
+    RECORDED_CHILD_PROBE_COUNT.with(|count| count.get())
+}
+
+impl JobRecord {
+    /// Whether a `stopped` record's resume handle is real: a shared run's
+    /// transcript is already in the global store, an isolated one's only when
+    /// the stop's own rescue moved it there (the envelope's
+    /// `transcript_rescued` verdict, written either way). The ONE resume
+    /// verdict — the note, the listing and the collect copy all read it, so
+    /// no surface offers a resume the record cannot honour.
+    pub(crate) fn stop_is_resumable(&self) -> bool {
+        !self.isolated
+            || self
+                .envelope
+                .as_ref()
+                .and_then(|e| e.get("transcript_rescued"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }
+
+    /// Whether the child pid this record stamped at the spawn still names
+    /// that child: the pid is non-zero and the process's start token still
+    /// matches the recorded one, which is what tells the run's own process
+    /// from a pid the OS reused. `false` on Windows, which records no child.
+    pub(crate) fn recorded_child_alive(&self) -> bool {
+        #[cfg(test)]
+        RECORDED_CHILD_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+        self.child_pid != 0
+            && self.child_start_token.as_deref().is_some_and(|token| {
+                crate::daemon::gateway::process_start_time(self.child_pid).as_deref() == Some(token)
+            })
+    }
 }
 
 /// What one job's `running` record carries from its mint through every
@@ -406,13 +491,15 @@ fn base36(mut n: u64) -> String {
     out
 }
 
-/// A fresh, process-unique, filesystem-safe job id: `started_at` (epoch ms) in
-/// base-36, then a decimal monotonic counter. The stamp is encoded to keep the
-/// id short; the counter stays decimal because a same-millisecond run count is
-/// already tiny, and its only job is to differ.
+/// A fresh, filesystem-safe job id: `started_at` (epoch ms) in base-36, the
+/// minting server's decimal pid, then a decimal monotonic counter. The stamp is
+/// encoded to keep the id short; the pid keeps the id unique across `clauth mcp`
+/// processes on one box, since the counter restarts at 0 in each. The counter
+/// stays decimal because a same-millisecond run count is already tiny, and its
+/// only job is to differ within one process.
 pub(crate) fn new_job_id(started_at: u64) -> String {
     let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("d-{}-{n}", base36(started_at))
+    format!("d-{}-{}-{n}", base36(started_at), std::process::id())
 }
 
 /// True iff `id` is safe as a single path component (no separators, no
@@ -502,6 +589,21 @@ pub(crate) fn write_heartbeat_with_session(
     tail: &str,
     session_id: Option<&str>,
 ) -> Result<()> {
+    write_heartbeat_with_spawn_facts(spec, last_output_at, tail, session_id, 0, None)
+}
+
+/// [`write_heartbeat_with_session`] plus the spawn facts: the child's pid and
+/// its start token, recorded at the spawn so a later server's sweep can stop
+/// the tree a killed server left behind, and carried forward by every beat so
+/// the record keeps them however it is rewritten.
+pub(crate) fn write_heartbeat_with_spawn_facts(
+    spec: &RunningSpec,
+    last_output_at: u64,
+    tail: &str,
+    session_id: Option<&str>,
+    child_pid: u32,
+    child_start_token: Option<&str>,
+) -> Result<()> {
     write_atomic(
         &JobRecord {
             job_id: spec.job_id.clone(),
@@ -525,8 +627,11 @@ pub(crate) fn write_heartbeat_with_session(
             done_at: 0,
             crashed: false,
             outcome: false,
+            stopped: false,
             owner_pid: spec.owner_pid,
             owner_started_at: spec.owner_started_at,
+            child_pid,
+            child_start_token: child_start_token.map(str::to_string),
         },
         spec.kind,
     )
@@ -541,6 +646,9 @@ pub(crate) fn write_heartbeat_with_session(
 /// can be missing: the spawn's own liveness write has not landed yet. A run
 /// that already finished is `Finished`, so `hand_off` never reaches the
 /// rename — its settled record stays put.
+/// A collectable record already on disk (a racing hand-off promoted first) is
+/// kept: a fresh mint would drop the session id and child facts it carries,
+/// leaving the sweep a record it reaps instead of converts.
 ///
 /// What this does NOT do is stop the liveness spelling coming back. The rename
 /// is atomic; the concurrent writer is not bounded by it, and a heartbeat that
@@ -551,7 +659,7 @@ pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
     debug_assert_eq!(spec.kind, RecordKind::Collectable);
     let from = job_path(&spec.job_id, RecordKind::Liveness)?;
     let to = job_path(&spec.job_id, RecordKind::Collectable)?;
-    if std::fs::rename(&from, &to).is_err() {
+    if std::fs::rename(&from, &to).is_err() && !to.exists() {
         write_running(spec)?;
     }
     Ok(())
@@ -571,6 +679,9 @@ pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Res
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // The one completion envelope a host exit produces carries the marker; the
+    // record's own flag is what every reader classifies on.
+    let stopped = envelope.get("stopped").and_then(serde_json::Value::as_str) == Some("host_exit");
     write_atomic(
         &JobRecord {
             job_id: spec.job_id.clone(),
@@ -594,25 +705,30 @@ pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Res
             done_at: crate::usage::now_ms(),
             crashed: false,
             outcome: false,
-            // A finished record is final: no owner liveness is read from it.
+            stopped,
+            // A finished record is final: no owner liveness is read from it,
+            // and its child is gone.
             owner_pid: 0,
             owner_started_at: 0,
+            child_pid: 0,
+            child_start_token: None,
         },
         // A result is always collectable: the one run that finalizes with a
         // liveness record still open is a blocking one, and its caller already
         // took the envelope from the join, so `Handoff::finalize` settles that
         // record ([`write_done_liveness`]: done + outcome, no envelope) rather
-        // than writing a second delivery into it.
+        // than writing a second delivery into it — except for a stop at the
+        // host's exit, which has no caller left and lands here.
         RecordKind::Collectable,
     )
 }
 
 /// Settle a blocking run's liveness record at its finish: the same spelling,
 /// `done` state, no envelope — the caller's join was the one delivery — and
-/// the run's outcome off the envelope's error flag, which is all the finish
-/// leaves for the mascot's cue and `monitor`'s reason arm to read. The
-/// `done_at` stamp is what the startup sweep reaps by [`DONE_TTL_MS`],
-/// exactly like every other done record, so no new sweep arm exists for it.
+/// the run's outcome off the envelope's error flag, which the mascot's cue
+/// reads; `monitor`'s reason arm reads the done state alone. The `done_at`
+/// stamp is what the startup sweep reaps by [`DONE_TTL_MS`], exactly like
+/// every other done record, so no new sweep arm exists for it.
 /// The record stays under the `Liveness` spelling, so no caller-supplied id
 /// can resolve it (see [`RecordKind`]) and the result is never delivered
 /// twice. Mirrors [`write_done`]'s field choices: the run's session id rides
@@ -646,8 +762,11 @@ pub(crate) fn write_done_liveness(spec: &RunningSpec, envelope: &serde_json::Val
             done_at: crate::usage::now_ms(),
             crashed: false,
             outcome: !crate::mcp::envelope_reports_failure(envelope),
+            stopped: false,
             owner_pid: 0,
             owner_started_at: 0,
+            child_pid: 0,
+            child_start_token: None,
         },
         RecordKind::Liveness,
     )
@@ -693,6 +812,18 @@ pub(crate) fn write_done_parts(
 /// the collectable spelling ONLY — see [`RecordKind`].
 pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     let bytes = std::fs::read(job_path(job_id, RecordKind::Collectable).ok()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Read a blocking run's liveness record, or `None` if the file is absent or
+/// unparseable. Guarded by [`is_safe_job_id`] the way [`liveness_exists`] is:
+/// it answers about an id that resolved to NOTHING, where the caller has
+/// already stopped expecting the id to be well-formed.
+pub(crate) fn read_liveness(job_id: &str) -> Option<JobRecord> {
+    if !is_safe_job_id(job_id) {
+        return None;
+    }
+    let bytes = std::fs::read(job_path(job_id, RecordKind::Liveness).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -762,6 +893,12 @@ pub(crate) struct DeliveryLedger {
     /// ledger an older build wrote reads as a successful finish.
     #[serde(default)]
     pub(crate) failed: bool,
+    /// Whether the delivered record was a stop, judged at the claim by the
+    /// one phase classification: a stop cues no finish, whichever spelling a
+    /// reader first sees its id as. `#[serde(default)]`, so a ledger an older
+    /// build wrote reads as no stop.
+    #[serde(default)]
+    pub(crate) stopped: bool,
 }
 
 /// The ledger path for `job_id`. Guarded by [`is_safe_job_id`] at every caller
@@ -803,6 +940,7 @@ pub(crate) fn write_delivery_ledger_for_test_with_by(job_id: &str, by: &str, at:
         at,
         profile: "work".to_string(),
         failed: false,
+        stopped: false,
     }) else {
         return;
     };
@@ -829,12 +967,14 @@ fn write_delivery_ledger(record: &JobRecord, claimant: Claimant) {
     let Ok(path) = ledger_path(&record.job_id) else {
         return;
     };
+    let at = crate::usage::now_ms();
     let Ok(bytes) = serde_json::to_vec(&DeliveryLedger {
         job_id: record.job_id.clone(),
         by: claimant.label().to_string(),
-        at: crate::usage::now_ms(),
+        at,
         profile: record.profile.clone(),
         failed: crate::mcp::done_job_failed(record),
+        stopped: phase_of(record, RecordKind::Collectable, at) == JobPhase::Stopped,
     }) else {
         return;
     };
@@ -933,6 +1073,55 @@ pub(crate) fn liveness_is_done(job_id: &str) -> bool {
             .is_some_and(|record| record.state == JobState::Done)
 }
 
+/// The store entry a failed tag walk parks the tag's only name in:
+/// `<job id>.pending` beside the records, deliberately NOT a `.json` — no
+/// reader enumerates it ([`list`], [`read`], `clauth jobs`, the stopped note),
+/// and the startup sweep's foreign-file arm is its only consumer. It outlives
+/// the record: a record's own reap, collect or Done TTL can run while the
+/// marker still names the tag, and a completed walk is the one thing that
+/// removes it. A box whose enumeration never works keeps the marker and pays
+/// one logged failure per startup sweep until it can — the alternative is
+/// retiring the tag's only name on a walk that never proved the tag gone.
+#[cfg(unix)]
+const PENDING_SUFFIX: &str = ".pending";
+
+/// The job id a pending-marker path names, `None` for any other file.
+#[cfg(unix)]
+fn pending_marker_job_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let id = name.strip_suffix(PENDING_SUFFIX)?;
+    is_safe_job_id(id).then(|| id.to_string())
+}
+
+/// Park the tag's only name in the pending marker. The content repeats the id
+/// for an operator reading the store; the sweep takes the tag from the file
+/// name. Validated the way [`pending_marker_job_id`] validates the read, so a
+/// corrupted record's internal id cannot steer the write outside the store.
+#[cfg(unix)]
+pub(crate) fn write_pending_marker(job_id: &str) -> Result<()> {
+    if !is_safe_job_id(job_id) {
+        logline!("clauth: refusing the pending tag-sweep marker for unsafe job id {job_id:?}");
+        anyhow::bail!("job id {job_id:?} is not a safe path component");
+    }
+    let path = jobs_dir()?.join(format!("{job_id}{PENDING_SUFFIX}"));
+    if let Err(e) = crate::profile::atomic_write_600(&path, job_id.as_bytes()) {
+        logline!("clauth: writing the pending tag-sweep marker for `{job_id}` failed: {e}");
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// The startup sweep's marker consumer: re-run the tag sweep the failed walk
+/// owed, and remove the marker only once a walk completed — a failed
+/// enumeration (already logged) keeps the marker, which is the tag's only
+/// remaining name.
+#[cfg(unix)]
+fn sweep_pending_marker(path: &Path, job_id: &str) {
+    if stop_tagged(job_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Delete a blocking run's liveness record (best-effort).
 ///
 /// Its own function rather than a `kind` argument on [`remove`], because the two
@@ -942,6 +1131,288 @@ pub(crate) fn liveness_is_done(job_id: &str) -> bool {
 pub(crate) fn remove_liveness(job_id: &str) {
     if let Ok(path) = job_path(job_id, RecordKind::Liveness) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The filename tail a resumed-session marker carries: `<session_id>.resumed`
+/// under the jobs dir. Deliberately not `.json`, so no store reader parses
+/// it as a record — the sweep's foreign-file arm owns it.
+const RESUMED_SUFFIX: &str = ".resumed";
+
+/// Where the resumed marker for `session_id` stands.
+fn resumed_marker_path(session_id: &str) -> Result<PathBuf> {
+    Ok(jobs_dir()?.join(format!("{session_id}{RESUMED_SUFFIX}")))
+}
+
+/// One resumed marker's content, as the fence reads it.
+///
+/// `resumed_at` is the start of the run its resume launched — the instant the
+/// fence compares another record's start against — and `live` holds the ids of
+/// the session's records that read live when that resume listed them: the ones
+/// the resume did not consume, whose later stops it must never fence.
+struct ResumedMarker {
+    resumed_at: u64,
+    live: Vec<String>,
+}
+
+impl ResumedMarker {
+    /// The instant on the first line, then one live job id per line. A marker
+    /// written without a live set carries the bare instant and reads back with
+    /// no ids; an unparsable first line is no marker at all.
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        let resumed_at = lines.next()?.trim().parse::<u64>().ok()?;
+        let live = lines
+            .map(str::trim)
+            .filter(|id| is_safe_job_id(id))
+            .map(str::to_string)
+            .collect();
+        Some(Self { resumed_at, live })
+    }
+
+    /// The content [`Self::parse`] reads back, ids one per line: every job id
+    /// is path-safe, so none can carry the separator.
+    fn render(&self) -> String {
+        let mut text = format!("{}\n", self.resumed_at);
+        for id in &self.live {
+            text.push_str(id);
+            text.push('\n');
+        }
+        text
+    }
+}
+
+/// Whether the resumed marker for `session_id` fences a run of `job_id` that
+/// started at `run_started_at`. The marker carries the start of the run its
+/// resume launched and the ids that resume found live, so only a run already
+/// under way before that one, and not one it left running, is a record the
+/// resume consumed: the resumed run's own stop and any stop of a run live at
+/// the resume are told and kept like any other. The note filters on this and
+/// the sweep's post-write check retires a tombstone on it. The session id is
+/// validated before the join: it reaches here from a stored record the user's
+/// uid can edit.
+pub(crate) fn resumed_marker_fences(session_id: &str, job_id: &str, run_started_at: u64) -> bool {
+    if !is_safe_job_id(session_id) {
+        return false;
+    }
+    let Ok(path) = resumed_marker_path(session_id) else {
+        return false;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Absent is the only read that fences nothing: a marker that exists
+        // but cannot be read is still a resume's fence, dated only by its TTL.
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    // A marker whose content is the session id itself predates the instant
+    // content, and one whose first line is no instant is corrupt: both fence
+    // everything, because reading either as absent (a numeric session id would
+    // read as a centuries-old instant) would re-open a re-tell the file was
+    // written to close. Each ages out on the same TTL.
+    if text.trim() == session_id {
+        return true;
+    }
+    let Some(marker) = ResumedMarker::parse(&text) else {
+        return true;
+    };
+    run_started_at < marker.resumed_at && !marker.live.iter().any(|id| id == job_id)
+}
+
+/// The session id a resumed-marker path names, `None` for any other file.
+fn resumed_marker_session_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let id = name.strip_suffix(RESUMED_SUFFIX)?;
+    is_safe_job_id(id).then(|| id.to_string())
+}
+
+/// Whether a resumed marker is past [`DONE_TTL_MS`], read off its mtime —
+/// the instant the write landed. An unreadable stamp reads as fresh: the
+/// marker is the fence that keeps a resumed run from being re-told, so a
+/// sweep spares what it cannot date.
+fn resumed_marker_expired(path: &Path, now: u64) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|age| now.saturating_sub(age.as_millis() as u64) > DONE_TTL_MS)
+}
+
+/// Park the resumed session's marker in the jobs store: the start of the run
+/// the resume launched, then the ids of the session's records that read live
+/// when the resume listed them — the pair [`resumed_marker_fences`] compares
+/// another record's start and id against, so neither the resumed run's own
+/// stop nor a stop of a run the resume left running is fenced as one it
+/// consumed. The session itself is read from the file name. The instant is
+/// the run's, not this write's: a background resume mints that record before
+/// this runs, and a write-time instant would fence it. Content that already
+/// carries a later instant keeps it, so a backward wall-clock step between two
+/// resumes can only over-fence, never un-fence a record the earlier resume
+/// consumed. Validated the way [`resumed_marker_session_id`] validates the
+/// read, so a corrupted record's internal id cannot steer the write outside
+/// the store. Written through the 0o600 atomic writer the tree invariant
+/// requires, like every other file under `~/.clauth`.
+///
+/// The write takes the state lock the store's TTL reap takes: the reap stats
+/// and unlinks in one hold, so a resume's fresh marker can never land between
+/// that stat and that unlink and be the file the reap deletes. The read the
+/// monotone instant needs rides inside the same hold, against the same reap.
+pub(crate) fn write_resumed_marker(
+    session_id: &str,
+    resumed_at: u64,
+    live: &[String],
+) -> Result<()> {
+    if !is_safe_job_id(session_id) {
+        logline!(
+            "clauth: refusing the resumed-session marker for unsafe session id {session_id:?}"
+        );
+        anyhow::bail!("session id {session_id:?} is not a safe path component");
+    }
+    let path = resumed_marker_path(session_id)?;
+    let live: Vec<String> = live
+        .iter()
+        .filter(|id| is_safe_job_id(id))
+        .cloned()
+        .collect();
+    let written = with_state_lock(|_held| {
+        let resumed_at = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| ResumedMarker::parse(&text))
+            .map_or(resumed_at, |existing| existing.resumed_at.max(resumed_at));
+        let marker = ResumedMarker { resumed_at, live };
+        crate::profile::atomic_write_600(&path, marker.render().as_bytes())
+            .map_err(anyhow::Error::from)
+    });
+    if let Err(e) = written {
+        logline!("clauth: writing the resumed-session marker for `{session_id}` failed: {e}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove the `stopped` record(s) whose resume handle is `session_id`: a
+/// `delegate` resume by that id has taken the session, so the stopped note
+/// must not offer it again on the next compaction. Only a record that reads
+/// [`JobPhase::Stopped`] is removed — a corpse whose recorded child still
+/// runs, a blocking run its caller still holds, and every other record keep
+/// whatever they are. The spelling removed is the one the record actually
+/// holds: a stopped record can still sit in the liveness spelling until the
+/// next sweep converts it, and that is the file the note read.
+///
+/// The resumed marker lands FIRST, before any removal: the sweep's
+/// post-write check keys on it, so a tombstone the sweep writes while this
+/// removal runs — from a claim this list never saw — is retired by the
+/// sweep itself, whichever racer lands second. A marker that fails to write
+/// stops the removal loudly: without it no order is airtight, so the record
+/// stays.
+///
+/// A stopped record still `running` on disk is a corpse no sweep has
+/// converted yet: its escaped processes carry the run's job-id tag, and once
+/// this removal retires the record no later sweep targets that id — so the
+/// tag sweep runs here, before the remove. The resumed run's own tag is a
+/// NEW job id, so the sweep never reaches the new child. The sweep spends up
+/// to the group grace, which is why the one caller sits after its own
+/// child's pipe drains have started. Unix-only: Windows has no tag sweep.
+///
+/// A failed walk does not undo the removal — the resumed session must not
+/// read stopped anywhere after it — it parks the tag's name in the pending
+/// marker, where a later startup sweep retries the stop. A failed marker
+/// write keeps the record instead: it is the tag's only other name.
+///
+/// Each spelling is claimed the way the sweep's conversion is: renamed to
+/// the claim name first, so a conversion racing this removal finds no
+/// source to claim and writes nothing at all. A spelling holding a finished
+/// result is kept: a job's collectable `Done` beside a stopped liveness
+/// leftover is the result a `monitor` collect still owes, never a record this
+/// resume took.
+///
+/// The marker fences by the record, not by its presence alone: it carries the
+/// ids of this session's records that read live when this removal listed them,
+/// and a stop is a new record — told and kept like any other — when its run
+/// started at or after `resumed_at`, the resumed run's own start, or when that
+/// run was one this resume left live.
+pub(crate) fn remove_stopped_with_session(session_id: &str, now: u64, resumed_at: u64) {
+    // Read the store BEFORE the marker lands: these are the ids whose runs the
+    // resume left going, and one that stops between this list and the marker
+    // write still counts as live at the resume. Reading the store after it
+    // would file such a stop as consumed, and the record would never be told.
+    // The claim list below stays after the marker, where every tombstone a
+    // racing sweep writes is either visible to it or retired by the sweep's
+    // own post-write check.
+    //
+    // The verdict is the ID's, over every spelling it holds: a finished
+    // blocking run leaves its liveness file behind, still reading as a live
+    // hold, while the collectable spelling is the stop. A record whose stop
+    // any spelling carries is this resume's to take.
+    let jobs = list(now);
+    let stopped: HashSet<&str> = jobs
+        .iter()
+        .filter(|job| job.phase() == JobPhase::Stopped)
+        .map(|job| job.record.job_id.as_str())
+        .collect();
+    let live: Vec<String> = jobs
+        .iter()
+        .filter(|job| {
+            job.record.session_id.as_deref() == Some(session_id)
+                && !stopped.contains(job.record.job_id.as_str())
+        })
+        .map(|job| job.record.job_id.clone())
+        .collect();
+    if let Err(e) = write_resumed_marker(session_id, resumed_at, &live) {
+        logline!(
+            "clauth: writing the resumed-session marker for `{session_id}` failed: {e}; the stopped record stays"
+        );
+        return;
+    }
+    #[cfg(test)]
+    if HOLD_RESUME_MID_REMOVAL.load(std::sync::atomic::Ordering::Relaxed) {
+        hold_resume_park();
+    }
+    for job in list(now) {
+        if job.phase() == JobPhase::Stopped
+            && job.record.session_id.as_deref() == Some(session_id)
+            && job.record.started_at < resumed_at
+            && !live.iter().any(|id| id == &job.record.job_id)
+        {
+            #[cfg(unix)]
+            if job.record.state == JobState::Running
+                && !stop_tagged(&job.record.job_id)
+                && write_pending_marker(&job.record.job_id).is_err()
+            {
+                continue;
+            }
+            claim_job_spelling(&job.record.job_id, RecordKind::Liveness);
+            claim_job_spelling(&job.record.job_id, RecordKind::Collectable);
+        }
+    }
+}
+
+/// Claim one record spelling by renaming it to the claim name and deleting
+/// the claim: the rename fails exactly when the spelling is already gone,
+/// and the claim name is the sweep's own, so a conversion racing this
+/// removal finds no source to claim and writes nothing.
+///
+/// A spelling that carries a finished result and is not a stop is kept: the
+/// same state the sweep's conversion refuses to overwrite (a finish whose
+/// liveness leftover still stands) reaches here as two spellings of one job,
+/// and the collectable one is the result a `monitor` collect still owes.
+fn claim_job_spelling(job_id: &str, kind: RecordKind) {
+    let Ok(path) = job_path(job_id, kind) else {
+        return;
+    };
+    let finished = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<JobRecord>(&bytes).ok())
+        .is_some_and(|record| record.envelope.is_some() && !record.stopped);
+    if finished {
+        return;
+    }
+    let claimed = path.with_extension("json.claim");
+    if std::fs::rename(&path, &claimed).is_ok() {
+        let _ = std::fs::remove_file(&claimed);
     }
 }
 
@@ -1005,6 +1476,197 @@ pub(crate) fn reset_marker_registration_for_test() {
     MARKER_REGISTRATION.store(REG_NEVER, Ordering::Release);
     SERVER_MARKER_HELD.store(false, Ordering::Relaxed);
     SERVER_STARTED_AT.store(0, Ordering::Relaxed);
+}
+
+/// Test seam: the armed sweep removes a corpse's source file once it has read
+/// the record and reached the conversion's write point — the instant a
+/// concurrent resume's removal acts — so the conversion's source guard is
+/// driven on real store bytes rather than a hand-built interleaving.
+#[cfg(test)]
+static REMOVE_CONVERSION_SOURCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm [`REMOVE_CONVERSION_SOURCE`] for the guard's lifetime,
+/// clearing it on drop even if the test panics. It borrows the
+/// [`HomeSandbox`](crate::testutil::HomeSandbox) for the reason
+/// `profile::FailAppStateSave` does: the flag is a process-global serialized
+/// by `HOME_TEST_LOCK`, which the home sandbox holds.
+#[cfg(test)]
+pub(crate) struct RemoveConversionSource<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> RemoveConversionSource<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        REMOVE_CONVERSION_SOURCE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RemoveConversionSource<'_> {
+    fn drop(&mut self) {
+        REMOVE_CONVERSION_SOURCE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test seam: the armed sweep parks between its claim rename and its
+/// tombstone write, so a test runs a resume inside the claim window on real
+/// store bytes rather than a hand-built interleaving. The park is bounded, so
+/// a hold a test forgot to release cannot wedge the sweep forever.
+#[cfg(test)]
+static HOLD_CONVERSION_AFTER_CLAIM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The park's state: 0 idle, 1 parked at the claim, 2 released.
+#[cfg(test)]
+static CONVERSION_HOLD: (std::sync::Mutex<u8>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Test-only RAII: arm [`HOLD_CONVERSION_AFTER_CLAIM`] for the seam's
+/// lifetime, releasing the park and clearing the flag on drop even if the
+/// test panics. It borrows the [`HomeSandbox`](crate::testutil::HomeSandbox)
+/// the way [`RemoveConversionSource`] does: the flag is a process-global
+/// serialized by `HOME_TEST_LOCK`, which the home sandbox holds.
+#[cfg(test)]
+pub(crate) struct HoldConversionAfterClaim<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> HoldConversionAfterClaim<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        *CONVERSION_HOLD.0.lock().unwrap() = 0;
+        HOLD_CONVERSION_AFTER_CLAIM.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+
+    /// Block until the sweep's conversion parks at the claim, or fail the
+    /// test: the seam's whole point is the resume running inside the claim
+    /// window.
+    pub(crate) fn wait_parked(&self) {
+        let (lock, cond) = &CONVERSION_HOLD;
+        let mut state = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while *state != 1 {
+            assert!(
+                *state != 2,
+                "the conversion ran past the seam without parking"
+            );
+            let (guard, _) = cond
+                .wait_timeout(state, std::time::Duration::from_millis(50))
+                .unwrap();
+            state = guard;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the conversion never parked at the claim"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HoldConversionAfterClaim<'_> {
+    fn drop(&mut self) {
+        let (lock, cond) = &CONVERSION_HOLD;
+        *lock.lock().unwrap() = 2;
+        cond.notify_all();
+        HOLD_CONVERSION_AFTER_CLAIM.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The seam's park: block the sweep's own thread between the claim and the
+/// write until the test releases the hold, bounded so a forgotten release
+/// cannot wedge the sweep.
+#[cfg(test)]
+fn hold_conversion_park() {
+    let (lock, cond) = &CONVERSION_HOLD;
+    let mut state = lock.lock().unwrap();
+    *state = 1;
+    cond.notify_all();
+    let _ = cond
+        .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+            *state == 1
+        })
+        .unwrap();
+}
+
+/// Arms the resume-side park in [`remove_stopped_with_session`]: the resume
+/// parks between writing the resumed marker and listing the store, so a test
+/// can run the sweep's conversion to completion inside that window.
+#[cfg(test)]
+static HOLD_RESUME_MID_REMOVAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The park's state: 0 idle, 1 parked, 2 released.
+#[cfg(test)]
+static RESUME_HOLD: (std::sync::Mutex<u8>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Test-only RAII: arm [`HOLD_RESUME_MID_REMOVAL`] for the seam's lifetime,
+/// releasing the park and clearing the flag on drop even if the test panics.
+/// It borrows the [`HomeSandbox`](crate::testutil::HomeSandbox) the way
+/// [`HoldConversionAfterClaim`] does: the flag is a process-global serialized
+/// by `HOME_TEST_LOCK`, which the home sandbox holds.
+#[cfg(test)]
+pub(crate) struct HoldResumeMidRemoval<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> HoldResumeMidRemoval<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        *RESUME_HOLD.0.lock().unwrap() = 0;
+        HOLD_RESUME_MID_REMOVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+
+    /// Block until the resume parks at its mid-removal point, or fail the
+    /// test: the seam's whole point is the sweep's conversion completing
+    /// inside the resume's window.
+    pub(crate) fn wait_parked(&self) {
+        let (lock, cond) = &RESUME_HOLD;
+        let mut state = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while *state != 1 {
+            assert!(*state != 2, "the resume ran past the seam without parking");
+            let (guard, _) = cond
+                .wait_timeout(state, std::time::Duration::from_millis(50))
+                .unwrap();
+            state = guard;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume never parked at its mid-removal point"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HoldResumeMidRemoval<'_> {
+    fn drop(&mut self) {
+        let (lock, cond) = &RESUME_HOLD;
+        *lock.lock().unwrap() = 2;
+        cond.notify_all();
+        HOLD_RESUME_MID_REMOVAL.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The seam's park: block the resume's own thread at its mid-removal point
+/// until the test releases the hold, bounded so a forgotten release cannot
+/// wedge the removal.
+#[cfg(test)]
+fn hold_resume_park() {
+    let (lock, cond) = &RESUME_HOLD;
+    let mut state = lock.lock().unwrap();
+    *state = 1;
+    cond.notify_all();
+    let _ = cond
+        .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+            *state == 1
+        })
+        .unwrap();
 }
 
 /// How long a delegate mint waits for an in-flight marker registration to settle
@@ -1331,7 +1993,7 @@ pub(crate) enum JobLiveness {
     Corpse,
 }
 
-/// How one stored record reads to a reader ENUMERATING the store — four
+/// How one stored record reads to a reader ENUMERATING the store — five
 /// situations where [`JobLiveness`] carries three, because a `Running` record
 /// means two different things depending on which spelling holds it and only the
 /// pair answers "is anything already waiting on this".
@@ -1358,6 +2020,10 @@ pub(crate) enum JobPhase {
     /// [`RUNNING_TTL_MS`] (an ownerless record an older server wrote), or owned
     /// by a server whose marker is released — and so is the result.
     Orphaned,
+    /// A delegate the host session's exit stopped, or killed before its server
+    /// could write the stop: the resume handle survives, and the record says
+    /// the run did not finish.
+    Stopped,
 }
 
 impl JobPhase {
@@ -1369,15 +2035,17 @@ impl JobPhase {
             Self::Blocking => "blocking",
             Self::Done => "done",
             Self::Orphaned => "orphaned",
+            Self::Stopped => "stopped",
         }
     }
 
     /// Whether a `monitor` call naming this record's id could collect a RESULT
-    /// from it. False for a blocking run by construction (see [`RecordKind`])
-    /// and for an orphan, whose result died with its server. A tombstone, an
-    /// orphan whose collectable record still sits on disk, is the exception:
-    /// `monitor` naming its id answers it with the crash copy and then removes
-    /// it. `collectable: false` there names the absence of a result, never the
+    /// from it. False for a blocking run by construction (see [`RecordKind`]),
+    /// for an orphan, whose result died with its server, and for a stopped
+    /// run, whose result never existed. A tombstone (an orphan's or a stop's
+    /// collectable record still on disk) is the exception: `monitor` naming
+    /// its id answers it with the tombstone copy and then removes it.
+    /// `collectable: false` there names the absence of a result, never the
     /// absence of an answer. A settled liveness record (the `Done` a blocking
     /// run's finish leaves) answers true here but no id reaches the spelling —
     /// the row flag in `jobs_cli` consults the record's kind for it.
@@ -1388,7 +2056,7 @@ impl JobPhase {
     /// Whether something is still spending an account under this record.
     ///
     /// A DIFFERENT question from [`is_collectable`], and the pair splits the
-    /// four phases two ways that do not line up: a blocking run is live and not
+    /// five phases two ways that do not line up: a blocking run is live and not
     /// collectable, a done one is collectable and not live. Naming both keeps a
     /// later caller from reaching for whichever predicate happens to be there.
     ///
@@ -1431,7 +2099,7 @@ impl StoredJob {
         now.saturating_sub(self.anchor) / 1000
     }
 
-    /// Which of the four situations this record is in.
+    /// Which of the five situations this record is in.
     ///
     /// The one classification in the crate: `clauth jobs`, `monitor`'s listing
     /// and the TUI's delegates detail all read a record's situation from here, so
@@ -1444,12 +2112,31 @@ impl StoredJob {
     /// situation a `running` record is in.
     pub(crate) fn phase(&self) -> JobPhase {
         match self.liveness {
+            // A stop's `Done` record (the in-process finalize, or the sweep's
+            // tombstone) reads `stopped`, never `done` or the crash copy.
+            JobLiveness::Done if self.record.stopped => JobPhase::Stopped,
             // A crashed blocking run's record is `Done` on disk but carries no
             // envelope; it is the sweep's tombstone, not a result to collect.
             // The settled liveness record is the same shape with `crashed`
             // false and the run's `outcome` on it — a done row, not an orphan.
             JobLiveness::Done if self.record.crashed => JobPhase::Orphaned,
             JobLiveness::Done => JobPhase::Done,
+            // An owner-gone corpse that still carries its handle reads
+            // `stopped` at once: the hook and the resumed server's own sweep
+            // race, and the note must not need the sweep to have won. An
+            // ownerless silent record is not proven to be a `/exit` — silence
+            // alone is its corpse rule — so it stays `orphaned`. A corpse
+            // whose recorded child is STILL RUNNING stays `orphaned` too: its
+            // transcript is being written right now, so naming it `stopped`
+            // would offer a resume while the original run is live. It reads
+            // `stopped` once a sweep stops the child.
+            JobLiveness::Corpse
+                if self.record.session_id.is_some()
+                    && owner_is_gone(&self.record)
+                    && !self.record.recorded_child_alive() =>
+            {
+                JobPhase::Stopped
+            }
             JobLiveness::Corpse => JobPhase::Orphaned,
             JobLiveness::Running => match self.kind {
                 RecordKind::Collectable => JobPhase::Running,
@@ -1480,14 +2167,17 @@ impl StoredJob {
 /// still store.
 ///
 /// **`job_id` is not an arbitrary string here**, which is why it is the
-/// tiebreak: [`new_job_id`] mints `d-<base36 started_at>-<counter>`, so the
-/// comparison is over a mint stamp followed by a per-process sequence, and
-/// descending order puts the newest mint first — the same direction the anchor
-/// sorts. Two bounds worth stating rather than discovering: base-36 stamps
-/// compare as numbers only while they are the same width (the next width change
-/// is decades out), and the counter is decimal, so `-9` sorts above `-10` within
-/// one millisecond. Neither can reorder records with different anchors, and both
-/// are stable — which is the property this is for.
+/// tiebreak: [`new_job_id`] mints `d-<base36 started_at>-<pid>-<counter>`, so
+/// the comparison is over a mint stamp, then the minting process's pid, then a
+/// per-process sequence. Descending order puts a later stamp first — the same
+/// direction the anchor sorts — while a same-millisecond tie across two pids
+/// falls to the pid's decimal TEXT: `d-<ms>-9-0` sorts above `d-<ms>-10-0`,
+/// stable and deterministic but neither chronological nor numeric. Two more
+/// bounds worth stating rather than discovering: base-36 stamps compare as
+/// numbers only while they are the same width (the next width change is decades
+/// out), and the counter is decimal, so `-9` sorts above `-10` within one
+/// millisecond in one process. None can reorder records with different anchors,
+/// and all are stable — which is the property this is for.
 pub(crate) fn list(now: u64) -> Vec<StoredJob> {
     list_readable(now).unwrap_or_default()
 }
@@ -1572,6 +2262,27 @@ pub(crate) fn list_ledgers_readable() -> Option<Vec<DeliveryLedger>> {
     }
     ledgers.sort_by_key(|ledger| std::cmp::Reverse(ledger.at));
     Some(ledgers)
+}
+
+/// The phase a record read from `kind`'s spelling reads as, classified the way
+/// [`list`] classifies it: a collect arm and `monitor`'s unknown arm route a
+/// caller-supplied id by the SAME verdict every other surface uses, so a
+/// collect, a listing and a `monitor` cannot answer differently about one
+/// file. [`read`] resolves the collectable spelling and [`read_liveness`] the
+/// liveness one, so each caller pins the kind it read.
+pub(crate) fn phase_of(record: &JobRecord, kind: RecordKind, now: u64) -> JobPhase {
+    let liveness = match record.state {
+        JobState::Done => JobLiveness::Done,
+        JobState::Running if running_is_corpse(record, now) => JobLiveness::Corpse,
+        JobState::Running => JobLiveness::Running,
+    };
+    StoredJob {
+        record: record.clone(),
+        kind,
+        liveness,
+        anchor: retention_anchor(record),
+    }
+    .phase()
 }
 
 /// [`list`] banded for a READER: live rows first, each band still in `list`'s
@@ -1662,6 +2373,258 @@ fn reap_stale_ledger(path: &Path, now: u64) {
     }
 }
 
+/// How long a stop waits between its SIGTERM and its SIGKILL: the window the
+/// delegate's `claude` gets to flush its transcript and its MCP servers and
+/// shell children get to wind down. A real `claude -p` exits within ~185 ms of
+/// a group SIGTERM (measured 2026-11-07, Claude Code 2.1.319), so 300 ms gives
+/// a loaded box 1.6x that worst case; the poll loop still ends the grace early
+/// once no tagged pid is alive. Shared by the supervision loop's stop and the
+/// sweep's backstop; the exit handler's own fast SIGTERM is not followed by
+/// one — the loop owns the escalation.
+#[cfg(unix)]
+pub(crate) const GROUP_STOP_GRACE: Duration = Duration::from_millis(300);
+
+/// How long the sweep's stop arm settles a KILLed child's death before
+/// judging it: the window is a settle heuristic, not a measured death bound
+/// — a child still alive past it is judged the survivor the KILL cannot
+/// reach (an uninterruptible state), whose record the sweep keeps rather
+/// than naming a live transcript stopped. The only miss is a slow-dying
+/// child, converted by a later sweep once it is gone. A child already gone
+/// before the stop costs nothing — the settle's first read ends it.
+#[cfg(unix)]
+const STOP_SURVIVOR_SETTLE: Duration = Duration::from_millis(100);
+
+/// Send `signal` to the delegate child's whole process group. The spawn sets
+/// `process_group(0)`, so the child's pid IS the group id. Signalling a group
+/// that is already gone fails silently (ESRCH), which is what every stop path
+/// wants from its second or late signal.
+#[cfg(unix)]
+pub(crate) fn signal_group(pid: u32, signal: i32) {
+    #[expect(
+        unsafe_code,
+        reason = "killpg has no safe std wrapper; the pid is a recorded child's"
+    )]
+    // SAFETY: killpg takes a group id and a signal, and the pid came from a
+    // child this process recorded at its spawn.
+    unsafe {
+        libc::killpg(pid as i32, signal);
+    }
+}
+
+/// Whether the delegate child's process group still exists. `killpg` with
+/// signal 0 probes without delivering anything: 0 means members live, ESRCH
+/// means none. A stop reads this after its SIGTERM to skip the grace and the
+/// SIGKILL once nothing survived, and to know that the group KILL it is about
+/// to send still has a group to land on.
+#[cfg(unix)]
+pub(crate) fn group_alive(pgid: u32) -> bool {
+    #[expect(
+        unsafe_code,
+        reason = "killpg has no safe std wrapper; the pgid is a recorded child's"
+    )]
+    // SAFETY: killpg takes a group id and a signal; 0 probes without
+    // delivering anything.
+    unsafe {
+        libc::killpg(pgid as i32, 0) == 0
+    }
+}
+
+/// Send `signal` to one pid, the per-pid twin of [`signal_group`]. A pid that
+/// is already gone fails silently (ESRCH), which is what the sweep wants from
+/// its second or late signal.
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: i32) {
+    #[expect(
+        unsafe_code,
+        reason = "libc::kill has no safe std wrapper; the pid was verified by its exact clauth tag"
+    )]
+    // SAFETY: kill takes a pid and a signal; the pid's environment was read
+    // right before this call and carried this run's exact tag.
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+/// This process and its ancestors, which the escaped-process sweep must never
+/// signal: the server can itself be a delegate, and its ancestors may carry a
+/// PARENT run's tag. The walk is bounded so a wedged proc table cannot loop
+/// it.
+#[cfg(unix)]
+fn self_and_ancestors() -> HashSet<u32> {
+    let mut skip = HashSet::new();
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        if !skip.insert(pid) {
+            break;
+        }
+        match crate::session_record::parent_pid(pid) {
+            Some(parent) if parent != 0 => pid = parent,
+            _ => break,
+        }
+    }
+    skip
+}
+
+/// Whether `pid`'s environment holds one `CLAUTH_DELEGATE_JOB_ID=<job id>`
+/// entry exactly.
+#[cfg(unix)]
+fn env_carries_tag(pid: u32, job_id: &str) -> bool {
+    crate::runtime::process_environ(pid).is_some_and(|env| {
+        crate::runtime::environ_entry_equals(&env, super::DELEGATE_JOB_ENV, job_id)
+    })
+}
+
+/// Whether a sweep target still lives: the liveness read treats a zombie as
+/// gone, which is what the sweep wants — a zombie cannot keep running and a
+/// SIGKILL cannot end it. macOS reads the no-spawn `proc_bsdinfo`
+/// (`proc_pidinfo` answers 0 for a zombie), so one iteration of the 20 ms
+/// poll never spends a `ps` spawn; linux keeps the start-time read.
+#[cfg(unix)]
+fn tagged_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::daemon::gateway::process_start_time(pid).is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::runtime::proc_bsdinfo(pid).is_some()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Test seam: counts the tag sweeps' process enumerations
+/// ([`find_tagged_pids`] calls), so a test can pin that the reader's
+/// child-alive arm short-circuits before its walk. A test asserts a delta
+/// from a baseline read, never an absolute: the threaded fallback runs many
+/// tests in one process.
+#[cfg(all(test, unix))]
+static TAG_WALK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+pub(crate) fn tag_walk_count() -> usize {
+    TAG_WALK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Every live pid whose environment carries `CLAUTH_DELEGATE_JOB_ID=<job id>`
+/// exactly, minus this process and its ancestors. The one enumeration the
+/// stop sweep and the reader's tag probe share, so the two paths cannot
+/// disagree about which processes a tag names. `None` when the enumeration
+/// fails, which the reader's leave decision reads as "cannot prove the tag
+/// gone", never as "no tag". On macOS the enumeration spawns `ps` — the same
+/// unbounded child [`JobRecord::recorded_child_alive`] reads with — for every
+/// reader sweep and every startup sweep.
+#[cfg(unix)]
+fn find_tagged_pids(job_id: &str) -> Option<Vec<u32>> {
+    #[cfg(all(test, unix))]
+    TAG_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let skip = self_and_ancestors();
+    Some(
+        crate::runtime::live_process_pids()?
+            .into_iter()
+            .filter(|pid| !skip.contains(pid) && env_carries_tag(*pid, job_id))
+            .collect(),
+    )
+}
+
+/// Whether any live process carries the run's tag: the reader sweep's
+/// read-only half of [`find_tagged_pids`] — no signal, no sleep — which is
+/// what keeps a `monitor` call's sweep off the stdio server's runtime. The
+/// stop itself stays the startup sweep's. `None` when the enumeration failed:
+/// an unreadable process table cannot prove the tag gone.
+#[cfg(unix)]
+pub(crate) fn tag_lives(job_id: &str) -> Option<bool> {
+    Some(!find_tagged_pids(job_id)?.is_empty())
+}
+
+/// The escaped-process sweep: stop every live process whose environment
+/// carries `CLAUTH_DELEGATE_JOB_ID=<job id>` exactly, except this process and
+/// its ancestors. A Bash call inside the delegate runs in its own session, so
+/// a `&` child it starts sits outside the delegate's process group — the group
+/// stop's `killpg` never reaches it — and carries the run's tag instead.
+/// TERM first, then the same grace the group stop uses (polling, as
+/// [`stop_recorded_child`] does), then KILL whatever still lives. The tag is
+/// re-checked right before each signal, so a pid the OS reused is never
+/// signalled blind.
+///
+/// What the sweep cannot reach: a process started with a scrubbed environment
+/// (`env -i`) carries no tag, and on macOS some system binaries hide their
+/// environment, so a tagged-looking one reads untagged. Both keep running.
+///
+/// Returns whether the process walk completed. `false` (already logged by the
+/// enumeration) cannot prove the tag gone, so the record that names it must
+/// stay for a later sweep rather than convert.
+#[cfg(unix)]
+pub(crate) fn stop_tagged(job_id: &str) -> bool {
+    // A failed enumeration already logged; a stop finds nothing to signal
+    // rather than panicking on it.
+    let Some(mut alive) = find_tagged_pids(job_id) else {
+        return false;
+    };
+    for pid in &alive {
+        signal_pid(*pid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + GROUP_STOP_GRACE;
+    while !alive.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        alive.retain(|pid| tagged_alive(*pid));
+    }
+    for pid in alive {
+        // The grace is the pid-reuse window: re-read the tag before the KILL.
+        if env_carries_tag(pid, job_id) {
+            signal_pid(pid, libc::SIGKILL);
+        }
+    }
+    true
+}
+
+/// The exit stop's backstop: stop the delegate child a dead server left
+/// running, when the recorded pid still names it, and stop the processes that
+/// run escaped outside its group ([`stop_tagged`], keyed on the run's job id
+/// tag). The escaped sweep runs whether or not the child lives: a delegate
+/// that finished or died on its own after its server died still left the
+/// processes it backgrounded running, and no later sweep targets their job
+/// id. The start token tells the run's own process from a pid the OS reused —
+/// a mismatched one is left alone. Runs ONLY from the startup sweep's own
+/// thread (the full scope): the kill spends up to the group grace, and the
+/// reader sweep a `monitor` call triggers must never block the stdio server's
+/// runtime on it. Unix-only; Windows keeps today's behaviour.
+///
+/// Returns whether the tag sweep's process walk completed: a failed walk
+/// cannot prove the tag gone, so the caller keeps the record that names it.
+#[cfg(unix)]
+fn stop_recorded_child(record: &JobRecord) -> bool {
+    let child_alive = record.recorded_child_alive();
+    if child_alive {
+        signal_group(record.child_pid, libc::SIGTERM);
+    }
+    // The deadline is anchored before the sweep so the sweep's grace — the
+    // same length, on its own TERM — overlaps this one instead of running
+    // after it: one shared grace window, both KILLs at its end, never two
+    // serial graces.
+    let deadline = Instant::now() + GROUP_STOP_GRACE;
+    let walked = stop_tagged(&record.job_id);
+    if !child_alive {
+        return walked;
+    }
+    // Poll the group across the grace, the way the supervision loop polls
+    // its child: the grace is spent only while anyone survived the TERM. The
+    // KILL fires even when the recorded leader itself already exited on the
+    // TERM — its surviving descendants hold the group, and Linux keeps the
+    // reaped pid allocated while any group member lives, so the pgid cannot
+    // be reused under it.
+    while group_alive(record.child_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if group_alive(record.child_pid) {
+        signal_group(record.child_pid, libc::SIGKILL);
+    }
+    walked
+}
+
 fn sweep(now: u64, scope: Scope) {
     let full = scope == Scope::Everything;
     let Ok(dir) = jobs_dir() else {
@@ -1682,9 +2645,30 @@ fn sweep(now: u64, scope: Scope) {
         }
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             if full {
-                // A delivery ledger is kept while the unknown answer it feeds
-                // matters and reaped with the done TTL; everything else here is
-                // a stray tmp / foreign file.
+                // A pending marker is the tag's name a failed walk parked; it
+                // is swept, never swept away. A delivery ledger is kept while
+                // the unknown answer it feeds matters and reaped with the done
+                // TTL; everything else here is a stray tmp / foreign file.
+                #[cfg(unix)]
+                if let Some(job_id) = pending_marker_job_id(&path) {
+                    sweep_pending_marker(&path, &job_id);
+                    continue;
+                }
+                // A resumed marker is the fence that keeps a resumed run
+                // from being re-told: a live one is spared whatever else
+                // this sweep would delete here, an aged one reaped on the
+                // store's Done TTL. The stat and the unlink run under the
+                // state lock the marker's writer takes, so a fresh marker a
+                // concurrent resume lands is never the file reaped.
+                if resumed_marker_session_id(&path).is_some() {
+                    let _ = with_state_lock(|_held| {
+                        if resumed_marker_expired(&path, now) {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        Ok(())
+                    });
+                    continue;
+                }
                 if is_ledger_path(&path) {
                     reap_stale_ledger(&path, now);
                 } else {
@@ -1711,11 +2695,17 @@ fn sweep(now: u64, scope: Scope) {
             // silent past the window: the session's watcher still owes it one
             // lost-job wake. An untied corpse has no watcher to owe, a silent
             // one has had the window, and a liveness record keeps its own arm
-            // below.
+            // below. A corpse whose server is gone AND whose record carries
+            // its resume handle is an exit-shaped stop, so the tied keep only
+            // holds the handleless corpses the lost wake owes — the stop arm
+            // below classifies the handled one at once (the startup sweep
+            // stopping the child it left; the reader leaving the record until
+            // the child and the tag are provably gone).
             JobState::Running => {
                 running_is_corpse(&record, now)
                     && (kind == RecordKind::Liveness
                         || record.host_session.is_none()
+                        || (record.session_id.is_some() && owner_is_gone(&record))
                         || running_is_silent(&record, now))
             }
         };
@@ -1723,13 +2713,127 @@ fn sweep(now: u64, scope: Scope) {
             surviving.insert(record.job_id.clone());
             continue;
         }
-        // A dead blocking run's liveness record is CONVERTED rather than
-        // deleted: the caller holding the join is gone, and the run's handle is
-        // the only thing it left to resume from. A collectable corpse tied to a
-        // session was kept above for the session's watcher to report lost; an
-        // untied or silent one is deleted, since its result died with its
-        // server and no watcher will report it.
-        if record.state == JobState::Running && kind == RecordKind::Liveness {
+        // A corpse whose server is gone AND whose record carries its resume
+        // handle was a delegate the host session's exit stopped or killed:
+        // it becomes a stopped tombstone instead of being reaped, and the
+        // child it may have left running is stopped first. A handleless
+        // corpse is the watcher's lost wake to carry (kept above while tied
+        // and unsilent), and an ownerless silent record is not proven to be
+        // an exit, so both keep the arms below — a `session_id`, when one
+        // carries it, stays on the crash path.
+        if record.state == JobState::Running
+            && record.session_id.is_some()
+            && owner_is_gone(&record)
+        {
+            // The kill spends up to the group grace, so it runs only from
+            // the startup sweep's own thread (the full scope). A reader
+            // sweep whose corpse's recorded child STILL RUNS leaves the
+            // record for that startup sweep — a tombstone written now would
+            // read `stopped` for a live, spending delegate (see
+            // [`StoredJob::phase`]) — and one whose child is provably gone
+            // converts here, kill or no kill. The tag probe adds one more
+            // leave: a gone child's run may still have escaped processes
+            // carrying the job-id tag, and the startup sweep's stop targets
+            // that id through this record — a sweep that converted the corpse
+            // would retire the only record naming the tag, and those
+            // processes would never be stopped. The probe is read-only, so
+            // the reader still sends no signal and sleeps not at all. A
+            // failed enumeration is not an empty one: only a completed walk
+            // that found no tagged process proves the tag gone, so only that
+            // may convert, on the startup path as on the reader's.
+            #[cfg(unix)]
+            {
+                if full {
+                    if !stop_recorded_child(&record) {
+                        // A box whose enumeration never works keeps this
+                        // corpse, one logged failure per sweep, until it can.
+                        surviving.insert(record.job_id.clone());
+                        continue;
+                    }
+                    // A child that survived the TERM+KILL keeps the running
+                    // record: a tombstone would read stopped while the child
+                    // still spends, and the note would offer the live
+                    // transcript for a resume. The settle lets a KILLed
+                    // child's death land before the verdict, so only a child
+                    // the KILL cannot reach is judged the survivor.
+                    let settle = Instant::now() + STOP_SURVIVOR_SETTLE;
+                    while record.recorded_child_alive() && Instant::now() < settle {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if record.recorded_child_alive() {
+                        surviving.insert(record.job_id.clone());
+                        continue;
+                    }
+                } else if record.recorded_child_alive() || tag_lives(&record.job_id) != Some(false)
+                {
+                    surviving.insert(record.job_id.clone());
+                    continue;
+                }
+            }
+            // The conversion writes to the COLLECTABLE spelling, a file this
+            // sweep has not read (or the corpse itself, for a background
+            // record). Never overwrite a record that carries an envelope: a
+            // finish whose liveness leftover is the stale file here must keep
+            // its result.
+            if kind == RecordKind::Liveness
+                && read(&record.job_id).is_some_and(|existing| existing.envelope.is_some())
+            {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            #[cfg(test)]
+            if REMOVE_CONVERSION_SOURCE.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&path);
+            }
+            // The conversion's atomic step claims the source: the rename fails
+            // exactly when the file this sweep read no longer stands — a
+            // concurrent resume's removal retired the record — and a tombstone
+            // written then would resurrect it, so nothing is written. The
+            // claim also moves the only copy a later removal could still
+            // reach, so the write below cannot recreate a removed record. A
+            // crash between the claim and the write loses the record's only
+            // copy, the same accepted cost the delivery claim carries (a
+            // leftover claimed file is reaped by the startup sweep's
+            // foreign-file arm).
+            let claimed = path.with_extension("json.claim");
+            if std::fs::rename(&path, &claimed).is_err() {
+                continue;
+            }
+            #[cfg(test)]
+            if HOLD_CONVERSION_AFTER_CLAIM.load(std::sync::atomic::Ordering::Relaxed) {
+                hold_conversion_park();
+            }
+            let mut stopped = record;
+            stopped.state = JobState::Done;
+            stopped.done_at = now;
+            stopped.envelope = None;
+            stopped.stopped = true;
+            // The crash marker stays: the server DID die without finishing —
+            // the stop is the exit's classification of that death, not a
+            // replacement for it.
+            stopped.crashed = true;
+            // Drop the source only once the tombstone landed: a failed write
+            // (ENOSPC, read-only dir) renames the claim back, so the source
+            // stays the surviving carrier of the handle.
+            if write_atomic(&stopped, RecordKind::Collectable).is_ok() {
+                let _ = std::fs::remove_file(&claimed);
+                // The resume's marker predates its removal: a tombstone for a
+                // run that started before the resumed run is the record the
+                // resume already took — a claim this sweep landed inside the
+                // resume's own removal is seen by neither side otherwise — so
+                // it must not outlive the resume. A run that started at or
+                // after the resumed run, or one the resume listed live and
+                // finds stopped here, is a new stop, and its tombstone stands.
+                if stopped.session_id.as_deref().is_some_and(|session_id| {
+                    resumed_marker_fences(session_id, &stopped.job_id, stopped.started_at)
+                }) && let Ok(tombstone) = job_path(&stopped.job_id, RecordKind::Collectable)
+                {
+                    let _ = std::fs::remove_file(tombstone);
+                }
+            } else {
+                let _ = std::fs::rename(&claimed, &path);
+            }
+        } else if record.state == JobState::Running && kind == RecordKind::Liveness {
             // The conversion writes to the COLLECTABLE spelling, a file this
             // sweep has not read. Never overwrite a record that carries an
             // envelope: a finish whose liveness leftover is the stale file here
@@ -1737,6 +2841,27 @@ fn sweep(now: u64, scope: Scope) {
             if read(&record.job_id).is_some_and(|existing| existing.envelope.is_some()) {
                 let _ = std::fs::remove_file(&path);
                 continue;
+            }
+            // The same proof the branch above takes, for the corpses it
+            // cannot classify as a stopped peer: an ownerless record, or one
+            // that never pinned a session id, still leaves processes carrying
+            // its job-id tag, and retiring the record retires the tag's only
+            // handle. The startup sweep stops the tag first; the reader stays
+            // read-only and leaves whatever a completed walk cannot prove
+            // gone.
+            #[cfg(unix)]
+            {
+                if full {
+                    if !stop_tagged(&record.job_id) {
+                        // A box whose enumeration never works keeps this
+                        // corpse, one logged failure per sweep, until it can.
+                        surviving.insert(record.job_id.clone());
+                        continue;
+                    }
+                } else if tag_lives(&record.job_id) != Some(false) {
+                    surviving.insert(record.job_id.clone());
+                    continue;
+                }
             }
             let mut crashed = record;
             crashed.state = JobState::Done;
@@ -1750,6 +2875,38 @@ fn sweep(now: u64, scope: Scope) {
                 let _ = std::fs::remove_file(&path);
             }
         } else {
+            // The reap retires the tag's only name: an expired Running record
+            // may still have escaped processes carrying its tag, so the walk
+            // must complete first, and the record is retired only once the
+            // pending marker naming that tag stands. A finished record keeps
+            // today's reap: its stop's walk already ran, and a failed one
+            // parked the marker then.
+            #[cfg(unix)]
+            {
+                if record.state == JobState::Running {
+                    if full {
+                        if stop_tagged(&record.job_id) {
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                        if write_pending_marker(&record.job_id).is_ok() {
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                        // The marker write failed: the record is the tag's
+                        // only name still, so the reap waits for the next
+                        // sweep's retry.
+                        surviving.insert(record.job_id.clone());
+                        continue;
+                    }
+                    // The reader sends no signal and writes no marker: only a
+                    // completed walk that found nothing proves the tag gone.
+                    if tag_lives(&record.job_id) != Some(false) {
+                        surviving.insert(record.job_id.clone());
+                        continue;
+                    }
+                }
+            }
             let _ = std::fs::remove_file(&path);
         }
     }

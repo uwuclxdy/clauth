@@ -58,6 +58,10 @@ type Job = {
   doneAt?: number
   tail?: string
   cancelled?: boolean
+  /** The host exit's or the sweep's stop marker. */
+  stopped?: boolean
+  /** The sweep's marker for the server that died without finishing. */
+  crashed?: boolean
 }
 
 // One `<id>.json` as clauth serializes it: field order and skip-if-default
@@ -69,7 +73,9 @@ function jobFile(j: Job): string {
     state: j.state,
     started_at: j.startedAt,
   }
-  if (j.state !== 'running') {
+  // The sweep's tombstone is the one finished shape with no envelope: it
+  // carries the crash marker and the stop marker instead.
+  if (j.state !== 'running' && !(j.stopped === true && j.crashed === true)) {
     rec.envelope = {
       profile: j.profile,
       session_id: j.sessionId ?? null,
@@ -91,16 +97,26 @@ function jobFile(j: Job): string {
   rec.recorded_at = j.startedAt
   if (j.tail !== undefined && j.tail !== '') rec.tail = j.tail
   if (j.doneAt !== undefined) rec.done_at = j.doneAt
-  rec.crashed = false
+  rec.crashed = j.crashed ?? false
+  if (j.stopped === true) rec.stopped = true
   rec.owner_pid = 5151
   rec.owner_started_at = j.startedAt - 60_000
   return JSON.stringify(rec)
 }
 
-// The delivery ledger a collect leaves at `<id>.json.delivered`: these four
-// fields and nothing else (`DeliveryLedger` in src/mcp/jobs.rs).
+// The delivery ledger at `<id>.json.delivered` as an older build wrote it: job
+// id, claimant, instant and profile, with neither the `failed` verdict nor the
+// `stopped` marker a newer writer adds beside them (`DeliveryLedger` in
+// src/mcp/jobs.rs), so these fixtures read the serde defaults.
 function ledgerFile(id: string, profile: string, at: number): string {
   return JSON.stringify({ job_id: id, by: 'hook', at, profile })
+}
+
+// The delivery ledger a newer build writes: the old fields, the claim's
+// failure verdict, and the stop marker a record collected after its session's
+// exit leaves behind.
+function stoppedLedgerFile(id: string, profile: string, at: number): string {
+  return JSON.stringify({ job_id: id, by: 'monitor', at, profile, failed: false, stopped: true })
 }
 
 // Claude Code's project folder for a working directory: every character
@@ -356,7 +372,7 @@ function installWorld(on: On) {
       surfaces.splice(0, surfaces.length, ...next)
     },
     job: (j: Job) => put(`${JOBS}/${j.id}.json`, jobFile(j)),
-    // clauth's collect: the record goes, the four-field ledger stays.
+    // clauth's collect: the record goes and the delivery ledger stays.
     deliver: (id: string, profile: string) => {
       remove(`${JOBS}/${id}.json`)
       put(`${JOBS}/${id}.json.delivered`, ledgerFile(id, profile, clock.now()))
@@ -1071,6 +1087,160 @@ test('M3a-B: a live run whose owner process is gone reads orphaned once and stop
   const after = textOf(await drawn(pane))
   expect(hasWord(after, late.id), `the pane lists ${late.id} although nothing live should scan: ${clip(after)}`).toBe(false)
   expect(noticesNaming(world, late.id), `a notice named ${late.id} although nothing live should scan`).toBe(0)
+  await pane.unmount()
+})
+
+test('a delegate its session exit stopped reads stopped, not done', async ($, on) => {
+  const world = installWorld(on)
+  await startSession($)
+  const job = ownJob(world.clock.now(), 'd-mvzfs001-0', 'D1', 300_000, {
+    state: 'done',
+    doneAt: world.clock.now() - 60_000,
+    stopped: true,
+  })
+  await delegate($, world, job)
+  await world.clock.advance(POLL_MS)
+  const pane = await mountPane($, world)
+  const row = rowFor(await drawn(pane), job.id, [job.id])
+  expect(row !== undefined, `the pane lost the stopped ${job.id}`).toBe(true)
+  const text = textOf(row!)
+  expect(/\bstopped\b/.test(text), `the stop at the session's exit reads done, not stopped: ${clip(text)}`).toBe(true)
+  expect(RUNNING_WORD.test(text), `the stopped ${job.id} still reads running: ${clip(text)}`).toBe(false)
+  expect(
+    buttonsIn(row!).some(b => STOP_WORD.test(textOf(b))),
+    `the stopped ${job.id} still offers a stop control: ${clip(text)}`,
+  ).toBe(false)
+  await pane.unmount()
+})
+
+test('the sweep\'s stopped tombstone reads stopped, not orphaned', async ($, on) => {
+  const world = installWorld(on)
+  await startSession($)
+  const job = ownJob(world.clock.now(), 'd-mvzfs002-0', 'D1', 300_000, {
+    state: 'done',
+    doneAt: world.clock.now() - 60_000,
+    stopped: true,
+    crashed: true,
+  })
+  await delegate($, world, job)
+  await world.clock.advance(POLL_MS)
+  const pane = await mountPane($, world)
+  const row = rowFor(await drawn(pane), job.id, [job.id])
+  expect(row !== undefined, `the pane lost the swept ${job.id}`).toBe(true)
+  const text = textOf(row!)
+  expect(/\bstopped\b/.test(text), `the sweep's tombstone reads orphaned, not stopped: ${clip(text)}`).toBe(true)
+  expect(/\borphaned\b/.test(text), `the stopped ${job.id} still reads orphaned: ${clip(text)}`).toBe(false)
+  await pane.unmount()
+})
+
+test('a row the pane marked orphaned moves to stopped when its record later reads it', async ($, on) => {
+  on('process.run', { argv: [/^ps$/] }, ($, e, next) =>
+    e.argv.includes('5151') ? processResult(1, '') : next(e),
+  )
+  const world = installWorld(on)
+  await startSession($)
+  const now = world.clock.now()
+  const job = ownJob(now, 'd-mvzfs003-0', 'D1', 300_000)
+  await delegate($, world, job)
+  // A second live run keeps the pane's ticks going once the orphan settles.
+  const keeper = ownJob(now, 'd-mvzfs004-1', 'D2', 60_000)
+  world.put(`${JOBS}/${keeper.id}.json`, jobFileWith(keeper, { owner_pid: 4242 }))
+  await world.clock.advance(2 * POLL_MS)
+  const pane = await mountPane($, world)
+  const ids = [job.id, keeper.id]
+  const orphaned = textOf(rowFor(await drawn(pane), job.id, ids) ?? '')
+  expect(/\borphaned\b/.test(orphaned), `the run whose owner is gone does not read orphaned: ${clip(orphaned)}`).toBe(true)
+  expect(noticesNaming(world, job.id), `the orphaned ${job.id} raised no notice`).toBe(1)
+
+  // The startup sweep converts the corpse into its stopped tombstone.
+  world.job({ ...job, state: 'done', doneAt: world.clock.now() - 1_000, stopped: true, crashed: true })
+  await world.clock.advance(TICK_MS)
+  const row = rowFor(await drawn(pane), job.id, ids)
+  expect(row !== undefined, `the pane lost ${job.id} when its record became the stopped tombstone`).toBe(true)
+  const text = textOf(row!)
+  expect(/\bstopped\b/.test(text), `the converted ${job.id} still reads orphaned, not stopped: ${clip(text)}`).toBe(true)
+  expect(/\borphaned\b/.test(text), `the converted ${job.id} still reads orphaned: ${clip(text)}`).toBe(false)
+  expect(noticesNaming(world, job.id), `the row moving to stopped raised a second notice naming ${job.id}`).toBe(1)
+  await pane.unmount()
+})
+
+test('a live row whose stop is collected into its ledger settles stopped, not done', async ($, on) => {
+  const world = installWorld(on)
+  await startSession($)
+  const job = ownJob(world.clock.now(), 'd-mvzfs005-0', 'D1', 300_000)
+  await delegate($, world, job)
+  await world.clock.advance(POLL_MS)
+  const pane = await mountPane($, world)
+  expect(rowFor(await drawn(pane), job.id, [job.id]) !== undefined, `the pane lost the running ${job.id}`).toBe(true)
+
+  // clauth collects the stopped record between two reads: the record goes,
+  // its ledger stays with the stop marker the claim judged.
+  world.remove(`${JOBS}/${job.id}.json`)
+  world.put(`${JOBS}/${job.id}.json.delivered`, stoppedLedgerFile(job.id, job.profile, world.clock.now()))
+  await world.clock.advance(TICK_MS)
+
+  const row = rowFor(await drawn(pane), job.id, [job.id])
+  expect(row !== undefined, `the pane lost the collected ${job.id}`).toBe(true)
+  const text = textOf(row!)
+  expect(/\bstopped\b/.test(text), `the stop collected into its ledger reads done, not stopped: ${clip(text)}`).toBe(true)
+  expect(/\bdone\b/.test(text), `the stopped ${job.id} still reads done: ${clip(text)}`).toBe(false)
+  expect(RUNNING_WORD.test(text), `the stopped ${job.id} still reads running: ${clip(text)}`).toBe(false)
+  expect(
+    buttonsIn(row!).some(b => STOP_WORD.test(textOf(b))),
+    `the stopped ${job.id} still offers a stop control: ${clip(text)}`,
+  ).toBe(false)
+  const notices = world.notices.filter(n => hasWord(n.text, job.id))
+  expect(notices.length, `${job.id} was noticed ${notices.length} times, not once`).toBe(1)
+  expect(/\bstopped\b/.test(notices[0]!.text), `the notice for ${job.id} does not say stopped: ${clip(notices[0]!.text)}`).toBe(true)
+  await pane.unmount()
+})
+
+test('a ledger an older build wrote, with no stopped field, settles its collected row as done', async ($, on) => {
+  const world = installWorld(on)
+  await startSession($)
+  const job = ownJob(world.clock.now(), 'd-mvzfs006-1', 'D2', 300_000)
+  await delegate($, world, job)
+  await world.clock.advance(POLL_MS)
+  const pane = await mountPane($, world)
+
+  world.remove(`${JOBS}/${job.id}.json`)
+  world.put(`${JOBS}/${job.id}.json.delivered`, ledgerFile(job.id, job.profile, world.clock.now()))
+  await world.clock.advance(TICK_MS)
+
+  const row = rowFor(await drawn(pane), job.id, [job.id])
+  expect(row !== undefined, `the pane lost the collected ${job.id}`).toBe(true)
+  const text = textOf(row!)
+  expect(FINISHED_WORD.test(text), `the collected ${job.id} does not say done: ${clip(text)}`).toBe(true)
+  expect(/\bstopped\b/.test(text), `a ledger an older build wrote reads stopped: ${clip(text)}`).toBe(false)
+  expect(/\bended\b/.test(text), `the collected ${job.id} reads ended, not done: ${clip(text)}`).toBe(false)
+  await pane.unmount()
+})
+
+test('an orphaned row whose stop is collected into its ledger reads stopped', async ($, on) => {
+  on('process.run', { argv: [/^ps$/] }, ($, e, next) =>
+    e.argv.includes('5151') ? processResult(1, '') : next(e),
+  )
+  const world = installWorld(on)
+  await startSession($)
+  const now = world.clock.now()
+  const job = ownJob(now, 'd-mvzfs007-0', 'D1', 300_000)
+  await delegate($, world, job)
+  const keeper = ownJob(now, 'd-mvzfs008-1', 'D2', 60_000)
+  world.put(`${JOBS}/${keeper.id}.json`, jobFileWith(keeper, { owner_pid: 4242 }))
+  await world.clock.advance(2 * POLL_MS)
+  const pane = await mountPane($, world)
+  const ids = [job.id, keeper.id]
+  const orphaned = textOf(rowFor(await drawn(pane), job.id, ids) ?? '')
+  expect(/\borphaned\b/.test(orphaned), `fixture control: not orphaned: ${clip(orphaned)}`).toBe(true)
+
+  // One monitor call by id: the reader sweep converts the corpse and the claim
+  // collects it, so the pane never reads the tombstone, only the ledger.
+  world.remove(`${JOBS}/${job.id}.json`)
+  world.put(`${JOBS}/${job.id}.json.delivered`, stoppedLedgerFile(job.id, job.profile, world.clock.now()))
+  await world.clock.advance(TICK_MS)
+  await world.clock.advance(TICK_MS)
+  const text = textOf(rowFor(await drawn(pane), job.id, ids) ?? '')
+  expect(/\bstopped\b/.test(text), `the collected stop still reads: ${clip(text)}`).toBe(true)
   await pane.unmount()
 })
 

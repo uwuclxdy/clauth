@@ -28,12 +28,14 @@ export type ClauthQueuedPrompt = {
 
 /** A delegate's state word: `running` and `blocking` are live (a background
  *  job, a blocking run whose caller holds the join); every other word is
- *  final. `ended` is a live run whose record went with no result left. */
+ *  final. `stopped` is a run its Claude Code session's exit stopped; `ended`
+ *  is a live run whose record went with no result left. */
 export type ClauthDelegateWord =
   | 'running'
   | 'blocking'
   | 'done'
   | 'cancelled'
+  | 'stopped'
   | 'orphaned'
   | 'ended'
 

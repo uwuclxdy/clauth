@@ -666,3 +666,55 @@ fn a_wide_script_profile_pads_like_its_ascii_twin() {
     );
     assert_eq!(wide, twin.replace(TWIN, WIDE));
 }
+
+/// A stopped record reads its own word, dated by when it stopped, with no
+/// elapsed figure and no invented result text.
+#[test]
+fn a_stopped_record_reads_stopped() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-stop.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "work",
+            "state": "done",
+            "started_at": NOW - 65_000,
+            "done_at": NOW - 5_000,
+            "stopped": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let rows = rows(NOW);
+    assert_eq!(rows.len(), 1, "one record in the store");
+    assert_eq!(
+        rows[0].phase.label(),
+        "stopped",
+        "the row's state word is stopped"
+    );
+    assert_eq!(
+        row_json(&rows[0]),
+        serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "work",
+            "state": "stopped",
+            "collectable": false,
+            "session_id": null,
+            "isolated": false,
+            "age_secs": 5,
+            "elapsed_secs": null,
+            "last_output_secs_ago": null,
+            "idle_kill_in_secs": null,
+            "wall_kill_in_secs": null,
+            "tail": "",
+        })
+    );
+    assert_eq!(
+        render_table(&rows),
+        "STATE    JOB ID  PROFILE  AGE  ELAPSED  LAST OUTPUT  KILL IN\n\
+         stopped  d-stop  work      5s        -            -  -\n"
+    );
+}

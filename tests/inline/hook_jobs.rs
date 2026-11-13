@@ -264,7 +264,7 @@ fn own_jobs_are_this_sessions_by_host_alone() {
     seed_done("d-finished", "DS1", Some(SESSION), 1_000);
     seed_done("d-peer-finished", "DS1", Some(OTHER), 1_000);
 
-    let mut own = own_jobs(SESSION, NOW);
+    let mut own = own_jobs(SESSION, NOW, None);
     own.sort();
     assert_eq!(own, ["d-dead", "d-finished", "d-own"]);
 }
@@ -280,12 +280,12 @@ fn an_ownerless_record_silent_past_the_window_is_awaited_as_an_orphan() {
     seed_running("d-silent", Some(SESSION), 0);
 
     assert_eq!(
-        own_jobs(SESSION, NOW),
+        own_jobs(SESSION, NOW, None),
         ["d-silent"],
         "within the window it is still awaited"
     );
     assert_eq!(
-        own_jobs(SESSION, NOW + 2 * jobs::RUNNING_TTL_MS),
+        own_jobs(SESSION, NOW + 2 * jobs::RUNNING_TTL_MS, None),
         ["d-silent"],
         "past the window it is adopted as orphaned, to report its result lost"
     );
@@ -311,7 +311,7 @@ fn a_silent_record_of_a_live_owner_is_not_awaited() {
     record["host_session"] = SESSION.into();
     write_record(&record);
 
-    assert_eq!(own_jobs(SESSION, NOW), Vec::<String>::new());
+    assert_eq!(own_jobs(SESSION, NOW, None), Vec::<String>::new());
 }
 
 /// The ids `own_jobs` hands on come from the store's own files, which the
@@ -337,7 +337,7 @@ fn a_store_record_with_an_unsafe_id_is_never_awaited() {
     .unwrap();
     seed_running("d-safe", Some(SESSION), 0);
 
-    assert_eq!(own_jobs(SESSION, NOW), ["d-safe"]);
+    assert_eq!(own_jobs(SESSION, NOW, None), ["d-safe"]);
 }
 
 /// A blocking run is never awaited (its caller holds the join); a crashed
@@ -362,7 +362,7 @@ fn a_blocking_run_is_not_awaited_but_a_crashed_tombstone_is() {
         "host_session": SESSION,
     }));
 
-    assert_eq!(own_jobs(SESSION, NOW), ["d-crashed"]);
+    assert_eq!(own_jobs(SESSION, NOW, None), ["d-crashed"]);
 }
 
 #[test]
@@ -962,4 +962,144 @@ fn no_claude_pid_reads_as_not_moved() {
     );
 
     assert!(!host_session_moved(SESSION));
+}
+
+/// A pid no live server holds a marker for, so a record it owns reads as
+/// owned by a server that died: the shape `/exit` leaves when Claude Code
+/// kills `clauth mcp` before it stopped its delegates.
+const DEAD_SERVER_PID: u32 = 999_999_937;
+
+/// A delegate still running when its session's server died, `ago` ms of
+/// silence before the sweep. `kind` picks the spelling: `"json"` for a
+/// background job, `"live.json"` for a blocking run.
+fn seed_running_under_dead_server(
+    job_id: &str,
+    profile: &str,
+    session_id: &str,
+    isolated: bool,
+    kind: &str,
+) {
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "profile": profile,
+        "state": "running",
+        "started_at": NOW - 60_000,
+        "recorded_at": NOW - 60_000,
+        "last_output_at": NOW - 5_000,
+        "host_session": SESSION,
+        "session_id": session_id,
+        "isolated": isolated,
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+    });
+    std::fs::write(
+        dir.join(format!("{job_id}.{kind}")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A delegate the session's
+/// `/exit` stopped is named with the session id `delegate` resumes it by. The
+/// stopped record here is the one the resumed session's own server boot leaves
+/// (its startup sweep), the path every `/exit` the server did not outlive takes.
+#[test]
+fn a_resume_names_a_delegate_stopped_at_exit_with_its_session_id() {
+    let _home = HomeSandbox::new();
+    seed_running_under_dead_server("d-stop", "D1", "5f2c-sid", false, "json");
+    jobs::gc_running_corpses(NOW);
+
+    assert_eq!(
+        note_at(&resume(), NOW).as_deref(),
+        Some(
+            "clauth note: a delegate this session started was stopped when the session exited: `d-stop` on `D1`. `delegate` with `session_id: \"5f2c-sid\"` and `profiles: [\"D1\"]` resumes it."
+        )
+    );
+}
+
+/// The hook and the resumed session's MCP server boot race: the hook can read
+/// the store before the server's startup sweep ran, so a dead server's
+/// `running` record that still sits unswept is named the same way.
+#[test]
+fn an_unswept_dead_servers_delegate_is_named_too() {
+    let _home = HomeSandbox::new();
+    seed_running_under_dead_server("d-stop", "D1", "5f2c-sid", false, "json");
+
+    assert_eq!(
+        note_at(&resume(), NOW).as_deref(),
+        Some(
+            "clauth note: a delegate this session started was stopped when the session exited: `d-stop` on `D1`. `delegate` with `session_id: \"5f2c-sid\"` and `profiles: [\"D1\"]` resumes it."
+        )
+    );
+}
+
+/// Several stopped delegates: each carries its own session id, newest stop
+/// first (the store's order, the same rule the result note reads).
+#[test]
+fn several_stopped_delegates_are_named_each_with_its_session_id() {
+    let _home = HomeSandbox::new();
+    seed_running_under_dead_server("d-old", "D1", "sid-old", false, "json");
+    jobs::gc_running_corpses(NOW - 1_000);
+    seed_running_under_dead_server("d-new", "D4", "sid-new", false, "json");
+    jobs::gc_running_corpses(NOW);
+
+    assert_eq!(
+        note_at(&resume(), NOW).as_deref(),
+        Some(
+            "clauth note: delegates this session started were stopped when the session exited: `d-new` on `D4` (`session_id: \"sid-new\"`), `d-old` on `D1` (`session_id: \"sid-old\"`). `delegate` with a `session_id` and its `profiles` resumes one."
+        )
+    );
+}
+
+/// A blocking run stopped at `/exit` is named the
+/// same way as a background one.
+#[test]
+fn a_blocking_run_stopped_at_exit_is_named_like_a_background_one() {
+    let _home = HomeSandbox::new();
+    seed_running_under_dead_server("d-attached", "D2", "sid-attached", false, "live.json");
+    jobs::gc_running_corpses(NOW);
+
+    assert_eq!(
+        note_at(&resume(), NOW).as_deref(),
+        Some(
+            "clauth note: a delegate this session started was stopped when the session exited: `d-attached` on `D2`. `delegate` with `session_id: \"sid-attached\"` and `profiles: [\"D2\"]` resumes it."
+        )
+    );
+}
+
+/// An isolated run's transcript lives in a
+/// throwaway runtime the sweep cannot rescue, so its session id resumes
+/// nothing: the note says so and offers no resume.
+#[test]
+fn an_unrescued_isolated_delegate_is_named_not_resumable() {
+    let _home = HomeSandbox::new();
+    seed_running_under_dead_server("d-iso", "D1", "sid-iso", true, "json");
+    jobs::gc_running_corpses(NOW);
+
+    assert_eq!(
+        note_at(&resume(), NOW).as_deref(),
+        Some(
+            "clauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `d-iso` on `D1`. `monitor` with its job_id shows what it wrote before it stopped."
+        )
+    );
+}
+
+/// A finished result and a stopped delegate in one resume: both notes, the
+/// result first, joined the way the hook joins its legs.
+#[test]
+fn a_waiting_result_and_a_stopped_delegate_are_both_named() {
+    let _home = HomeSandbox::new();
+    seed_done("d-a", "DS1", Some(SESSION), 2_000);
+    seed_running_under_dead_server("d-stop", "D1", "5f2c-sid", false, "json");
+    jobs::gc_running_corpses(NOW);
+
+    assert_eq!(
+        note_at(&resume(), NOW),
+        Some(format!(
+            "{}\n\nclauth note: a delegate this session started was stopped when the session exited: `d-stop` on `D1`. `delegate` with `session_id: \"5f2c-sid\"` and `profiles: [\"D1\"]` resumes it.",
+            one("d-a", "DS1")
+        ))
+    );
 }

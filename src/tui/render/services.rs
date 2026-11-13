@@ -2756,11 +2756,11 @@ fn delegate_row_line(
 // How a delegate row reads: `JobPhase`, the crate's one classification of a
 // stored record, plus the two things a TERMINAL adds to it.
 //
-// The four situations, the word for each, and the band a row sits in all live on
+// The five situations, the word for each, and the band a row sits in all live on
 // `JobPhase` in `src/mcp/jobs.rs`, because `clauth jobs` and `monitor`'s listing
 // answer the same questions and three copies of one rule is how they drift. What
 // stays here is presentation and only presentation: the glyph and the hue. The
-// word is mandatory beside the mark either way — three of the four share the `●`
+// word is mandatory beside the mark either way — three of the five share the `●`
 // glyph, so hue alone cannot carry the state.
 
 /// `●` for a run that is or was doing something, `○` for one whose server is
@@ -2768,7 +2768,8 @@ fn delegate_row_line(
 fn state_mark(phase: JobPhase) -> &'static str {
     match phase {
         JobPhase::Running | JobPhase::Blocking | JobPhase::Done => theme::DOT_ON,
-        JobPhase::Orphaned => theme::DOT_OFF,
+        // One whose server is gone, stopped or orphaned alike.
+        JobPhase::Orphaned | JobPhase::Stopped => theme::DOT_OFF,
     }
 }
 
@@ -2777,7 +2778,7 @@ fn state_color(phase: JobPhase) -> Color {
         JobPhase::Running | JobPhase::Blocking => theme::accent_color(),
         JobPhase::Done => theme::success_color(),
         // Disconnected carries no semantic charge of its own; the word does.
-        JobPhase::Orphaned => theme::text_dim_color(),
+        JobPhase::Orphaned | JobPhase::Stopped => theme::text_dim_color(),
     }
 }
 
@@ -2816,12 +2817,13 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
     // decides how long it survives.
     let since = job.age_secs(now);
     // Through `phase()` rather than by re-matching `(liveness, kind)` here: the
-    // four situations and any later fifth live on `JobPhase`, so this pane
+    // five situations and any later sixth live on `JobPhase`, so this pane
     // cannot drift its own classification.
     let state = job.phase();
     let (mut facts, live) = match state {
         JobPhase::Done => (vec![format!("finished {}", age_phrase(since))], None),
         JobPhase::Orphaned => (vec![format!("last seen {}", age_phrase(since))], None),
+        JobPhase::Stopped => (vec![format!("stopped {}", age_phrase(since))], None),
         JobPhase::Running | JobPhase::Blocking => {
             let live = jobs::running_liveness(record, now);
             let elapsed = format!("elapsed {}", humanize_duration(live.elapsed_secs as i64));
@@ -2859,7 +2861,7 @@ fn delegate_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
             Some(speed_fact(speed))
         }
         JobPhase::Done => finished_speed_fact(job, app),
-        JobPhase::Orphaned => None,
+        JobPhase::Orphaned | JobPhase::Stopped => None,
     }
 }
 

@@ -1066,11 +1066,13 @@ async function fileStamp($: EngineInterface, path: string): Promise<string | nul
   }
 }
 
-// The word a record names: a live run, a cancel flagged beside `done`, the
-// sweep's crash tombstone, then plain `done`.
+// The word a record names: a live run, a stop at the host's exit (the
+// in-process record and the sweep's tombstone alike), a cancel flagged beside
+// `done`, the sweep's crash tombstone, then plain `done`.
 function delegateWordOf(record: JsonObject, isBlocking: boolean): ClauthDelegateWord {
   const state = textOf(record.state)
   if (state === 'running') return isBlocking ? 'blocking' : 'running'
+  if (record.stopped === true) return 'stopped'
   if (objectOf(record.envelope)?.cancelled === true) return 'cancelled'
   if (record.crashed === true) return 'orphaned'
   return 'done'
@@ -1157,8 +1159,12 @@ async function settleGoneDelegate(
   const ledger = `${row.id}.json.delivered`
   if (names.has(ledger)) {
     delegateAbsentScans.delete(row.id)
-    const at = epochMsOf((await readJsonObject($, `${dir}/${ledger}`))?.at)
-    return { ...row, word: 'done', endedAt: at === 0 ? now : at }
+    // The record is gone, so the ledger's own stop marker is all that is left
+    // of the stop; a ledger an older build wrote has none and reads as a
+    // plain finish.
+    const delivered = await readJsonObject($, `${dir}/${ledger}`)
+    const at = epochMsOf(delivered?.at)
+    return { ...row, word: delivered?.stopped === true ? 'stopped' : 'done', endedAt: at === 0 ? now : at }
   }
   const absent = (delegateAbsentScans.get(row.id) ?? 0) + 1
   if (absent < DELEGATE_ABSENT_SCANS) {
@@ -1241,8 +1247,11 @@ async function scanDelegates($: EngineInterface): Promise<void> {
       const priorRun = textOf(record.state) === 'running' && priorSessions.has(host)
       if (host !== sid && !priorRun) continue
     }
-    if (kept !== undefined && !isLive(kept.word)) continue
     const row = delegateRowOf(record, isBlocking, now)
+    // A finished row keeps its word, except one the owner probe marked
+    // `orphaned`: the sweep's stopped tombstone that replaces its record is
+    // the better word for the same run.
+    if (kept !== undefined && !isLive(kept.word) && !(kept.word === 'orphaned' && row.word === 'stopped')) continue
     // A record first seen already finished before this session began was
     // noticed in the conversation that ran it: list it, never toast it again.
     rows.set(
@@ -1267,6 +1276,12 @@ async function scanDelegates($: EngineInterface): Promise<void> {
   }
   for (const row of rows.values()) {
     if (isLive(row.word)) rows.set(row.id, await settleGoneDelegate($, dir, row, names, now))
+    else if (row.word === 'orphaned' && !names.has(`${row.id}.json`) && names.has(`${row.id}.json.delivered`)) {
+      // A stop collected before any read saw its tombstone leaves only the
+      // ledger's stop marker to move an `orphaned` row to `stopped`.
+      const delivered = await readJsonObject($, `${dir}/${row.id}.json.delivered`)
+      if (delivered?.stopped === true) rows.set(row.id, { ...row, word: 'stopped' })
+    }
   }
   // The owner's liveness is the one question the record's fields cannot
   // answer and a stale stamp answers wrong (a silent run is static too), so

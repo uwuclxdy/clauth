@@ -70,9 +70,9 @@ pub(crate) struct JobRow {
     /// which is exactly what `retention_anchor` answers, so a row is dated by
     /// the same field that decides how long it survives.
     pub(crate) age_secs: u64,
-    /// The run's liveness at `now`, or `None` on a finished or orphaned record,
-    /// where every countdown it would carry has already stopped meaning
-    /// anything.
+    /// The run's liveness at `now`, or `None` on a finished, orphaned or
+    /// stopped record, where every countdown it would carry has already
+    /// stopped meaning anything.
     pub(crate) live: Option<RunningLiveness>,
     /// The run's own session id — the handle `delegate({resume})` takes. Read
     /// here because a record outlives the server that wrote it, so after a

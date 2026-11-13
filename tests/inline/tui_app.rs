@@ -75598,6 +75598,224 @@ fn a_delegate_finishing_makes_the_mascot_wink_or_sneeze() {
     }
 }
 
+/// A stopped delegate moves the mascot not at all, whichever shape left the
+/// record: the in-process stop at the host's exit, the sweep's tombstone for
+/// the run it killed, or an isolated run whose transcript was not rescued.
+/// The reads around it still cue a plain finish and a failed one.
+#[test]
+fn a_stopped_delegate_never_moves_the_mascot() {
+    for (stopped_id, envelope, crashed) in [
+        (
+            "d-stop-exit-0",
+            serde_json::json!({
+                "profile": "acct",
+                "stopped": "host_exit",
+                "is_error": true,
+                "elapsed_secs": 61,
+                "result": "the host session's exit stopped the run",
+            }),
+            false,
+        ),
+        ("d-stop-swept-0", serde_json::Value::Null, true),
+        (
+            "d-stop-isolated-0",
+            serde_json::json!({
+                "profile": "acct",
+                "stopped": "host_exit",
+                "is_error": true,
+                "elapsed_secs": 61,
+                "transcript_rescued": false,
+                "result": "the host session's exit stopped the run",
+            }),
+            false,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::switch_tab(&mut app, super::Tab::Overview);
+        mascot_idle_at(&mut app, 30_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "an empty store moved the mascot"
+        );
+
+        let now = crate::usage::now_ms();
+        let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join(format!("{stopped_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": stopped_id,
+                "profile": "acct",
+                "state": "done",
+                "started_at": now - 60_000,
+                "done_at": now - 1_000,
+                "envelope": envelope,
+                "crashed": crashed,
+                "stopped": true,
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "{stopped_id} moved the mascot"
+        );
+        let seen = app
+            .mascot_seen
+            .delegates_done
+            .as_ref()
+            .expect("the first read seeds the seen set");
+        assert!(
+            seen.contains(stopped_id),
+            "{stopped_id} never entered the seen set"
+        );
+        app.mascot.tick(60_000);
+        app.anim_phase_ms = Some(60_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "{stopped_id} cued on a later read"
+        );
+
+        write_done_job(
+            "d-finish-ok-0",
+            serde_json::json!({ "result": "ok" }),
+            false,
+        );
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Wink),
+            "a plain finish stopped cueing"
+        );
+        app.mascot.tick(90_000);
+        app.anim_phase_ms = Some(90_000);
+        write_done_job(
+            "d-finish-fail-0",
+            serde_json::json!({ "is_error": true, "result": "the model refused" }),
+            false,
+        );
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Sneeze),
+            "a failed finish stopped cueing"
+        );
+    }
+}
+
+/// A stop collected between two reads moves the mascot not at all: one
+/// `monitor` call converts a dead owner's running record, claims it, and
+/// leaves the delivery ledger whose arm reads the claim's own stop verdict.
+/// A ledger an older build wrote, with no stop key, still parses and cues its
+/// finish.
+#[test]
+fn a_stop_collected_between_two_reads_never_moves_the_mascot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    mascot_idle_at(&mut app, 30_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an empty store moved the mascot"
+    );
+    let now = crate::usage::now_ms();
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let id = "d-stop-collected-0";
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": id,
+            "profile": "acct",
+            "state": "running",
+            "started_at": now - 60_000,
+            "session_id": "sess-stop-collected",
+            "owner_pid": 999_999_937u32,
+            "owner_started_at": now - 120_000,
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the running corpse moved the mascot"
+    );
+
+    // What one `monitor` call by id does: the reader sweep converts the
+    // corpse, then the claim consumes it and leaves its delivery ledger.
+    crate::mcp::jobs::gc_running_corpses(crate::usage::now_ms());
+    let converted = crate::mcp::jobs::read(id).expect("the sweep left a tombstone");
+    assert!(
+        converted.stopped,
+        "fixture control: the reader sweep did not convert {id} into a stop"
+    );
+    assert!(
+        matches!(
+            crate::mcp::jobs::claim(id, crate::mcp::jobs::Claimant::Monitor),
+            crate::mcp::jobs::Claim::Owned(_)
+        ),
+        "fixture control: the monitor claim did not own {id}"
+    );
+    let ledger = crate::mcp::jobs::delivery_ledger(id).expect("the claim left a ledger");
+    assert!(
+        ledger.failed,
+        "fixture control: the stop's ledger does not read failed"
+    );
+    app.mascot.tick(90_000);
+    app.anim_phase_ms = Some(90_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a stop collected between two reads moved the mascot through its ledger"
+    );
+    let seen = app
+        .mascot_seen
+        .delegates_done
+        .as_ref()
+        .expect("the first read seeds the seen set");
+    assert!(
+        seen.contains(id),
+        "the collected stop never entered the seen set"
+    );
+
+    let old_id = "d-ledger-old-0";
+    std::fs::write(
+        dir.join(format!("{old_id}.json.delivered")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": old_id,
+            "by": "hook",
+            "at": crate::usage::now_ms(),
+            "profile": "acct",
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+    assert!(
+        crate::mcp::jobs::delivery_ledger(old_id).is_some(),
+        "a ledger an older build wrote, with no stop key, no longer parses"
+    );
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "an old ledger with no stop key stopped cueing its finish"
+    );
+}
+
 #[test]
 fn a_login_landing_makes_the_mascot_celebrate() {
     use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile};

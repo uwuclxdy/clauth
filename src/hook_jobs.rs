@@ -1,7 +1,8 @@
 //! Uncollected-results leg of `clauth hook-profile-changed-note`: on a
 //! `SessionStart` resume or compaction, names the background delegates this
-//! conversation started whose results still sit in the job store, riding the
-//! envelope the other legs share.
+//! conversation started whose results still sit in the job store, and the
+//! delegates this conversation's `/exit` stopped (with the session id that
+//! resumes each), riding the envelope the other legs share.
 //!
 //! The `mcp-await-job` delivery hook is bound to the process that spawned the
 //! job, so a result still uncollected when that session exited waits for the
@@ -9,7 +10,11 @@
 //! compaction drops whatever a resume injected, so it names them again. The
 //! store is the ledger of what is unread: both delivery paths evict a record
 //! through `jobs::claim`, so a collected result is never named, and a record
-//! the startup sweep is about to reap is never offered.
+//! the startup sweep is about to reap is never offered. No delivery hook
+//! claims a stopped delegate's record — the note below is its one injected
+//! delivery — though `monitor`'s collect still answers and consumes one; so
+//! the stop note and the result note can both name one resume's worth of the
+//! store.
 //!
 //! Matched on `host_session` alone, strictly — the same untied-record rule
 //! `hook_context`'s `spawned_here` applies: a record with no host is some
@@ -26,6 +31,7 @@
 //! set, which rides a sidecar beside the record, never the lease file's
 //! content ([`record_lost`]).
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
@@ -33,11 +39,25 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_record};
-use crate::mcp::jobs::{self, JobPhase, RecordKind, StoredJob};
+use crate::mcp::jobs::{self, JobPhase, JobState, RecordKind, StoredJob};
 
 /// The most job ids one note names; the rest are counted. Bounds the injected
 /// context on a fan-out's worth of results.
 const NAMED_MAX: usize = 10;
+
+/// One delegate this session's `/exit` stopped, for the note's copy.
+struct StoppedLeg {
+    job_id: String,
+    profile: String,
+    /// The resume handle. The in-process stop and the sweep's conversion both
+    /// carry one; a `Stopped` record without one is skipped by the note's
+    /// `filter_map` (there is nothing to name).
+    session_id: String,
+    /// The record's own resume verdict ([`jobs::JobRecord::stop_is_resumable`]):
+    /// a shared run's transcript is in the global store; an isolated one's
+    /// only when the stop's own rescue moved it there.
+    resumable: bool,
+}
 
 pub(crate) fn note(payload: &Payload) -> Option<String> {
     note_at(payload, crate::usage::now_ms())
@@ -63,11 +83,52 @@ fn note_at(payload: &Payload, now: u64) -> Option<String> {
         })
         .map(|job| (job.record.job_id, job.record.profile))
         .collect();
-    render(&waiting)
+    let stopped: Vec<StoppedLeg> = jobs::list(now)
+        .into_iter()
+        .filter(|job| {
+            job.phase() == JobPhase::Stopped
+                && !jobs::done_is_expired(&job.record, now)
+                && job.record.host_session.as_deref() == Some(payload.session_id.as_str())
+                // A stopped record whose run started before the resumed run,
+                // and was not one that resume left live, is the record that
+                // resume took: the note must never re-tell it. A run that
+                // started at or after the resumed run — that run's own stop —
+                // or one still running at the resume fences nothing and is
+                // told like any other stop.
+                && !job.record.session_id.as_deref().is_some_and(|session_id| {
+                    jobs::resumed_marker_fences(
+                        session_id,
+                        &job.record.job_id,
+                        job.record.started_at,
+                    )
+                })
+        })
+        .filter_map(|job| {
+            let resumable = job.record.stop_is_resumable();
+            job.record.session_id.as_ref().map(|session_id| StoppedLeg {
+                job_id: job.record.job_id,
+                profile: job.record.profile,
+                session_id: session_id.clone(),
+                resumable,
+            })
+        })
+        .collect();
+    let mut notes = Vec::new();
+    if let Some(note) = render_waiting(&waiting) {
+        notes.push(note);
+    }
+    if let Some(note) = render_stopped(&stopped) {
+        notes.push(note);
+    }
+    if notes.is_empty() {
+        return None;
+    }
+    // The same join the envelope uses between legs.
+    Some(notes.join("\n\n"))
 }
 
 /// The copy over `(job_id, profile)` pairs in the store's newest-first order.
-fn render(waiting: &[(String, String)]) -> Option<String> {
+fn render_waiting(waiting: &[(String, String)]) -> Option<String> {
     if waiting.is_empty() {
         return None;
     }
@@ -100,11 +161,16 @@ fn render(waiting: &[(String, String)]) -> Option<String> {
 /// wake ever reports.
 ///
 /// One store read and nothing else: this runs at every turn end of every
-/// install, and an empty answer ends the hook.
-pub(crate) fn own_jobs(session_id: &str, now: u64) -> Vec<String> {
+/// install, and an empty answer ends the hook. `seen` is the watcher's
+/// already-watched set: an id it holds is awaited without a phase read — the
+/// poll reads that record every poll and owns its child probe (throttled)
+/// and its transition out, so a phase read here would only probe the child a
+/// second time, outside the poll's rate. `None` from a caller outside the
+/// watcher's loop classifies everything, as before.
+pub(crate) fn own_jobs(session_id: &str, now: u64, seen: Option<&HashSet<String>>) -> Vec<String> {
     jobs::list(now)
         .into_iter()
-        .filter(|job| is_awaited(job, session_id, now))
+        .filter(|job| is_awaited(job, session_id, now, seen))
         .map(|job| job.record.job_id)
         // The ids come from the store's own files, which the user's uid can
         // edit, so a record is not trusted input: only a safe id may reach
@@ -113,20 +179,40 @@ pub(crate) fn own_jobs(session_id: &str, now: u64) -> Vec<String> {
         .collect()
 }
 
-fn is_awaited(job: &StoredJob, session_id: &str, now: u64) -> bool {
-    job.kind == RecordKind::Collectable
-        && job.record.host_session.as_deref() == Some(session_id)
-        && match job.phase() {
-            // Done keeps a result to deliver; Orphaned carries the lost-result
-            // wake. The reported-lost set keeps a later turn end that adopts
-            // the orphan again from waking twice.
-            JobPhase::Done | JobPhase::Orphaned => true,
-            // A running record silent past the store's own corpse window is
-            // dead to the watcher as it is to the sweep, owned or ownerless,
-            // so a hung job's wakes stop with it instead of repeating forever.
-            JobPhase::Running => !jobs::running_is_silent(&job.record, now),
-            JobPhase::Blocking => false,
-        }
+fn is_awaited(job: &StoredJob, session_id: &str, now: u64, seen: Option<&HashSet<String>>) -> bool {
+    if job.kind != RecordKind::Collectable || job.record.host_session.as_deref() != Some(session_id)
+    {
+        return false;
+    }
+    if seen.is_some_and(|seen| seen.contains(&job.record.job_id)) {
+        return true;
+    }
+    // A running corpse carrying a session id whose owner is gone is the resume
+    // note's shape: while its recorded child lives the watcher would hold it
+    // silently, and once that child dies the record reads stopped and the note
+    // is its one telling — so the watcher is never woken for it either way.
+    // Leaving it to the note this way is also what keeps the scan off the
+    // child probes: classifying this shape is the one phase read that forks
+    // one, and the poll's ledger counts every probe.
+    if job.record.state == JobState::Running
+        && job.record.session_id.is_some()
+        && jobs::owner_is_gone(&job.record)
+    {
+        return false;
+    }
+    match job.phase() {
+        // Done keeps a result to deliver; Orphaned carries the lost-result
+        // wake. The reported-lost set keeps a later turn end that adopts the
+        // orphan again from waking twice. A stopped record's one delivery is
+        // the resume note, never the watcher.
+        JobPhase::Done | JobPhase::Orphaned => true,
+        JobPhase::Stopped => false,
+        // A running record silent past the store's own corpse window is dead
+        // to the watcher as it is to the sweep, owned or ownerless, so a hung
+        // job's wakes stop with it instead of repeating forever.
+        JobPhase::Running => !jobs::running_is_silent(&job.record, now),
+        JobPhase::Blocking => false,
+    }
 }
 
 /// Whether `job_id` is a job [`own_jobs`] would find for this session: a hook
@@ -754,6 +840,66 @@ pub(crate) fn host_session_moved(session_id: &str) -> bool {
     };
     crate::session_record::session_record(&dir, pid)
         .is_some_and(|record| record.session_id.as_str() != session_id)
+}
+
+/// The stopped copy, in the store's newest-first order. Resumable legs share
+/// the one/several sentences; a never-rescued isolated run names nothing to
+/// resume and gets its own sentence, one per record (the copy has no plural
+/// form for it). At most [`NAMED_MAX`] delegates are named across both
+/// shapes — the isolated sentences count toward the same cap — and the rest
+/// are counted with the result note's own clause, placed exactly where the
+/// result note places it: before the closing sentence.
+fn render_stopped(stopped: &[StoppedLeg]) -> Option<String> {
+    if stopped.is_empty() {
+        return None;
+    }
+    let resumable: Vec<&StoppedLeg> = stopped.iter().filter(|leg| leg.resumable).collect();
+    let unrescued: Vec<&StoppedLeg> = stopped.iter().filter(|leg| !leg.resumable).collect();
+    let named_resumable = resumable.len().min(NAMED_MAX);
+    let named_unrescued = unrescued.len().min(NAMED_MAX - named_resumable);
+    let rest = stopped.len() - named_resumable - named_unrescued;
+    // The count clause lands on the note's last sentence; which sentence that
+    // is follows from the cap (the resumable sentence comes first, the
+    // isolated ones after).
+    let clause = |rest: usize| format!(", and {rest} more (`clauth jobs` lists them)");
+    let last_is_isolated = named_unrescued > 0;
+    let mut notes = Vec::new();
+    if named_resumable > 0 {
+        notes.push(if named_resumable == 1 {
+            let leg = resumable[0];
+            format!(
+                "clauth note: a delegate this session started was stopped when the session exited: `{}` on `{}`. `delegate` with `session_id: \"{}\"` and `profiles: [\"{}\"]` resumes it.",
+                leg.job_id, leg.profile, leg.session_id, leg.profile
+            )
+        } else {
+            let mut named = resumable[..named_resumable]
+                .iter()
+                .map(|leg| {
+                    format!(
+                        "`{}` on `{}` (`session_id: \"{}\"`)",
+                        leg.job_id, leg.profile, leg.session_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !last_is_isolated && rest > 0 {
+                named.push_str(&clause(rest));
+            }
+            format!(
+                "clauth note: delegates this session started were stopped when the session exited: {named}. `delegate` with a `session_id` and its `profiles` resumes one."
+            )
+        });
+    }
+    for (i, leg) in unrescued[..named_unrescued].iter().enumerate() {
+        let mut named = format!("`{}` on `{}`", leg.job_id, leg.profile);
+        if last_is_isolated && i == named_unrescued - 1 && rest > 0 {
+            named.push_str(&clause(rest));
+        }
+        notes.push(format!(
+            "clauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: {named}. `monitor` with its job_id shows what it wrote before it stopped."
+        ));
+    }
+    Some(notes.join("\n\n"))
 }
 
 #[cfg(test)]

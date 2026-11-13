@@ -13732,3 +13732,43 @@ fn with_a_problem_the_down_walk_still_lands_on_the_option_row() {
         rows.join("\n")
     );
 }
+
+/// A stopped record draws its own word, dated by when it stopped, and no
+/// live figures — the word is what tells it from an orphaned row.
+#[test]
+fn a_stopped_record_draws_its_own_facts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-stop.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "D1",
+            "state": "done",
+            "started_at": NOW - 65_000,
+            "done_at": NOW - 5_000,
+            "stopped": true,
+            "session_id": "sid-tui",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let cells = super::delegate_cells(&jobs::list_banded(NOW), NOW);
+    let cell = cells
+        .iter()
+        .find(|c| c.profile == "D1")
+        .expect("the stopped row is drawn");
+    assert_eq!(cell.state, crate::mcp::jobs::JobPhase::Stopped);
+    assert_eq!(cell.facts, vec!["stopped 5s ago".to_string()]);
+    assert_eq!(super::state_mark(crate::mcp::jobs::JobPhase::Stopped), "○");
+    // The drawn row text itself, by equality: a wording drift in the TUI's
+    // own row builder stays green on the facts alone.
+    let line = super::delegate_row_line(cell, 2, 40, false, false);
+    let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(
+        drawn, "  ○ stopped   D1  stopped 5s ago",
+        "the drawn row is the stopped one's own facts, exactly"
+    );
+}
