@@ -1133,7 +1133,10 @@ fn delete_sends_the_delete_removes_the_dir_whole_and_keeps_the_token_ledger() {
         split: Some(split),
         hours: None,
     });
-    assert!(ledger.record(&base, "2026-06-18"), "the day records");
+    assert!(
+        ledger.record_covering(&base, "2026-06-18", true),
+        "the day records"
+    );
     ledger.save(&clauth_dir);
     let ledger_path = clauth_dir.join("token_ledger.json");
     let ledger_before = std::fs::read(&ledger_path).expect("the ledger landed");
