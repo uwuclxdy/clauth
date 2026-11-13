@@ -11205,3 +11205,122 @@ fn the_pool_read_paces_on_the_proxys_bind_origin() {
         "both arms serialize on one proxy's requests"
     );
 }
+
+/// One pool id carrying two units, the mixed unit's figure first: the unit
+/// that owns the bar is the first that carries BOTH a grant and a left, so a
+/// grantless first figure never starves the pool, and the other unit never
+/// enters the sums.
+#[test]
+fn a_pool_never_sums_two_units_whose_figure_counts_first() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 1_000_000.0, "limit": 2_000_000.0, "used": 1_000_000.0,
+                "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "one bar, the first counting unit's");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+    assert!(
+        (stats.bars[0].pct - 50.0).abs() < 1e-6,
+        "the token figure never enters the USD pool: {}",
+        stats.bars[0].pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("1M left")),
+        "the other unit keeps its own line: {:?}",
+        stats.rows
+    );
+}
+
+/// A first-seen figure with no grant never fixes the pool's unit: the first
+/// figure carrying both a grant and a left owns it and draws the bar.
+#[test]
+fn a_pool_draws_its_bar_from_the_first_unit_that_counts() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "the counting unit draws the bar");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// A figure outside the bar's set never times it: the countdown comes from the
+/// figures the bar counts.
+#[test]
+fn an_uncounted_figures_expiry_never_times_the_bar() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "unit": "tokens", "expires_at": "2030-01-01T01:00:00Z"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "limit": 100.0, "used": 50.0, "unit": "tokens",
+                "expires_at": "2031-01-01T01:00:00Z"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 50 left of 100");
+    assert_eq!(
+        stats.bars[0].resets_at.as_deref(),
+        Some("2031-01-01T01:00:00Z"),
+        "the counted figure's expiry, never the grantless one's"
+    );
+}
+
+/// A `requests` unit is spelled, grouped and never compacted like a token
+/// count: the schema-valid shape the unit fallback exists for.
+#[test]
+fn a_pool_spells_and_groups_a_requests_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 12_345.0, "limit": 20_000.0, "used": 7_655.0,
+                "unit": "requests"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "credit | 12,345 requests left of 20,000 requests"
+    );
+}
+
+/// The entry a bare funnel profile builds carries the pool target with the
+/// profile's own bind, the value the pacing key is derived from.
+#[test]
+fn a_bare_profile_targets_the_pool_on_its_bind() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, json!({"accounts": []}));
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let profile = crate::profile::load_profile(&ProfileName::from("px")).expect("load profile");
+    let entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+    match entry.target {
+        crate::providers::ThirdPartyTarget::ProxyPool { service, base_url } => {
+            assert_eq!(service.as_str(), "stub");
+            assert_eq!(base_url, stub.base, "the pool target carries the bind");
+        }
+        other => panic!("expected the pool target, got {other:?}"),
+    }
+}

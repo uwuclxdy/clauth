@@ -2044,8 +2044,8 @@ fn stat_row(label: &str, value: String) -> crate::providers::StatRow {
 }
 
 /// How a balance amount is spelled: a token count compacts (`205M`); every
-/// other amount keeps its exact value through
-/// [`crate::format::format_amount`] and names the unit its figure spells.
+/// other amount keeps its exact value, grouped with thousands separators, and
+/// names the unit its figure spells.
 #[derive(Default, PartialEq)]
 enum BalanceUnit {
     #[default]
@@ -2054,13 +2054,14 @@ enum BalanceUnit {
 }
 
 /// One balance pool: every `balance` figure of one `id` that carries the
-/// first-seen figure's unit and the grant and left it was read with.
+/// grant and left of the set's unit.
 #[derive(Default)]
 struct BalancePool {
     label: String,
-    /// The first-seen figure's unit owns the pool: a figure of another unit
-    /// names another balance and never enters this bar's figures.
-    unit: BalanceUnit,
+    /// The unit the first figure to enter the set named: a figure of another
+    /// unit names another balance and never enters this bar's figures. `None`
+    /// until a figure carries both a grant and a left.
+    unit: Option<BalanceUnit>,
     granted: f64,
     /// The summed `remaining` of the same figures that published a grant.
     left: f64,
@@ -2070,10 +2071,10 @@ struct BalancePool {
 
 /// One bar per balance pool, in the order the pools first appear. A pool with
 /// no finite granted total (or a non-positive one) gets no bar: its share is
-/// not a figure the proxy published. Grant, left and spent come from one set —
-/// the figures carrying a finite `limit` AND a finite `remaining`, of the
-/// first-seen unit — so no side of the bar names a figure another side did not
-/// read.
+/// not a figure the proxy published. Grant, left, spent and expiry come from
+/// one set — the figures carrying a finite `limit` AND a finite `remaining`,
+/// of the unit the first such figure named — so no side of the bar, nor its
+/// `resets in` countdown, names a figure another side did not read.
 fn balance_bars(
     accounts: &[PoolAccount<'_>],
     text: &dyn Fn(&str) -> String,
@@ -2094,7 +2095,6 @@ fn balance_bars(
                     id.to_string(),
                     BalancePool {
                         label: balance_label(figure, text),
-                        unit: balance_unit(figure, text),
                         ..BalancePool::default()
                     },
                 ));
@@ -2102,24 +2102,9 @@ fn balance_bars(
             }
         };
         let pool = &mut pools[index].1;
-        // Another unit's figure keeps its own account line and never enters
-        // this bar's figures.
-        if balance_unit(figure, text) != pool.unit {
-            continue;
-        }
-        if let Some((epoch, stamp)) = figure
-            .get("expires_at")
-            .and_then(Value::as_str)
-            .and_then(|stamp| crate::usage::iso_to_epoch_secs(stamp).map(|epoch| (epoch, stamp)))
-            && pool
-                .expiry
-                .as_ref()
-                .is_none_or(|(earliest, _)| epoch < *earliest)
-        {
-            pool.expiry = Some((epoch, stamp.to_string()));
-        }
         // A figure naming only one side of the bar is no member of its set:
-        // the grant and the left must both be figures this read produced.
+        // the grant and the left must both be figures this read produced, so
+        // it never fixes the unit and never times the bar either.
         let (Some(limit), Some(remaining)) = (
             figure
                 .get("limit")
@@ -2132,6 +2117,28 @@ fn balance_bars(
         ) else {
             continue;
         };
+        // The first figure to enter the set owns the unit: a grantless figure
+        // first in the pool never fixes it, and another unit's figure keeps its
+        // own account line rather than entering this bar's figures.
+        let unit = balance_unit(figure, text);
+        if let Some(owned) = pool.unit.as_ref()
+            && *owned != unit
+        {
+            continue;
+        }
+        pool.unit.get_or_insert(unit);
+        // The countdown comes from the same set as the sums.
+        if let Some((epoch, stamp)) = figure
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .and_then(|stamp| crate::usage::iso_to_epoch_secs(stamp).map(|epoch| (epoch, stamp)))
+            && pool
+                .expiry
+                .as_ref()
+                .is_none_or(|(earliest, _)| epoch < *earliest)
+        {
+            pool.expiry = Some((epoch, stamp.to_string()));
+        }
         pool.granted += limit;
         pool.left += remaining;
         pool.spent += figure
@@ -2146,11 +2153,12 @@ fn balance_bars(
             if !(pool.granted.is_finite() && pool.granted > 0.0) {
                 return None;
             }
+            let unit = pool.unit.as_ref()?;
             let label = format!(
                 "{} | {} left of {}",
                 pool.label,
-                balance_amount(pool.left, &pool.unit),
-                balance_amount(pool.granted, &pool.unit),
+                balance_amount(pool.left, unit),
+                balance_amount(pool.granted, unit),
             );
             Some(crate::providers::UsageBar {
                 label,
@@ -2208,15 +2216,24 @@ fn balance_unit(figure: &Value, text: &dyn Fn(&str) -> String) -> BalanceUnit {
 }
 
 /// One side of a pool bar's `left of` phrase or a balance line's `left`: a
-/// token count compacts, every other amount keeps its exact value and names
-/// the unit word its figure spells.
+/// token count compacts; every other amount keeps its exact value, grouped
+/// with thousands separators — whole amounts as integers, fractional ones at
+/// two decimals — and names the unit word its figure spells.
 fn balance_amount(amount: f64, unit: &BalanceUnit) -> String {
+    // `group_thousands` expects a non-negative figure and would put its comma
+    // right after a minus sign; the sign stays this caller's.
+    let grouped = |amount: f64| {
+        let sign = if amount < 0.0 { "-" } else { "" };
+        let decimals = if amount.fract() == 0.0 { 0 } else { 2 };
+        format!(
+            "{sign}{}",
+            crate::format::group_thousands(amount.abs(), decimals)
+        )
+    };
     match unit {
         BalanceUnit::Tokens => crate::format::format_compact(amount),
-        BalanceUnit::Named(Some(word)) => {
-            format!("{} {word}", crate::format::format_amount(amount))
-        }
-        BalanceUnit::Named(None) => crate::format::format_amount(amount),
+        BalanceUnit::Named(Some(word)) => format!("{} {word}", grouped(amount)),
+        BalanceUnit::Named(None) => grouped(amount),
     }
 }
 

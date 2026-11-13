@@ -8404,3 +8404,97 @@ fn a_pool_account_id_wider_than_the_key_column_still_fits_its_value() {
         "a 12-cell id fits its value: the last whole part that fits the row's column"
     );
 }
+
+/// A pool bar's label is fitted to the pane like a row's value: at 41 cells
+/// the drawn line stays inside the interior and the cut label ends on `…`, so
+/// the granted total never appears truncated as a smaller number.
+#[test]
+fn a_pool_bar_label_fits_a_narrow_interior() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let body = serde_json::json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": [
+            {"kind": "balance", "id": "credit", "label": "campaign balance flash",
+             "remaining": 204977981.0, "limit": 300000000.0, "used": 95022019.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let lines: Vec<String> = build_tp_rows(
+        &profile,
+        41,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+    .collect();
+    for line in &lines {
+        assert!(
+            line.chars().count() <= 41,
+            "every drawn line stays inside the 41-cell interior: {line:?}"
+        );
+    }
+    let label_line = lines
+        .iter()
+        .find(|line| line.contains("campaign balance flash"))
+        .expect("the bar label is drawn");
+    assert!(
+        label_line.contains('…'),
+        "a cut bar label ends on an ellipsis, never a truncated figure: {label_line:?}"
+    );
+}
+
+/// A single-part value wider than the column ends on an ellipsis at exactly the
+/// column's width: the truncate branch of the fit.
+#[test]
+fn a_single_part_value_ends_on_an_ellipsis() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let long = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_string();
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![crate::providers::StatRow {
+            label: "summary".to_string(),
+            value: long.clone(),
+            kind: crate::providers::StatRowKind::Body,
+            raw: None,
+        }],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let lines: Vec<String> = build_tp_rows(
+        &profile,
+        41,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        lines,
+        vec![format!("  {:<13}{}…", "summary", &long[..25])],
+        "one over-wide part keeps 25 cells and ends on the ellipsis in a 26-cell column"
+    );
+}

@@ -1008,11 +1008,37 @@ impl Stat {
         } else {
             0
         };
-        let header_pad = pct_col
-            .saturating_sub(self.label.chars().count())
+        let pct_cells = Span::raw(pct_str.as_ref()).width();
+        // The eyebrow shares its row with the rate column and, when they fit,
+        // the amount + `%`. A bar label carrying its own figures (`… | 205M
+        // left of 300M`) is cut to the room those leave, so the granted total
+        // cannot reach the pane edge as a smaller number there; the cut ends
+        // on the house `…`. A rate section that alone fills the row leaves the
+        // label uncut on the fallback line (the pinned OAuth shape).
+        let full_room = pct_col
             .saturating_sub(max_rate_w)
             .saturating_sub(amount_section_w)
-            .saturating_sub(pct_str.chars().count());
+            .saturating_sub(pct_cells);
+        // Under three cells the cut would leave dots where the label's name
+        // was; a row that tight drops the `%` pair to its own line (the fit
+        // fallback below) whenever the label cannot sit beside it, so there
+        // the label keeps the room the rate section leaves instead.
+        let label_room = if full_room >= 3 {
+            full_room
+        } else {
+            pct_col.saturating_sub(max_rate_w)
+        };
+        let label = if label_room > 0 && grapheme_cells(&self.label) > label_room {
+            truncate(&self.label, label_room)
+        } else {
+            self.label.clone()
+        };
+        let label_cells = grapheme_cells(&label);
+        let header_pad = pct_col
+            .saturating_sub(label_cells)
+            .saturating_sub(max_rate_w)
+            .saturating_sub(amount_section_w)
+            .saturating_sub(pct_cells);
 
         let filled = self.pct.map_or(0, |p| {
             (((p / 100.0) * bar_width as f64).round() as usize).min(bar_width)
@@ -1055,7 +1081,7 @@ impl Stat {
             v
         };
 
-        let mut label_spans = vec![Span::styled(self.label.clone(), theme::label())];
+        let mut label_spans = vec![Span::styled(label.clone(), theme::label())];
         if let Some(rate) = self.burn_rate
             && rate > 0.0
         {
@@ -1089,9 +1115,7 @@ impl Stat {
             label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
-        let pct_cells = Span::raw(pct_str.as_ref()).width();
-        let fits =
-            Span::raw(&self.label).width() + max_rate_w + amount_section_w + pct_cells <= pct_col;
+        let fits = label_cells + max_rate_w + amount_section_w + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
         if fits {
             out.push(Line::from({
