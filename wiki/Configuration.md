@@ -323,9 +323,11 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
   base-env.json            # the values your own settings.json held under custom env keys a profile replaced (0600; a value clauth records writing only as a SHA-256 digest)
   mcp-sync-state.json      # the MCP login sync's memory: which login each store, live file and Keychain item held per MCP server (a truncated SHA-256 of its token, never the token) and which logins were signed out (0600); one that does not parse is renamed mcp-sync-state.json.corrupt-<epoch_ms> (0600) before the next save, and the sync then only fills gaps
   .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
-  jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
+  jobs/<id>.json           # backgrounded delegate jobs and the delegates a session's exit stopped, GC'd after a day
   jobs/<id>.live.json      # a blocking delegate's run while its caller is attached, then its done record until the 24 h sweep
   jobs/<id>.json.delivered # exactly-once delivery ledger after collection
+  jobs/<sid>.resumed       # left each time a `delegate` resumes a session id, so a stop that resume took is never named again (0600; removed after a day)
+  jobs/<id>.pending        # a delegate whose leftover processes clauth could not list when it stopped the run; each `clauth mcp` start retries the stop and removes it once it can (0600)
   keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live session clauth launched (start, delegate, background)
