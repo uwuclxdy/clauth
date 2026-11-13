@@ -227,6 +227,180 @@ fn an_end_relays_the_rows_no_wake_reached() {
     assert_eq!(next(&sub, NONE), None);
 }
 
+/// At `/exit` the resolver no longer knows the peer before the mod posts
+/// `end` (observed 2/2 in a sandbox, 2026-11-07). The `end` is still taken
+/// from the instance the hub holds for that pid, and the stream sees the
+/// session end at once rather than at the silence sweep.
+#[test]
+fn an_end_after_the_session_record_is_gone_still_ends_the_session() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (records, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    records.lock().unwrap().remove(&100);
+    let end = serde_json::json!({"session": "s-one", "seq": 2, "kind": "end"});
+    let (status, answer) = hub.event(100, end.to_string().as_bytes());
+
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// Only an `end` falls back to the held instance, and only for the session
+/// that instance holds: any other kind from a peer the resolver forgot, an
+/// `end` naming another session, an `end` missing its `seq`, and an `end` from
+/// a pid the hub never held all stay refused as an unknown peer.
+#[test]
+fn a_forgotten_peer_may_only_end_its_own_held_session() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (records, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    records.lock().unwrap().remove(&100);
+
+    let refused = [
+        (
+            100,
+            serde_json::json!({"session": "s-one", "seq": 2, "kind": "turn_start"}),
+        ),
+        (
+            100,
+            serde_json::json!({"session": "s-two", "seq": 2, "kind": "end"}),
+        ),
+        (
+            200,
+            serde_json::json!({"session": "s-one", "seq": 2, "kind": "end"}),
+        ),
+        (100, serde_json::json!({"session": "s-one", "kind": "end"})),
+    ];
+    for (pid, body) in refused {
+        let (status, answer) = hub.event(pid, body.to_string().as_bytes());
+        assert_eq!(status, 403, "{pid} {body}: {answer}");
+        assert_eq!(answer["error"], "unknown_peer", "{pid} {body}");
+    }
+    let (status, answer) = hub.poll(100, "s-one", Duration::ZERO);
+    assert_eq!(status, 403, "a poll from a forgotten peer: {answer}");
+    assert_eq!(
+        answer["error"], "unknown_peer",
+        "a poll from a forgotten peer: {answer}"
+    );
+}
+
+/// A held instance can be closed under `event`'s own lock: a peer silent past
+/// the bound still holds its instance when the fallback reads it, and
+/// `close_silent` then removes it before the re-check, so the `end` stays an
+/// unknown peer and the stream sees that instance's single sweep `end` frame.
+/// An instance replaced by a successor between the two locks is unreachable
+/// from a test: only `close_silent` runs between them.
+#[test]
+fn a_fallback_end_for_a_silence_closed_instance_stays_unknown() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (records, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    records.lock().unwrap().remove(&100);
+    hub.advance_clock(SILENCE_LIMIT + Duration::from_secs(1));
+    let end = serde_json::json!({"session": "s-one", "seq": 2, "kind": "end"});
+    let (status, answer) = hub.event(100, end.to_string().as_bytes());
+
+    assert_eq!(status, 403, "{answer}");
+    assert_eq!(answer["error"], "unknown_peer");
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// A fallback `end` is judged like a resolved one: a stale `seq` is refused
+/// `409 stale_sequence` with the instance left live, a fresh `end` then ends
+/// it once, and one after that is an unknown peer.
+#[test]
+fn a_stale_fallback_end_is_judged_and_the_instance_survives() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (records, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    records.lock().unwrap().remove(&100);
+    let stale = serde_json::json!({"session": "s-one", "seq": 1, "kind": "end"});
+    let (status, answer) = hub.event(100, stale.to_string().as_bytes());
+    assert_eq!(status, 409, "stale: {answer}");
+    assert_eq!(next(&sub, NONE), None);
+    let end = serde_json::json!({"session": "s-one", "seq": 2, "kind": "end"});
+    let (status, answer) = hub.event(100, end.to_string().as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    let again = serde_json::json!({"session": "s-one", "seq": 3, "kind": "end"});
+    let (status, answer) = hub.event(100, again.to_string().as_bytes());
+    assert_eq!(status, 403, "after removal: {answer}");
+    assert_eq!(next(&sub, NONE), None);
+}
+
+/// The `/exit` shape: rows land after the session record is gone, so the mod's
+/// `append` naming them is refused, and the fallback `end`'s final tail still
+/// relays them before the `end` status.
+#[test]
+fn a_fallback_end_relays_the_rows_its_refused_append_named() {
+    let sb = HomeSandbox::new();
+    let path = transcript_path(&sb, "s-one");
+    let before = line(&row("u0", "already there"));
+    append_raw(&path, &before);
+    let (records, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    records.lock().unwrap().remove(&100);
+    append_raw(&path, &line(&row("u1", "/exit")));
+    let append = serde_json::json!({"session": "s-one", "seq": 2, "kind": "append", "uuid": "u1"});
+    let (status, _) = hub.event(100, append.to_string().as_bytes());
+    assert_eq!(status, 403, "the append is refused");
+    let end = serde_json::json!({"session": "s-one", "seq": 3, "kind": "end"});
+    let (status, answer) = hub.event(100, end.to_string().as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.record".into(),
+            serde_json::json!({"session": "s-one", "agent_id": null, "offset": before.len() as u64, "record": row("u1", "/exit")})
+        )),
+        "the refused append's row relays first"
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "end"})
+        ))
+    );
+    assert_eq!(next(&sub, NONE), None);
+}
+
 /// The end's final read covers every file the instance already holds a tail
 /// for: the main transcript and each subagent file a wake has opened. A
 /// subagent file no wake ever named stays out, its rows the history route's,
@@ -888,7 +1062,8 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
             ],
             "asks": [
                 {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null}
-            ]
+            ],
+            "prompts": []
         })
     );
 }
@@ -1008,7 +1183,7 @@ fn a_cleared_session_ends_for_subscribers() {
     );
     assert_eq!(
         hub.snapshot(),
-        serde_json::json!({"sessions": [], "asks": []})
+        serde_json::json!({"sessions": [], "asks": [], "prompts": []})
     );
 }
 

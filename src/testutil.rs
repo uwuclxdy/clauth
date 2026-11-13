@@ -71,8 +71,8 @@ pub(crate) fn node_path(path: &Path) -> PathBuf {
 /// A `RecvBody` bound or one of ureq's other phases is a different, unruled
 /// budget even when it errors inside the window.
 ///
-/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
-/// ureq error is the io error's inner source.
+/// ureq's `BodyReader` (3.4.2; unchanged through 3.5.1) surfaces its timeout as
+/// `io::Error::other`, so the ureq error is the io error's inner source.
 pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
     let err = result.as_ref().expect_err("a stalled body is an error");
     let io = err
@@ -1406,6 +1406,29 @@ for arg in "$@"; do
   fi
   prev=$arg
 done
+# Opt-in: dump this child's environment, so a test can pin what the spawn
+# exports (the per-run job id tag included). Lands before every exit branch.
+if [ -n "${CLAUDE_SHIM_ENV_DUMP-}" ]; then
+  env > "$CLAUDE_SHIM_ENV_DUMP"
+fi
+# Opt-in: a process in its own session, the shape a delegate's Bash call
+# leaves behind — the Bash runs in its own session, so a `&` child it starts
+# sits outside this delegate's process group and inherits this child's
+# environment, the per-run stop tag included. Records its own pid (the exec
+# keeps it) into the named file, then runs the named binary for 600 s: the
+# real Bash tool refuses a bare `sleep`, so tests pass a renamed copy.
+if [ -n "${CLAUDE_SHIM_ESCAPED_HOLD-}" ]; then
+  setsid sh -c 'printf "%s\n" "$$" > "$1"; exec "$2" 600' sh "$CLAUDE_SHIM_ESCAPED_HOLD" "$CLAUDE_SHIM_ESCAPED_BIN" &
+fi
+# Opt-in: a process outside both sweeps — its own session, so the group stop
+# misses it, and a scrubbed environment, so the tag sweep cannot see it — that
+# inherits this child's stdout and stderr and holds them open long after the
+# child exits. The shape a stop cannot end, and the one that makes the run's
+# post-exit pipe wait spend its whole grace. Records its pid, then runs the
+# named binary for 600 s.
+if [ -n "${CLAUDE_SHIM_UNSEEN_HOLD-}" ]; then
+  setsid sh -c 'printf "%s\n" "$$" > "$1"; exec env -i "$2" 600' sh "$CLAUDE_SHIM_UNSEEN_HOLD" "$CLAUDE_SHIM_UNSEEN_BIN" &
+fi
 # Opt-in: a grandchild subshell inherits this child's stderr (the pipe clauth
 # reads) and stays alive for the named seconds while the child exits at once,
 # so a test can pin that the run finalizes on the child's exit without waiting
@@ -1413,6 +1436,33 @@ done
 if [ -n "${CLAUDE_SHIM_GRANDCHILD_HOLD-}" ]; then
   ( sleep "$CLAUDE_SHIM_GRANDCHILD_HOLD" ) &
   exit 0
+fi
+# Opt-in: write a fake transcript record keyed by the pinned delegate session
+# id, so a test can pin that an isolated stop's rescue lifted it into the
+# global store.
+if [ -n "${CLAUDE_SHIM_TRANSCRIPT-}" ]; then
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-cwd"
+  printf '{"sessionId":"%s","type":"user"}\n' "$CLAUTH_DELEGATE_SESSION_ID" > "$CLAUDE_CONFIG_DIR/projects/-fake-cwd/$CLAUTH_DELEGATE_SESSION_ID.jsonl"
+fi
+# Opt-in: a delegate kept alive until signalled, for the stop tests: record
+# this shim's pid and a same-group grandchild's pid (one per line), then wait
+# on SIGTERM/SIGINT, appending which arrived before exiting 0. The grandchild
+# dies with the group signal, which is what unblocks the wait for the trap.
+# With CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD the grandchild ignores SIGTERM
+# instead, so only the group SIGKILL after the grace can end it: a descendant
+# that ignores the SIGTERM (a backgrounded shell job's shape) is what the
+# grace exists for.
+if [ -n "${CLAUDE_SHIM_SIGNAL_HOLD-}" ]; then
+  if [ -n "${CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD-}" ]; then
+    ( trap '' TERM; sleep 600 ) &
+  else
+    ( sleep 600 ) &
+  fi
+  printf '%s\n' "$$" > "$CLAUDE_SHIM_SIGNAL_HOLD"
+  printf '%s\n' "$!" >> "$CLAUDE_SHIM_SIGNAL_HOLD"
+  trap 'trap "" TERM; sleep "${CLAUDE_SHIM_TERM_DELAY:-0}"; printf "%s\n" TERM >> "$CLAUDE_SHIM_SIGNAL_HOLD"; exit 0' TERM
+  trap 'printf "%s\n" INT >> "$CLAUDE_SHIM_SIGNAL_HOLD"; exit 0' INT
+  while :; do sleep 1; done
 fi
 # Opt-in scripted failure: print the named stderr text and exit with the named
 # code, so a test drives a delegate's non-zero-exit path through a real spawn.
@@ -1542,6 +1592,15 @@ pub(crate) struct FakeClaude<'a> {
     prev_exit: Option<std::ffi::OsString>,
     prev_grandchild_hold: Option<std::ffi::OsString>,
     prev_session_exit: Option<std::ffi::OsString>,
+    prev_signal_hold: Option<std::ffi::OsString>,
+    prev_term_ignoring: Option<std::ffi::OsString>,
+    prev_transcript: Option<std::ffi::OsString>,
+    prev_escaped_hold: Option<std::ffi::OsString>,
+    prev_escaped_bin: Option<std::ffi::OsString>,
+    prev_unseen_hold: Option<std::ffi::OsString>,
+    prev_unseen_bin: Option<std::ffi::OsString>,
+    prev_term_delay: Option<std::ffi::OsString>,
+    prev_env_dump: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1659,6 +1718,58 @@ impl<'a> FakeClaude<'a> {
         unsafe {
             std::env::remove_var("CLAUDE_SHIM_SESSION_EXIT");
         }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the signal-hold
+        // branch.
+        let prev_signal_hold = std::env::var_os("CLAUDE_SHIM_SIGNAL_HOLD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_SIGNAL_HOLD");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the transcript
+        // branch.
+        let prev_transcript = std::env::var_os("CLAUDE_SHIM_TRANSCRIPT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TRANSCRIPT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would turn every signal-hold grandchild
+        // TERM-ignoring.
+        let prev_term_ignoring = std::env::var_os("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the escaped
+        // branch.
+        let prev_escaped_hold = std::env::var_os("CLAUDE_SHIM_ESCAPED_HOLD");
+        let prev_escaped_bin = std::env::var_os("CLAUDE_SHIM_ESCAPED_BIN");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ESCAPED_HOLD");
+            std::env::remove_var("CLAUDE_SHIM_ESCAPED_BIN");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the unseen-hold
+        // branch.
+        let prev_unseen_hold = std::env::var_os("CLAUDE_SHIM_UNSEEN_HOLD");
+        let prev_unseen_bin = std::env::var_os("CLAUDE_SHIM_UNSEEN_BIN");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_UNSEEN_HOLD");
+            std::env::remove_var("CLAUDE_SHIM_UNSEEN_BIN");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop. An
+        // inherited value would slow every signal-hold shim's TERM exit.
+        let prev_term_delay = std::env::var_os("CLAUDE_SHIM_TERM_DELAY");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TERM_DELAY");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the env-dump
+        // branch.
+        let prev_env_dump = std::env::var_os("CLAUDE_SHIM_ENV_DUMP");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ENV_DUMP");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1677,6 +1788,15 @@ impl<'a> FakeClaude<'a> {
             prev_exit,
             prev_grandchild_hold,
             prev_session_exit,
+            prev_signal_hold,
+            prev_term_ignoring,
+            prev_transcript,
+            prev_escaped_hold,
+            prev_escaped_bin,
+            prev_unseen_hold,
+            prev_unseen_bin,
+            prev_term_delay,
+            prev_env_dump,
         }
     }
 
@@ -1760,6 +1880,108 @@ impl<'a> FakeClaude<'a> {
         // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
         unsafe { std::env::set_var("CLAUDE_SHIM_SESSION_EXIT", code) };
     }
+
+    /// Point the shim's signal-hold opt-in at `path`: the shim records its own
+    /// pid and a grandchild's pid there (one per line), waits until signalled,
+    /// and appends the signal name it got before exiting 0. Restored on drop
+    /// like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_signal_hold(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_SIGNAL_HOLD", path) };
+    }
+
+    /// Make the shim write a fake transcript keyed by the pinned delegate
+    /// session id before whatever it does next, so a test can pin that an
+    /// isolated stop's rescue lifted it. Restored on drop like every other
+    /// pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_transcript(&mut self) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TRANSCRIPT", "1") };
+    }
+
+    /// Make the signal-hold grandchild ignore SIGTERM, so a stop test can pin
+    /// that the group SIGKILL after the grace ends a TERM-surviving
+    /// descendant. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_term_ignoring_grandchild(&mut self) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD", "1") };
+    }
+
+    /// Point the shim's escaped-process opt-in at `record` and the long-lived
+    /// binary it runs: the shim backgrounds that binary in its own session —
+    /// outside the delegate's process group, the measured shape of a Bash
+    /// call's `&` child — and records its pid in `record`. Restored on drop
+    /// like every other pin. The fixture backgrounds it with `setsid`, so the
+    /// helper takes its callers' platform gate.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_escaped_hold(&mut self, bin: &std::path::Path, record: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_ESCAPED_BIN", bin);
+            std::env::set_var("CLAUDE_SHIM_ESCAPED_HOLD", record);
+        }
+    }
+
+    /// Point the shim's unseen-hold opt-in at `record` and the long-lived
+    /// binary it runs: a process in its own session with a scrubbed
+    /// environment — outside both the group stop and the tag sweep — that
+    /// inherits the shim's stdout and stderr and holds them open after the
+    /// shim exits. Records its own pid. The fixture backgrounds it with
+    /// `setsid` and `env -i`, so the helper takes its callers' platform gate.
+    /// Restored on drop like every other pin.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_unseen_hold(&mut self, bin: &std::path::Path, record: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_UNSEEN_BIN", bin);
+            std::env::set_var("CLAUDE_SHIM_UNSEEN_HOLD", record);
+        }
+    }
+
+    /// Make the shim's TERM trap sleep the named seconds before it records
+    /// the signal and exits, so a stop test can pose a delegate's measured
+    /// SIGTERM-to-exit time. Restored on drop like every other pin.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_term_delay(&mut self, secs: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TERM_DELAY", secs) }
+    }
+
+    /// Point the shim's env-dump opt-in at `path`: the shim writes its own
+    /// environment there at startup, so a test can pin what the spawn
+    /// exports. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_env_dump(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_ENV_DUMP", path) };
+    }
 }
 
 #[cfg(unix)]
@@ -1786,6 +2008,18 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_EXIT", &self.prev_exit),
                 ("CLAUDE_SHIM_GRANDCHILD_HOLD", &self.prev_grandchild_hold),
                 ("CLAUDE_SHIM_SESSION_EXIT", &self.prev_session_exit),
+                ("CLAUDE_SHIM_SIGNAL_HOLD", &self.prev_signal_hold),
+                (
+                    "CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD",
+                    &self.prev_term_ignoring,
+                ),
+                ("CLAUDE_SHIM_TRANSCRIPT", &self.prev_transcript),
+                ("CLAUDE_SHIM_ESCAPED_HOLD", &self.prev_escaped_hold),
+                ("CLAUDE_SHIM_ESCAPED_BIN", &self.prev_escaped_bin),
+                ("CLAUDE_SHIM_UNSEEN_HOLD", &self.prev_unseen_hold),
+                ("CLAUDE_SHIM_UNSEEN_BIN", &self.prev_unseen_bin),
+                ("CLAUDE_SHIM_TERM_DELAY", &self.prev_term_delay),
+                ("CLAUDE_SHIM_ENV_DUMP", &self.prev_env_dump),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),
@@ -2698,7 +2932,13 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
         .to_string()
 }
 
-/// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+/// Overwrite a file's or a directory's modification time — for cache-staleness,
+/// tie-break and age tests.
+///
+/// A file opens for writing. A directory opens differently per platform: unix
+/// cannot open one for writing and sets its mtime through a read-only handle;
+/// Windows needs write access to change any timestamp, plus
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle at all.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
 /// inside another thread's `MoveFileEx` replace over the same path fails with
@@ -2708,9 +2948,23 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
 /// one attempt. Bounded, so a genuinely absent file still panics with its own
 /// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
+    let mut options = std::fs::OpenOptions::new();
+    // `metadata` follows a symlink, as the open does.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+    } else {
+        options.write(true);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let file = loop {
-        match std::fs::OpenOptions::new().write(true).open(path) {
+        match options.open(path) {
             Ok(file) => break file,
             Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3623,6 +3877,7 @@ mod route_harness {
             path: path.to_string(),
             query: query.to_string(),
             bearer: bearer.map(str::to_string),
+            authorization_seen: bearer.is_some(),
             if_none_match: None,
             body: body.as_bytes().to_vec(),
             // Routing does not depend on this; the connection loop owns it.
@@ -3753,6 +4008,39 @@ impl Drop for Owned {
     }
 }
 
+/// Kill the process a shim recorded in `path` when the test unwinds, a red
+/// before the test's own cleanup included: a fixture-spawned holder sits in
+/// its own session, so nothing else reaps it. Reads the file at drop, so a
+/// guard armed before the shim wrote it still holds. Best-effort, never
+/// asserts — a fixture's `Drop` must not panic into an unwinding test.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct KillOnDrop(std::option::Option<PathBuf>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl KillOnDrop {
+    pub(crate) fn for_record(path: &Path) -> Self {
+        Self(Some(path.to_path_buf()))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Some(pid) = text.lines().next().and_then(|l| l.parse::<u32>().ok()) else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
 /// How long a re-entered fixture child sleeps between polls of its parent.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -3877,6 +4165,19 @@ fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command 
     cmd.env("CLAUDE_CONFIG_DIR", config_dir)
         .env(READY_ENV, ready);
     cmd
+}
+
+/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
+/// tagged with a `CLAUTH_DELEGATE_JOB_ID` the caller picks, writing `ready`
+/// once parked: the escaped-process sweep's fixture. The tag's environment
+/// must stay readable by the sweep on macOS, where an Apple platform binary
+/// (a copied `/bin/sleep`) would have it withheld — a re-entered,
+/// linker-signed test binary exposes it. The caller reaps the child.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_tagged_park(tag: &str, ready: &Path) -> std::process::Child {
+    let mut cmd = reentry_command(PARK_TEST, &[]);
+    cmd.env(READY_ENV, ready).env("CLAUTH_DELEGATE_JOB_ID", tag);
+    cmd.spawn().expect("spawn tagged parked process")
 }
 
 // ── fixture parent-death harness ─────────────────────────────────────────────
@@ -4173,13 +4474,24 @@ pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
     .expect("write daemon.status.json");
 }
 
+/// The hang bound `reap_bounded` gives a stop-test child to die of the
+/// SIGTERM its stop sent: the daemon's drain can wait up to
+/// [`crate::daemon::SPEND_DRAIN_BOUND`] in all, its token spend and the tick
+/// thread's exit save sharing that window, plus a margin for the loopback
+/// saves and the process's own exit. A hang detector, not a race bound:
+/// raising it weakens nothing.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const SERVE_STOP_REAP_BOUND: std::time::Duration =
+    crate::daemon::SPEND_DRAIN_BOUND.saturating_add(std::time::Duration::from_secs(10));
+
 /// Wait for a fake supervisor the code under test should have SIGTERMed to
-/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
-/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
-/// the exit status on success, which the caller asserts is SIGTERM.
+/// exit, BOUNDED by [`SERVE_STOP_REAP_BOUND`]: a red (no SIGTERM came) kills +
+/// reaps the child and panics with an assertion, never hangs the suite on an
+/// unbounded `wait`. Returns the exit status on success, which the caller
+/// asserts is SIGTERM.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + SERVE_STOP_REAP_BOUND;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status,

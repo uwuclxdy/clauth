@@ -7177,6 +7177,10 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
 
 const CEDAR_EMBER_NO_GRANT: &str = include_str!("../fixtures/cedar-ember-no-grant.json");
 const CEDAR_EMBER_THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
+/// A real read's body, verbatim: two launch grants, each clearing a window
+/// with no short label, each with an end stamp and a label past the 40-cell cap.
+const CEDAR_EMBER_TWO_LAUNCH_GRANTS: &str =
+    include_str!("../fixtures/cedar-ember-two-launch-grants.json");
 const RESET_PROFILE_BODY: &str = r#"{"account": {"uuid": "acc-1"}, "organization": {"uuid": "org-1", "organization_type": "claude_max"}}"#;
 const RESET_READ: &str = "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 HTTP/1.1";
 const RESET_PROFILE: &str = "GET /api/oauth/profile HTTP/1.1";
@@ -7255,6 +7259,7 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
     seed_claude_reset_profiles();
     let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, i| match (path, i) {
         (_, 0) => (200, CEDAR_EMBER_THREE_GRANTS.to_string()),
+        (_, 1) => (200, CEDAR_EMBER_TWO_LAUNCH_GRANTS.to_string()),
         _ => (200, CEDAR_EMBER_NO_GRANT.to_string()),
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
@@ -7266,9 +7271,28 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
         listed,
         [
             "clauth: 'cl2' has 2 limit resets available.",
-            "    Old reset: 1 of 1 available, resets 5h",
-            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 1 available, resets 5h",
+            "  * Weekly reset: 1 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
+        ]
+    );
+    // 2027-03-09T07:59:00Z, the fixture's `ends_at` on both grants.
+    let ends = crate::format::local_stamp(1_804_579_140).expect("stamp");
+    let real = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        real,
+        [
+            "clauth: 'cl2' has 2 limit resets available.".to_string(),
+            format!(
+                "  * New model launch: one Fable reset for Max, Team Premium and Enterprise \
+                 Premium: 1 available, resets 7d fable, expires {ends}  (used next)"
+            ),
+            format!(
+                "    New model launch: one more Fable reset at 6 months' tenure: 1 available, \
+                 resets 7d fable, expires {ends}"
+            ),
         ]
     );
     let none = stdout_of(|| {
@@ -7282,7 +7306,7 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
     let seen = handle.join().expect("join stub");
     assert_eq!(
         request_lines(&seen),
-        [RESET_READ, RESET_READ],
+        [RESET_READ, RESET_READ, RESET_READ],
         "--list spends nothing"
     );
     let header = |name| crate::testutil::request_header(&seen[0], name);
@@ -7327,7 +7351,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     assert_eq!(
         asked,
         "clauth: use the limit reset \"Weekly reset\" on 'cl2'? It resets 5h and 7d now and \
-         cannot be undone; 1 of 2 available on it."
+         cannot be undone; 1 available on it."
     );
     assert_eq!(declined, ["clauth: aborted. no reset was used on 'cl2'."]);
 

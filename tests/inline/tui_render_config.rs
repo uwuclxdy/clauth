@@ -3089,6 +3089,10 @@ fn three_band_setup_app(broken: bool) -> App {
             reset_7d_oi: None,
             plan: None,
             status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
         }],
     }]);
     app

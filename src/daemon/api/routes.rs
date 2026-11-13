@@ -37,13 +37,14 @@ use super::events::HerdrSeam;
 use super::events::events as events_handler;
 use super::gateway;
 pub(crate) use super::http::ErrorBody;
-use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
+use super::http::{Request, Response, SoloHeader, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
 use super::proxies;
 use super::push;
 use super::sessions;
 use super::terminal;
+use super::ticket;
 
 /// Every route lives under this prefix, and it is spelled once.
 ///
@@ -256,6 +257,15 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::Control,
         handler: agent::keys,
     },
+    // A POST the view tier may make: it writes no file, and the ticket's stream
+    // takes its mode from the device's row at the upgrade, so a mint grants
+    // nothing the tier does not already hold.
+    Route {
+        method: "POST",
+        path: "/panes/{id}/ticket",
+        access: Access::View,
+        handler: ticket::mint,
+    },
     Route {
         method: "POST",
         path: "/sessions/{id}/prompt",
@@ -310,7 +320,7 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::View,
         handler: push::key,
     },
-    // The two rows below are the one write the view tier can make, a
+    // The two rows below are the one durable write the view tier can make, a
     // deliberate exception to "every mutating route needs control": a device
     // writes only its own subscription row, and the row reaches nothing the
     // tier does not already read. Two bounds hold it there: the endpoint must
@@ -430,6 +440,8 @@ pub(crate) struct ApiContext {
     /// The one-line-per-failure-span latch on [`listed_origins`]: re-arms on
     /// the next read that succeeds.
     pub(crate) origins_failed_noted: AtomicBool,
+    /// The live terminal tickets. Memory only, so a restart empties the table.
+    pub(crate) tickets: super::ticket::Tickets,
 }
 
 impl ApiContext {
@@ -465,6 +477,7 @@ impl ApiContext {
             skipped_origins: RankedMutex::new(BTreeSet::new()),
             last_origins: RankedMutex::new(None),
             origins_failed_noted: AtomicBool::new(false),
+            tickets: super::ticket::Tickets::new(Box::new(super::ticket::Stamp::now)),
         })
     }
 
@@ -573,6 +586,21 @@ const TIER_UNKNOWN: &str = "this device was paired by a newer clauth with a tier
 /// The reason a bearer gets from a page whose origin the host does not list.
 const ORIGIN_NOT_ALLOWED: &str = "this page's origin is not in `[serve] app_origins` in \
                                   profiles.toml on the host";
+/// The reason a bearer gets from a page whose `Origin` no list entry can equal.
+const ORIGIN_UNLISTABLE: &str = "this page sends an origin `[serve] app_origins` can never list \
+                                 (`null`, sent twice, or not UTF-8); open the app from the web \
+                                 address it is served at";
+
+/// The reason an `origin_not_allowed` refusal of `origin` carries. Entry
+/// validation rejects `null`, and a repeated or non-UTF-8 header equals no
+/// entry, so no edit to the list can let those in.
+pub(super) fn origin_refusal(origin: &SoloHeader) -> &'static str {
+    match origin {
+        SoloHeader::Unusable => ORIGIN_UNLISTABLE,
+        SoloHeader::One(origin) if origin == "null" => ORIGIN_UNLISTABLE,
+        SoloHeader::Absent | SoloHeader::One(_) => ORIGIN_NOT_ALLOWED,
+    }
+}
 
 /// `[serve] app_origins` as this request sees it: read fresh, so an edit
 /// applies to the next request, and only the entries that count. A
@@ -673,12 +701,12 @@ fn note_skipped_origin(ctx: &ApiContext, text: &str, reason: &str) {
 /// Authentication runs before the path is judged, an unknown path included, so
 /// an unpaired caller learns nothing past a 401 about which paths exist. The
 /// pairing redemption is the one route that reads no bearer, since a device
-/// holds none until it succeeds.
+/// holds none until it succeeds. The stream's upgrade is the one request a
+/// ticket can stand in for a bearer on: read only when no `Authorization`
+/// header was presented and on that path, so a bearer decides alone wherever
+/// one is sent, and its device reaches the bridge and never the route table
+/// ([`ticket`]).
 pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handled {
-    // One-shot latches: the store is read per request, so an unlatched line
-    // would be one line per request for the daemon's life.
-    static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
-
     let path = req.path.strip_prefix(API_PREFIX);
     let route = path.and_then(|path| {
         ROUTES.iter().find_map(|route| {
@@ -710,24 +738,19 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     let device = match devices::authenticate(req.bearer.as_deref()) {
         Ok(Some(device)) => device,
         Ok(None) => {
+            if !req.presented_authorization()
+                && let Some(pane_id) = path.and_then(terminal::pane_stream_target)
+                && let Some(ticket) = req.ws.offer.ticket()
+            {
+                return ticket::attach(ctx, req, ticket, &pane_id);
+            }
             return Handled {
                 response: Response::unauthorized(),
                 device: None,
                 hijack: None,
             };
         }
-        Err(e) => {
-            // The per-request line names the route and status only, so the
-            // cause has to be carried by this one line or nowhere.
-            if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
-                logline!("clauth api: refusing every request until the device list reads: {e:#}");
-            }
-            return Handled {
-                response: Response::error(500, "internal"),
-                device: None,
-                hijack: None,
-            };
-        }
+        Err(e) => return refuse_unread_devices(&e),
     };
 
     // CORS reaches no write and no upgrade, so a removed origin whose page still
@@ -735,7 +758,11 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     // an unpaired caller's 401 both come first.
     if req.cross_origin.refused {
         return Handled {
-            response: Response::refused(403, "origin_not_allowed", ORIGIN_NOT_ALLOWED),
+            response: Response::refused(
+                403,
+                "origin_not_allowed",
+                origin_refusal(&req.cross_origin.origin),
+            ),
             device: Some(device.name),
             hijack: None,
         };
@@ -746,7 +773,7 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     // WebSocket is not an HTTP resource — OpenAPI covers HTTP only, and the
     // frame vocabulary is hand-written in the plan doc.
     if let Some(pane_id) = path.and_then(terminal::pane_stream_target) {
-        return terminal::request(ctx, req, &device, &pane_id);
+        return terminal::request(ctx, req, &device, &pane_id, terminal::Credential::Bearer);
     }
 
     let response = match route {
@@ -779,6 +806,31 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     Handled {
         response,
         device: Some(device.name),
+        hijack: None,
+    }
+}
+
+/// The one-shot latch behind the line an unreadable device list earns: the store
+/// is read per request and per stream, so an unlatched line would be one line per
+/// reader for the daemon's life.
+pub(super) static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
+
+/// The one line an unreadable device list earns, whichever reader met it: a
+/// request's refusal, an open terminal stream, or an `/events` stream. The
+/// per-request line names the route and status only, so the cause has to be
+/// carried by this one line or nowhere.
+pub(super) fn note_unread_devices(e: &anyhow::Error) {
+    if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
+        logline!("clauth api: refusing every request until the device list reads: {e:#}");
+    }
+}
+
+/// The answer to a device list that does not read, whichever credential met it.
+pub(super) fn refuse_unread_devices(e: &anyhow::Error) -> Handled {
+    note_unread_devices(e);
+    Handled {
+        response: Response::error(500, "internal"),
+        device: None,
         hijack: None,
     }
 }
@@ -887,7 +939,7 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     ),
     security(("bearer" = ["view"]))
 )]
-fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
+fn status(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     let include_disabled = req.flag("all");
     if !include_disabled {
         let waited = req
@@ -897,7 +949,7 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
         // Only a client that says what it already holds can be made to wait;
         // with no tag every answer is a change, so there is nothing to wait for.
         if let (Some(wait), Some(tag)) = (waited, req.if_none_match.as_deref()) {
-            return wait_for_status_change(ctx, tag, wait);
+            return wait_for_status_change(ctx, tag, wait, caller);
         }
         // A body caught mid-replacement never reaches the client here either:
         // it does not parse, so the read falls through to the rebuild below —
@@ -960,7 +1012,16 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
 /// digesting it every [`WAIT_POLL`] costs almost nothing — and unlike an mtime
 /// it cannot be fooled. (A filesystem that stamps two writes microseconds apart
 /// with one mtime is not hypothetical; comparing content is immune to it.)
-fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Response {
+///
+/// Both answers pass through [`waited_answer`]: a device revoked while the
+/// request is parked got through the authentication at its start, so the row is
+/// read again before this answers, once per answer and never per poll tick.
+fn wait_for_status_change(
+    ctx: &ApiContext,
+    tag: &str,
+    wait: Duration,
+    caller: &Caller<'_>,
+) -> Response {
     let deadline = std::time::Instant::now() + wait;
     loop {
         // Read before the deadline is tested: a zero-wait conditional request is
@@ -974,13 +1035,33 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
         if let Some((body, etag)) = read_feed_tagged(&ctx.status_path)
             && etag != tag
         {
-            return Response::raw_json_tagged(200, body, etag);
+            return waited_answer(caller, || Response::raw_json_tagged(200, body, etag));
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return Response::not_modified(tag.to_string());
+            return waited_answer(caller, || Response::not_modified(tag.to_string()));
         }
         std::thread::sleep(WAIT_POLL.min(deadline - now));
+    }
+}
+
+/// The answer a long poll owes once it is ready: its caller's row, read fresh,
+/// decides whether the answer reaches it. A revoke during the wait is a CLI
+/// writing a file after this request authenticated, so its change answer and its
+/// deadline answer both answer the 401 its next request would get; a list that
+/// does not read answers as it does at a request's start. A caller with no
+/// device, which the route table does not build on this path, fails closed with
+/// the 500 the other in-handler re-checks answer. One read per answer.
+fn waited_answer(caller: &Caller<'_>, answer: impl FnOnce() -> Response) -> Response {
+    let Some(device) = caller.device else {
+        // No device means no row to re-read, and the feed must not go out
+        // unread: answer as the store read failure below does.
+        return Response::error(500, "internal");
+    };
+    match devices::by_pairing_id(&device.pairing_id()) {
+        Ok(Some(_)) => answer(),
+        Ok(None) => Response::unauthorized(),
+        Err(e) => refuse_unread_devices(&e).response,
     }
 }
 
@@ -1310,7 +1391,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, ticket::mint, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
     components(schemas(create::BackgroundSessionCreated)),
     modifiers(&BearerScheme, &SessionsCreateOneOf)
 )]
@@ -1355,7 +1436,7 @@ impl utoipa::Modify for SessionsCreateOneOf {
         let Some(RefOr::T(response)) = operation.responses.responses.get_mut("200") else {
             return;
         };
-        let Some(content) = response.content.get_mut("application/json") else {
+        let Some(RefOr::T(content)) = response.content.get_mut("application/json") else {
             return;
         };
         let [pane, background] = [

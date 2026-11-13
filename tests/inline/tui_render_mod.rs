@@ -431,7 +431,7 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         let viewport = app.global_config_viewport.get();
         assert!(viewport >= 4, "config publishes its viewport at {w}x{h}");
         let starts: Vec<usize> = app.global_config_row_starts.borrow().clone();
-        assert_eq!(starts.len(), 21, "one start line per config row");
+        assert_eq!(starts.len(), 22, "one start line per config row");
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
         let target = starts[0] + viewport - 1;
         let expected = (0..starts.len())
@@ -576,6 +576,113 @@ fn long_config_pane_follows_selection_without_repinning() {
         .position(|r| r.contains("allow extra usage"))
         .unwrap();
     assert_eq!(after, before, "nearby selection does not recenter the form");
+    app.global_config_cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        0,
+        "first row restores the top"
+    );
+}
+
+/// A form whose view is derived from the frame alone (the smallest offset
+/// showing the row, or a follow seeded at the bottom or at the row) puts a
+/// mid-form row back at offset 1 after the pane grows, or loses the view after
+/// a move or a resize; the saved viewport only clamps to the new maximum, and
+/// an adjacent move or a resize that still fits leaves the row where it was
+/// drawn, at the maximum and below it.
+#[test]
+fn a_grown_config_pane_clamps_its_saved_viewport_instead_of_recomputing_it() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        23,
+        "the last row stops at the 80x14 pane's maximum, 31 - 8"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+        .unwrap();
+    term.backend_mut().resize(80, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 80x24 the form draws 31 lines (22 rows, 4 band headers, 3 spacers,
+    // the wrapped home-tab row's second line and the focused row's hint) in an
+    // 18-row pane, so the saved offset from 80x14 clamps to 31 - 18; the row's
+    // line 15 sits on 13 + 2, the band's edge, so the follow leaves it there.
+    assert_eq!(
+        app.global_config_offset.get(),
+        13,
+        "the saved viewport clamps to the grown pane's maximum"
+    );
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = rows
+        .iter()
+        .position(|row| row.contains("auto-start queue"))
+        .unwrap();
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        rows.iter().position(|row| row.contains("auto-start queue")),
+        Some(before),
+        "an adjacent move does not repin the grown pane"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::ContextNudge)
+        .unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // ContextNudge's line 14 falls inside the 13 + 2 band, so the follow lifts
+    // the view to 14 - 2, below the maximum; a view seeded at the bottom on
+    // every draw reads 12 here too, then drops back to 13 on the next move.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an upward move follows the row"
+    );
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an adjacent move keeps a viewport below the maximum"
+    );
+    // The row's lines 15-16 keep two lines either side inside an 8-row pane
+    // at offset 12, and 12 stays under the 80x24 maximum of 13, so neither
+    // resize moves the view; a view reseeded at the bottom or at the row on
+    // a resize reads 13 in both.
+    for (height, label) in [(14, "a shrunk pane"), (24, "a regrown pane")] {
+        term.backend_mut().resize(80, height);
+        term.autoresize().unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        assert_eq!(
+            app.global_config_offset.get(),
+            12,
+            "{label} keeps a saved view that still fits"
+        );
+    }
+    term.backend_mut().resize(70, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 70 columns one more line wraps below the row, so the form grows to
+    // 32 lines and its maximum to 14 while the row keeps lines 15-16: the
+    // saved 12 still fits and holds; a view reseeded on a width or length
+    // change reads 13 from the bottom or the row and 1 from the top.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "a narrower pane keeps a saved view that still fits"
+    );
     app.global_config_cursor = 0;
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert_eq!(
@@ -917,15 +1024,21 @@ fn a_usage_status_row_past_its_deadline_reads_queued_instead_of_refresh_in_zero(
 
 /// A stood-down instance mirrors another process's disk and runs no fetch round
 /// of its own, so a past published deadline is its own cache-mtime estimate, not
-/// a due fetch. Both surfaces must render that row as a countdown — the floored
-/// `0s` under its staleness cue — never a `queued` spinner promising work this
-/// process will not do.
+/// a due fetch. Both surfaces must render that row as overdue — the `+4m` age
+/// under its amber staleness cue, the usage row's `refresh overdue` — never a
+/// `queued` spinner promising work this process will not do, and never a
+/// countdown frozen at `0s`.
 #[test]
-fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
+fn a_stood_down_row_past_its_deadline_shows_its_overdue_age_not_queued() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::Tab;
 
     let mut app = app_with_a_passed_deadline("dueacct");
+    // 4m30s past due: `+4m` holds 30 s from either minute boundary.
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("dueacct")),
+        crate::usage::now_ms() - 270_000,
+    );
     // Another instance wins the usage-fetch lease first; its `File` must stay
     // alive so the flock stays held for the rest of the test.
     let other = crate::daemon::FetchLease::new();
@@ -951,24 +1064,33 @@ fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
             .any(|c| crate::spinner::SPINNER_FRAMES.contains(&c.symbol())),
         "a stood-down row must not claim a queued fetch:\n{text}"
     );
+    assert!(
+        !text.contains("0s"),
+        "the mirror's past estimate must not floor at `0s`:\n{text}"
+    );
     assert_eq!(
-        text.split_whitespace().filter(|w| *w == "0s").count(),
+        text.split_whitespace().filter(|w| *w == "+4m").count(),
         1,
-        "the mirror's past estimate floors at `0s`:\n{text}"
+        "the mirror's past estimate reads its overdue age:\n{text}"
     );
-    let zero = cells
+    let plus = cells
         .iter()
-        .position(|c| c.symbol() == "0")
-        .unwrap_or_else(|| panic!("the timer slot holds no countdown:\n{text}"));
+        .position(|c| c.symbol() == "+")
+        .unwrap_or_else(|| panic!("the timer slot holds no overdue age:\n{text}"));
     assert_eq!(
-        cells[zero + 1].symbol(),
-        "s",
-        "the cell is a countdown:\n{text}"
+        cells[plus + 1].symbol(),
+        "4",
+        "the cell is the age:\n{text}"
     );
     assert_eq!(
-        cells[zero].fg,
+        cells[plus + 2].symbol(),
+        "m",
+        "the cell is the age:\n{text}"
+    );
+    assert_eq!(
+        cells[plus].fg,
         crate::tui::theme::warning_color(),
-        "the stood-down countdown keeps its amber staleness cue:\n{text}"
+        "the stood-down overdue age keeps its amber staleness cue:\n{text}"
     );
 
     app.tab = Tab::Usage;
@@ -978,8 +1100,12 @@ fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
         "a stood-down status row names no queued fetch:\n{usage}"
     );
     assert!(
-        usage.contains("refresh in 0s"),
-        "the mirror's past estimate reads `refresh in 0s`:\n{usage}"
+        usage.contains("refresh overdue"),
+        "the mirror's past estimate reads overdue:\n{usage}"
+    );
+    assert!(
+        !usage.contains("refresh in 0s"),
+        "a passed deadline must not read `refresh in 0s`:\n{usage}"
     );
 }
 
@@ -8308,7 +8434,9 @@ fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
 
 /// The #74 `stale` pill end to end: an aged `usage_cache.json` on disk, one
 /// `apply_usage` (the per-tick map), then a real draw whose per-frame snapshot
-/// carries that map to the Usage tab's status block.
+/// carries that map to the Usage tab's status block. The reading is past its
+/// own cadence with no deadline published, so the dot arm reads the overdue
+/// wording the pill prepends — the pill's threshold is what this pins.
 #[test]
 fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
     use crate::tui::app::Tab;
@@ -8350,7 +8478,7 @@ fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
     assert_eq!(
         rows_with(&dump(&app, 100, 40), &["stale"]),
         vec![
-            "│                            ││ status    [ stale ] ◌ up to date                                   │"
+            "│                            ││ status    [ stale ] ◌ refresh overdue · read 23m ago               │"
         ],
         "the aged cache's stale pill reaches the drawn status block"
     );
@@ -10011,4 +10139,239 @@ fn the_full_tier_paints_the_base_surface() {
             .any(|(_, _, bg)| *bg == Color::Rgb(30, 30, 46)),
         "the full tier paints BG"
     );
+}
+
+/// A stood-down overdue fixture for the Usage fetch row's width ladder:
+/// `uwuclxdy`'s reading `read_ago_ms` old with fetch status `status`, the
+/// `[ stale ]` cue armed when `stale`, its published deadline
+/// `deadline_ago_ms` past.
+fn overdue_width_app(
+    read_ago_ms: u64,
+    deadline_ago_ms: u64,
+    status: crate::usage::FetchStatus,
+    stale: bool,
+) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![oauth("uwuclxdy", false)],
+    });
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - read_ago_ms);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), status);
+    if stale {
+        app.stale_cues.insert("uwuclxdy".to_string(), true);
+    }
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the competing instance wins the lease");
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - deadline_ago_ms,
+    );
+    app.tab = crate::tui::app::Tab::Usage;
+    app
+}
+
+/// A due time passed under a second ago is already overdue: the overview
+/// timer slot reads `+1s`, never `+0s`. The fixture dates the refresh off the
+/// reading's own stamp on the instance that fetches (a stuck worker holds the
+/// leg, so nothing published a deadline) — the one arm where a sub-second
+/// overdue age can still render. The 300 ms age sits clear of both the due
+/// boundary and the `+2s` flip.
+#[test]
+fn a_deadline_passed_under_a_second_ago_reads_plus_one_second() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut app = app_with_a_passed_deadline("dueacct");
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .remove(&crate::usage::FetchLeg::OAuth.key(ProfileName::from("dueacct")));
+    let cfg = app.config();
+    let interval = crate::usage::usage_interval_ms(
+        cfg.find(&ProfileName::from("dueacct"))
+            .expect("fixture profile"),
+        cfg.state.refresh_interval_ms,
+    );
+    drop(cfg);
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 300),
+        ..crate::usage::UsageInfo::default()
+    };
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("dueacct".to_string(), reading);
+
+    app.tab = Tab::Overview;
+    let cells = cells_of_row_holding(&app, 100, 24, "dueacct");
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(
+        !text.split_whitespace().any(|w| w == "+0s"),
+        "a passed due time must not read `+0s`:\n{text}"
+    );
+    assert_eq!(
+        text.split_whitespace().filter(|w| *w == "+1s").count(),
+        1,
+        "the age reads one second, the overdue floor:\n{text}"
+    );
+}
+
+/// A failed account whose leg a left-running fetch worker holds has no
+/// published deadline, on the instance that fetches: the reading's own stamp
+/// plus the account's interval dates when the refresh fell due, so the Usage
+/// fetch row reads the overdue wording, never a bare `[ failed ]`.
+#[test]
+fn a_late_workers_failed_usage_row_reads_the_overdue_wording() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let p = oauth("uwuclxdy", false);
+    let interval = crate::usage::usage_interval_ms(&p, AppState::default().refresh_interval_ms);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    // The 90 s interval + 4m30s lands the stamp exactly 6 m out, and
+    // `spoken_age` floors, so `read 6m ago` holds from the stamp to the 7 m
+    // boundary — a full minute of margin.
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - interval - 270_000);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), crate::usage::FetchStatus::Failed);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "a late worker belongs to the instance that fetches"
+    );
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 120, 30);
+    let row = usage
+        .lines()
+        .find(|l| l.contains("[ failed ]"))
+        .unwrap_or_else(|| panic!("the failed fetch row renders:\n{usage}"));
+    let row = &row[row.find("status").expect("the key cell renders")..];
+    assert_eq!(
+        row.trim_end().trim_end_matches('│').trim_end(),
+        "status    [ failed ]  retry overdue · read 6m ago",
+        "the late worker's row reads the overdue wording:\n{usage}"
+    );
+}
+
+/// A fresh reading with no published deadline is not overdue until its own
+/// interval has run: the draw site hands the Usage row the account's real
+/// interval, so a reading younger than it reads `up to date`. A draw site
+/// passing a smaller interval would date this same reading overdue.
+#[test]
+fn a_fresh_usage_row_with_no_deadline_reads_up_to_date_inside_its_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let p = oauth("uwuclxdy", false);
+    let interval = crate::usage::usage_interval_ms(&p, AppState::default().refresh_interval_ms);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    // Two thirds of the interval old: a third of it (30 s at the default
+    // 90 s) of margin before the refresh falls due.
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - interval * 2 / 3);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), crate::usage::FetchStatus::Fresh);
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 120, 30);
+    let row = usage
+        .lines()
+        .find(|l| l.contains("status") && l.contains('◌'))
+        .unwrap_or_else(|| panic!("the fetch row renders:\n{usage}"));
+    let row = &row[row.find("status").expect("the key cell renders")..];
+    assert_eq!(
+        row.trim_end().trim_end_matches('│').trim_end(),
+        "status    ◌ up to date",
+        "a reading inside its interval is not overdue:\n{usage}"
+    );
+}
+
+/// The overdue fetch row at desktop widths: when the pane cannot hold the
+/// dated row, the ` · read Nm ago` half drops whole first — the drawn row
+/// reads either the full string or the undated form, never a figure
+/// cut mid-word. The 70-column pin drives the `[ cached ]` arm alone: the
+/// `[ stale ] [ cached ]` row is 47 cells against the 45-cell pane at
+/// that width, so even its undated form cannot fit and the pane's own cut
+/// (the pre-existing clip) takes over.
+#[test]
+fn the_overdue_fetch_row_drops_its_reading_age_whole_before_clipping() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stale_app = overdue_width_app(
+        13 * 60_000 + 30_000,
+        270_000,
+        crate::usage::FetchStatus::Cached,
+        true,
+    );
+    let bare_app = overdue_width_app(
+        13 * 60_000 + 30_000,
+        270_000,
+        crate::usage::FetchStatus::Cached,
+        false,
+    );
+    let stale_full = "status    [ stale ] [ cached ]  refresh overdue · read 13m ago";
+    let stale_undated = "status    [ stale ] [ cached ]  refresh overdue";
+    let bare_full = "status    [ cached ]  refresh overdue · read 13m ago";
+    let bare_undated = "status    [ cached ]  refresh overdue";
+    for (w, app, full, undated) in [
+        (120u16, &stale_app, stale_full, stale_undated),
+        (90, &stale_app, stale_full, stale_undated),
+        (80, &stale_app, stale_full, stale_undated),
+        (70, &bare_app, bare_full, bare_undated),
+    ] {
+        let usage = dump(app, w, 30);
+        let row = usage
+            .lines()
+            .find(|l| l.contains("[ cached ]") || l.contains("[ stale ]"))
+            .unwrap_or_else(|| panic!("the fetch row renders at {w} columns:\n{usage}"));
+        let row = &row[row.find("status").expect("the key cell renders")..];
+        let row = row.trim_end().trim_end_matches('│').trim_end();
+        if w == 120 {
+            assert_eq!(row, full, "at 120 columns the row fits whole:\n{usage}");
+        } else {
+            assert!(
+                row == full || row == undated,
+                "at {w} columns the row is whole or sheds its reading age whole, never cut mid-word: {row:?}"
+            );
+        }
+    }
 }

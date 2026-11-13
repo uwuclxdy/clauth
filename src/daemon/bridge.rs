@@ -8,12 +8,16 @@
 //! [`Instance`] through the [`PeerResolver`] — never taking a session id off the
 //! wire — and keys the session per `(pid, procStart, sessionId)` so a recycled
 //! pid, a `/clear` or a second live process cannot cross sessions or swallow
-//! another session's commands. Linux and macOS only: the whole module is
-//! `#[cfg(unix)]` at its declaration in `mod.rs`.
+//! another session's commands. The one fallback is an `end` the resolver no
+//! longer knows the peer for, taken under the instance the hub already holds
+//! for that pid ([`Hub::held_for_end`]) and only when it names that instance's
+//! own session. Linux and macOS only: the whole module is `#[cfg(unix)]` at
+//! its declaration in `mod.rs`.
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, RandomState};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -23,7 +27,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::daemon::api::http::sanitize_for_log;
 use crate::logline::logline;
@@ -88,7 +92,10 @@ const MAX_PARKED_POLLS: usize = 256;
 /// bites a mod that stopped polling, whose commands would otherwise grow
 /// without bound while every command route kept answering 200 (SB-10, SB-19).
 /// 8192 doubles the write-timeout pin's 4096-command batch, so the cap never
-/// bites a live mod while still bounding one stopped-reading instance.
+/// bites a live mod while still bounding one stopped-reading instance. It
+/// bounds the prompts one instance holds still awaiting an outcome too: no
+/// poll drains those, so a mod that never reports would otherwise grow the
+/// snapshot without bound.
 pub(crate) const MAX_QUEUED_COMMANDS: usize = 8192;
 
 /// Cap on one instance's parked per-ask waits. Each held check parks its own
@@ -97,6 +104,11 @@ pub(crate) const MAX_QUEUED_COMMANDS: usize = 8192;
 /// many checks falls back to the stock dialog instead of parking without
 /// bound.
 pub(crate) const MAX_WAITS_PER_INSTANCE: usize = 8;
+
+/// Settled prompt outcomes one live instance keeps beside its queued prompts,
+/// for the snapshot a reconnecting stream opens with; queued prompts are
+/// never evicted.
+const KEPT_PROMPT_OUTCOMES: usize = 16;
 
 /// How long the accept loop pauses after an error it cannot attribute to one
 /// connection, so a persistent failure cannot spin a core (mirrors the REST
@@ -236,6 +248,10 @@ struct FileTail {
 pub(crate) struct Hub {
     listening: bool,
     resolver: PeerResolver,
+    /// A random nonce minted at construction: prompt ids carry it, so an id an
+    /// earlier daemon run minted — still queued in a live mod — collides with
+    /// one this run mints only by a 2^-64 chance.
+    prompt_nonce: u64,
     inner: Mutex<Inner>,
     changed: Condvar,
     /// Live `/events` subscribers; a full channel is dropped on the next
@@ -259,6 +275,9 @@ struct Inner {
     /// Pids already logged as unknown, for the SB-3 "not registered, logged
     /// once" memo.
     unknown_logged: HashSet<u32>,
+    /// The last minted prompt id's counter, hub-wide, so no client ever sees
+    /// one id name two prompts; the hub's nonce keeps ids unique across runs.
+    last_prompt: u64,
 }
 
 /// One live claude instance, keyed by its peer pid. Liveness is the poll:
@@ -286,6 +305,11 @@ struct Live {
     /// The `start` event's cwd and interactive, for the snapshot.
     cwd: Value,
     interactive: Value,
+    /// Whether the mod reports each prompt's outcome: its `start` carried
+    /// `"prompt_reports": true`, or one of its polls announced reports. A mod
+    /// that never reports gets no prompt id, so nothing sits queued here for a
+    /// session that would never settle it.
+    prompt_reports: bool,
     /// The main transcript, located at registration and tailed on each
     /// main-file wake; `None` until the file is found (SB-11).
     main_file: Option<FileTail>,
@@ -335,6 +359,13 @@ struct Live {
     /// run.
     ending: bool,
     last_poll: Instant,
+    /// Every prompt minted for this instance and not yet evicted, in mint
+    /// order: each still queued, plus the [`KEPT_PROMPT_OUTCOMES`] most recently
+    /// settled, so a reconnecting stream learns what became of a prompt it saw
+    /// queued.
+    prompts: Vec<MintedPrompt>,
+    /// The settled ids in `prompts`, oldest settle first: the eviction order.
+    settled_prompts: VecDeque<String>,
 }
 
 impl Live {
@@ -353,6 +384,7 @@ impl Live {
             announced: false,
             cwd: Value::Null,
             interactive: Value::Null,
+            prompt_reports: false,
             main_file: None,
             subagent_files: HashMap::new(),
             subagent_snapshot: HashMap::new(),
@@ -365,6 +397,8 @@ impl Live {
             rewake: HashSet::new(),
             ending: false,
             last_poll: now,
+            prompts: Vec::new(),
+            settled_prompts: VecDeque::new(),
         }
     }
 
@@ -375,6 +409,146 @@ impl Live {
     fn owned(&self) -> usize {
         self.commands.len() + self.inflight
     }
+
+    /// The prompts this instance holds with no outcome yet: the count a
+    /// reporting instance's cap bounds, since a poll drains the command but
+    /// only a report settles the record.
+    fn queued_prompts(&self) -> usize {
+        self.prompts
+            .iter()
+            .filter(|minted| minted.state == PromptState::Queued)
+            .count()
+    }
+
+    /// Move a queued prompt to its settled `state`, evicting the oldest
+    /// settled one past [`KEPT_PROMPT_OUTCOMES`]. `false` for an id this
+    /// instance holds no queued prompt under: a repeat report, or one naming
+    /// an id never minted here.
+    fn settle_prompt(&mut self, id: &str, state: PromptState) -> bool {
+        let Some(entry) = self
+            .prompts
+            .iter_mut()
+            .find(|minted| minted.id == id && minted.state == PromptState::Queued)
+        else {
+            return false;
+        };
+        entry.state = state;
+        self.settled_prompts.push_back(id.to_owned());
+        if self.settled_prompts.len() > KEPT_PROMPT_OUTCOMES
+            && let Some(evicted) = self.settled_prompts.pop_front()
+        {
+            self.prompts.retain(|minted| minted.id != evicted);
+        }
+        true
+    }
+}
+
+/// One prompt minted for an instance: its id and where it stands.
+struct MintedPrompt {
+    id: String,
+    state: PromptState,
+}
+
+/// Where one minted prompt stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptState {
+    /// Handed to the mod, no outcome reported yet.
+    Queued,
+    /// The mod submitted it and Claude Code took it.
+    Delivered,
+    Dropped(DropReason),
+}
+
+/// Why a prompt never reached the conversation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// Claude Code refused it on every try the mod made.
+    Refused,
+    /// Claude Code dropped it for good: removed from its queue before it ran,
+    /// or any other drop a retry cannot undo.
+    Removed,
+    /// The mod cannot tell whether Claude Code took it: a fresh module load
+    /// found the submit still out.
+    Unknown,
+    /// The session ended with it still queued; only the daemon reports this.
+    SessionEnd,
+}
+
+impl PromptState {
+    /// One prompt's `session.prompt` frame, the snapshot's entry shape too.
+    fn frame(self, session: &str, prompt: &str) -> Value {
+        let (state, reason) = match self {
+            Self::Queued => ("queued", None),
+            Self::Delivered => ("delivered", None),
+            Self::Dropped(DropReason::Refused) => ("dropped", Some("refused")),
+            Self::Dropped(DropReason::Removed) => ("dropped", Some("removed")),
+            Self::Dropped(DropReason::Unknown) => ("dropped", Some("unknown")),
+            Self::Dropped(DropReason::SessionEnd) => ("dropped", Some("session_end")),
+        };
+        let mut frame = json!({"session": session, "prompt": prompt, "state": state});
+        if let Some(reason) = reason {
+            frame["reason"] = json!(reason);
+        }
+        frame
+    }
+}
+
+/// A mod `prompt` report's id and outcome, or `None` for a report the daemon
+/// cannot read: a missing or non-string id, a state other than `delivered` or
+/// `dropped`, a drop without a reason the mod may give, or a delivery
+/// carrying one. `session_end` is the daemon's own reason, never the mod's.
+fn prompt_report(value: &Value) -> Option<(&str, PromptState)> {
+    let prompt = value.get("prompt")?.as_str()?;
+    let reason = value.get("reason").map(Value::as_str);
+    let state = match (value.get("state")?.as_str()?, reason) {
+        ("delivered", None) => PromptState::Delivered,
+        ("dropped", Some(Some("refused"))) => PromptState::Dropped(DropReason::Refused),
+        ("dropped", Some(Some("removed"))) => PromptState::Dropped(DropReason::Removed),
+        ("dropped", Some(Some("unknown"))) => PromptState::Dropped(DropReason::Unknown),
+        _ => return None,
+    };
+    Some((prompt, state))
+}
+
+/// A prompt text Claude Code's `$.prompt.submit` always refuses, so the mod
+/// path refuses it before queueing rather than letting the mod retry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptRefusal {
+    /// Begins with `/` after JavaScript's `trimStart()`: read as a command.
+    Command,
+    /// Empty after JavaScript's `trim()`.
+    Blank,
+}
+
+impl PromptRefusal {
+    fn of(text: &str) -> Option<Self> {
+        let rest = text.trim_start_matches(is_js_whitespace);
+        if rest.is_empty() {
+            Some(Self::Blank)
+        } else if rest.starts_with('/') {
+            Some(Self::Command)
+        } else {
+            None
+        }
+    }
+}
+
+/// JavaScript's `String.prototype.trim` set: Unicode `Zs` plus TAB, VT, FF,
+/// U+FEFF and the line terminators LF, CR, U+2028, U+2029. Rust's
+/// `char::is_whitespace` differs on U+0085 and U+FEFF, and the engine's
+/// refusal is judged by this set.
+fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{B}' | '\u{C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
 }
 
 /// What [`Hub::deliver`] found on the mod side of a prompt or interrupt.
@@ -390,6 +564,34 @@ pub(crate) enum ModDelivery {
     NoMod,
 }
 
+/// What [`Hub::deliver_prompt`] found on the mod side of a prompt.
+pub(crate) enum PromptDelivery {
+    /// Exactly one live instance: the prompt is queued for its poll. `prompt`
+    /// is the minted id when that instance reports outcomes, `None` when its
+    /// mod predates the reports and the prompt rides without one.
+    Queued { prompt: Option<String> },
+    /// Exactly one live instance, and a text Claude Code always refuses:
+    /// nothing queued, nothing minted.
+    Refused(PromptRefusal),
+    /// Two live instances resolve to the id: refused, never handed to either.
+    Ambiguous,
+    /// The one live instance's command queue is at [`MAX_QUEUED_COMMANDS`].
+    Busy,
+    /// The one live instance holds [`MAX_QUEUED_COMMANDS`] prompts still
+    /// awaiting an outcome: a poll frees no place, only a report does.
+    PromptsBusy,
+    /// No live instance: the route falls back to herdr, text untouched.
+    NoMod,
+}
+
+/// The live, non-ending instances holding one session id, as the command
+/// routes count them.
+enum Holders {
+    One(u32),
+    Many,
+    None,
+}
+
 /// What [`Hub::answer`] found on the mod side of an ask answer.
 pub(crate) enum AskOutcome {
     /// The ask was open; the answer is queued and the ask closes.
@@ -399,6 +601,14 @@ pub(crate) enum AskOutcome {
     /// The ask is open but the instance's queue is at [`MAX_QUEUED_COMMANDS`]:
     /// refused 503, the ask stays open for a retry (A#1).
     Busy,
+    /// A `decision` sent to a question ask, or `answers` sent to any other
+    /// ask: refused, nothing queued, the ask stays open.
+    WrongForm,
+    /// An answer or note key is not byte-equal to one of the open ask's
+    /// question texts: refused, nothing queued, the ask stays open.
+    UnknownQuestion,
+    /// An answer is empty: refused, nothing queued, the ask stays open.
+    EmptyAnswer,
     /// The ask was answered (or closed at the desk) already.
     AskClosed,
     /// The instance never held that ask id.
@@ -452,11 +662,24 @@ impl PollAnswer {
     }
 }
 
+/// A fresh nonce for this hub's prompt ids. Randomness here buys uniqueness
+/// across daemon runs, not secrecy: an id only has to never collide with one
+/// an earlier run already handed a mod.
+fn mint_prompt_nonce() -> u64 {
+    let mut bytes = [0u8; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        // Uniqueness is all an id needs, so a hashed fallback still separates runs.
+        Err(_) => RandomState::new().build_hasher().finish(),
+    }
+}
+
 impl Hub {
     pub(crate) fn new(listening: bool, resolver: PeerResolver) -> Arc<Self> {
         Arc::new(Self {
             listening,
             resolver,
+            prompt_nonce: mint_prompt_nonce(),
             inner: Mutex::new(Inner::default()),
             changed: Condvar::new(),
             subs: Mutex::new(Vec::new()),
@@ -540,15 +763,25 @@ impl Hub {
     }
 
     /// The end frames for a closing instance: every open ask closes `by:
-    /// session_end`, then the `end` status (SB-13). Every removal path calls
-    /// this, so the one notify here wakes any wait (and poll) parked on the
-    /// instance, whatever path removed it.
+    /// session_end`, every prompt still queued drops `session_end`, then the
+    /// `end` status (SB-13). Every removal path calls this, so the one notify
+    /// here wakes any wait (and poll) parked on the instance, and no queued
+    /// prompt goes unreported, whatever path removed it.
     fn emit_instance_end(&self, live: &Live) {
         for (ask, _) in &live.open_asks {
             self.broadcast(
                 "session.ask",
                 json!({"session": live.session_id, "ask": ask, "state": "closed", "by": "session_end"}),
             );
+        }
+        for minted in &live.prompts {
+            if minted.state == PromptState::Queued {
+                self.broadcast(
+                    "session.prompt",
+                    PromptState::Dropped(DropReason::SessionEnd)
+                        .frame(&live.session_id, &minted.id),
+                );
+            }
         }
         self.broadcast(
             "session.status",
@@ -557,9 +790,10 @@ impl Hub {
         self.changed.notify_all();
     }
 
-    /// The snapshot a (re)connecting stream opens with: every live session and
-    /// every open ask, sessions sorted by id and asks by session then open
-    /// order. The revalidation closes moved or silent instances first, with
+    /// The snapshot a (re)connecting stream opens with: every live session,
+    /// every open ask and every kept prompt, sessions sorted by id, asks by
+    /// session then open order, prompts by session then mint order. The
+    /// revalidation closes moved or silent instances first, with
     /// the peer resolve running off every hub lock (SB-10, SB-13).
     pub(crate) fn snapshot(&self) -> Value {
         let records: Vec<(u32, String, String)> = {
@@ -594,7 +828,15 @@ impl Hub {
                 }));
             }
         }
-        json!({"sessions": session_entries, "asks": asks})
+        let prompts: Vec<Value> = sessions
+            .iter()
+            .flat_map(|live| {
+                live.prompts
+                    .iter()
+                    .map(|minted| minted.state.frame(&live.session_id, &minted.id))
+            })
+            .collect();
+        json!({"sessions": session_entries, "asks": asks, "prompts": prompts})
     }
 
     /// The periodic silence sweep: close every instance silent past the bound
@@ -613,6 +855,9 @@ impl Hub {
     }
 
     /// One event from the mod at `peer_pid`, resolved to a session and handled.
+    /// The session comes from the resolver; only an `end` from a peer it no
+    /// longer knows falls back to the instance the hub holds for that pid
+    /// ([`Hub::held_for_end`]), then runs the same `end` path.
     pub(crate) fn event(&self, peer_pid: u32, body: &[u8]) -> (u16, Value) {
         if body.len() > BODY_LIMIT {
             logline!(
@@ -621,11 +866,18 @@ impl Hub {
             );
             return (413, error_value("body_too_large"));
         }
-        let Some(resolved) = (self.resolver)(peer_pid) else {
+        let parsed = serde_json::from_slice::<Value>(body).ok();
+        let resolved = (self.resolver)(peer_pid);
+        let fallback = resolved.is_none();
+        let Some(resolved) = resolved.or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| self.held_for_end(peer_pid, value))
+        }) else {
             self.log_unknown_peer(peer_pid);
             return (403, error_value("unknown_peer"));
         };
-        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        let Some(value) = parsed else {
             return (400, error_value("bad_request"));
         };
         let Some(named) = value.get("session").and_then(Value::as_str) else {
@@ -646,7 +898,7 @@ impl Hub {
         // Validate the kind and its fields before the sequence advances or the
         // instance is created (A#13): a refused event must not consume its seq.
         let kind = match value.get("kind").and_then(Value::as_str) {
-            Some(k @ ("start" | "turn_start" | "turn_end" | "append" | "end")) => k,
+            Some(k @ ("start" | "turn_start" | "turn_end" | "append" | "end" | "prompt")) => k,
             Some("ask_opened") if value.get("ask").and_then(Value::as_str).is_some() => {
                 "ask_opened"
             }
@@ -654,6 +906,14 @@ impl Hub {
                 "ask_closed"
             }
             _ => return (400, error_value("bad_request")),
+        };
+        let report = if kind == "prompt" {
+            let Some(report) = prompt_report(&value) else {
+                return (400, error_value("bad_request"));
+            };
+            Some(report)
+        } else {
+            None
         };
 
         // The device store is read once per `ask_opened` (A#15), before any hub
@@ -665,13 +925,26 @@ impl Hub {
         self.close_silent(&mut inner, now);
 
         // `end` goes through the same reconcile path so a moved record closes
-        // the old instance before the sequence is judged (A#14). The final
+        // the old instance before the sequence is judged (A#14); an end taken
+        // under the held instance reconciles onto that same instance. The final
         // transcript tail runs between the judge and the removal, with every
         // read off the hub lock, so the rows no wake reached relay before the
         // `end` status closes the stream's view. An `end` for a pid whose
         // instance this call just minted emits nothing: no `start` was ever
         // broadcast for it.
         if kind == "end" {
+            // The fallback identity was read before this lock: if the instance
+            // it named was replaced since, the end stays an unknown peer rather
+            // than reconciling onto the successor.
+            if fallback
+                && !inner.instances.get(&peer_pid).is_some_and(|live| {
+                    live.session_id == resolved.session_id && live.proc_start == resolved.proc_start
+                })
+            {
+                drop(inner);
+                self.log_unknown_peer(peer_pid);
+                return (403, error_value("unknown_peer"));
+            }
             let generation = {
                 let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
                 if seq <= live.seq_high {
@@ -764,6 +1037,12 @@ impl Hub {
             "start" => {
                 live.cwd = value.get("cwd").cloned().unwrap_or(Value::Null);
                 live.interactive = value.get("interactive").cloned().unwrap_or(Value::Null);
+                // Tracking only ever turns on (a `start` carrying the flag, or a
+                // poll announcing it): a later start without the flag must not
+                // un-track a mod the polls already marked.
+                if value.get("prompt_reports").and_then(Value::as_bool) == Some(true) {
+                    live.prompt_reports = true;
+                }
                 self.broadcast(
                     "session.status",
                     json!({"session": named, "state": "start", "cwd": live.cwd, "interactive": live.interactive}),
@@ -865,6 +1144,14 @@ impl Hub {
                     // or a rejected fetch), so its late `ask_closed` is the ask's
                     // last consumer: drop the kept payload, keep the id.
                     live.closed_asks.insert(ask.to_string(), Value::Null);
+                }
+                (200, json!({ "ok": true }))
+            }
+            "prompt" => {
+                if let Some((prompt, state)) = report
+                    && live.settle_prompt(prompt, state)
+                {
+                    self.broadcast("session.prompt", state.frame(named, prompt));
                 }
                 (200, json!({ "ok": true }))
             }
@@ -1240,19 +1527,33 @@ impl Hub {
     /// `wait` for a command. Commands are delivered once, to their own
     /// instance's queue alone. A direct caller (a test) that receives the
     /// answer has the write succeed by construction, so its drained commands
-    /// are consumed here. Production polls only through [`poll_answer`], so the
-    /// consume-or-requeue choice stays in `serve`.
+    /// are consumed here. Production polls only through [`poll_answer`], so
+    /// the consume-or-requeue choice stays in `serve`. A poll with `reports` marks
+    /// the mod as reporting each prompt's outcome, as its `/poll` query flag
+    /// does; one without never turns tracking off.
     #[cfg(test)]
-    pub(crate) fn poll(&self, peer_pid: u32, session: &str, wait: Duration) -> (u16, Value) {
+    pub(crate) fn poll_as(
+        &self,
+        peer_pid: u32,
+        session: &str,
+        wait: Duration,
+        reports: bool,
+    ) -> (u16, Value) {
         let PollAnswer {
             status,
             body,
             drained,
-        } = self.poll_answer(peer_pid, session, wait);
+        } = self.poll_answer(peer_pid, session, wait, reports);
         if let Some(drained) = drained {
             self.consume(drained);
         }
         (status, body)
+    }
+
+    /// [`poll_as`] with `reports: false`.
+    #[cfg(test)]
+    pub(crate) fn poll(&self, peer_pid: u32, session: &str, wait: Duration) -> (u16, Value) {
+        self.poll_as(peer_pid, session, wait, false)
     }
 
     /// Resolve `peer_pid` to its instance and check `session` against it: the
@@ -1279,10 +1580,19 @@ impl Hub {
         Ok(resolved)
     }
 
-    /// [`poll`] with the drained commands carried back, so `serve` can requeue
-    /// them when the answer write fails rather than letting a 200'd command
-    /// vanish (A#1).
-    fn poll_answer(&self, peer_pid: u32, session: &str, wait: Duration) -> PollAnswer {
+    /// [`poll_as`] with the drained commands carried back, so `serve` can
+    /// requeue them when the answer write fails rather than letting a 200'd
+    /// command vanish (A#1). A poll with `reports` turns prompt tracking on for
+    /// the instance it reconciles, so a restarted daemon that first meets a
+    /// live mod by its poll learns the mod reports; one without never clears
+    /// it.
+    fn poll_answer(
+        &self,
+        peer_pid: u32,
+        session: &str,
+        wait: Duration,
+        reports: bool,
+    ) -> PollAnswer {
         let resolved = match self.resolve_peer(peer_pid, session, "poll") {
             Ok(resolved) => resolved,
             Err((status, body)) => return PollAnswer::empty(status, body),
@@ -1296,6 +1606,9 @@ impl Hub {
             self.close_silent(&mut inner, now);
             let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
             live.last_poll = now;
+            if reports {
+                live.prompt_reports = true;
+            }
             let commands: Vec<Value> = live.commands.drain(..).collect();
             live.inflight += commands.len();
             (created, live.generation, commands)
@@ -1484,11 +1797,86 @@ impl Hub {
         self.changed.notify_all();
     }
 
-    /// Queue `command` for the named session's live mod instance. Re-resolves
-    /// only the instances holding the named id first (A#15), off every hub
-    /// lock, so a moved or silent instance closes before the count decides
-    /// (SB-4, SB-10, SB-13).
+    /// Queue `command` for the named session's live mod instance, counted by
+    /// [`Hub::holders`].
     pub(crate) fn deliver(&self, session: &str, command: Value) -> ModDelivery {
+        let (mut inner, holders) = self.holders(session);
+        let pid = match holders {
+            Holders::None => return ModDelivery::NoMod,
+            Holders::Many => return ModDelivery::Ambiguous,
+            Holders::One(pid) => pid,
+        };
+        let live = inner
+            .instances
+            .get_mut(&pid)
+            .unwrap_or_else(|| unreachable!("the holder was counted under this lock hold"));
+        if live.owned() >= MAX_QUEUED_COMMANDS {
+            return ModDelivery::Busy;
+        }
+        live.commands.push_back(command);
+        self.changed.notify_all();
+        ModDelivery::Delivered
+    }
+
+    /// Queue a phone prompt for the named session's live mod instance. A mod
+    /// that reports outcomes gets a freshly minted id, recorded and announced
+    /// with its `queued` frame; one that predates the reports gets the bare
+    /// command. The text is judged on the same resolve that would queue it, so
+    /// a text Claude Code always refuses is refused only where a mod would
+    /// submit it, and the herdr fallback still gets it untouched.
+    pub(crate) fn deliver_prompt(&self, session: &str, text: &str) -> PromptDelivery {
+        let (mut inner, holders) = self.holders(session);
+        let pid = match holders {
+            Holders::None => return PromptDelivery::NoMod,
+            Holders::Many => return PromptDelivery::Ambiguous,
+            Holders::One(pid) => pid,
+        };
+        if let Some(refusal) = PromptRefusal::of(text) {
+            return PromptDelivery::Refused(refusal);
+        }
+        let Inner {
+            instances,
+            last_prompt,
+            ..
+        } = &mut *inner;
+        let live = instances
+            .get_mut(&pid)
+            .unwrap_or_else(|| unreachable!("the holder was counted under this lock hold"));
+        if live.owned() >= MAX_QUEUED_COMMANDS {
+            return PromptDelivery::Busy;
+        }
+        if !live.prompt_reports {
+            live.commands
+                .push_back(json!({"kind": "prompt", "text": text}));
+            self.changed.notify_all();
+            return PromptDelivery::Queued { prompt: None };
+        }
+        if live.queued_prompts() >= MAX_QUEUED_COMMANDS {
+            return PromptDelivery::PromptsBusy;
+        }
+        *last_prompt += 1;
+        let prompt = format!("p-{:x}-{last_prompt:x}", self.prompt_nonce);
+        live.commands
+            .push_back(json!({"kind": "prompt", "text": text, "prompt": prompt}));
+        live.prompts.push(MintedPrompt {
+            id: prompt.clone(),
+            state: PromptState::Queued,
+        });
+        self.changed.notify_all();
+        self.broadcast(
+            "session.prompt",
+            PromptState::Queued.frame(session, &prompt),
+        );
+        PromptDelivery::Queued {
+            prompt: Some(prompt),
+        }
+    }
+
+    /// The live, non-ending instances holding `session`, counted under the
+    /// returned lock hold. Re-resolves only the instances holding the named
+    /// id first (A#15), off every hub lock, so a moved or silent instance
+    /// closes before the count decides (SB-4, SB-10, SB-13).
+    fn holders(&self, session: &str) -> (MutexGuard<'_, Inner>, Holders) {
         let records: Vec<(u32, String, String)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             self.close_silent(&mut inner, self.now());
@@ -1502,31 +1890,23 @@ impl Hub {
         let moved = self.moved_records(&records);
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         self.close_moved(&mut inner, &moved);
-        let matching: Vec<u32> = inner
+        let mut matching = inner
             .instances
             .iter()
             .filter(|(_, live)| live.session_id == session && !live.ending)
-            .map(|(pid, _)| *pid)
-            .collect();
-        match matching.len() {
-            0 => ModDelivery::NoMod,
-            1 => {
-                let live = inner.instances.get_mut(&matching[0]).unwrap_or_else(|| {
-                    unreachable!("the matching pid was counted from the same map")
-                });
-                if live.owned() >= MAX_QUEUED_COMMANDS {
-                    return ModDelivery::Busy;
-                }
-                live.commands.push_back(command);
-                self.changed.notify_all();
-                ModDelivery::Delivered
-            }
-            _ => ModDelivery::Ambiguous,
-        }
+            .map(|(pid, _)| *pid);
+        let holders = match (matching.next(), matching.next()) {
+            (None, _) => Holders::None,
+            (Some(pid), None) => Holders::One(pid),
+            (Some(_), Some(_)) => Holders::Many,
+        };
+        (inner, holders)
     }
 
     /// Answer a held ask on the named session's live mod instance: the first
-    /// answer wins and closes the ask, whatever its form.
+    /// answer [`answer_refusal`] takes with room left in the queue wins and
+    /// closes the ask; every other outcome leaves the ask open and queues
+    /// nothing.
     pub(crate) fn answer(&self, session: &str, ask: &str, command: Value) -> AskOutcome {
         let records: Vec<(u32, String, String)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1562,6 +1942,9 @@ impl Hub {
                         // whatever the device state at answer time.
                         if !info.held {
                             return AskOutcome::AskNotFound;
+                        }
+                        if let Some(refusal) = answer_refusal(&info.tool, &info.input, &command) {
+                            return refusal;
                         }
                         if live.owned() >= MAX_QUEUED_COMMANDS {
                             return AskOutcome::Busy;
@@ -1620,6 +2003,35 @@ impl Hub {
     /// control-tier device is paired, read fresh on every call (SB-9, MB-1).
     fn remote_flag(&self) -> bool {
         self.listening && crate::daemon::api::devices::has_control_device()
+    }
+
+    /// The identity an `end` from a peer the resolver no longer knows is taken
+    /// under: at `/exit` the resolver already answers `None` for the peer when
+    /// the mod posts `end` (observed 2/2 in a sandbox, 2026-11-07). Only an
+    /// `end` naming the very session the hub already holds for `peer_pid` and
+    /// carrying the `seq` the end path judges qualifies; anything else stays an
+    /// unknown peer. No process-start check of its own: the pid is the
+    /// connecting process's own (`SO_PEERCRED` / `LOCAL_PEERPID`), so the poster
+    /// is the held instance's process or one that took its pid after it died.
+    /// A recycled pid keeps its predecessor's instance until a re-resolve
+    /// ([`process_gone_or_moved`]: linux by start time, macOS by liveness alone)
+    /// or the silence sweep closes it, and can end it first: the end frame that
+    /// dead instance gets anyway, sent early.
+    fn held_for_end(&self, peer_pid: u32, value: &Value) -> Option<Instance> {
+        if value.get("kind").and_then(Value::as_str) != Some("end") {
+            return None;
+        }
+        let named = value.get("session").and_then(Value::as_str)?;
+        value.get("seq").and_then(Value::as_u64)?;
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let live = inner
+            .instances
+            .get(&peer_pid)
+            .filter(|live| live.session_id == named)?;
+        Some(Instance {
+            session_id: live.session_id.clone(),
+            proc_start: live.proc_start.clone(),
+        })
     }
 
     /// Log the SB-3 "not registered, logged once" line for `peer_pid`.
@@ -1797,6 +2209,56 @@ fn answer_value(command: &Value) -> Value {
     stripped.remove("kind");
     stripped.remove("ask");
     Value::Object(stripped)
+}
+
+/// The question texts an `AskUserQuestion` ask holds: its `input` is the
+/// tool's `questions` array, each entry naming its text under `question`.
+/// `input` alone never makes an ask a question ask; one whose input yields no
+/// text refuses every `answers` key as unknown.
+fn ask_questions(input: &Value) -> Vec<&str> {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("question").and_then(Value::as_str))
+        .collect()
+}
+
+/// Why an answer the model could not use is refused, or `None` to take it.
+/// The ask's kind comes from its `tool`, never its `input`'s shape: a
+/// `decision` sent to a question ask, or `answers` sent to any other, is the
+/// wrong form. For a question ask every `answers` and `notes` key must be
+/// byte-equal to one of its question texts (a key matching none would reach
+/// the model as no answer at all), then every answer must be a non-empty
+/// string. A question left unanswered is allowed, a note on it included.
+fn answer_refusal(tool: &Value, input: &Value, command: &Value) -> Option<AskOutcome> {
+    let answers = command.get("answers").and_then(Value::as_object);
+    let question_ask = tool.as_str() == Some("AskUserQuestion");
+    if question_ask != answers.is_some() {
+        return Some(AskOutcome::WrongForm);
+    }
+    // A permission ask's decision is the form it takes: nothing to check.
+    let answers = answers?;
+    let no_notes = Map::new();
+    let notes = command
+        .get("notes")
+        .and_then(Value::as_object)
+        .unwrap_or(&no_notes);
+    let questions = ask_questions(input);
+    if !answers
+        .keys()
+        .chain(notes.keys())
+        .all(|key| questions.contains(&key.as_str()))
+    {
+        return Some(AskOutcome::UnknownQuestion);
+    }
+    if !answers
+        .values()
+        .all(|answer| answer.as_str().is_some_and(|text| !text.is_empty()))
+    {
+        return Some(AskOutcome::EmptyAnswer);
+    }
+    None
 }
 
 /// Release a parked wait's slot, only when the instance it parked on is still
@@ -2389,6 +2851,7 @@ fn serve(
         }
         ("GET", path) if path.starts_with("/poll") => {
             let session = parse_poll_session(path).unwrap_or_default();
+            let reports = parse_poll_reports(path);
             // Leave the event budget before parking: a parked poll holds the
             // poll budget, never an event slot (SB-10).
             drop(event);
@@ -2403,7 +2866,7 @@ fn serve(
                 status,
                 body,
                 drained,
-            } = hub.poll_answer(pid, session, POLL_WAIT);
+            } = hub.poll_answer(pid, session, POLL_WAIT, reports);
             // `written` only means the kernel took the bytes, not that the mod
             // processed them: a mod that closes after a short buffered answer
             // loses those commands, and a failed write settling after a newer
@@ -2612,30 +3075,33 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<Request, R
     Ok(Request { method, path, body })
 }
 
-fn parse_poll_session(path: &str) -> Option<&str> {
+/// The value of the first `key=value` pair for `key` in a path's query, none
+/// when no such pair exists; a pair with no `=` or an empty trailing pair is
+/// skipped rather than refusing the query.
+fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
     let query = path.split_once('?')?.1;
     query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == "session").then_some(value)
+        let (pair_key, value) = pair.split_once('=')?;
+        (pair_key == key).then_some(value)
     })
+}
+
+fn parse_poll_session(path: &str) -> Option<&str> {
+    query_param(path, "session")
+}
+
+/// Whether a poll's query announces `prompt_reports=1`: the mod sends it on
+/// every poll, so a restarted daemon that first meets a live mod by its poll
+/// still learns the mod reports.
+fn parse_poll_reports(path: &str) -> bool {
+    query_param(path, "prompt_reports") == Some("1")
 }
 
 /// The `session` and `ask` of a `GET /wait` query, both required — a missing
 /// one reads as `400 bad_request`, never a default that could wait on the wrong
 /// ask.
 fn parse_wait_query(path: &str) -> Option<(&str, &str)> {
-    let query = path.split_once('?')?.1;
-    let mut session = None;
-    let mut ask = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        match key {
-            "session" => session = Some(value),
-            "ask" => ask = Some(value),
-            _ => {}
-        }
-    }
-    Some((session?, ask?))
+    Some((query_param(path, "session")?, query_param(path, "ask")?))
 }
 
 fn write_response(stream: &mut UnixStream, status: u16, body: &Value) -> bool {
@@ -2879,3 +3345,7 @@ mod frames_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_wait.rs"]
 mod wait_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_prompts.rs"]
+mod prompts_tests;

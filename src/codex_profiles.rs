@@ -7,8 +7,8 @@
 //! construction: `profiles.toml` keeps its exact pre-codex schema, and an OLD
 //! binary never opens this file at all — so the mixed-version dual-write and
 //! serde-drop hazards `profiles.toml` would have carried are dissolved, not
-//! handled. (A NEWER binary's unknown keys are tolerated on load and dropped
-//! on the next rewrite, exactly `profiles.toml`'s own contract.)
+//! handled. (A NEWER binary's unknown keys are tolerated on load and stay
+//! where they are on the next save, exactly `profiles.toml`'s own contract.)
 //!
 //! One namespace spans both files: a profile name held by either harness is
 //! taken (enforced by `actions::validate_profile_name`, which reads both
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::lock::StateLock;
 use crate::profile::{
     DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileId,
-    ProfileName, atomic_write_600, clauth_dir, mkdir_700,
+    ProfileName, StateFile, clauth_dir, save_state_in_place,
 };
 
 /// The codex roster and its per-harness slots: the same four fields
@@ -333,8 +333,8 @@ impl CodexState {
     ///
     /// Saves only when the closure changed something: an untouched state
     /// leaves the file's bytes AND mtime alone, so a no-op verb (switching to
-    /// the already-active profile) neither rewrites a hand-edited file
-    /// through this binary's serializer nor bumps the reload fingerprint.
+    /// the already-active profile) never touches the file or bumps the reload
+    /// fingerprint.
     pub(crate) fn update<T>(f: impl FnOnce(&mut CodexState) -> Result<T>) -> Result<T> {
         let lock = StateLock::acquire()?;
         let mut state = Self::load()?;
@@ -350,10 +350,12 @@ impl CodexState {
     /// holds the cross-process state lock, and the only caller is
     /// [`CodexState::update`], which acquired it around the load.
     fn save(&self, _witness: &StateLock) -> Result<()> {
-        mkdir_700(&clauth_dir()?)?;
-        atomic_write_600(&codex_state_path()?, toml::to_string_pretty(self)?)
-            .context("failed to write codex-profiles.toml")
+        save_state_in_place(&codex_state_path()?, self)
     }
+}
+
+impl StateFile for CodexState {
+    const LABEL: &'static str = "codex-profiles.toml";
 }
 
 fn codex_state_path() -> Result<PathBuf> {

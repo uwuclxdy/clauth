@@ -17,7 +17,7 @@ fn split(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u6
 }
 
 /// A merged base carrying transcript-derived (split-bearing) per-day rows — the
-/// shape `merge_topup` hands to [`Ledger::record`]. The rows carry no hourly
+/// shape `merge_topup` hands to [`Ledger::record_covering`]. The rows carry no hourly
 /// buckets (the v1-ledger path).
 fn base_with(days: &[(&str, ModelTokens)]) -> TokenStats {
     let mut b = TokenStats::default();
@@ -80,7 +80,7 @@ fn record_then_apply_survives_transcript_loss() {
     let merged = base_with(&[("2026-06-16", m)]);
 
     let mut ledger = Ledger::default();
-    assert!(ledger.record(&merged, "2026-06-18"));
+    assert!(ledger.record_covering(&merged, "2026-06-18", true));
     assert_eq!(ledger.recorded_through.as_deref(), Some("2026-06-17"));
 
     // Fresh base as if stats-cache is frozen at 06-09 and 06-16's transcripts
@@ -109,9 +109,10 @@ fn record_then_apply_survives_transcript_loss() {
 #[test]
 fn apply_skips_days_covered_by_stats_cache() {
     let mut ledger = Ledger::default();
-    ledger.record(
+    ledger.record_covering(
         &base_with(&[("2026-06-16", split("claude-opus-4-8", 100, 50, 0, 0))]),
         "2026-06-18",
+        true,
     );
 
     let mut fresh = TokenStats::default();
@@ -137,9 +138,10 @@ fn effective_cutoff_takes_the_later_boundary() {
     );
     assert_eq!(l.effective_cutoff(None), None);
 
-    l.record(
+    l.record_covering(
         &base_with(&[("2026-06-16", split("m", 1, 0, 0, 0))]),
         "2026-06-18",
+        true,
     );
     // recorded_through = 06-17.
     assert_eq!(
@@ -166,7 +168,7 @@ fn record_never_stores_today() {
     ]);
 
     let mut l = Ledger::default();
-    assert!(l.record(&merged, today));
+    assert!(l.record_covering(&merged, today, true));
     assert!(l.days.contains_key("2026-06-16"));
     assert!(
         !l.days.contains_key(today),
@@ -179,14 +181,14 @@ fn record_never_stores_today() {
 fn watermark_advances_across_idle_days_and_is_monotonic() {
     let mut l = Ledger::default();
     // A run with no usage still finalizes every day through yesterday.
-    assert!(l.record(&TokenStats::default(), "2026-06-20"));
+    assert!(l.record_covering(&TokenStats::default(), "2026-06-20", true));
     assert_eq!(l.recorded_through.as_deref(), Some("2026-06-19"));
     assert!(l.days.is_empty());
 
     // A later day already at/before the watermark records nothing and never
     // regresses the watermark.
     let old = base_with(&[("2026-06-10", split("m", 5, 0, 0, 0))]);
-    assert!(!l.record(&old, "2026-06-20"));
+    assert!(!l.record_covering(&old, "2026-06-20", true));
     assert!(l.days.is_empty());
     assert_eq!(l.recorded_through.as_deref(), Some("2026-06-19"));
 }
@@ -200,9 +202,10 @@ fn save_load_round_trip() {
     std::fs::create_dir_all(&dir).expect("mkdir .clauth");
 
     let mut l = Ledger::default();
-    l.record(
+    l.record_covering(
         &base_with(&[("2026-06-16", split("claude-opus-4-8", 7, 3, 100, 20))]),
         "2026-06-18",
+        true,
     );
     l.save(&dir);
 
@@ -250,7 +253,7 @@ fn hours_survive_record_save_load_apply() {
     });
 
     let mut ledger = Ledger::default();
-    assert!(ledger.record(&merged, "2026-06-18"));
+    assert!(ledger.record_covering(&merged, "2026-06-18", true));
     // The wire model carries the buckets next to the flat split.
     let wm = &ledger.days["2026-06-16"]["claude-opus-4"];
     let wm_hours = wm.hours.as_ref().expect("hours recorded");
@@ -277,7 +280,7 @@ fn hours_survive_record_save_load_apply() {
     // hours are neither rewritten nor dropped.
     let mut replay = reloaded;
     assert!(
-        !replay.record(&fresh, "2026-06-18"),
+        !replay.record_covering(&fresh, "2026-06-18", true),
         "a day at/before the watermark is never re-recorded"
     );
     let wm = &replay.days["2026-06-16"]["claude-opus-4"];
@@ -327,7 +330,7 @@ fn a_fast_line_split_survives_record_save_load() {
     });
 
     let mut ledger = Ledger::default();
-    assert!(ledger.record(&merged, "2026-06-18"));
+    assert!(ledger.record_covering(&merged, "2026-06-18", true));
     ledger.save(&dir);
 
     let reloaded = Ledger::load(&dir);
@@ -503,7 +506,7 @@ fn v1_ledger_without_hours_loads_applies_and_rerecords() {
         hours: Some(h17),
     });
     let mut ledger = ledger;
-    assert!(ledger.record(&merged, "2026-06-18"));
+    assert!(ledger.record_covering(&merged, "2026-06-18", true));
     ledger.save(&dir);
 
     // On the wire the v1 day still has no `hours` key; the new day does.
@@ -1037,9 +1040,10 @@ fn remap_models_rekeys_only_the_movable_rows_the_corpus_fully_covers() {
 fn a_ledger_this_build_starts_owes_no_remap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut ledger = Ledger::load(dir.path());
-    ledger.record(
+    ledger.record_covering(
         &base_with(&[("2026-06-15", split("claude-opus-5-5", 1, 1, 0, 0))]),
         "2026-06-20",
+        true,
     );
     assert_eq!(ledger.remap_through("2026-06-20"), None);
 }

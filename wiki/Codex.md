@@ -110,7 +110,7 @@ A link onto another profile, or a real file (you logged your own codex back in),
 
 ## Auto-switch
 
-The codex chain is separate from the Claude Code one and lives in `~/.clauth/codex-profiles.toml`, hand-edited: `fallback_chain` in walk order, `wrap_off`, and its own `weekly_switch_threshold` ([Configuration](Configuration#codex-profilestoml)). It is walked with the same rules ([Auto-switch](Auto-Switch#codex)): the active codex profile has to be a chain member, it has to be exhausted (5h past 95%, or the weekly window past the codex file's line) or dead, and the walk takes the next member with headroom, preferring one whose usage was read live. A dead member is one whose chain clauth has quarantined, or whose usage polls keep answering 401 past two forced refreshes.
+The codex chain is separate from the Claude Code one and lives in `~/.clauth/codex-profiles.toml`, hand-edited: `fallback_chain` in walk order, `wrap_off`, and its own `weekly_switch_threshold` ([Configuration](Configuration#codex-profilestoml)); clauth edits the file in place, so comments, key order and any key clauth does not model survive its saves. It is walked with the same rules ([Auto-switch](Auto-Switch#codex)): the active codex profile has to be a chain member, it has to be exhausted (5h past 95%, or the weekly window past the codex file's line) or dead, and the walk takes the next member with headroom, preferring one whose usage was read live. A dead member is one whose chain clauth has quarantined, or whose usage polls keep answering 401 past two forced refreshes.
 
 What differs is when the switch lands. codex reads `auth.json` once at start, so a switch moves the active marker and takes effect at the next `clauth start`; a running session finishes on the account it started with. codex 0.157 and later run every task inside one shared app-server daemon (`codex app-server --managed-daemon`), and `codex resume` reconnects to it, so a switch reaches those tasks only once that daemon restarts: it read the login when it started. When a switch moves clauth's `auth.json` link, clauth checks the codex home whose link it moved (under `CODEX_HOME` when you set one, else under the home a `clauth start` session carries, else `~/.codex`) for a daemon that started at or before the move. A hand switch prints how to restart it (`codex app-server daemon restart`, which stops running tasks' current turn and leaves them resumable); an auto-switch that moves the link off an account the chain judged spent or dead restarts the daemon itself (`clauth: restarted codex's app-server daemon (…)`), one restart at a time. The check needs the daemon's unix control socket, so on Windows clauth neither prints the note nor restarts anything. A stale daemon never writes its old login into the new account's store: codex re-reads `auth.json` before every refresh and refuses on an account mismatch, so it errors once its token expires instead. The daemon log reads `clauth: codex auto-switched to '<name>'. Live at the next codex session`, or `. Restarting codex's app-server daemon so its tasks resume on it` when it restarts one. With `wrap_off = true` and every member spent, the active slot is cleared once the active account itself is at `100%` of its weekly window or past `95%` of its 5h window (`clauth: every codex account is spent. Codex active slot cleared`), and that switch-off is recorded in `codex-profiles.toml`. While the record stands, once a usage reading (fetched by a running daemon or an open TUI, or cached within one refresh interval) shows a chain member's window recovered, the next codex poll re-arms the slot onto the first such member in chain order that is not dead, as an auto-switch with the same log line, and `clauth switch <name>` picks a member by hand before then. A switch that moves the active slot, deleting the active codex profile, or a capture that stores a login ends the record; re-capturing the account the `auth.json` link still follows stores nothing and ends nothing, and a hand edit of `active_profile` does not end it either. An empty slot with no record behind it, such as the one deleting the active codex profile leaves, stays empty until `clauth switch <name>`.
 
@@ -145,7 +145,7 @@ No refresh revives a dead chain; a new login is the only exit, and the browser f
 
 ## Use a usage-limit reset
 
-A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. A Claude Code account's resets are [below](Codex#a-claude-code-account). The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
 
 ```sh
 clauth limit-reset work --list   # the account's resets; spends nothing
@@ -186,6 +186,25 @@ clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reope
 
 Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose outcome stays unknown (no answer, a 5xx, or a reply clauth cannot read or that leaves the outcome open) leaves a record, `--list` names it (``clauth: a usage-limit reset sent at <time> got no answer; run `clauth limit-reset work` again before <time> to re-send it.``), and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. Two runs on one account never spend at once, whichever roster the account is on: a second `clauth limit-reset` on that account prints `clauth: another limit-reset on 'work' is running; waiting for it.` and waits, even while the first sits at its `[y/N]`; it then decides on what the first left, so a record still inside its 10 minutes is offered for a re-send (behind its own `[y/N]` unless `--yes`) instead of spending another reset. `--list` never waits, and neither does a run refused before the lock (no `--yes` on a non-TTY stdin or stdout, no login, a quarantined chain). The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
 
+### A Claude Code account
+
+The samples above are a codex account's. A Claude Code account's resets go through the same command, and a spend uses the grant the server names next, the row `--list` marks `*` and `(used next)`. Each `--list` row opens on the grant's label, printed whole with control characters dropped, and counts the grant's resets the server marks usable now against the ones it still holds, spent ones left out: `1 available` when every one is usable, `0/1 available` when none is, and every row reads 0 while the server's next reset cannot be spent. It then names the windows the grant resets (`5h`, `7d`, `7d opus`, `7d sonnet`, `7d fable`, any other as the server sends it, control characters dropped, cut to 40 cells; `nothing` when it names none), then any state the server gives and `, expires <time>` when the grant ends:
+
+```
+clauth: 'home' has 2 limit resets available.
+    Old reset: 1 available, resets 5h
+  * Weekly reset: 1 available, resets 5h and 7d  (used next)
+    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown
+```
+
+When the server names no next grant, `--list` prints `clauth: no limit resets available on 'home'.`, with the server's reason in parentheses before the period when it gives one (`clauth: no limit resets available on 'home' (no_grant).`). A next grant the server does not mark usable now refuses the spend and uses nothing: `Error: the limit reset 'home' would use next is unavailable (cooldown), so no reset was used`.
+
+A spend's question names the grant, its label cut to 40 cells (an untitled one asks `use a limit reset on 'home'?`) and the same count; short of a limit it adds the most headroom left in a window it resets (`'home' still has 60% of its 7d left.`), and when the server names the weekly reset it closes on `The weekly reset stays <time>.`:
+
+```
+clauth: use the limit reset "Weekly reset" on 'home'? It resets 5h and 7d now and cannot be undone; 1 available on it. [y/N]
+```
+
 ## Managed config
 
 Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file codex lets an administrator use to outrank a session's own flags. A `cli_auth_credentials_store` there other than `"file"` refuses the start, because codex would ignore the session's linked `auth.json`; a `debug.config_lockfile.load_path` refuses it, because codex would replay that lockfile as its whole config and drop the file store; a `sqlite_home` starts the session with a warning, since every profile's state databases then land in that one directory. Both refusals say what to do (`ask whoever manages this machine to remove the key`) and why (`clauth cannot override a managed config`). On macOS codex can also take a managed config from an MDM profile; clauth does not read that one, so a key delivered that way is not caught before the spawn. On Windows codex reads its managed config from inside `CODEX_HOME`, which the session home never holds.
@@ -212,7 +231,7 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 
 | Path | Holds |
 |------|-------|
-| `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold`, and `[ids]` (written by clauth, one per profile; leave it as written) |
+| `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold`, and `[ids]` (written by clauth, one per profile; leave it as written); clauth edits the file in place, so comments, key order and any key clauth does not model survive its saves |
 | `~/.clauth/profiles/<name>/auth.json` | the chain, owner-only, written atomically by clauth and in place by codex through the links |
 | `~/.clauth/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` when you set it |
 | `~/.clauth/profiles/<name>/auth.lkg.json` | the last-known-good copy of the chain |

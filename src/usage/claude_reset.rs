@@ -18,8 +18,8 @@ use serde::Deserialize;
 
 use super::codex_reset::{
     FailureVoice, cap_drawn, quoted_escaped, re_send_deadline, re_send_hint,
-    read_failure as shared_read_failure, read_reply, spend_failure as shared_spend_failure, stamp,
-    trim_padding,
+    read_failure as shared_read_failure, read_reply, read_reply_hinted,
+    spend_failure as shared_spend_failure, stamp, trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
 use super::fetch::{AuthClient, LimitResets};
@@ -131,8 +131,6 @@ pub(crate) struct Grant {
     #[serde(default)]
     label: String,
     #[serde(default)]
-    resets_total: u32,
-    #[serde(default)]
     resets_left: u32,
     #[serde(default)]
     ends_at: Option<String>,
@@ -165,14 +163,14 @@ impl Grant {
         self.ends_at.as_deref()
     }
 
-    /// The server's label, or the generic name; control characters dropped,
-    /// cut to the same 40 the window names use (this text reaches a terminal).
+    /// The server's label whole, or the generic name; control characters
+    /// dropped, since this text reaches a terminal. The prompt cuts it to 40.
     fn label(&self) -> String {
         let label = terminal_safe(&self.label);
         if shows_nothing(&label) {
             "limit reset".to_string()
         } else {
-            cap_drawn(trim_padding(&label), 40)
+            trim_padding(&label).to_string()
         }
     }
 
@@ -199,7 +197,7 @@ impl CedarEmberBody {
 }
 
 /// Parse the `cedar_ember` block off a raw usage body. Test-only: the wire
-/// read ([`read_status_at`]) parses the typed body through [`read_reply`], and
+/// read ([`read_status_at`]) parses the typed body through [`read_reply_hinted`], and
 /// this seam lets tests drive fixture bytes straight into the parser.
 #[cfg(test)]
 pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
@@ -210,7 +208,16 @@ pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
 
 /// GET the account's reset grants. Spends nothing.
 pub(crate) fn read_status_at(url: &str, access_token: &str) -> Result<ResetStatus, ResetCallError> {
-    read_reply::<CedarEmberBody>(
+    read_status_hinted_at(url, access_token).map_err(|(err, _)| err)
+}
+
+/// [`read_status_at`] carrying a non-2xx reply's `retry-after` beside its
+/// error (see [`read_reply_hinted`]), for the scheduler's side read.
+pub(crate) fn read_status_hinted_at(
+    url: &str,
+    access_token: &str,
+) -> Result<ResetStatus, (ResetCallError, Option<Duration>)> {
+    read_reply_hinted::<CedarEmberBody>(
         super::fetch::apply_auth_headers(
             super::fetch::http_agent().get(url),
             access_token,
@@ -362,16 +369,29 @@ pub(crate) fn new_request_id() -> anyhow::Result<String> {
 // ── the operator-facing text ────────────────────────────────────────────────
 
 /// A cleared-window name as the terminal reads it: the short labels Claude
-/// Code's own copy uses, any other name as sent with its control characters
-/// dropped and cut to 40. Shared by `--list` and the TUI's resets row, so the
-/// two surfaces never spell a label apart.
+/// Code's own copy uses, `7d fable` for the weekly window Fable counts into
+/// (the name the usage bars give it), any other name as sent with its control
+/// characters dropped and cut to 40. Shared by `--list` and the TUI's resets
+/// row, so the two surfaces never spell a label apart.
 pub(crate) fn window_label(name: &str) -> String {
     match name {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
         "seven_day_opus" => "7d opus".to_string(),
+        "seven_day_overage_included" => "7d fable".to_string(),
         "seven_day_sonnet" => "7d sonnet".to_string(),
         other => cap_drawn(&terminal_safe(other), 40),
+    }
+}
+
+/// `N available` when a spend can use every reset still held, else
+/// `usable/held available`. Shared by `--list` and the TUI's resets row, so
+/// both count against what is held, never a grant's original size.
+pub(crate) fn available_of(usable: u32, held: u32) -> String {
+    if usable == held {
+        format!("{usable} available")
+    } else {
+        format!("{usable}/{held} available")
     }
 }
 
@@ -528,11 +548,12 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .ends_at
             .as_deref()
             .filter(|e| !shows_nothing(&terminal_safe(e)))
-            .map(|e| format!(", ends {}", stamp(e)))
+            .map(|e| format!(", expires {}", stamp(e)))
             .unwrap_or_default();
         let suffix = if marked { "  (used next)" } else { "" };
-        // The row counts only what a spend would use now: with no spendable
-        // next grant, the header says 0 and every row reads 0 too.
+        // The row counts the grant's resets the server marks usable now,
+        // against the ones it still holds; with no spendable next grant the
+        // header counts none and every row reads 0 too.
         let count = if grant.usable_now && spendable.is_some() {
             grant.resets_left
         } else {
@@ -542,10 +563,10 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .map(|state| format!(", {state}"))
             .unwrap_or_default();
         lines.push(format!(
-            "  {} {}: {count} of {} available, resets {}{tail}{ends}{suffix}",
+            "  {} {}: {}, resets {}{tail}{ends}{suffix}",
             if marked { "*" } else { " " },
             grant.label(),
-            grant.resets_total,
+            available_of(count, grant.resets_left),
             clears_summary(&grant.clears),
         ));
     }
@@ -553,20 +574,21 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
+/// Only the spendable next grant is asked about, so every reset it holds is
+/// usable and the count reads bare.
 pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> String {
     let head = if grant.is_untitled() {
         format!("clauth: use a limit reset on '{name}'?")
     } else {
         format!(
             "clauth: use the limit reset \"{}\" on '{name}'?",
-            grant.label()
+            cap_drawn(&grant.label(), 40)
         )
     };
     let mut prompt = format!(
-        "{head} It resets {} now and cannot be undone; {} of {} available on it.",
+        "{head} It resets {} now and cannot be undone; {} available on it.",
         clears_summary(&grant.clears),
         grant.resets_left,
-        grant.resets_total,
     );
     if !status.at_limit
         && let Some(warning) = not_at_limit_warning(name, grant)

@@ -46,9 +46,9 @@ fn a_grant_list_marks_the_servers_next_grant() {
         describe_grants("cl1", &status(THREE_GRANTS)),
         [
             "clauth: 'cl1' has 2 limit resets available.",
-            "    Old reset: 1 of 1 available, resets 5h",
-            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 1 available, resets 5h",
+            "  * Weekly reset: 1 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     assert_eq!(
@@ -67,19 +67,52 @@ fn a_grant_with_an_end_names_it_after_its_state() {
     );
     let lines = describe_grants("cl1", &status(&body));
     assert!(
-        lines[2].starts_with("  * Weekly reset: 1 of 2 available, resets 5h and 7d, ends "),
+        lines[2].starts_with("  * Weekly reset: 1 available, resets 5h and 7d, expires "),
         "{}",
         lines[2]
     );
     assert!(lines[2].ends_with("  (used next)"), "{}", lines[2]);
 }
 
-/// The server's label is cut to 40 cells on both surfaces that print it.
+/// Each row names its own grant's end: two grants ending at different
+/// instants print two different stamps, so a row never borrows the next
+/// grant's end.
 #[test]
-fn a_long_server_label_is_cut_on_both_surfaces() {
+fn each_grant_row_names_its_own_end() {
+    let old_ends = THREE_GRANTS.replacen(
+        r#""ends_at": null, "clears": ["five_hour"]"#,
+        r#""ends_at": "2027-01-01T00:00:00+00:00", "clears": ["five_hour"]"#,
+        1,
+    );
+    assert_ne!(old_ends, THREE_GRANTS, "the old grant's end applied");
+    let body = old_ends.replacen(
+        r#""ends_at": null, "clears": ["five_hour", "seven_day"]"#,
+        r#""ends_at": "2027-03-09T07:59:00+00:00", "clears": ["five_hour", "seven_day"]"#,
+        1,
+    );
+    assert_ne!(body, old_ends, "the weekly grant's end applied");
+    let old = crate::format::local_stamp(1_798_761_600).expect("stamp");
+    let week = crate::format::local_stamp(1_804_579_140).expect("stamp");
+
+    assert_eq!(
+        describe_grants("cl1", &status(&body)),
+        [
+            "clauth: 'cl1' has 2 limit resets available.".to_string(),
+            format!("    Old reset: 1 available, resets 5h, expires {old}"),
+            format!("  * Weekly reset: 1 available, resets 5h and 7d, expires {week}  (used next)"),
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown".to_string(),
+        ]
+    );
+}
+
+/// `--list` prints the server's label whole; the spend prompt cuts it to 40
+/// cells.
+#[test]
+fn a_long_server_label_is_whole_in_the_list_and_cut_in_the_prompt() {
+    let long = "x".repeat(500);
     let body = THREE_GRANTS.replacen(
         r#""label": "Weekly reset""#,
-        &format!(r#""label": "{}""#, "x".repeat(500)),
+        &format!(r#""label": "{long}""#),
         1,
     );
     let status = status(&body);
@@ -87,10 +120,49 @@ fn a_long_server_label_is_cut_on_both_surfaces() {
     let cut = format!("{}...", "x".repeat(37));
     assert!(prompt.contains(&format!("\"{cut}\" on 'cl1'")), "{prompt}");
     let lines = describe_grants("cl1", &status);
+    assert_eq!(
+        lines[2],
+        format!("  * {long}: 1 available, resets 5h and 7d  (used next)")
+    );
+}
+
+/// A whole label still drops the blanks around it on both surfaces.
+#[test]
+fn a_padded_server_label_prints_trimmed() {
+    let body = THREE_GRANTS.replacen(
+        r#""label": "Weekly reset""#,
+        r#""label": "  Weekly reset  ""#,
+        1,
+    );
+    assert_ne!(body, THREE_GRANTS, "the padded label applied");
+    let status = status(&body);
+    assert_eq!(
+        describe_grants("cl1", &status)[2],
+        "  * Weekly reset: 1 available, resets 5h and 7d  (used next)"
+    );
+    let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
     assert!(
-        lines[2].starts_with(&format!("  * {cut}: 1 of 2")),
-        "{}",
-        lines[2]
+        prompt.starts_with("clauth: use the limit reset \"Weekly reset\" on 'cl1'?"),
+        "{prompt}"
+    );
+}
+
+/// The window Fable counts into reads `7d fable` on every reset surface, the
+/// name the usage bars and MCP `profiles` give the same window.
+#[test]
+fn the_fable_weekly_reads_7d_fable() {
+    assert_eq!(window_label("seven_day_overage_included"), "7d fable");
+    let body = THREE_GRANTS.replacen(
+        r#""clears": ["five_hour", "seven_day"]"#,
+        r#""clears": ["seven_day_overage_included"]"#,
+        1,
+    );
+    let status = status(&body);
+    let prompt = spend_prompt("cl1", &status, status.next_grant().expect("a next grant"));
+    assert!(prompt.contains("It resets 7d fable now"), "{prompt}");
+    assert_eq!(
+        describe_grants("cl1", &status)[2],
+        "  * Weekly reset: 1 available, resets 7d fable  (used next)"
     );
 }
 
@@ -101,7 +173,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     assert_eq!(
         spend_prompt("cl1", &at_limit, grant),
         "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
-         and cannot be undone; 1 of 2 available on it."
+         and cannot be undone; 1 available on it."
     );
 
     let early = status(
@@ -117,7 +189,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     assert_eq!(
         spend_prompt("cl1", &early, grant),
         "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
-         and cannot be undone; 1 of 2 available on it. 'cl1' still has 60% of its 7d left.",
+         and cannot be undone; 1 available on it. 'cl1' still has 60% of its 7d left.",
         "short of a limit, the warning names the cleared window the reset throws the most \
          headroom away on"
     );
@@ -128,7 +200,7 @@ fn the_prompt_names_the_grant_and_what_it_clears() {
     assert_eq!(
         spend_prompt("cl1", &untitled, grant),
         "clauth: use a limit reset on 'cl1'? It resets 5h and 7d now and cannot be undone; \
-         1 of 2 available on it."
+         1 available on it."
     );
 }
 
@@ -144,7 +216,7 @@ fn the_prompt_names_the_weekly_reset_it_leaves_in_place() {
     assert!(
         prompt.starts_with(
             "clauth: use the limit reset \"Weekly reset\" on 'cl1'? It resets 5h and 7d now \
-             and cannot be undone; 1 of 2 available on it. The weekly reset stays "
+             and cannot be undone; 1 available on it. The weekly reset stays "
         ),
         "{prompt}"
     );
@@ -380,9 +452,9 @@ fn a_grant_list_with_no_next_grant_still_lists_every_grant() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    Old reset: 0 of 1 available, resets 5h",
-            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 0/1 available, resets 5h",
+            "    Weekly reset: 0/1 available, resets 5h and 7d",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     assert_eq!(status(&body).usable_resets(), 0);
@@ -401,9 +473,9 @@ fn a_next_grant_id_naming_no_listed_grant_counts_nothing() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    Old reset: 0 of 1 available, resets 5h",
-            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 0/1 available, resets 5h",
+            "    Weekly reset: 0/1 available, resets 5h and 7d",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     assert_eq!(status(&body).usable_resets(), 0);
@@ -423,9 +495,9 @@ fn a_next_grant_the_server_will_not_spend_counts_nothing() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: 'cl1' has 0 limit resets available.",
-            "    Old reset: 0 of 1 available, resets 5h",
-            "    Weekly reset: 0 of 2 available, resets 5h and 7d",
-            "  * limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown  \
+            "    Old reset: 0/1 available, resets 5h",
+            "    Weekly reset: 0/1 available, resets 5h and 7d",
+            "  * limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown  \
              (used next)",
         ]
     );
@@ -447,9 +519,9 @@ fn a_next_grant_clauth_will_not_send_counts_nothing() {
         describe_grants("cl1", &status(&body)),
         [
             "clauth: 'cl1' has 0 limit resets available.",
-            "    Old reset: 0 of 1 available, resets 5h",
-            "  * Weekly reset: 0 of 2 available, resets 5h and 7d  (used next)",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+            "    Old reset: 0/1 available, resets 5h",
+            "  * Weekly reset: 0/1 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
         ]
     );
     assert_eq!(status(&body).usable_resets(), 0);
@@ -470,8 +542,8 @@ fn a_null_or_absent_reset_block_reads_as_no_grant() {
 }
 
 /// Server text reaches the `[y/N]` line and `--list` without format
-/// characters (a right-to-left override would reorder the confirm line) and
-/// cut to a bounded length.
+/// characters (a right-to-left override would reorder the confirm line), and
+/// a server reason cut to a bounded length.
 #[test]
 fn server_text_drops_format_characters_and_is_bounded() {
     let long = "x".repeat(500);
@@ -573,7 +645,6 @@ fn a_blank_server_reason_reads_as_no_reason() {
         grants: vec![Grant {
             id: "g".to_string(),
             label: String::new(),
-            resets_total: 1,
             resets_left: 1,
             ends_at: None,
             clears: vec!["five_hour".to_string(), "seven_day_blue".to_string()],
@@ -588,7 +659,7 @@ fn a_blank_server_reason_reads_as_no_reason() {
         describe_grants("cl1", &status),
         [
             "clauth: no limit resets available on 'cl1'.",
-            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue",
+            "    limit reset: 0/1 available, resets 5h and seven_day_blue",
         ]
     );
     assert_eq!(
@@ -629,7 +700,6 @@ fn a_blank_stamp_reads_as_no_stamp() {
     let next = Grant {
         id: "g".to_string(),
         label: String::new(),
-        resets_total: 1,
         resets_left: 1,
         ends_at: Some("\u{200b}".to_string()),
         clears: vec!["five_hour".to_string()],
@@ -647,7 +717,7 @@ fn a_blank_stamp_reads_as_no_stamp() {
         describe_grants("cl1", &status),
         [
             "clauth: 'cl1' has 1 limit reset available.",
-            "  * limit reset: 1 of 1 available, resets 5h  (used next)",
+            "  * limit reset: 1 available, resets 5h  (used next)",
         ]
     );
 
@@ -670,7 +740,6 @@ fn a_blank_stamp_reads_as_no_stamp() {
         grants: vec![Grant {
             id: "g".to_string(),
             label: String::new(),
-            resets_total: 1,
             resets_left: 1,
             ends_at: None,
             clears: vec!["five_hour".to_string()],
@@ -687,6 +756,44 @@ fn a_blank_stamp_reads_as_no_stamp() {
     assert!(
         !prompt.contains("weekly reset stays"),
         "a blank weekly stamp prints no clause: {prompt}"
+    );
+    assert!(
+        prompt.ends_with("cannot be undone; 1 available on it."),
+        "a grant with every reset left reads its bare count: {prompt}"
+    );
+}
+
+/// The Fable weekly window a grant clears reads as the usage bars name it,
+/// in the list row and in the spend prompt.
+#[test]
+fn a_fable_window_grant_reads_7d_fable() {
+    let status = ResetStatus {
+        grants: vec![Grant {
+            id: "g".to_string(),
+            label: "Fable reset".to_string(),
+            resets_left: 1,
+            ends_at: None,
+            clears: vec!["seven_day_overage_included".to_string()],
+            paused: false,
+            usable_now: true,
+            percent_used: std::collections::HashMap::new(),
+            unavailable_reason: None,
+        }],
+        next_grant_id: Some("g".to_string()),
+        at_limit: true,
+        ..ResetStatus::default()
+    };
+    assert_eq!(
+        describe_grants("cl1", &status),
+        [
+            "clauth: 'cl1' has 1 limit reset available.",
+            "  * Fable reset: 1 available, resets 7d fable  (used next)",
+        ]
+    );
+    assert_eq!(
+        spend_prompt("cl1", &status, status.next_grant().expect("a next grant")),
+        "clauth: use the limit reset \"Fable reset\" on 'cl1'? It resets 7d fable now and \
+         cannot be undone; 1 available on it."
     );
 }
 
@@ -764,7 +871,6 @@ fn usable_resets_saturates_instead_of_overflowing() {
     let grant = |id: &str, left: u32, usable_now: bool| Grant {
         id: id.to_string(),
         label: String::new(),
-        resets_total: left,
         resets_left: left,
         ends_at: None,
         clears: vec![],
@@ -803,7 +909,6 @@ fn banked_resets_counts_unusable_grants_and_saturates() {
     let grant = |id: &str, left: u32, usable_now: bool| Grant {
         id: id.to_string(),
         label: String::new(),
-        resets_total: left,
         resets_left: left,
         ends_at: None,
         clears: vec![],
@@ -841,7 +946,6 @@ fn the_list_count_line_saturates_like_the_side_read() {
     let grant = |id: &str, left: u32, usable_now: bool| Grant {
         id: id.to_string(),
         label: String::new(),
-        resets_total: left,
         resets_left: left,
         ends_at: None,
         clears: vec![],

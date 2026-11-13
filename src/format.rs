@@ -617,9 +617,10 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
-/// The CLI switch over an unsaved live login whose outgoing account runs on a
+/// A switch over an unsaved live login whose outgoing account runs on a
 /// long-lived token: that account's store cannot take an OAuth login, so the
-/// switch does not offer to save it there.
+/// CLI switch does not offer to save it there and the headless switch's
+/// `Overwrite` default (the plugin, the API) refuses before capturing.
 pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
     format!(
         "'{name}' runs on a long-lived token and cannot hold this login; save it as another \

@@ -416,13 +416,14 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
 /// How long `--replace` (and the TUI's `stop daemon`) waits for a terminated
 /// holder's flock to auto-release on death before it escalates (SIGTERM →
-/// SIGKILL on unix, another `/F` on Windows). A holder signalled mid token
-/// spend waits that spend out ([`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND))
-/// while its children stop inside `DAEMON_STOP_BUDGET` plus their answer
-/// grace, so the force kill must wait past the longer of the two plus one
-/// poll, or it lands between the token endpoint's answer and the save. This
-/// derives that longer term (the drain) plus five seconds of headroom; the
-/// children's side is pinned beside its own constants.
+/// SIGKILL on unix, another `/F` on Windows). A signalled holder's drain
+/// waits out its token spend and its tick thread's exit save, together
+/// inside [`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND), while its children
+/// stop inside `DAEMON_STOP_BUDGET` plus their answer grace, so the force
+/// kill must wait past the longer of the two plus one poll, or it lands
+/// between the token endpoint's answer and the save. This derives that
+/// longer term (the drain) plus five seconds of headroom; the children's
+/// side is pinned beside its own constants.
 pub(super) const REPLACE_WAIT: Duration =
     super::SPEND_DRAIN_BOUND.saturating_add(Duration::from_secs(5));
 const _: () = assert!(

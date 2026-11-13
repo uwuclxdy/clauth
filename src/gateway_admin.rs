@@ -145,10 +145,16 @@ pub(crate) struct PoolProvider {
 }
 
 /// One pool account's fields the Overview and Usage panes render. Every other
-/// field shunt reports is ignored. `paused` defaults: shunt adds the key in
-/// v0.52.0, so a row from the v0.48.0 floor lacks it and must read as `false`
-/// (unpaused) instead of failing the whole listing; every `Option` field
-/// parses an absent key as `None` on its own.
+/// field shunt reports is ignored, `requests_succeeded` included. `paused`
+/// defaults: shunt adds the key in v0.52.0, so a row from the v0.48.0 floor
+/// lacks it and must read as `false` (unpaused) instead of failing the whole
+/// listing; every `Option` field parses an absent key as `None` on its own.
+/// The request counters (`requests_attempted`, `requests_failed`,
+/// `requests_cancelled`, counted since shunt's process start or the account's
+/// add, whichever is later) and
+/// `mean_latency_ms` arrive in v0.61.0, so an older row reads `None` for all
+/// four; `mean_latency_ms` is also `null` until an attempt got response
+/// headers.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct PoolAccount {
     pub(crate) name: String,
@@ -167,6 +173,10 @@ pub(crate) struct PoolAccount {
     pub(crate) reset_7d_oi: Option<u64>,
     pub(crate) plan: Option<String>,
     pub(crate) status: Option<String>,
+    pub(crate) requests_attempted: Option<u64>,
+    pub(crate) requests_failed: Option<u64>,
+    pub(crate) requests_cancelled: Option<u64>,
+    pub(crate) mean_latency_ms: Option<f64>,
 }
 
 // ── names ───────────────────────────────────────────────────────────────────

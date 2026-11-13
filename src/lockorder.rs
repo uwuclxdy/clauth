@@ -338,6 +338,11 @@ pub(crate) mod rank {
         /// one assignment, and the line it decides on is written after the
         /// guard drops.
         LastOrigins = 1905;
+        /// The live terminal tickets (`daemon::api::ticket::Tickets`). A true
+        /// leaf: every acquisition does in-memory work only (a sweep, a count,
+        /// a removal, an insert), and every check, store read, herdr call and
+        /// line that follows a removal runs after the guard drops.
+        TerminalTickets = 1906;
         /// The per-account `limit-reset` spend flock
         /// (`usage::limit_reset_pending::LimitResetLock`,
         /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend

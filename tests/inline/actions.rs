@@ -6135,6 +6135,51 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// A comment written above an account in `profiles.toml` describes that
+/// account: after a rename it stays on the new name, never on a neighbour.
+#[test]
+fn a_rename_keeps_the_comment_above_the_account_in_both_lists() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in ["a", "b"] {
+        create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+            None,
+        )
+        .expect("create profile");
+    }
+    let path = home.home().join(".clauth").join("profiles.toml");
+    std::fs::write(
+        &path,
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"a\",\n  \"b\",\n]\n",
+    )
+    .expect("hand edit");
+    config.state = crate::profile::load_app_state().expect("load");
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile::ProfileName::from("z"),
+        &rotation_guard("a"),
+    )
+    .expect("rename");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"z\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"z\",\n  \"b\",\n]\n"
+    );
+}
+
 /// A profile held by a live `clauth start` session must not be renamed — the
 /// rename moves the whole profile directory, which holds the session's runtime
 /// tree, markers and env paths, and nothing rekeys the live-session registry
@@ -11419,6 +11464,7 @@ fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_m
         crate::usage::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
 }
@@ -20129,7 +20175,8 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
     let (_, out) = through_handle(stale, |h| switch_profile_reconciled(h, &b, Some(&a)));
     assert_eq!(
         out.expect_err("the switch refuses").to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+        "'a' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
     );
     assert_eq!(
         live_regular_refresh().as_deref(),
@@ -20152,6 +20199,47 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
             .active_profile,
         Some(a),
         "nothing switched"
+    );
+}
+
+/// A capture that writes nothing refuses as the generic unsaved-login text
+/// instead of reporting success: the live login and both stores stay, so the
+/// relink riding on it never drops the login. Driven at the helper level with
+/// a stale config naming `a` while disk names `b`; no caller passes such a
+/// state (the reconciled arms mirror the disk marker under their hold first,
+/// the TUI arm runs under `while_disk_names_active`), so this post-check has
+/// no caller-level pin.
+#[test]
+fn a_capture_whose_sink_cannot_land_refuses_as_unsaved() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut stale = crate::profile::load_config().expect("stale read");
+    assert_eq!(
+        stale.state.active_profile.as_ref(),
+        Some(&a),
+        "fixture: the copy names a"
+    );
+    peer_switches_to(&b);
+    relogin_live("y5");
+    let err = crate::actions::force_capture_live_login(&mut stale)
+        .expect_err("the capture refuses rather than report success");
+    assert_eq!(
+        err.to_string(),
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(store_refresh("a").as_deref(), Some("a"), "a's store");
+    assert_eq!(store_refresh("b").as_deref(), Some("b"), "b's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-y5"),
+        "the live login stays"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(b),
+        "disk keeps b active"
     );
 }
 
@@ -20920,6 +21008,134 @@ fn a_switch_off_a_long_lived_account_never_offers_to_save_into_it() {
             "Error: 'a' runs on a long-lived token and cannot hold this login; save it as \
              another account first: `clauth capture <new name>`"
         )
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
+/// A headless switch whose `Overwrite` default lands on an outgoing account
+/// running on a long-lived token refuses with the long-lived line — that
+/// account's store cannot hold the login, the same sentence the CLI's prompt
+/// path refuses with — never the generic unsaved-login text, and changes
+/// nothing.
+#[test]
+fn a_headless_overwrite_off_a_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &b,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
+/// A headless switch whose `Overwrite` default lands on the already-active
+/// account running on a long-lived token refuses with the long-lived line —
+/// that account's store cannot hold the login — never the generic
+/// unsaved-login text, and changes nothing.
+#[test]
+fn a_headless_overwrite_onto_the_active_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, _) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &a,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
     );
     assert_eq!(
         store_refresh("a").as_deref(),

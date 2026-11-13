@@ -1,8 +1,9 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::daemon::LeaseTicket;
 use crate::lockorder::{RankedMutex, rank};
@@ -242,11 +243,16 @@ pub(crate) struct LegKey {
 /// plus the ladder deferral baked into it.
 pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<LegKey, FetchStamp>, rank::LastFetched>>;
 
-/// One profile's consecutive-failure counters. Both ladder off
-/// [`rate_limit_backoff_ms`] and both clear on the next live fetch, but they stay
+/// One profile's poll-health record. The two counters both ladder off
+/// [`rate_limit_backoff_ms`] and clear on the next live fetch, but they stay
 /// separate counters because every other reader means only one of them: a 429
 /// streak feeds [`is_stuck_rate_limited`], the auto-switch freshness bypass and
-/// `status.json`'s `stale`, none of which a refresh failure may claim.
+/// `status.json`'s `stale`, none of which a refresh failure may claim. The mark
+/// beside them is no counter: it is set by an attempt this instance sends — a
+/// `/usage` fetch, a token rotation or a usage probe answer other than the
+/// organization refusal — that serves no live body. A live body or a stand-down
+/// tick clears it; an organization refusal neither sets nor clears it, the
+/// `/profile` identity request never counts, and it ladders nothing.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct StreakCounts {
     /// Consecutive 429s from `/usage`.
@@ -255,6 +261,15 @@ pub(crate) struct StreakCounts {
     /// token is dead ([`crate::oauth::RefreshError::Transient`]). A confirmed
     /// dead token quarantines instead and carries its own, wider backoff.
     pub(crate) refresh_fail: u32,
+    /// Set by an attempt this instance sends for this account — a `/usage`
+    /// fetch, a token rotation or a usage probe answer other than the
+    /// organization refusal — that serves no live body. Cleared by the next live
+    /// body and by a stand-down tick; an organization refusal neither sets nor
+    /// clears it, and the `/profile` identity request never counts. Not a ladder
+    /// axis: the usage pane's skipped-spent guard reads it so a failed fetch
+    /// keeps its `Cached` pill where a seeded `Cached` (a boot seed, a
+    /// stand-down hydrate) falls through to `[ spent ]`.
+    pub(crate) last_fetch_failed: bool,
 }
 
 /// Per-profile poll-health streaks, driving exponential backoff in
@@ -660,6 +675,13 @@ pub(crate) struct ProfileActivityState {
     third_party_late: u32,
     codex_late: u32,
     claude_resets_late: u32,
+    /// The scheduler deliberately publishes no countdown for this leg this tick
+    /// (a spent account under `refresh_spent_accounts` off, a suppressed dead
+    /// credential, a selected leg on no work list), so a display surface must
+    /// not read the absent deadline as a stuck worker's. Re-published whole
+    /// every tick beside the countdowns.
+    oauth_blanked: bool,
+    third_party_blanked: bool,
 }
 
 impl ProfileActivityState {
@@ -700,6 +722,16 @@ impl ProfileActivityState {
         }
     }
 
+    fn blanked(&self, leg: FetchLeg) -> bool {
+        match leg {
+            FetchLeg::OAuth => self.oauth_blanked,
+            FetchLeg::ThirdParty => self.third_party_blanked,
+            // No site blanks these legs: the codex side read owns no row, and
+            // the banked-reset read leaves the poll's own countdown alone.
+            FetchLeg::Codex | FetchLeg::ClaudeResets => false,
+        }
+    }
+
     /// Raise `leg`'s fetch mark, unless that leg's worker was left running late:
     /// the partition starts no other worker there, so the mark is the late
     /// worker's own, and its drain already said it failed.
@@ -716,9 +748,13 @@ impl ProfileActivityState {
             .unwrap_or(ProfileActivity::Idle)
     }
 
-    /// Nothing is recorded for the account, so its row can go.
+    /// Nothing is recorded for the account, so its row can go. A blanked
+    /// countdown IS recorded (the renderer reads it), so its state stays.
     fn is_idle(&self) -> bool {
-        self.is_settled() && self.claude_resets_late == 0
+        self.is_settled()
+            && self.claude_resets_late == 0
+            && !self.oauth_blanked
+            && !self.third_party_blanked
     }
 
     /// Nothing a switch or a rotation of the account has to wait for. A
@@ -1582,6 +1618,14 @@ fn tick_seam_reached(seam: TickSeam) {
 /// The rotation runs under a [`SchedulerSpend`] claim held through the land of
 /// the minted pair; a refusing `spend_gate` (the shutdown flag set, or the
 /// tick's lease ticket spent) bails unrotated, nothing sent.
+///
+/// The outcome carries [`FetchOutcome::fetch_failed`] when this tick sent a
+/// request for the account and served no live body. Only three sends count: the
+/// pre-rotation `/usage` fetch, the proactive plain poll in `bail_unrotated`,
+/// and the token exchange. A `/profile` identity request (an adopt resolving
+/// which account a pair belongs to) sends nothing counted, so a tick that only
+/// adopted never marks; a reactive bail after the pre-rotation fetch is marked,
+/// because that fetch already sent.
 fn fetch_with_rotation<'g>(
     config: &crate::profile::ConfigHandle,
     entry: &TokenEntry,
@@ -1590,7 +1634,38 @@ fn fetch_with_rotation<'g>(
     activity: &ActivityStore,
     spend_gate: impl Into<SpendGate<'g>>,
 ) -> FetchOutcome {
-    let spend_gate = spend_gate.into();
+    let sent = Cell::new(false);
+    let outcome = fetch_with_rotation_inner(
+        config,
+        entry,
+        prev_plan,
+        refetch,
+        activity,
+        spend_gate.into(),
+        &sent,
+    );
+    if sent.get() && !outcome.from_fetch {
+        outcome.with_fetch_failed()
+    } else {
+        outcome
+    }
+}
+
+/// [`fetch_with_rotation`]'s body. `sent` records that this tick sent a request
+/// of the account's own — the `/usage` fetch or the token rotation the rule
+/// counts — because every non-live outcome after one is a failed attempt. Each
+/// path sets it at its FIRST request; every later request in the same tick
+/// follows one of those, so a set per call would only record the same tick
+/// twice.
+fn fetch_with_rotation_inner<'g>(
+    config: &crate::profile::ConfigHandle,
+    entry: &TokenEntry,
+    prev_plan: Option<PlanInfo>,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+    spend_gate: SpendGate<'g>,
+    sent: &Cell<bool>,
+) -> FetchOutcome {
     let name = &entry.name;
     let access_token = entry.access_token.as_str();
     let refresh_token = entry.refresh_token.as_deref();
@@ -1658,6 +1733,7 @@ fn fetch_with_rotation<'g>(
             Some(activity),
             &mut profile_fetch,
         );
+        sent.set(true);
         // Read the clock AFTER the fetch resolves — `fetch_raw` is a blocking
         // HTTP round-trip, so reading it earlier would classify a token whose
         // expiry falls inside that window against a stale `now`. Read once,
@@ -1698,14 +1774,16 @@ fn fetch_with_rotation<'g>(
     // the refresh race must never cost a live usage poll.
     let bail_unrotated = |profile_fetch: &mut crate::usage::ProfileFetchDecision| {
         if proactive {
-            match fetch_raw(
+            let result = fetch_raw(
                 name,
                 access_token,
                 prev_plan.clone(),
                 false,
                 Some(activity),
                 profile_fetch,
-            ) {
+            );
+            sent.set(true);
+            match result {
                 Ok(info) => FetchOutcome::live(name, info, None).with_profile_fetch(profile_fetch),
                 Err(FetchError::RateLimited { retry_after, plan }) => {
                     FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
@@ -1716,6 +1794,9 @@ fn fetch_with_rotation<'g>(
                     .with_profile_fetch(profile_fetch),
             }
         } else {
+            // Reactive: the plain fetch above already ran and was refused (a
+            // 401, or a 429 on a clock-expired token), so this bail's failure
+            // mark rides that tick's request.
             bail_cached(profile_fetch)
         }
     };
@@ -1838,6 +1919,8 @@ fn fetch_with_rotation<'g>(
     run_claimed_rotation_hook(name);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
+    // The exchange is this tick's request: the retry below follows it.
+    sent.set(true);
     let rotation = crate::oauth::settle_refresh_answer(
         config,
         name,
@@ -1992,6 +2075,14 @@ struct FetchOutcome {
     /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
+    /// This tick sent a request for the account (a `/usage` fetch, a token
+    /// rotation, or a usage probe answered with anything but the organization
+    /// refusal) and served no live body. Folded into the profile's
+    /// `last_fetch_failed` mark by [`apply_outcome`] -> [`update_streaks`]; a
+    /// live body or a stand-down tick clears the mark, and a tick that sent
+    /// nothing never carries this flag.
+    /// Render-only — no cadence or backoff reads it.
+    fetch_failed: bool,
     /// A rotation's persist refused because the store holds no login any more
     /// (a logout landed mid-rotation): the drain drops this profile's
     /// `TokenList` entry rather than poll one more tick on a gone login.
@@ -2033,6 +2124,7 @@ impl FetchOutcome {
             from_headers: false,
             retry_after: None,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             oauth_identity: crate::usage::OAuthIdentity::default(),
@@ -2068,6 +2160,12 @@ impl FetchOutcome {
         self
     }
 
+    /// Mark this outcome as a tick that sent a request and served no live body.
+    fn with_fetch_failed(mut self) -> Self {
+        self.fetch_failed = true;
+        self
+    }
+
     /// Mark this outcome as carrying a refused persist whose store holds no
     /// login: the drain drops the profile's `TokenList` entry.
     fn with_login_gone(mut self) -> Self {
@@ -2093,6 +2191,7 @@ impl FetchOutcome {
             from_headers: false,
             retry_after,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             oauth_identity: crate::usage::OAuthIdentity::default(),
@@ -3334,34 +3433,38 @@ fn deadline_spread(name: &ProfileName, now: EpochMs, interval_ms: u64) -> Interv
     IntervalMs::from_millis(h.finish() % span)
 }
 
-/// Update `name`'s failure counters from a fetch `status` (plus whether its
-/// refresh leg just failed transiently), returning the post-update counts.
-/// `Fresh` clears both (a live body breaks the storm). Otherwise `RateLimited`
-/// bumps the 429 axis and a transient refresh failure bumps its own; a status
-/// that says nothing about either — a network-blip `Cached`/`Failed` mid-storm —
-/// leaves both as is so the ramp is not reset. Leaf lock, taken and released
-/// before the caller writes `last_fetched`/`status`.
+/// Update `name`'s failure records from a fetch `status` (plus whether its
+/// refresh leg just failed transiently and whether the attempt served no live
+/// body), returning the post-update counts. `Fresh` clears all of it (a live
+/// body breaks the storm). Otherwise `RateLimited` bumps the 429 axis and a
+/// transient refresh failure bumps its own; `fetch_failed` sets the
+/// `last_fetch_failed` mark. A status that says nothing about any of them — a
+/// seeded `Cached`/`Failed` that rode no attempt — leaves the entry as is so the
+/// ramp is not reset. Leaf lock, taken and released before the caller writes
+/// `last_fetched`/`status`.
 fn update_streaks(
     streaks: &PollStreaks,
     name: &ProfileName,
     status: FetchStatus,
     refresh_failed: bool,
+    fetch_failed: bool,
 ) -> StreakCounts {
     let Ok(mut m) = streaks.lock() else {
         return StreakCounts::default();
     };
-    // A live body clears BOTH axes: whatever went wrong, this profile is serving
-    // again. That also covers the preemptive-rotation case, where a refresh can
-    // fail while the still-valid access token fetches fine — nothing is degraded
-    // yet, so nothing should ladder or light up the row.
+    // A live body clears both axes AND the failure mark: whatever went wrong,
+    // this profile is serving again. That also covers the preemptive-rotation
+    // case, where a refresh can fail while the still-valid access token fetches
+    // fine — nothing is degraded yet, so nothing should ladder or light up the
+    // row.
     if matches!(status, FetchStatus::Fresh) {
         m.remove(name.as_str());
         return StreakCounts::default();
     }
     let rate_limited = matches!(status, FetchStatus::RateLimited);
-    if !rate_limited && !refresh_failed {
-        // Says nothing about either axis — leave both counters (and, when this
-        // profile has none, the empty map) untouched.
+    if !rate_limited && !refresh_failed && !fetch_failed {
+        // Says nothing about either axis or the mark — leave the entry (and,
+        // when this profile has none, the empty map) untouched.
         return m.get(name.as_str()).copied().unwrap_or_default();
     }
     let counts = m.entry(name.to_string()).or_default();
@@ -3370,6 +3473,9 @@ fn update_streaks(
     }
     if refresh_failed {
         counts.refresh_fail = counts.refresh_fail.saturating_add(1);
+    }
+    if fetch_failed {
+        counts.last_fetch_failed = true;
     }
     *counts
 }
@@ -3722,6 +3828,7 @@ fn apply_outcome_flagged(
         &outcome.name,
         outcome.status,
         outcome.refresh_failed,
+        outcome.fetch_failed,
     );
     let defer = next_slot_deferral(
         rate_limited,
@@ -4035,14 +4142,34 @@ pub(crate) fn try_seed_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
+    try_seed_cache_status(store, status, last_fetched, name, now, interval_ms, None)
+}
+
+/// [`try_seed_cache`] with the status its write carries overridden: the
+/// stand-down hydrate passes the durable dead-credential verdict so it lands
+/// in the same insert the cache-derived status would, never a second write a
+/// reader could land between.
+fn try_seed_cache_status(
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+    now: u64,
+    interval_ms: u64,
+    status_override: Option<FetchStatus>,
+) -> bool {
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::OAuth);
     let Some((info, clock, fetch_status)) =
         load_cache_seed(name, interval_ms, now, usage_cache_clock, |n| {
             load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE)
         })
     else {
+        // A refused name keeps its verdict even where the cache yields no
+        // body to seed, written in this same pass.
+        record_verdict(status, name, status_override);
         return false;
     };
+    let fetch_status = status_override.unwrap_or(fetch_status);
     // A plan-only body (a login plan seed, or a cold fill) carries a plan, no
     // windows and no `fetched_at`: there is no `/usage` reading to resume, so
     // the seed fills the store alone and leaves the OAuth cadence unstamped —
@@ -4063,6 +4190,10 @@ pub(crate) fn try_seed_cache(
         s.insert(name.to_string(), info);
     }
     if plan_only {
+        // A plan-only body writes no status, but a refused name
+        // keeps its verdict: the stamp is the cadence's, the verdict the
+        // credential's, and this pass must carry it in its own write.
+        record_verdict(status, name, status_override);
         return true;
     }
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
@@ -4124,6 +4255,36 @@ pub(crate) fn seed_third_party_name(
     now: u64,
     interval_ms: u64,
 ) {
+    seed_third_party_name_status(
+        store,
+        status,
+        last_fetched,
+        name,
+        scheduled,
+        now,
+        interval_ms,
+        None,
+    );
+}
+
+/// [`seed_third_party_name`] with the status its write carries overridden:
+/// the stand-down hydrate passes the durable dead-credential verdict so it
+/// lands in the same insert the cache-derived status would, never a second
+/// write a reader could land between.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the seed writes three stores and carries its schedule, clock and verdict inputs"
+)]
+fn seed_third_party_name_status(
+    store: &ThirdPartyUsageStore,
+    status: &ThirdPartyStatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+    scheduled: bool,
+    now: u64,
+    interval_ms: u64,
+    status_override: Option<FetchStatus>,
+) {
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::ThirdParty);
     let mtime_of = |n: &ProfileName| profile_cache_mtime_ms(n, THIRD_PARTY_CACHE_FILE);
     let Some((copy, mtime, mtime_status)) = load_cache_seed(
@@ -4133,6 +4294,9 @@ pub(crate) fn seed_third_party_name(
         mtime_of,
         crate::profile_cache::load_third_party_copy,
     ) else {
+        // A refused name keeps its verdict even where the cache yields no
+        // copy to seed (an unparseable file), written in this same pass.
+        record_verdict(status, name, status_override);
         return;
     };
     // The status claims what the walk may act on: a proxy copy's chain windows
@@ -4143,6 +4307,7 @@ pub(crate) fn seed_third_party_name(
         now.checked_sub(chain)
             .map_or(FetchStatus::Cached, |_| status_at(chain, now, interval_ms))
     });
+    let fetch_status = status_override.unwrap_or(fetch_status);
     let written = scheduled.then(|| copy.written_ms(mtime, now));
     let stats = copy.stats;
     #[cfg(test)]
@@ -4172,6 +4337,20 @@ pub(crate) fn seed_third_party_name(
         if let Ok(mut st) = status.lock() {
             st.insert(name.to_string(), fetch_status);
         }
+    }
+}
+
+/// Record a dead-credential verdict in the seed pass's own status write: a
+/// reader between two writes could see the account as fresh or cached.
+fn record_verdict<R: crate::lockorder::Rank>(
+    status: &Arc<RankedMutex<HashMap<String, FetchStatus>, R>>,
+    name: &ProfileName,
+    verdict: Option<FetchStatus>,
+) {
+    if let Some(verdict) = verdict
+        && let Ok(mut st) = status.lock()
+    {
+        st.insert(name.to_string(), verdict);
     }
 }
 
@@ -4766,23 +4945,32 @@ pub(crate) fn collect_oauth_seed_names(
 /// The guard is held across the filter deliberately: the closure takes no other
 /// lock, so there is no ordering hazard for `lockorder` to police, and cloning
 /// the map to avoid it would copy state this loop is the only reader of.
+/// Returns the kept snapshot plus the legs each dropped entry's countdown was
+/// deliberately blanked for (the `publish_blanked_countdowns` input).
 fn filter_suppressed(
     suppressed_auth_expired: &SuppressedAuthExpiredStore,
     snapshot: Vec<ThirdPartyEntry>,
-) -> Vec<ThirdPartyEntry> {
+) -> (Vec<ThirdPartyEntry>, HashSet<LegKey>) {
     let Ok(sup) = suppressed_auth_expired.lock() else {
-        return snapshot;
+        return (snapshot, HashSet::new());
     };
     if sup.is_empty() {
-        return snapshot;
+        return (snapshot, HashSet::new());
     }
-    snapshot
+    let mut blanked = HashSet::new();
+    let kept = snapshot
         .into_iter()
         .filter(|e| {
-            sup.get(e.name.as_str())
-                .is_none_or(|recorded| *recorded != e.credential_fingerprint())
+            let suppressed = sup
+                .get(e.name.as_str())
+                .is_some_and(|recorded| *recorded == e.credential_fingerprint());
+            if suppressed {
+                blanked.insert(e.key());
+            }
+            !suppressed
         })
-        .collect()
+        .collect();
+    (kept, blanked)
 }
 
 /// Fetch a pre-partitioned set of due OAuth profiles and apply outcomes to the
@@ -4989,6 +5177,34 @@ fn log_resets_left_running(name: &ProfileName) {
     logline!(
         "clauth: '{name}': limit reset read still running after {:?}; left running",
         tick_fetch_deadline()
+    );
+}
+
+/// The line a failed banked-reset side read gets: what came back, the hint a
+/// laddered status was honoured under, and the gap `stamp_resets` set, in
+/// whole seconds. No body text: it may echo account data.
+fn log_resets_failure(
+    name: &ProfileName,
+    err: &claude_reset::ResetCallError,
+    next: &ResetsNext,
+    gap_ms: u64,
+) {
+    use claude_reset::ResetCallError;
+    let what = match (err, next) {
+        (ResetCallError::Unauthorized, _) => "got HTTP 401".to_string(),
+        (ResetCallError::Status(status), ResetsNext::Ladder { retry_after, .. }) => {
+            match retry_after {
+                Some(hint) => format!("got HTTP {status} (Retry-After {}s)", hint.as_secs()),
+                None => format!("got HTTP {status} (no Retry-After)"),
+            }
+        }
+        (ResetCallError::Status(status), ResetsNext::Hour) => format!("got HTTP {status}"),
+        (ResetCallError::Transport, _) => "got no answer".to_string(),
+        (ResetCallError::Parse, _) => "answered in a shape clauth does not read".to_string(),
+    };
+    logline!(
+        "clauth: '{name}': the limit reset read {what}; next read in {}s",
+        gap_ms / 1000
     );
 }
 
@@ -5876,6 +6092,85 @@ fn publish_countdowns(
     }
 }
 
+/// Leg keys for every profile whose selected leg ([`FetchLeg::for_profile`])
+/// is on no work list this tick. The standing member is a keyless provider or
+/// endpoint account, whose cached figures still display and whose countdown
+/// nothing publishes while the key is gone — but the set is per-tick, so it
+/// also holds the transient members: an OAuth entry the identity filter
+/// dropped, a probe whose switch just turned off. Their countdowns republish
+/// once the tick re-admits the name. The deliberately-blanked publish
+/// includes these so a renderer never dates the absent deadline as a
+/// left-running worker's overdue refresh. A late-held leg keeps its snapshot
+/// entry (its worker still runs), so it is never treated as off the list
+/// here.
+fn unpolled_selected_blanked(
+    selected: &[(ProfileName, FetchLeg)],
+    oauth_work: &HashSet<ProfileName>,
+    third_party_work: &HashSet<ProfileName>,
+) -> HashSet<LegKey> {
+    selected
+        .iter()
+        .filter(|(name, leg)| match leg {
+            FetchLeg::OAuth => !oauth_work.contains(name),
+            FetchLeg::ThirdParty => !third_party_work.contains(name),
+            // No display profile maps to these legs.
+            FetchLeg::Codex | FetchLeg::ClaudeResets => false,
+        })
+        .map(|(name, leg)| leg.key(name.clone()))
+        .collect()
+}
+
+/// Full-replace publish of the deliberately-blanked legs, beside the countdown
+/// publish: every flag cleared, then the blanked set re-raised, so a row whose
+/// countdown comes back (a spent window reset, a lifted suppression) loses its
+/// blank in the same tick its deadline republishes. The same pass drops an
+/// entry the clear just idled (a removed account's): the fetching tick has no
+/// general idle sweep, and the entry would otherwise linger for the process's
+/// life.
+pub(crate) fn publish_blanked_countdowns(activity: &ActivityStore, blanked: &HashSet<LegKey>) {
+    if let Ok(mut states) = activity.lock() {
+        for state in states.values_mut() {
+            state.oauth_blanked = false;
+            state.third_party_blanked = false;
+        }
+        for key in blanked {
+            match key.leg {
+                FetchLeg::OAuth => {
+                    states
+                        .entry(key.name.to_string())
+                        .or_default()
+                        .oauth_blanked = true
+                }
+                FetchLeg::ThirdParty => {
+                    states
+                        .entry(key.name.to_string())
+                        .or_default()
+                        .third_party_blanked = true
+                }
+                // Nothing blanks these legs; a key of theirs in the set is a
+                // bug, and the flag would have no reader either way.
+                FetchLeg::Codex | FetchLeg::ClaudeResets => {}
+            }
+        }
+        states.retain(|_, state| !state.is_idle());
+    }
+}
+
+/// Whether the scheduler deliberately publishes no countdown for `key`'s leg
+/// this tick (a spent account under `refresh_spent_accounts` off, a suppressed
+/// dead credential, a selected leg on no work list), as opposed to a
+/// left-running worker holding it. The renderer's no-deadline overdue arm
+/// reads this: a deliberately blanked row keeps its blank slot instead of
+/// claiming an overdue refresh.
+pub(crate) fn countdown_blanked(
+    activity: &HashMap<String, ProfileActivityState>,
+    key: &LegKey,
+) -> bool {
+    activity
+        .get(key.name.as_str())
+        .is_some_and(|state| state.blanked(key.leg))
+}
+
 /// Republish one profile's countdown (`stamped + interval`, mirroring
 /// [`partition_due`]) the instant its fetch lands, so the timer jumps straight
 /// from the fetch spinner to the real interval instead of holding the pre-fetch
@@ -5931,7 +6226,8 @@ pub(crate) fn selected_next_refresh(
 /// `fetches_here` scopes the derivation to the instance that runs the fetches
 /// itself. A stood-down instance mirrors another process's disk, and the
 /// deadline it publishes there is its own cache-mtime estimate — nothing on it
-/// is about to fetch, so its rows keep their countdown and staleness cue.
+/// is about to fetch, so its rows stay idle: a future deadline keeps its
+/// countdown, a past one reads the overdue age, never `queued`.
 pub(crate) fn display_activity(
     selected: ProfileActivity,
     next_refresh: Option<u64>,
@@ -6038,9 +6334,10 @@ pub(crate) struct SchedulerState {
     /// Pending weekly-reset re-test kicks (see [`weekly_reset_pending`]).
     weekly_reset_kicks: WeeklyResetKicks,
     /// The claude banked-reset side read's cadence memo (see
-    /// [`ClaudeResetsMemo`]): last read per account, plus the due marks a
-    /// 100% crossing sets. One per scheduler, so two schedulers sharing one
-    /// process each run their own hour.
+    /// [`ClaudeResetsMemo`]): last read per account, a refused read's retry,
+    /// plus the due marks a 100% crossing or a fall before its reset sets. One
+    /// per scheduler, so two schedulers sharing one process each run their own
+    /// hour.
     claude_resets_memo: ClaudeResetsMemoLock,
     /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
     /// queue spaces against, plus per-profile election health.
@@ -6238,6 +6535,12 @@ const SPEND_CAP_IN_FLIGHT_GRACE_MS: u64 = 30_000;
 thread_local! {
     static TPS_PRODUCER: std::cell::RefCell<crate::tps::Producer> =
         std::cell::RefCell::new(crate::tps::Producer::new());
+    /// The lease generation the producer's last leased pass ran under: the
+    /// exit save's ticket. A watchdog release moves the lease's generation, so
+    /// a life that lost the lease, or re-took it with no producer pass since
+    /// (the pass that runs `rejoin_files` first), saves nothing at exit.
+    static TPS_LEASE_GENERATION: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
     /// (last write ms, last written bytes with `generated_at` blanked).
     static TPS_LAST_WRITE: std::cell::RefCell<(u64, Option<Vec<u8>>)> =
         const { std::cell::RefCell::new((0, None)) };
@@ -6828,6 +7131,9 @@ fn tps_producer_tick(now_ms: u64) {
 /// shared tps files. Neither check is a lock shared with the release: the
 /// check-to-write window it cannot close is stated on `Producer::tick_leased`.
 fn tps_producer_tick_leased(now_ms: u64, lease: Option<LeaseTicket<'_>>) {
+    if let Some(ticket) = lease {
+        TPS_LEASE_GENERATION.with(|g| g.set(Some(ticket.generation())));
+    }
     let snap = TPS_PRODUCER.with(|p| p.borrow_mut().tick_leased(now_ms, lease));
     if !lease_is_current(lease) {
         return;
@@ -6866,6 +7172,17 @@ fn tps_producer_tick_leased(now_ms: u64, lease: Option<LeaseTicket<'_>>) {
         c.0 = now_ms;
         c.1 = Some(slow_bytes);
     });
+}
+
+/// The tick thread's last act on a clean stop: the producer's pending
+/// attribution save, under the ticket of its last leased pass, so a life
+/// that never ran one, or whose lease moved since, writes nothing.
+fn tps_exit_save(lease: &crate::daemon::FetchLease) {
+    let Some(generation) = TPS_LEASE_GENERATION.with(std::cell::Cell::get) else {
+        return;
+    };
+    let ticket = lease.ticket_at(generation);
+    TPS_PRODUCER.with(|p| p.borrow_mut().save_before_exit(now_ms(), Some(ticket)));
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -7104,8 +7421,34 @@ pub(crate) fn tick(state: &SchedulerState) {
     // Drop profiles with a dead usage credential (session-suppressed) from the
     // third-party leg so they aren't re-fetched every cadence. Only a manual
     // refresh (forced, cleared above) re-admits one for a single retry.
-    let tp_snapshot = filter_suppressed(&state.suppressed_auth_expired, tp_snapshot);
-    let probe_snapshot = filter_suppressed_probes(&state.suppressed_auth_expired, probe_snapshot);
+    let (tp_snapshot, mut blanked) = filter_suppressed(&state.suppressed_auth_expired, tp_snapshot);
+    let (probe_snapshot, probe_blanked) =
+        filter_suppressed_probes(&state.suppressed_auth_expired, probe_snapshot);
+    blanked.extend(probe_blanked);
+    // A profile whose selected leg is on no work list this tick (a keyless
+    // provider or endpoint account, or a transient member an identity move
+    // or a probe switch-off dropped for this tick) gets the deliberate blank
+    // too: nothing publishes that leg's countdown this tick, so the renderer
+    // must not date its fossil cache as a late worker's overdue refresh.
+    if let Ok(cfg) = state.config.lock() {
+        let selected: Vec<(ProfileName, FetchLeg)> = cfg
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), FetchLeg::for_profile(p)))
+            .collect();
+        let oauth_work: HashSet<ProfileName> = oauth_snapshot
+            .iter()
+            .map(|e| e.name.clone())
+            .chain(probe_snapshot.iter().map(|e| e.name.clone()))
+            .collect();
+        let third_party_work: HashSet<ProfileName> =
+            tp_snapshot.iter().map(|e| e.name.clone()).collect();
+        blanked.extend(unpolled_selected_blanked(
+            &selected,
+            &oauth_work,
+            &third_party_work,
+        ));
+    }
 
     // Partition both before either fetches, then publish in one window so the
     // countdown map never shows a leg as momentarily missing (and a deleted
@@ -7126,13 +7469,13 @@ pub(crate) fn tick(state: &SchedulerState) {
         .map(|c| c.state.refresh_spent_accounts)
         .unwrap_or(true);
     if !refresh_spent {
-        drop_spent_oauth(
+        blanked.extend(drop_spent_oauth(
             state,
             &oauth_snapshot,
             &mut oauth_due,
             &mut oauth_next,
             &forced,
-        );
+        ));
     }
     // Fire-once post-reset poll: once a 5h window has reset (plus grace), force a
     // single fetch so the overview drops the stale pre-reset reading instead of
@@ -7188,15 +7531,16 @@ pub(crate) fn tick(state: &SchedulerState) {
     // A spent probed account is skipped as a polled one is, the more so since
     // each probe spends inference on it.
     if !refresh_spent {
-        drop_spent_oauth(
+        blanked.extend(drop_spent_oauth(
             state,
             &probe_snapshot,
             &mut probe_due,
             &mut probe_next,
             &forced,
-        );
+        ));
     }
     oauth_next.extend(probe_next);
+    publish_blanked_countdowns(&state.activity, &blanked);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
     // Names actually scheduled this tick across both legs. A forced name absent
@@ -7313,9 +7657,10 @@ pub(crate) fn tick(state: &SchedulerState) {
     // and the switch scans, inside the lease-holder path: the scans decide
     // switches off the stores the landings just wrote and must not wait behind
     // the read's request spacing, while a due mark a landing set is still read
-    // in this tick. One read per account an hour, at most one account a tick,
-    // so a pass costs the tick at most one request slot, one fetch deadline
-    // and the tick's one flock wait.
+    // in this tick. One read per account an hour (sooner after a refused or
+    // unanswered read, on the poll's ladder), at most one account a tick, so a
+    // pass costs the tick at most one request slot, one fetch deadline and the
+    // tick's one flock wait.
     claude_resets_tick(state, Some(timed_out.as_ref()), lease);
 
     // tps producer leg, lease holder only (a stood-down tick returned above,
@@ -7377,17 +7722,24 @@ impl ProbeEntry {
 fn filter_suppressed_probes(
     suppressed_auth_expired: &SuppressedAuthExpiredStore,
     snapshot: Vec<ProbeEntry>,
-) -> Vec<ProbeEntry> {
+) -> (Vec<ProbeEntry>, HashSet<LegKey>) {
     let Ok(sup) = suppressed_auth_expired.lock() else {
-        return snapshot;
+        return (snapshot, HashSet::new());
     };
-    snapshot
+    let mut blanked = HashSet::new();
+    let kept = snapshot
         .into_iter()
         .filter(|e| {
-            sup.get(e.name.as_str())
-                .is_none_or(|recorded| *recorded != e.fingerprint())
+            let suppressed = sup
+                .get(e.name.as_str())
+                .is_some_and(|recorded| *recorded == e.fingerprint());
+            if suppressed {
+                blanked.insert(e.key());
+            }
+            !suppressed
         })
-        .collect()
+        .collect();
+    (kept, blanked)
 }
 
 /// The probe leg's membership: every enabled profile [`usage_probe_admits`],
@@ -7478,7 +7830,12 @@ fn probe_outcome(
     answer: super::inference::anthropic::ProbeAnswer,
 ) -> FetchOutcome {
     use super::inference::anthropic::ProbeAnswer;
-    match answer {
+    // An org refusal is a live verdict — the plan it lands is what the row
+    // shows — so it is no failed attempt. Every other answer that serves no
+    // usage body followed a probe this tick sent, and marks the account for the
+    // pane's skipped-spent guard.
+    let org_refused = matches!(answer, ProbeAnswer::OrgRefused { .. });
+    let outcome = match answer {
         ProbeAnswer::Reading {
             info, retry_after, ..
         } => {
@@ -7522,6 +7879,11 @@ fn probe_outcome(
             ..PlanInfo::default()
         })),
         ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
+    };
+    if org_refused || outcome.from_fetch {
+        outcome
+    } else {
+        outcome.with_fetch_failed()
     }
 }
 
@@ -7777,7 +8139,10 @@ fn fetch_probe_due_flagged(
             } else {
                 // The countdown this tick published for the entry stands no
                 // fetch: withdraw it, so the late account's timer cell reads
-                // blank.
+                // the overdue age its reading dates, or the deliberate blank
+                // its leg earns off the work list (a spent skip, a suppressed
+                // credential, a selected leg on no work list), never a
+                // countdown no fetch will run.
                 withdraw_countdown(&state.next_refresh_per_profile, &worker.ticket.key);
                 if lease_is_current(lease) {
                     log_left_running(name);
@@ -8010,12 +8375,17 @@ pub(crate) fn forget_codex_polled(name: &str) {
 const CLAUDE_RESETS_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 /// Per-scheduler cadence memo for the claude banked-reset side read: epoch ms
-/// of each account's last read attempt (the tick's `now`), plus the names a
-/// fresh landing marked due for a window that crossed to 100% or fell before
-/// its reset. A plain struct built empty, as `weekly_reset_kicks` is a plain set.
+/// of each account's last read attempt (the tick's `now`), the names a fresh
+/// landing marked due for a window that crossed to 100% or fell before its
+/// reset, and, for an account whose last read was refused (a 429, a 5xx, no
+/// answer), the epoch ms its retry falls due beside its count of 429s since
+/// the last landed read, hour-keeping failure or forget, which picks the rung
+/// of the poll's deferral ladder. A plain struct built empty, as
+/// `weekly_reset_kicks` is a plain set.
 pub(crate) struct ClaudeResetsMemo {
     last_read_at: HashMap<String, u64>,
     due: HashSet<String>,
+    retry: HashMap<String, (u64, u32)>,
 }
 
 impl ClaudeResetsMemo {
@@ -8023,16 +8393,18 @@ impl ClaudeResetsMemo {
         Self {
             last_read_at: HashMap::new(),
             due: HashSet::new(),
+            retry: HashMap::new(),
         }
     }
 
     /// Drop `name` — `clear_memory`'s OAuth arm and the rename path. A
     /// re-login removes the account's reading with `forget_disk`, so the next
     /// pass reads at once; a rename carries the reading to the new name, whose
-    /// seed dates the hour there.
+    /// seed dates the hour there. A pending retry and its rung go too.
     pub(crate) fn forget(&mut self, name: &str) {
         self.last_read_at.remove(name);
         self.due.remove(name);
+        self.retry.remove(name);
     }
 }
 
@@ -8164,9 +8536,12 @@ pub(crate) fn claude_resets_tick(
 /// read an hour, and once more inside the hour when a fresh landing marked it
 /// due (a window crossed to 100% or fell before its reset). A successful read
 /// lands the usable count, the banked total, the next grant's windows and end,
-/// and the read's stamp in the account's own `limit_resets.json`; a 401 or any failure writes
-/// nothing and still stamps the memo, so a broken account is not re-read every
-/// tick (the codex leg's rule). Each read runs on its own worker, and one
+/// and the read's stamp in the account's own `limit_resets.json`. A failure
+/// writes nothing, says so in one line and still stamps the memo: a refusal
+/// (a 429, a 5xx, no answer) retries on the poll's deferral ladder, honouring
+/// the server's Retry-After, while a 401, any other status or a body clauth
+/// cannot read keeps the hour, so a broken account is not re-read every tick
+/// (the codex leg's rule). Each read runs on its own worker, and one
 /// still out at the tick fetch deadline, or one that never ran, counts as a
 /// failure: it is left running, its late answer lands nothing, and its
 /// account gets no second read until it exits.
@@ -8336,6 +8711,10 @@ fn claude_resets_tick_flagged(
                     }
                 };
                 let due_now = memo.due.contains(name.as_str())
+                    || memo
+                        .retry
+                        .get(name.as_str())
+                        .is_some_and(|(retry_at, _)| now >= *retry_at)
                     || last
                         .is_none_or(|last| now.saturating_sub(last) >= CLAUDE_RESETS_INTERVAL_MS);
                 due_now.then_some((name, access_token, epoch_at_spawn))
@@ -8389,7 +8768,7 @@ fn claude_resets_tick_flagged(
                     #[cfg(test)]
                     probe_panic::hit(name.as_str());
                     await_request_slot(ANTHROPIC_ORIGIN);
-                    let read = claude_reset::read_status_at(&url, &access_token);
+                    let read = claude_reset::read_status_hinted_at(&url, &access_token);
                     // A drain that stopped waiting on this worker drops this
                     // send; harmless. A panicking worker never reaches here.
                     let _ = tx.send((
@@ -8439,31 +8818,43 @@ fn claude_resets_tick_flagged(
         // Residual, as at the landing and the kick: a forget in the window
         // between this check and the write lands the old count; a re-login on
         // disk still fails the identity compare below.
-        if let Ok(status) = read {
-            let reading = claude_reset::status_reading(&status);
-            // A login another process installed (a CLI `clauth login`) moves
-            // no epoch here, so the write and the stamp are gated on the
-            // stored identity under the state flock: a readable moved login
-            // keeps its own (absent) reading and reads on the next pass under
-            // the reload's memo drop, instead of the old login's count
-            // re-creating the file under a fresh hour. An unreadable store or
-            // a flock timeout lands no reading either, but the reload never
-            // forgets an unreadable half, so the stamp keeps such an attempt
-            // an hour away instead of a request-spacing pass.
-            let landed = crate::lock::with_state_lock_flag(timed_out, |_held| {
-                if !lease_is_current(lease) {
-                    return Ok::<(bool, bool), anyhow::Error>((false, false));
+        let status = match read {
+            Ok(status) => status,
+            Err((err, retry_after)) => {
+                // Stamped whatever the lease says, as every failure is; only
+                // the holder says so, and only once the stamp names the gap.
+                let next = ResetsNext::after_failure(&err, retry_after);
+                if let Some(gap_ms) = stamp_resets(state, &name, epoch_at_spawn, now, &next)
+                    && lease_is_current(lease)
+                {
+                    log_resets_failure(&name, &err, &next, gap_ms);
                 }
-                let (disk, unreadable) = crate::usage::read_oauth_for_compare(&name);
-                let ok = !unreadable && !crate::usage::oauth_changed(&identity, &disk);
-                if ok {
-                    write_profile_cache_for(Harness::Claude, &name, LIMIT_RESETS_FILE, &reading);
-                }
-                Ok::<(bool, bool), anyhow::Error>((ok, unreadable))
-            });
-            if matches!(landed, Ok((false, false))) {
                 continue;
             }
+        };
+        let reading = claude_reset::status_reading(&status);
+        // A login another process installed (a CLI `clauth login`) moves
+        // no epoch here, so the write and the stamp are gated on the
+        // stored identity under the state flock: a readable moved login
+        // keeps its own (absent) reading and reads on the next pass under
+        // the reload's memo drop, instead of the old login's count
+        // re-creating the file under a fresh hour. An unreadable store or
+        // a flock timeout lands no reading either, but the reload never
+        // forgets an unreadable half, so the stamp keeps such an attempt
+        // an hour away instead of a request-spacing pass.
+        let landed = crate::lock::with_state_lock_flag(timed_out, |_held| {
+            if !lease_is_current(lease) {
+                return Ok::<(bool, bool), anyhow::Error>((false, false));
+            }
+            let (disk, unreadable) = crate::usage::read_oauth_for_compare(&name);
+            let ok = !unreadable && !crate::usage::oauth_changed(&identity, &disk);
+            if ok {
+                write_profile_cache_for(Harness::Claude, &name, LIMIT_RESETS_FILE, &reading);
+            }
+            Ok::<(bool, bool), anyhow::Error>((ok, unreadable))
+        });
+        if matches!(landed, Ok((false, false))) {
+            continue;
         }
         stamp_resets_attempt(state, &name, epoch_at_spawn, now);
     }
@@ -8492,24 +8883,97 @@ struct ClaudeResetsRead {
     name: ProfileName,
     epoch_at_spawn: u64,
     identity: crate::usage::OAuthIdentity,
-    read: Result<claude_reset::ResetStatus, claude_reset::ResetCallError>,
+    read: Result<claude_reset::ResetStatus, (claude_reset::ResetCallError, Option<Duration>)>,
 }
 
-/// Date a side-read attempt. The memo stamps on success and every failure, and
-/// the attempt consumes the due mark either way: the trigger fired, and the
-/// hour now runs from it. Epoch-gated here, past the read and any flock wait, so
-/// a forget that landed meanwhile leaves the name unstamped, as the landing's
-/// pre-check does.
+/// How a side-read attempt sets its account's next read.
+enum ResetsNext {
+    /// The full hour: a landing, a rejected or unreadable answer, and a read
+    /// that never started, panicked or was left running.
+    Hour,
+    /// A refusal (a 429, a 5xx, no answer) is no broken account: the retry
+    /// rides the poll's own deferral ladder, honouring the server's hint.
+    /// `climbs` is set for a 429 alone, which moves the account up a rung, as
+    /// only a 429 moves the poll's (`update_streaks`).
+    Ladder {
+        retry_after: Option<Duration>,
+        climbs: bool,
+    },
+}
+
+impl ResetsNext {
+    /// The next read a failed side read gets: a 429, a 5xx or no answer is a
+    /// refusal; a 401, any other status and a body clauth cannot read keep
+    /// the hour.
+    fn after_failure(err: &claude_reset::ResetCallError, retry_after: Option<Duration>) -> Self {
+        use claude_reset::ResetCallError;
+        match err {
+            ResetCallError::Status(429) => Self::Ladder {
+                retry_after,
+                climbs: true,
+            },
+            ResetCallError::Status(500..=599) | ResetCallError::Transport => Self::Ladder {
+                retry_after,
+                climbs: false,
+            },
+            ResetCallError::Unauthorized | ResetCallError::Status(_) | ResetCallError::Parse => {
+                Self::Hour
+            }
+        }
+    }
+}
+
+/// Date a side-read attempt that keeps the hour: [`stamp_resets`] with
+/// [`ResetsNext::Hour`].
 fn stamp_resets_attempt(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64, now: u64) {
-    let Some(_epoch) =
-        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)
-    else {
-        return;
-    };
-    if let Ok(mut guard) = state.claude_resets_memo.lock() {
-        let memo = &mut *guard;
-        memo.due.remove(name.as_str());
-        memo.last_read_at.insert(name.to_string(), now);
+    let _ = stamp_resets(state, name, epoch_at_spawn, now, &ResetsNext::Hour);
+}
+
+/// Date a side-read attempt and set its account's next read; returns the gap
+/// to it (ms). The memo stamps on success and every failure, and the attempt
+/// consumes the due mark either way: the trigger fired, and the next read now
+/// runs from it. [`ResetsNext::Ladder`] sets the retry `interval +`
+/// [`next_slot_deferral`] out, the slot math the poll's own landing uses, on
+/// the rung its 429s have climbed: a 5xx or no answer retries on
+/// the rung as it stands and leaves the count alone. Anything else drops the
+/// retry, so the next refusal starts on the first rung. Epoch-gated here, past
+/// the read and any flock wait, so a forget that landed meanwhile leaves the
+/// name unstamped (`None`), as the landing's pre-check does.
+fn stamp_resets(
+    state: &SchedulerState,
+    name: &ProfileName,
+    epoch_at_spawn: u64,
+    now: u64,
+    next: &ResetsNext,
+) -> Option<u64> {
+    let _epoch =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)?;
+    let mut guard = state.claude_resets_memo.lock().ok()?;
+    let memo = &mut *guard;
+    memo.due.remove(name.as_str());
+    memo.last_read_at.insert(name.to_string(), now);
+    match next {
+        ResetsNext::Hour => {
+            memo.retry.remove(name.as_str());
+            Some(CLAUDE_RESETS_INTERVAL_MS)
+        }
+        ResetsNext::Ladder {
+            retry_after,
+            climbs,
+        } => {
+            let streak = memo
+                .retry
+                .get(name.as_str())
+                .map_or(0, |(_, streak)| *streak)
+                .saturating_add(u32::from(*climbs));
+            let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+            let gap_ms = interval_ms.saturating_add(
+                next_slot_deferral(true, *retry_after, streak, interval_ms, false).as_millis(),
+            );
+            memo.retry
+                .insert(name.to_string(), (now.saturating_add(gap_ms), streak));
+            Some(gap_ms)
+        }
     }
 }
 
@@ -8978,7 +9442,8 @@ fn apply_codex_switch_leased(
 ///   * re-seed the usage / third-party stores from the disk caches the daemon
 ///     keeps fresh ([`try_seed_cache`] stamps status Fresh/Cached off the cache
 ///     clock, and `last_fetched` at the instant the daemon fetched — so the
-///     countdowns below track the daemon's real cadence);
+///     countdowns below track the daemon's real cadence), stamping a durable
+///     dead-credential verdict as `AuthExpired` in the same write;
 ///   * republish countdowns from those stamps (partition is reused for its
 ///     timing math only; the due list is deliberately discarded — nothing
 ///     fetches here);
@@ -9008,7 +9473,14 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // (`tp_snapshot`) only, exactly as its boot seed does. The work lists stay
     // `oauth_snapshot` / `tp_snapshot`, and a third-party status or stamp is
     // written for a `tp_snapshot` name only.
-    let (oauth_seed_names, third_party_seed_names, probe_seeds, probed_tokens, pairless) = state
+    let (
+        oauth_seed_names,
+        third_party_seed_names,
+        probe_seeds,
+        probed_tokens,
+        pairless,
+        selected_legs,
+    ) = state
         .config
         .lock()
         .map(|cfg| {
@@ -9029,6 +9501,10 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
                 collect_probe_seeds(&cfg),
                 probed_tokens,
                 pairless_kick_names(&cfg),
+                cfg.profiles
+                    .iter()
+                    .map(|p| (p.name.clone(), FetchLeg::for_profile(p)))
+                    .collect::<Vec<(ProfileName, FetchLeg)>>(),
             )
         })
         .unwrap_or_default();
@@ -9036,17 +9512,6 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // so a probed account counts down here too.
     let mut probe_snapshot = build_probe_entries(probe_seeds);
 
-    hydrate_from_daemon_caches(
-        &state.store,
-        &state.status,
-        &state.third_party_usage_store,
-        &state.third_party_status,
-        &state.last_fetched,
-        &oauth_seed_names,
-        &third_party_seed_names,
-        &tp_snapshot,
-        interval_ms,
-    );
     // The fetching instance's probe status never reaches this one; a refused
     // setup token does, through its durable record, so the row says so rather
     // than read the cached figures as current or wait on a probe that rests.
@@ -9058,13 +9523,33 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // The fetching instance counts no probe down for a token it rests, so
     // neither does this one: the countdown would run out at `0s` and stay.
     probe_snapshot.retain(|e| !refused.contains(&e.name));
-    if !refused.is_empty()
-        && let Ok(mut st) = state.status.lock()
-    {
-        for name in refused {
-            st.insert(name.to_string(), FetchStatus::AuthExpired);
-        }
-    }
+    // The fetching instance's third-party verdict never reaches this one
+    // either; a refused endpoint credential leaves the same durable record.
+    let tp_refused: Vec<ProfileName> = tp_snapshot
+        .iter()
+        .filter(|e| crate::profile_cache::auth_expired_matches(&e.name, e.credential_fingerprint()))
+        .map(|e| e.name.clone())
+        .collect();
+    // Both verdicts ride the hydrate's own status writes (computed here,
+    // before any write of this tick, so the hydrate stamps `AuthExpired` in
+    // the same insert that would carry the cache-derived form): a reader — a
+    // frame, a `status.json` write — landing between a hydrate write and a
+    // later seed would see the dead account as fresh or cached. A record the
+    // holder cleared (a re-keyed or re-logged account) drops the name from
+    // the set, so the next tick reverts to the derived form.
+    hydrate_from_daemon_caches(
+        &state.store,
+        &state.status,
+        &state.third_party_usage_store,
+        &state.third_party_status,
+        &state.last_fetched,
+        &oauth_seed_names,
+        &third_party_seed_names,
+        &tp_snapshot,
+        &refused,
+        &tp_refused,
+        interval_ms,
+    );
     // Mirror the fetching instance's kick blocks (write-through cache files) so
     // a stood-down TUI still shows the blocked pill for an outage it can't see.
     let mut kick_names: Vec<String> = oauth_snapshot.iter().map(|e| e.name.to_string()).collect();
@@ -9072,6 +9557,15 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     sync_kick_blocks_from_cache(&state.kick_blocks, &kick_names);
 
     let now = now_ms();
+    // The mark records this instance's own attempts; a stood-down instance
+    // sends none, so its mark may be stale — the fetching instance may
+    // have served the account since.
+    if let Ok(mut streaks) = state.poll_streaks.lock() {
+        streaks.retain(|_, counts| {
+            counts.last_fetch_failed = false;
+            *counts != StreakCounts::default()
+        });
+    }
     let streaks = streak_snapshot(&state.poll_streaks);
     let (_, mut oauth_next) = partition_due(
         &oauth_snapshot,
@@ -9100,7 +9594,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .lock()
         .map(|c| c.state.refresh_spent_accounts)
         .unwrap_or(true);
-    if !refresh_spent && let Ok(store) = state.store.lock() {
+    let mut blanked: HashSet<LegKey> = if !refresh_spent && let Ok(store) = state.store.lock() {
         let mut skip = spent_skip_set(&oauth_snapshot, &forced, &store, now_epoch_secs());
         skip.extend(spent_skip_set(
             &probe_snapshot,
@@ -9109,7 +9603,29 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
             now_epoch_secs(),
         ));
         oauth_next.retain(|key, _| !skip.contains(key.name.as_str()));
-    }
+        skip.iter()
+            .map(|name| FetchLeg::OAuth.key(ProfileName::from(name.as_str())))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    // A profile whose selected leg is on no work list here (a keyless
+    // provider or endpoint account, or a transient member dropped for this
+    // tick) gets the deliberate blank too: the mirror publishes no countdown
+    // for that leg this tick, so the renderer must not date its fossil cache
+    // as a late worker's overdue refresh.
+    let oauth_work: HashSet<ProfileName> = oauth_snapshot
+        .iter()
+        .map(|e| e.name.clone())
+        .chain(probe_snapshot.iter().map(|e| e.name.clone()))
+        .collect();
+    let third_party_work: HashSet<ProfileName> =
+        tp_snapshot.iter().map(|e| e.name.clone()).collect();
+    blanked.extend(unpolled_selected_blanked(
+        &selected_legs,
+        &oauth_work,
+        &third_party_work,
+    ));
     let (_, tp_next) = partition_due(
         &tp_snapshot,
         now,
@@ -9119,6 +9635,11 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &streaks,
     );
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
+    // No worker runs on the mirror, so a leg can never be late there: the
+    // blanked publish carries the spent skips and the no-work-list legs, and
+    // a suppressed name keeps its countdown (the mirror's work lists still
+    // hold its entry).
+    publish_blanked_countdowns(&state.activity, &blanked);
 
     clear_orphaned_forced(&state.activity, &forced, &HashSet::new());
     // With no worker running, EVERY Queued mark is an orphan — not only forced
@@ -9148,8 +9669,15 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
 /// `last_fetched` stamped at the cache clock ([`bootstrap_third_party`]). A
 /// name whose cache file the daemon removed drops its stale entries; a cache
 /// that exists but won't parse leaves them (a transient read must not blank a
-/// reading).
-#[allow(clippy::too_many_arguments)]
+/// reading). A name in `oauth_refused` / `tp_refused` (the durable dead-
+/// credential verdicts the caller computed before this pass) gets
+/// `AuthExpired` in this pass's own status write instead of the derived form,
+/// so no reader between two writes can see the dead account as fresh or
+/// cached.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stand-down hydrate writes five stores off two seed lists and two refusal sets"
+)]
 fn hydrate_from_daemon_caches(
     store: &UsageStore,
     status: &StatusStore,
@@ -9159,25 +9687,55 @@ fn hydrate_from_daemon_caches(
     oauth_seed_names: &[(String, u64)],
     third_party_seed_names: &[String],
     third_party_work: &[ThirdPartyEntry],
+    oauth_refused: &[ProfileName],
+    tp_refused: &[ProfileName],
     interval_ms: u64,
 ) {
+    let oauth_refused: HashSet<&str> = oauth_refused.iter().map(|n| n.as_str()).collect();
+    let tp_refused: HashSet<&str> = tp_refused.iter().map(|n| n.as_str()).collect();
     let now = now_ms();
     for (name, oauth_interval_ms) in oauth_seed_names {
         let pname = ProfileName::from(name.clone());
-        if profile_cache_mtime_ms(&pname, USAGE_CACHE_FILE).is_none() {
-            remove_oauth_hydration_entries(store, status, last_fetched, &pname);
-        } else {
-            try_seed_cache(store, status, last_fetched, &pname, now, *oauth_interval_ms);
+        let verdict = oauth_refused
+            .contains(name.as_str())
+            .then_some(FetchStatus::AuthExpired);
+        match (
+            verdict,
+            profile_cache_mtime_ms(&pname, USAGE_CACHE_FILE).is_some(),
+        ) {
+            (verdict, true) => {
+                try_seed_cache_status(
+                    store,
+                    status,
+                    last_fetched,
+                    &pname,
+                    now,
+                    *oauth_interval_ms,
+                    verdict,
+                );
+            }
+            (Some(verdict), false) => {
+                // The verdict stands where the cache is gone: drop the stale
+                // reading and stamp, keep only the verdict entry.
+                super::forget::remove_name_entry(store, &pname);
+                super::forget::remove_leg_entry(last_fetched, &pname, FetchLeg::OAuth);
+                record_verdict(status, &pname, Some(verdict));
+            }
+            (None, false) => remove_oauth_hydration_entries(store, status, last_fetched, &pname),
         }
     }
     let scheduled: HashSet<&str> = third_party_work.iter().map(|e| e.name.as_str()).collect();
     for name in third_party_seed_names {
         let pname = ProfileName::from(name.clone());
         let is_scheduled = scheduled.contains(name.as_str());
-        if profile_cache_mtime_ms(&pname, THIRD_PARTY_CACHE_FILE).is_none() {
-            remove_third_party_hydration_entries(tp_store, tp_status, last_fetched, &pname);
-        } else {
-            seed_third_party_name(
+        let verdict = tp_refused
+            .contains(name.as_str())
+            .then_some(FetchStatus::AuthExpired);
+        match (
+            verdict,
+            profile_cache_mtime_ms(&pname, THIRD_PARTY_CACHE_FILE).is_some(),
+        ) {
+            (verdict, true) => seed_third_party_name_status(
                 tp_store,
                 tp_status,
                 last_fetched,
@@ -9185,7 +9743,18 @@ fn hydrate_from_daemon_caches(
                 is_scheduled,
                 now,
                 interval_ms,
-            );
+                verdict,
+            ),
+            (Some(verdict), false) => {
+                // The verdict stands where the cache is gone: drop the stale
+                // reading and stamp, keep only the verdict entry.
+                super::forget::remove_name_entry(tp_store, &pname);
+                super::forget::remove_leg_entry(last_fetched, &pname, FetchLeg::ThirdParty);
+                record_verdict(tp_status, &pname, Some(verdict));
+            }
+            (None, false) => {
+                remove_third_party_hydration_entries(tp_store, tp_status, last_fetched, &pname)
+            }
         }
     }
 }
@@ -9252,12 +9821,13 @@ pub(crate) fn spawn_refresher(
     fetch_lease: Arc<crate::daemon::FetchLease>,
     display_reader: bool,
     snapshot: Arc<RankedMutex<crate::usage::SnapshotMap, rank::Snapshot>>,
-) {
+) -> crate::daemon::TickThread {
     // Seed kick blocks from the per-profile cache files on the CALLING thread
     // so a restart mid-outage resumes the decayed retry clock instead of
     // hammering. Must happen here, not inside the spawned closure below:
-    // nothing joins that thread, so a home-derived path resolved on it could
-    // outlive a test's `HOME_OVERRIDE` and read the operator's real home.
+    // only a clean stop waits for that thread, so a home-derived path
+    // resolved on it could outlive a test's `HOME_OVERRIDE` and read the
+    // operator's real home.
     let mut names: Vec<String> = tokens
         .lock()
         .map(|t| t.iter().map(|e| e.name.to_string()).collect())
@@ -9337,24 +9907,24 @@ pub(crate) fn spawn_refresher(
         *slot.borrow_mut() = Some(Arc::clone(&state.skipped_unreadable));
     });
     let watchdog_lease = Arc::clone(&state.fetch_lease);
-    start_refresher_workers(state, watchdog_lease, tick_and_stamp);
+    start_refresher_workers(state, watchdog_lease, tick_and_stamp)
 }
 
 /// The only place the lease watchdog and the tick thread are spawned, so the
 /// test-only wiring pin can record the arguments the spawns actually use: no
-/// in-process test may start either thread, so the pin reads them before the
-/// spawn-skip.
+/// in-process test may start either thread through here, so the pin reads them
+/// before the spawn-skip.
 fn start_refresher_workers(
     state: SchedulerState,
     watchdog_lease: Arc<crate::daemon::FetchLease>,
     tick_body: fn(&SchedulerState),
-) {
+) -> crate::daemon::TickThread {
     #[cfg(test)]
     LAST_REFRESHER_START.with(|slot| {
         *slot.borrow_mut() = Some((Arc::clone(&watchdog_lease), tick_body));
     });
     // Same test-skip rationale as the status/tokens/pricing workers in
-    // `tui/app.rs`: a detached tick thread is never joined, so it could run
+    // `tui/app.rs`: a tick thread no test stops could run
     // `tick()` — which itself resolves home-derived paths and makes network
     // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound. The
     // one caller that must run it is the re-entered E2E `serve` stop test: a
@@ -9364,25 +9934,49 @@ fn start_refresher_workers(
     // leaves the suppression in place.
     #[cfg(test)]
     if std::env::var_os(CLAUTH_TEST_RUN_SCHEDULER).is_none() {
-        return;
+        return crate::daemon::TickThread::new(None, Arc::clone(&state.shutting_down));
     }
     crate::daemon::spawn_lease_watchdog(watchdog_lease, Arc::clone(&state.shutting_down));
+    spawn_tick_thread(state, tick_body)
+}
+
+/// The tick thread: `tick_body` once per [`TICK_INTERVAL`] until the stop
+/// flag rises, then the producer's exit save. The interval is slept on the
+/// thread's park token, so a [`crate::daemon::TickThread::stop`] ends the
+/// sleep at once instead of leaving the process to exit mid-sleep.
+fn spawn_tick_thread(
+    state: SchedulerState,
+    tick_body: fn(&SchedulerState),
+) -> crate::daemon::TickThread {
+    let shutting_down = Arc::clone(&state.shutting_down);
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("clauth-tick".into())
         .spawn(move || {
-            loop {
-                if state.shutting_down.load(Ordering::SeqCst) {
-                    break;
-                }
-                std::thread::sleep(TICK_INTERVAL);
+            while !state.shutting_down.load(Ordering::SeqCst) {
+                sleep_unless_stopped(&state.shutting_down, TICK_INTERVAL);
                 if state.shutting_down.load(Ordering::SeqCst) {
                     break;
                 }
                 tick_body(&state);
             }
+            tps_exit_save(&state.fetch_lease);
         })
         .expect("failed to spawn scheduler tick thread");
+    crate::daemon::TickThread::new(Some(thread), shutting_down)
+}
+
+/// Park for `interval`, or until the stop flag rises and an unpark lands; a
+/// spurious wake parks again for the rest.
+fn sleep_unless_stopped(shutting_down: &AtomicBool, interval: Duration) {
+    let started = Instant::now();
+    while !shutting_down.load(Ordering::SeqCst) {
+        let remaining = interval.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::park_timeout(remaining);
+    }
 }
 
 /// Evaluate the fallback chain and queue an auto-switch target.
@@ -11041,23 +11635,24 @@ fn merge_forced<T: NamedEntry + Clone>(
 /// `Queued` spinner that no worker will ever clear are both stale UI. The
 /// overview timer renders blank and the usage tab reads "up to date"/"spent"
 /// instead. Reads the usage store once. Fetch-leg only; switch/fallback
-/// predicates are untouched.
+/// predicates are untouched. Returns the skipped names' OAuth-leg keys for the
+/// blanked-countdown publish.
 fn drop_spent_oauth<E: NamedEntry>(
     state: &SchedulerState,
     snapshot: &[E],
     due: &mut Vec<E>,
     next: &mut HashMap<LegKey, u64>,
     forced: &HashSet<String>,
-) {
+) -> HashSet<LegKey> {
     let now_secs = now_epoch_secs();
     let skip = {
         let Ok(store) = state.store.lock() else {
-            return; // can't read usage → fail safe to polling everything
+            return HashSet::new(); // can't read usage → fail safe to polling everything
         };
         spent_skip_set(snapshot, forced, &store, now_secs)
     };
     if skip.is_empty() {
-        return;
+        return HashSet::new();
     }
     due.retain(|entry| !skip.contains(entry.name()));
     next.retain(|key, _| !skip.contains(key.name.as_str()));
@@ -11076,6 +11671,9 @@ fn drop_spent_oauth<E: NamedEntry>(
             }
         }
     }
+    skip.iter()
+        .map(|name| FetchLeg::OAuth.key(ProfileName::from(name.as_str())))
+        .collect()
 }
 
 /// Names `refresh_spent_accounts` OFF skips this tick: an unforced, already-
@@ -11205,6 +11803,10 @@ mod proxy_p6_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/inline/scheduler_exit_save.rs"]
+mod exit_save_tests;
 
 /// CLA-ROLL cadence for the rolling-sidecar freshness scan. The due predicate is
 /// stateless against the wall clock ([`crate::oauth::rolling_sidecar_restamp_due`]),

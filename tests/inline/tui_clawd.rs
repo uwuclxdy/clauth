@@ -30,8 +30,6 @@ fn animation_frame_counts_match_the_extracted_sequences() {
         (Anim::Waddle, 19),
         (Anim::Peek, 20),
         (Anim::Wink, 6),
-        (Anim::Boop, 11),
-        (Anim::Tap, 14),
         (Anim::Sneeze, 12),
         (Anim::Turn, 19),
         (Anim::CoinHop, 14),
@@ -42,11 +40,8 @@ fn animation_frame_counts_match_the_extracted_sequences() {
 }
 
 #[test]
-fn the_five_in_place_animations_are_the_idle_set() {
-    assert_eq!(
-        SUBTLE.map(Anim::name),
-        ["look", "wink", "boop", "tap", "sneeze"]
-    );
+fn the_hello_and_launch_pools() {
+    assert_eq!(HELLO.map(Anim::name), ["look", "wink"]);
     assert_eq!(
         BIG.map(Anim::name),
         [
@@ -74,56 +69,341 @@ fn the_simplified_arm_is_apple_terminal_alone() {
     assert!(full_sprite(None));
 }
 
-/// Every animation sits in the pool its kind names. The match is
-/// wildcard-free, so a new `Anim` variant fails to compile here until it is
-/// given a pool; the literal list beside it must then name it too, or the
-/// variant is never checked.
+/// Every event, the animation it plays, and its rank for the one waiting
+/// slot (higher outranks lower).
+const BINDINGS: [(Cue, &str, u8); 14] = [
+    (Cue::Switch, "jump", 1),
+    (Cue::SessionMoved, "skip", 1),
+    (Cue::SessionStarted, "waddle", 1),
+    (Cue::LoginGained, "celebrate", 0),
+    (Cue::UpdateInstalled, "celebrate", 0),
+    (Cue::WindowReset, "spin", 0),
+    (Cue::DelegateDone, "wink", 0),
+    (Cue::BellCrossed, "peek", 2),
+    (Cue::NewIncident, "peek", 2),
+    (Cue::DaemonReplaced, "peek", 2),
+    (Cue::Quarantined, "sneeze", 3),
+    (Cue::RefreshFailed, "sneeze", 3),
+    (Cue::DelegateFailed, "sneeze", 3),
+    (Cue::DaemonDown, "sneeze", 3),
+];
+
+/// A mascot past its launch animation, idle at `LAUNCH_DONE_MS`.
+const LAUNCH_DONE_MS: u64 = 5_000;
+
+fn settled() -> Stage<Clawd> {
+    let mut clawd = Stage::new(Clawd::new());
+    clawd.tick(0);
+    clawd.tick(LAUNCH_DONE_MS);
+    assert_eq!(
+        clawd.playing_anim(),
+        None,
+        "the launch animation never ended"
+    );
+    clawd
+}
+
+/// The playing animation's name and start, read off the state the frame
+/// reads.
+fn now_playing(clawd: &Stage<Clawd>) -> Option<(&'static str, u64)> {
+    clawd
+        .playing
+        .map(|playing| (playing.anim.name(), playing.start_ms))
+}
+
 #[test]
-fn every_animation_sits_in_the_pool_its_kind_names() {
-    fn pool_of(anim: Anim) -> &'static [Anim] {
-        match anim {
-            Anim::Look | Anim::Wink | Anim::Boop | Anim::Tap | Anim::Sneeze => SUBTLE.as_slice(),
-            Anim::Jump
-            | Anim::Celebrate
-            | Anim::Skip
-            | Anim::Spin
-            | Anim::Peekaboo
-            | Anim::Drop
-            | Anim::Waddle
-            | Anim::Peek
-            | Anim::Turn
-            | Anim::CoinHop => BIG.as_slice(),
-        }
-    }
-    let every = [
-        Anim::Look,
-        Anim::Wink,
-        Anim::Boop,
-        Anim::Tap,
-        Anim::Sneeze,
-        Anim::Jump,
-        Anim::Celebrate,
-        Anim::Skip,
-        Anim::Spin,
-        Anim::Peekaboo,
-        Anim::Drop,
-        Anim::Waddle,
-        Anim::Peek,
-        Anim::Turn,
-        Anim::CoinHop,
-    ];
-    for anim in every {
+fn every_event_plays_its_bound_animation_at_once() {
+    for (cue, name, _) in BINDINGS {
+        assert_eq!(
+            Clawd::new().react(cue).expect("bound").name(),
+            name,
+            "{cue:?}"
+        );
+        let mut clawd = settled();
+        clawd.cue(cue, 30_000);
+        assert_eq!(now_playing(&clawd), Some((name, 30_000)), "{cue:?}");
         assert!(
-            pool_of(anim).contains(&anim),
-            "{} sits in the pool its kind names",
-            anim.name()
+            clawd.frame(30_000).is_some(),
+            "{cue:?} draws its first frame"
         );
     }
 }
 
+/// The simplified sprite (Terminal.app) shows every bound animation as motion.
+#[test]
+fn every_bound_animation_reads_on_the_simplified_sprite() {
+    for (cue, _, _) in BINDINGS {
+        assert!(
+            reads_as_motion(Clawd::new().react(cue).expect("bound")),
+            "{cue:?}"
+        );
+    }
+    for anim in HELLO {
+        assert!(reads_as_motion(anim), "{}", anim.name());
+    }
+}
+
+/// Nothing plays on a timer once the launch animation ends: not at the old
+/// ten-second idle slot, not at the old thirty-minute one, not hours later.
+#[test]
+fn no_timer_plays_anything_after_launch() {
+    let mut clawd = settled();
+    for now in [
+        10_000,
+        20_000,
+        30 * 60 * 1000,
+        30 * 60 * 1000 + 10_000,
+        3 * 60 * 60 * 1000,
+    ] {
+        clawd.tick(now);
+        assert_eq!(now_playing(&clawd), None, "something played at {now} ms");
+    }
+}
+
+#[test]
+fn an_event_never_cuts_a_running_animation() {
+    let mut clawd = settled();
+    clawd.cue(Cue::Switch, 30_000);
+    let jump_ends = 30_000 + frames_ms(Anim::Jump);
+    clawd.cue(Cue::Quarantined, 30_080);
+    clawd.tick(30_080);
+    clawd.tick(jump_ends - 1);
+    assert_eq!(now_playing(&clawd), Some(("jump", 30_000)));
+    clawd.tick(jump_ends);
+    assert_eq!(now_playing(&clawd), Some(("sneeze", jump_ends)));
+}
+
+/// One slot waits behind the running animation and keeps the highest-ranked
+/// event; the others drop and never play.
+#[test]
+fn the_waiting_slot_keeps_the_highest_ranked_event() {
+    let mut clawd = settled();
+    clawd.cue(Cue::SessionMoved, 30_000);
+    clawd.cue(Cue::DelegateDone, 30_100);
+    clawd.cue(Cue::BellCrossed, 30_200);
+    clawd.cue(Cue::Switch, 30_300);
+    clawd.cue(Cue::WindowReset, 30_400);
+    let skip_ends = 30_000 + frames_ms(Anim::Skip);
+    clawd.tick(skip_ends);
+    assert_eq!(now_playing(&clawd), Some(("peek", skip_ends)));
+    let peek_ends = skip_ends + frames_ms(Anim::Peek);
+    clawd.tick(peek_ends);
+    assert_eq!(now_playing(&clawd), None, "a dropped event played");
+    clawd.tick(peek_ends + 5_000);
+    assert_eq!(now_playing(&clawd), None, "a dropped event played");
+}
+
+/// Each rank outranks the one below it in the slot, and only those.
+#[test]
+fn the_slot_ranks_follow_the_bindings() {
+    for (low, low_name, low_rank) in BINDINGS {
+        for (high, high_name, high_rank) in BINDINGS {
+            if high_rank <= low_rank || low_name == "skip" || high_name == "skip" {
+                continue;
+            }
+            let mut clawd = settled();
+            clawd.cue(Cue::SessionMoved, 30_000);
+            clawd.cue(low, 30_100);
+            clawd.cue(high, 30_200);
+            let skip_ends = 30_000 + frames_ms(Anim::Skip);
+            clawd.tick(skip_ends);
+            assert_eq!(
+                now_playing(&clawd),
+                Some((high_name, skip_ends)),
+                "{high:?} outranks {low:?}"
+            );
+
+            let mut clawd = settled();
+            clawd.cue(Cue::SessionMoved, 30_000);
+            clawd.cue(high, 30_100);
+            clawd.cue(low, 30_200);
+            clawd.tick(skip_ends);
+            assert_eq!(
+                now_playing(&clawd),
+                Some((high_name, skip_ends)),
+                "{low:?} displaced {high:?}"
+            );
+        }
+    }
+}
+
+/// A skip's rank holds in the waiting slot against every other rank: it
+/// displaces the lower one and drops before the higher, whichever arrives
+/// first. Each pair runs anchored on a running jump — a third animation, so
+/// neither pair member's own repeat window can swallow it.
+#[test]
+fn a_skip_holds_its_rank_in_the_waiting_slot_against_every_other_rank() {
+    for (other, winner) in [
+        (Cue::WindowReset, "skip"),
+        (Cue::BellCrossed, "peek"),
+        (Cue::Quarantined, "sneeze"),
+    ] {
+        let jump_ends = 30_000 + frames_ms(Anim::Jump);
+        let mut clawd = settled();
+        clawd.cue(Cue::Switch, 30_000);
+        clawd.cue(Cue::SessionMoved, 30_100);
+        clawd.cue(other, 30_200);
+        clawd.tick(jump_ends);
+        assert_eq!(
+            now_playing(&clawd),
+            Some((winner, jump_ends)),
+            "{other:?} meets a skip waiting first"
+        );
+
+        let mut clawd = settled();
+        clawd.cue(Cue::Switch, 30_000);
+        clawd.cue(other, 30_100);
+        clawd.cue(Cue::SessionMoved, 30_200);
+        clawd.tick(jump_ends);
+        assert_eq!(
+            now_playing(&clawd),
+            Some((winner, jump_ends)),
+            "a skip meets {other:?} waiting first"
+        );
+    }
+}
+
+/// A waiting event plays after waiting exactly three seconds and drops after
+/// any longer wait.
+#[test]
+fn a_waiting_event_drops_after_three_seconds() {
+    let mut clawd = settled();
+    clawd.cue(Cue::Switch, 30_000);
+    clawd.cue(Cue::Quarantined, 30_100);
+    clawd.tick(33_100);
+    assert_eq!(now_playing(&clawd), Some(("sneeze", 33_100)));
+
+    let mut clawd = settled();
+    clawd.cue(Cue::Switch, 30_000);
+    clawd.cue(Cue::Quarantined, 30_100);
+    clawd.tick(33_101);
+    assert_eq!(now_playing(&clawd), None, "a stale event played");
+}
+
+/// One animation plays at most once per twenty seconds, whichever event asks
+/// for it; another animation is not held back.
+#[test]
+fn one_animation_plays_at_most_once_per_twenty_seconds() {
+    let mut clawd = settled();
+    clawd.cue(Cue::BellCrossed, 30_000);
+    clawd.tick(40_000);
+    clawd.cue(Cue::Switch, 40_000);
+    assert_eq!(now_playing(&clawd), Some(("jump", 40_000)));
+    clawd.tick(45_000);
+    clawd.cue(Cue::NewIncident, 49_999);
+    assert_eq!(now_playing(&clawd), None, "peek played twice in 20 s");
+    clawd.cue(Cue::DaemonReplaced, 50_000);
+    assert_eq!(now_playing(&clawd), Some(("peek", 50_000)));
+
+    // A dropped request does not restart the twenty seconds.
+    let mut clawd = settled();
+    clawd.cue(Cue::Quarantined, 30_000);
+    clawd.tick(40_000);
+    clawd.cue(Cue::RefreshFailed, 45_000);
+    clawd.cue(Cue::DaemonDown, 50_000);
+    assert_eq!(now_playing(&clawd), Some(("sneeze", 50_000)));
+}
+
+/// While the header draws no art, events drop and nothing advances: the
+/// launch animation waits for the art, and a hidden event never plays later.
+#[test]
+fn a_hidden_mascot_drops_events_and_stops_its_clock() {
+    let mut clawd = Stage::new(Clawd::new());
+    clawd.set_shown(false);
+    clawd.tick(0);
+    clawd.tick(2_000);
+    assert_eq!(now_playing(&clawd), None, "the launch played unseen");
+    clawd.set_shown(true);
+    clawd.tick(2_080);
+    let launch = clawd.playing.expect("no launch once the art shows");
+    assert!(BIG.contains(&launch.anim));
+    assert_eq!(launch.start_ms, 2_080);
+
+    let mut clawd = settled();
+    clawd.set_shown(false);
+    clawd.cue(Cue::Quarantined, 30_000);
+    clawd.tick(30_000);
+    clawd.set_shown(true);
+    clawd.tick(30_080);
+    assert_eq!(now_playing(&clawd), None, "a hidden event played later");
+
+    let mut clawd = settled();
+    clawd.cue(Cue::Switch, 30_000);
+    clawd.cue(Cue::Quarantined, 30_100);
+    clawd.set_shown(false);
+    clawd.tick(30_500);
+    clawd.set_shown(true);
+    clawd.tick(30_000 + frames_ms(Anim::Jump));
+    assert_eq!(
+        now_playing(&clawd),
+        None,
+        "the waiting event survived a hide"
+    );
+}
+
+/// A key after five minutes with no key plays one small hello; a key sooner,
+/// or the next key after the hello, plays nothing. The TUI's start counts as
+/// the last key.
+#[test]
+fn a_key_after_five_quiet_minutes_plays_one_hello() {
+    const QUIET_MS: u64 = 5 * 60 * 1000;
+    let mut clawd = settled();
+    clawd.key_pressed(QUIET_MS - 1);
+    assert_eq!(now_playing(&clawd), None, "a hello before five minutes");
+
+    let mut clawd = settled();
+    clawd.key_pressed(QUIET_MS);
+    let hello = clawd.playing.expect("no hello after five quiet minutes");
+    assert!(HELLO.contains(&hello.anim), "{}", hello.anim.name());
+    assert_eq!(hello.start_ms, QUIET_MS);
+    clawd.tick(QUIET_MS + 2_000);
+    clawd.key_pressed(QUIET_MS + 2_000);
+    assert_eq!(now_playing(&clawd), None, "a second hello");
+
+    // Each key restarts the quiet five minutes.
+    let mut clawd = settled();
+    clawd.key_pressed(200_000);
+    clawd.key_pressed(200_000 + QUIET_MS - 1);
+    assert_eq!(now_playing(&clawd), None, "the quiet span ignored a key");
+    clawd.key_pressed(200_000 + QUIET_MS - 1 + QUIET_MS);
+    assert!(clawd.playing.is_some(), "no hello after a fresh quiet span");
+}
+
+/// `reduce_motion` keeps the mascot on its rest pose: no launch, no event, no
+/// hello moves it.
+#[test]
+fn reduce_motion_keeps_the_mascot_still() {
+    let mut clawd = Stage::new(Clawd::new());
+    clawd.set_reduce_motion(true);
+    clawd.tick(0);
+    assert!(clawd.frame(0).is_none(), "the launch moved a still mascot");
+    for (cue, _, _) in BINDINGS {
+        clawd.cue(cue, 30_000);
+        clawd.tick(30_000);
+        assert!(
+            clawd.frame(30_000).is_none(),
+            "{cue:?} moved a still mascot"
+        );
+    }
+    clawd.key_pressed(10 * 60 * 1000);
+    assert!(
+        clawd.frame(10 * 60 * 1000).is_none(),
+        "a hello moved a still mascot"
+    );
+
+    // Turned on mid-animation, it stills at once.
+    let mut clawd = settled();
+    clawd.cue(Cue::Switch, 30_000);
+    clawd.set_reduce_motion(true);
+    assert!(
+        clawd.frame(30_080).is_none(),
+        "a running animation kept moving"
+    );
+}
+
 #[test]
 fn launch_opens_with_a_big_animation_on_the_first_tick() {
-    let mut clawd = Clawd::new();
+    let mut clawd = Stage::new(Clawd::new());
     assert!(
         clawd.playing.is_none(),
         "construction must not start the launch animation"
@@ -140,7 +420,7 @@ fn launch_opens_with_a_big_animation_on_the_first_tick() {
 
     // A startup slow enough to miss the animation's whole length still gets
     // it: the clock starts at the first tick, not at construction.
-    let mut slow = Clawd::new();
+    let mut slow = Stage::new(Clawd::new());
     slow.tick(5_000);
     let playing = slow.playing.expect("no launch animation on a slow start");
     assert!(BIG.contains(&playing.anim));
@@ -148,73 +428,9 @@ fn launch_opens_with_a_big_animation_on_the_first_tick() {
 }
 
 #[test]
-fn each_ten_second_slot_opens_a_subtle_animation() {
-    let mut clawd = Clawd::new();
-    clawd.tick(0);
-    clawd.tick(SUBTLE_PERIOD_MS);
-    let playing = match clawd.playing {
-        Some(playing) => playing,
-        None => panic!("no animation at the first idle slot"),
-    };
-    assert!(SUBTLE.contains(&playing.anim));
-    assert_eq!(playing.start_ms, SUBTLE_PERIOD_MS);
-}
-
-#[test]
-fn each_thirty_minute_slot_opens_a_big_animation() {
-    let mut clawd = Clawd::new();
-    clawd.tick(0);
-    clawd.tick(BIG_PERIOD_MS);
-    let playing = match clawd.playing {
-        Some(playing) => playing,
-        None => panic!("no animation at the first big slot"),
-    };
-    assert!(BIG.contains(&playing.anim));
-    assert_eq!(playing.start_ms, BIG_PERIOD_MS);
-}
-
-/// A big moment restarts the subtle rhythm: the next idle slot lands a full
-/// period after it, not at the one it swallowed.
-#[test]
-fn a_big_animation_restarts_the_subtle_clock() {
-    let mut clawd = Clawd::new();
-    clawd.next_big_ms = BIG_PERIOD_MS;
-    clawd.next_subtle_ms = BIG_PERIOD_MS;
-    clawd.tick(BIG_PERIOD_MS);
-    let big = clawd.playing.expect("no big animation at its slot");
-    assert!(BIG.contains(&big.anim));
-    assert_eq!(
-        clawd.next_subtle_ms,
-        BIG_PERIOD_MS + SUBTLE_PERIOD_MS,
-        "a big moment pushes the next idle slot out by a full period"
-    );
-
-    clawd.tick(BIG_PERIOD_MS + frames_ms(big.anim));
-    assert!(clawd.playing.is_none(), "the swallowed idle slot fired");
-    assert_eq!(clawd.next_subtle_ms, BIG_PERIOD_MS + SUBTLE_PERIOD_MS);
-}
-
-#[test]
-fn a_running_animation_is_never_cut_short() {
-    let mut clawd = Clawd::new();
-    clawd.tick(0);
-    clawd.tick(SUBTLE_PERIOD_MS);
-    let before = clawd
-        .playing
-        .map(|playing| (playing.anim, playing.start_ms));
-    clawd.tick(SUBTLE_PERIOD_MS + FRAME_MS);
-    assert_eq!(
-        clawd
-            .playing
-            .map(|playing| (playing.anim, playing.start_ms)),
-        before
-    );
-}
-
-#[test]
 fn frames_advance_once_per_tui_tick() {
     let frames = Anim::Wink.frames();
-    let mut clawd = Clawd::new();
+    let mut clawd = Stage::new(Clawd::new());
     clawd.playing = Some(Playing {
         anim: Anim::Wink,
         start_ms: 0,
@@ -262,8 +478,6 @@ fn every_animation_opens_on_its_extracted_first_frame() {
         (Anim::Waddle, ["         ", "         ", "         "]),
         (Anim::Peek, ["         ", "         ", "         "]),
         (Anim::Wink, [" ▐▛███▂█ ", "▝▜██████▀", " ▝▝   ▝▝ "]),
-        (Anim::Boop, ["         ", " ▐▂███▂█ ", "·▜██████·"]),
-        (Anim::Tap, [" ▐▛███▛█ ", "▝▜██████▀", " ▝▝      "]),
         (Anim::Sneeze, ["▗▟▂███▂█▄", " ▜██████▘", " ▝▝   ▝▝ "]),
         (Anim::Turn, [" ▐█▜██▛█ ", "▝▜██████▀", " ▝▝   ▝▝ "]),
         (Anim::CoinHop, ["         ", " ▐▛███▛█ ", "▝▜██████▀"]),
@@ -302,26 +516,6 @@ fn every_facing_rotation_matches_its_extracted_art() {
         };
         assert_eq!(rows(&frame, true), art.map(String::from), "{facing:?}");
     }
-}
-
-#[test]
-fn a_finished_animation_clears_at_its_last_frame_boundary() {
-    let frames = Anim::Wink.frames();
-    let end = FRAME_MS * frames.len() as u64;
-    let mut clawd = Clawd::new();
-    clawd.tick(0);
-    clawd.playing = Some(Playing {
-        anim: Anim::Wink,
-        start_ms: 0,
-    });
-    clawd.next_subtle_ms = end;
-    clawd.tick(end);
-    let playing = match clawd.playing {
-        Some(playing) => playing,
-        None => panic!("the finished slot never opened the due subtle animation"),
-    };
-    assert_eq!(playing.start_ms, end);
-    assert!(SUBTLE.contains(&playing.anim));
 }
 
 /// Claude Code's simplified arm (`bt` in the source): a body edge either side
@@ -418,14 +612,10 @@ fn the_simplified_sprite_paints_every_facing_as_an_open_face() {
     }
 }
 
-/// Claude Code filters its pools for the simplified sprite: no facing frame
-/// anywhere, and the first frame must not be the open-eyed rest pose.
+/// Claude Code filters its launch pool for the simplified sprite: no facing
+/// frame anywhere, and the first frame must not be the open-eyed rest pose.
 #[test]
-fn the_simplified_pools_drop_facings_and_rest_pose_openings() {
-    assert_eq!(
-        subtle_pool(false),
-        [Anim::Look, Anim::Wink, Anim::Boop, Anim::Sneeze].as_slice()
-    );
+fn the_simplified_launch_pool_drops_facings_and_rest_pose_openings() {
     assert_eq!(
         big_pool(false),
         [
@@ -476,4 +666,57 @@ fn every_facing_cuts_the_span_the_source_table_names() {
             );
         }
     }
+}
+
+/// An equal-rank cue arriving behind the one waiting in the slot drops,
+/// whichever of the two lands first: the slot keeps its first occupant at
+/// that rank.
+#[test]
+fn an_equal_rank_event_drops_from_the_waiting_slot() {
+    let mut clawd = settled();
+    clawd.cue(Cue::SessionMoved, 30_000);
+    clawd.cue(Cue::SessionStarted, 30_100);
+    clawd.cue(Cue::Switch, 30_200);
+    let skip_ends = 30_000 + frames_ms(Anim::Skip);
+    clawd.tick(skip_ends);
+    assert_eq!(now_playing(&clawd), Some(("waddle", skip_ends)));
+    let waddle_ends = skip_ends + frames_ms(Anim::Waddle);
+    clawd.tick(waddle_ends);
+    assert_eq!(now_playing(&clawd), None, "the dropped jump played");
+
+    let mut clawd = settled();
+    clawd.cue(Cue::SessionMoved, 30_000);
+    clawd.cue(Cue::Switch, 30_100);
+    clawd.cue(Cue::SessionStarted, 30_200);
+    clawd.tick(skip_ends);
+    assert_eq!(now_playing(&clawd), Some(("jump", skip_ends)));
+    let jump_ends = skip_ends + frames_ms(Anim::Jump);
+    clawd.tick(jump_ends);
+    assert_eq!(now_playing(&clawd), None, "the dropped waddle played");
+}
+
+/// The launch's own animation sits inside the twenty-second window: asking
+/// for it again right after the launch drops, while another animation still
+/// plays. A launch pick has no bound cue of its own, so the request goes in
+/// directly at the same rank an event uses.
+#[test]
+fn the_launch_animation_counts_in_the_twenty_second_window() {
+    let mut clawd = Stage::new(Clawd::new());
+    clawd.tick(0);
+    let launched = clawd.playing.expect("the launch animation").anim;
+    let launch_ends = frames_ms(launched);
+    clawd.tick(launch_ends);
+    assert_eq!(now_playing(&clawd), None, "the launch never ended");
+    clawd.request(launched, Rank::Activity, launch_ends + 1);
+    assert_eq!(
+        now_playing(&clawd),
+        None,
+        "the launch's animation repeated inside twenty seconds"
+    );
+    clawd.request(Anim::Wink, Rank::Activity, launch_ends + 1);
+    assert_eq!(
+        now_playing(&clawd).map(|playing| playing.0),
+        Some("wink"),
+        "a different animation was held back by the launch's window"
+    );
 }

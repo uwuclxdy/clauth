@@ -47,6 +47,7 @@ use crate::fallback::{
 };
 use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
+use crate::hook_jobs::{CacheTtl, TtlSource};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -63,6 +64,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::clawd;
+use crate::tui::mascot;
 use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
@@ -665,6 +667,14 @@ impl ConfigRow {
             | ConfigRow::Create => false,
         }
     }
+
+    /// `+` / `-` step only the two numeric rows: `alert at` and `probe every`.
+    pub(crate) fn steps(self) -> bool {
+        matches!(
+            self,
+            ConfigRow::BellThreshold | ConfigRow::UsageProbeInterval
+        )
+    }
 }
 
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
@@ -839,12 +849,13 @@ pub(crate) fn preferred_days_at(index: usize) -> Vec<Weekday> {
 }
 
 /// Presets for the burn-aware early-switch floor (percent). The projection may
-/// not switch below the chosen value, so wasted headroom is capped at
-/// `100 - floor`. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
+/// not switch below `min(floor, threshold)`, so wasted headroom is capped at
+/// `100 - min(floor, threshold)`; a floor at or above the threshold does
+/// nothing. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
 pub(crate) const BURN_FLOOR_PRESETS: [f64; 4] = [97.0, 98.0, 99.0, 100.0];
 
 /// Presets for the burn-aware projection horizon cap (ms). The projection looks
-/// ahead by `min(refresh_interval, this)`; a shorter cap keeps the switch
+/// ahead by `min(poll interval, this)`; a shorter cap keeps the switch
 /// nearer 100. Default 60 s (see [`crate::profile::DEFAULT_BURN_HORIZON_MS`]).
 pub(crate) const BURN_HORIZON_PRESETS: [u64; 4] = [30_000, 45_000, 60_000, 90_000];
 
@@ -867,6 +878,10 @@ pub(crate) enum GlobalConfigRow {
     /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
+    /// `AppState.reduce_motion`: space/⏎ stills the header mascot, the header
+    /// gauge's account name and the Overview's provider wave, or lets them
+    /// move again.
+    ReduceMotion,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     SwitchOffWhenSpent,
@@ -897,9 +912,9 @@ pub(crate) enum GlobalConfigRow {
     /// Read off disk where it is used, so a flip applies to the next sync pass
     /// and the next swap hand-off. ENUMERATED on/off, ⏎ mirrors space.
     SyncMcpLogins,
-    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
-    /// follow-up b) — off by default, projects the ACTIVE profile's
-    /// utilization ahead of the next poll instead of the static threshold.
+    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`) — off by
+    /// default, also projects the ACTIVE profile's utilization ahead, beside
+    /// the static threshold, which still applies.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
     /// today's chain-position walk) / `soonest weekly reset` / `most weekly
@@ -4416,6 +4431,40 @@ pub(crate) struct ServicesState {
     /// shown row: a blurred detail keeps the fix line's tint only from then
     /// on. Cleared on a selector move to another row.
     pub(crate) problem_entered: bool,
+    /// Whether the plugin detail's walk sits on its OPTIONS row (`idle wake`)
+    /// rather than on [`Self::problem_cursor`]'s problem. Every landing on the
+    /// row stores it (the descend, the walk arms, a cursor clamp that settles
+    /// the walk). Read through [`Self::plugin_on_option`], which also holds
+    /// while the check offers no problem, so a fresh box's detail rests on the
+    /// row.
+    pub(crate) plugin_option_focus: bool,
+    /// The tooltip text the focused `idle wake` option row renders under
+    /// itself, resolved at recompute over the same cache view the readout
+    /// lines read (never re-read per frame). `None` before the first
+    /// recompute.
+    pub(crate) plugin_idle_wake_tooltip: Option<String>,
+    /// Armed when a list `↵` descend lands the plugin walk on the option
+    /// row, or a card replacement clears the last problem the previous plugin
+    /// frame showed, and consumed by the first plugin render of that card. On
+    /// a card with no problems that render scrolls the row and its
+    /// explanation into view once; the arrows then scroll the card freely.
+    pub(crate) plugin_option_scroll_pending: std::cell::Cell<bool>,
+    /// The offset a one-shot scroll rendered for the option row, pending
+    /// adoption into [`Self::detail_scroll`] at the next key, whatever it
+    /// is (the render cannot write that plain field). While it stands the
+    /// free-scroll path draws it, so a frame between the scroll and the
+    /// key never jumps.
+    pub(crate) plugin_option_scroll_adopt: std::cell::Cell<Option<u16>>,
+    /// The option row's index in the detail's line list, published by the
+    /// plugin render — `None` before the first one. The in-view gate of
+    /// [`Self::plugin_option_acts`] reads it.
+    pub(crate) plugin_option_row: std::cell::Cell<Option<usize>>,
+    /// Whether the last plugin detail frame drew a problem. The cursor clamp
+    /// reads it as the "before" side of a card replacement: a replacement that
+    /// leaves a focused plugin detail with no problem arms the option-row
+    /// scroll only if the frame the user last saw showed one, and clears it as
+    /// it arms.
+    pub(crate) plugin_problem_shown: std::cell::Cell<bool>,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
@@ -4517,6 +4566,12 @@ impl Default for ServicesState {
             delegates_has_descended: false,
             problem_cursor: 0,
             problem_entered: false,
+            plugin_option_focus: false,
+            plugin_idle_wake_tooltip: None,
+            plugin_option_scroll_pending: std::cell::Cell::new(false),
+            plugin_option_scroll_adopt: std::cell::Cell::new(None),
+            plugin_option_row: std::cell::Cell::new(None),
+            plugin_problem_shown: std::cell::Cell::new(false),
             herdr_options_cursor: 0,
             herdr_options_entered: false,
             herdr_fix_focus: false,
@@ -4564,8 +4619,51 @@ impl ServicesState {
                 .herdr_fix_focus
                 .then(|| check.problems.first().map(|p| &p.fix))
                 .flatten(),
+            "plugin" if self.plugin_on_option() => None,
             _ => check.problems.get(self.problem_cursor).map(|p| &p.fix),
         }
+    }
+
+    /// Whether the plugin detail's walk sits on the OPTIONS row: the stored
+    /// focus, or a check with no problem to stand on. Says nothing about a
+    /// page key having hidden the walk focus (`diagnostic_focus`).
+    pub(crate) fn plugin_on_option(&self) -> bool {
+        self.plugin_option_focus
+            || self
+                .selected_check()
+                .is_some_and(|c| c.label == "plugin" && c.problems.is_empty())
+    }
+
+    /// Whether `space`/`↵` flip the plugin detail's `idle wake` row: the
+    /// detail holds focus on the row, no page key hid it, and the row itself
+    /// is on screen.
+    pub(crate) fn plugin_option_acts(&self) -> bool {
+        self.focus == ServicesFocus::Detail
+            && !self.diagnostic_focus
+            && self.selected_check().is_some_and(|c| c.label == "plugin")
+            && self.plugin_on_option()
+            && self.plugin_option_row_in_view()
+    }
+
+    /// Whether the option row itself is on screen inside the detail pane's
+    /// viewport, over the geometry the last plugin render published. With no
+    /// geometry published for this card yet (a key before the first frame,
+    /// or a unit test that skips the render) the row counts as in view: the
+    /// in-view gate only applies over a published geometry.
+    fn plugin_option_row_in_view(&self) -> bool {
+        let Some(row) = self.plugin_option_row.get() else {
+            return true;
+        };
+        let scroll = self
+            .displayed_scroll
+            .get()
+            .min(self.detail_max_scroll.get());
+        shunt_block_in_view(
+            scroll as usize,
+            self.detail_viewport.get() as usize,
+            row,
+            row + 1,
+        )
     }
 
     /// Whether `f` would move focus: the row shows a fix line other than the
@@ -5034,15 +5132,40 @@ pub(crate) struct CodexRow {
     pub(crate) fetched_at: Option<u64>,
 }
 
-/// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
-/// roster is one small TOML and each reading is the profile's own cache file
-/// plus the small files beside its store (the quarantine record, and the store
-/// itself on a cache miss for the plan), the same set `status --json` reads
-/// with no daemon running.
+/// [`codex_rows_landed`]'s rows, for the tests that only need the snapshot.
+#[cfg(test)]
 pub(crate) fn codex_rows() -> Vec<CodexRow> {
-    crate::codex_profiles::CodexState::load()
-        .map(|state| codex_rows_from(&state))
-        .unwrap_or_default()
+    codex_rows_landed().0
+}
+
+/// Read the codex roster into the [`App::codex_rows`] snapshot, naming
+/// whether the read landed: construction seeds the mascot's codex edges only
+/// off a landed read, so a roster unreadable then seeds on its first landed
+/// refresh instead of reading as edges. Lock-free: the roster is one small
+/// TOML and each reading is the profile's own cache file plus the small files
+/// beside its store (the quarantine record, and the store itself on a cache
+/// miss for the plan), the same set `status --json` reads with no daemon
+/// running.
+fn codex_rows_landed() -> (Vec<CodexRow>, bool) {
+    match crate::codex_profiles::CodexState::load() {
+        Ok(state) => (codex_rows_from(&state), true),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+/// A window's reset instant, parsed the way every reset compare reads it.
+fn window_reset_instant(window: Option<&crate::usage::UsageWindow>) -> Option<i64> {
+    window
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(crate::usage::iso_to_epoch_secs)
+}
+
+/// One codex row's 5h and 7d reset instants, for the codex reset compare.
+fn window_instants(row: &CodexRow) -> [Option<i64>; 2] {
+    [
+        window_reset_instant(row.five_hour.as_ref()),
+        window_reset_instant(row.seven_day.as_ref()),
+    ]
 }
 
 /// [`codex_rows`] over a roster already read.
@@ -5313,6 +5436,81 @@ impl AutoSwitchProjection {
     }
 }
 
+/// The last reading of each producer field a mascot cue is an edge of. Each
+/// starts from the first reading (construction's, where it takes one), so a
+/// launch is never an event, and a reading that could not be taken leaves the
+/// last one standing rather than reading as a change.
+#[derive(Default)]
+struct MascotSeen {
+    active: Option<SeenAccount>,
+    auth_broken: Vec<SeenAccount>,
+    /// Session id -> the account the row last read ran on, off the last tally
+    /// that read.
+    sessions: Option<std::collections::BTreeMap<String, String>>,
+    /// Per account, each window's 5h and 7d boundary as a `(last named,
+    /// highest named)` pair: the reset test reads the first, the "later"
+    /// test the second.
+    resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Every delegate job id seen finished; `None` before the first read. Ids
+    /// are minted unique and a finish is final, so the set only grows: a read
+    /// that misses a record cannot make it finish twice.
+    delegates_done: Option<HashSet<String>>,
+    /// The codex roster's active name at the last landed reading.
+    codex_active: Option<String>,
+    /// The codex roster's broken names at the last landed reading.
+    codex_broken: Vec<String>,
+    /// Per codex account, each window's 5h and 7d boundary as a `(last
+    /// named, highest named)` pair, the same shape [`Self::resets`] holds.
+    codex_resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Whether a codex reading has landed yet: the first landing seeds, so a
+    /// roster unreadable at construction cannot read as an edge once it lands.
+    codex_seeded: bool,
+}
+
+/// One account as a name-keyed producer field names it, with the stored id
+/// under the name: a rename moves the name but keeps the id, so an id that
+/// matches across a move is the same account, never an event.
+#[derive(Clone)]
+struct SeenAccount {
+    name: ProfileName,
+    id: Option<crate::profile::ProfileId>,
+}
+
+impl SeenAccount {
+    /// The reading under `name` now, with the id the disk holds for it.
+    fn read(name: &ProfileName) -> Self {
+        Self {
+            name: name.clone(),
+            id: crate::profile::stored_profile_id(name),
+        }
+    }
+}
+
+impl MascotSeen {
+    /// The seed a fresh app reads: every name-keyed field with the id the disk
+    /// holds under it.
+    fn seeded(active: Option<&ProfileName>, auth_broken: &[ProfileName]) -> Self {
+        Self {
+            active: active.map(SeenAccount::read),
+            auth_broken: auth_broken.iter().map(SeenAccount::read).collect(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The one mascot slot's concrete type, named here alone: the slot field,
+/// the header's size read and the row floor below all follow it, so swapping
+/// the mascot is a one-site edit.
+type SlotMascot = clawd::Clawd;
+
+/// The art header's info column needs a row for the brand, one for the
+/// status line and one for the tabs: a mascot shorter than three rows cannot
+/// carry them, so the slot mascot's height floors at three.
+const _: () = assert!(
+    <SlotMascot as mascot::Mascot>::SIZE.1 >= 3,
+    "the mascot must stand at least 3 rows tall to carry the header's info column"
+);
+
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -5331,7 +5529,7 @@ pub(crate) struct App {
     pub(crate) op_sender: OpResultSender,
     /// Off-thread AUTH-1 switch-gate answers; drained in `on_tick` by
     /// `drain_switch_gates`, which completes or refuses the pending switch.
-    pub(crate) switch_gates: std::sync::mpsc::Receiver<SwitchGateResult>,
+    pub(crate) switch_gates: Arc<SwitchGates>,
     /// Sender side; cloned into each switch-gate worker.
     pub(crate) switch_gate_tx: std::sync::mpsc::Sender<SwitchGateResult>,
     /// Startup signals from reconcile/bootstrap workers; drained in `on_tick`.
@@ -5376,6 +5574,13 @@ pub(crate) struct App {
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
     pub(crate) stale_cues: HashMap<String, bool>,
+    /// The reading clock per profile, written each tick by `apply_usage` beside
+    /// the stale cue and read by the per-frame snapshot: the OAuth arm's
+    /// `fetched_at` (with the cache mtime fallback for an undatable body), the
+    /// third-party arm's cache mtime. The overdue rows derive their due time
+    /// off this, once per tick, never per frame; the read age dates off the
+    /// reading's own stamp ([`ReadingsSnapshot::read_clock_of`]).
+    pub(crate) reading_clocks: HashMap<String, u64>,
     /// Per-name stats of the durable key-rejection records the last time
     /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
     /// per-second stat per profile is cheap, a per-second read of every record
@@ -5562,8 +5767,6 @@ pub(crate) struct App {
     pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
-    /// Update check thread handle; awaited on TUI exit for clean shutdown.
-    pub(crate) update_handle: Option<update::UpdateThread>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
@@ -5729,6 +5932,11 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
+    /// The model the Models selection holds, by identity: written with the
+    /// cursor by `set_token_model_cursor`, so a list that re-ranked since the
+    /// last write (a bucket rollover) still re-homes the picker onto its model
+    /// rather than the row the old index now names.
+    pub(crate) token_model_identity: Option<String>,
     pub(crate) model_detail_focus: StatusFocus,
     pub(crate) model_detail_scroll: u16,
     pub(crate) model_detail_max_scroll: std::cell::Cell<u16>,
@@ -5783,9 +5991,12 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
-    /// Header mascot playback: a random big animation at launch and every 30
-    /// minutes, a subtler one every 10 seconds.
-    pub(crate) clawd: clawd::Clawd,
+    /// Header mascot playback: one big animation at launch, then a
+    /// [`mascot::Cue`] a producer raises or a quiet key's hello, under the
+    /// slot rules in [`mascot::Stage`].
+    pub(crate) mascot: mascot::Stage<SlotMascot>,
+    /// The readings the per-tick mascot cues compare against.
+    mascot_seen: MascotSeen,
     /// Pinned animation phase for render tests that must sample a specific point
     /// of the wave. Backdating `started_at` instead would subtract from
     /// `Instant::now()`, which panics on a host whose uptime is shorter than the
@@ -5867,6 +6078,8 @@ pub(crate) struct App {
     pub(crate) bootstrap_active: Arc<AtomicBool>,
     /// Signal to the scheduler thread that the UI is shutting down.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The terminal-free shutdown, shared with the stop-signal watcher.
+    pub(crate) shutdown: Arc<Shutdown>,
     /// Per-tab background-event indicator; `None` = no pending activity.
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
@@ -5911,6 +6124,8 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// When [`poll_delegate_jobs`] last read the job store; `None` = due.
+    last_delegate_poll: Option<Instant>,
     /// The job-store snapshot the Setup detail's live-session field reads from,
     /// so a frame never walks `~/.claude/jobs`. Cached like `live_sessions`:
     /// refreshed by [`poll_live_sessions`] on its own tick, never on a config
@@ -6226,6 +6441,14 @@ pub(crate) struct ReadingsSnapshot {
     pub(crate) oauth: HashMap<String, UsageInfo>,
     /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
     pub(crate) stale: HashMap<String, bool>,
+    /// The reading clock per profile name, cloned off `App::reading_clocks` —
+    /// the third-party arm's cache mtime (its `UsageInfo` carries no stamp) and
+    /// the mtime fallback for an undatable OAuth body.
+    pub(crate) clock: HashMap<String, u64>,
+    /// Whether each profile's usage cache is third-party-classified, the
+    /// picker's own split: the read age may date a third-party name off its
+    /// mtime (the file's only writer is a fetch outcome), never an OAuth one.
+    pub(crate) is_third_party: HashMap<String, bool>,
 }
 
 impl ReadingsSnapshot {
@@ -6241,6 +6464,27 @@ impl ReadingsSnapshot {
     pub(crate) fn stale_of(&self, name: &str) -> bool {
         self.stale.get(name).copied().unwrap_or(false)
     }
+    /// The clock dating `name`'s reading: its own stamp (`own_stamp`), falling
+    /// back to the per-tick map — the third-party arm's cache mtime and the mtime
+    /// fallback for an undatable OAuth body.
+    pub(crate) fn clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name)
+            .or_else(|| self.clock.get(name).copied())
+    }
+    /// The clock dating the `read Nm ago` phrase — only a stamp the reading
+    /// itself carries: the picked reading's own `fetched_at`, or a third-party
+    /// reading's cache mtime (its stamp; the file's only writer is a fetch
+    /// outcome). An undatable OAuth body's mtime fallback dates the due time
+    /// ([`Self::clock_of`]) only, never the read age: a date the cache mtime
+    /// alone would give is a date clauth did not read.
+    pub(crate) fn read_clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name).or_else(|| {
+            self.clock
+                .get(name)
+                .copied()
+                .filter(|_| self.is_third_party.get(name).is_some_and(|tp| *tp))
+        })
+    }
     /// Whether `name`'s UNPICKED OAuth reading carries the no-5h-limit mark
     /// ([`crate::usage::UsageInfo::no_five_hour_limit`]) — the store the
     /// scheduler's election reads. The picked reading (`usage_of`) is the
@@ -6248,6 +6492,15 @@ impl ReadingsSnapshot {
     /// verdict reads only off the raw OAuth store.
     pub(crate) fn no_five_hour_limit(&self, name: &str) -> bool {
         self.oauth.get(name).is_some_and(|u| u.no_five_hour_limit)
+    }
+    /// The reading's own stamp when it dates the present: only a live fetch
+    /// stamps `fetched_at`, and a future stamp proves the clock moved, not
+    /// that the read is fresh ([`crate::usage::usage_cache_clock_of`]).
+    fn own_stamp(&self, name: &str) -> Option<u64> {
+        self.usage
+            .get(name)
+            .and_then(|u| u.fetched_at)
+            .filter(|at| *at <= crate::usage::now_ms())
     }
 }
 
@@ -6434,9 +6687,53 @@ impl App {
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
+        let (codex, codex_landed) = codex_rows_landed();
+        let mascot_seen = MascotSeen {
+            sessions: live_sessions.session_members().cloned(),
+            codex_seeded: codex_landed,
+            codex_active: codex
+                .iter()
+                .find(|row| row.active)
+                .map(|row| row.name.to_string()),
+            codex_broken: codex
+                .iter()
+                .filter(|row| row.broken)
+                .map(|row| row.name.to_string())
+                .collect(),
+            codex_resets: codex
+                .iter()
+                .map(|row| {
+                    (
+                        row.name.to_string(),
+                        Self::seed_windows(window_instants(row)),
+                    )
+                })
+                .collect(),
+            ..MascotSeen::seeded(
+                config.state.active_profile.as_ref(),
+                &config.state.auth_broken,
+            )
+        };
+        let mut mascot = mascot::Stage::new(SlotMascot::new());
+        mascot.set_reduce_motion(config.state.reduce_motion);
 
+        let config: ConfigHandle = Arc::new(RankedMutex::new(config));
+        let switch_gates = Arc::new(SwitchGates(std::sync::Mutex::new(switch_gates)));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Shutdown {
+            ran: std::sync::Once::new(),
+            began: AtomicBool::new(false),
+            shutting_down: Arc::clone(&shutting_down),
+            activity: Arc::clone(&activity),
+            switch_gates: Arc::clone(&switch_gates),
+            config: Arc::clone(&config),
+            scheduler: std::sync::Mutex::new(None),
+            update_handle: std::sync::Mutex::new(update_handle),
+            #[cfg(test)]
+            runs: AtomicUsize::new(0),
+        });
         let mut app = Self {
-            config: Arc::new(RankedMutex::new(config)),
+            config,
             usage_store,
             usage_status,
             usage_tokens,
@@ -6465,6 +6762,7 @@ impl App {
             claude_resets_memo,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
+            reading_clocks: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             credit_refusals: HashMap::new(),
@@ -6541,7 +6839,6 @@ impl App {
             compact: false,
             below_width_floor: false,
             update_results,
-            update_handle,
             login: None,
             shunt_paste: None,
             shunt_add_committed: None,
@@ -6596,6 +6893,7 @@ impl App {
             tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
+            token_model_identity: None,
             model_detail_focus: StatusFocus::List,
             model_detail_scroll: 0,
             model_detail_max_scroll: std::cell::Cell::new(0),
@@ -6625,7 +6923,8 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
-            clawd: clawd::Clawd::new(),
+            mascot,
+            mascot_seen,
             #[cfg(test)]
             anim_phase_ms: None,
             #[cfg(test)]
@@ -6648,7 +6947,8 @@ impl App {
             startup_seeded: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
+            shutdown,
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: crate::bell::BellLatch::default(),
             history_cache,
@@ -6658,6 +6958,7 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            last_delegate_poll: None,
             job_trees,
             handed_off,
             tps,
@@ -6668,7 +6969,7 @@ impl App {
             #[cfg(test)]
             delegate_speed_walks: 0,
             last_finished_speeds_refresh: Instant::now(),
-            codex_rows: codex_rows(),
+            codex_rows: codex,
             claude_resets,
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
@@ -6834,12 +7135,31 @@ impl App {
     /// `false` paints Claude Code's simplified mascot, the one it draws on
     /// Apple's Terminal.app.
     pub(crate) fn with_full_sprite(mut self, full_sprite: bool) -> Self {
-        self.clawd.full_sprite = full_sprite;
+        self.mascot.set_full_sprite(full_sprite);
         self
     }
 
-    /// The production write path for the tally after construction.
+    /// The production write path for the tally after construction. A session
+    /// id the last read tally lacked is a session starting; one whose account
+    /// (the member it runs on) changed has moved, whatever its swap stamp. An
+    /// unread tally is no reading.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        if let Some(now) = tally.session_members() {
+            let mut cues = Vec::new();
+            if let Some(before) = &self.mascot_seen.sessions {
+                for (id, member) in now {
+                    match before.get(id) {
+                        None => cues.push(mascot::Cue::SessionStarted),
+                        Some(was) if was != member => cues.push(mascot::Cue::SessionMoved),
+                        Some(_) => {}
+                    }
+                }
+            }
+            self.mascot_seen.sessions = Some(now.clone());
+            for cue in cues {
+                self.cue_mascot(cue);
+            }
+        }
         self.live_sessions = tally;
     }
 
@@ -6973,7 +7293,7 @@ impl App {
                             *boot = Some(settled.placed);
                         }
                         let _placed = enter_bare_item_placement(settled.placed);
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                     Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
@@ -6983,7 +7303,7 @@ impl App {
                     }
                     Err(e) => {
                         crate::logline::logline!("clauth: {e:#}");
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                 }
@@ -7075,7 +7395,7 @@ impl App {
     /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
     /// `usage_store` paired with the in-memory `history_cache`; `None` for a
     /// third-party-classified active, whose provider window never pairs with the
-    /// OAuth burn history (maintainer ruling 2026-09-10).
+    /// OAuth burn history.
     fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
         let (name, third_party) = {
             let cfg = self.config();
@@ -7176,7 +7496,7 @@ impl App {
             .map(|m| m.threshold)
             .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
         // A third-party-classified active has no burn history to pair with its
-        // provider window (maintainer ruling 2026-09-10), so no rate.
+        // provider window, so no rate.
         let active_rate = if third_party_names.contains(&active) {
             None
         } else {
@@ -7257,7 +7577,7 @@ impl App {
             return;
         }
         self.refresh_tokens();
-        self.start_scheduler();
+        self.shutdown.adopt_scheduler(self.start_scheduler());
         self.apply_usage();
         // Single-fetcher lease (#27): the startup switch one-shot is a switch
         // DECISION, so it may run only if THIS instance is the fetcher. Acquire
@@ -7333,7 +7653,7 @@ impl App {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher.
-    fn start_scheduler(&self) {
+    fn start_scheduler(&self) -> crate::daemon::TickThread {
         let h = WorkerHandles::from_app(self);
         spawn_refresher(
             h.config,
@@ -7370,7 +7690,7 @@ impl App {
             // Pinned by construction, not a test: a TUI test drives this call site but never reads the provider store this flag shapes.
             true,
             h.snapshot,
-        );
+        )
     }
 
     /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
@@ -7510,7 +7830,56 @@ impl App {
             third_party: third_party_usage,
             oauth: usage_store,
             stale: self.stale_cues.clone(),
+            clock: self.reading_clocks.clone(),
+            is_third_party: third_party,
         }
+    }
+
+    /// A window resets when a fresh reading names a later boundary and the
+    /// boundary it last named has passed. "Later" compares against the
+    /// highest boundary ever named and "passed" against the one last named:
+    /// a rollover spike reports `now + 5h` for a while before settling onto
+    /// the boundary the window really ends on, so the highest instant alone
+    /// would keep the next rollover from counting once the settled boundary
+    /// passed. Compared as an instant, so the same reset spelled in another
+    /// offset is none, and the highest instant outlives a lapsed window, so
+    /// a window reopening on a later reset still counts.
+    fn observe_window_resets(&mut self, readings: Vec<(String, [Option<i64>; 2])>) {
+        let now = crate::usage::now_epoch_secs();
+        if Self::reset_windows(&mut self.mascot_seen.resets, readings, now) {
+            self.cue_mascot(mascot::Cue::WindowReset);
+        }
+    }
+
+    /// The per-boundary reset compare shared by the claude and codex arms: a
+    /// fresh reading that names a later boundary than the highest one ever named
+    /// resets once the boundary LAST named has passed. The pair keeps both facts —
+    /// a rollover spike reports `now + 5h` for a while before settling, so the
+    /// highest instant alone would keep the next rollover from counting long
+    /// after the settled boundary passed.
+    fn reset_windows(
+        seen: &mut HashMap<String, [Option<(i64, i64)>; 2]>,
+        readings: impl IntoIterator<Item = (String, [Option<i64>; 2])>,
+        now: i64,
+    ) -> bool {
+        let mut reset = false;
+        for (name, instants) in readings {
+            let slot = seen.entry(name).or_default();
+            for (seen, read) in slot.iter_mut().zip(instants) {
+                let Some(read) = read else {
+                    continue;
+                };
+                reset |= seen.is_some_and(|(last, max)| last <= now && read > max);
+                *seen = Some((read, seen.map_or(read, |(_, max)| max.max(read))));
+            }
+        }
+        reset
+    }
+
+    /// The first stored reading of a window pair: the boundary last named and the
+    /// highest one are the same instant, so no reset can fire off it.
+    fn seed_windows(instants: [Option<i64>; 2]) -> [Option<(i64, i64)>; 2] {
+        instants.map(|instant| instant.map(|instant| (instant, instant)))
     }
 
     pub(crate) fn apply_usage(&mut self) {
@@ -7518,13 +7887,15 @@ impl App {
         // bell, history/wallet re-read sets and the stale map all derive from
         // its one picker pass, never a second one.
         let readings = self.readings_snapshot();
-        let (bells, history_names, wallet_names, stale_map) = {
+        let (bells, resets, history_names, wallet_names, stale_map, clock_map) = {
             let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             let mut stale_map = HashMap::new();
+            let mut clock_map = HashMap::new();
             let mut bells = Vec::new();
+            let mut resets = Vec::new();
             let mut history_names = Vec::new();
             let mut wallet_names = Vec::new();
             for p in &cfg.profiles {
@@ -7549,9 +7920,14 @@ impl App {
                     && oauth_usage
                         .as_ref()
                         .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                // One mtime stat per third-party profile per pass: the stale
+                // arm and the due-time clock arm share it.
+                let tp_mtime = p
+                    .usage_cache_is_third_party()
+                    .then(|| profile_cache_mtime_ms(&p.name, usage_cache_file(p)))
+                    .flatten();
                 let past_threshold = if p.usage_cache_is_third_party() {
-                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
-                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
+                    tp_mtime.is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
                 } else {
                     crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
                         stale_after_ms(interval_ms),
@@ -7562,6 +7938,21 @@ impl App {
                 };
                 let stale = !spent_skipped && past_threshold;
                 stale_map.insert(name.clone(), stale);
+                // The due-time clock the overdue arms derive their deadline
+                // off: the third-party arm's cache mtime (that file's only
+                // writer is a fetch outcome), the OAuth arm's own stamp with
+                // the mtime fallback for an undatable body. The fallback
+                // dates the due time only — the read age dates off the
+                // reading's own stamp, so an undatable OAuth body shows its
+                // overdue forms undated.
+                let clock = if p.usage_cache_is_third_party() {
+                    tp_mtime
+                } else {
+                    crate::usage::usage_cache_clock_of(&p.name, oauth_usage.as_ref())
+                };
+                if let Some(at) = clock {
+                    clock_map.insert(name.clone(), at);
+                }
                 // The same reading the daemon's bell judges: a lapsed 5h
                 // window is no figure, and an aged one is not fresh.
                 let util = readings
@@ -7588,7 +7979,17 @@ impl App {
                         .is_none_or(|age| stale && age > stale_after_ms(interval_ms)),
                     None => stale,
                 };
-                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !bell_stale;
+                let fetched_fresh = readings.status_of(&name) == Some(FetchStatus::Fresh);
+                if fetched_fresh && let Some(usage) = readings.usage_of(&name) {
+                    resets.push((
+                        name.clone(),
+                        [
+                            window_reset_instant(usage.five_hour.as_ref()),
+                            window_reset_instant(usage.seven_day.as_ref()),
+                        ],
+                    ));
+                }
+                let fresh = fetched_fresh && !bell_stale;
                 bells.push((name.clone(), p.bell_threshold, util, fresh));
                 if readings.usage.contains_key(&name) {
                     history_names.push(name.clone());
@@ -7597,22 +7998,35 @@ impl App {
                     wallet_names.push(name);
                 }
             }
-            (bells, history_names, wallet_names, stale_map)
+            (
+                bells,
+                resets,
+                history_names,
+                wallet_names,
+                stale_map,
+                clock_map,
+            )
         };
         self.stale_cues = stale_map;
+        self.reading_clocks = clock_map;
         // `bells` is the full profile set this pass observed, so an account
         // deleted while ringing forgets and re-arms if re-created past the line.
         {
             let present: HashSet<&str> =
                 bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
             self.bell_fired.forget_absent(&present);
+            self.mascot_seen
+                .resets
+                .retain(|name, _| present.contains(name.as_str()));
         }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);
                 self.set_tab_activity(Tab::Overview, ToastKind::Warning);
+                self.cue_mascot(mascot::Cue::BellCrossed);
             }
         }
+        self.observe_window_resets(resets);
 
         // Re-read any history log that changed on disk. The file is written by
         // whichever process holds the fetch lease — this one or a headless
@@ -8000,13 +8414,28 @@ impl App {
     /// binding surface.
     const WIDTH_FLOOR: u16 = 34;
 
+    /// The one mascot slot's cell size, `(columns, rows)`: the header's art
+    /// fit, its height and its logo column read it, and it follows the slot's
+    /// type ([`SlotMascot`]), so a new mascot re-sizes the header from the
+    /// one place its type is named.
+    pub(crate) const MASCOT_SIZE: (usize, usize) = <SlotMascot as mascot::Mascot>::SIZE;
+
     /// Called each frame with the current terminal size. Tracks compact
     /// state and the width floor; the matching warning banner is recomputed
     /// from these flags in `update_banner` each tick, so it self-clears on
-    /// resize (no toast).
+    /// resize (no toast). The mascot plays only while the header draws its art.
     pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
         self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
+        let frame = ratatui::layout::Rect::new(0, 0, terminal_width, terminal_height);
+        self.mascot.set_shown(crate::tui::render::art_fits(frame));
+    }
+
+    /// The one seam every mascot cue goes through, stamped on the clock the
+    /// mascot draws by.
+    pub(crate) fn cue_mascot(&mut self, cue: mascot::Cue) {
+        let now_ms = self.anim_ms();
+        self.mascot.cue(cue, now_ms);
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -9044,6 +9473,87 @@ pub(crate) fn pane_state(app: &App) -> PaneState {
     PaneState::Rest
 }
 
+/// Whether the tab's descended scrolling pane has anywhere to scroll: the bound
+/// its render published this frame, which the body draws before the footer and
+/// the help modal, and the one its `↑`/`↓` clamp against. A pane that fits
+/// moves nothing either way, so no hint offers its arrows.
+pub(crate) fn detail_scrolls(app: &App) -> bool {
+    match app.tab {
+        Tab::Usage => app.usage_detail_max_scroll.get() > 0,
+        Tab::Tokens => app.model_detail_max_scroll.get() > 0,
+        Tab::Status => app.status.detail_max_scroll.get() > 0,
+        Tab::Services => app.services.detail_max_scroll.get() > 0,
+        Tab::Overview | Tab::Setup | Tab::Fallback | Tab::Config => false,
+    }
+}
+
+/// What the page keys do on this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageAction {
+    /// The press pages a selection: a list walk, or the delegates job list.
+    Move,
+    /// The press scrolls a pane: a detail's scroll, the shunt card, the
+    /// herdr / plugin diagnostics.
+    Scroll,
+}
+
+/// The page keys' effect on this frame, read off the same routing the key
+/// handlers use: `None` where a press moves nothing. A list, a Setup card and
+/// the Fallback card or `+ add` picker page their selection only while they
+/// have a second row to walk to; the Tokens dashboard pages its cards only
+/// once [`dash_walks`] holds; the delegates detail pages its job list only
+/// while it can move; the Usage / Tokens / Status scroll details, the shunt
+/// card, the herdr / plugin diagnostics and the generic scroll details scroll
+/// only while their published bound leaves somewhere to go.
+pub(crate) fn page_keys_act(app: &App) -> Option<PageAction> {
+    match app.tab {
+        Tab::Overview => walk_moves(app.main_items().len()).then_some(PageAction::Move),
+        Tab::Usage => match app.usage_detail_focus {
+            StatusFocus::Detail => detail_scrolls(app).then_some(PageAction::Scroll),
+            StatusFocus::List => walk_moves(app.setup_items().len()).then_some(PageAction::Move),
+        },
+        Tab::Tokens => match app.token_view {
+            TokenView::Dashboard => dash_walks(app).then_some(PageAction::Move),
+            TokenView::Models if app.model_detail_focus == StatusFocus::Detail => {
+                detail_scrolls(app).then_some(PageAction::Scroll)
+            }
+            TokenView::Models => walk_moves(token_model_count(app)).then_some(PageAction::Move),
+        },
+        Tab::Setup => match app.config_focus {
+            ConfigFocus::Profiles => {
+                walk_moves(app.setup_items().len() + 1).then_some(PageAction::Move)
+            }
+            ConfigFocus::Actions => {
+                walk_moves(setup_card_row_count(app)).then_some(PageAction::Move)
+            }
+        },
+        Tab::Fallback => match app.fallback_focus {
+            FallbackFocus::Chain => walk_moves(chain_items(app).len()).then_some(PageAction::Move),
+            // A member card walks its rows; the `+ add` picker its candidates.
+            FallbackFocus::Detail => walk_moves(match selected_chain_member(app) {
+                Some(_) => FALLBACK_ROWS.len(),
+                None => chain_candidates(app).len(),
+            })
+            .then_some(PageAction::Move),
+        },
+        Tab::Config => Some(PageAction::Move),
+        Tab::Status => match app.status.focus {
+            StatusFocus::Detail => detail_scrolls(app).then_some(PageAction::Scroll),
+            StatusFocus::List => walk_moves(app.status.incidents.len()).then_some(PageAction::Move),
+        },
+        Tab::Services => match app.services.focus {
+            ServicesFocus::List => walk_moves(app.services.row_count()).then_some(PageAction::Move),
+            ServicesFocus::Detail => match app.services.selected_check().map(|c| c.label) {
+                Some("delegates") => app
+                    .services
+                    .delegates_selection_moves()
+                    .then_some(PageAction::Move),
+                _ => detail_scrolls(app).then_some(PageAction::Scroll),
+            },
+        },
+    }
+}
+
 /// Back out of the current sub-focus, the `esc`/`←` ascend path. Mirrors the
 /// `esc` chain exactly so `←` and `esc` can never diverge.
 fn ascend_pane(app: &mut App) {
@@ -9117,6 +9627,15 @@ fn alt_jump_target(key: KeyEvent) -> Option<Tab> {
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
+    }
+    let now_ms = app.anim_ms();
+    app.mascot.key_pressed(now_ms);
+
+    // The offset a one-shot scroll rendered becomes the key state on the next
+    // key, whatever it is, ahead of every handler: a reset then acts on the
+    // scroll the user saw.
+    if let Some(offset) = app.services.plugin_option_scroll_adopt.take() {
+        app.services.detail_scroll = offset;
     }
 
     // `ctrl+c` arms or completes its own 2-step quit, ahead of every owner so a
@@ -9290,9 +9809,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('a') => {
-            let state = build_action_menu(app);
-            if !state.items.is_empty() {
-                app.open_modal(Modal::ActionMenu(state));
+            if action_menu_opens(app) {
+                app.open_modal(Modal::ActionMenu(build_action_menu(app)));
             }
             return;
         }
@@ -9315,8 +9833,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if app.tab == Tab::Usage {
                 usage_refresh(app);
             } else {
-                app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing every account");
+                refresh_every_account(app);
             }
             return;
         }
@@ -9477,16 +9994,40 @@ pub(crate) fn token_model_count(app: &App) -> usize {
     token_period_models(app).len()
 }
 
-/// Keep detail focus on a model only while the active list can select one.
-fn clamp_token_model_cursor(app: &mut App) {
-    let len = token_model_count(app);
-    if len == 0 {
+/// The identity of the model under the Models cursor, `None` while the active
+/// list is empty.
+fn token_model_at_cursor(app: &App) -> Option<String> {
+    token_period_models(app)
+        .get(app.token_model_cursor)
+        .map(|m| m.model.clone())
+}
+
+/// Point the Models cursor at row `cursor` and store the model that row names
+/// as the selection's anchor. The one writer of both, so the anchor a later
+/// re-home reads always names the model the picker shows.
+fn set_token_model_cursor(app: &mut App, cursor: usize) {
+    app.token_model_cursor = cursor;
+    app.token_model_identity = token_model_at_cursor(app);
+}
+
+/// Re-anchor the Models cursor after the ranked list changed: the selection
+/// follows its model wherever the new ranking put it, and a model gone from
+/// the new list keeps the old row index, clamped to the last row. Sites that
+/// change the list BEFORE re-ranking (the cache toggle, a period or filter
+/// change) capture the identity from the live cursor; the sites that may run
+/// after the list already re-ranked (a bucket-bound tick, a stats load) pass
+/// the stored anchor instead.
+fn rehome_token_model_cursor(app: &mut App, identity: Option<String>) {
+    let models = token_period_models(app);
+    // Detail focus holds only while the active list can select a model.
+    if models.is_empty() {
         app.model_detail_focus = StatusFocus::List;
         app.model_detail_scroll = 0;
     }
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    let cursor = identity
+        .and_then(|identity| models.iter().position(|m| m.model == identity))
+        .unwrap_or_else(|| app.token_model_cursor.min(models.len().saturating_sub(1)));
+    set_token_model_cursor(app, cursor);
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -9523,7 +10064,7 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                 app.token_view = TokenView::Models;
                 app.model_detail_focus = StatusFocus::List;
                 app.model_detail_scroll = 0;
-                app.token_model_cursor = 0;
+                set_token_model_cursor(app, 0);
             }
             KeyCode::Up => dash_move_focus(app, DashDir::Prev),
             KeyCode::Down => dash_move_focus(app, DashDir::Next),
@@ -9562,22 +10103,25 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
             } else {
                 let len = token_model_count(app);
                 match key.code {
-                    KeyCode::Up if len > 0 => {
-                        app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+                    KeyCode::Up if walk_moves(len) => {
+                        set_token_model_cursor(
+                            app,
+                            (app.token_model_cursor + len - 1).rem_euclid(len),
+                        );
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::Down if len > 0 => {
-                        app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                    KeyCode::Down if walk_moves(len) => {
+                        set_token_model_cursor(app, (app.token_model_cursor + 1).rem_euclid(len));
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::PageUp if len > 0 => {
-                        app.token_model_cursor =
-                            selector_page_up(app.token_model_cursor, &app.models_selector);
+                    KeyCode::PageUp if walk_moves(len) => {
+                        let next = selector_page_up(app.token_model_cursor, &app.models_selector);
+                        set_token_model_cursor(app, next);
                         app.model_detail_scroll = 0;
                     }
-                    KeyCode::PageDown if len > 0 => {
-                        app.token_model_cursor =
-                            selector_page_down(app.token_model_cursor, &app.models_selector);
+                    KeyCode::PageDown if walk_moves(len) => {
+                        let next = selector_page_down(app.token_model_cursor, &app.models_selector);
+                        set_token_model_cursor(app, next);
                         app.model_detail_scroll = 0;
                     }
                     KeyCode::Enter if len > 0 => {
@@ -9599,15 +10143,23 @@ enum DashDir {
     PageDown,
 }
 
+/// Whether the dashboard's card walk (`↑`/`↓` and the page keys) acts: only
+/// once the render has laid out all seven cards. A failed read and the
+/// pre-first-paint spinner draw no cards, so the walk has nothing to move.
+/// The walk's handler, the help's card rows and [`page_keys_act`] read this.
+pub(crate) fn dash_walks(app: &App) -> bool {
+    app.token_dash_rows.borrow().len() == 7
+}
+
 /// Move dashboard card focus one step (or one page) and reconcile the
 /// first-visible card, both through [`follow_dash_focus`].
 fn dash_move_focus(app: &mut App, dir: DashDir) {
+    if !dash_walks(app) {
+        return;
+    }
     let (new_focus, new_first) = {
         let order = app.token_dash_order.get();
         let rows = app.token_dash_rows.borrow();
-        if rows.len() != 7 {
-            return;
-        }
         let viewport = app.token_dash_viewport.get();
         let Some(pos) = order.iter().position(|&k| k == app.token_dash_focus) else {
             return;
@@ -10168,7 +10720,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.token_view = TokenView::Dashboard;
             app.model_detail_focus = StatusFocus::List;
             app.model_detail_scroll = 0;
-            app.token_model_cursor = 0;
+            set_token_model_cursor(app, 0);
         }
         Tab::Setup => {
             if keyboard_owner(app).is_some() {
@@ -10263,6 +10815,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                 // A fresh entry is a new subject, not a leave: every detail
                 // starts never-entered, whatever the ascend above flagged.
                 app.services.problem_entered = false;
+                app.services.plugin_option_focus = false;
                 app.services.herdr_options_entered = false;
                 app.services.cursor = 0;
                 app.services.detail_scroll = 0;
@@ -10408,6 +10961,15 @@ fn reseed_shunt_field(app: &mut App) {
     };
     *input = InputState::new(current.as_deref().unwrap_or(""));
     *saved = current;
+}
+
+/// Whether a wrapping `↑`/`↓` walk over `len` rows lands anywhere new: a lone
+/// row wraps onto itself, so its walk moves nothing and no hint offers it.
+/// The Overview, Tokens Models, Usage, Status, Services and Setup account
+/// lists and the Setup pool detail gate their walk and page arms on it, so a
+/// press the surfaces hide there changes nothing.
+pub(crate) fn walk_moves(len: usize) -> bool {
+    len > 1
 }
 
 /// Move `profile_cursor` by `delta`, wrapping in `0..len`.
@@ -10625,19 +11187,19 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up if count > 0 => {
+        KeyCode::Up if walk_moves(count) => {
             app.move_overview_cursor((app.overview_cursor + count - 1) % count);
         }
-        KeyCode::Down if count > 0 => {
+        KeyCode::Down if walk_moves(count) => {
             app.move_overview_cursor((app.overview_cursor + 1) % count);
         }
-        KeyCode::PageUp if count > 0 => {
+        KeyCode::PageUp if walk_moves(count) => {
             app.move_overview_cursor(selector_page_up(
                 app.overview_cursor,
                 &app.overview_selector,
             ));
         }
-        KeyCode::PageDown if count > 0 => {
+        KeyCode::PageDown if walk_moves(count) => {
             app.move_overview_cursor(selector_page_down(
                 app.overview_cursor,
                 &app.overview_selector,
@@ -10675,20 +11237,20 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
     }
     let count = app.setup_items().len();
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up if walk_moves(count) => {
             step_usage_cursor(app, -1);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::Down => {
+        KeyCode::Down if walk_moves(count) => {
             step_usage_cursor(app, 1);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp if walk_moves(count) => {
             let next = selector_page_up(app.usage_position(), &app.usage_selector);
             app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown if walk_moves(count) => {
             let next = selector_page_down(app.usage_position(), &app.usage_selector);
             app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
@@ -10819,19 +11381,19 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
         StatusFocus::List => {
             let len = app.status.incidents.len();
             match key.code {
-                KeyCode::Up if len > 0 => {
+                KeyCode::Up if walk_moves(len) => {
                     app.status.cursor = (app.status.cursor + len - 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::Down if len > 0 => {
+                KeyCode::Down if walk_moves(len) => {
                     app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::PageUp if len > 0 => {
+                KeyCode::PageUp if walk_moves(len) => {
                     app.status.cursor = selector_page_up(app.status.cursor, &app.status.selector);
                     app.status.detail_scroll = 0;
                 }
-                KeyCode::PageDown if len > 0 => {
+                KeyCode::PageDown if walk_moves(len) => {
                     app.status.cursor = selector_page_down(app.status.cursor, &app.status.selector);
                     app.status.detail_scroll = 0;
                 }
@@ -10886,34 +11448,53 @@ fn trigger_status_refresh(app: &mut App) {
     app.toast(ToastKind::Info, "refreshing status");
 }
 
+/// Whether the focused Services frame binds the fix keys (`f` walks to the
+/// next fix line, `↵` opens the focused one's confirm): the list, and the
+/// shunt, herdr and plugin-problems detail keymaps. Every other detail is
+/// scroll-only, so a fix line there acts on neither key, and neither surface
+/// advertises one.
+pub(crate) fn services_fix_keys_act(app: &App) -> bool {
+    match app.services.focus {
+        ServicesFocus::List => true,
+        ServicesFocus::Detail => match app.services.selected_check().map(|c| c.label) {
+            Some("shunt" | "herdr") => true,
+            Some("plugin") => app
+                .services
+                .selected_check()
+                .is_some_and(|c| !c.problems.is_empty()),
+            _ => false,
+        },
+    }
+}
+
 /// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
 /// to the detail pane (the `delegates` detail only while it lists a job), `f`
 /// descends onto the selected row's first fix line. Detail focus: the plugin
-/// detail walks its fixable problems, the herdr detail walks its heal line and
-/// options rows, the delegates detail walks its jobs, every other detail
-/// scrolls (clamped by the render pass); `f` walks to the next fix line and `↵`
-/// on a focused one opens its confirm.
+/// detail walks its fixable problems and then its OPTIONS row, the herdr
+/// detail walks its heal line and options rows, the delegates detail walks
+/// its jobs, every other detail scrolls (clamped by the render pass); `f`
+/// walks to the next fix line and `↵` on a focused one opens its confirm.
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
             let len = app.services.row_count();
             let before = app.services.cursor;
             match key.code {
-                KeyCode::Up if len > 0 => {
+                KeyCode::Up if walk_moves(len) => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
                     app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::Down if len > 0 => {
+                KeyCode::Down if walk_moves(len) => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
                     app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::PageUp if len > 0 => {
+                KeyCode::PageUp if walk_moves(len) => {
                     app.services.cursor =
                         selector_page_up(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
@@ -10921,7 +11502,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
-                KeyCode::PageDown if len > 0 => {
+                KeyCode::PageDown if walk_moves(len) => {
                     app.services.cursor =
                         selector_page_down(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
@@ -10952,6 +11533,15 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         } else {
                             settle_shunt_focus(app);
                         }
+                        if app
+                            .services
+                            .selected_check()
+                            .is_some_and(|c| c.label == "plugin")
+                            && app.services.plugin_on_option()
+                        {
+                            app.services.plugin_option_focus = true;
+                            app.services.plugin_option_scroll_pending.set(true);
+                        }
                     }
                 }
                 KeyCode::Char('f') => {
@@ -10965,6 +11555,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
             // keeps the remembered row.
             if app.services.cursor != before {
                 app.services.problem_entered = false;
+                app.services.plugin_option_focus = false;
                 app.services.herdr_options_entered = false;
             }
         }
@@ -10973,6 +11564,11 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
             if matches!(label, Some("herdr" | "plugin"))
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
+                // Diagnostics that fit leave a page press nothing to read: it
+                // neither scrolls nor moves focus onto them.
+                if page_keys_act(app).is_none() {
+                    return;
+                }
                 let max = app.services.detail_max_scroll.get();
                 let viewport = app.services.detail_viewport.get();
                 let origin = if app.services.diagnostic_focus {
@@ -10988,12 +11584,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 };
             } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
-            } else if label == Some("plugin")
-                && app
-                    .services
-                    .selected_check()
-                    .is_some_and(|c| !c.problems.is_empty())
-            {
+            } else if label == Some("plugin") {
                 handle_plugin_problems_key(app, key);
             } else if label == Some("shunt") {
                 handle_shunt_detail_key(app, key);
@@ -11069,10 +11660,15 @@ fn walk_to_next_fix(app: &mut App) {
             } else if app.services.diagnostic_focus {
                 let top = app.services.displayed_scroll.get() as usize;
                 problems.iter().position(|&line| line >= top).unwrap_or(0)
+            } else if app.services.plugin_option_focus {
+                // The plugin's OPTIONS row sits below every fix line, so the
+                // next fix from it wraps to the first.
+                0
             } else {
                 (app.services.problem_cursor + 1) % problems.len()
             };
             app.services.diagnostic_focus = false;
+            app.services.plugin_option_focus = false;
             app.services.problem_cursor = next;
         }
     }
@@ -11128,29 +11724,75 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     app.services.set_shunt_focus(Some(stops[target].kind()));
 }
 
-/// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
-/// problems (wrapping), `↵` opens the focused one's confirm. The render keeps
-/// the focused line on screen; there is no manual scroll offset to maintain
-/// here.
+/// The plugin detail's keymap: ↑↓ move over the fixable problems and then the
+/// OPTIONS row as one wrapping list, `f` over the problems alone; `↵` opens
+/// the focused problem's confirm, and `space`/`↵` flip the focused option
+/// while its row is on screen. With no problem the cursor rests on the lone
+/// option row and ↑↓ scroll the card's text instead. A descend that rests on
+/// the row, or a card replacement that clears the last problem the previous
+/// frame showed, arms a one-shot scroll the next render consumes, so the first
+/// frame after either shows the row and its explanation; after that the arrows
+/// scroll freely.
 fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
     let len = app
         .services
         .selected_check()
         .map(|c| c.problems.len())
         .unwrap_or(0);
+    let on_option = app.services.plugin_on_option();
+    let cursor = app.services.problem_cursor.min(len.saturating_sub(1));
     match key.code {
-        KeyCode::Up if len > 0 => {
+        // With no problem to walk, the arrows scroll the card's text (a no-op
+        // while it fits its pane) with the cursor resting on the lone option
+        // row, and clear a page-hidden focus a shrunken walk left behind.
+        KeyCode::Up | KeyCode::Down if len == 0 => {
             app.services.diagnostic_focus = false;
-            app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
+            let max = app.services.detail_max_scroll.get();
+            app.services.detail_scroll = if key.code == KeyCode::Up {
+                app.services.detail_scroll.min(max).saturating_sub(1)
+            } else {
+                app.services.detail_scroll.saturating_add(1).min(max)
+            };
         }
-        KeyCode::Down if len > 0 => {
+        KeyCode::Up => {
             app.services.diagnostic_focus = false;
-            app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
+            if on_option {
+                app.services.plugin_option_focus = false;
+                app.services.problem_cursor = len - 1;
+            } else if cursor == 0 {
+                app.services.plugin_option_focus = true;
+            } else {
+                app.services.problem_cursor = cursor - 1;
+            }
+        }
+        KeyCode::Down => {
+            app.services.diagnostic_focus = false;
+            if on_option {
+                app.services.plugin_option_focus = false;
+                app.services.problem_cursor = 0;
+            } else if cursor == len - 1 {
+                app.services.plugin_option_focus = true;
+            } else {
+                app.services.problem_cursor = cursor + 1;
+            }
         }
         KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') if app.services.plugin_option_acts() => {
+            toggle_plugin_idle_wake(app);
+        }
         KeyCode::Enter => apply_service_fix(app),
         _ => {}
     }
+}
+
+/// Flip `[plugin] idle_wake` and persist it at once, writing the negation of
+/// the displayed value (the `[update]` toggle's shape), then rebuild the plugin
+/// card so the readout and the row's explanation follow on the next frame.
+fn toggle_plugin_idle_wake(app: &mut App) {
+    let next = !app.config().state.plugin.idle_wake;
+    app.save_state_delta(|s, _held| s.plugin.idle_wake = next);
+    app.apply_forgets();
+    refresh_plugin_check(app);
 }
 
 /// The delegates detail's keymap while descended: ↑↓ walks the job list
@@ -12508,70 +13150,69 @@ fn leave_shunt_detail(app: &mut App) {
     }
 }
 
-/// `esc` on a config row that is not editing: fold its entry (back to the
-/// entry row), or fold its open draft (back to the `+ add` row) — the Setup
-/// `+ new` form's precedent, whose `esc` at rest drops the draft. Returns
-/// `true` when it folded; a server field row (or no config focus) leaves it to
-/// ascend as today.
+/// What `esc` on a shunt config row that is not editing folds instead of
+/// leaving the card: its open draft (back to the `+ add` row) — the Setup
+/// `+ new` form's precedent, whose `esc` at rest drops the draft — or its
+/// expanded entry (back to the entry row).
+enum ShuntEscFold {
+    Draft(ShuntAddKind),
+    Entry(ShuntEntryKey),
+}
+
+/// The fold `esc` runs on the focused shunt row, `None` where it ascends as
+/// today: a server field row, no config focus, or a locked row.
+fn shunt_esc_fold(app: &App) -> Option<ShuntEscFold> {
+    match app.services.focused_shunt_focus()? {
+        ShuntFocus::Field { key } => {
+            if field_locked(app, key) {
+                return None;
+            }
+            if let ShuntFieldKey::Draft { kind, .. } = key {
+                return Some(ShuntEscFold::Draft(*kind));
+            }
+            field_entry(key).map(ShuntEscFold::Entry)
+        }
+        ShuntFocus::SaveAdd { kind } => (!app.services.saving(&ShuntSaveKey::SaveAdd(*kind)))
+            .then_some(ShuntEscFold::Draft(*kind)),
+        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(*kind) => {
+            (!app.services.saving(&ShuntSaveKey::SaveAdd(*kind)))
+                .then_some(ShuntEscFold::Draft(*kind))
+        }
+        // `esc` on the `remove <kind>` row folds its entry like the field
+        // rows, unless the remove is locked: then it ascends.
+        ShuntFocus::Remove { key } => (!app.services.saving(&ShuntSaveKey::Remove(key.clone())))
+            .then(|| ShuntEscFold::Entry(key.clone())),
+        _ => None,
+    }
+}
+
+/// Whether `esc` (and `←`) on the shunt card folds a row instead of leaving
+/// the card: the help modal names that `go back`, never a list return.
+pub(crate) fn shunt_esc_folds(app: &App) -> bool {
+    shunt_esc_fold(app).is_some()
+}
+
+/// Run [`shunt_esc_fold`]'s fold. Returns `true` when it folded.
 fn shunt_esc_folds_entry(app: &mut App) -> bool {
-    let Some(focus) = app.services.focused_shunt_focus().cloned() else {
+    let Some(fold) = shunt_esc_fold(app) else {
         return false;
     };
-    let fold_draft = |app: &mut App, kind: ShuntAddKind| {
-        app.services.shunt_drafts.fold(kind);
-        rebuild_shunt_config_stops(app);
-        app.services
-            .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
-    };
-    match focus {
-        ShuntFocus::Field { key } => {
-            // A locked row's `esc` ascends to the list (no fold) — ruling 2.
-            if field_locked(app, &key) {
-                return false;
-            }
-            if let ShuntFieldKey::Draft { kind, .. } = &key {
-                fold_draft(app, *kind);
-                return true;
-            }
-            let Some(entry) = field_entry(&key) else {
-                return false;
-            };
+    match fold {
+        ShuntEscFold::Draft(kind) => {
+            app.services.shunt_drafts.fold(kind);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+        }
+        ShuntEscFold::Entry(entry) => {
             app.services.shunt_expanded.remove(&entry);
             retire_remove_refusal(app, &entry);
             rebuild_shunt_config_stops(app);
             app.services
                 .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
-            true
         }
-        ShuntFocus::SaveAdd { kind } => {
-            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-                return false;
-            }
-            fold_draft(app, kind);
-            true
-        }
-        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(kind) => {
-            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-                return false;
-            }
-            fold_draft(app, kind);
-            true
-        }
-        ShuntFocus::Remove { key } => {
-            // `esc` on the `remove <kind>` row folds its entry like C2's field
-            // rows, unless the remove is locked (ruling 2): then it ascends.
-            if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
-                return false;
-            }
-            app.services.shunt_expanded.remove(&key);
-            retire_remove_refusal(app, &key);
-            rebuild_shunt_config_stops(app);
-            app.services
-                .set_shunt_focus(Some(ShuntFocusLine::Entry(key)));
-            true
-        }
-        _ => false,
     }
+    true
 }
 
 /// Open the read-only `check output` modal over the held failed-check stderr,
@@ -12605,7 +13246,7 @@ fn diagnostic_toast_body(title: &str, diagnostic: &str) -> String {
 
 /// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
 /// active profile's repair lives on the divergence resolver's own `d` prompt,
-/// never on this tab. Only the four shunt fixes are gated by an in-flight shunt
+/// never on this tab. Only the five shunt fixes are gated by an in-flight shunt
 /// action — a second shunt press starts nothing, while the plugin and herdr
 /// fixes keep working.
 fn apply_service_fix(app: &mut App) {
@@ -12813,10 +13454,7 @@ fn require_after_mint(app: &mut App, pid_at_mint: Option<u32>) {
 /// tag-refresh stepper. Only the herdr detail routes here — every other
 /// detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
-    let has_fix = app
-        .services
-        .selected_check()
-        .is_some_and(|c| !c.problems.is_empty());
+    let has_fix = herdr_check_has_fix(app);
     if !has_fix {
         app.services.herdr_fix_focus = false;
     }
@@ -12852,10 +13490,10 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
             activate_herdr_option(app, HERDR_OPTIONS[cursor]);
         }
         KeyCode::Char('+') if !app.services.diagnostic_focus && !on_fix => {
-            step_herdr_tag_refresh(app, 1);
+            step_herdr_tag_refresh(app, true);
         }
         KeyCode::Char('-') if !app.services.diagnostic_focus && !on_fix => {
-            step_herdr_tag_refresh(app, -1);
+            step_herdr_tag_refresh(app, false);
         }
         _ => {}
     }
@@ -12901,17 +13539,52 @@ pub(crate) fn herdr_config_writable(app: &App) -> bool {
     app.services.herdr_config.as_ref().is_some_and(|c| c.parsed)
 }
 
-/// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
-/// every other row.
-fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
-    if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
-        return;
+/// Whether the selected herdr check offers its heal line. The handler clears a
+/// fix-line focus the check no longer backs before it reads that focus.
+fn herdr_check_has_fix(app: &App) -> bool {
+    app.services
+        .selected_check()
+        .is_some_and(|c| !c.problems.is_empty())
+}
+
+/// Whether `space` activates the focused herdr options row: the handler's own
+/// arm (not on the fix line, not reading diagnostics) with the row's
+/// activation gate — the delegate-row rewrite needs a writable config, every
+/// other option row acts. A stored fix-line focus counts only while the check
+/// still offers the fix, as the handler reads it after its entry cleanup.
+pub(crate) fn herdr_space_acts(app: &App) -> bool {
+    let on_fix = app.services.herdr_fix_focus && herdr_check_has_fix(app);
+    if app.services.diagnostic_focus || on_fix {
+        return false;
+    }
+    match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+        Some(HerdrOption::DelegateRowText) => herdr_config_writable(app),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// The tag-refresh seconds one `+` (`up`) or `-` lands on: ±1 second, floored
+/// at 1. `None` on every other row, or where that direction does not move the
+/// value; the step and the footer's per-direction hints read this.
+pub(crate) fn herdr_tag_step(app: &App, up: bool) -> Option<u64> {
+    if HERDR_OPTIONS.get(app.services.herdr_options_cursor) != Some(&HerdrOption::TagRefresh) {
+        return None;
     }
     let cur = app.config().state.herdr.tag_watch_secs;
-    let next = if delta > 0 {
+    let next = if up {
         cur.saturating_add(1)
     } else {
         cur.saturating_sub(1).max(1)
+    };
+    (next != cur).then_some(next)
+}
+
+/// `+`/`-` on the tag-refresh stepper: persist where [`herdr_tag_step`]
+/// lands.
+fn step_herdr_tag_refresh(app: &mut App, up: bool) {
+    let Some(next) = herdr_tag_step(app, up) else {
+        return;
     };
     app.save_state_delta(|s, _held| s.herdr.tag_watch_secs = next);
     app.apply_forgets();
@@ -13610,8 +14283,9 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     // worker lands it, above); the config read is a cheap `fs::read_to_string`
     // that rides the tick, using the config path the herdr probe resolved. No
     // herdr row when herdr does not resolve or its probe has not landed yet.
-    let (plugin_check, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    let ((plugin_check, plugin_tooltip), herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     let plugin_health = plugin_check.health;
+    app.services.plugin_idle_wake_tooltip = Some(plugin_tooltip);
     checks.push(plugin_check);
 
     // rex row — read-only and experimental, pushed above herdr so that row's
@@ -17919,21 +18593,108 @@ fn error_toast_detail(err: &anyhow::Error) -> String {
 /// renderer tones that line by it, so the copy and its color share one spelling.
 pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 
+/// The cache-TTL detail lines of the Claude Code group, resolved by the
+/// one resolver over the one view ([`crate::hook_jobs::CacheView`]). The row
+/// reads the TUI process's env and settings, the wake the session's, so the
+/// two can name different sources. The wake's window reads its own constant,
+/// never a second spelling of it. `idle_wake` is `[plugin] idle_wake`: off,
+/// the wake line is absent whatever the TTL.
+fn cache_detail_lines(cache: &crate::hook_jobs::CacheView, idle_wake: bool) -> Vec<String> {
+    let wake_min = crate::mcp::AWAIT_IDLE_WAKE_SECS / 60;
+    let main = cache.main_ttl();
+    let main_line = match main {
+        (_, TtlSource::Automatic) => "cache: auto: 1h subscription, 5m api key".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!("cache: {}, CLAUDE_CODE_PROMPT_CACHE_TTL", ttl.label())
+        }
+        (ttl, TtlSource::Setting) => format!("cache: {}, promptCacheTtl", ttl.label()),
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let agent = cache.subagent_ttl();
+    let agent_line = match agent {
+        (_, TtlSource::Automatic) => "agent cache: auto: 5m".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("agent cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!(
+                "agent cache: {}, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+                ttl.label()
+            )
+        }
+        (ttl, TtlSource::Setting) => {
+            format!("agent cache: {}, subagentPromptCacheTtl", ttl.label())
+        }
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("agent cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let mut lines = vec![main_line, agent_line];
+    if idle_wake {
+        lines.push(match main {
+            (_, TtlSource::Automatic) => {
+                format!("idle wake: {wake_min} min idle with a delegate, 1h only")
+            }
+            (CacheTtl::OneHour, _) => format!("idle wake: {wake_min} min idle with a delegate"),
+            (CacheTtl::FiveMinutes, _) => "idle wake: off: a 5 min cache expires first".to_string(),
+        });
+    }
+    lines
+}
+
+/// The explanation the focused `idle wake` option row renders under itself,
+/// by state: the key, and the main cache's TTL — a setting, an env var, or
+/// automatic. On, an automatic length names the 1 h condition (the card
+/// cannot tell a 1 h subscription from a 5 m api-key session), a set 1 h
+/// length names the plain cache, and a 5 m length the wake that never
+/// fires. The `55` reads the wake's own constant, as the readout line does.
+pub(crate) fn plugin_idle_wake_tooltip(
+    cache: &crate::hook_jobs::CacheView,
+    idle_wake: bool,
+) -> String {
+    let wake_min = crate::mcp::AWAIT_IDLE_WAKE_SECS / 60;
+    if !idle_wake {
+        "a delegate may wake a session with an expired prompt cache".to_string()
+    } else {
+        match cache.main_ttl() {
+            (_, TtlSource::Automatic) => format!(
+                "sends a short no-op keepalive after {wake_min} idle minutes while delegates run to keep a 1h prompt cache warm"
+            ),
+            (CacheTtl::OneHour, _) => format!(
+                "sends a short no-op keepalive after {wake_min} idle minutes while delegates run to keep prompt cache warm"
+            ),
+            (CacheTtl::FiveMinutes, _) => {
+                "on, but a 5 min prompt cache expires first, so it never fires".to_string()
+            }
+        }
+    }
+}
+
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
-/// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
-/// on PATH and the data dir, a blank line between the three groups, and the
-/// shell completion script's state last. The install leads because installing
-/// is the fix a fresh box needs, and it also registers the server. Health is
-/// the worst of the five, but a missing completion script offers its fix
-/// without moving it; the fixable problems walk in detail order, so
-/// list-level `f` lands on install first. `clauth_path` and `completions` are
-/// passed in (the recompute resolves both off the live box) so the verdict
-/// logic unit-tests without a live `PATH` or `$SHELL`.
+/// entry (+ the `r`-gated start probe), then the Claude Code version, the
+/// cache-TTL lines (`idle wake` only while `[plugin] idle_wake` is on),
+/// clauth on PATH and the data dir, a blank line
+/// between the three groups, and the shell completion script's state last.
+/// The install leads because installing is the fix a fresh box needs, and it
+/// also registers the server. Health is the worst of the five, but a missing
+/// completion script offers its fix without moving it; the fixable problems
+/// walk in detail order, so list-level `f` lands on install first.
+/// `clauth_path`, `completions` and `cache` are passed in (the recompute
+/// resolves them off the live box) so the verdict logic unit-tests without a
+/// live `PATH`, `$SHELL` or env; `idle_wake` is the app state's
+/// `[plugin] idle_wake`, which the card's OPTIONS row flips.
 pub(crate) fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
     mcp_boot: Option<crate::plugin_probe::McpProbe>,
     completions: Option<crate::completions::InstalledScript>,
+    cache: crate::hook_jobs::CacheView,
+    idle_wake: bool,
 ) -> Check {
     use crate::plugin_probe as probe;
 
@@ -18129,6 +18890,9 @@ pub(crate) fn plugin_check(
         // a binary is absent.
         None => detail.push(format!("claude: press {} to probe", prose::key("r"))),
     }
+    for line in cache_detail_lines(&cache, idle_wake) {
+        detail.push(line);
+    }
     match &clauth_path {
         Some(path) => detail.push(format!("path: {}", path.display())),
         None => {
@@ -18228,20 +18992,27 @@ fn open_incident_link(app: &mut App) {
     }
 }
 
+/// The account a switch to profile `idx` would confirm, `None` when it is
+/// already active. `switch_profile` already refuses a disabled target (shared
+/// guard), but a disabled row must never even offer the confirm — never
+/// selectable, not just never landed.
+fn switch_offer(app: &App, idx: usize) -> Option<ProfileName> {
+    let cfg = app.config();
+    let profile = cfg.profiles.get(idx)?;
+    (!cfg.is_active(&profile.name) && !profile.is_disabled()).then(|| profile.name.clone())
+}
+
+/// Whether the Overview `↵` offers a switch on the row under the cursor: a
+/// codex or pool row, the active account and a disabled one take none.
+pub(crate) fn overview_enter_switches(app: &App) -> bool {
+    matches!(app.current_main_item(), Some(MainItemKind::Profile(idx)) if switch_offer(app, idx).is_some())
+}
+
 /// Request switch to profile at `idx`; no-ops if already active.
 fn request_switch_to(app: &mut App, idx: usize) {
-    let cfg = app.config();
-    let Some(profile) = cfg.profiles.get(idx) else {
+    let Some(name) = switch_offer(app, idx) else {
         return;
     };
-    let name = profile.name.clone();
-    // `switch_profile` already refuses a disabled target (shared guard), but a
-    // disabled row must never even offer the confirm — never selectable, not
-    // just never landed.
-    if cfg.is_active(&name) || profile.is_disabled() {
-        return;
-    }
-    drop(cfg);
     app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("switch to '{name}'?"),
         detail: None,
@@ -18262,14 +19033,30 @@ fn activate_main_item(app: &mut App) {
     }
 }
 
-fn reorder_main_cursor(app: &mut App, delta: i32) {
+/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the account under the
+/// Overview cursor between, `None` off an account row or at that end of the
+/// roster.
+fn main_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
-        return;
+        return None;
     };
     let new_idx = match delta.signum() {
         -1 if idx > 0 => idx - 1,
         1 if idx + 1 < app.config().profiles.len() => idx + 1,
-        _ => return,
+        _ => return None,
+    };
+    Some((idx, new_idx))
+}
+
+/// Whether `⇧↑↓` moves the account under the Overview cursor either way: the
+/// joined key stays offered while one of its directions swaps.
+pub(crate) fn main_reorder_moves(app: &App) -> bool {
+    main_reorder_slots(app, -1).is_some() || main_reorder_slots(app, 1).is_some()
+}
+
+fn reorder_main_cursor(app: &mut App, delta: i32) {
+    let Some((idx, new_idx)) = main_reorder_slots(app, delta) else {
+        return;
     };
     let (result, moved) = {
         let mut cfg = app.config();
@@ -18631,6 +19418,58 @@ impl Drop for BareItemAnswerGuard {
     }
 }
 
+/// Refuse a write that would make `name` active while it is disabled in either
+/// copy: memory (the roster this app loaded) or disk (a peer's disable since).
+/// Toasts the refusal under `head` and answers `true`, so the caller returns.
+/// Answered before the bare-item gate, whose settle can already write the live
+/// login into the target's store, and before a door raises a confirm for an
+/// activation a disabled target can never perform.
+fn refuse_disabled_target(app: &mut App, name: &ProfileName, head: &str) -> bool {
+    let in_memory = app.config().find(name).is_some_and(|p| p.is_disabled());
+    let refusal = match read_target_profile(name) {
+        Ok(profile) if in_memory || profile.is_disabled() => {
+            anyhow::anyhow!(crate::disabled_account_refusal(name))
+        }
+        Ok(_) => return false,
+        Err(e) => e,
+    };
+    app.toast(
+        ToastKind::Danger,
+        format!(
+            "{head} failed\n{}",
+            escape_control(&error_toast_detail(&refusal))
+        ),
+    );
+    true
+}
+
+/// Refuse `name` when disk marks it disabled. Called under the caller's hold:
+/// a peer's disable can land after the early refusal, on disk alone.
+fn refuse_disabled_on_disk(name: &ProfileName) -> Result<()> {
+    if read_target_profile(name)?.is_disabled() {
+        return Err(anyhow::anyhow!(crate::disabled_account_refusal(name)));
+    }
+    Ok(())
+}
+
+/// `name`'s profile off disk for a disabled check. A `config.toml` the proxy
+/// checks refuse fails with their own refusal, in their order (an account on a
+/// proxy or an unreadable `[proxy]` table, then an unclassifiable file), the
+/// one they give when they run first, rather than the raw read error.
+fn read_target_profile(name: &ProfileName) -> Result<crate::profile::Profile> {
+    crate::profile::read_profile(name).map_err(|e| {
+        if let Err(refusal) = crate::actions::refuse_relogin_off_proxy(name) {
+            return refusal;
+        }
+        match crate::profile::stored_proxy_claim_failing_closed(name) {
+            crate::profile::ProxyClaim::Unclassifiable => {
+                crate::actions::CaptureRefused(name.clone()).into()
+            }
+            _ => e,
+        }
+    })
+}
+
 /// The account a confirm about to open for `name` lands on, or a toast
 /// headed `failed` when none can be claimed; a proxy account takes the
 /// re-login refusal's toast instead.
@@ -18822,6 +19661,14 @@ fn toast_bare_item_notice(app: &mut App, notice: crate::claude::BareItemNotice) 
     }
 }
 
+/// The boot relink of the active account, which nobody is waiting on: a failure
+/// (the guard's refusal, a failed stamp) is logged instead of dropped.
+fn relink_at_boot(name: &crate::profile::ProfileName) {
+    if let Err(e) = link_profile_credentials(name) {
+        crate::logline::logline!("clauth: {e:#}; .credentials.json was not relinked to '{name}'");
+    }
+}
+
 /// Run a held write again: its gate takes `placed` instead of settling.
 fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u8; 32]>) {
     app.bare_item_ready = Some(placed);
@@ -18830,7 +19677,7 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
             if app.config().is_active(&name)
                 && let Some(_placed) = bare_item_gate(app, BareItemWrite::BootRelink(name.clone()))
             {
-                let _ = link_profile_credentials(&name);
+                relink_at_boot(&name);
                 app.refresh_unsaved_live_login();
             }
         }
@@ -19706,11 +20553,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 21] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 22] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
+    GlobalConfigRow::ReduceMotion,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::SyncMcpLogins,
@@ -19740,7 +20588,8 @@ impl GlobalConfigRow {
             GlobalConfigRow::Theme
             | GlobalConfigRow::ResetShape
             | GlobalConfigRow::ClockNotation
-            | GlobalConfigRow::HomeTab => "appearance",
+            | GlobalConfigRow::HomeTab
+            | GlobalConfigRow::ReduceMotion => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::SyncMcpLogins
@@ -19834,21 +20683,60 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Whether `space` (and `↵` off the typed rows) acts on a Config-tab row. A
+/// row another setting makes inert renders dimmed and its keys no-op:
+/// `clock` while the countdown is relative (no surface draws a clock then, so
+/// the notation would decide nothing); `burn floor` / `burn horizon` while
+/// burn-aware is off (they only shape the projection the static path never
+/// runs); `extra usage spent` while spend budget is off (it decides no halt
+/// when nothing spends); `auto-start queue` while no account's `auto_start`
+/// opts it in (a queue with no possible member spaces nothing).
+pub(crate) fn global_config_row_live(app: &App, row: GlobalConfigRow) -> bool {
+    match row {
+        GlobalConfigRow::ClockNotation => app.config().state.reset_display().shows_clock(),
+        GlobalConfigRow::BurnFloor | GlobalConfigRow::BurnHorizon => {
+            app.config().state.burn_aware_switching
+        }
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => app.config().state.spend_budget_switching,
+        GlobalConfigRow::AutoStartQueue => app
+            .config()
+            .profiles
+            .iter()
+            .any(|p| p.has_effective_auto_start()),
+        GlobalConfigRow::Theme
+        | GlobalConfigRow::ResetShape
+        | GlobalConfigRow::HomeTab
+        | GlobalConfigRow::ReduceMotion
+        | GlobalConfigRow::DivergenceDefault
+        | GlobalConfigRow::SwitchOffWhenSpent
+        | GlobalConfigRow::WeeklyThreshold
+        | GlobalConfigRow::RefreshInterval
+        | GlobalConfigRow::ContextNudge
+        | GlobalConfigRow::BurnAware
+        | GlobalConfigRow::WalkOrder
+        | GlobalConfigRow::SpendBudget
+        | GlobalConfigRow::PreemptiveRotation
+        | GlobalConfigRow::AutoUpdate
+        | GlobalConfigRow::PreserveNonLoginKeys
+        | GlobalConfigRow::SyncMcpLogins
+        | GlobalConfigRow::RefreshSpentAccounts => true,
+    }
+}
+
 /// Apply space (or ⏎ on non-refresh rows) on a Config-tab row: cycle the theme
 /// tier, flip wrap-off, or step the refresh interval forward through presets
-/// (wrapping past the top preset back to the first).
+/// (wrapping past the top preset back to the first). An inert row
+/// ([`global_config_row_live`]) changes nothing.
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
+    if !global_config_row_live(app, row) {
+        return;
+    }
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::ResetShape => cycle_reset_display(app),
         GlobalConfigRow::HomeTab => cycle_home_tab(app),
-        // Inert while the countdown is relative (rendered dimmed): no surface
-        // draws a clock then, so the notation would decide nothing.
-        GlobalConfigRow::ClockNotation => {
-            if app.config().state.reset_display().shows_clock() {
-                cycle_clock_format(app);
-            }
-        }
+        GlobalConfigRow::ReduceMotion => toggle_reduce_motion(app),
+        GlobalConfigRow::ClockNotation => cycle_clock_format(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
@@ -19856,44 +20744,16 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::ContextNudge => step_context_nudge(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::WalkOrder => cycle_walk_order(app),
-        // Inert while burn-aware is off (rendered dimmed): the floor/cap only
-        // shape the projection, which the static path never runs.
-        GlobalConfigRow::BurnFloor => {
-            if app.config().state.burn_aware_switching {
-                step_burn_floor(app);
-            }
-        }
-        GlobalConfigRow::BurnHorizon => {
-            if app.config().state.burn_aware_switching {
-                step_burn_horizon(app);
-            }
-        }
+        GlobalConfigRow::BurnFloor => step_burn_floor(app),
+        GlobalConfigRow::BurnHorizon => step_burn_horizon(app),
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
-        // Inert while spend budget is off (rendered dimmed): decides no halt when
-        // nothing spends, so it stays a true disabled row — the key is a no-op.
-        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
-            if app.config().state.spend_budget_switching {
-                toggle_budget_wrap_off(app);
-            }
-        }
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => toggle_budget_wrap_off(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
         GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::SyncMcpLogins => toggle_sync_mcp_logins(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
-        // Inert while no account's `auto_start` opts it in (rendered dimmed):
-        // a queue with no possible member spaces nothing, so it stays a true
-        // disabled row — the key is a no-op.
-        GlobalConfigRow::AutoStartQueue => {
-            if app
-                .config()
-                .profiles
-                .iter()
-                .any(|p| p.has_effective_auto_start())
-            {
-                toggle_auto_start_queue(app);
-            }
-        }
+        GlobalConfigRow::AutoStartQueue => toggle_auto_start_queue(app),
     }
 }
 
@@ -20177,6 +21037,16 @@ fn cycle_home_tab(app: &mut App) {
     app.apply_forgets();
 }
 
+/// Flip `reduce_motion` (default off). The mascot stills at once rather than
+/// at the next tick's compare, so no frame of motion follows the press.
+fn toggle_reduce_motion(app: &mut App) {
+    let next = !app.config().state.reduce_motion;
+    app.save_state_delta(|s, _held| s.reduce_motion = next);
+    app.apply_forgets();
+    let still = app.config().state.reduce_motion;
+    app.mascot.set_reduce_motion(still);
+}
+
 fn cycle_divergence_default(app: &mut App) {
     let next = next_divergence_default(app.config().state.default_divergence);
     app.save_state_delta(|s, _held| s.default_divergence = next);
@@ -20198,11 +21068,10 @@ fn toggle_wrap_off(app: &mut App) {
     app.apply_forgets();
 }
 
-/// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
-/// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `update_app_state`, drain forgets — no separate propagation to the
-/// scheduler is needed since `next_auto_switch_target` reads the flag straight
-/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// Flip the opt-in burn-aware auto-switch mode through `save_state_delta`,
+/// then drain forgets — no separate propagation to the scheduler is needed
+/// since `next_auto_switch_target` reads the flag straight off the same shared
+/// `config` (`snapshot_chain` copies it into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     let next = !app.config().state.burn_aware_switching;
     app.save_state_delta(|s, _held| s.burn_aware_switching = next);
@@ -20346,8 +21215,10 @@ fn toggle_show_estimates(app: &mut App) {
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
 fn toggle_count_cache(app: &mut App) {
+    let identity = token_model_at_cursor(app);
     let next = !app.config().state.count_cache;
     app.save_state_delta(|s, _held| s.count_cache = next);
+    rehome_token_model_cursor(app, identity);
     app.apply_forgets();
 }
 
@@ -20640,10 +21511,14 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
         }
         // Continuous fields only — `max spend` (a dollar ceiling) has no
         // natural step unit and stays typed-only.
-        KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
-        KeyCode::Char('-' | '_') if row == FallbackRow::Threshold => adjust_threshold(app, -5.0),
-        KeyCode::Char('+' | '=') if row == FallbackRow::WeeklyAt => adjust_weekly(app, 5.0),
-        KeyCode::Char('-' | '_') if row == FallbackRow::WeeklyAt => adjust_weekly(app, -5.0),
+        KeyCode::Char(key @ ('+' | '=' | '-' | '_')) if fallback_row_steps(app, row) => {
+            let up = matches!(key, '+' | '=');
+            if row == FallbackRow::Threshold {
+                adjust_threshold(app, up);
+            } else {
+                adjust_weekly(app, up);
+            }
+        }
         // The day row is a cycle row at rest and a chip row once descended:
         // space walks the preset ladder (the `weekly limit` row's grammar), ⏎
         // opens the chip picker. Split here so `run_fallback_row` keeps its
@@ -20841,12 +21716,20 @@ pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &ProfileName) -> bool {
     candidate.api_key.is_some() != chain_kind
 }
 
+/// Whether the chain list's `↵` descends: on a member, or on `+ add` while an
+/// account can still join.
+pub(crate) fn chain_enter_acts(app: &App) -> bool {
+    match chain_items(app).get(app.chain_cursor).copied() {
+        Some(ChainItemKind::Member(_)) => true,
+        Some(ChainItemKind::Add) => !chain_candidates(app).is_empty(),
+        None => false,
+    }
+}
+
 /// Enter right pane for the selected chain item. No-op on `+ add` when empty.
 fn enter_fallback_detail(app: &mut App) {
-    match chain_items(app).get(app.chain_cursor).copied() {
-        Some(ChainItemKind::Member(_)) => {}
-        Some(ChainItemKind::Add) if !chain_candidates(app).is_empty() => {}
-        _ => return,
+    if !chain_enter_acts(app) {
+        return;
     }
     app.fallback_edit = None;
     app.fallback_focus = FallbackFocus::Detail;
@@ -20870,21 +21753,36 @@ fn drop_fallback_detail(app: &mut App) {
     app.fallback_detail_entered = false;
 }
 
+/// The chain slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the selected member
+/// between, `None` on `+ add` or at that end of the chain.
+fn chain_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
+    let pos = selected_chain_member(app)?;
+    let target = usize::try_from(pos as i32 + delta).ok()?;
+    (target < app.config().state.fallback_chain.len()).then_some((pos, target))
+}
+
+/// Whether `⇧↑↓` moves the selected member either way: the joined key stays
+/// offered while one of its directions swaps.
+pub(crate) fn chain_reorder_moves(app: &App) -> bool {
+    chain_reorder_slots(app, -1).is_some() || chain_reorder_slots(app, 1).is_some()
+}
+
 /// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
 /// or at boundary. Chain index == cursor for members (they precede `+ add`).
 fn reorder_chain_member(app: &mut App, delta: i32) {
-    let Some(pos) = selected_chain_member(app) else {
+    let Some((pos, target)) = chain_reorder_slots(app, delta) else {
         return;
     };
-    let target = pos as i32 + delta;
     let landed = {
         let mut cfg = app.config();
-        if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
+        // Re-read under the guard that writes the order: a reload since the
+        // slot was resolved may have shortened the chain.
+        if target >= cfg.state.fallback_chain.len() {
             return;
         }
         let mut order = cfg.state.fallback_chain.clone();
-        order.swap(pos, target as usize);
-        let moved = order[target as usize].clone();
+        order.swap(pos, target);
+        let moved = order[target].clone();
         set_chain_order(&mut cfg, &order)
             .ok()
             .and_then(|saved| saved.iter().position(|n| n == &moved))
@@ -20899,11 +21797,55 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     }
 }
 
+/// Whether a member card row's keys act (`↵`, `space`, and `+`/`-` where the
+/// row binds them): `rotate at` while the member resolves to an account,
+/// `weekly at` while its weekly gate is on, `preferred days` while the chain
+/// entry has an account to hold the list, `max spend` while spend budget is on.
+/// A dimmed row, or a chain entry with no account behind it, takes no key.
+pub(crate) fn fallback_row_acts(app: &App, row: FallbackRow) -> bool {
+    match row {
+        FallbackRow::Threshold => selected_threshold(app).is_some(),
+        FallbackRow::WeeklyAt => {
+            selected_weekly_override(app).is_some_and(|(_, check_weekly)| check_weekly)
+        }
+        FallbackRow::PreferredDays => {
+            selected_member_name(app).is_some_and(|member| member_days(app, &member).is_some())
+        }
+        FallbackRow::MaxSpend => {
+            let armed = app.config().state.spend_budget_switching;
+            armed && selected_max_spend(app).is_some()
+        }
+        FallbackRow::CheckWeekly
+        | FallbackRow::CheckScoped
+        | FallbackRow::CheckCreditCap
+        | FallbackRow::LastResort
+        | FallbackRow::Preferred => {
+            // The toggles write through the member's roster profile; a chain
+            // entry whose account is gone has nowhere to flip, so the keys
+            // are inert there (the handler's write returns at the lookup).
+            selected_member_name(app).is_some_and(|member| app.config().find(&member).is_some())
+        }
+        FallbackRow::Remove => true,
+    }
+}
+
+/// Whether `+` / `-` step the member card's focused `row`: `rotate at` and
+/// `weekly at` only, while [`fallback_row_acts`] holds for it and either
+/// direction moves it ([`fallback_step_lands`]). The card's key handler and
+/// the help's joined `+ / -` row read this.
+pub(crate) fn fallback_row_steps(app: &App, row: FallbackRow) -> bool {
+    fallback_step_lands(app, row, true) || fallback_step_lands(app, row, false)
+}
+
 /// ⏎ on a member detail row: a typed row opens its field and `preferred
 /// days` its picker; remove arms, then removes on the second press. Each one
 /// pins the member under the cursor. Space reaches here for every row but
-/// `remove` and `preferred days` (the key handler splits both out).
+/// `remove` and `preferred days` (the key handler splits both out). A row
+/// [`fallback_row_acts`] rules inert changes nothing.
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
+    if !fallback_row_acts(app, row) {
+        return;
+    }
     match row {
         FallbackRow::Threshold => {
             if let Some(current) = selected_threshold(app) {
@@ -21350,37 +22292,58 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     false
 }
 
-/// Step the threshold by `delta`, clamped to 0..=100, and persist.
-fn adjust_threshold(app: &mut App, delta: f64) {
-    if let Some(name) = selected_member_name(app)
-        && let Some(current) = selected_threshold(app)
-    {
-        write_threshold(
-            app,
-            &name,
-            (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD),
-        );
+/// The `rotate at` value one `+` (`up`) or `-` lands on, clamped to 0..=100;
+/// `None` where that direction does not move it or [`fallback_row_acts`]
+/// rules the row inert.
+fn threshold_step(app: &App, up: bool) -> Option<f64> {
+    if !fallback_row_acts(app, FallbackRow::Threshold) {
+        return None;
+    }
+    let current = selected_threshold(app)?;
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
+    let next = (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD);
+    (next != current).then_some(next)
+}
+
+/// The `weekly at` override one `+` (`up`) or `-` lands on, clamped to
+/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`; `None` where that
+/// direction does not move it or [`fallback_row_acts`] rules the row inert
+/// (its weekly gate off, rendered dimmed). An unset override bases the nudge
+/// on the chain-wide resolved default so the value visibly moves off what the
+/// dimmed-default row already shows.
+fn weekly_step(app: &App, up: bool) -> Option<f64> {
+    if !fallback_row_acts(app, FallbackRow::WeeklyAt) {
+        return None;
+    }
+    let (override_pct, _) = selected_weekly_override(app)?;
+    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
+    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
+    (next != base).then_some(next)
+}
+
+/// Whether one `+` (`up`) or `-` moves the member card's stepper `row`: the
+/// value each step function returns on and the footer's per-direction hints.
+pub(crate) fn fallback_step_lands(app: &App, row: FallbackRow, up: bool) -> bool {
+    match row {
+        FallbackRow::Threshold => threshold_step(app, up).is_some(),
+        FallbackRow::WeeklyAt => weekly_step(app, up).is_some(),
+        _ => false,
     }
 }
 
-/// Step the selected member's `weekly at` override by `delta`, clamped to
-/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`, and persist. Mirrors
-/// `run_fallback_row`'s `check_weekly` guard: inert while the member's weekly
-/// gate is off (rendered dimmed), same no-op contract as a dimmed row's ⏎.
-/// An unset override bases the nudge on the chain-wide resolved default so
-/// the value visibly moves off what the dimmed-default row already shows.
-fn adjust_weekly(app: &mut App, delta: f64) {
-    let (Some(name), Some((override_pct, check_weekly))) =
-        (selected_member_name(app), selected_weekly_override(app))
-    else {
-        return;
-    };
-    if !check_weekly {
-        return;
+/// `+`/`-` on `rotate at`: persist where [`threshold_step`] lands.
+fn adjust_threshold(app: &mut App, up: bool) {
+    if let (Some(name), Some(next)) = (selected_member_name(app), threshold_step(app, up)) {
+        write_threshold(app, &name, next);
     }
-    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
-    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
-    write_weekly_override(app, &name, Some(next));
+}
+
+/// `+`/`-` on `weekly at`: persist where [`weekly_step`] lands.
+fn adjust_weekly(app: &mut App, up: bool) {
+    if let (Some(name), Some(next)) = (selected_member_name(app), weekly_step(app, up)) {
+        write_weekly_override(app, &name, Some(next));
+    }
 }
 
 /// A per-member usage gate a toggle row flips (`Profile::check_weekly` /
@@ -21945,6 +22908,13 @@ fn submit_paste_code(app: &mut App) {
     }
 }
 
+/// Whether `a` opens the action menu: never while it would list nothing. The
+/// footer's `a actions`, the help modal's `a` rows and the key handler read
+/// this.
+pub(crate) fn action_menu_opens(app: &App) -> bool {
+    !build_action_menu(app).items.is_empty()
+}
+
 /// Build the action menu for the current screen/focus context: what acts on the
 /// focused account, then what acts on the tab.
 pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
@@ -22441,6 +23411,9 @@ fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
 fn refresh_usage_account(app: &mut App, name: &ProfileName) {
     match account_by_name(app, name) {
         Some((name, true, _)) | Some((name, _, true)) => {
+            if refresh_stood_down(app, Some(&name)) {
+                return;
+            }
             app.manual_refresh_one(&name);
             app.toast(ToastKind::Info, format!("refreshing '{name}'"));
         }
@@ -22449,6 +23422,35 @@ fn refresh_usage_account(app: &mut App, name: &ProfileName) {
         }
         None => {}
     }
+}
+
+/// Queue every account for a refetch (Overview `r`, the menu's refresh-all),
+/// or toast why not.
+fn refresh_every_account(app: &mut App) {
+    if refresh_stood_down(app, None) {
+        return;
+    }
+    app.manual_refresh();
+    app.toast(ToastKind::Info, "refreshing every account");
+}
+
+/// The gate every manual usage refresh passes: while another instance holds
+/// the usage-fetch lease this one fetches nothing, and its stand-down tick
+/// drains the refetch queue unread. A refresh then queues nothing and toasts
+/// who refreshes instead, scoped to `name` when it asked for one account;
+/// `true` when it stood down. The toast names the daemon in every case, a
+/// lease another clauth TUI holds with no daemon running included, so its
+/// copy never splits by who holds the lease.
+fn refresh_stood_down(app: &mut App, name: Option<&ProfileName>) -> bool {
+    if app.fetch_lease.fetches_here() {
+        return false;
+    }
+    let subject = name.map_or_else(|| "usage".to_string(), |name| format!("'{name}'"));
+    app.toast(
+        ToastKind::Info,
+        format!("the daemon refreshes {subject} on its own schedule; r can't force it"),
+    );
+    true
 }
 
 /// Queue a usage refetch for the account under the cursor, or toast why not.
@@ -22616,10 +23618,7 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::ApplyPreset => apply_preset_identity(app, row_identity),
         // Tab-global actions: no row identity.
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshAll => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing every account");
-        }
+        ActionMenuAction::RefreshAll => refresh_every_account(app),
         ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
@@ -22934,30 +23933,45 @@ fn drain_daemon_control(app: &mut App) {
     }
 }
 
+/// Land one probe's health: the one place `daemon_health` moves, so the
+/// throttled poll and a TUI-issued stop/start tell the same edge. A held lock,
+/// fed or not, is a running daemon; only losing it is the daemon going down,
+/// and a start is no event.
+fn land_daemon_health(app: &mut App, health: crate::daemon::DaemonHealth) {
+    let went_down = app.daemon_health != crate::daemon::DaemonHealth::Absent
+        && health == crate::daemon::DaemonHealth::Absent;
+    app.daemon_health = health;
+    if went_down {
+        app.cue_mascot(mascot::Cue::DaemonDown);
+    }
+}
+
 /// Re-probe the header chip and the menu's verb at once rather than at the
 /// next throttled probe.
 fn reprobe_daemon(app: &mut App) {
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     app.last_daemon_probe = Instant::now();
 }
 
-/// Swap the Tokens model filter and re-clamp the Models cursor — the filtered
-/// list can be shorter than where the cursor sat.
+/// Swap the Tokens model filter and re-anchor the Models cursor — the
+/// filtered list re-ranks and can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
+    let identity = token_model_at_cursor(app);
     app.token_filter = filter;
     app.model_detail_scroll = 0;
-    clamp_token_model_cursor(app);
+    rehome_token_model_cursor(app, identity);
 }
 
-/// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
-/// list can be shorter than where the cursor sat.
+/// Swap the Tokens period lens and re-anchor the Models cursor — the scoped
+/// list re-ranks and can be shorter than where the cursor sat.
 fn set_token_period(app: &mut App, period: TokenPeriod) {
+    let identity = token_model_at_cursor(app);
     app.token_period = period;
     app.model_detail_scroll = 0;
-    clamp_token_model_cursor(app);
+    rehome_token_model_cursor(app, identity);
 }
 
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
@@ -22969,13 +23983,13 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
         ConfigFocus::Profiles => {
             let before = app.setup_position();
             match key.code {
-                KeyCode::Up => step_setup_cursor(app, -1, sel_len),
-                KeyCode::Down => step_setup_cursor(app, 1, sel_len),
-                KeyCode::PageUp => {
+                KeyCode::Up if walk_moves(sel_len) => step_setup_cursor(app, -1, sel_len),
+                KeyCode::Down if walk_moves(sel_len) => step_setup_cursor(app, 1, sel_len),
+                KeyCode::PageUp if walk_moves(sel_len) => {
                     let next = selector_page_up(app.setup_position(), &app.setup_selector);
                     app.step_selection(SelectionSlotKind::Setup, next);
                 }
-                KeyCode::PageDown => {
+                KeyCode::PageDown if walk_moves(sel_len) => {
                     let next = selector_page_down(app.setup_position(), &app.setup_selector);
                     app.step_selection(SelectionSlotKind::Setup, next);
                 }
@@ -23070,25 +24084,15 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         _ => run_config_row(app, row),
                     }
                 }
-                KeyCode::Char('+' | '=')
-                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                KeyCode::Char(key @ ('+' | '=' | '-' | '_'))
+                    if rows[app.config_action_cursor].steps() =>
                 {
-                    step_bell_threshold(app, 5.0);
-                }
-                KeyCode::Char('-' | '_')
-                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
-                {
-                    step_bell_threshold(app, -5.0);
-                }
-                KeyCode::Char('+' | '=')
-                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
-                {
-                    step_usage_probe_interval(app, USAGE_PROBE_STEP_MS);
-                }
-                KeyCode::Char('-' | '_')
-                    if rows[app.config_action_cursor] == ConfigRow::UsageProbeInterval =>
-                {
-                    step_usage_probe_interval(app, -USAGE_PROBE_STEP_MS);
+                    let up = matches!(key, '+' | '=');
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold {
+                        step_bell_threshold(app, up);
+                    } else {
+                        step_usage_probe_interval(app, up);
+                    }
                 }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
@@ -23218,15 +24222,17 @@ fn pool_provider_name(app: &App, pi: usize) -> Option<String> {
 /// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎ runs
 /// them — `refresh` on a worker, `remove` behind the inline 2-step (never the
 /// Overview's confirm modal). The 2-step acts on the selection's own pool pair.
+/// A lone row has nowhere to walk, so its walk keys leave an armed remove armed.
 fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
     let rows = app.pool_detail_rows();
     if rows.is_empty() {
         return;
     }
     let last = rows.len() - 1;
+    let walks = walk_moves(rows.len());
     app.config_action_cursor = app.config_action_cursor.min(last);
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up if walks => {
             disarm_pool_2step(app);
             app.config_action_cursor = if app.config_action_cursor == 0 {
                 last
@@ -23234,7 +24240,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.config_action_cursor - 1
             };
         }
-        KeyCode::Down => {
+        KeyCode::Down if walks => {
             disarm_pool_2step(app);
             app.config_action_cursor = if app.config_action_cursor >= last {
                 0
@@ -23242,7 +24248,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.config_action_cursor + 1
             };
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp if walks => {
             disarm_pool_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
@@ -23257,7 +24263,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.setup_detail_total.get(),
             );
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown if walks => {
             disarm_pool_2step(app);
             let starts = app.setup_detail_row_starts.borrow();
             let block_ends = app.setup_detail_block_ends.borrow();
@@ -23488,6 +24494,7 @@ fn drain_codex_login(app: &mut App) {
             Ok(canonical) => {
                 refresh_codex_rows(app);
                 app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
@@ -23587,6 +24594,18 @@ fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
         }
     }
     rows
+}
+
+/// How many rows the descended Setup card walks: the codex detail's action
+/// rows, the pool detail's, or the claude / `+ new` card's.
+pub(crate) fn setup_card_row_count(app: &App) -> usize {
+    match app.setup_selection() {
+        SetupSelection::Item(MainItemKind::Codex(_)) => CodexDetailRow::ALL.len(),
+        SetupSelection::Item(MainItemKind::Shunt(..)) => app.pool_detail_rows().len(),
+        SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
+            config_rows(app).len()
+        }
+    }
 }
 
 /// Detail rows for the current selection. `+ new` → create form; account →
@@ -23845,13 +24864,26 @@ fn land_new_account(app: &mut App) {
 /// loss-warning route as `n`, landing on the row that fixes the account's dead
 /// credential (or the editor's first row for a healthy account).
 fn start_edit_selected(app: &mut App, item: MainItemKind) {
-    let target = match item {
-        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
-        other => app.setup_item_for(other).map(EditTarget::Item),
-    };
-    if let Some(target) = target {
+    if let Some(target) = edit_target_of(app, item) {
         request_target(app, LossWarningTarget::EditAccount(target));
     }
+}
+
+/// The Setup editor `e` opens for an Overview row, `None` when the row
+/// resolves to no account.
+fn edit_target_of(app: &App, item: MainItemKind) -> Option<EditTarget> {
+    match item {
+        MainItemKind::Profile(idx) => app.profile_name_at(idx).map(EditTarget::Profile),
+        other => app.setup_item_for(other).map(EditTarget::Item),
+    }
+}
+
+/// Whether the Overview `e` opens an editor: a row under the cursor that
+/// resolves to an account.
+pub(crate) fn overview_edit_acts(app: &App) -> bool {
+    app.current_main_item()
+        .and_then(|item| edit_target_of(app, item))
+        .is_some()
 }
 
 /// `start_edit_selected`'s landing: switch to Setup, select the item the way an
@@ -24087,16 +25119,49 @@ fn disarm_armed_action(app: &mut App) {
     }
 }
 
-/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
-fn run_config_row(app: &mut App, row: ConfigRow) {
-    // The mint-seeded api key row is a Disabled row: focusable but inert, so
-    // ⏎ opens no editor while the base url still names the gateway.
-    if row == ConfigRow::ApiKey
+/// Whether the Setup `disable` row on `name` is dimmed inert: the account is
+/// active or holds a live `clauth start` session. Reads the tick's job
+/// snapshot, as the row's dim does, so a frame never walks the job store;
+/// [`run_config_row`] re-checks the live store before it acts.
+pub(crate) fn disable_row_gated(app: &App, name: &ProfileName) -> bool {
+    let active = app.config().is_active(name);
+    active || crate::runtime::has_live_session_in(name, &app.job_trees, &app.handed_off)
+}
+
+/// Whether the Setup `Login` row on `name` refuses its `↵`: a proxy account,
+/// or one whose `[proxy]` table clauth cannot read, logs in only through its
+/// proxy. Reads the loaded roster, as the footer and the help do;
+/// [`run_config_row`] also re-checks the record on disk before it acts.
+pub(crate) fn login_row_refused(app: &App, name: &ProfileName) -> bool {
+    app.config()
+        .find(name)
+        .is_some_and(|p| !p.spends_oauth_chain())
+}
+
+/// Whether the Setup `switch to a rolling token` row on `name` is dimmed
+/// inert: a disabled account or a quarantined login, the two states the CLI
+/// refuses up front. The one predicate the row's dim, the footer's `↵` gate
+/// and [`run_config_row`]'s arm share.
+pub(crate) fn rolling_switch_row_gated(app: &App, name: &ProfileName) -> bool {
+    let cfg = app.config();
+    cfg.find(name).is_some_and(|p| p.is_disabled()) || cfg.state.auth_broken.contains(name)
+}
+
+/// Whether `row` is the mint-seeded api key row: a Disabled row, focusable but
+/// inert, so ⏎ opens no editor while the base url still names the gateway.
+/// The handler's return, the footer's dropped `↵` and the help's `↵ on a
+/// field` count read this.
+pub(crate) fn minted_key_row(app: &App, row: ConfigRow) -> bool {
+    row == ConfigRow::ApiKey
         && app
             .config_draft
             .as_ref()
             .is_some_and(ConfigDraft::mint_armed)
-    {
+}
+
+/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
+fn run_config_row(app: &mut App, row: ConfigRow) {
+    if minted_key_row(app, row) {
         return;
     }
     // Env rows seed their buffer before editing, so they're driven out of band.
@@ -24254,10 +25319,13 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
-            if editing
-                .as_deref()
-                .is_some_and(|name| relogin_refused_off_proxy(app, name))
-            {
+            // The disk's refusal toasts; a roster that still holds a proxy
+            // claim the disk dropped stays inert, since no surface offers the
+            // key until the roster reloads.
+            if editing.as_deref().is_some_and(|name| {
+                relogin_refused_off_proxy(app, name)
+                    || login_row_refused(app, &ProfileName::from(name))
+            }) {
                 return;
             }
             match login_row_flow(app, editing.as_deref()) {
@@ -24360,15 +25428,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::RollingTokenSwitch => {
             if let Some(name) = name {
-                // Same dim gate the renderer dims on, re-derived here (the
-                // clear row's three-surface pattern): a disabled account and
+                // Same dim gate the renderer dims on, the one spelling both
+                // surfaces and this handler share: a disabled account and
                 // a quarantined login are both inert, a stale arm included.
-                let gated = {
-                    let cfg = app.config();
-                    cfg.find(&name).is_some_and(|p| p.is_disabled())
-                        || cfg.state.auth_broken.contains(&name)
-                };
-                if gated {
+                if rolling_switch_row_gated(app, &name) {
                     return;
                 }
                 let armed = app
@@ -25380,18 +26443,17 @@ pub(crate) fn parse_bell_threshold(raw: &str) -> Option<Option<f64>> {
     crate::fallback::parse_threshold(raw).map(Some)
 }
 
-/// `+`/`-` on the `alert at` row: step by `delta` inside the typed range,
-/// starting from 95% when the alert is off.
-fn step_bell_threshold(app: &mut App, delta: f64) {
-    let Some(name) = app
+/// The `alert at` value one `+` (`up`) or `-` lands on inside the typed
+/// range, starting from 95% when the alert is off; `None` where that
+/// direction does not move it.
+fn bell_threshold_step(app: &App, up: bool) -> Option<f64> {
+    let name = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
-        .map(ProfileName::from)
-    else {
-        return;
-    };
+        .map(ProfileName::from)?;
     let current = app.config().find(&name).and_then(|p| p.bell_threshold);
+    let delta = if up { PERCENT_STEP } else { -PERCENT_STEP };
     let next = match current {
         // Rounded to hundredths, so a step off `5.01` lands on `0.01`, not on
         // a float tail.
@@ -25401,12 +26463,34 @@ fn step_bell_threshold(app: &mut App, delta: f64) {
         ),
         None => DEFAULT_BELL_THRESHOLD,
     };
-    write_bell_threshold(app, Some(next));
+    (current != Some(next)).then_some(next)
+}
+
+/// `+`/`-` on the `alert at` row: write where [`bell_threshold_step`] lands.
+fn step_bell_threshold(app: &mut App, up: bool) {
+    if let Some(next) = bell_threshold_step(app, up) {
+        write_bell_threshold(app, Some(next));
+    }
 }
 
 /// Where `+`/`-` start on an account with no alert: the commented-out default
 /// in a fresh `config.toml`.
 const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
+
+/// What one `+`/`-` moves a percentage stepper by: `alert at`, `rotate at`
+/// and `weekly at`.
+const PERCENT_STEP: f64 = 5.0;
+
+/// Whether one `+` (`up`) or `-` moves the Setup card's stepper `row`: the
+/// value each step function returns on, the footer's per-direction hints and,
+/// either direction holding, the help's joined `+ / -` row.
+pub(crate) fn config_step_lands(app: &App, row: ConfigRow, up: bool) -> bool {
+    match row {
+        ConfigRow::BellThreshold => bell_threshold_step(app, up).is_some(),
+        ConfigRow::UsageProbeInterval => usage_probe_step(app, up).is_some(),
+        _ => false,
+    }
+}
 
 /// Persist the drafted account's alert threshold, rolling memory back on a
 /// failed save, then reseed the row's buffer from what was saved.
@@ -25836,7 +26920,8 @@ fn drain_codex_new_login(app: &mut App) {
             Ok(outcome) => {
                 match stash_new_form_login(app, DraftLogin::CodexMint(Box::new(outcome))) {
                     StashOutcome::Staged => {
-                        app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                        app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                        app.cue_mascot(mascot::Cue::LoginGained);
                     }
                     StashOutcome::FormClosed => app.toast(
                         ToastKind::Warning,
@@ -28382,17 +29467,33 @@ fn toggle_usage_probe(app: &mut App, name: &ProfileName) {
 /// What one `+`/`-` on the `probe every` row moves the interval by.
 const USAGE_PROBE_STEP_MS: i64 = 30_000;
 
-/// Step the drafted account's probe interval by `delta_ms` from wherever it
-/// stands. It writes the interval alone, never the switch.
-fn step_usage_probe_interval(app: &mut App, delta_ms: i64) {
-    let Some(current) = app.config_draft.as_ref().and_then(|d| {
+/// The drafted account's probe interval one `+` (`up`) or `-` lands on from
+/// wherever it stands, kept in its band; `None` where that direction does not
+/// move it.
+fn usage_probe_step(app: &App, up: bool) -> Option<u64> {
+    let current = app.config_draft.as_ref().and_then(|d| {
         let cfg = app.config();
         cfg.find(&ProfileName::from(d.editing_name.clone()?))
             .map(|p| p.usage_probe_interval_ms)
-    }) else {
-        return;
+    })?;
+    let delta = if up {
+        USAGE_PROBE_STEP_MS
+    } else {
+        -USAGE_PROBE_STEP_MS
     };
-    write_usage_probe_interval(app, current.saturating_add_signed(delta_ms));
+    let next = current.saturating_add_signed(delta).clamp(
+        crate::profile::MIN_USAGE_PROBE_INTERVAL_MS,
+        crate::profile::MAX_USAGE_PROBE_INTERVAL_MS,
+    );
+    (next != current).then_some(next)
+}
+
+/// `+`/`-` on the `probe every` row: write where [`usage_probe_step`] lands.
+/// It writes the interval alone, never the switch.
+fn step_usage_probe_interval(app: &mut App, up: bool) {
+    if let Some(next) = usage_probe_step(app, up) {
+        write_usage_probe_interval(app, next);
+    }
 }
 
 /// ⏎ on the `probe every` field: whole seconds, an `s` after them allowed,
@@ -29456,6 +30557,16 @@ fn run_capture_overwrite(
     from_divergence: Option<String>,
     copy: OverwriteCopy,
 ) {
+    // A divergence's capture relinks and activates the target, which a
+    // disabled account can never take; the gate's settle could already write
+    // the live login into it, so refuse first. A proxy account refuses ahead
+    // of that: enabling it would not let the save through.
+    if from_divergence.is_some()
+        && (relogin_refused_off_proxy(app, &name)
+            || refuse_disabled_target(app, &ProfileName::from(name.as_str()), copy.verb()))
+    {
+        return;
+    }
     // The overwrite relinks the live slot when the profile is or
     // becomes the active one, a divergence's capture always (it
     // deactivates the prior one first). Settled before that detach,
@@ -29481,6 +30592,12 @@ fn run_capture_overwrite(
     } else {
         None
     };
+    // A held divergence write resumes here too, past its gate; the hook lets
+    // a test act as a peer between that gate and the hold.
+    #[cfg(test)]
+    if from_divergence.is_some() {
+        run_before_adopt_hold_hook();
+    }
     // Same deferred detach as the non-colliding path: only disown the
     // prior active profile once the overwrite is actually confirmed,
     // so a cancel (handled entirely by `handle_confirm_key` popping
@@ -29509,6 +30626,7 @@ fn run_capture_overwrite(
                 &ProfileName::from(from.as_str()),
                 *snapshot,
                 |cfg, snapshot| {
+                    refuse_disabled_on_disk(&name)?;
                     crate::actions::overwrite_captured_profile_held(
                         cfg, &name, &account, snapshot, true,
                     )
@@ -29582,6 +30700,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if relogin_refused_off_proxy(app, &name) {
                 return;
             }
+            // The gate's settle can write the live login into the target's
+            // store, so a target already disabled refuses first. A held adopt
+            // resumes here too, past its settle.
+            if refuse_disabled_target(app, &ProfileName::from(name.as_str()), "save") {
+                return;
+            }
             // `name` is never the active profile (the picker lists only others),
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
@@ -29598,6 +30722,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             ) else {
                 return;
             };
+            #[cfg(test)]
+            run_before_adopt_hold_hook();
             let name = ProfileName::from(name);
             // The store, the activation and the relink share one hold with the
             // check that the divergence the prompt showed still stands.
@@ -29608,6 +30734,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     &ProfileName::from(from.as_str()),
                     *snapshot,
                     |cfg, snapshot| {
+                        refuse_disabled_on_disk(&name)?;
                         // Captured before the activation replaces the marker,
                         // through the one helper that also answers for a
                         // CLEARED marker — this arm can run after a
@@ -30156,6 +31283,9 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     if relogin_refused_off_proxy(app, &owner) {
                         return;
                     }
+                    if refuse_disabled_target(app, &ProfileName::from(owner.as_str()), "save") {
+                        return;
+                    }
                     // The owner was named for the login the prompt read, so
                     // only that login is captured.
                     let Some(snapshot) = capture_live_or_toast(app) else {
@@ -30415,6 +31545,30 @@ impl DivergenceMoved {
     }
 }
 
+/// Test seam: what a peer does right after the next divergence write's (an
+/// adopt or a capture overwrite) bare-item gate, before its hold, run once.
+#[cfg(test)]
+static BEFORE_ADOPT_HOLD: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn before_the_next_adopt_hold(f: impl FnOnce() + Send + 'static) {
+    if let Ok(mut hook) = BEFORE_ADOPT_HOLD.lock() {
+        *hook = Some(Box::new(f));
+    }
+}
+
+#[cfg(test)]
+fn run_before_adopt_hold_hook() {
+    let hook = BEFORE_ADOPT_HOLD
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 /// Test seam: what a peer does right after the next divergence adopt's hold
 /// releases, run once.
 #[cfg(test)]
@@ -30462,15 +31616,18 @@ fn while_divergence_stands<T>(
 }
 
 /// Open the "save elsewhere" picker from the Divergence modal about `active`.
-/// Lists every profile except that diverged one; a refresh-token match is
-/// pre-selected. With no other profile to pick, drops straight into a
-/// new-profile capture.
+/// Lists every profile except that diverged one and those its `↵` would only
+/// refuse (a disabled account, or one that logs in through its proxy); a
+/// refresh-token match is pre-selected. With no other profile to pick, drops
+/// straight into a new-profile capture. The `↵` still re-checks each target
+/// on disk.
 fn open_divergence_target_picker(app: &mut App, active: &str, seen: Option<u64>) {
     let (targets, preselect) = {
         let cfg = app.config();
         let targets: Vec<String> = cfg
             .profiles
             .iter()
+            .filter(|p| !p.is_disabled() && p.spends_oauth_chain())
             .map(|p| p.name.as_str().to_string())
             .filter(|n| n != active)
             .collect();
@@ -30569,6 +31726,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if relogin_refused_off_proxy(app, &target) {
+                return;
+            }
+            if refuse_disabled_target(app, &ProfileName::from(target.as_str()), "save") {
                 return;
             }
             let Some(snapshot) = capture_live_or_toast(app) else {
@@ -30698,6 +31858,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
+            let is_divergence = form.from_divergence.is_some();
             // Chars + cross-harness only — the own-roster duplicate branch of
             // `validate_profile_name` is deliberately skipped so a claude
             // collision falls through to the canonical_name lookup below
@@ -30719,6 +31880,15 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             if collision
                 .as_deref()
                 .is_some_and(|existing| relogin_refused_off_proxy(app, existing))
+            {
+                return;
+            }
+            // The divergence picker's rows refuse a disabled target before
+            // their confirm; this typed-name route is the same door, and the
+            // prompt stays open so the name can be changed.
+            if let Some(existing) = collision.as_deref()
+                && is_divergence
+                && refuse_disabled_target(app, &ProfileName::from(existing), "save")
             {
                 return;
             }
@@ -30952,6 +32122,7 @@ fn apply_status_incidents(
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }
+            app.cue_mascot(mascot::Cue::NewIncident);
         }
         app.status.seen_latest = newest_id.clone();
     }
@@ -31002,9 +32173,13 @@ fn drain_tokens_events(app: &mut App) {
                 app.tokens_failed_expanded = false;
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
+                // Re-anchor after the loader replaces the grouped list. The
+                // anchor the selection stored, never the model the old row
+                // names now: the list being replaced may already re-rank
+                // under the new bucket bounds.
+                let identity = app.token_model_identity.clone();
                 app.token_stats = Some(*stats);
-                // Re-clamp after the loader replaces the grouped list.
-                clamp_token_model_cursor(app);
+                rehome_token_model_cursor(app, identity);
             }
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
@@ -31164,7 +32339,8 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // so the profile this login belongs to has no final name yet.
         match stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome))) {
             StashOutcome::Staged => {
-                app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             StashOutcome::FormClosed => app.toast(
                 ToastKind::Warning,
@@ -31291,6 +32467,7 @@ fn apply_login_snapshot(
             app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{name}'"));
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -31348,6 +32525,7 @@ fn apply_console_login(
                     "console session captured for '{name}'\nit expires 48h after your aliyun sign-in, not after this login"
                 ),
             );
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -31362,7 +32540,7 @@ fn apply_console_login(
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
     let now_ms = app.anim_ms();
-    app.clawd.tick(now_ms);
+    app.mascot.tick(now_ms);
     // Safety net: a forget noted without an immediate drain still lands before
     // the next frame reads the stores; the per-site drains keep this a no-op.
     app.apply_forgets();
@@ -31374,6 +32552,7 @@ pub(crate) fn on_tick(app: &mut App) {
                     ToastKind::Success,
                     format!("updated to v{v}\nrestart to apply"),
                 );
+                app.cue_mascot(mascot::Cue::UpdateInstalled);
             }
             UpdateEvent::Available(v) => {
                 app.toast(
@@ -31394,7 +32573,11 @@ pub(crate) fn on_tick(app: &mut App) {
         && app.token_view == TokenView::Models
         && app.token_period.bucket().is_some()
     {
-        clamp_token_model_cursor(app);
+        // The bucket bounds shift with the clock, so the drain above may
+        // already have re-ranked the list under the new bucket: re-home off
+        // the stored anchor, never the model the old row names now.
+        let identity = app.token_model_identity.clone();
+        rehome_token_model_cursor(app, identity);
     }
     drain_pricing_events(app);
     drain_login_events(app);
@@ -31434,6 +32617,7 @@ pub(crate) fn on_tick(app: &mut App) {
             app.usage_detail_scroll = 0;
         }
     }
+    observe_mascot_state(app);
     app.apply_usage();
 
     drain_switch_gates(app);
@@ -31524,6 +32708,7 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
     poll_live_sessions(app);
+    poll_delegate_jobs(app);
     sync_broken_verdicts(app);
     sync_credit_refusals(app);
     poll_codex_rows(app);
@@ -31635,6 +32820,7 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     if refresh_codex_rows(app) {
+        observe_codex_state(app);
         app.place_overview_cursor();
     }
     let names: Vec<crate::profile::ProfileName> = app
@@ -31644,6 +32830,82 @@ fn poll_codex_rows(app: &mut App) {
         .map(|p| p.name.clone())
         .collect();
     app.claude_resets = claude_resets(&names);
+}
+
+/// The codex roster's mascot edges, compared right after each landed refresh
+/// off the snapshot the refresh already took (never a per-tick disk read): the
+/// active name changing is a switch, a name entering `broken` is a quarantine
+/// (one leaving it is none), and a 5h or 7d window rolls over under the same
+/// rule [`App::observe_window_resets`] applies to the claude windows — a
+/// fresh reading names a later boundary than the highest one ever named, once
+/// the boundary last named has passed. An unreadable roster keeps the
+/// previous rows, so it never reads as an edge, and the first landed reading
+/// only seeds.
+fn observe_codex_state(app: &mut App) {
+    let active = app
+        .codex_rows
+        .iter()
+        .find(|row| row.active)
+        .map(|row| row.name.to_string());
+    let broken: Vec<String> = app
+        .codex_rows
+        .iter()
+        .filter(|row| row.broken)
+        .map(|row| row.name.to_string())
+        .collect();
+    let resets: HashMap<String, [Option<i64>; 2]> = app
+        .codex_rows
+        .iter()
+        .map(|row| (row.name.to_string(), window_instants(row)))
+        .collect();
+
+    if !app.mascot_seen.codex_seeded {
+        app.mascot_seen.codex_seeded = true;
+        app.mascot_seen.codex_active = active;
+        app.mascot_seen.codex_broken = broken;
+        app.mascot_seen.codex_resets = resets
+            .into_iter()
+            .map(|(name, instants)| (name, App::seed_windows(instants)))
+            .collect();
+        return;
+    }
+
+    let switched = match (&app.mascot_seen.codex_active, &active) {
+        (Some(seen), Some(next)) => *seen != *next,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.codex_active = active;
+
+    let quarantined = broken
+        .iter()
+        .any(|name| !app.mascot_seen.codex_broken.contains(name));
+    app.mascot_seen.codex_broken = broken;
+
+    let now = crate::usage::now_epoch_secs();
+    let reset = App::reset_windows(
+        &mut app.mascot_seen.codex_resets,
+        resets
+            .iter()
+            .map(|(name, instants)| (name.clone(), *instants)),
+        now,
+    );
+    // A dropped codex profile forgets its boundaries, so a re-created one
+    // seeds again, the way the claude arm's retain does.
+    let present: HashSet<&str> = resets.keys().map(String::as_str).collect();
+    app.mascot_seen
+        .codex_resets
+        .retain(|name, _| present.contains(name.as_str()));
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+    if reset {
+        app.cue_mascot(mascot::Cue::WindowReset);
+    }
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
@@ -31657,7 +32919,7 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     // The image this process runs never comes back, so each kind's toast
@@ -31782,6 +33044,7 @@ fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
         if app.daemon_toasted_kinds.latch(change) {
             app.toast(ToastKind::Warning, daemon_binary_toast(change));
         }
+        app.cue_mascot(mascot::Cue::DaemonReplaced);
     }
     refresh_plugin_check(app);
 }
@@ -31794,7 +33057,9 @@ fn refresh_plugin_check(app: &mut App) {
         return;
     };
     let clauth_path = crate::plugin_probe::on_path("clauth");
-    app.services.checks[idx] = plugin_row(app, clauth_path.as_deref());
+    let (check, tooltip) = plugin_row(app, clauth_path.as_deref());
+    app.services.plugin_idle_wake_tooltip = Some(tooltip);
+    app.services.checks[idx] = check;
     clamp_problem_cursor(app);
 }
 
@@ -31992,6 +33257,154 @@ fn poll_live_sessions(app: &mut App) {
     app.job_trees = jobs;
 }
 
+/// Read the delegate job store at most once a second on every tab, so a
+/// delegate finishing while the Services tab is out of view still reaches the
+/// mascot: each job seen finished for the first time cues a finish, failed by
+/// the same error flag every stored-record delivery folds. A finish claimed
+/// between two reads left its delivery ledger, which cues by the verdict the
+/// claim stamped, so a claimed finish reaches the mascot exactly like an
+/// unclaimed one. One id cues once, whichever spelling it is first seen as.
+/// A stop cues nothing — the note a resumed session reads names it — and its
+/// id still enters the seen set, so no later read can cue it.
+/// The first read only seeds, ledgers included, so a finish from before the
+/// launch is no event; a store that could not be read is no reading, so it
+/// neither seeds nor cues.
+fn poll_delegate_jobs(app: &mut App) {
+    const DELEGATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_delegate_poll
+        .is_some_and(|t| t.elapsed() < DELEGATE_POLL_INTERVAL)
+    {
+        return;
+    }
+    app.last_delegate_poll = Some(Instant::now());
+    let Some(jobs) = crate::mcp::jobs::list_banded_readable(crate::usage::now_ms()) else {
+        return;
+    };
+    let finished = jobs
+        .iter()
+        .filter(|job| matches!(job.liveness, crate::mcp::jobs::JobLiveness::Done));
+    let Some(ledgers) = crate::mcp::jobs::list_ledgers_readable() else {
+        return;
+    };
+    let Some(seen) = app.mascot_seen.delegates_done.as_mut() else {
+        app.mascot_seen.delegates_done = Some(
+            finished
+                .map(|job| job.record.job_id.clone())
+                .chain(ledgers.into_iter().map(|ledger| ledger.job_id))
+                .collect(),
+        );
+        return;
+    };
+    let mut cues: Vec<mascot::Cue> = finished
+        .filter(|job| seen.insert(job.record.job_id.clone()))
+        .filter(|job| job.phase() != crate::mcp::jobs::JobPhase::Stopped)
+        .map(|job| {
+            if crate::mcp::done_job_failed(&job.record) {
+                mascot::Cue::DelegateFailed
+            } else {
+                mascot::Cue::DelegateDone
+            }
+        })
+        .collect();
+    cues.extend(
+        ledgers
+            .into_iter()
+            .filter(|ledger| seen.insert(ledger.job_id.clone()))
+            .filter(|ledger| !ledger.stopped)
+            .map(|ledger| {
+                if ledger.failed {
+                    mascot::Cue::DelegateFailed
+                } else {
+                    mascot::Cue::DelegateDone
+                }
+            }),
+    );
+    for cue in cues {
+        app.cue_mascot(cue);
+    }
+}
+
+/// The mascot's config-held edges, compared each tick after the reload so one
+/// compare covers an in-TUI write and another process's alike: the active
+/// account changing is a switch, and a name entering `auth_broken` is a
+/// quarantine (one leaving it is none). A rename moves a name but keeps the
+/// account's stored id under it, so an id matching across the move is no cue;
+/// a name whose id cannot be read falls back to the name answer. A reload that
+/// flips `reduce_motion` applies it here. An id is read only when its name is
+/// new to the reading, never per tick.
+fn observe_mascot_state(app: &mut App) {
+    let (active, auth_broken, still) = {
+        let cfg = app.config();
+        (
+            cfg.state.active_profile.as_ref().cloned(),
+            cfg.state.auth_broken.clone(),
+            cfg.state.reduce_motion,
+        )
+    };
+    app.mascot.set_reduce_motion(still);
+
+    let before = app.mascot_seen.active.clone();
+    let now = active.as_ref().map(|name| match &before {
+        Some(seen) if seen.name == *name => seen.clone(),
+        _ => SeenAccount::read(name),
+    });
+    let switched = match (&before, &now) {
+        (Some(seen), Some(next)) => {
+            seen.name != next.name && !same_account(seen.id.as_ref(), next.id.as_ref())
+        }
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.active = now;
+
+    let before = std::mem::take(&mut app.mascot_seen.auth_broken);
+    let mut departed: Vec<crate::profile::ProfileId> = before
+        .iter()
+        .filter(|seen| !auth_broken.contains(&seen.name))
+        .filter_map(|seen| seen.id.clone())
+        .collect();
+    let mut quarantined = false;
+    let mut now = Vec::with_capacity(auth_broken.len());
+    for name in &auth_broken {
+        if let Some(seen) = before.iter().find(|seen| seen.name == *name) {
+            now.push(seen.clone());
+            continue;
+        }
+        let seen = SeenAccount::read(name);
+        let renamed =
+            seen.id
+                .as_ref()
+                .is_some_and(|id| match departed.iter().position(|old| old == id) {
+                    Some(pos) => {
+                        departed.remove(pos);
+                        true
+                    }
+                    None => false,
+                });
+        if !renamed {
+            quarantined = true;
+        }
+        now.push(seen);
+    }
+    app.mascot_seen.auth_broken = now;
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+}
+
+/// Whether two names answer for one account: both stored ids read and equal.
+fn same_account(
+    old: Option<&crate::profile::ProfileId>,
+    new: Option<&crate::profile::ProfileId>,
+) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old == new)
+}
+
 /// Re-sync the durable dead-login verdicts into the live `ThirdPartyBroken`
 /// mirror at most once a second, through the pass the daemon runs too
 /// ([`crate::usage::sync_dead_logins`]). This is the stood-down TUI's heal
@@ -32094,15 +33507,20 @@ fn poll_services_refresh(app: &mut App) {
     }
 }
 
+/// One recompute's plugin and herdr rows: the plugin check with its focused
+/// `idle wake` option's explanation, and the herdr check with its config
+/// verdict when herdr resolves.
+type PluginHerdrChecks = (
+    (Check, String),
+    Option<(Check, Option<crate::herdr::ConfigStatus>)>,
+);
+
 /// Read the plugin and herdr rows' health from the clauth path the caller
 /// resolved, the cached probes and the local config files — the cheap reads
 /// the in-view recompute and the out-of-view refresh share. Never spawns a
 /// process. `clauth_path` is passed in so a recompute that already walked
 /// `PATH` for its own gates walks it once, not again here.
-fn plugin_herdr_checks(
-    app: &App,
-    clauth_path: Option<&std::path::Path>,
-) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
+fn plugin_herdr_checks(app: &App, clauth_path: Option<&std::path::Path>) -> PluginHerdrChecks {
     let plugin = plugin_row(app, clauth_path);
     let herdr = app
         .services
@@ -32123,13 +33541,20 @@ fn plugin_herdr_checks(
 
 /// The `plugin` row over the cached probes, closed by the daemon's
 /// changed-binary line for the kind the app holds. The line moves no health:
-/// the heal only waits for the daemon's restart.
-fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
+/// the heal only waits for the daemon's restart. Returns the check and the
+/// focused `idle wake` row's explanation, resolved over the same cache view
+/// the readout lines read.
+fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> (Check, String) {
+    let idle_wake = app.config().state.plugin.idle_wake;
+    let cache = crate::hook_jobs::CacheView::read();
+    let tooltip = plugin_idle_wake_tooltip(&cache, idle_wake);
     let mut check = plugin_check(
         clauth_path,
         app.services.cc_version.clone(),
         app.services.mcp_boot.clone(),
         crate::completions::detected_installed_script(),
+        cache,
+        idle_wake,
     );
     // Its own group, last: the renderer wraps it over several rows, and past
     // every fix line those rows move no fix line's rendered row.
@@ -32139,10 +33564,16 @@ fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
             .detail
             .push(daemon_binary_card_line(change).to_string());
     }
-    check
+    (check, tooltip)
 }
 
 /// Keep the detail's problem cursor inside the selected row's problem set.
+/// A replacement that clears the plugin card's last problem while its detail
+/// holds focus leaves the walk resting on the option row, so the one-shot
+/// scroll is armed here (the same one a list `↵` descend arms) to bring the
+/// row into view on the next frame. What arms it is the problem the previous
+/// plugin frame drew, not where the walk stood: a card that never had one
+/// drew none, so a plain refresh of it keeps the user's scroll.
 fn clamp_problem_cursor(app: &mut App) {
     let problems = app
         .services
@@ -32153,6 +33584,17 @@ fn clamp_problem_cursor(app: &mut App) {
     if app.services.problem_cursor > problems {
         app.services.problem_cursor = problems;
     }
+    if app.services.focus == ServicesFocus::Detail
+        && app.services.plugin_problem_shown.get()
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "plugin" && c.problems.is_empty())
+    {
+        app.services.plugin_problem_shown.set(false);
+        app.services.plugin_option_focus = true;
+        app.services.plugin_option_scroll_pending.set(true);
+    }
 }
 
 /// Re-read only the plugin and herdr rows' health while the Services tab is
@@ -32161,7 +33603,7 @@ fn clamp_problem_cursor(app: &mut App) {
 /// shunt probe start out of view.
 fn refresh_services_activity(app: &mut App) {
     let clauth_path = crate::plugin_probe::on_path("clauth");
-    let (plugin, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    let ((plugin, _tooltip), herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     record_plugin_herdr_health(
         app,
         plugin.health,
@@ -32295,6 +33737,7 @@ fn drain_op_results(app: &mut App) {
                     ),
                 );
                 app.set_tab_activity(Tab::Usage, ToastKind::Danger);
+                app.cue_mascot(mascot::Cue::RefreshFailed);
             }
         }
     }
@@ -32318,8 +33761,17 @@ fn blocking_modal_open(app: &App) -> bool {
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
 /// stack under an open modal — except during the exit wait, which must drain
-/// the answered gate's `Switching` marker or the quit strands on it.
+/// the answered gate's `Switching` marker or the quit strands on it. Once the
+/// shared shutdown began, an answer is drained and its marker cleared with no
+/// relink, as the shutdown's own spend wait does: its credential detach must
+/// stay the last word at exit.
 fn drain_switch_gates(app: &mut App) {
+    if app.shutdown.began() {
+        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
+            clear_activity(&app.activity, &name);
+        }
+        return;
+    }
     if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
@@ -32567,6 +34019,7 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
@@ -32850,43 +34303,144 @@ where
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
-/// Snapshot active credentials and detach the symlink. After shutdown, external
-/// writes to `.credentials.json` land in the standalone file, not the profile.
-///
-/// The bounded wait covers only a running token spend, as the backstop for an
-/// exit that skipped the exit wait (a second quit, or a quit while a checking
-/// save holds it): a process that dies between the token endpoint's answer and
-/// the stage write loses the minted pair. A usage read, a queued fetch or a
-/// third-party leg may be abandoned, so none of them delays the exit.
+/// The one receiver of switch-gate answers, shared by the frame loop's drain
+/// and the shutdown's spend wait, which may run on the stop-signal watcher.
+pub(crate) struct SwitchGates(std::sync::Mutex<std::sync::mpsc::Receiver<SwitchGateResult>>);
+
+impl SwitchGates {
+    /// The next queued answer; the lock is released before it returns.
+    pub(crate) fn try_recv(&self) -> Result<SwitchGateResult, std::sync::mpsc::TryRecvError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+    }
+}
+
+/// The TUI's terminal-free shutdown, reachable from the frame loop's thread
+/// and from the stop-signal watcher, which runs it when a stop signal finds the
+/// frame loop unable to return.
+pub(crate) struct Shutdown {
+    ran: std::sync::Once,
+    /// Raised first in the body: from then on [`drain_switch_gates`] clears an
+    /// answered gate with no relink, so a gate answered while the watcher runs
+    /// the shutdown cannot undo the body's detach. A frame held past the grace
+    /// can still relink through a confirm or a rolling switch, which do not
+    /// read it.
+    began: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    activity: ActivityStore,
+    switch_gates: Arc<SwitchGates>,
+    config: ConfigHandle,
+    /// The scheduler's tick thread once bootstrap started it.
+    scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
+    /// The update check thread; `None` when the saved toggle is off.
+    update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
+    /// How many times the shutdown's body started.
+    #[cfg(test)]
+    runs: AtomicUsize,
+}
+
+impl Shutdown {
+    /// Run the shutdown body unless a run of it already finished. A caller
+    /// arriving while another runs it waits for that run: once it finishes,
+    /// the caller returns; if it panicked, the caller runs the body itself. So
+    /// no caller returns, and none can exit the process, while a run is
+    /// mid-save.
+    pub(crate) fn run(&self) {
+        self.ran.call_once_force(|_| self.run_body());
+    }
+
+    /// Hand bootstrap's tick thread to the shutdown that waits for it.
+    fn adopt_scheduler(&self, scheduler: crate::daemon::TickThread) {
+        *self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler);
+    }
+
+    /// Whether the body has started: the stop-signal watcher can run it while
+    /// the frame loop is still live, held past its grace.
+    fn began(&self) -> bool {
+        self.began.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot active credentials and detach the symlink. After shutdown,
+    /// external writes to `.credentials.json` land in the standalone file, not
+    /// the profile.
+    ///
+    /// The bounded wait covers only a running token spend, as the backstop for
+    /// an exit that skipped the exit wait (a second quit, a quit while a
+    /// checking save holds it, or a stop signal): a process that dies between
+    /// the token endpoint's answer and the stage write loses the minted pair. A
+    /// usage read, a queued fetch or a third-party leg may be abandoned, so
+    /// none of them delays the exit.
+    ///
+    /// The scheduler's tick thread is woken first and waited for last, so its
+    /// exit save of the tps producer's unsaved records overlaps the waits
+    /// between. It gets until the later of the waits' end and the daemon's
+    /// child stop budget past the start of shutdown, so a quit stays quick —
+    /// the daemon waits its full drain bound instead; a tick still running then
+    /// is abandoned and its records lost, as a crash loses them.
+    fn run_body(&self) {
+        self.began.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(scheduler) = &scheduler {
+            scheduler.stop();
+        }
+        let wait_start = Instant::now();
+        while wait_start.elapsed() < Duration::from_millis(2000) {
+            // Drain answered switch gates each iteration without relinking: the
+            // gate already landed its pair (staged/landed), and relinking during
+            // shutdown would re-point credentials after the user quit. Clearing
+            // the marker is what frees the spend wait — an answered gate that
+            // stays queued would otherwise burn the whole bound.
+            while let Ok(SwitchGateResult { name, .. }) = self.switch_gates.try_recv() {
+                clear_activity(&self.activity, &name);
+            }
+            if !token_spend_in_flight(&self.activity) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Wait up to 5 s for the update check to finish, detaching a
+        // still-running check after that (a slow download shouldn't delay TUI
+        // exit) — but a running replace step is waited for, up to
+        // `update::REPLACE_WAIT_CAP` (60 s) past those 5 s, so this shutdown
+        // path strands the self-replace's staged file beside the binary only
+        // behind a replace that outlasts that cap.
+        let update_handle = self
+            .update_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = update_handle {
+            handle.wait_on_exit(Duration::from_secs(5));
+        }
+        if let Some(scheduler) = &scheduler {
+            let window = wait_start
+                .elapsed()
+                .max(crate::daemon::gateway::DAEMON_STOP_BUDGET);
+            scheduler.wait_stopped(wait_start, window);
+        }
+        {
+            let mut cfg = App::lock_config(&self.config);
+            let _ = snapshot_active_credentials(&mut cfg);
+        }
+        let _ = detach_credentials_link();
+    }
+}
+
+/// The frame loop's call into the shared [`Shutdown::run`].
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
-    app.shutting_down.store(true, Ordering::SeqCst);
-    let wait_start = Instant::now();
-    while wait_start.elapsed() < Duration::from_millis(2000) {
-        // Drain answered switch gates each iteration without relinking: the
-        // gate already landed its pair (staged/landed), and relinking during
-        // shutdown would re-point credentials after the user quit. Clearing the
-        // marker is what frees the spend wait — an answered gate that stays
-        // queued would otherwise burn the whole bound.
-        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
-            clear_activity(&app.activity, &name);
-        }
-        if !token_spend_in_flight(&app.activity) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Wait up to 5 s for the update check to finish, detaching a still-running
-    // check after that (a slow download shouldn't delay TUI exit) — but never
-    // while the replace step runs, so this shutdown path can't strand the
-    // self-replace's staged file beside the binary.
-    if let Some(handle) = app.update_handle.take() {
-        handle.wait_on_exit(Duration::from_secs(5));
-    }
-    {
-        let mut cfg = app.config();
-        let _ = snapshot_active_credentials(&mut cfg);
-    }
-    let _ = detach_credentials_link();
+    app.shutdown.run();
     Ok(())
 }
 

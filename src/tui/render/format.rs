@@ -185,6 +185,68 @@ pub(super) fn duration_label(secs: u64) -> String {
     }
 }
 
+/// The age a profile's published refresh deadline overran by, `Some` only when
+/// this instance runs no fetch for it: a stood-down mirror's stamp is its own
+/// cache-derived estimate and nothing here will fetch the row, so its slot
+/// reads the overrun instead of a countdown frozen at `0s`. The instance that
+/// fetches draws the queued spinner for a past deadline instead
+/// ([`crate::usage::display_activity`]), so it never reaches this.
+///
+/// The overrun reads overdue only past one
+/// [`crate::usage::tick_fetch_deadline`]: the published stamp is the holder's
+/// cache estimate, and one tick fetch deadline is the wait the holder gives
+/// its own fetch, so a smaller overrun still reads as a healthy cycle — the
+/// countdown form, never a per-cycle overdue flash. The age itself still
+/// counts from the deadline.
+pub(super) fn past_deadline_age(fetches_here: bool, next: u64) -> Option<u64> {
+    if fetches_here {
+        return None;
+    }
+    let overrun = crate::usage::now_ms().checked_sub(next)?;
+    let grace = crate::usage::tick_fetch_deadline().as_millis() as u64;
+    (overrun > grace).then_some(overrun)
+}
+
+/// The age a reading overran its own cadence by — `now - (clock + interval)` —
+/// the deadline a reading carries when no fetch owner published one (a stuck
+/// worker holds the leg, so the countdown map has no entry). `None` without a
+/// reading clock to derive the deadline from, or before it falls due.
+pub(super) fn reading_due_age(reading_clock: Option<u64>, interval_ms: u64) -> Option<u64> {
+    let due = reading_clock?.saturating_add(interval_ms);
+    let now = crate::usage::now_ms();
+    (due < now).then(|| now - due)
+}
+
+/// The overdue fetch-row suffix: `refresh overdue · read 4m ago`. Without a
+/// reading clock to date, the overdue state still reads, undated.
+pub(super) fn overdue_phrase(verb: &str, reading_clock: Option<u64>) -> String {
+    match reading_clock {
+        Some(at) => format!("{verb} overdue · read {}", relative_age(at)),
+        None => format!("{verb} overdue"),
+    }
+}
+
+/// The overview timer slot's overdue label: [`duration_label`]'s one-unit form
+/// up to 99 days, then whole weeks past 99 days and whole years past 99 weeks.
+/// The ages its callers produce (`now - due`, `due >= 0`) keep every form
+/// inside the slot's 4 inner cells until the wall clock passes ~2070, when the
+/// years arm's `+100y` (5 cells) would shift the row's columns.
+pub(super) fn overdue_label(age_ms: u64) -> String {
+    let days = age_ms / 86_400_000;
+    if days >= 100 {
+        let weeks = days / 7;
+        if weeks >= 100 {
+            format!("+{}y", weeks / 52)
+        } else {
+            format!("+{weeks}w")
+        }
+    } else {
+        // A deadline passed under a second ago is already overdue: its age
+        // reads `+1s`, never `+0s`.
+        format!("+{}", duration_label((age_ms / 1000).max(1)))
+    }
+}
+
 /// The widest whole reading, `100%`: the label budget every Overview usage tier
 /// is sized for. A longer label (`73.42%`) widens its column by the excess.
 pub(super) const PCT_LABEL_BUDGET: usize = 4;

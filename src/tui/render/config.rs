@@ -374,21 +374,37 @@ struct Snap {
     login_disabled_reason: Option<String>,
 }
 
+/// The `ClearSessionToken` gate — ONE formula for every reader: the card's
+/// [`Snap`] feeds it the per-frame sidecar read, the footer and help feed it
+/// the tick's sidecar cache, and `run_config_row` makes the same judgment
+/// from a fresh disk read. Refused only when clearing would strip the
+/// account's LAST credential, i.e. a stored PIECE (sidecar or preserved mint)
+/// with no other login behind it. A flag-only account disarms without
+/// touching a credential, so it is never gated — a row that dims while its
+/// press acts would be the renderer's own lie.
+pub(crate) fn clear_gated_facts(
+    has_other_login: bool,
+    rolling_armed: bool,
+    holds_sidecar: bool,
+    has_static_backup: bool,
+) -> bool {
+    if has_other_login {
+        return false;
+    }
+    let flag_only = rolling_armed && !holds_sidecar && !has_static_backup;
+    !flag_only
+}
+
 impl Snap {
-    /// The `ClearSessionToken` gate — ONE spelling for both render readers
-    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row` makes
-    /// the same judgment from a fresh disk read): refused only when clearing
-    /// would strip the account's LAST credential, i.e. a stored PIECE (sidecar
-    /// or preserved mint) with no other login behind it. A flag-only account
-    /// disarms without touching a credential, so it is never gated — a row
-    /// that dims while its press acts would be the renderer's own lie.
+    /// The `ClearSessionToken` gate off the per-frame facts [`Self`] holds,
+    /// through the one formula [`clear_gated_facts`].
     fn clear_gated(&self) -> bool {
-        if self.has_other_login {
-            return false;
-        }
-        let flag_only =
-            self.rolling_armed && self.session_token.is_none() && !self.has_static_backup;
-        !flag_only
+        clear_gated_facts(
+            self.has_other_login,
+            self.rolling_armed,
+            self.session_token.is_some(),
+            self.has_static_backup,
+        )
     }
 
     /// The `RollingTokenSwitch` gate — ONE spelling for both render readers

@@ -102,11 +102,32 @@ enum Plant {
     ModelEmpty,
     /// A contract 1.1 proxy declares a `null` figure `model`.
     ModelNull,
-    /// A contract 1.2 proxy declares an empty figure `model`.
-    ModelEmptyOnOneTwo,
+    /// A contract 1.3 proxy declares an empty figure `model`.
+    ModelEmptyOnOneThree,
+    /// A contract 1.3 proxy, a minor past every one clauth knows.
+    ContractOneThree,
+    /// A contract 1.2 proxy listing `token_stats`, its token route conformant.
+    TokenStats,
+    /// `TokenStats`, its token route answering without the admin token.
+    TokensWithoutToken,
+    /// `TokenStats`, its record's `output_tokens` the string `"1"`.
+    TokenOutputString,
+    /// `TokenStats`, its record's `model` a `null`.
+    TokenModelNull,
+    /// `TokenStats`, a read without `since` carrying `dropped: false`.
+    TokensDroppedFalse,
+    /// `TokenStats`, a read naming a cursor it never served answering
+    /// without `dropped`.
+    UnknownCursorNotDropped,
+    /// A contract 1.2 proxy without `token_stats` whose token route answers
+    /// 404 rather than 501.
+    Tokens404,
     /// A contract 1.0 proxy declares a figure `model` that is a number, a
     /// field 1.0 does not define.
     ModelNumberOnOneZero,
+    /// `TokenStats`, its ring's first record `id` 129 astral characters (258
+    /// UTF-16 units), its second 128 (256 units).
+    TokenIdPastUtf16Max,
 }
 
 impl Plant {
@@ -118,11 +139,30 @@ impl Plant {
             Self::ContractOneOne | Self::ModelNotString | Self::ModelEmpty | Self::ModelNull => {
                 "1.1"
             }
-            Self::ContractOneTwo | Self::ModelEmptyOnOneTwo => "1.2",
+            Self::ContractOneTwo | Self::Tokens404 => "1.2",
+            _ if self.token_stats() => "1.2",
+            Self::ContractOneThree | Self::ModelEmptyOnOneThree => "1.3",
             _ => "1.0",
         }
     }
+
+    /// Whether `/info` lists the `token_stats` capability.
+    fn token_stats(self) -> bool {
+        matches!(
+            self,
+            Self::TokenStats
+                | Self::TokensWithoutToken
+                | Self::TokenOutputString
+                | Self::TokenModelNull
+                | Self::TokensDroppedFalse
+                | Self::UnknownCursorNotDropped
+                | Self::TokenIdPastUtf16Max
+        )
+    }
 }
+
+/// The one cursor the stub's token route serves.
+const CURSOR: &str = "stub-life.1";
 
 struct StubState {
     plant: Plant,
@@ -138,6 +178,10 @@ struct StubState {
     requests: Vec<String>,
     /// Every flow a re-bind request opened.
     rebinds: Vec<String>,
+    /// Every request's target, query included, in arrival order.
+    targets: Vec<String>,
+    /// The targets of the requests that carried the admin token.
+    authed_targets: Vec<String>,
 }
 
 impl StubState {
@@ -182,6 +226,8 @@ impl StubState {
             inferences: 0,
             requests: Vec::new(),
             rebinds: Vec::new(),
+            targets: Vec::new(),
+            authed_targets: Vec::new(),
         }
     }
 }
@@ -200,7 +246,7 @@ fn setting_default(key: &str) -> Value {
 fn known_path(segs: &[&str]) -> bool {
     matches!(
         segs,
-        ["info" | "accounts" | "usage" | "config" | "events"]
+        ["info" | "accounts" | "usage" | "config" | "events" | "tokens"]
             | ["accounts", _]
             | ["accounts", "login", _]
             | ["accounts", _, "key"]
@@ -393,6 +439,7 @@ fn handle(
     if let Some(rest) = path.strip_prefix("/clauth/v1/") {
         let segs: Vec<&str> = rest.split('/').collect();
         let exempt = (s.plant == Plant::UsageWithoutToken && method == "GET" && segs == ["usage"])
+            || (s.plant == Plant::TokensWithoutToken && method == "GET" && segs == ["tokens"])
             || (s.plant == Plant::LoginWithoutToken
                 && method == "POST"
                 && segs == ["accounts", "login"]);
@@ -466,12 +513,15 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             let model = match s.plant {
                 Plant::ContractOneOne | Plant::ContractOneTwo => Some(json!("glm-5")),
                 Plant::ModelNotString | Plant::ModelNumberOnOneZero => Some(json!(5)),
-                Plant::ModelEmpty | Plant::ModelEmptyOnOneTwo => Some(json!("")),
+                Plant::ModelEmpty | Plant::ModelEmptyOnOneThree => Some(json!("")),
                 Plant::ModelNull => Some(Value::Null),
                 _ => None,
             };
             if let Some(model) = model {
                 info["figures"][1]["model"] = model;
+            }
+            if s.plant.token_stats() {
+                info["capabilities"] = json!(["events", "token_stats"]);
             }
             let settings = info["settings"].as_array_mut().unwrap();
             if matches!(
@@ -701,6 +751,58 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             }
             ok(200, json!({"values": s.config}))
         }
+        ("GET", ["tokens"]) if s.plant == Plant::TokenIdPastUtf16Max => {
+            let widest = json!([
+                {
+                    "id": "\u{1F600}".repeat(129), "account": ACCOUNT, "model": "stub-model",
+                    "output_tokens": 1, "started_at": "2026-09-29T10:00:00Z",
+                    "ended_at": "2026-09-29T10:00:01Z", "ttft_ms": 120,
+                },
+                {
+                    "id": "\u{1F600}".repeat(128), "account": ACCOUNT, "model": "stub-model",
+                    "output_tokens": 1, "started_at": "2026-09-29T10:00:00Z",
+                    "ended_at": "2026-09-29T10:00:01Z", "ttft_ms": 120,
+                },
+            ]);
+            let since = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="));
+            let body = match since {
+                None => json!({"records": widest, "cursor": CURSOR}),
+                Some(CURSOR) => json!({"records": [], "cursor": CURSOR}),
+                Some(_) => json!({"records": widest, "cursor": CURSOR, "dropped": true}),
+            };
+            ok(200, body)
+        }
+        ("GET", ["tokens"]) if s.plant.token_stats() => {
+            let mut record = json!({
+                "id": "msg_1", "account": ACCOUNT, "model": "stub-model", "output_tokens": 1,
+                "started_at": "2026-09-29T10:00:00Z", "ended_at": "2026-09-29T10:00:01Z",
+                "ttft_ms": 120,
+            });
+            match s.plant {
+                Plant::TokenOutputString => record["output_tokens"] = json!("1"),
+                Plant::TokenModelNull => record["model"] = Value::Null,
+                _ => {}
+            }
+            let since = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="));
+            let body = match since {
+                None if s.plant == Plant::TokensDroppedFalse => {
+                    json!({"records": [record], "cursor": CURSOR, "dropped": false})
+                }
+                None => json!({"records": [record], "cursor": CURSOR}),
+                Some(CURSOR) => json!({"records": [], "cursor": CURSOR}),
+                Some(_) if s.plant == Plant::UnknownCursorNotDropped => {
+                    json!({"records": [record], "cursor": CURSOR})
+                }
+                Some(_) => json!({"records": [record], "cursor": CURSOR, "dropped": true}),
+            };
+            ok(200, body)
+        }
+        ("GET", ["tokens"]) if s.plant == Plant::Tokens404 => control_err(404, "not_found", None),
+        ("GET", ["tokens"]) => control_err(501, "unsupported", None),
         ("GET", ["events"]) if s.plant == Plant::SseNoHead => Reply {
             raw: Some("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n".into()),
             ..ok(200, Value::Null)
@@ -809,6 +911,10 @@ fn serve_one(mut sock: TcpStream, state: &Mutex<StubState>) {
         .split_once('?')
         .map_or(target.as_str(), |(path, _)| path);
     state.requests.push(format!("{method} {path}"));
+    state.targets.push(target.clone());
+    if header(&headers, "authorization") == Some(format!("Bearer {ADMIN}").as_str()) {
+        state.authed_targets.push(target.clone());
+    }
     let reply = handle(&mut state, &method, &target, &headers, &body);
     if let Some(raw) = reply.raw {
         let _ = sock.write_all(raw.as_bytes());
@@ -1082,8 +1188,8 @@ fn a_contract_1_1_proxy_declaring_a_figure_model_is_checked_whole() {
 }
 
 #[test]
-fn a_minor_past_1_1_is_skipped_naming_the_minor_this_clauth_knows() {
-    let stub = Stub::start(Plant::ContractOneTwo);
+fn a_minor_past_1_2_is_skipped_naming_the_minor_this_clauth_knows() {
+    let stub = Stub::start(Plant::ContractOneThree);
     let (admin, key) = secrets();
 
     let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
@@ -1091,8 +1197,204 @@ fn a_minor_past_1_1_is_skipped_naming_the_minor_this_clauth_knows() {
     assert_eq!(report.violations, Vec::<Violation>::new());
     assert_eq!(
         report.skipped,
-        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+        vec!["fields contract 1.3 adds beyond 1.2: this clauth knows 1.2".to_string()]
     );
+}
+
+/// The token route's reads, query included, in the order the check sent them.
+fn token_reads(stub: &Stub) -> Vec<String> {
+    stub.state()
+        .targets
+        .iter()
+        .filter(|t| t.split('?').next() == Some("/clauth/v1/tokens"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_contract_1_2_proxy_serving_token_stats_is_checked_whole() {
+    let stub = Stub::start(Plant::TokenStats);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
+    let reads = token_reads(&stub);
+    assert!(
+        reads.iter().any(|t| t == "/clauth/v1/tokens"),
+        "a read without a cursor: {reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|t| *t == format!("/clauth/v1/tokens?since={CURSOR}")),
+        "a read from the cursor the first read served: {reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|t| t.starts_with("/clauth/v1/tokens?since=")
+                && *t != format!("/clauth/v1/tokens?since={CURSOR}")),
+        "a read from a cursor the proxy never served: {reads:?}"
+    );
+    // The safe run's login leg opens one flow and cancels it, as on a 1.0
+    // proxy; the token leg adds no mutation.
+    assert_eq!(
+        stub.state().mutations,
+        vec![
+            "POST /accounts/login".to_string(),
+            "DELETE /accounts/login/f_1".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_contract_1_2_proxy_without_token_stats_answers_its_token_route_501() {
+    let stub = Stub::start(Plant::ContractOneTwo);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
+    let authed: Vec<String> = stub
+        .state()
+        .authed_targets
+        .iter()
+        .filter(|t| t.split('?').next() == Some("/clauth/v1/tokens"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        authed,
+        vec!["/clauth/v1/tokens".to_string()],
+        "one read carrying the admin token, answered 501"
+    );
+}
+
+#[test]
+fn a_token_route_answering_404_without_the_capability_fails_naming_501() {
+    let stub = Stub::start(Plant::Tokens404);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/tokens",
+            "status 501",
+            "status 404"
+        )]
+    );
+}
+
+#[test]
+fn a_token_route_answering_without_the_token_fails_naming_it() {
+    let stub = Stub::start(Plant::TokensWithoutToken);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/tokens (no token)",
+            "status 401",
+            "status 200"
+        )]
+    );
+}
+
+#[test]
+fn a_token_record_output_that_is_no_integer_fails_naming_the_field() {
+    let stub = Stub::start(Plant::TokenOutputString);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![
+            violation(
+                "GET /clauth/v1/tokens",
+                "records[0].output_tokens: integer",
+                "string"
+            ),
+            violation(
+                "GET /clauth/v1/tokens?since={unknown}",
+                "records[0].output_tokens: integer",
+                "string"
+            ),
+        ]
+    );
+}
+
+/// The contract's optional record fields are absent or set, never `null`.
+#[test]
+fn a_token_record_model_that_is_null_fails_as_no_string() {
+    let stub = Stub::start(Plant::TokenModelNull);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![
+            violation("GET /clauth/v1/tokens", "records[0].model: string", "null"),
+            violation(
+                "GET /clauth/v1/tokens?since={unknown}",
+                "records[0].model: string",
+                "null"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_read_without_a_cursor_carrying_dropped_false_fails_naming_it() {
+    let stub = Stub::start(Plant::TokensDroppedFalse);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/tokens",
+            "dropped: absent",
+            "false"
+        )]
+    );
+}
+
+#[test]
+fn a_read_from_an_unknown_cursor_not_marked_dropped_fails_naming_it() {
+    let stub = Stub::start(Plant::UnknownCursorNotDropped);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/tokens?since={unknown}",
+            "dropped: true",
+            "nothing"
+        )]
+    );
+}
+
+/// The token route is a 1.2 addition: an older proxy is never asked for it.
+#[test]
+fn a_contract_1_1_proxy_is_never_asked_for_its_token_route() {
+    let stub = Stub::start(Plant::ContractOneOne);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(token_reads(&stub), Vec::<String>::new());
 }
 
 #[test]
@@ -1148,7 +1450,7 @@ fn a_null_figure_model_fails_as_no_string() {
 
 #[test]
 fn a_later_minor_is_still_held_to_the_figure_model_rule() {
-    let stub = Stub::start(Plant::ModelEmptyOnOneTwo);
+    let stub = Stub::start(Plant::ModelEmptyOnOneThree);
     let (admin, key) = secrets();
 
     let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
@@ -1163,7 +1465,7 @@ fn a_later_minor_is_still_held_to_the_figure_model_rule() {
     );
     assert_eq!(
         report.skipped,
-        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+        vec!["fields contract 1.3 adds beyond 1.2: this clauth knows 1.2".to_string()]
     );
 }
 
@@ -3018,5 +3320,30 @@ fn an_oversized_health_body_is_named_as_no_answer() {
             "an answer",
             "no answer (the response body is larger than request limit: 1048576)"
         )]
+    );
+}
+
+/// A record `id` of 129 astral characters (258 UTF-16 units) fails on both
+/// reads that carry it, while a sibling at 128 characters (256 units) passes
+/// clean: the checker counts the UTF-16 units the core counts, never chars.
+#[test]
+fn a_token_record_id_past_256_utf16_units_fails_though_its_chars_fit() {
+    let stub = Stub::start(Plant::TokenIdPastUtf16Max);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    let at: Vec<(&str, &str)> = report
+        .violations
+        .iter()
+        .map(|v| (v.route.as_str(), v.expected.as_str()))
+        .collect();
+    let want = "records[0].id: a string of 1 to 256 UTF-16 units";
+    assert_eq!(
+        at,
+        vec![
+            ("GET /clauth/v1/tokens", want),
+            ("GET /clauth/v1/tokens?since={unknown}", want),
+        ]
     );
 }

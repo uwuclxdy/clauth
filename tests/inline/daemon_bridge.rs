@@ -330,31 +330,472 @@ fn an_ask_is_answered_once() {
     assert_eq!(body_json(&unknown)["error"], "ask_not_found");
 }
 
-/// An `AskUserQuestion` ask takes its answers as the body names them.
+const LOGO: &str = "Which color do you want for the logo?";
+const FONT: &str = "Which font?";
+
+/// Open an `AskUserQuestion` ask the way the mod posts one: its `input` is the
+/// tool's `questions` array, each entry naming its text under `question`.
+fn open_question(hub: &Hub, pid: u32, session: &str, seq: u64, ask: &str) {
+    let questions = serde_json::json!([
+        {"question": LOGO, "header": "Logo", "multiSelect": false, "options": [{"label": "Red"}, {"label": "Blue"}]},
+        {"question": FONT, "header": "Font", "multiSelect": true, "options": [{"label": "Sans"}, {"label": "Mono"}]}
+    ]);
+    let body = serde_json::json!({"session": session, "seq": seq, "kind": "ask_opened", "ask": ask, "tool": "AskUserQuestion", "input": questions});
+    let (status, answer) = hub.event(pid, body.to_string().as_bytes());
+    assert_eq!(status, 200, "ask_opened {ask}: {answer}");
+}
+
+fn answer_question(
+    ctx: &ApiContext,
+    ask: &str,
+    body: &serde_json::Value,
+) -> crate::daemon::api::http::Response {
+    call(
+        ctx,
+        &req(
+            "POST",
+            &format!("/api/v1/sessions/s-one/asks/{ask}"),
+            Some(TOKEN),
+            &body.to_string(),
+        ),
+    )
+}
+
+fn question_hub() -> (Arc<Hub>, Arc<ApiContext>, Table) {
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    open_question(&hub, 100, "s-one", 2, "q1");
+    let ctx = ctx_over(&hub);
+    (hub, ctx, t)
+}
+
+/// An `AskUserQuestion` ask takes its answers keyed by each question's exact
+/// text; a question left unanswered is allowed, and no note means no `notes`.
 #[test]
 fn a_question_ask_takes_answers() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: "Red"}}));
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {LOGO: "Red"}}])
+    );
+}
+
+/// Notes ride beside the answers, keyed like them, and reach the mod in the
+/// command; an empty note counts as no note, so a body whose every note is
+/// empty queues no `notes` at all.
+#[test]
+fn a_question_answer_carries_its_notes() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    let resp = answer_question(
+        &ctx,
+        "q1",
+        &serde_json::json!({"answers": {LOGO: "Red", FONT: "Sans, Mono"}, "notes": {LOGO: "a darker red", FONT: ""}}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {LOGO: "Red", FONT: "Sans, Mono"}, "notes": {LOGO: "a darker red"}}])
+    );
+
+    open_question(&hub, 100, "s-one", 3, "q2");
+    let resp = answer_question(
+        &ctx,
+        "q2",
+        &serde_json::json!({"answers": {LOGO: "Blue"}, "notes": {LOGO: ""}}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q2", "answers": {LOGO: "Blue"}}])
+    );
+
+    // An empty note keyed by no question is no note either: dropped, never
+    // refused as an unknown question.
+    open_question(&hub, 100, "s-one", 4, "q3");
+    let resp = answer_question(
+        &ctx,
+        "q3",
+        &serde_json::json!({"answers": {LOGO: "Blue"}, "notes": {"Logo": ""}}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q3", "answers": {LOGO: "Blue"}}])
+    );
+}
+
+/// A note on a question left unanswered is allowed: Claude Code shows that
+/// question to the model as `(no option selected)` with the note.
+#[test]
+fn a_note_may_stand_on_an_unanswered_question() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    let resp = answer_question(
+        &ctx,
+        "q1",
+        &serde_json::json!({"answers": {LOGO: "Red"}, "notes": {FONT: "pick for me"}}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {LOGO: "Red"}, "notes": {FONT: "pick for me"}}])
+    );
+}
+
+const UNKNOWN_QUESTION: &str =
+    "each answer and note must name one of the ask's questions by its exact text.";
+const EMPTY_ANSWER: &str = "each answer must be a non-empty string.";
+
+/// An answer or a note keyed by anything but a question's exact text is
+/// refused by name before anything is queued, and the ask stays open: the
+/// same device's corrected answer then goes through.
+#[test]
+fn an_answer_or_note_naming_no_question_is_refused() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    for body in [
+        serde_json::json!({"answers": {"Which colour?": "Red"}}),
+        serde_json::json!({"answers": {"which color do you want for the logo?": "Red"}}),
+        serde_json::json!({"answers": {format!("{LOGO} "): "Red"}}),
+        serde_json::json!({"answers": {LOGO: "Red", "Logo": "Blue"}}),
+        serde_json::json!({"answers": {LOGO: "Red"}, "notes": {"Logo": "darker"}}),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        let got = body_json(&resp);
+        assert_eq!(got["error"], "answer_unknown_question", "{body}");
+        assert_eq!(got["reason"], UNKNOWN_QUESTION, "{body}");
+    }
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: "Red"}}));
+    assert_eq!(
+        resp.status,
+        200,
+        "the ask stayed open: {}",
+        body_json(&resp)
+    );
+}
+
+/// An empty answer is refused by name, the ask kept open; a key naming no
+/// question is the first refusal when both are wrong.
+#[test]
+fn an_empty_answer_is_refused() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: ""}}));
+    assert_eq!(resp.status, 400);
+    let got = body_json(&resp);
+    assert_eq!(got["error"], "answer_empty");
+    assert_eq!(got["reason"], EMPTY_ANSWER);
+
+    let resp = answer_question(
+        &ctx,
+        "q1",
+        &serde_json::json!({"answers": {LOGO: "", "Which colour?": "Red"}}),
+    );
+    assert_eq!(resp.status, 400);
+    assert_eq!(body_json(&resp)["error"], "answer_unknown_question");
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: "Red"}}));
+    assert_eq!(
+        resp.status,
+        200,
+        "the ask stayed open: {}",
+        body_json(&resp)
+    );
+}
+
+/// A whitespace-only answer is a non-empty string, so it is taken like any
+/// other: `answer_empty` is the empty string alone.
+#[test]
+fn a_whitespace_only_answer_is_taken() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: " "}}));
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {LOGO: " "}}])
+    );
+}
+
+/// Question texts compare byte for byte, never trimmed or case-folded: a text
+/// with surrounding whitespace, one with a newline and one outside ASCII each
+/// take only their exact key, while a trimmed copy of the whitespace one and a
+/// case-folded copy of the non-ASCII one are refused.
+#[test]
+fn a_question_text_compares_byte_for_byte() {
     let _home = HomeSandbox::new();
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
     start(&hub, 100, "s-one");
-    open_ask(&hub, 100, "s-one", 2, "q1");
+    let spaced = "  Which colour?  ";
+    let multiline = "Which font?\nWhich weight?";
+    let nonascii = "Quel est le nom du café ?";
+    let questions = serde_json::json!([
+        {"question": spaced},
+        {"question": multiline},
+        {"question": nonascii}
+    ]);
+    let opened = serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": questions});
+    assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
     let ctx = ctx_over(&hub);
 
-    let resp = call(
+    let trimmed = spaced.trim();
+    let folded = nonascii.to_uppercase();
+    for body in [
+        serde_json::json!({"answers": {trimmed: "Red"}}),
+        serde_json::json!({"answers": {folded: "Le Café"}}),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        assert_eq!(
+            body_json(&resp)["error"],
+            "answer_unknown_question",
+            "{body}"
+        );
+    }
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let exact = serde_json::json!({"answers": {
+        spaced: "Red",
+        multiline: "Sans, Mono",
+        nonascii: "Le Café"
+    }});
+    let resp = answer_question(&ctx, "q1", &exact);
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+}
+
+/// A value that is not a string, a `notes` that is neither an object nor
+/// `null`, `notes` beside a `decision` or alone, or an `answers` with no entry
+/// at all is the wrong body shape: `bad_request`, nothing queued.
+#[test]
+fn a_misshapen_answer_or_note_is_a_bad_request() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    for body in [
+        serde_json::json!({"answers": {LOGO: 3}}),
+        serde_json::json!({"answers": {LOGO: ["Red"]}}),
+        serde_json::json!({"answers": {LOGO: null}}),
+        serde_json::json!({"answers": {}}),
+        serde_json::json!({"answers": {LOGO: "Red"}, "notes": {LOGO: 3}}),
+        serde_json::json!({"answers": {LOGO: "Red"}, "notes": "darker"}),
+        serde_json::json!({"answers": {LOGO: "Red"}, "notes": [LOGO]}),
+        serde_json::json!({"decision": "allow", "notes": {LOGO: "x"}}),
+        serde_json::json!({"notes": {LOGO: "x"}}),
+        serde_json::json!({"notes": null}),
+        serde_json::json!({"answers": "Red"}),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        assert_eq!(body_json(&resp)["error"], "bad_request", "{body}");
+    }
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+}
+
+/// A generated client writes every unset field as `null` (the app's Dart
+/// serializer does), so a `null` `answers`, `notes` or `decision` reads as
+/// absent: its decision and its answers both land.
+#[test]
+fn a_generated_clients_null_fields_read_as_absent() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+    open_ask(&hub, 100, "s-one", 3, "a1");
+
+    let resp = answer_question(
         &ctx,
-        &req(
-            "POST",
-            "/api/v1/sessions/s-one/asks/q1",
-            Some(TOKEN),
-            r#"{"answers":{"Which colour?":"blue"}}"#,
-        ),
+        "a1",
+        &serde_json::json!({"decision": "allow", "answers": null, "notes": null}),
     );
-    assert_eq!(resp.status, 200);
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    let resp = answer_question(
+        &ctx,
+        "q1",
+        &serde_json::json!({"decision": null, "answers": {LOGO: "Red"}, "notes": null}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
     assert_eq!(
         commands(&hub, 100, "s-one"),
-        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {"Which colour?": "blue"}}])
+        serde_json::json!([
+            {"kind": "answer", "ask": "a1", "decision": "allow"},
+            {"kind": "answer", "ask": "q1", "answers": {LOGO: "Red"}}
+        ])
     );
+}
+
+/// `answers: null` beside a decision, with no `notes` field at all, reads as
+/// absent on its own.
+#[test]
+fn a_null_answers_reads_as_absent() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    open_ask(&hub, 100, "s-one", 2, "a1");
+    let ctx = ctx_over(&hub);
+
+    let resp = answer_question(
+        &ctx,
+        "a1",
+        &serde_json::json!({"decision": "allow", "answers": null}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "a1", "decision": "allow"}])
+    );
+}
+
+/// A permission ask takes a decision, so `answers` sent to it are the wrong
+/// form: refused by name, never queued for a mod that would drop them with the
+/// ask closed, and the ask kept open for the decision it takes.
+#[test]
+fn answers_to_a_permission_ask_are_the_wrong_form() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    open_ask(&hub, 100, "s-one", 2, "a1");
+    let ctx = ctx_over(&hub);
+
+    let resp = answer_question(&ctx, "a1", &serde_json::json!({"answers": {"ls": "yes"}}));
+    assert_eq!(resp.status, 400);
+    let got = body_json(&resp);
+    assert_eq!(got["error"], "answer_wrong_form");
+    assert_eq!(got["reason"], WRONG_FORM);
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let resp = answer_question(&ctx, "a1", &serde_json::json!({"decision": "allow"}));
+    assert_eq!(
+        resp.status,
+        200,
+        "the ask stayed open: {}",
+        body_json(&resp)
+    );
+}
+
+const WRONG_FORM: &str = "a question takes answers, and a permission ask takes a decision.";
+
+/// A decision sent to a question ask is the wrong form: refused by name,
+/// nothing queued, the ask kept open for the answers it takes. It is checked
+/// before the answer rules, so it wins over them.
+#[test]
+fn a_decision_to_a_question_ask_is_the_wrong_form() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+
+    for body in [
+        serde_json::json!({"decision": "allow"}),
+        serde_json::json!({"decision": "deny"}),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        let got = body_json(&resp);
+        assert_eq!(got["error"], "answer_wrong_form", "{body}");
+        assert_eq!(got["reason"], WRONG_FORM, "{body}");
+    }
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"answers": {LOGO: "Red"}}));
+    assert_eq!(
+        resp.status,
+        200,
+        "the ask stayed open: {}",
+        body_json(&resp)
+    );
+}
+
+/// A refused answer is refused before the queue cap is consulted: a full queue
+/// answers the body's own 400, not the 503 a taken command would get, and the
+/// ask stays open.
+#[test]
+fn a_refused_answer_is_refused_before_a_full_queue() {
+    let _home = HomeSandbox::new();
+    let (hub, ctx, _t) = question_hub();
+    {
+        let mut inner = hub.inner.lock().unwrap();
+        let live = inner.instances.get_mut(&100).expect("the live instance");
+        for _ in 0..MAX_QUEUED_COMMANDS {
+            live.commands
+                .push_back(serde_json::json!({"kind": "prompt", "text": "x"}));
+        }
+    }
+
+    for (body, code) in [
+        (
+            serde_json::json!({"decision": "allow"}),
+            "answer_wrong_form",
+        ),
+        (
+            serde_json::json!({"answers": {"Which colour?": "Red"}}),
+            "answer_unknown_question",
+        ),
+        (serde_json::json!({"answers": {LOGO: ""}}), "answer_empty"),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        assert_eq!(body_json(&resp)["error"], code, "{body}");
+    }
+
+    let inner = hub.inner.lock().unwrap();
+    let live = inner.instances.get(&100).expect("the live instance");
+    assert_eq!(
+        live.commands.len(),
+        MAX_QUEUED_COMMANDS,
+        "a refusal queues nothing"
+    );
+    assert!(
+        live.open_asks.iter().any(|(id, _)| id == "q1"),
+        "a refusal leaves the ask open"
+    );
+}
+
+/// An ask's kind comes from its tool, never its input's shape: a permission
+/// ask whose tool input happens to be an array of `question` objects (an MCP
+/// tool's own input) still takes a decision and refuses answers keyed by
+/// those texts, and a question ask whose input carries no question text
+/// still refuses a decision.
+#[test]
+fn an_asks_kind_comes_from_its_tool() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let lookalike = serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "mcp__forms__ask", "input": [{"question": LOGO}]});
+    assert_eq!(hub.event(100, lookalike.to_string().as_bytes()).0, 200);
+    let bare = serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": {}});
+    assert_eq!(hub.event(100, bare.to_string().as_bytes()).0, 200);
+    let ctx = ctx_over(&hub);
+
+    let resp = answer_question(&ctx, "a1", &serde_json::json!({"answers": {LOGO: "Red"}}));
+    assert_eq!(resp.status, 400);
+    assert_eq!(body_json(&resp)["error"], "answer_wrong_form");
+    let resp = answer_question(&ctx, "q1", &serde_json::json!({"decision": "allow"}));
+    assert_eq!(resp.status, 400);
+    assert_eq!(body_json(&resp)["error"], "answer_wrong_form");
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+
+    let resp = answer_question(&ctx, "a1", &serde_json::json!({"decision": "deny"}));
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
 }
 
 /// A body naming both, or neither, of `decision` and `answers` is refused

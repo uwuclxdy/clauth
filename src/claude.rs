@@ -1761,7 +1761,9 @@ fn keychain_mirror_verdict(linkable: bool, absent: AbsentSource) -> KeychainMirr
 /// refreshed the account it runs on there): the write then leaves the item in
 /// place and says so ([`bare_item_may_be_replaced`]; `placed` is the key of
 /// an item the caller settled), returning [`ItemWrite::Refused`], which the
-/// caller turns into a failed switch before it publishes the link.
+/// caller turns into a failed switch before it publishes the link. An install
+/// whose source already holds the item's login replaces it either way
+/// ([`bare_item_may_take_source`]).
 #[cfg(target_os = "macos")]
 fn keychain_mirror_source(
     path: &Path,
@@ -1791,7 +1793,9 @@ fn keychain_mirror_source(
                 if preserve {
                     sync_item_into_its_store(item, Some(path));
                 }
-                may_replace(item)
+                let may = bare_item_may_take_source(item, &store, placed);
+                refused.set(!may);
+                may
             })?
         }
         // Both other outcomes complete the switch: an actually-signed-out item,
@@ -2117,23 +2121,53 @@ fn bare_item_token_holders<'a>(
     item: &serde_json::Value,
     stores: &'a [(ProfileName, serde_json::Value)],
 ) -> Option<Vec<&'a ProfileName>> {
-    let access = login_access_token(item)?;
-    let (key, token) = match login_refresh_token(item) {
-        Some(refresh) => ("refreshToken", refresh),
-        None => ("accessToken", access),
-    };
+    login_access_token(item)?;
     let mut holders: Vec<&ProfileName> = Vec::new();
     for (name, store) in stores {
-        let held = store
-            .get("claudeAiOauth")
-            .and_then(|login| login.get(key))
-            .and_then(serde_json::Value::as_str)
-            == Some(token);
-        if held && !holders.contains(&name) {
+        if store_holds_item_login(item, store) && !holders.contains(&name) {
             holders.push(name);
         }
     }
     Some(holders)
+}
+
+/// Whether `store` holds the item's login, on [`bare_item_token_holders`]'
+/// tiers: the refresh token of a rotating pair, the access token of a mint.
+/// `false` when the item holds no login.
+fn store_holds_item_login(item: &serde_json::Value, store: &serde_json::Value) -> bool {
+    let Some(access) = login_access_token(item) else {
+        return false;
+    };
+    let (key, token) = match login_refresh_token(item) {
+        Some(refresh) => ("refreshToken", refresh),
+        None => ("accessToken", access),
+    };
+    store
+        .get("claudeAiOauth")
+        .and_then(|login| login.get(key))
+        .and_then(serde_json::Value::as_str)
+        == Some(token)
+}
+
+/// Whether an install of `source` may replace the bare `item`: `source`
+/// already holds the item's login, so the write puts back the login it
+/// replaces and strands nothing, or [`bare_item_may_be_replaced`] lets it go.
+/// The first arm is the first capture's relink (#158): it runs before the
+/// roster names the new profile, so the guard's roster search cannot find the
+/// store that just saved the item's login.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS item mirror; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_may_take_source(
+    item: &serde_json::Value,
+    source: &serde_json::Value,
+    placed: Option<&[u8; 32]>,
+) -> bool {
+    store_holds_item_login(item, source) || bare_item_may_be_replaced(item, placed)
 }
 
 /// The non-empty refresh token of `store`'s login.
@@ -5937,6 +5971,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
         if linkable {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
@@ -7990,12 +8025,61 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
         if linkable {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         Ok(())
     })
+}
+
+/// Keep a repoint of `.credentials.json` visible to the Claude Code sessions
+/// already running on it.
+///
+/// Claude Code re-reads its login only when the mtime of what the link resolves
+/// to is not EQUAL to the one it memoized at its last request (see
+/// `runtime::touch_store`). The per-session swap moves the incoming store's
+/// mtime before it repoints; the global relinks did not, so a switch onto a
+/// store carrying a session's memoized mtime moved the link, reported success,
+/// and left that session on the account it had just been switched off.
+///
+/// The two stores' current mtimes cannot tell that case apart: a session idle
+/// across a write to the outgoing store still holds the value it saw before the
+/// write, and the incoming store can carry it while the two current mtimes
+/// differ. So every relink onto a DIFFERENT store is stamped, as the swap
+/// stamps every move. A relink onto the same store and a first link (a live
+/// path that resolves to nothing yet) are left as they were. The stamp is the
+/// swap's own ([`crate::runtime::stamp_store`], receipt included), keyed the
+/// way a swap keys it: a legacy `.pending` sidecar beside the incoming store,
+/// which a stamp ahead of it would discard, is landed by a `load_profile`
+/// first. Only then, unlike the swap, which refuses an unreadable profile
+/// before it gets here: the relinks also serve an account whose `config.toml`
+/// cannot be read (the TUI's divergence overwrite relinks one on purpose), and
+/// that load would fail them.
+///
+/// Runs after the Keychain mirror and before the repoint. A failed load or
+/// stamp fails the relink with the link unmoved; on macOS the Keychain item
+/// has already moved to the incoming account by then.
+fn keep_repoint_visible(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
+    let (Ok(live), Ok(incoming)) = (
+        crate::canonical::identity(link),
+        crate::canonical::identity(target),
+    ) else {
+        return Ok(());
+    };
+    if live == incoming {
+        return Ok(());
+    }
+    // The outgoing store's mtime, as the swap passes it: what a session that
+    // read it last memoized, for the stamp's coarse-tick fallback.
+    let outgoing = std::fs::metadata(&live)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    if crate::profile::rotation_staged_beside(target) {
+        crate::profile::load_profile(name)?;
+    }
+    crate::runtime::stamp_store(name, target, outgoing)
 }
 
 /// Replace the symlink at `.credentials.json` with a regular file (same bytes).

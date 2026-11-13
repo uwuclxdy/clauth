@@ -5351,8 +5351,15 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 /// ([`SessionSwap::retouch_after_item_leg`]), which only follows a stamp a
 /// [`SwapPlan`] already keyed: the `.pending` resolution the plan stands for
 /// ran before that first stamp, and the receipt it left resolves the
-/// re-stamp's displaced value back to the store's real write time.
-fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>) -> Result<()> {
+/// re-stamp's displaced value back to the store's real write time. Also
+/// reached by the global switch's relinks
+/// (`claude::keep_repoint_visible`), which run the same `load_profile` first
+/// when a `.pending` stands beside the store.
+pub(crate) fn stamp_store(
+    member: &ProfileName,
+    store: &Path,
+    memoized: Option<SystemTime>,
+) -> Result<()> {
     // Through the resolver, not the raw mtime: on a swap BACK onto a member the
     // value being displaced is that member's own earlier stamp, and a receipt
     // recording a stamp as a write time hands the readers the exact answer this
@@ -8988,6 +8995,103 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Test seam: [`live_process_pids`] answers `None` for the guard's lifetime —
+/// the failure a `read_dir("/proc")` error, a `ps` spawn or exit error, or
+/// undecodable `ps` output produces — so a test can drive the reader's leave
+/// decision through the enumeration-failure arm. Armed through the RAII
+/// [`FailLiveProcessEnumeration`] guard, cleared on drop so an arm that never
+/// reached the enumeration cannot leak into a sibling test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static FAIL_LIVE_PROCESS_ENUMERATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`live_process_pids`] failure for the guard's
+/// lifetime, clearing it on drop even if the test panics. It BORROWS the
+/// [`HomeSandbox`](crate::testutil::HomeSandbox) for the reason
+/// `profile::FailAppStateSave` does: the override is a process-global
+/// serialized by `HOME_TEST_LOCK`, which the home sandbox holds, so dropping
+/// the home first is E0505 at compile time instead of a race nothing checks.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct FailLiveProcessEnumeration<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl<'a> FailLiveProcessEnumeration<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_LIVE_PROCESS_ENUMERATION.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for FailLiveProcessEnumeration<'_> {
+    fn drop(&mut self) {
+        FAIL_LIVE_PROCESS_ENUMERATION.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Every live process id on the box, for the escaped-process sweep's
+/// enumeration: the numeric `/proc` entries on linux, `ps -axo pid=` on macOS
+/// (a child read with no bound of its own: `ps` exits on its own, but
+/// `.output()` waits for it however long that takes). `None` — plus one log
+/// line — on a failure: a stop finds nothing to signal, and a reader leaves
+/// the record it would otherwise convert, so a later startup sweep retries.
+/// Unix-only, like its one caller.
+#[cfg(unix)]
+pub(crate) fn live_process_pids() -> Option<Vec<u32>> {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if FAIL_LIVE_PROCESS_ENUMERATION.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_dir("/proc") {
+            Ok(entries) => Some(
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                    .collect(),
+            ),
+            Err(e) => {
+                logline!(
+                    "clauth: enumerating processes failed, the tagged-process sweep cannot see its targets: {e}"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = match std::process::Command::new("ps")
+            .args(["-axo", "pid="])
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                logline!(
+                    "clauth: `ps -axo pid=` failed, the tagged-process sweep cannot see its targets"
+                );
+                return None;
+            }
+        };
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            logline!(
+                "clauth: `ps -axo pid=` output was not utf-8, the tagged-process sweep cannot see its targets"
+            );
+            return None;
+        };
+        Some(
+            text.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect(),
+        )
+    }
+}
+
 /// Whether the process `pid` is Claude Code's background service, by the
 /// supervisor's argv (`claude daemon run`), read as the supervisor checks read
 /// it. False where argv cannot be read, and on every other platform.
@@ -9017,6 +9121,18 @@ pub(crate) fn environ_sets(environ: &[u8], key: &str) -> bool {
             .and_then(|rest| rest.strip_prefix(b"="))
             .is_some_and(|value| !value.is_empty())
     })
+}
+
+/// Whether NUL-separated env bytes hold one entry equal to `key=value`
+/// exactly. The escaped-process sweep matches on this: a key-presence or
+/// prefix match would signal a process tagged with a DIFFERENT job id that
+/// merely shares a prefix. Unix-only, like its one caller.
+#[cfg(unix)]
+pub(crate) fn environ_entry_equals(environ: &[u8], key: &str, value: &str) -> bool {
+    let mut entry = key.as_bytes().to_vec();
+    entry.push(b'=');
+    entry.extend_from_slice(value.as_bytes());
+    environ.split(|b| *b == 0).any(|kv| kv == entry.as_slice())
 }
 
 /// `daemon.lock`'s `pid` + `procStart`. The lock is a CONTENT file, not a

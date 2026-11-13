@@ -183,7 +183,8 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Interface and keys](https://github.com/uwuclxdy/clauth/wiki/Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](https://github.com/uwuclxdy/clauth/wiki/Configuration) | both TOML files key by key, model routing, storage layout |
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
-| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
+| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
+| [REST API](https://github.com/uwuclxdy/clauth/wiki/REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server, `delegate` in full, answering a session from your phone |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |

@@ -491,7 +491,7 @@ fn funded_wallet_rate_is_none_without_a_funded_wallet() {
     assert!(funded_wallet_rate(&[], &rows).is_none());
 }
 
-// --- project_utilization (issue #8 follow-up b: burn-aware auto-switch) ---
+// --- project_utilization (burn-aware auto-switch) ---
 
 #[test]
 fn project_utilization_zero_burn_runs_flat() {
@@ -522,7 +522,7 @@ fn project_utilization_heavy_burn_crosses_cap_within_one_poll() {
     assert!((projected - 120.0).abs() < 0.01, "projected={projected}");
     assert!(
         projected >= 100.0,
-        "heavy burn must cross the cap before the next poll"
+        "heavy burn must reach the cap before the next poll"
     );
 }
 

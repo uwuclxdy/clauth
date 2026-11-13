@@ -221,7 +221,7 @@ impl std::error::Error for GateNeeded {}
 /// [`overwrite_captured_profile_held`]), typed so a caller that frames its
 /// failures by operation can give it the login's head.
 #[derive(Debug)]
-pub(crate) struct CaptureRefused(ProfileName);
+pub(crate) struct CaptureRefused(pub(crate) ProfileName);
 
 impl std::fmt::Display for CaptureRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -691,9 +691,23 @@ pub(crate) fn switch_profile_discard_gated(
 
 /// Force-capture the live login into the account disk names active (mirrored
 /// into `config` under the caller's hold), then require that it landed: a
-/// relink after a capture that wrote nothing would drop the login. Returns
+/// relink after a capture that wrote nothing would drop the login. A diverged
+/// unsaved login on an account running on a long-lived token refuses before
+/// the capture with the long-lived line — that account's store cannot hold an
+/// OAuth login. The capture itself writes nothing for an unsaved login (the
+/// sink's sync matches only a store the login already belongs to), so the
+/// pre-check only picks which refusal sentence appears: without it the
+/// post-check below refuses with the generic unsaved-login text. Returns
 /// whether the OAuth half's stored identity changed.
 pub(crate) fn force_capture_live_login(config: &mut AppConfig) -> Result<bool> {
+    if let Some(active) = config.state.active_profile.as_ref()
+        && live_diverged_and_unsaved(active)?
+        && crate::claude::has_session_token(active)
+    {
+        bail!(DeepRefusal(crate::format::long_lived_cannot_hold_login(
+            active
+        )));
+    }
     let oauth_changed = force_snapshot_active_credentials(config)?;
     if let Some(active) = config.state.active_profile.as_ref()
         && live_diverged_and_unsaved(active)?

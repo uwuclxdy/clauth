@@ -9,13 +9,17 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, CodexDetailRow, CodexLoginSession, ConfigEntryRef, ConfigFocus, ConfigRow, FallbackHint,
-    FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow, HERDR_OPTIONS, HerdrOption, KeyOwner,
-    LoginSession, LossWarningTarget, MainItemKind, Modal, PaneState, PoolDetailRow,
+    FallbackRow, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow, HERDR_OPTIONS, HerdrOption,
+    KeyOwner, LoginSession, LossWarningTarget, MainItemKind, Modal, PaneState, PoolDetailRow,
     PoolMutationKind, ScrollStamp, ServiceFix, ServicesFocus, SetupSelection, ShuntEntryKey,
     ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab, TokenView,
-    build_action_menu, config_rows, config_view, entry_for_key, escape_control, fallback_hint,
-    field_locked, fix_verb, has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner,
-    pane_state, token_model_count,
+    action_menu_opens, chain_candidates, chain_enter_acts, chain_items, chain_reorder_moves,
+    config_rows, config_step_lands, config_view, detail_scrolls, disable_row_gated, entry_for_key,
+    escape_control, fallback_hint, fallback_row_acts, fallback_step_lands, field_locked, fix_verb,
+    global_config_row_live, has_sub_focus, herdr_config_writable, herdr_tag_step, is_cycle_field,
+    keyboard_owner, login_row_refused, main_reorder_moves, minted_key_row, overview_edit_acts,
+    page_keys_act, pane_state, rolling_switch_row_gated, services_fix_keys_act, token_model_count,
+    walk_moves,
 };
 use super::super::theme;
 use super::format::{
@@ -204,23 +208,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // applies. Reading the real menu
     // keeps the hint honest per row instead of leaving each arm's literal to
     // drift.
-    if build_action_menu(app).items.is_empty() {
+    if !action_menu_opens(app) {
         hints.retain(|(key, _)| *key != "a");
     }
 
     // `e` opens the cursor's Setup editor and nothing without a row under the
-    // cursor: an empty roster, or a filter hiding every row. Its handler keeps
-    // the same condition.
-    if app.tab == Tab::Overview && owner.is_none() && app.current_main_item().is_none() {
+    // cursor that resolves to an account; `⇧↑↓` swaps the cursor's account
+    // with a neighbour. Each reads the predicate its handler acts on.
+    if app.tab == Tab::Overview && owner.is_none() && !overview_edit_acts(app) {
         hints.retain(|(key, _)| *key != "e");
     }
-    // `⇧↑↓` swaps the cursor's account with a neighbour: nothing moves without
-    // an account under the cursor and a second account, as its handler checks.
-    if app.tab == Tab::Overview
-        && owner.is_none()
-        && !(matches!(app.current_main_item(), Some(MainItemKind::Profile(_)))
-            && app.config().profiles.len() > 1)
-    {
+    if app.tab == Tab::Overview && owner.is_none() && !main_reorder_moves(app) {
         hints.retain(|(key, _)| *key != "⇧↑↓");
     }
 
@@ -428,14 +426,16 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         return hints;
     }
 
-    // The Status list hints derive from the incident count like Services: `↑↓`
-    // and `↵` act only while the list holds a row, and the key handler gates
-    // both on the same `incidents.len() > 0` predicate this reads, so an empty
-    // list advertises neither.
+    // The Status list hints derive from the incident count like Services: the
+    // key handler gates `↑↓` and `↵` on the same count this reads, and a lone
+    // incident's walk wraps onto itself, so neither shows where it acts on
+    // nothing.
     if app.tab == Tab::Status && app.status.focus == StatusFocus::List {
         let mut hints = Vec::new();
-        if !app.status.incidents.is_empty() {
+        if walk_moves(app.status.incidents.len()) {
             hints.push(("↑↓", "incident"));
+        }
+        if !app.status.incidents.is_empty() {
             hints.push(("↵", "open"));
         }
         hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
@@ -443,319 +443,454 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         return hints;
     }
 
-    let tail: &[(&str, &str)] = match app.tab {
-        Tab::Overview => &[
+    let mut hints: Vec<(&'static str, &'static str)> = match app.tab {
+        Tab::Overview => vec![
             ("⇧↑↓", "reorder"),
             ("e", "edit"),
             ("a", "actions"),
             ("c", "harness"),
             ("?", "help"),
         ],
-        Tab::Usage => &[], // handled above: its hints derive per row
-        Tab::Tokens => match app.token_view {
-            TokenView::Dashboard if app.tokens_failed => &[
-                ("↵", "cause"),
-                ("r", "reload"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            TokenView::Dashboard if token_model_count(app) == 0 => &[
-                ("r", "reload"),
-                ("c", "count cache"),
-                ("t", "period"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            TokenView::Dashboard => &[
-                ("↵", "models"),
-                ("r", "reload"),
-                ("c", "count cache"),
-                ("t", "period"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            TokenView::Models if app.model_detail_focus == StatusFocus::Detail => &[
-                ("↑↓", "scroll"),
-                ("c", "count cache"),
-                ("t", "period"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            TokenView::Models if token_model_count(app) == 0 => &[
-                ("c", "count cache"),
-                ("t", "period"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            TokenView::Models => &[
-                ("↑↓", "model"),
-                ("↵", "detail"),
-                ("c", "count cache"),
-                ("t", "period"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-        },
+        Tab::Usage => Vec::new(), // handled above: its hints derive per row
+        Tab::Tokens => token_hints(app),
         Tab::Setup => match app.config_focus {
-            ConfigFocus::Profiles => &[
-                ("↑↓", "account"),
-                ("↵", "configure"),
-                ("n", "new"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            ConfigFocus::Actions => match app.setup_selection() {
-                // The codex and pool detail panes carry their own action rows;
-                // the hint derives from the row under the cursor, never a dead
-                // `↵ edit / toggle` or a key the pane does not bind.
-                SetupSelection::Item(MainItemKind::Codex(_)) => {
-                    if app.codex_detail_armed {
-                        &[("↵", "confirm delete"), ("esc", "cancel"), ("?", "help")]
-                    } else {
-                        match CodexDetailRow::ALL.get(app.config_action_cursor) {
-                            Some(CodexDetailRow::ReLogin) => &[
-                                ("↑↓", "row"),
-                                ("↵", "re-login"),
-                                ("a", "actions"),
-                                ("?", "help"),
-                            ],
-                            Some(CodexDetailRow::Delete) => &[
-                                ("↑↓", "row"),
-                                ("↵", "delete"),
-                                ("a", "actions"),
-                                ("?", "help"),
-                            ],
-                            None => &[("a", "actions"), ("?", "help")],
-                        }
-                    }
+            ConfigFocus::Profiles => {
+                // `+ new` is a row of the walk, so an empty roster's lone row
+                // has nowhere to go.
+                let mut hints = Vec::new();
+                if walk_moves(app.setup_items().len() + 1) {
+                    hints.push(("↑↓", "account"));
                 }
-                SetupSelection::Item(MainItemKind::Shunt(..)) => {
-                    if app.pool_detail_armed {
-                        &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
-                    } else {
-                        let rows = app.pool_detail_rows();
-                        if rows.is_empty() {
-                            // kimi / unknown auth mode (or a name outside
-                            // shunt's grammar): facts only, nothing to walk or
-                            // run — advertise no row key.
-                            &[("a", "actions"), ("?", "help")]
-                        } else {
-                            match rows.get(app.config_action_cursor) {
-                                Some(PoolDetailRow::Refresh) => &[
-                                    ("↑↓", "row"),
-                                    ("↵", "refresh"),
-                                    ("a", "actions"),
-                                    ("?", "help"),
-                                ],
-                                Some(PoolDetailRow::Remove) => &[
-                                    ("↑↓", "row"),
-                                    ("↵", "remove"),
-                                    ("a", "actions"),
-                                    ("?", "help"),
-                                ],
-                                None => &[("a", "actions"), ("?", "help")],
-                            }
-                        }
-                    }
-                }
-                // Claude rows and `+ new` keep the row-aware claude arm:
-                // the `model` and `effort` rows cycle on space; `alert at`
-                // steps on `+`/`-`; env rows edit a value or open the
-                // add-env editor.
-                SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
-                    match config_rows(app).get(app.config_action_cursor) {
-                        Some(ConfigRow::Model | ConfigRow::Effort) => &[
-                            ("↑↓", "row"),
-                            ("space", "cycle"),
-                            ("↵", "custom"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        Some(ConfigRow::BellThreshold) => &[
-                            ("↑↓", "row"),
-                            ("+", "raise"),
-                            ("-", "lower"),
-                            ("↵", "type"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        // `alert at`'s keys, where a larger value probes less
-                        // often.
-                        Some(ConfigRow::UsageProbeInterval) => &[
-                            ("↑↓", "row"),
-                            ("+", "less often"),
-                            ("-", "more often"),
-                            ("↵", "type"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        Some(ConfigRow::EnvEntry(_)) => &[
-                            ("↑↓", "row"),
-                            ("↵", "edit value"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        Some(ConfigRow::EnvAdd) => &[
-                            ("↑↓", "row"),
-                            ("↵", "add env"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        Some(ConfigRow::ModelOverrideAdd) => &[
-                            ("↑↓", "row"),
-                            ("↵", "add override"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        // The mint-seeded api key row is a Disabled row (focusable
-                        // but inert), so the footer drops its edit hint.
-                        Some(ConfigRow::ApiKey)
-                            if app.config_draft.as_ref().is_some_and(|d| d.mint_armed()) =>
-                        {
-                            &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
-                        }
-                        // The `type` / `family` cycle rows advance on space or ↵.
-                        Some(ConfigRow::Type) | Some(ConfigRow::Family) => &[
-                            ("↑↓", "row"),
-                            ("space/↵", "cycle"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                        // The disabled shunt `+ login` is inert: no ↵ hint. The
-                        // one predicate the row renders by, never a disk read
-                        // here.
-                        Some(ConfigRow::Login) if app.shunt_login_disabled().is_some() => {
-                            &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
-                        }
-                        _ => &[
-                            ("↑↓", "row"),
-                            ("↵", "edit / toggle"),
-                            ("a", "actions"),
-                            ("?", "help"),
-                        ],
-                    }
-                }
-            },
-        },
-        Tab::Config => {
-            if GLOBAL_CONFIG_ROWS
-                .get(app.global_config_cursor)
-                .is_some_and(|r| {
-                    matches!(
-                        r,
-                        GlobalConfigRow::RefreshInterval
-                            | GlobalConfigRow::ContextNudge
-                            | GlobalConfigRow::WeeklyThreshold
-                    )
-                })
-            {
-                &[
-                    ("↑↓", "row"),
-                    ("space", "cycle"),
-                    ("↵", "custom"),
+                hints.extend([
+                    ("↵", "configure"),
+                    ("n", "new"),
                     ("a", "actions"),
                     ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("space/↵", "cycle / toggle"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+                ]);
+                hints
             }
-        }
+            ConfigFocus::Actions => setup_card_hints(app),
+        },
+        Tab::Config => config_hints(app),
         Tab::Status => match app.status.focus {
-            StatusFocus::List => &[], // handled above: its hints derive from the incident count
-            StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
-        },
-        Tab::Services => &[], // handled above: its hints carry a computed verb
-        Tab::Fallback => match fallback_hint(app) {
-            FallbackHint::Empty => &[("a", "actions"), ("?", "help")],
-            FallbackHint::ChainMember => &[
-                ("↑↓", "move"),
-                ("⇧↑↓", "reorder"),
-                ("↵", "open"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::ChainAdd => &[
-                ("↑↓", "move"),
-                ("↵", "add"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailThreshold => &[
-                ("↑↓", "row"),
-                ("+", "raise"),
-                ("-", "lower"),
-                ("↵", "type"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailWeeklyAt => &[
-                ("↑↓", "row"),
-                ("+", "raise"),
-                ("-", "lower"),
-                ("↵", "type"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailCheckWeekly
-            | FallbackHint::DetailCheckScoped
-            | FallbackHint::DetailCheckCreditCap
-            | FallbackHint::DetailLastResort
-            | FallbackHint::DetailPreferred => &[
-                ("↑↓", "row"),
-                ("space/↵", "toggle"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            // The row's own keys lead so the narrow-width trim, which drops the
-            // rightmost non-essential hint first, sheds `↑↓ row` before them.
-            FallbackHint::DetailPreferredDays => &[
-                ("space", "preset"),
-                ("↵", "days"),
-                ("↑↓", "row"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailMaxSpend => &[
-                ("↑↓", "row"),
-                ("↵", "type"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailRemove => &[
-                ("↑↓", "row"),
-                ("↵", "remove"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
-            FallbackHint::DetailRemoveArmed => {
-                &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
+            StatusFocus::List => Vec::new(), // handled above: its hints derive from the incident count
+            StatusFocus::Detail => {
+                let mut hints = Vec::new();
+                if detail_scrolls(app) {
+                    hints.push(("↑↓", "scroll"));
+                }
+                hints.extend([("a", "actions"), ("?", "help")]);
+                hints
             }
-            FallbackHint::DetailAdd => &[
-                ("↑↓", "pick"),
-                ("↵", "add"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
         },
+        Tab::Services => Vec::new(), // handled above: its hints carry a computed verb
+        Tab::Fallback => fallback_hints(app),
     };
 
-    let mut hints = tail.to_vec();
     // An armed 2-step's way out is its `esc cancel`: `q` ascends out of the card
     // the same way there, so `q back` would be a second name for it. The codex
     // and pool details arm the same way, so they skip `q` too.
     let setup_armed = app.tab == Tab::Setup
         && app.config_focus == ConfigFocus::Actions
-        && (app.codex_detail_armed || app.pool_detail_armed);
+        && (app.codex_detail_armed
+            || app.pool_detail_armed
+            || setup_delete_armed(app)
+            || setup_token_row_armed(app, ConfigRow::ClearSessionToken)
+            || setup_token_row_armed(app, ConfigRow::RollingTokenSwitch));
     if !(setup_armed
         || (app.tab == Tab::Fallback && fallback_hint(app) == FallbackHint::DetailRemoveArmed))
     {
         hints.push(("q", q_label));
     }
+    hints
+}
+
+/// The Tokens tab's own hints: `↑↓` scrolls a model detail only while it has
+/// somewhere to scroll and walks the model list only past one model, the
+/// bound and the count the key handler steps over.
+fn token_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    const LENSES: [(&str, &str); 4] = [
+        ("c", "count cache"),
+        ("t", "period"),
+        ("a", "actions"),
+        ("?", "help"),
+    ];
+    let mut hints = Vec::new();
+    match app.token_view {
+        TokenView::Dashboard if app.tokens_failed => {
+            return vec![
+                ("↵", "cause"),
+                ("r", "reload"),
+                ("a", "actions"),
+                ("?", "help"),
+            ];
+        }
+        TokenView::Dashboard => {
+            if token_model_count(app) > 0 {
+                hints.push(("↵", "models"));
+            }
+            hints.push(("r", "reload"));
+        }
+        TokenView::Models if app.model_detail_focus == StatusFocus::Detail => {
+            if detail_scrolls(app) {
+                hints.push(("↑↓", "scroll"));
+            }
+        }
+        TokenView::Models => {
+            let len = token_model_count(app);
+            if walk_moves(len) {
+                hints.push(("↑↓", "model"));
+            }
+            if len > 0 {
+                hints.push(("↵", "detail"));
+            }
+        }
+    }
+    hints.extend(LENSES);
+    hints
+}
+
+/// The Setup card's armed `delete account`: its second `↵` deletes.
+fn setup_delete_armed(app: &App) -> bool {
+    config_rows(app).get(app.config_action_cursor) == Some(&ConfigRow::Delete)
+        && app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.armed_action == Some(ConfigRow::Delete))
+}
+
+/// What `↵` does on the Setup card's `disable` row: `enable` on a disabled
+/// account, `disable` (armed first) otherwise, `None` while the row is inert
+/// — the account is active or holds a live session.
+pub(super) fn setup_disable_verb(app: &App) -> Option<&'static str> {
+    let name = crate::profile::ProfileName::from(app.config_draft.as_ref()?.editing_name.clone()?);
+    if disable_row_gated(app, &name) {
+        return None;
+    }
+    let disabled = app
+        .config()
+        .find(&name)
+        .is_some_and(crate::profile::Profile::is_disabled);
+    Some(if disabled { "enable" } else { "disable" })
+}
+
+/// Whether the Setup card's `clear long-lived token` / `switch to a rolling
+/// token` row under the cursor is armed (its second `↵` acts). The arm
+/// disarms when focus moves, so the cursor check matches the held arm.
+fn setup_token_row_armed(app: &App, row: ConfigRow) -> bool {
+    config_rows(app).get(app.config_action_cursor) == Some(&row)
+        && app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.armed_action == Some(row))
+}
+
+/// The focused profile name, the Setup card's own selection.
+fn setup_focused_name(app: &App) -> Option<crate::profile::ProfileName> {
+    match app.setup_selection() {
+        SetupSelection::Item(MainItemKind::Profile(i)) => {
+            app.config().profiles.get(i).map(|p| p.name.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether the Setup card's `clear long-lived token` row is dimmed inert: the
+/// [`super::config::clear_gated_facts`] formula fed the tick's facts (the
+/// sidecar cache the Overview builds, the config's flags and other logins) —
+/// the handler re-checks the live store before it acts, exactly as the
+/// disable row's gate does.
+fn clear_session_row_gated(app: &App, name: &crate::profile::ProfileName) -> bool {
+    let cfg = app.config();
+    let profile = cfg.find(name);
+    let has_other_login = profile.is_some_and(|p| p.credentials.is_some() || p.api_key.is_some());
+    let rolling_armed = profile.is_some_and(|p| p.rolling_token);
+    let holds_sidecar = app.session_tokens.contains_key(name.as_str());
+    let has_static_backup = crate::claude::has_static_backup(name);
+    super::config::clear_gated_facts(
+        has_other_login,
+        rolling_armed,
+        holds_sidecar,
+        has_static_backup,
+    )
+}
+
+/// The Setup card's hints for the row under the cursor, each `↵` naming what
+/// it does on that row and none offered where the row's `↵` is inert. The
+/// help modal's card `↵` row reads the same list.
+pub(crate) fn setup_card_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    const ROW: (&str, &str) = ("↑↓", "row");
+    let mut hints: Vec<(&'static str, &'static str)> = Vec::new();
+    match app.setup_selection() {
+        // The codex and pool detail panes carry their own action rows; the
+        // hint derives from the row under the cursor, never a key the pane
+        // does not bind.
+        SetupSelection::Item(MainItemKind::Codex(_)) => {
+            if app.codex_detail_armed {
+                return vec![("↵", "confirm delete"), ("esc", "cancel"), ("?", "help")];
+            }
+            let verb = match CodexDetailRow::ALL.get(app.config_action_cursor) {
+                Some(CodexDetailRow::ReLogin) => Some("log in"),
+                Some(CodexDetailRow::Delete) => Some("delete"),
+                None => None,
+            };
+            if let Some(verb) = verb {
+                if walk_moves(CodexDetailRow::ALL.len()) {
+                    hints.push(ROW);
+                }
+                hints.push(("↵", verb));
+            }
+        }
+        SetupSelection::Item(MainItemKind::Shunt(..)) => {
+            if app.pool_detail_armed {
+                return vec![("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")];
+            }
+            // kimi / unknown auth mode (or a name outside shunt's grammar):
+            // no rows, facts only, nothing to walk or run.
+            let rows = app.pool_detail_rows();
+            let verb = match rows.get(app.config_action_cursor) {
+                Some(PoolDetailRow::Refresh) => Some("refresh"),
+                Some(PoolDetailRow::Remove) => Some("remove"),
+                None => None,
+            };
+            if let Some(verb) = verb {
+                if walk_moves(rows.len()) {
+                    hints.push(ROW);
+                }
+                hints.push(("↵", verb));
+            }
+        }
+        // Claude rows and `+ new` name each row's own keys: the `model` and
+        // `effort` rows cycle on space; `alert at` steps on `+`/`-`; env rows
+        // edit a value or open the add-env editor; an action row's `↵` names
+        // its action.
+        SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
+            if setup_delete_armed(app) {
+                return vec![("↵", "confirm delete"), ("esc", "cancel"), ("?", "help")];
+            }
+            let rows = config_rows(app);
+            if walk_moves(rows.len()) {
+                hints.push(ROW);
+            }
+            let keys: &[(&str, &str)] = match rows.get(app.config_action_cursor).copied() {
+                Some(ConfigRow::Model | ConfigRow::Effort) => {
+                    &[("space", "cycle"), ("↵", "custom")]
+                }
+                // Each step key while its own direction moves the value; on
+                // `probe every` a larger value probes less often.
+                Some(row @ (ConfigRow::BellThreshold | ConfigRow::UsageProbeInterval)) => {
+                    let (raise, lower) = if row == ConfigRow::BellThreshold {
+                        ("raise", "lower")
+                    } else {
+                        ("less often", "more often")
+                    };
+                    if config_step_lands(app, row, true) {
+                        hints.push(("+", raise));
+                    }
+                    if config_step_lands(app, row, false) {
+                        hints.push(("-", lower));
+                    }
+                    &[("↵", "type")]
+                }
+                Some(ConfigRow::EnvEntry(_)) => &[("↵", "edit value")],
+                Some(ConfigRow::EnvAdd) => &[("↵", "add env")],
+                Some(ConfigRow::ModelOverrideAdd) => &[("↵", "add override")],
+                Some(row @ ConfigRow::ApiKey) if minted_key_row(app, row) => &[],
+                // The `type` / `family` cycle rows advance on space or ↵.
+                Some(ConfigRow::Type | ConfigRow::Family) => &[("space/↵", "cycle")],
+                // The disabled shunt `+ login` is inert: no ↵ hint. The one
+                // predicate the row renders by, never a disk read here.
+                Some(ConfigRow::Login) if app.shunt_login_disabled().is_some() => &[],
+                // A proxy account's `↵` only toasts its refusal: no hint.
+                Some(ConfigRow::Login)
+                    if setup_focused_name(app).is_some_and(|n| login_row_refused(app, &n)) =>
+                {
+                    &[]
+                }
+                Some(ConfigRow::Login) => &[("↵", "log in")],
+                Some(ConfigRow::CaptureLogin) => &[("↵", "capture")],
+                Some(ConfigRow::DeleteCreds) => &[("↵", "log out")],
+                Some(ConfigRow::Disabled) => match setup_disable_verb(app) {
+                    Some("enable") => &[("↵", "enable")],
+                    Some(_) => &[("↵", "disable")],
+                    None => &[],
+                },
+                Some(ConfigRow::Delete) => &[("↵", "delete")],
+                Some(ConfigRow::Create) => &[("↵", "create")],
+                Some(ConfigRow::AutoStart | ConfigRow::UsageProbe) => &[("space/↵", "toggle")],
+                Some(
+                    ConfigRow::Name
+                    | ConfigRow::BaseUrl
+                    | ConfigRow::ApiKey
+                    | ConfigRow::FableModel
+                    | ConfigRow::OpusModel
+                    | ConfigRow::SonnetModel
+                    | ConfigRow::HaikuModel
+                    | ConfigRow::SubagentModel
+                    | ConfigRow::AdvisorModel,
+                ) => &[("↵", "edit")],
+                // The two token rows arm like the delete row: once armed the
+                // footer names the confirm and its way out. The gate is read
+                // BEFORE the armed branch, so an arm the gate later closes
+                // drops its `↵` at once — the handler refuses at the same
+                // gate, and a hidden confirm would be dead. `esc cancel` and
+                // `? help` stay: esc still disarms. Unarmed, a dimmed row
+                // drops only its `↵`, like every other inert row.
+                Some(ConfigRow::ClearSessionToken) => {
+                    let gated = setup_focused_name(app)
+                        .is_some_and(|name| clear_session_row_gated(app, &name));
+                    match (
+                        gated,
+                        setup_token_row_armed(app, ConfigRow::ClearSessionToken),
+                    ) {
+                        (true, true) => return vec![("esc", "cancel"), ("?", "help")],
+                        (false, true) => {
+                            return vec![("↵", "confirm clear"), ("esc", "cancel"), ("?", "help")];
+                        }
+                        (true, false) => &[],
+                        (false, false) => &[("↵", "clear")],
+                    }
+                }
+                Some(ConfigRow::RollingTokenSwitch) => {
+                    let gated = setup_focused_name(app)
+                        .is_some_and(|name| rolling_switch_row_gated(app, &name));
+                    match (
+                        gated,
+                        setup_token_row_armed(app, ConfigRow::RollingTokenSwitch),
+                    ) {
+                        (true, true) => return vec![("esc", "cancel"), ("?", "help")],
+                        (false, true) => {
+                            return vec![("↵", "confirm switch"), ("esc", "cancel"), ("?", "help")];
+                        }
+                        (true, false) => &[],
+                        (false, false) => &[("↵", "switch")],
+                    }
+                }
+                None => &[],
+            };
+            hints.extend_from_slice(keys);
+        }
+    }
+    hints.extend([("a", "actions"), ("?", "help")]);
+    hints
+}
+
+/// The Config tab's hints for the row under the cursor: the three typed rows
+/// cycle on space and type on `↵`; any other row's space and `↵` act only
+/// while [`global_config_row_live`] holds, as its key handler checks.
+fn config_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut hints = Vec::new();
+    if walk_moves(GLOBAL_CONFIG_ROWS.len()) {
+        hints.push(("↑↓", "row"));
+    }
+    match GLOBAL_CONFIG_ROWS.get(app.global_config_cursor).copied() {
+        Some(
+            GlobalConfigRow::RefreshInterval
+            | GlobalConfigRow::ContextNudge
+            | GlobalConfigRow::WeeklyThreshold,
+        ) => hints.extend([("space", "cycle"), ("↵", "custom")]),
+        Some(row) if global_config_row_live(app, row) => {
+            hints.push(("space/↵", "cycle / toggle"));
+        }
+        Some(_) | None => {}
+    }
+    hints.extend([("a", "actions"), ("?", "help")]);
+    hints
+}
+
+/// The Fallback tab's hints, each read off the predicate its key handler
+/// acts on: the chain walk past one item, the reorder while either direction
+/// swaps, a card row's keys while [`fallback_row_acts`] holds, each step key
+/// while [`fallback_step_lands`] holds for its direction.
+fn fallback_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    const ROW: (&str, &str) = ("↑↓", "row");
+    let row_keys = |row: FallbackRow, keys: &[(&'static str, &'static str)]| {
+        let mut hints = vec![ROW];
+        if fallback_row_acts(app, row) {
+            hints.extend_from_slice(keys);
+        }
+        hints
+    };
+    // A stepper row's `+` and `-` each show while their own direction moves
+    // the value (a joined slot would stay while either does).
+    let stepper = |row: FallbackRow| {
+        let mut hints = vec![ROW];
+        if fallback_step_lands(app, row, true) {
+            hints.push(("+", "raise"));
+        }
+        if fallback_step_lands(app, row, false) {
+            hints.push(("-", "lower"));
+        }
+        if fallback_row_acts(app, row) {
+            hints.push(("↵", "type"));
+        }
+        hints
+    };
+    let mut hints = match fallback_hint(app) {
+        FallbackHint::Empty => Vec::new(),
+        FallbackHint::ChainMember | FallbackHint::ChainAdd => {
+            let mut hints = Vec::new();
+            if walk_moves(chain_items(app).len()) {
+                hints.push(("↑↓", "move"));
+            }
+            if chain_reorder_moves(app) {
+                hints.push(("⇧↑↓", "reorder"));
+            }
+            if chain_enter_acts(app) {
+                let verb = if fallback_hint(app) == FallbackHint::ChainAdd {
+                    "add"
+                } else {
+                    "open"
+                };
+                hints.push(("↵", verb));
+            }
+            hints
+        }
+        FallbackHint::DetailThreshold => stepper(FallbackRow::Threshold),
+        FallbackHint::DetailWeeklyAt => stepper(FallbackRow::WeeklyAt),
+        FallbackHint::DetailCheckWeekly => {
+            row_keys(FallbackRow::CheckWeekly, &[("space/↵", "toggle")])
+        }
+        FallbackHint::DetailCheckScoped => {
+            row_keys(FallbackRow::CheckScoped, &[("space/↵", "toggle")])
+        }
+        FallbackHint::DetailCheckCreditCap => {
+            row_keys(FallbackRow::CheckCreditCap, &[("space/↵", "toggle")])
+        }
+        FallbackHint::DetailLastResort => {
+            row_keys(FallbackRow::LastResort, &[("space/↵", "toggle")])
+        }
+        FallbackHint::DetailPreferred => row_keys(FallbackRow::Preferred, &[("space/↵", "toggle")]),
+        // The row's own keys lead so the narrow-width trim, which drops the
+        // rightmost non-essential hint first, sheds `↑↓ row` before them.
+        FallbackHint::DetailPreferredDays => {
+            let mut hints = Vec::new();
+            if fallback_row_acts(app, FallbackRow::PreferredDays) {
+                hints.extend([("space", "preset"), ("↵", "days")]);
+            }
+            hints.push(ROW);
+            hints
+        }
+        FallbackHint::DetailMaxSpend => row_keys(FallbackRow::MaxSpend, &[("↵", "type")]),
+        FallbackHint::DetailRemove => vec![ROW, ("↵", "remove")],
+        FallbackHint::DetailRemoveArmed => {
+            return vec![("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")];
+        }
+        // The candidate count the picker's handler and the help's `↵ add`
+        // read: with none left, `↵` adds nothing.
+        FallbackHint::DetailAdd => {
+            let candidates = chain_candidates(app).len();
+            let mut hints = Vec::new();
+            if walk_moves(candidates) {
+                hints.push(("↑↓", "pick"));
+            }
+            if candidates > 0 {
+                hints.push(("↵", "add"));
+            }
+            hints
+        }
+    };
+    hints.extend([("a", "actions"), ("?", "help")]);
     hints
 }
 
@@ -765,6 +900,9 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 pub(crate) struct UsageKeyFacts {
     /// In detail focus (↑↓ scrolls, esc/← ascend).
     pub(crate) detail: bool,
+    /// `↑↓` acts: the detail has somewhere to scroll, or the list a second
+    /// row to walk to.
+    pub(crate) arrows: bool,
     /// `↵` descends: list focus with at least one item row.
     pub(crate) enter: bool,
     /// `r` acts, and what it re-reads.
@@ -797,9 +935,15 @@ pub(crate) fn usage_key_facts(app: &App) -> UsageKeyFacts {
         | SetupSelection::Item(MainItemKind::Codex(_))
         | SetupSelection::New => (None, false),
     };
+    let items = app.setup_items().len();
     UsageKeyFacts {
         detail,
-        enter: !detail && !app.setup_items().is_empty(),
+        arrows: if detail {
+            detail_scrolls(app)
+        } else {
+            walk_moves(items)
+        },
+        enter: !detail && items > 0,
         r,
         n,
     }
@@ -809,13 +953,11 @@ pub(crate) fn usage_key_facts(app: &App) -> UsageKeyFacts {
 fn usage_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut hints: Vec<(&'static str, &'static str)> = Vec::new();
     let facts = usage_key_facts(app);
-    if facts.detail {
-        hints.push(("↑↓", "scroll"));
-    } else {
-        hints.push(("↑↓", "account"));
-        if facts.enter {
-            hints.push(("↵", "detail"));
-        }
+    if facts.arrows {
+        hints.push(("↑↓", if facts.detail { "scroll" } else { "account" }));
+    }
+    if facts.enter {
+        hints.push(("↵", "detail"));
     }
     match facts.r {
         Some(UsageRefresh::RefreshAccount) => hints.push(("r", "refresh account")),
@@ -890,13 +1032,13 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.services.focus {
         ServicesFocus::List => {
             let mut hints = Vec::new();
-            // `↑↓`/`↵` act only while the list holds a row; the key handler
-            // gates both on the same `row_count() > 0` predicate this reads.
-            if app.services.row_count() > 0 {
+            // `↑↓`/`↵` act only while the list holds a row, the count the key
+            // handler gates both on; a lone row's walk wraps onto itself.
+            if walk_moves(app.services.row_count()) {
                 hints.push(("↑↓", "row"));
-                if app.services.enter_descends() {
-                    hints.push(("↵", "detail"));
-                }
+            }
+            if app.services.row_count() > 0 && app.services.enter_descends() {
+                hints.push(("↵", "detail"));
             }
             hints.push(("r", "refresh"));
             if app.services.f_moves() {
@@ -924,6 +1066,39 @@ fn shunt_fix(fix: &ServiceFix) -> bool {
             | ServiceFix::AddAdminTable
             | ServiceFix::RequireClientTokens
     )
+}
+
+/// What `space` does on the shunt card's focused line, the one predicate the
+/// footer arm and the help's `space` row share, gated exactly as the key
+/// handler's callees act: the `enabled` toggle while no action runs, an
+/// entry while its remove is not checking, or a cycle field while its save
+/// is not checking. Every other focused line's `space` does nothing.
+pub(crate) enum ShuntSpaceAction {
+    ToggleEnabled,
+    ExpandEntry,
+    CollapseEntry,
+    CycleField,
+}
+
+pub(crate) fn shunt_space(app: &App) -> Option<ShuntSpaceAction> {
+    match app.services.focused_shunt_focus() {
+        Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
+            Some(ShuntSpaceAction::ToggleEnabled)
+        }
+        Some(ShuntFocus::Entry { key })
+            if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
+        {
+            Some(if app.services.shunt_expanded.contains(key) {
+                ShuntSpaceAction::CollapseEntry
+            } else {
+                ShuntSpaceAction::ExpandEntry
+            })
+        }
+        Some(ShuntFocus::Field { key }) if !field_locked(app, key) && is_cycle_field(key) => {
+            Some(ShuntSpaceAction::CycleField)
+        }
+        _ => None,
+    }
 }
 
 /// Services detail hints, row-aware: the herdr options rows name their own
@@ -988,29 +1163,9 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             Some(ShuntFocus::Fix { fix, .. }) if !app.services.shunt_action.running => {
                 hints.push(("↵", fix_verb(fix)));
             }
-            Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
-                hints.push(("space/↵", "toggle"));
-            }
             Some(ShuntFocus::CheckOutput { .. }) => hints.push(("↵", "open")),
-            Some(ShuntFocus::Entry { key })
-                if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
-            {
-                hints.push((
-                    "space/↵",
-                    if app.services.shunt_expanded.contains(key) {
-                        "collapse"
-                    } else {
-                        "expand"
-                    },
-                ));
-            }
-            Some(ShuntFocus::Field { key }) if !field_locked(app, key) => {
-                if is_cycle_field(key) {
-                    hints.push(("space", "cycle"));
-                    hints.push(("↵", "custom"));
-                } else {
-                    hints.push(("↵", "edit value"));
-                }
+            Some(ShuntFocus::Field { key }) if !field_locked(app, key) && !is_cycle_field(key) => {
+                hints.push(("↵", "edit value"));
             }
             Some(ShuntFocus::Add { kind })
                 if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
@@ -1044,37 +1199,72 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             _ => {}
         }
+        // The state-control keys read [`shunt_space`], the one predicate the
+        // help modal's `space` row shares: the `enabled` toggle and an entry
+        // join `space` and `↵`; a cycle field splits them (its `↵` opens the
+        // custom-value editor instead of stepping).
+        match shunt_space(app) {
+            Some(ShuntSpaceAction::ToggleEnabled) => hints.push(("space/↵", "toggle")),
+            Some(ShuntSpaceAction::ExpandEntry) => hints.push(("space/↵", "expand")),
+            Some(ShuntSpaceAction::CollapseEntry) => hints.push(("space/↵", "collapse")),
+            Some(ShuntSpaceAction::CycleField) => {
+                hints.push(("space", "cycle"));
+                hints.push(("↵", "custom"));
+            }
+            None => {}
+        }
         hints.extend(next_fix);
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
 
     if label != Some("herdr") {
-        let walks_problems = label == Some("plugin")
-            && app
-                .services
-                .selected_check()
-                .is_some_and(|c| !c.problems.is_empty());
-        let mut hints = if walks_problems {
-            vec![("↑↓", "problem")]
-        } else {
-            vec![("↑↓", "scroll")]
-        };
-        if walks_problems && app.services.detail_max_scroll.get() > 0 {
+        let problems = app
+            .services
+            .selected_check()
+            .filter(|c| c.label == "plugin")
+            .map_or(0, |c| c.problems.len());
+        // The plugin walk runs over its problems and the OPTIONS row.
+        let walks_problems = label == Some("plugin");
+        let mut hints = Vec::new();
+        // The focused row's own key leads — the option row's toggle, a
+        // problem's `↵ <verb>` — so the narrow-width trim sheds the shared
+        // hints before the key the shown row acts on.
+        if app.services.plugin_option_acts() {
+            hints.push(("space/↵", "toggle"));
+        } else if services_fix_keys_act(app)
+            && let Some(v) = verb
+        {
+            hints.push(("↵", v));
+        }
+        // The problem walk moves past one stop, or returns from a page's
+        // hidden action focus; a scroll-only detail (a no-problem plugin card
+        // included — its cursor rests on the lone option row) scrolls only
+        // while its published bound leaves somewhere to go.
+        if walks_problems && problems > 0 {
+            if walk_moves(problems + 1) || app.services.diagnostic_focus {
+                hints.push(("↑↓", "row"));
+            }
+        } else if detail_scrolls(app) {
+            hints.push(("↑↓", "scroll"));
+        }
+        if walks_problems && problems > 0 && page_keys_act(app).is_some() {
             hints.push(("pgup/pgdn", "read"));
         }
         hints.push(("r", "refresh"));
-        if let Some(v) = verb {
-            hints.push(("↵", v));
+        // The `f` walk acts only inside a keymap that binds it — the plugin
+        // problems walk here; a scroll-only detail (any other check)
+        // advertises neither, the predicate its handler routing consults.
+        if services_fix_keys_act(app) {
+            hints.extend(next_fix);
         }
-        hints.extend(next_fix);
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
 
     if app.services.diagnostic_focus {
         let mut hints = vec![("↑↓", "row")];
-        if app.services.detail_max_scroll.get() > 0 {
+        if page_keys_act(app).is_some() {
             hints.push(("pgup/pgdn", "read"));
         }
         hints.push(("r", "refresh"));
@@ -1095,14 +1285,16 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
+        // Each step key while its own direction moves the value.
         Some(HerdrOption::TagRefresh) => {
-            let mut hints = vec![
-                ("↑↓", "row"),
-                ("+", "raise"),
-                ("-", "lower"),
-                ("↵", "type"),
-                ("r", "refresh"),
-            ];
+            let mut hints = vec![("↑↓", "row")];
+            if herdr_tag_step(app, true).is_some() {
+                hints.push(("+", "raise"));
+            }
+            if herdr_tag_step(app, false).is_some() {
+                hints.push(("-", "lower"));
+            }
+            hints.extend([("↵", "type"), ("r", "refresh")]);
             hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
@@ -1132,7 +1324,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints
         }
     };
-    if app.services.detail_max_scroll.get() > 0 {
+    if page_keys_act(app).is_some() {
         hints.insert(1, ("pgup/pgdn", "read"));
     }
     hints

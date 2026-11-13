@@ -118,7 +118,7 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
     .expect("update");
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),
-        "active_profile = \"b\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\n"
+        "profiles = [\"a\", \"b\"]\nactive_profile = \"b\"\n"
     );
 
     write_codex_state("profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 75.0\n");
@@ -129,7 +129,7 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
     .expect("update");
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),
-        "active_profile = \"a\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\nweekly_switch_threshold = 75.0\n"
+        "profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 75.0\nactive_profile = \"a\"\n"
     );
 }
 
@@ -157,7 +157,7 @@ fn the_switch_off_marker_reads_back_and_a_switch_drops_the_key() {
     .expect("update");
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),
-        "active_profile = \"a\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\n",
+        "profiles = [\"a\", \"b\"]\nactive_profile = \"a\"\n",
         "the switch clears the marker and the save drops the key"
     );
 }
@@ -199,6 +199,253 @@ fn an_out_of_band_weekly_line_heals_on_the_next_save() {
     .expect("update");
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),
-        "active_profile = \"b\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\nweekly_switch_threshold = 98.0\n"
+        "profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 98.0\nactive_profile = \"b\"\n"
+    );
+}
+
+#[test]
+fn a_codex_update_edits_in_place_keeping_unknown_keys() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    let fixture = "# top note\nfrom_the_future = 1\nwrap_off = true # mine\n\
+                   profiles = [\n  # work\n  \"a\",\n  \"b\",\n]\n";
+    write_codex_state(fixture);
+    CodexState::update(|state| {
+        state.set_active(Some("b"));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        format!("{fixture}active_profile = \"b\"\n"),
+    );
+}
+
+#[test]
+fn removing_a_codex_profile_keeps_the_comments_around_it() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state(
+        "profiles = [\n  # one\n  \"a\",\n  # two\n  \"b\",\n]\n\
+         fallback_chain = [\"a\", \"b\"]\n\n[ids]\n# ids note\na = \"id-a\"\nb = \"id-b\"\n",
+    );
+    CodexState::update(|state| {
+        state.remove_profile("b");
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # one\n  \"a\",\n  # two\n]\n\
+         fallback_chain = [\"a\"]\n\n[ids]\n# ids note\na = \"id-a\"\n",
+    );
+}
+
+#[test]
+fn a_new_codex_profile_lands_in_the_list_and_its_id_table_in_place() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("# keep\nprofiles = [\"a\"]\n\n[ids]\n# ids note\na = \"id-a\"\n");
+    CodexState::update(|state| state.add_profile("b")).expect("update");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        after.starts_with(
+            "# keep\nprofiles = [\"a\", \"b\"]\n\n[ids]\n# ids note\na = \"id-a\"\nb = \""
+        ),
+        "{after}"
+    );
+    let back = CodexState::load().expect("reload");
+    assert_eq!(back.profiles().len(), 2);
+    assert!(back.id("b").is_some());
+}
+
+/// An array of tables prints its key's decor above every element, so a carried
+/// comment lands on the first element's header and appears once.
+#[test]
+fn a_removed_key_above_an_array_of_tables_hands_its_comment_to_the_first_element() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state(
+        "profiles = [\"a\"]\n#c1\nactive_profile = \"a\" #c2\n\n#c9\n[[arr]]\nk = 1\n[[arr]]\nk = 2\n",
+    );
+    CodexState::update(|state| {
+        state.set_active(None);
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"a\"]\n#c1\n#c2\n\n#c9\n[[arr]]\nk = 1\n[[arr]]\nk = 2\n",
+    );
+}
+
+#[test]
+fn a_codex_update_with_no_file_writes_the_full_render() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    CodexState::update(|state| state.add_profile("a")).expect("update");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(after.contains("wrap_off = false"), "{after}");
+    assert!(after.contains("fallback_chain = []"), "{after}");
+}
+
+/// The raw read sees the `nan` the load normalized away, so the typed view of
+/// the file has to render it for the save to replace it.
+#[test]
+fn a_nan_weekly_line_heals_on_the_next_save() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("profiles = [\"a\"]\nweekly_switch_threshold = nan\n");
+    CodexState::update(|state| {
+        state.set_active(Some("a"));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"a\"]\nweekly_switch_threshold = 98.0\nactive_profile = \"a\"\n",
+    );
+}
+
+/// The load refuses a wrong-typed key first, so only a hand edit landing
+/// between the in-hold load and the save's raw read reaches this refusal.
+#[test]
+fn a_wrong_typed_key_landing_inside_the_hold_refuses_the_save_naming_it() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("profiles = [\"a\"]\n");
+    let hand_edit = "# mine\nprofiles = \"oops\"\n";
+    let err = CodexState::update(|state| {
+        write_codex_state(hand_edit);
+        state.set_active(Some("a"));
+        Ok(())
+    })
+    .expect_err("the save refuses");
+    assert_eq!(
+        err.to_string(),
+        "codex-profiles.toml has `profiles` in a shape clauth cannot read; \
+         fix or remove that line, then try again",
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), hand_edit);
+}
+
+#[test]
+fn a_file_turning_unparseable_inside_the_hold_refuses_the_save() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("profiles = [\"a\"]\n");
+    let hand_edit = "= nope\n";
+    let err = CodexState::update(|state| {
+        write_codex_state(hand_edit);
+        state.set_active(Some("a"));
+        Ok(())
+    })
+    .expect_err("the save refuses");
+    assert_eq!(
+        err.to_string(),
+        format!("failed to parse {} at line 1, column 1", path.display()),
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), hand_edit);
+}
+
+#[test]
+fn a_save_whose_edit_changes_no_bytes_leaves_the_mtime_alone() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("profiles = [\"a\"]\n");
+    let hand_edit = "profiles = [\"a\"] # mine\nactive_profile = \"a\"\n";
+    let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    CodexState::update(|state| {
+        write_codex_state(hand_edit);
+        crate::testutil::set_mtime(&path, stamp);
+        state.set_active(Some("a"));
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), hand_edit);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        stamp,
+    );
+}
+
+#[test]
+fn keys_going_absent_leave_their_comments_on_the_next_item() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state(
+        "# slot\nactive_profile = \"a\" # on it\n# marker\nswitched_off = true\n\
+         # line\nweekly_switch_threshold = 75.0\nprofiles = [\"a\"]\n",
+    );
+    CodexState::update(|state| {
+        state.set_active(None);
+        state.clear_switched_off();
+        state.weekly_switch_threshold = None;
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# slot\n# on it\n# marker\n# line\nprofiles = [\"a\"]\n",
+    );
+}
+
+#[test]
+fn removing_the_last_codex_profile_moves_the_id_tables_comments() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state(
+        "profiles = [\"a\"]\n\n# the ids\n[ids] # header\n# ids note\na = \"id-a\" # its own\n",
+    );
+    CodexState::update(|state| {
+        state.remove_profile("a");
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\n\n# the ids\n# header\n# ids note\n# its own\n",
+    );
+}
+
+#[test]
+fn an_id_table_the_file_lacks_lands_as_a_block_table() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    write_codex_state("profiles = [\"a\"] # mine\n");
+    CodexState::update(|state| state.claim_id("a").map(|_| ())).expect("update");
+    let id = CodexState::load().expect("reload").ids["a"].clone();
+    let id = toml::Value::try_from(id).expect("id value");
+    let id = id.as_str().expect("a string id");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        format!("profiles = [\"a\"] # mine\n\n[ids]\na = \"{id}\"\n"),
     );
 }

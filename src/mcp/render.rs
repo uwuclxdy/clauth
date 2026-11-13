@@ -13,15 +13,19 @@ use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
-/// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
-/// provider, tier, base url). Volatile usage figures rot within a turn, so they are
-/// served fresh per call by `profiles`, never baked into the boot-time block.
+/// Per-profile snapshot fed to [`instructions_block`]: stable identity (name,
+/// provider, tier, base url), the active and disabled flags, and a sort key.
+/// Volatile usage figures rot within a turn, so they are served fresh per call by
+/// `profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
+    /// Whether the account is disabled. A disabled row the roster keeps says so in
+    /// its marker, since the header tells a reader disabled ones are left out.
+    pub(crate) disabled: bool,
     /// Where this profile sorts in the roster. See [`RosterRank`].
     pub(crate) rank: RosterRank,
 }
@@ -270,20 +274,35 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
 /// runtime marks the profile the session is pinned to and the account the global
 /// link points at separately; a global session IS the global link, so the active
 /// profile carries both names; a custom config dir holds no clauth session
-/// profile, so only the global link gets a name. The old bare `(active)` read as
+/// profile, so only the global link gets a name. A bare `active` would read as
 /// "this session's account" where a `clauth start` session does not spend the
 /// active profile at all.
 fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
     match auth {
         SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime && p.active => {
-            Some(" (global active, this session)")
+            Some("global active, this session")
         }
-        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some(" (this session)"),
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some("this session"),
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom if p.active => {
-            Some(" (global active)")
+            Some("global active")
         }
-        SessionAuth::Global if p.active => Some(" (global active, this session)"),
+        SessionAuth::Global if p.active => Some("global active, this session"),
         SessionAuth::Global | SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => None,
+    }
+}
+
+/// A roster member as the block spells it: the name, then one paren holding the
+/// [`marker`] and, for a kept disabled account, `disabled`. Composed here once so
+/// every marker arm carries the flag.
+fn member_label(p: &ProfileSnapshot, auth: &SessionAuth) -> String {
+    let tags: Vec<&str> = marker(p, auth)
+        .into_iter()
+        .chain(p.disabled.then_some("disabled"))
+        .collect();
+    if tags.is_empty() {
+        p.name.clone()
+    } else {
+        format!("{} ({})", p.name, tags.join("; "))
     }
 }
 
@@ -318,10 +337,7 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 
     let mut out = String::new();
     for (bracket, members) in &groups {
-        let names: Vec<String> = members
-            .iter()
-            .map(|p| marker(p, auth).map_or_else(|| p.name.clone(), |m| format!("{}{m}", p.name)))
-            .collect();
+        let names: Vec<String> = members.iter().map(|p| member_label(p, auth)).collect();
         out.push_str("- ");
         out.push_str(&names.join(", "));
         out.push(' ');
@@ -600,8 +616,8 @@ state).\n\n",
         switch_router_clause(auth),
     ));
     out.push_str(
-        "Profiles, most headroom first (session-start snapshot; call `profiles` for live usage \
-and anything added since):\n",
+        "Profiles, most headroom first (session-start snapshot, disabled accounts left out; call \
+`profiles` for live usage and anything added since):\n",
     );
     out.push_str(&roster_lines(profiles, auth));
     out
@@ -739,7 +755,9 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 /// One age per row and no tail, no quota and no deadline countdown: this
 /// enumerates so a caller can NAME a job, and `monitor({job_ids})` is the check
 /// that reports what one is doing. Ten rows of the full running line would cost
-/// more than the reply it rides on.
+/// more than the reply it rides on. An isolated orphan's row names no resume:
+/// its transcript left with the throwaway tree, so the session id is no handle
+/// `delegate` accepts.
 fn jobs_listing_prose(p: &Value) -> String {
     let Some(rows) = p.get("jobs").and_then(Value::as_array) else {
         return String::new();
@@ -769,13 +787,22 @@ fn jobs_listing_prose(p: &Value) -> String {
         }
         // The resume sentence is what makes the pair-loop possible from the
         // listing alone: a session id whose run is over is a handle. Rendered
-        // for an orphaned row (the only handle left) and a done one (the
-        // completion's own id, stamped by every completion arm). On a running
-        // row it would invite resuming a session the live run still holds, so
-        // it stays unsaid there — the JSON row still carries the key either way.
-        if matches!(state, "orphaned" | "done")
-            && let Some(sid) = row.get("session_id").and_then(Value::as_str)
-        {
+        // for a done row (the completion's own id, stamped by every completion
+        // arm) and for a stopped or orphaned row whose own `resumable` verdict
+        // says the handle is real now: a stopped row's transcript may never
+        // have reached the global store, and an orphan whose recorded child
+        // still writes the transcript would put a second writer on a live
+        // session. On a running row it would invite resuming a session the
+        // live run still holds, so it stays unsaid there — the JSON row still
+        // carries the key either way.
+        let resume_sentence = if matches!(state, "stopped" | "orphaned") {
+            row.get("resumable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        } else {
+            state == "done"
+        };
+        if resume_sentence && let Some(sid) = row.get("session_id").and_then(Value::as_str) {
             out.push_str(&format!("; resume with session id `{sid}`"));
         }
         out.push_str(&age_phrase(row));
@@ -793,7 +820,7 @@ fn jobs_listing_prose(p: &Value) -> String {
 /// The one age a listing row carries, named for the question that row's state
 /// makes worth asking: a live run's is how long it has been going, a finished
 /// one's how long its result has been sitting there, an orphan's how long ago
-/// anything last wrote to it.
+/// anything last wrote to it, a stopped one's how long ago the stop landed.
 fn age_phrase(row: &Value) -> String {
     // `humanize_span`, never `humanize_duration`: every figure here is a SPAN,
     // and at zero that function spells `now`, which renders `elapsed now` and
@@ -808,6 +835,7 @@ fn age_phrase(row: &Value) -> String {
     let when = humanize_span(secs);
     match row.get("state").and_then(Value::as_str) {
         Some("orphaned") => format!(", last seen {when} ago"),
+        Some("stopped") => format!(", stopped {when} ago"),
         _ => format!(", finished {when} ago"),
     }
 }
@@ -1988,8 +2016,22 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
 pub(crate) fn monitor_job_prose(p: &Value) -> String {
-    // A crashed tombstone's owner copy is the whole line: no `delegate to`,
-    // `finished`/`failed`, or target footer may qualify it.
+    // A stopped tombstone's copy is the whole line: no `delegate to`,
+    // `finished`/`failed`, or target footer may qualify it. The text the run
+    // had written rides the same line when the record still holds it: the copy
+    // replaces the false resume promise, never the salvage.
+    if p.get("stopped").and_then(Value::as_bool).unwrap_or(false) {
+        let mut out = p
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if let Some(partial) = p.get("partial_result").and_then(Value::as_str) {
+            out.push_str(&format!("; partial result: {partial}"));
+        }
+        return out;
+    }
+    // A crashed tombstone's copy is the whole line, the same rule.
     if p.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
         return p
             .get("result")

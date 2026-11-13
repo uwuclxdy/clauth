@@ -231,6 +231,7 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         path: path.to_string(),
         query: query.to_string(),
         bearer: bearer.map(str::to_string),
+        authorization_seen: bearer.is_some(),
         if_none_match: None,
         body: body.as_bytes().to_vec(),
         keep_alive: true,
@@ -609,6 +610,7 @@ fn a_keepalive_is_written_after_the_injected_interval() {
         none.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -662,6 +664,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
             stream_resolve.as_ref(),
             &TerminalHolders::new(),
             &StreamConfig::DEFAULT,
+            None,
             #[cfg(unix)]
             Some(stream_hub.as_ref()),
         )
@@ -777,6 +780,7 @@ fn a_dropped_subscription_ends_the_stream() {
             stream_resolve.as_ref(),
             &TerminalHolders::new(),
             &StreamConfig::DEFAULT,
+            None,
             #[cfg(unix)]
             Some(stream_hub.as_ref()),
         );
@@ -987,6 +991,7 @@ fn a_pane_created_mid_stream_resubscribes_and_a_pane_closed_reopens_silently() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -1132,6 +1137,7 @@ fn a_failed_reopen_keeps_the_live_connection_and_retries() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -1229,6 +1235,7 @@ fn a_retry_after_absence_hands_back_the_snapshot() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -1298,6 +1305,7 @@ fn the_herdr_socket_is_resolved_once_even_as_retries_keep_connecting() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -1380,6 +1388,7 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &StreamConfig::DEFAULT,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -1497,5 +1506,122 @@ fn a_fight_just_before_the_deadline_still_reaches_the_client() {
     assert_eq!(
         fights,
         vec![serde_json::json!({"pane_id": "w1:p3", "devices": ["driver", "phone"]})]
+    );
+}
+
+// --- A bridge drain that never reads empty -------------------------------------
+
+/// A sink that hands the hub one more frame on every flush until `until`, so
+/// the subscription always holds one frame and never fills: the bridge drain
+/// cannot end by reading it empty while the refill runs.
+struct RefillingSink {
+    hub: Arc<Hub>,
+    seq: u64,
+    until: Instant,
+}
+
+impl Write for RefillingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if Instant::now() < self.until {
+            self.hub.event(
+                100,
+                serde_json::json!({"session": "s-one", "seq": self.seq, "kind": "turn_start", "turn": "t"})
+                    .to_string()
+                    .as_bytes(),
+            );
+            self.seq += 1;
+        }
+        Ok(())
+    }
+}
+
+/// A hub holding one live session, and a sink that refills it for 12 s: well
+/// past every bound below, and short enough that a stream missing them still
+/// ends.
+fn refilling() -> (Arc<Hub>, RefillingSink) {
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    hub.event(
+        100,
+        serde_json::json!({
+            "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let sink = RefillingSink {
+        hub: Arc::clone(&hub),
+        seq: 2,
+        until: Instant::now() + Duration::from_secs(12),
+    };
+    (hub, sink)
+}
+
+#[test]
+fn a_revoke_ends_a_stream_whose_bridge_drain_never_empties() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    devices::seed_for_tests("phone", Tier::View, TOKEN).expect("seed the device");
+    let device = devices::authenticate(Some(TOKEN))
+        .expect("the list reads")
+        .expect("the device");
+    let (hub, mut sink) = refilling();
+    let started = Instant::now();
+    let mut row = devices::RowWatch::new(&device, started);
+    devices::revoke("phone").expect("revoke");
+    run_stream_with_config(
+        &mut sink,
+        started + Duration::from_secs(30),
+        &path,
+        none.as_ref(),
+        &TerminalHolders::new(),
+        &StreamConfig::DEFAULT,
+        Some(&mut row),
+        #[cfg(unix)]
+        Some(hub.as_ref()),
+    )
+    .expect("stream");
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "the stream outlived its revoke by {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_bridge_drain_that_never_empties_still_ends_at_the_deadline() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let (hub, mut sink) = refilling();
+    let started = Instant::now();
+    run_stream_with_config(
+        &mut sink,
+        started + Duration::from_secs(2),
+        &path,
+        none.as_ref(),
+        &TerminalHolders::new(),
+        &StreamConfig::DEFAULT,
+        None,
+        #[cfg(unix)]
+        Some(hub.as_ref()),
+    )
+    .expect("stream");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stream outlived its deadline by {:?}",
+        started.elapsed()
     );
 }

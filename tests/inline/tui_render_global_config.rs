@@ -58,6 +58,55 @@ fn toggles() -> RowState {
         reset_display: ResetDisplay::Relative,
         clock_format: ClockFormat::H24,
         home_tab: HomeTab::Overview,
+        reduce_motion: false,
+    }
+}
+
+/// The `reduce motion` toggle sits in the appearance band right after
+/// `home tab`, draws its state at the shared value column, and its hint names
+/// what each state does.
+#[test]
+fn the_reduce_motion_row_follows_home_tab_and_names_what_it_stills() {
+    let home = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::HomeTab)
+        .expect("home tab row");
+    assert_eq!(
+        GLOBAL_CONFIG_ROWS.get(home + 1),
+        Some(&GlobalConfigRow::ReduceMotion)
+    );
+    assert_eq!(GlobalConfigRow::ReduceMotion.band(), "appearance");
+
+    for (on, glyph, hint) in [
+        (
+            false,
+            "○─",
+            "the mascot reacts to events and provider names shimmer",
+        ),
+        (
+            true,
+            "─●",
+            "the mascot and provider names stay still; spinners keep turning",
+        ),
+    ] {
+        let rows = RowState {
+            reduce_motion: on,
+            ..toggles()
+        };
+        let line = line_text(&one_row(
+            GlobalConfigRow::ReduceMotion,
+            false,
+            rows,
+            tunables(),
+            None,
+        ));
+        let col = value_col("reduce motion", &line);
+        assert_eq!(col, 2 + KEY_W + KEY_GUTTER, "{line:?}");
+        assert_eq!(line[col..].trim_end(), glyph, "{line:?}");
+        assert_eq!(
+            row_hint(GlobalConfigRow::ReduceMotion, rows, tunables()).as_deref(),
+            Some(hint)
+        );
     }
 }
 
@@ -382,6 +431,34 @@ fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
         row_hint(GlobalConfigRow::AutoStartQueue, off, tunables()).as_deref(),
         Some("auto-start usage windows as soon as possible"),
     );
+}
+
+/// The compatible toggle's bracket frame drops exactly one bracket pair: a
+/// glyph carrying its own (`[[on]]`) renders whole, its inner brackets in the
+/// word span's state colour, while the theme's own `[on]`/`[off]` glyphs keep
+/// their word alone between the dim brackets.
+#[test]
+fn the_compatible_toggle_drops_exactly_one_bracket_pair() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let state = theme::accent();
+    let frames = crate::tui::render::panes::compatible_toggle_spans("[[on]]", state);
+    let rendered: Vec<_> = frames.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(rendered, vec!["[", "[on]", "]"], "the glyph renders whole");
+    assert_eq!(frames[0].style, theme::dim(), "the frame's own bracket");
+    assert_eq!(frames[1].style, state, "the word carries the state");
+    assert_eq!(frames[2].style, theme::dim());
+
+    // The theme's glyphs hold no inner brackets: the word is the glyph less
+    // its one frame pair.
+    let plain = crate::tui::render::panes::compatible_toggle_spans("[on]", state);
+    let words: Vec<_> = plain.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(words, vec!["[", "on", "]"]);
+
+    // The call site feeds the tier's glyph through the same frame.
+    let on = toggle_value(true, false);
+    let parts: Vec<_> = on.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(parts, vec!["[", "on", "]"], "the on toggle at compatible");
+    assert_eq!(on[1].style, theme::accent());
 }
 
 /// `refresh spent` is a pure on/off boolean — a toggle (`─●` / `○─`),
@@ -1624,11 +1701,11 @@ fn value_row_hints_state_what_the_setting_does() {
             ),
             (
                 GlobalConfigRow::BurnFloor,
-                "never switch away before this share is used, however fast the burn",
+                "the burn projection never switches below this share; it does nothing at or above an account's threshold",
             ),
             (
                 GlobalConfigRow::BurnHorizon,
-                "how far ahead to look when guessing the next switch",
+                "how far ahead to look, never past the next usage reading",
             ),
         ] {
             assert_eq!(
@@ -1650,6 +1727,26 @@ fn value_row_hints_state_what_the_setting_does() {
     assert_eq!(
         row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
         Some("no context nudge is sent")
+    );
+}
+
+/// The burn-aware hint names the threshold check that still applies with the
+/// mode on, so the projection reads as an earlier switch, never a later one.
+#[test]
+fn burn_aware_hints_keep_the_threshold_check() {
+    let mut on = toggles();
+    on.burn_aware = true;
+    let mut off = toggles();
+    off.burn_aware = false;
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, on, tunables()).as_deref(),
+        Some(
+            "switch the active account away at its threshold, or sooner once its burn would reach 100% within the look-ahead"
+        )
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, off, tunables()).as_deref(),
+        Some("switch the active account away once its usage crosses its threshold")
     );
 }
 

@@ -36,6 +36,14 @@ pub(crate) use crate::proxy_account::{Secret, read_secret_file};
 const MISSING_ID: &str = "zz-check-nonexistent";
 const UNKNOWN_SETTING: &str = "zz-check-unknown";
 const NOT_A_KEY: &str = "clp_zz-check-not-a-key";
+/// A token-route cursor no proxy serves: the read naming it must answer every
+/// retained record marked `dropped`.
+const UNKNOWN_CURSOR: &str = "zz-check-unknown-cursor";
+/// The contract minor that adds `GET /clauth/v1/tokens`.
+const TOKENS_MINOR: u64 = 2;
+/// The longest token-record `id` and `model`, in the UTF-16 units the core
+/// counts.
+pub(crate) const WIRE_STRING_MAX: usize = 256;
 /// A model Claude Code itself sends, so any proxy that serves Claude Code
 /// must accept it.
 const INFERENCE_MODEL: &str = "claude-haiku-4-5";
@@ -676,6 +684,21 @@ struct Health {
     contract: Value,
 }
 
+impl Health {
+    /// The minor `contract` declares, `None` when it does not parse.
+    fn minor(&self) -> Option<u64> {
+        self.contract
+            .as_str()
+            .and_then(contract_version)
+            .map(|(_, minor)| minor)
+    }
+
+    /// Whether the declared minor defines `GET /clauth/v1/tokens`.
+    fn defines_tokens(&self) -> bool {
+        self.minor().is_some_and(|minor| minor >= TOKENS_MINOR)
+    }
+}
+
 #[derive(Default)]
 struct Declared {
     capabilities: Vec<String>,
@@ -797,7 +820,7 @@ fn check_expecting(
     let Some(health) = c.health()? else {
         return Ok(c.report);
     };
-    c.control_auth();
+    c.control_auth(&health);
     let declared = c.info(&health);
     let accounts = c.accounts(&declared);
     // Before any paid request: a mistyped account costs nothing.
@@ -811,6 +834,7 @@ fn check_expecting(
     c.method_and_cap();
     c.login_flow(None);
     c.events(&declared);
+    c.tokens(&health, &declared);
     c.inference_routes(&declared);
     if let Some(view) = target {
         c.destructive(view, &declared, &usage);
@@ -989,6 +1013,20 @@ impl Checker<'_> {
             None | Some(Value::Null) => None,
             Some(_) => self.req(route, obj, path, name, kind),
         }
+    }
+
+    /// An optional field the contract types without `null`: absent passes,
+    /// and anything present, `null` included, must be of `kind`.
+    fn present<'v>(
+        &mut self,
+        route: &str,
+        obj: &'v Value,
+        path: &str,
+        name: &str,
+        kind: Kind,
+    ) -> Option<&'v Value> {
+        obj.get(name)?;
+        self.req(route, obj, path, name, kind)
     }
 
     fn one_of(&mut self, route: &str, v: &Value, at: &str, allowed: &[&str]) -> bool {
@@ -1213,8 +1251,9 @@ impl Checker<'_> {
     }
 
     /// Every control route refuses a request carrying no admin token; `/info`
-    /// also refuses a wrong token and the inference key.
-    fn control_auth(&mut self) {
+    /// also refuses a wrong token and the inference key. The token route is
+    /// asked only of a proxy declaring the minor that adds it.
+    fn control_auth(&mut self, health: &Health) {
         let missing = MISSING_ID;
         let routes: [(Method, &str, String, Option<Value>); 14] = [
             (Method::Get, "/info", "/info".into(), None),
@@ -1277,7 +1316,10 @@ impl Checker<'_> {
             ),
             (Method::Get, "/events", "/events".into(), None),
         ];
-        for (method, template, path, body) in routes {
+        let tokens = health
+            .defines_tokens()
+            .then(|| (Method::Get, "/tokens", "/tokens".into(), None));
+        for (method, template, path, body) in routes.into_iter().chain(tokens) {
             let route = format!("{} {CONTROL}{template} (no token)", method.as_str());
             let path = format!("{CONTROL}{path}");
             let body = body.map(|b| b.to_string());
@@ -1363,11 +1405,7 @@ impl Checker<'_> {
         }
         // A field a later minor adds is unknown to a proxy declaring an
         // earlier one, which the contract tells readers to ignore.
-        let minor_defines_model = health
-            .contract
-            .as_str()
-            .and_then(contract_version)
-            .is_some_and(|(_, minor)| minor >= 1);
+        let minor_defines_model = health.minor().is_some_and(|minor| minor >= 1);
         let mut ids = BTreeSet::new();
         for (at, figure) in self.items(&route, &body, "", "figures") {
             let id = self
@@ -1377,11 +1415,8 @@ impl Checker<'_> {
             let kind = self.req_one_of(&route, figure, &at, "kind", KINDS);
             self.req(&route, figure, &at, "label", Kind::Str);
             let chain = self.chain(&route, figure, &at, kind.as_deref());
-            // The contract types `model` as a string, never null, so `opt`'s
-            // null-as-absent reading does not apply.
             if minor_defines_model
-                && figure.get("model").is_some()
-                && let Some(model) = self.req(&route, figure, &at, "model", Kind::Str)
+                && let Some(model) = self.present(&route, figure, &at, "model", Kind::Str)
             {
                 self.report.checks += 1;
                 if model.as_str().is_some_and(str::is_empty) {
@@ -2263,6 +2298,106 @@ impl Checker<'_> {
         } else {
             let answer = self.admin_call(&route, Method::Get, "/events", None);
             self.control_error(&route, answer, 501, "unsupported", None);
+        }
+    }
+
+    /// The token route, on a proxy whose `/health` declares the minor that
+    /// adds it: with `token_stats` listed, a read without a cursor, one from
+    /// the cursor it served, and one from a cursor no proxy serves; without
+    /// it, the control route's 501.
+    fn tokens(&mut self, health: &Health, declared: &Declared) {
+        if !health.defines_tokens() {
+            return;
+        }
+        let route = format!("GET {CONTROL}/tokens");
+        if !declared.capabilities.iter().any(|c| c == "token_stats") {
+            let answer = self.admin_call(&route, Method::Get, "/tokens", None);
+            self.control_error(&route, answer, 501, "unsupported", None);
+            return;
+        }
+        if let Some(cursor) = self.token_read(&route, "/tokens", false) {
+            let since = crate::oauth_login::percent_encode(&cursor);
+            self.token_read(
+                &format!("{route}?since={{cursor}}"),
+                &format!("/tokens?since={since}"),
+                false,
+            );
+        }
+        self.token_read(
+            &format!("{route}?since={{unknown}}"),
+            &format!("/tokens?since={UNKNOWN_CURSOR}"),
+            true,
+        );
+    }
+
+    /// One token-records read: every record held to its fields, `dropped`
+    /// present only as `true` and only where the cursor was `unknown`, and the
+    /// cursor it serves, `None` when it served none.
+    fn token_read(&mut self, route: &str, path: &str, unknown: bool) -> Option<String> {
+        let answer = self.admin_call(route, Method::Get, path, None);
+        let body = self.expect_json(route, answer, 200)?;
+        for (at, record) in self.items(route, &body, "", "records") {
+            self.token_record(route, record, &at);
+        }
+        if unknown {
+            self.equals(route, body.get("dropped"), "dropped", &json!(true));
+        } else {
+            self.report.checks += 1;
+            if let Some(dropped) = body.get("dropped") {
+                self.violation(route, "dropped: absent".to_string(), repr(dropped));
+            }
+        }
+        let cursor = self.req(route, &body, "", "cursor", Kind::Str)?;
+        self.report.checks += 1;
+        match cursor.as_str() {
+            Some(cursor) if !cursor.is_empty() => Some(cursor.to_string()),
+            _ => {
+                self.violation(
+                    route,
+                    "cursor: a non-empty string".to_string(),
+                    repr(cursor),
+                );
+                None
+            }
+        }
+    }
+
+    fn token_record(&mut self, route: &str, record: &Value, at: &str) {
+        if let Some(id) = self.req(route, record, at, "id", Kind::Str) {
+            self.wire_string(route, id, &join(at, "id"));
+        }
+        self.req(route, record, at, "account", Kind::Id);
+        if let Some(model) = self.present(route, record, at, "model", Kind::Str) {
+            self.wire_string(route, model, &join(at, "model"));
+        }
+        if let Some(output) = self.req(route, record, at, "output_tokens", Kind::Int) {
+            self.non_negative(route, output, &join(at, "output_tokens"));
+        }
+        self.req(route, record, at, "started_at", Kind::Time);
+        self.req(route, record, at, "ended_at", Kind::Time);
+        if let Some(ttft) = self.present(route, record, at, "ttft_ms", Kind::Int) {
+            self.non_negative(route, ttft, &join(at, "ttft_ms"));
+        }
+    }
+
+    /// A string the core copies from the response the client saw: 1 to
+    /// [`WIRE_STRING_MAX`] UTF-16 units, as the core measures it.
+    fn wire_string(&mut self, route: &str, v: &Value, at: &str) {
+        self.report.checks += 1;
+        let units = v.as_str().map_or(0, |s| s.encode_utf16().count());
+        if !(1..=WIRE_STRING_MAX).contains(&units) {
+            self.violation(
+                route,
+                format!("{at}: a string of 1 to {WIRE_STRING_MAX} UTF-16 units"),
+                repr(v),
+            );
+        }
+    }
+
+    fn non_negative(&mut self, route: &str, v: &Value, at: &str) {
+        self.report.checks += 1;
+        if v.as_u64().is_none() {
+            self.violation(route, format!("{at}: an integer >= 0"), repr(v));
         }
     }
 

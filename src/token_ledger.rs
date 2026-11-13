@@ -322,12 +322,19 @@ impl Ledger {
     }
 
     /// Record every finalized day the merged `base` carries a split for, then
-    /// advance `recorded_through` to yesterday. A finalized day is any day after
-    /// the current watermark and strictly before `today`; the sweep always covers
-    /// up to now, so once merged, every day through yesterday is complete. The
-    /// watermark is monotonic, so a day is recorded exactly once. Returns whether
-    /// anything changed (worth a `save`).
-    pub(crate) fn record(&mut self, base: &TokenStats, today: &str) -> bool {
+    /// advance `recorded_through` to yesterday **when the sweep covered every
+    /// day up to it** (`sweep_covers_all_days`). A finalized day is any day
+    /// after the current watermark and strictly before `today`; the watermark
+    /// only moves over days a sweep actually covered — a skipped sweep leaves
+    /// it alone, so a later launch cannot mistake the unswept history for
+    /// counted days. The watermark is monotonic, so a day is recorded exactly
+    /// once. Returns whether anything changed (worth a `save`).
+    pub(crate) fn record_covering(
+        &mut self,
+        base: &TokenStats,
+        today: &str,
+        sweep_covers_all_days: bool,
+    ) -> bool {
         let floor = self.recorded_through.clone().unwrap_or_default();
         let mut changed = false;
 
@@ -354,9 +361,11 @@ impl Ledger {
             changed = true;
         }
 
-        // Everything through yesterday is now final: advance the watermark even
+        // Everything through yesterday is final: advance the watermark even
         // across idle (no-usage) days, which are legitimately absent from `days`.
-        if let Some(yesterday) = prev_day(today)
+        // Only a sweep that covered those days may move it.
+        if sweep_covers_all_days
+            && let Some(yesterday) = prev_day(today)
             && self
                 .recorded_through
                 .as_deref()

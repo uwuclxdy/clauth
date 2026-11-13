@@ -902,6 +902,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail,
+                last_fetch_failed: false,
             },
         )])
     };
@@ -985,6 +986,7 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1027,6 +1029,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     );
 
@@ -1038,6 +1041,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -1120,6 +1124,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1162,6 +1167,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
         super::StreakCounts {
             rate_limit: 5,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1211,6 +1217,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1236,6 +1243,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 2,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1266,6 +1274,7 @@ fn partition_due_clamp_leaves_third_party_untouched() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1679,42 +1688,46 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
 /// The two streak axes must move independently, because every other reader
 /// means only one of them: `rate_limit` feeds `is_stuck_rate_limited`, the
 /// auto-switch freshness bypass and `status.json`'s `stale` — none of which a
-/// refresh failure may ever claim. A live body clears both.
+/// refresh failure may ever claim. The `last_fetch_failed` mark is not an axis:
+/// a failed attempt sets it without touching either ladder, a no-op outcome
+/// holds it, and a live body clears all of it.
 #[test]
 fn streak_axes_move_independently_and_a_live_body_clears_both() {
     use super::FetchStatus;
 
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let update = |status: FetchStatus, refresh_failed: bool| {
+    let update = |status: FetchStatus, refresh_failed: bool, fetch_failed: bool| {
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("a"),
             status,
             refresh_failed,
+            fetch_failed,
         )
     };
 
     // A transient refresh failure bails to `Cached` — it must NOT touch the 429
     // axis, or a client-side bug would report a stuck throttle and let the
     // auto-switch rotate the chain away on it.
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 1));
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 2));
 
     // A 429 bumps only its own axis and leaves the refresh count standing.
-    let counts = update(FetchStatus::RateLimited, false);
+    let counts = update(FetchStatus::RateLimited, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
 
     // A status that says nothing about either axis holds both — and must not
     // conjure an entry for a profile that has none.
-    let counts = update(FetchStatus::Failed, false);
+    let counts = update(FetchStatus::Failed, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
     assert_eq!(
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("never-seen"),
             FetchStatus::Failed,
+            false,
             false
         ),
         super::StreakCounts::default(),
@@ -1727,9 +1740,481 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
     // A live body clears both: whatever went wrong, the profile is serving. This
     // is also the preemptive-rotation case — a refresh can fail while the still
     // valid access token fetches fine, and nothing is degraded yet.
-    let counts = update(FetchStatus::Fresh, true);
+    let counts = update(FetchStatus::Fresh, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 0));
     assert!(!streaks.lock().unwrap().contains_key("a"));
+
+    // A failed fetch attempt sets the mark without touching either ladder
+    // axis, and a later no-op outcome (a seeded reading) holds it until a
+    // live body clears it.
+    let counts = update(FetchStatus::Cached, false, true);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, true),
+        "a failed attempt sets the mark and bumps neither axis"
+    );
+    let counts = update(FetchStatus::Failed, false, false);
+    assert!(
+        counts.last_fetch_failed,
+        "a no-op outcome holds the mark, never clears it"
+    );
+    let counts = update(FetchStatus::Fresh, false, false);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, false),
+        "a live body clears the mark with the entry"
+    );
+}
+
+/// A `/usage` fetch that errors lands the per-account failure mark: the
+/// fail-serving outcome carries it to `update_streaks`, which sets it without
+/// bumping either ladder axis. A live body clears it with the entry.
+#[test]
+fn a_failed_fetch_lands_a_per_account_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-fetch-fail";
+    let (base, server) = crate::testutil::serve_endpoints(1, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the failed fetch must attempt /usage: {seen:?}"
+    );
+    assert_eq!(
+        outcome.status,
+        super::FetchStatus::Cached,
+        "a failed fetch with a cache on disk serves Cached"
+    );
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("a failed fetch lands a per-account failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "the mark is the last-fetch-failed signal, never a ladder axis: {mark:?}"
+    );
+    assert_eq!(
+        (mark.rate_limit, mark.refresh_fail),
+        (0, 0),
+        "a plain failed fetch bumps neither ladder axis: {mark:?}"
+    );
+
+    // The account's next live read clears the mark with the rest of the entry.
+    land_outcome_onto(
+        &store,
+        fresh_outcome(name, crate::usage::UsageInfo::default()),
+        &streaks,
+    );
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "a live body clears the failure mark"
+    );
+}
+
+/// The reactive rotation bail: a 401 sends the plain fetch into the rotation
+/// leg, and an entry holding no refresh token has nothing to spend there, so
+/// the refusal is the tick's only request. The failed attempt lands the mark.
+#[test]
+fn a_reactive_rotation_bail_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-bail-mark";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        refresh_token: None,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 must come from the plain fetch: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "no refresh token, so the leg must spend nothing: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive bail lands the failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive rotation bail is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive arm's plain-fetch failure: an account inside the rotation
+/// lead runs the plain usage poll instead of spending the chain (a standing
+/// quarantine refuses the refresh), and that poll's error is a failed attempt.
+#[test]
+fn a_proactive_plain_fetch_error_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-plain-fail";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window (floor 15 min), so the leg takes the
+        // proactive arm: no plain fetch runs before the rotation leg.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        auth_broken: true,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the proactive arm's live poll must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the quarantined refresh must not be spent: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive plain fetch's error lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a proactive plain-fetch error is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive rotation's retry dying: inside the lead window the leg spends
+/// the rotation first and only then polls, so the retry's error is a failed
+/// attempt of a tick that sent the rotation. The mark lands with the pair.
+#[test]
+fn a_proactive_rotation_whose_retry_fails_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-retry-fail";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the proactive arm must spend the rotation first: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the rotated token's retry must still run: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the minted pair survives a failed retry"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive rotation's failed retry lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a failed retry after a sent rotation is a failed attempt: {mark:?}"
+    );
+}
+
+/// Every probe answer that served no usage body marks the account (a failed
+/// request, a 429, a rejected token), while the organization refusal — a live
+/// verdict whose plan the row shows — leaves the mark alone.
+#[test]
+fn a_failed_probe_lands_the_failure_mark_and_an_org_refusal_does_not() {
+    use super::{UsageStore, probe_outcome};
+    use crate::usage::inference::anthropic::ProbeAnswer;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed-failed-mark");
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    for (answer, label) in [
+        (ProbeAnswer::Failed, "a failed probe"),
+        (
+            ProbeAnswer::RateLimited { retry_after: None },
+            "a rate-limited probe",
+        ),
+        (ProbeAnswer::Rejected, "a rejected probe"),
+    ] {
+        let streaks = land_outcome_with_streaks(&store, probe_outcome(&name, answer));
+        let mark = streaks
+            .lock()
+            .unwrap()
+            .get(name.as_str())
+            .copied()
+            .unwrap_or_else(|| panic!("{label} lands a streak entry"));
+        assert!(
+            mark.last_fetch_failed,
+            "{label} served no usage body, so it is a failed attempt: {mark:?}"
+        );
+    }
+
+    let refused = land_outcome_with_streaks(
+        &store,
+        probe_outcome(&name, ProbeAnswer::OrgRefused { canceled: false }),
+    );
+    assert!(
+        !refused.lock().unwrap().contains_key(name.as_str()),
+        "an org refusal is a live verdict, never a failed attempt"
+    );
+}
+
+/// The failed-fetch mark records this instance's own attempt. Once the
+/// instance stands down it sends nothing, and the instance that fetches may
+/// have served the account since, so a stand-down tick drops the mark: a
+/// skipped spent account the hydrate seeds `Cached` then reads `[ spent ]`, not
+/// a failure that is no longer the last attempt.
+#[test]
+fn a_stand_down_tick_drops_the_instances_own_failed_fetch_mark() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["kitty"]);
+    // The fetching instance's last live body: the week spent, dated two
+    // intervals back, so the hydrate seeds `Cached`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 2 * REFRESH_INTERVAL_MS),
+            ..UsageInfo::default()
+        },
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+    // This instance's own failed attempt, landed while it held the lease.
+    let mut failed = cached_outcome("kitty");
+    failed.fetch_failed = true;
+    super::apply_outcome_to(&state, failed);
+    assert!(
+        state
+            .poll_streaks
+            .lock()
+            .unwrap()
+            .get("kitty")
+            .is_some_and(|c| c.last_fetch_failed),
+        "the landing set the mark"
+    );
+    // A second account carrying a refresh streak beside its mark: the tick
+    // drops the mark only, never the counts the mirror's cadence reads.
+    state.poll_streaks.lock().unwrap().insert(
+        "tabby".to_string(),
+        super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: true,
+        },
+    );
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let status = state.status.lock().unwrap().get("kitty").copied();
+    let mark = state.poll_streaks.lock().unwrap().get("kitty").copied();
+    let next = state
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .get(&oauth_key("kitty"))
+        .copied();
+    assert_eq!(
+        status,
+        Some(super::FetchStatus::Cached),
+        "the hydrate seeds Cached"
+    );
+    assert_eq!(next, None, "the spent skip blanks the countdown");
+    assert!(
+        !mark.is_some_and(|c| c.last_fetch_failed),
+        "a stood-down instance holds no failed-fetch mark of its own: {mark:?}"
+    );
+    assert_eq!(
+        state.poll_streaks.lock().unwrap().get("tabby").copied(),
+        Some(super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: false,
+        }),
+        "a stand-down tick keeps every count and drops only the mark"
+    );
 }
 
 /// Forced (manual `r`) refetches skip a mid-switch profile for the same
@@ -1810,6 +2295,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -1999,6 +2485,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2041,6 +2528,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2390,6 +2878,7 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2601,17 +3090,38 @@ fn fresh_outcome(name: &str, info: crate::usage::UsageInfo) -> super::FetchOutco
 /// Land one outcome through the real landing (`apply_outcome`) with empty
 /// status/cadence stores, so a test reads only what the store then holds.
 fn land_outcome(store: &super::UsageStore, outcome: super::FetchOutcome) {
+    land_outcome_with_streaks(store, outcome);
+}
+
+/// [`land_outcome`] handing back the per-profile streak map the landing wrote,
+/// for a test that reads the failed-fetch mark.
+fn land_outcome_with_streaks(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+) -> super::PollStreaks {
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    land_outcome_onto(store, outcome, &streaks);
+    streaks
+}
+
+/// [`land_outcome_with_streaks`] landing into a caller-held streak map, so a
+/// test can land a second outcome over the first and read what the map then
+/// holds.
+fn land_outcome_onto(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+    streaks: &super::PollStreaks,
+) {
     use super::{StatusStore, apply_outcome};
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
     apply_outcome(
         outcome,
         store,
         &status,
         &last_fetched,
-        &streaks,
+        streaks,
         REFRESH_INTERVAL_MS,
         false,
         false,
@@ -2999,6 +3509,7 @@ fn reading_dead_names_never_flags_a_plan_with_no_five_hour_limit() {
         StreakCounts {
             rate_limit: ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -3283,6 +3794,7 @@ fn midstorm_kick_fires_for_a_member_hosting_a_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     // The persistent-429 shape: a plan-only, windowless store entry.
@@ -3324,6 +3836,7 @@ fn midstorm_kick_stays_gated_for_a_member_hosting_no_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3363,6 +3876,7 @@ fn midstorm_kick_keeps_the_block_ladder_for_a_hosting_member() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3424,6 +3938,7 @@ fn chain_session_hosts_reads_rows_the_decision_leg_would_move() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])))
     };
@@ -3601,6 +4116,7 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -3792,6 +4308,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         StreakCounts {
             rate_limit: 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
     let _ = super::run_fetch(
@@ -3996,6 +4513,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4067,6 +4585,7 @@ fn the_drain_arms_no_weekly_reset_mark_for_a_proxy_account() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4143,6 +4662,7 @@ fn the_drain_arms_no_weekly_reset_mark_for_a_record_the_memory_lags() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4232,6 +4752,7 @@ fn the_drain_arms_no_weekly_reset_mark_over_a_config_it_cannot_classify() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4931,6 +5452,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         let activity = crate::testutil::fresh_activity();
@@ -12375,6 +12897,7 @@ fn a_session_on_a_distrusted_member_gets_no_decision_unless_that_member_is_broke
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         scan_sessions_with_streaks(&config, &frozen_store(), &frozen_status(), &streaks);
@@ -13070,6 +13593,7 @@ fn retry_after_defers_next_fetch_slot() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -13241,6 +13765,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         name: crate::profile::ProfileName::from("a"),
@@ -13358,6 +13883,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
@@ -13428,6 +13954,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -13884,7 +14411,8 @@ fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
 
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
-/// map (the steady state for healthy profiles) is a no-op fast path.
+/// map (the steady state for healthy profiles) is a no-op fast path. The
+/// dropped entries' leg keys come back for the blanked-countdown publish.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
     let suppressed_auth_expired: SuppressedAuthExpiredStore =
@@ -13896,14 +14424,21 @@ fn filter_suppressed_drops_only_named_entries() {
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed_auth_expired, snap);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
+    assert_eq!(
+        blanked,
+        HashSet::from([tp_key("no-data")]),
+        "the dropped entry's third-party leg key is the blanked publish's input",
+    );
 
-    // Empty map → identity (the fast path).
+    // Empty map → identity (the fast path), nothing blanked.
     let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
-    assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+    let (out, blanked) = filter_suppressed(&empty, snap2);
+    assert_eq!(out.len(), 2);
+    assert!(blanked.is_empty());
 }
 
 /// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
@@ -13922,15 +14457,23 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
+    assert!(
+        filter_suppressed(&suppressed_auth_expired, vec![expired])
+            .0
+            .is_empty()
+    );
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
         "a re-login must re-admit the profile without a restart or a timer",
+    );
+    assert!(
+        blanked.is_empty(),
+        "a re-admitted credential blanks nothing",
     );
 }
 
@@ -13948,7 +14491,9 @@ fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
     assert_eq!(
-        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        filter_suppressed(&suppressed_auth_expired, vec![rotated])
+            .0
+            .len(),
         1
     );
 }
@@ -15573,6 +16118,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         ],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -15649,6 +16196,8 @@ fn standdown_hydrate_removes_a_cacheless_third_party_name() {
         &[],
         &["tp-cacheless".to_string()],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -15691,6 +16240,8 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
             &tp_status,
             &last_fetched,
             seed_names,
+            &[],
+            &[],
             &[],
             &[],
             REFRESH_INTERVAL_MS,
@@ -15766,6 +16317,8 @@ fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
         &tp_status,
         &last_fetched,
         &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
+        &[],
+        &[],
         &[],
         &[],
         REFRESH_INTERVAL_MS,
@@ -15963,6 +16516,533 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
+}
+
+/// A stood-down mirror's only channel for the fetching instance's third-party
+/// verdict is the durable record a refused endpoint credential leaves: the
+/// cache seed derives `Fresh`/`Cached` off the cache clock and this instance
+/// runs no fetch, so nothing else publishes `AuthExpired`. The tick seeds the
+/// verdict from the record, and the Overview row reads it off the app's own
+/// snapshot — the suppressed account's timer cell is blank, as the holder's
+/// is. A cleared record (the holder re-keyed or re-logged the account) drops
+/// the seed at the next tick and the row returns to its derived overdue age.
+#[test]
+fn a_stood_down_mirror_blanks_a_suppressed_endpoint_row_from_its_durable_record() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    // A disabled endpoint of the same credential shape: the seed's scope is
+    // the work list, which never holds a disabled account.
+    let off_name = "off";
+    let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from(off_name));
+    off.base_url = Some("https://disabled.example.com".to_string());
+    off.api_key = Some("off-key".to_string());
+    off.disabled = true;
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::profile::save_profile(&off).expect("save the disabled profile");
+    crate::testutil::register_names(&[name, off_name]);
+    // The holder's last reading, dated far past its refresh so the derived
+    // deadline sits far past the grace and its age form is deterministic.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), off.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The durable verdict, through its own writer.
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(name),
+            fingerprint,
+        ),
+        "the durable record landed"
+    );
+    // The same durable verdict for the disabled endpoint: the record lands,
+    // and only the work-list scope keeps it from seeding a status.
+    let off_fingerprint = crate::usage::profile_credential_fingerprint(&off)
+        .expect("a disabled endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(
+        &crate::profile::ProfileName::from(off_name),
+        off_fingerprint,
+    );
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(off_name),
+            off_fingerprint,
+        ),
+        "the disabled endpoint's durable record landed"
+    );
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::AuthExpired),
+        "the durable verdict reaches the snapshot the Overview renders from"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        !row.split_whitespace().any(|w| w.starts_with('+')),
+        "the suppressed row's timer cell is blank, never an overdue age:\n{row}"
+    );
+    assert_eq!(
+        readings.status_of(off_name),
+        None,
+        "the seed is scoped to the work list: a disabled endpoint's record seeds nothing"
+    );
+    assert!(
+        !app.third_party_status
+            .lock()
+            .unwrap()
+            .contains_key(off_name),
+        "the disabled endpoint's store entry stays unseeded"
+    );
+
+    // The holder re-keyed the account: the record clears, and the next
+    // stand-down tick drops the seed — the row returns to its derived form.
+    crate::profile_cache::clear_auth_expired(&crate::profile::ProfileName::from(name));
+    super::tick(&state);
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::Cached),
+        "a cleared record reverts the seed to the cache-derived status"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        row.split_whitespace().any(|w| w == "+4m"),
+        "the row returns to its derived overdue age:\n{row}"
+    );
+}
+
+/// A stood-down daemon has no display surface, so its feed reads the same
+/// third-party store a TUI mirror does: the tick seeds the durable verdict
+/// there, and `status.json` publishes `AuthExpired` for the suppressed account
+/// rather than the `Cached` the hydrate derived from the cache clock.
+#[test]
+fn a_stood_down_daemon_publishes_the_durable_auth_expired_verdict() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    // A warm cache older than the interval: the hydrate derives `Cached` from
+    // it, and that live entry outranks the durable record in the feed, so only
+    // the seed turns the published verdict into `AuthExpired`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+
+    // The daemon shape: no display reader, and a competing instance holds the
+    // lease, so the public `tick` routes to the stand-down pass.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    assert_eq!(
+        published_fetch_status(&app, name),
+        Some("AuthExpired".to_string()),
+        "a stood-down daemon's feed publishes the durable verdict, not the hydrated cache's form"
+    );
+}
+
+/// A reader sampling the status stores (and the published feed) across many
+/// stand-down ticks never observes a refused name as anything but
+/// `AuthExpired`: the cache-derived hydrate write and the durable-verdict
+/// seed land in one pass, so a frame or a `status.json` write landing
+/// between them cannot show the dead account as fresh or cached.
+#[test]
+fn no_reader_observes_a_refused_name_as_fresh_or_cached_across_standdown_ticks() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // The refused endpoint: a warm cache dated far past its refresh, so the
+    // hydrate derives a status for it each tick.
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    write_profile_cache(
+        &ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(name), THIRD_PARTY_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(name), fingerprint),
+        "the durable record landed"
+    );
+
+    // The refused setup token, the probe seed's own shape, with a usage
+    // cache dated far past its refresh so the OAuth hydrate derives a
+    // status for it too.
+    let probe_name = "probed";
+    let mut probe = crate::testutil::blank_profile(&ProfileName::from(probe_name));
+    probe.usage_probe = true;
+    probe.has_long_lived_sidecar = true;
+    probe.setup_token_digest =
+        crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    crate::profile::save_profile(&probe).expect("save the probed profile");
+    crate::testutil::register_names(&[probe_name]);
+    write_profile_cache(
+        &ProfileName::from(probe_name),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    let probe_cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(probe_name), USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &probe_cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let probe_fp = probe.setup_token_digest.expect("a digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(probe_name), probe_fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(probe_name), probe_fp),
+        "the probe verdict landed"
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), probe.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let iterations = Arc::new(AtomicU64::new(0));
+    let verdict_seen = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // The reader signals one full sampling pass before the ticks and the first
+    // verdict sighting before the window closes: the bounded-work pin below
+    // then holds by construction, never by a scheduling race.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (sampled_tx, sampled_rx) = std::sync::mpsc::channel::<()>();
+    let tp_status = Arc::clone(&app.third_party_status);
+    let oauth_status = Arc::clone(&app.usage_status);
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let config = app.config().clone();
+    let reader = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let iterations = Arc::clone(&iterations);
+        let verdict_seen = Arc::clone(&verdict_seen);
+        let violations = Arc::clone(&violations);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let first_pass = iterations.fetch_add(1, Ordering::Relaxed) == 0;
+                if let Ok(st) = tp_status.lock()
+                    && let Some(seen) = st.get(name).copied()
+                {
+                    if seen == super::FetchStatus::AuthExpired {
+                        if verdict_seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let _ = sampled_tx.send(());
+                        }
+                    } else {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("third-party store: {seen:?}"));
+                    }
+                }
+                if let Ok(st) = oauth_status.lock()
+                    && let Some(seen) = st.get(probe_name).copied()
+                    && seen != super::FetchStatus::AuthExpired
+                {
+                    violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("oauth store: {seen:?}"));
+                }
+                if iterations.load(Ordering::Relaxed).is_multiple_of(16) {
+                    let snapshot = live.snapshot();
+                    let signals = snapshot.signals();
+                    let body = crate::daemon::build_status(
+                        &config,
+                        REFRESH_INTERVAL_MS,
+                        Some(&signals),
+                        false,
+                    );
+                    if let Some(entry) = body.profiles.iter().find(|e| e.name.as_str() == name)
+                        && entry.fetch_status.as_deref() != Some("AuthExpired")
+                    {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("published feed: {:?}", entry.fetch_status));
+                    }
+                }
+                if first_pass {
+                    let _ = started_tx.send(());
+                }
+            }
+        }
+    });
+
+    // The reader proves it sampled before the window opens and that it saw the
+    // verdict before the window closes: both pins below hold by construction
+    // under any scheduling, and a starved reader fails the handshake instead of
+    // this test's own invariant. The reader is stopped and joined on the
+    // failure path too, so a red never leaves it spinning past the test.
+    let wait = std::time::Duration::from_secs(30);
+    let started = started_rx.recv_timeout(wait);
+    if started.is_ok() {
+        for _ in 0..60 {
+            super::tick(&state);
+        }
+    }
+    let sampled = started.is_ok().then(|| sampled_rx.recv_timeout(wait));
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("the reader joins");
+    started.expect("the reader thread sampled the stores before the ticks");
+    sampled
+        .expect("the tick window ran")
+        .expect("the reader saw the refused verdict before the stop");
+    assert!(
+        iterations.load(Ordering::Relaxed) > 0 && verdict_seen.load(Ordering::Relaxed) > 0,
+        "the reader sampled the refused name as AuthExpired across the ticks"
+    );
+    let violations = violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "a refused name never reads as anything but AuthExpired during a tick: {violations:?}"
+    );
+}
+
+/// `name`'s published `fetch_status`, built the way the daemon's own tick
+/// builds it: the live stores' snapshot, then `status.json`'s body.
+fn published_fetch_status(app: &crate::tui::App, name: &str) -> Option<String> {
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let snapshot = live.snapshot();
+    let signals = snapshot.signals();
+    let config = app.config().clone();
+    crate::daemon::build_status(&config, REFRESH_INTERVAL_MS, Some(&signals), false)
+        .profiles
+        .into_iter()
+        .find(|entry| entry.name.as_str() == name)
+        .expect("the profile is published in the feed")
+        .fetch_status
+}
+
+/// The Overview row holding `needle`, as the full frame draws it off the
+/// app's own snapshot.
+fn row_of(app: &crate::tui::App, needle: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("a test terminal");
+    term.draw(|f| crate::tui::draw(f, app))
+        .expect("draw the frame");
+    let buf = term.backend().buffer().clone();
+    crate::testutil::buffer_rows(&buf)
+        .into_iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row holds {needle:?}:\n{}",
+                crate::testutil::buffer_rows(&buf).join("\n")
+            )
+        })
 }
 
 /// A stood-down TUI hydrates the third-party display superset off the daemon's
@@ -17114,6 +18194,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
     let at_five = super::StreakCounts {
         rate_limit: 5,
         refresh_fail: 0,
+        last_fetch_failed: false,
     };
     streaks.lock().unwrap().insert("act".to_string(), at_five);
     streaks.lock().unwrap().insert("idle".to_string(), at_five);
@@ -17126,6 +18207,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -17250,6 +18332,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -18068,9 +19151,10 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
 }
 
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
-/// inside the spawned tick worker: nothing joins that worker, so a home-
-/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
-/// the operator's real home — live the moment the seed grows a write leg.
+/// inside the spawned tick worker: only a clean stop waits for that thread,
+/// up to its bound, so a home-derived path resolved on it could outlive a
+/// test's `HOME_OVERRIDE` and read the operator's real home — live the moment
+/// the seed grows a write leg.
 /// Entering through
 /// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
 /// the only way to pin WHERE the seed runs; asserting immediately after return,
@@ -20904,6 +21988,20 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
         vec![&name.to_string()],
         "this tick serves cache; the next one polls with the adopted token"
     );
+    // The 401 that drove the adopt was this tick's own request, so the
+    // fail-serving outcome lands the mark with the adopted pair.
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive adopt's tick sent the 401, so it lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive adopt still followed a failed fetch: {mark:?}"
+    );
 }
 
 /// The retry adopt, after the refresh comes back terminally rejected. The
@@ -20975,6 +22073,259 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
     assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// A proactive adopt that sends nothing is no failed attempt: the rotation lead
+/// only queues the adopt, and once the mirror token's identity is memoized the
+/// adopt sends no request at all, so the tick's outcome carries no failure
+/// mark.
+#[test]
+fn a_proactive_adopt_that_sends_nothing_lands_no_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-proactive-mute";
+    // The other replies only make a request the leg must not send visible to
+    // the assertion below.
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/api/oauth/profile") {
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (200, r#"{"object":"list","data":[]}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window: the leg takes the proactive arm, where no
+        // usage fetch runs before the adopt.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror("at-mirror-mute", crate::usage::now_ms() as i64 + 90_000_000);
+    let identity =
+        super::memoized_identity(&|_| Some(crate::profile::AccountId::from("uuid-anchor")));
+    assert_eq!(
+        identity("at-mirror-mute").as_deref(),
+        Some("uuid-anchor"),
+        "fixture control: the mirror token's identity is memoized without HTTP"
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "an adopt that sends nothing must make no request: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-mirror-mute".to_string(),
+            Some("at-mirror-mute-refresh".to_string())
+        )),
+        "the proactive adopt must carry the mirror's pair"
+    );
+    assert!(!outcome.from_fetch);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "an adopt that sent nothing lands no failure mark"
+    );
+}
+
+/// A stored pair the adopt-race install fixture moves in under the identity
+/// probe: its own refresh token, so the store differs from the adopt's
+/// pre-probe snapshot — the store-moved stand-down's input.
+fn adopt_race_store(access: &str, expires_at: i64) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: Some(expires_at),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// A peer's install landing inside the adopt's identity probe. The adopt must
+/// write nothing (the store moved under it), and the caller's carry leg hands
+/// the installed pair back with no token request — the tick spends no refresh
+/// token on a chain another writer just advanced. Deleting the adopt's
+/// store-moved stand-down makes it overwrite the install and this test reds.
+#[test]
+fn an_install_landing_inside_the_adopts_identity_probe_is_carried_with_no_token_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-install-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    let installed_expiry = crate::usage::now_ms() as i64 + 95_000_000;
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // install lands as it is served) → anything else would be the token request
+    // this tick must never make.
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::write(
+                &store_for_server,
+                serde_json::to_vec(&adopt_race_store("at-installed", installed_expiry))
+                    .expect("serialize the install"),
+            )
+            .expect("land the install");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-probe",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the install the adopt stood down for is carried, never spent against: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-installed".to_string(),
+            Some("at-installed-refresh".to_string())
+        )),
+        "the peer's install must reach the TokenList, or the next poll spends the superseded token"
+    );
+    let on_disk: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        on_disk.refresh_token(),
+        Some("at-installed-refresh"),
+        "the adopt overwrote the peer's install"
+    );
+    assert_eq!(
+        refetch.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec![&name.to_string()],
+        "the next tick polls with the carried pair"
+    );
+}
+
+/// A peer's log-out landing inside the adopt's identity probe. The deleted
+/// store stays deleted (the adopt writes nothing into it), and the leg spends
+/// the dead chain once and quarantines the profile until a new login. Deleting
+/// the adopt's store-moved stand-down makes it resurrect the store and this
+/// test reds.
+#[test]
+fn a_peer_log_out_inside_the_adopts_identity_probe_leaves_the_store_deleted() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-logout-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // log-out deletes the store as it is served) → the spent chain's terminal
+    // 400.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::remove_file(&store_for_server).expect("log the account out");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-logout",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    let token_requests = seen
+        .iter()
+        .filter(|p| p.starts_with("/v1/oauth/token"))
+        .count();
+    assert_eq!(
+        token_requests, 1,
+        "the logged-out chain is spent once, then quarantined: {seen:?}"
+    );
+    assert!(
+        !store.exists(),
+        "the adopt recreated a store a peer logged out"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "a terminally rejected chain quarantines the profile until a new login"
+    );
+    assert_eq!(outcome.rotated, None, "nothing was adopted");
 }
 
 /// CLA-ROLL: a rolling-token profile forces the preemptive leg regardless of the global
@@ -23678,6 +25029,7 @@ fn issue83_inputs(
         super::StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     (store, status, streaks)
@@ -24410,6 +25762,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
         super::StreakCounts {
             rate_limit: super::ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
@@ -31306,6 +32659,265 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
     );
 }
 
+/// The spent skip publishes the deliberate-blank fact beside the blanked
+/// countdown: the leg's activity state carries the flag the renderer reads,
+/// so a past-due reading clock never dates the absent deadline as overdue.
+#[test]
+fn a_spent_skipped_leg_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the spent skip publishes the OAuth leg's blanked flag",
+    );
+}
+
+/// A session-suppressed credential publishes the same blanked flag: the tick
+/// drops the suppressed entry from its work list (no fetch, no countdown) and
+/// flags the leg, so the renderer keeps the row's slot blank.
+#[test]
+fn a_suppressed_credential_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    let fingerprint = state
+        .config
+        .lock()
+        .unwrap()
+        .profiles
+        .first()
+        .and_then(|p| p.setup_token_digest)
+        .expect("the fixture mints a setup token");
+    state
+        .suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the suppressed probe's OAuth leg is flagged blanked",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "the suppressed entry publishes no countdown",
+    );
+}
+
+/// A spent OAuth account that also carries a third-party credential keeps its
+/// third-party countdown: the skip blanks the OAuth leg alone, so a hybrid
+/// row whose figures the third-party cache supplies keeps counting down.
+#[test]
+fn a_spent_hybrid_keeps_its_third_party_countdown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut state = spent_probe_state(false);
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![tp_entry("spent")]));
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("spent"),
+        FetchStamp::at(EpochMs::from_millis(crate::usage::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        next.contains_key(&tp_key("spent")),
+        "the third-party leg's countdown survives the OAuth skip",
+    );
+    assert!(
+        !next.contains_key(&oauth_key("spent")),
+        "the OAuth leg's countdown is blanked",
+    );
+    drop(next);
+    let activity = state.activity.lock().unwrap();
+    assert!(super::countdown_blanked(&activity, &oauth_key("spent")));
+    assert!(
+        !super::countdown_blanked(&activity, &tp_key("spent")),
+        "the third-party leg is not blanked",
+    );
+}
+
+/// The stood-down mirror's spent skip publishes the same blanked flag, so a
+/// stood-down TUI shows a spent row blank exactly as the armed one does, and
+/// nothing else is flagged (the mirror runs no worker, so no leg is late).
+#[test]
+fn a_stood_down_spent_row_publishes_its_blanked_countdown_flag() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    // The hydration seeds the store from the disk cache, so the spent reading
+    // must live there — a store-seeded entry with no cache file is dropped as
+    // stale by the same pass.
+    crate::testutil::register_names(&["kitty"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent_reading(),
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    config.lock().unwrap().state.refresh_spent_accounts = false;
+    let state = chain_state(&config, vec![token("kitty")]);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("kitty")),
+        "the mirror's spent skip publishes the OAuth leg's blanked flag",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("kitty")),
+        "the mirror blanks the spent countdown",
+    );
+}
+
+/// One DeepSeek provider profile, `keyless`, holding no api key: its
+/// selected leg is the third-party one and no work list carries it.
+fn keyless_provider_config() -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState};
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyless"));
+    profile.provider = Some(crate::providers::Provider::DeepSeek);
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            profiles: vec![crate::profile::ProfileName::from("keyless")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    }))
+}
+
+/// A keyless provider profile still displays its cached figures (the
+/// third-party display seed) while nothing polls its selected leg: the tick
+/// publishes the deliberate blank for that leg, so the renderer never dates
+/// the fossil cache as a late worker's overdue refresh.
+#[test]
+fn a_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the unpolled selected leg's blanked flag is published",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("keyless")),
+        "nothing polls the leg, so no countdown",
+    );
+}
+
+/// A leg blanked as unpolled while the account had no key stops reading blank
+/// once the key is back and the account joins the third-party work list: the
+/// publish clears the flag in the same pass, so a worker left running on that
+/// leg later is still dated overdue.
+#[test]
+fn a_keyless_leg_that_gains_its_key_drops_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "control: the keyless selected leg is blanked",
+    );
+    // The key comes back: the account joins the work list, and a fresh stamp
+    // keeps the leg off this tick's fetch.
+    state.config.lock().unwrap().profiles[0].api_key = Some("sk-keyless".to_string());
+    let entries = super::collect_third_party_entries(&state.config.lock().unwrap().profiles);
+    *state.third_party_tokens.lock().unwrap() = entries;
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("keyless"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "the restored key takes the leg off the blank set",
+    );
+}
+
+/// The stood-down mirror publishes the same blank for a selected leg on no
+/// work list, so a stood-down TUI's row keeps the blank slot too.
+#[test]
+fn a_stood_down_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the mirror's publish blanks the unpolled selected leg",
+    );
+}
+
+/// An entry the blanked flag alone keeps alive is dropped in the same pass
+/// that clears it: an account blanked one tick and gone the next leaves no
+/// inert entry behind (the fetching tick has no general idle sweep).
+#[test]
+fn an_account_blanked_one_tick_and_removed_the_next_leaves_no_activity_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &oauth_key("spent")),
+        "control: the first tick blanked the spent probe",
+    );
+    // The profile is gone before the next tick: nothing re-raises its flag.
+    state.config.lock().unwrap().profiles.clear();
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !state.activity.lock().unwrap().contains_key("spent"),
+        "the cleared entry is dropped in the same publish pass",
+    );
+}
+
+/// A polled OAuth leg that is merely not due stays off the blank set: the
+/// blank's work list is the tick's whole snapshot, never the due subset, so
+/// an idle-but-pending leg keeps its published countdown.
+#[test]
+fn a_polled_not_due_oauth_leg_is_not_blanked_after_a_real_tick() {
+    use crate::profile::{AppConfig, AppState};
+    let home = crate::testutil::HomeSandbox::new();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("polled", false)],
+    }));
+    let state = chain_state(&config, vec![token("polled")]);
+    // Just-fetched: the leg falls due a whole interval out, so the armed tick
+    // fetches nothing and the blank decision reads a real, not-due member.
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key("polled"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    // The endpoint stub answers the claude-resets side read (the tick's one
+    // network leg, unrelated to the blank) and records any fetch leak.
+    probe_tick_expecting_none(&home, &state, 1);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        !super::countdown_blanked(&activity, &oauth_key("polled")),
+        "the not-due leg stays off the blank set",
+    );
+    assert!(
+        state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("polled")),
+        "its countdown publishes",
+    );
+}
+
 #[test]
 fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
     let home = crate::testutil::HomeSandbox::new();
@@ -31625,6 +33237,138 @@ fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
             "cached {cached}, recorded {recorded_token}"
         );
     }
+}
+
+/// A refused setup token whose cache holds a plan-only body (a login-plan seed)
+/// still reads as the refusal it is: the plan-only arm leaves the OAuth cadence
+/// unstamped, so the verdict rides its own status insert there.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_a_plan_only_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
+    );
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the plan-only arm carries the verdict with no cadence stamp"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "the plan-only body still fills the reading store"
+    );
+}
+
+/// A refused setup token whose usage cache will not parse keeps the verdict:
+/// the cache seed's no-body arm writes it in the same pass, where the name
+/// would otherwise carry no status at all.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no reading"
+    );
+}
+
+/// A stood-down scheduler state over one refused endpoint `name`: its work
+/// list holds the credential `tp_entry` builds, and the durable record keys
+/// that entry's fingerprint, so the tick's hydrate sees the name as refused.
+fn refused_endpoint_state(name: &str) -> super::SchedulerState {
+    crate::testutil::register_names(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let entry = tp_entry(name);
+    let fingerprint = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&pn, fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&pn, fingerprint),
+        "the durable refusal record landed"
+    );
+    let mut state = completion_order_state();
+    state.tokens = Arc::new(RankedMutex::new(Vec::new()));
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![entry]));
+    state
+}
+
+/// A refused endpoint whose third-party cache will not parse keeps the
+/// verdict: the third-party no-body arm writes it where the cache yields no
+/// copy to seed.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no copy"
+    );
+}
+
+/// A refused endpoint with no cache at all drops its stale reading and keeps
+/// the verdict: the cache-gone arm removes the store entries and writes
+/// `AuthExpired` where the removal alone would leave no status behind.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    state.third_party_usage_store.lock().unwrap().insert(
+        name.to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    state
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), super::FetchStatus::Cached);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the cache-gone arm keeps the verdict"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key(name),
+        "and drops the stale reading whose cache is gone"
+    );
 }
 
 /// A stood-down TUI beside the process that fetches usage, whose probe finds
@@ -34930,6 +36674,7 @@ fn land_five_hour(state: &super::SchedulerState, name: &str, util: f64, token: &
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -35251,6 +36996,7 @@ fn land_windows_resetting(
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -36441,6 +38187,7 @@ fn land_reading_after_a_reset_under(
         from_fetch: fresh,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -36619,6 +38366,86 @@ fn a_resets_read_under_a_spent_ticket_writes_no_limit_resets_file() {
         .expect("re-take the released lease");
     super::claude_resets_tick_flagged(&state, crate::usage::now_ms(), None, None, Some(ticket));
     assert!(file.exists(), "control: a current ticket writes the file");
+    let _ = server.join().expect("listener");
+}
+
+/// A refused side read whose tick lost the lease on the wire raises no line,
+/// since only the holder speaks, yet still stamps its retry on the ladder's
+/// first rung (90 s interval + 10 s). Control: the retry under a re-taken
+/// ticket says so, on the second rung.
+#[test]
+fn a_refused_resets_read_under_a_spent_ticket_stamps_its_retry_without_a_line() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = save_unanchored_login("lr-lease2", "lr-lease2-tok");
+    crate::testutil::register_names(&["lr-lease2"]);
+    let state = resets_state(vec![profile]);
+    let released = Arc::new(AtomicBool::new(false));
+    let lease = Arc::clone(&state.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, {
+        let released = Arc::clone(&released);
+        let lease = Arc::clone(&lease);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ && !released.swap(true, Ordering::SeqCst) {
+                assert!(
+                    lease.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+            }
+            resets_429(Some(0))
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let t = RESETS_T;
+    let named = |lines: &crate::logline::LogLines| -> Vec<String> {
+        lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains("'lr-lease2'"))
+            .collect()
+    };
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        Vec::<String>::new(),
+        "a tick that lost the lease says nothing"
+    );
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert_eq!(memo.last_read_at.get("lr-lease2"), Some(&t));
+        assert_eq!(
+            memo.retry.get("lr-lease2"),
+            Some(&(t + 100_000, 1)),
+            "the refusal still stamps its retry on the first rung"
+        );
+    }
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t + 100_000, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        vec![refused_line("lr-lease2", 429, Some(0), 120)],
+        "control: the holder's retry says so, on the second rung"
+    );
     let _ = server.join().expect("listener");
 }
 
@@ -36954,6 +38781,549 @@ fn a_resets_read_that_cannot_start_dates_the_hour_with_one_line() {
 
     assert_resets_attempt_dated(&state, "lrs1", t, &lines, &stub);
     drop(endpoints);
+}
+
+// ── a failed side read says so once; a refusal retries on the poll's ladder ──
+
+/// One side-read reply: status, response headers, body.
+type ResetsReply = (u16, Vec<(String, String)>, String);
+
+/// The edge refusal's shape: a 429 carrying `retry-after` (seconds) when set.
+fn resets_429(retry_after: Option<u64>) -> ResetsReply {
+    let headers = retry_after
+        .map(|secs| vec![("retry-after".to_string(), secs.to_string())])
+        .unwrap_or_default();
+    (
+        429,
+        headers,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}"#
+            .to_string(),
+    )
+}
+
+/// What [`drive_resets_reads`] saw: per tick, the side reads sent so far and
+/// the lines naming the account that pass raised; then whether a reading
+/// landed.
+type ResetsRun = (Vec<(usize, Vec<String>)>, bool);
+
+/// Drives `name`'s side read at each instant of `ticks` (virtual epoch ms)
+/// against `base`, each pass under its own log capture.
+fn drive_resets_ticks(
+    home: &crate::testutil::HomeSandbox,
+    name: &str,
+    base: &str,
+    ticks: &[u64],
+    reads: impl Fn() -> usize,
+) -> ResetsRun {
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(home, base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for &at in ticks {
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads(), named));
+    }
+    let landed = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("path")
+    .exists();
+    drop(endpoints);
+    (seen, landed)
+}
+
+/// [`drive_resets_ticks`] against a stub answering the `i`-th side read with
+/// `reply(i)`. The stub's budget sits one above the reads the ticks can send,
+/// so a read past the expected ones is counted rather than refused.
+fn drive_resets_reads(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+) -> ResetsRun {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let run = drive_resets_ticks(&home, name, &base, ticks, || reads.load(Ordering::SeqCst));
+    let _ = server.join().expect("listener");
+    run
+}
+
+/// The line a side read refused on the poll's ladder raises.
+fn refused_line(name: &str, status: u16, retry_after: Option<u64>, next_secs: u64) -> String {
+    let hint = retry_after.map_or_else(
+        || "no Retry-After".to_string(),
+        |s| format!("Retry-After {s}s"),
+    );
+    format!(
+        "clauth: '{name}': the limit reset read got HTTP {status} ({hint}); next read in {next_secs}s"
+    )
+}
+
+const RESETS_T: u64 = 1_900_000_000_000;
+
+/// A 429 on the side read says so in one line naming the account, the status
+/// and the server's Retry-After, lands no reading, and its next read waits
+/// out that Retry-After (754 s, above the ladder's first 100 s rung).
+#[test]
+fn a_refused_side_read_names_the_account_status_and_retry_after_once() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf1", &[t, t + 753_999, t + 754_000], |_| {
+        resets_429(Some(754))
+    });
+    assert_eq!(
+        seen,
+        vec![
+            (1, vec![refused_line("lrf1", 429, Some(754), 754)]),
+            (1, vec![]),
+            (2, vec![refused_line("lrf1", 429, Some(754), 754)]),
+        ]
+    );
+    assert!(!landed, "a refused read lands no reading");
+}
+
+/// A 429 whose Retry-After names no wait (`/usage` sends `0` on every 429)
+/// retries on the poll's own ladder at the poll's 90 s interval, never the
+/// hour: `next_slot_deferral` gives a gap of interval + 10 s, 30 s, 90 s, then
+/// the #74 floor's 300 s, rung by consecutive refusal.
+#[test]
+fn a_refused_side_read_retries_on_the_polls_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,
+        t + 99_999,
+        t + 100_000,
+        t + 219_999,
+        t + 220_000,
+        t + 399_999,
+        t + 400_000,
+        t + 699_999,
+        t + 700_000,
+    ];
+    let (seen, landed) = drive_resets_reads("lrf2", &ticks, |_| resets_429(Some(0)));
+    let line = |next| vec![refused_line("lrf2", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(100)),
+            (1, vec![]),
+            (2, line(120)),
+            (2, vec![]),
+            (3, line(180)),
+            (3, vec![]),
+            (4, line(300)),
+            (4, vec![]),
+            (5, line(300)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// A Retry-After longer than the ladder's rung sets the gap, up to the poll's
+/// 15-minute `MAX_RETRY_AFTER_MS` cap. The line prints the hint as the poll's
+/// parser reads it, so a header past the cap prints the cap.
+#[test]
+fn a_long_retry_after_sets_the_next_side_read_up_to_the_cap() {
+    let t = RESETS_T;
+    let (seen, _) = drive_resets_reads("lrf3", &[t, t + 599_999, t + 600_000], |_| {
+        resets_429(Some(600))
+    });
+    let line = vec![refused_line("lrf3", 429, Some(600), 600)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+
+    let (seen, _) = drive_resets_reads("lrf4", &[t, t + 899_999, t + 900_000], |_| {
+        resets_429(Some(3600))
+    });
+    let line = vec![refused_line("lrf4", 429, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+}
+
+/// A 5xx is a refusal too: it retries on the same ladder, and its line says
+/// when the server named no Retry-After.
+#[test]
+fn a_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf5", &[t, t + 99_999, t + 100_000], |_| {
+        (503, Vec::new(), "upstream unavailable".to_string())
+    });
+    let line = vec![refused_line("lrf5", 503, None, 100)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A side read that gets no answer (here a refused connect) retries on the
+/// ladder like a 429, naming no status.
+#[test]
+fn an_unanswered_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lrf6", &base, &[t, t + 99_999, t + 100_000], || 0);
+    let line =
+        vec!["clauth: 'lrf6': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(
+        seen,
+        vec![(0, line.clone()), (0, vec![]), (0, line)],
+        "one line per attempt, the second on the ladder's first rung"
+    );
+    assert!(!landed);
+}
+
+/// A 401, any other 4xx and a body clauth cannot read are no refusal: each
+/// says so in one line and keeps the full hour.
+#[test]
+fn a_rejected_or_unreadable_side_read_keeps_the_hour_with_one_line() {
+    let t = RESETS_T;
+    let ticks = [t, t + 3_599_999, t + 3_600_000];
+    let cases: [(&str, ResetsReply, &str); 3] = [
+        (
+            "lrh1",
+            (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+            "the limit reset read got HTTP 401",
+        ),
+        (
+            "lrh2",
+            (
+                403,
+                vec![("retry-after".to_string(), "5".to_string())],
+                String::new(),
+            ),
+            "the limit reset read got HTTP 403",
+        ),
+        (
+            "lrh3",
+            (200, Vec::new(), "not json".to_string()),
+            "the limit reset read answered in a shape clauth does not read",
+        ),
+    ];
+    for (name, reply, what) in cases {
+        let (seen, landed) = drive_resets_reads(name, &ticks, move |_| reply.clone());
+        let line = vec![format!("clauth: '{name}': {what}; next read in 3600s")];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// The ladder's rung counts consecutive refusals: a landed read, or a failure
+/// that keeps the hour, starts the next refusal back on the first rung.
+#[test]
+fn a_landed_or_hour_keeping_read_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,             // 429: rung 1, 100 s
+        t + 100_000,   // 429: rung 2, 120 s
+        t + 220_000,   // 200: lands, the hour
+        t + 3_820_000, // 429: rung 1 again
+        t + 3_920_000, // 429: rung 2
+        t + 4_040_000, // 401: the hour
+        t + 7_640_000, // 429: rung 1 again
+        t + 7_739_999,
+        t + 7_740_000, // 429: rung 2
+    ];
+    let (seen, landed) = drive_resets_reads("lrl1", &ticks, |i| match i {
+        2 => (200, Vec::new(), CEDAR_EMBER_THREE_GRANTS.to_string()),
+        5 => (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+        _ => resets_429(Some(0)),
+    });
+    let refused = |next| vec![refused_line("lrl1", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![]),
+            (4, refused(100)),
+            (5, refused(120)),
+            (
+                6,
+                vec![
+                    "clauth: 'lrl1': the limit reset read got HTTP 401; next read in 3600s"
+                        .to_string()
+                ]
+            ),
+            (7, refused(100)),
+            (7, vec![]),
+            (8, refused(120)),
+        ]
+    );
+    assert!(landed, "the 200 landed its reading");
+}
+
+// ── a refusal's retry: the cases the ladder's own rules leave open ──
+
+/// [`drive_resets_reads`] with `before(state, i)` run ahead of the `i`-th
+/// tick, so a case can set or forget the memo between passes.
+fn drive_resets_reads_with(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+    before: impl Fn(&super::SchedulerState, usize),
+) -> Vec<(usize, Vec<String>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for (i, &at) in ticks.iter().enumerate() {
+        before(&state, i);
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads.load(Ordering::SeqCst), named));
+    }
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    seen
+}
+
+/// A 401's Retry-After is no refusal's hint: the hour holds, and the line
+/// names no Retry-After.
+#[test]
+fn a_401_carrying_a_retry_after_still_keeps_the_hour() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro1", &[t, t + 3_599_999, t + 3_600_000], |_| {
+        (
+            401,
+            vec![("retry-after".to_string(), "5".to_string())],
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )
+    });
+    let line =
+        vec!["clauth: 'lro1': the limit reset read got HTTP 401; next read in 3600s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A 5xx whose Retry-After asks past the poll's 15-minute cap retries at the
+/// cap, its line printing the hint as the poll's parser reads it.
+#[test]
+fn a_server_error_asking_past_the_cap_retries_at_the_cap() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro2", &[t, t + 899_999, t + 900_000], |_| {
+        (
+            503,
+            vec![("retry-after".to_string(), "3600".to_string())],
+            "upstream unavailable".to_string(),
+        )
+    });
+    let line = vec![refused_line("lro2", 503, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A refused read a due mark brought forward consumes the mark like any
+/// attempt, and its retry waits for the ladder's rung, not the next pass.
+#[test]
+fn a_refused_due_marked_read_consumes_the_mark_and_waits_for_its_rung() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro3",
+        &[t, t + 99_999, t + 100_000],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 0 {
+                let mut memo = state.claude_resets_memo.lock().unwrap();
+                memo.last_read_at.insert("lro3".to_string(), t - 60_000);
+                memo.due.insert("lro3".to_string());
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro3", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (1, vec![]), (2, line(120))]);
+}
+
+/// A memo forget drops a pending retry with its rung: the account reads on
+/// the next pass, and a refusal there starts on the ladder's first rung.
+#[test]
+fn a_forget_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro4",
+        &[t, t + 100_000, t + 100_001],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 2 {
+                state.claude_resets_memo.lock().unwrap().forget("lro4");
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro4", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (2, line(120)), (3, line(100))]);
+}
+
+/// Only a 429 moves the side read up a rung, as only a 429 moves the poll's:
+/// a 5xx between two 429s retries on the rung as it stands, and the 429 after
+/// it climbs from there.
+#[test]
+fn a_server_error_between_429s_holds_the_rung() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads(
+        "lro5",
+        &[t, t + 100_000, t + 220_000, t + 339_999, t + 340_000],
+        |i| match i {
+            2 => (503, Vec::new(), "upstream unavailable".to_string()),
+            _ => resets_429(Some(0)),
+        },
+    );
+    let refused = |next| vec![refused_line("lro5", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![refused_line("lro5", 503, None, 120)]),
+            (3, vec![]),
+            (4, refused(180)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// Every 5xx is a refusal: the range's ends and the edge's own 502 retry on
+/// the ladder's first rung like the 503 above.
+#[test]
+fn every_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    for (name, status) in [("lro6", 500u16), ("lro7", 502), ("lro8", 599)] {
+        let (seen, landed) = drive_resets_reads(name, &[t, t + 99_999, t + 100_000], move |_| {
+            (status, Vec::new(), String::new())
+        });
+        let line = vec![refused_line(name, status, None, 100)];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// A 200 whose body is cut off mid-read got no whole answer: it retries on
+/// the ladder like a refused connect.
+#[test]
+fn a_side_read_cut_off_mid_body_retries_on_the_ladder() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server = std::thread::spawn({
+        let reads = Arc::clone(&reads);
+        move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                crate::testutil::read_request_head(&mut sock);
+                reads.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"cedar",
+                );
+            }
+        }
+    });
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lro9", &base, &[t, t + 99_999, t + 100_000], || {
+            reads.load(Ordering::SeqCst)
+        });
+    let line =
+        vec!["clauth: 'lro9': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+    server.join().expect("listener");
+}
+
+/// The ladder rides the poll's own `refresh_interval`, never the default: at
+/// 10 s the rungs are 20 s, 40 s, 100 s and 280 s (interval + 10 s, 30 s,
+/// 90 s, 270 s, under the #74 floor's 300 s); at 30 min, past the 15-minute
+/// cap, a refusal waits exactly one interval.
+#[test]
+fn a_refused_side_read_rides_the_polls_own_refresh_interval() {
+    use std::sync::atomic::Ordering;
+    let t = RESETS_T;
+    let at = |interval: u64| {
+        move |state: &super::SchedulerState, i: usize| {
+            if i == 0 {
+                state.refresh_interval.store(interval, Ordering::Relaxed);
+            }
+        }
+    };
+
+    let seen = drive_resets_reads_with(
+        "lro10",
+        &[t, t + 19_999, t + 20_000, t + 60_000, t + 160_000],
+        |_| resets_429(Some(0)),
+        at(10_000),
+    );
+    let line = |next| vec![refused_line("lro10", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(20)),
+            (1, vec![]),
+            (2, line(40)),
+            (3, line(100)),
+            (4, line(280))
+        ]
+    );
+
+    let seen = drive_resets_reads_with(
+        "lro11",
+        &[t, t + 1_799_999, t + 1_800_000],
+        |_| resets_429(Some(0)),
+        at(1_800_000),
+    );
+    let line = |next| vec![refused_line("lro11", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(1800)), (1, vec![]), (2, line(1800))]);
 }
 
 // ── a tick that resumes after its instance lost the lease applies nothing ────
