@@ -15,7 +15,7 @@ use super::format::{
     NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, bar_fits, cue_style, duration_label,
     fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, overdue_label,
     past_deadline_age, reading_due_age, reset_in_secs, reset_resume, reset_room,
-    reset_suffix_worst, spinner_frame, spinner_style, truncate, window_label, window_note_spans,
+    reset_suffix_worst, spinner_frame, spinner_style, truncate, window_label,
     window_summary_spans_bracketed,
 };
 use super::header::{identity_wave_rest_ms, identity_wave_spans};
@@ -1520,7 +1520,8 @@ fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
 }
 
 /// The 5h cell of a plan with no 5h limit: the Usage tab's `no limit on this
-/// plan`, cut to fit the column.
+/// plan`, short enough for the cell to hold; a cell under 8 cells draws the
+/// dash instead.
 const NO_FIVE_HOUR_LIMIT: &str = "no limit";
 
 fn render_overview_row(
@@ -1828,19 +1829,15 @@ fn render_overview_row(
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
         ))
-    } else if five_window.is_none()
-        && readings
-            .usage_of(&profile.name)
-            .is_some_and(|usage| usage.no_five_hour_limit)
+    } else if readings
+        .usage_of(&profile.name)
+        .is_some_and(|usage| usage.no_five_hour_limit)
+        && grapheme_cells(NO_FIVE_HOUR_LIMIT) <= widths.five_hour
     {
-        // A plan with no 5h limit names that shape, as the Usage tab does,
-        // rather than the no-data dash an unread account gets.
-        flatten(window_note_spans(
-            NO_FIVE_HOUR_LIMIT,
-            widths.five_hour,
-            widths.claude_labels.five,
-            true,
-        ))
+        // Opens the cell where a bar's `[` does; the row pad fills the rest,
+        // so the 7d column keeps its place. A narrower cell falls through to
+        // the dash, since `overview_windows` hides the 5h window under the mark.
+        flatten(vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())])
     } else {
         flatten(window_summary_spans_bracketed(
             five_window.as_ref(),
@@ -2062,7 +2059,9 @@ struct OverviewLong {
 /// LONG window: the 7d window when present, else the provider-marked monthly
 /// quota (an OAuth reading has no monthly, so its 7d-else-first-scoped
 /// fallback stays byte-identical). `None` per slot when no source exists
-/// (renders `—`).
+/// (renders `—`), and in the 5h slot of a plan with no 5h limit: that cell
+/// reads `no limit`, so a 5h window its stored body still carries neither
+/// draws nor sizes the column, as the Usage tab hides it.
 fn overview_windows(
     profile: &Profile,
     readings: &ReadingsSnapshot,
@@ -2079,7 +2078,11 @@ fn overview_windows(
                 monthly: false,
             })
         };
-        return (usage.five_hour.clone(), long);
+        let five = usage
+            .five_hour
+            .clone()
+            .filter(|_| !usage.no_five_hour_limit);
+        return (five, long);
     }
     let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);
