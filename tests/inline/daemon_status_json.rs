@@ -3125,9 +3125,9 @@ fn status_schema_agrees_with_the_serialized_body() {
 /// their schemas (`SwitchOk.previous`, `PaneEntry.title`/`agent`/`tag`/
 /// `foreground_process_group_id`/`cwd`/`agent_session_id`, `PaneSession.cwd`,
 /// `SessionsBody.next_before`, `SessionRow.last_ran_profile`/`first_message`/
-/// `last_message` and `HistoryBody.next_before` answer `null`, never a dropped
-/// key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
-/// `HerdrState.reason`) stay optional.
+/// `last_message`/`title`/`git_branch` and `HistoryBody.next_before` answer
+/// `null`, never a dropped key), and the skip-when-absent `Option`s
+/// (`ErrorBody.reason`, `HerdrState.reason`) stay optional.
 #[test]
 fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     use crate::daemon::api::panes::{HerdrState, PaneEntry, PaneSession};
@@ -3178,7 +3178,13 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
         "SessionsBody.next_before is serialized on every answer, so its schema requires it"
     );
     let session_row_required = required(&SessionRow::schema(), "SessionRow");
-    for field in ["last_ran_profile", "first_message", "last_message"] {
+    for field in [
+        "last_ran_profile",
+        "first_message",
+        "last_message",
+        "title",
+        "git_branch",
+    ] {
         assert!(
             session_row_required.iter().any(|name| name == field),
             "SessionRow.{field} is serialized on every answer, so its schema requires it"
