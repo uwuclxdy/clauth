@@ -15,7 +15,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
         codex=$(clauth __complete --codex 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete rename disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -33,7 +33,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "rename" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
         local profiles codex
         profiles=$(clauth __complete 2>/dev/null)
         [ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex=$(clauth __complete --codex 2>/dev/null)
@@ -143,6 +143,7 @@ _clauth() {
             'login[log in via browser OAuth or an API key]' \
             'capture[save the login Claude Code is using now as a profile]' \
             'delete[remove a profile and its credentials]' \
+            'rename[rename a profile]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
             'limit-reset[spend a banked usage-limit reset]' \
@@ -166,7 +167,7 @@ _clauth() {
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|rename|disable|enable|rolling-token|static-token) ]]; then
         local -a profiles codex
         profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         [[ "${words[2]}" == (start|delete) ]] && codex=(${(f)"$(clauth __complete --codex 2>/dev/null)"})
@@ -348,6 +349,7 @@ complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with t
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a profile"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
+complete -c clauth -f -n __fish_is_first_token -a rename -d "Rename a profile"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
 complete -c clauth -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset"
@@ -395,6 +397,7 @@ complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" 
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from rename; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start; and not __fish_seen_subcommand_from proxy; and __clauth_start_takes_name" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from delete; and not __fish_seen_subcommand_from proxy; and not string match -qvr -- '^(--yes|-y|--force)\$' (commandline -opc)[3..]" -a "(__clauth_codex)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -d Profile

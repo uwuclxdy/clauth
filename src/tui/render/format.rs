@@ -185,6 +185,68 @@ pub(super) fn duration_label(secs: u64) -> String {
     }
 }
 
+/// The age a profile's published refresh deadline overran by, `Some` only when
+/// this instance runs no fetch for it: a stood-down mirror's stamp is its own
+/// cache-derived estimate and nothing here will fetch the row, so its slot
+/// reads the overrun instead of a countdown frozen at `0s`. The instance that
+/// fetches draws the queued spinner for a past deadline instead
+/// ([`crate::usage::display_activity`]), so it never reaches this.
+///
+/// The overrun reads overdue only past one
+/// [`crate::usage::tick_fetch_deadline`]: the published stamp is the holder's
+/// cache estimate, and one tick fetch deadline is the wait the holder gives
+/// its own fetch, so a smaller overrun still reads as a healthy cycle — the
+/// countdown form, never a per-cycle overdue flash. The age itself still
+/// counts from the deadline.
+pub(super) fn past_deadline_age(fetches_here: bool, next: u64) -> Option<u64> {
+    if fetches_here {
+        return None;
+    }
+    let overrun = crate::usage::now_ms().checked_sub(next)?;
+    let grace = crate::usage::tick_fetch_deadline().as_millis() as u64;
+    (overrun > grace).then_some(overrun)
+}
+
+/// The age a reading overran its own cadence by — `now - (clock + interval)` —
+/// the deadline a reading carries when no fetch owner published one (a stuck
+/// worker holds the leg, so the countdown map has no entry). `None` without a
+/// reading clock to derive the deadline from, or before it falls due.
+pub(super) fn reading_due_age(reading_clock: Option<u64>, interval_ms: u64) -> Option<u64> {
+    let due = reading_clock?.saturating_add(interval_ms);
+    let now = crate::usage::now_ms();
+    (due < now).then(|| now - due)
+}
+
+/// The overdue fetch-row suffix: `refresh overdue · read 4m ago`. Without a
+/// reading clock to date, the overdue state still reads, undated.
+pub(super) fn overdue_phrase(verb: &str, reading_clock: Option<u64>) -> String {
+    match reading_clock {
+        Some(at) => format!("{verb} overdue · read {}", relative_age(at)),
+        None => format!("{verb} overdue"),
+    }
+}
+
+/// The overview timer slot's overdue label: [`duration_label`]'s one-unit form
+/// up to 99 days, then whole weeks past 99 days and whole years past 99 weeks.
+/// The ages its callers produce (`now - due`, `due >= 0`) keep every form
+/// inside the slot's 4 inner cells until the wall clock passes ~2070, when the
+/// years arm's `+100y` (5 cells) would shift the row's columns.
+pub(super) fn overdue_label(age_ms: u64) -> String {
+    let days = age_ms / 86_400_000;
+    if days >= 100 {
+        let weeks = days / 7;
+        if weeks >= 100 {
+            format!("+{}y", weeks / 52)
+        } else {
+            format!("+{weeks}w")
+        }
+    } else {
+        // A deadline passed under a second ago is already overdue: its age
+        // reads `+1s`, never `+0s`.
+        format!("+{}", duration_label((age_ms / 1000).max(1)))
+    }
+}
+
 /// The widest whole reading, `100%`: the label budget every Overview usage tier
 /// is sized for. A longer label (`73.42%`) widens its column by the excess.
 pub(super) const PCT_LABEL_BUDGET: usize = 4;
@@ -198,9 +260,25 @@ const RESET_ROOM: usize = 9;
 
 /// Cells a bar-tier column gives its bar once the reading's `label_w` and the
 /// bracket-and-gap chrome are paid: the one rail the dash and the reading span
-/// both right-align to.
-fn rail_cells(width: usize, label_w: usize) -> usize {
-    width.saturating_sub(3 + label_w).min(BAR_CELLS)
+/// both right-align to. `bar_grow` raises the bar's cell ceiling for a column
+/// widened by that many cells, so the bar takes the whole widening.
+fn rail_cells(width: usize, label_w: usize, bar_grow: usize) -> usize {
+    width.saturating_sub(3 + label_w).min(BAR_CELLS + bar_grow)
+}
+
+/// Whether a cell of `width` cells holds the bar block (`[`, at least
+/// [`BAR_FLOOR`] cells, `]`) beside a `label_w`-cell reading; a narrower cell
+/// draws its reading alone. The Overview fill reads the same predicate to tell
+/// whether a usage column draws a bar at its laid-out width.
+pub(super) fn bar_fits(width: usize, label_w: usize) -> bool {
+    width >= BAR_FLOOR + 3 + label_w
+}
+
+/// Cells a bar-tier column leaves for its reset suffix past the bar block:
+/// the one budget the suffix's fit check reads, whatever the fill adds to the
+/// bar (`bar_grow` is paid back out, so the suffix keeps its room).
+pub(super) fn reset_room(width: usize, label_w: usize, bar_grow: usize) -> usize {
+    width.saturating_sub(BAR_CELLS + bar_grow + 3 + label_w)
 }
 
 /// A cell that holds a note instead of a reading (`no limit`), on the reading
@@ -214,7 +292,7 @@ pub(super) fn window_note_spans(
 ) -> Vec<Span<'static>> {
     let note_w = grapheme_cells(note);
     let rail = if include_bar && width >= BAR_FLOOR + 3 + label_w {
-        3 + rail_cells(width, label_w) + label_w
+        3 + rail_cells(width, label_w, 0) + label_w
     } else {
         label_w
     };
@@ -245,7 +323,12 @@ pub(super) fn window_label(window: &UsageWindow) -> String {
 /// left-padded to it so a column's `%` signs align. `prefix_cells` is a
 /// left-hand prefix the caller renders OUTSIDE this call (e.g. the overview's
 /// `30d ` monthly label): the bar sheds that many cells so the whole cell
-/// still fits the column and the `%` stays on the shared rail.
+/// still fits the column and the `%` stays on the shared rail. `bar_grow` is
+/// how many cells the caller widened the column by past its bar tier: the bar
+/// takes them all, so the reset countdown keeps the room it had. `clip` lets
+/// a filled row's reset suffix render cut at a grapheme boundary from any
+/// room the fill restores, the laid-out [`RESET_ROOM`] floor included;
+/// laid-out rows keep the whole-or-bare fallback.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn window_summary_spans_bracketed(
     window: Option<&UsageWindow>,
@@ -256,6 +339,8 @@ pub(super) fn window_summary_spans_bracketed(
     fmt: ResetFmt,
     stale: bool,
     prefix_cells: usize,
+    bar_grow: usize,
+    clip: bool,
 ) -> Vec<Span<'static>> {
     bracketed_spans(
         window,
@@ -267,6 +352,8 @@ pub(super) fn window_summary_spans_bracketed(
         stale,
         now_epoch_secs(),
         prefix_cells,
+        bar_grow,
+        clip,
     )
 }
 
@@ -293,6 +380,8 @@ pub(crate) fn window_summary_spans_bracketed_at(
         stale,
         now,
         0,
+        0,
+        false,
     )
 }
 
@@ -307,18 +396,20 @@ fn bracketed_spans(
     stale: bool,
     now: i64,
     prefix_cells: usize,
+    bar_grow: usize,
+    clip: bool,
 ) -> Vec<Span<'static>> {
     // `[` + cells + `]` + ` ` + label: whether the bar's floor fits beside a
     // label `label_w` wide.
-    let bar_fits = |label_w: usize| include_bar && width >= BAR_FLOOR + 3 + label_w;
+    let fits = |label_w: usize| include_bar && bar_fits(width, label_w);
     let Some(window) = window else {
         // The dash sits on the reading rail: right-aligned to the reading
         // span's width, so its right edge meets the readings' at every tier
         // (the bar cells, brackets and gap included).
-        let dash = if bar_fits(label_w) {
+        let dash = if fits(label_w) {
             format!(
                 "{NO_DATA:>right$}",
-                right = 3 + rail_cells(width, label_w) + label_w
+                right = 3 + rail_cells(width, label_w, bar_grow) + label_w
             )
         } else {
             format!("{NO_DATA:>label_w$}")
@@ -336,23 +427,25 @@ fn bracketed_spans(
     };
     // The label is the reading, so the reset countdown and then the bar cells
     // give way before it is ever cut.
-    let block_w = |cells: usize| cells + 3 + label_w;
-    if !bar_fits(label_w) {
+    if !fits(label_w) {
         return vec![Span::styled(format!("{label:>label_w$}"), fill_style)];
     }
-    let cells = rail_cells(width, label_w).saturating_sub(prefix_cells);
+    let cells = rail_cells(width, label_w, bar_grow).saturating_sub(prefix_cells);
     let mut spans = vec![
         Span::styled("[", bracket),
         Span::styled(bar_string_with_cells(pct, cells), fill_style),
         Span::styled("]", bracket),
         Span::styled(format!(" {label:>label_w$}"), fill_style),
     ];
-    let room = width.saturating_sub(block_w(BAR_CELLS));
-    if room >= RESET_ROOM
+    let room = reset_room(width, label_w, bar_grow);
+    // A filled row's suffix is clipped to its room, so any restored room
+    // shows it; the laid-out gate only keeps a wide whole countdown from
+    // crowding the bar.
+    if (clip || room >= RESET_ROOM)
         && let Some(secs) = reset_in_secs_at(window, now)
     {
         let style = reset_style.unwrap_or_else(theme::faint);
-        spans.extend(reset_suffix_spans(secs, fmt, room, style));
+        spans.extend(reset_suffix_spans(secs, fmt, room, style, clip));
     }
     spans
 }
@@ -497,8 +590,10 @@ fn column_text(rel: &str, at: Option<&str>, display: ResetDisplay) -> String {
 /// leaves in the column. A stamp too wide for it degrades to the bare countdown
 /// rather than overflowing the row — the countdown itself is never fit-checked,
 /// so the stock relative form renders exactly as it did before the setting
-/// existed.
-fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize) -> String {
+/// existed. With `clip` (a filled row restoring the room one cell at a time)
+/// the stamp renders cut at a grapheme boundary instead, so the wall-clock
+/// time shows as it grows rather than popping in whole.
+fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize, clip: bool) -> String {
     let bare = format!(" ({})", humanize_duration(secs));
     // Under `relative` this equals `bare`, so the fit check only ever strips a
     // clock — the stock form renders exactly as it did before the setting
@@ -506,6 +601,8 @@ fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize) -> String {
     let full = format!(" ({})", reset_column(secs, fmt));
     if full.chars().count() <= room {
         full
+    } else if clip {
+        prefix_in_cells(&full, room).0
     } else {
         bare
     }
@@ -514,8 +611,14 @@ fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize) -> String {
 /// [`reset_suffix`] as styled spans, keeping the `·` that joins a countdown to
 /// its stamp neutral. Only `both` mode produces one; every other shape (bare
 /// countdown, clock-only) has no separator and lands as a single span.
-fn reset_suffix_spans(secs: i64, fmt: ResetFmt, room: usize, style: Style) -> Vec<Span<'static>> {
-    let suffix = reset_suffix(secs, fmt, room);
+fn reset_suffix_spans(
+    secs: i64,
+    fmt: ResetFmt,
+    room: usize,
+    style: Style,
+    clip: bool,
+) -> Vec<Span<'static>> {
+    let suffix = reset_suffix(secs, fmt, room, clip);
     match suffix.split_once(" · ") {
         Some((pre, post)) => vec![
             Span::styled(pre.to_string(), style),
@@ -524,6 +627,51 @@ fn reset_suffix_spans(secs: i64, fmt: ResetFmt, room: usize, style: Style) -> Ve
         ],
         None => vec![Span::styled(suffix, style)],
     }
+}
+
+/// Widest wall-clock time `clock_text` draws, by notation: `12:59pm` (a
+/// two-digit hour in 12-hour notation), `21:59` in 24-hour.
+fn clock_worst(fmt: ClockFormat) -> usize {
+    match fmt {
+        ClockFormat::H24 => 5,
+        ClockFormat::H12 => 7,
+    }
+}
+
+/// Widest day qualifier `clock_text` puts before its time: `wed ` inside the
+/// next six days, `sep 30, ` beyond them (a month, a two-digit day, the
+/// comma).
+const WEEKDAY_QUALIFIER: usize = 4;
+const DATE_QUALIFIER: usize = 8;
+
+/// Widest countdown `humanize_duration` draws inside each Overview window:
+/// `4h 59m` in the 5h window, `23h 59m` in the 7d one.
+const FIVE_COUNTDOWN: usize = 6;
+const SEVEN_COUNTDOWN: usize = 7;
+
+/// The widest ` (…)` reset suffix the Overview draws in each usage column, 5h
+/// first, in `fmt`'s display mode: the countdown's widest two-unit form beside
+/// the clock half's own worst case. A column reserves this room once past the
+/// layout width, so a countdown ticking shorter leaves blank cells after its
+/// stamp instead of moving the table.
+pub(super) fn reset_suffix_worst(fmt: ResetFmt) -> (usize, usize) {
+    let clock = clock_worst(fmt.clock);
+    let (five, seven) = match fmt.display {
+        ResetDisplay::Relative => (FIVE_COUNTDOWN, SEVEN_COUNTDOWN),
+        ResetDisplay::Both => (
+            // The countdown, its ` · ` and the day-less stamp.
+            FIVE_COUNTDOWN + 3 + clock,
+            SEVEN_COUNTDOWN + 3 + clock,
+        ),
+        // A 5h reset crosses at most one local midnight, so its stamp carries
+        // a weekday at most; the 7d window reaches the date form.
+        ResetDisplay::Clock => (
+            FIVE_COUNTDOWN.max(WEEKDAY_QUALIFIER + clock),
+            SEVEN_COUNTDOWN.max(DATE_QUALIFIER + clock),
+        ),
+    };
+    // The ` (` and `)` `reset_suffix` wraps around it.
+    (five + 3, seven + 3)
 }
 
 /// The wall-clock half of a reset stamp, or `None` when the operator didn't ask

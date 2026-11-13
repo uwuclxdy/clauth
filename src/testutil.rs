@@ -71,8 +71,8 @@ pub(crate) fn node_path(path: &Path) -> PathBuf {
 /// A `RecvBody` bound or one of ureq's other phases is a different, unruled
 /// budget even when it errors inside the window.
 ///
-/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
-/// ureq error is the io error's inner source.
+/// ureq's `BodyReader` (3.4.2; unchanged through 3.5.1) surfaces its timeout as
+/// `io::Error::other`, so the ureq error is the io error's inner source.
 pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
     let err = result.as_ref().expect_err("a stalled body is an error");
     let io = err
@@ -210,6 +210,9 @@ pub(crate) struct HomeSandbox {
     prev_claude_pid: Option<std::ffi::OsString>,
     prev_codex_home: Option<std::ffi::OsString>,
     prev_operator_codex_home: Option<std::ffi::OsString>,
+    prev_appdata: Option<std::ffi::OsString>,
+    prev_ssl_cert_file: Option<std::ffi::OsString>,
+    prev_ssl_cert_dir: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
@@ -278,6 +281,13 @@ impl HomeSandbox {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CLAUDE_PID");
         }
+        // A Windows browser manifest's dir reads this before the home, so it
+        // would name the real profile.
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("APPDATA");
+        }
         // The two codex homes this process reads, cleared for the same reason:
         // a suite run from inside a `clauth start` codex session inherits a
         // session `CODEX_HOME` and a carried operator home, and both outrank
@@ -291,6 +301,17 @@ impl HomeSandbox {
             std::env::remove_var("CODEX_HOME");
             std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME");
         }
+        // The TLS root decision reads these on every agent build: a runner's
+        // own bundle would otherwise decide every test's trust store (and the
+        // root decision logs a warning inside whichever test builds first). A
+        // test that WANTS one pins it with [`EnvPin`].
+        let prev_ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
+        let prev_ssl_cert_dir = std::env::var_os("SSL_CERT_DIR");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
         Self {
             _tmp: tmp,
             _guard: guard,
@@ -300,6 +321,9 @@ impl HomeSandbox {
             prev_claude_pid,
             prev_codex_home,
             prev_operator_codex_home,
+            prev_appdata,
+            prev_ssl_cert_file,
+            prev_ssl_cert_dir,
         }
     }
 
@@ -335,6 +359,7 @@ impl Drop for HomeSandbox {
         crate::usage::reset_pending_forgets_for_test();
         crate::usage::reset_profile_fetched_for_test();
         crate::usage::clear_seed_hooks_for_test();
+        crate::usage::clear_claude_resets_seed_apply_hooks_for_test();
         crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();
         // Clear the process-wide lock-timeout override after the joins above
@@ -374,9 +399,21 @@ impl Drop for HomeSandbox {
             Some(prev) => unsafe { std::env::set_var("CODEX_HOME", prev) },
             None => unsafe { std::env::remove_var("CODEX_HOME") },
         }
+        match self.prev_ssl_cert_file.take() {
+            Some(prev) => unsafe { std::env::set_var("SSL_CERT_FILE", prev) },
+            None => unsafe { std::env::remove_var("SSL_CERT_FILE") },
+        }
+        match self.prev_ssl_cert_dir.take() {
+            Some(prev) => unsafe { std::env::set_var("SSL_CERT_DIR", prev) },
+            None => unsafe { std::env::remove_var("SSL_CERT_DIR") },
+        }
         match self.prev_operator_codex_home.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUTH_OPERATOR_CODEX_HOME", prev) },
             None => unsafe { std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME") },
+        }
+        match self.prev_appdata.take() {
+            Some(prev) => unsafe { std::env::set_var("APPDATA", prev) },
+            None => unsafe { std::env::remove_var("APPDATA") },
         }
         // A non-panicking miss ran the whole teardown above; panic LAST naming
         // the count and the bound. The unwind then drops the guard (poisoning
@@ -1107,12 +1144,14 @@ pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     std::fs::create_dir(&path).expect("block the credentials path with a directory");
 }
 
-/// Make `dir` refuse to create or write files for the guard's lifetime, so a
-/// test can drive a save failure without root: on Unix the dir's mode drops to
-/// 0o500 (no write bit), on Windows a deny ACE for Everyone removes add-file /
-/// add-subdir (`(WD,AD)`). The constructor probes a real write so a fault that
-/// never bites fails by name instead of greening the test; `Drop` restores
-/// best-effort and never asserts.
+/// Make `dir` refuse to create files for the guard's lifetime, so a test can
+/// drive a save failure without root: on Unix the dir's mode drops to 0o500
+/// (no write bit), on Windows a deny ACE for Everyone (`(WD,AD)`) refuses a
+/// new file. Windows still lets a new subdirectory through it (CI's
+/// `windows-latest`, 2026-10-21), so a fault a test poses is a new FILE. The
+/// constructor probes a real file write so a fault that never bites fails by
+/// name instead of greening the test; `Drop` restores best-effort and never
+/// asserts.
 #[cfg(test)]
 pub(crate) struct UnwritableDir {
     path: PathBuf,
@@ -2022,6 +2061,8 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -2288,6 +2329,55 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     let holder = crate::profile::open_state_file(&path).expect("open holder handle");
     holder.lock().expect("hold the rotation lock");
     holder
+}
+
+/// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
+/// scheduler's hourly side read or the CLI's post-spend refresh) with no banked
+/// total, as an older reading stores it: the usable count, the next grant's raw
+/// window names and end, and the read's own epoch-ms stamp.
+pub(crate) fn write_claude_limit_resets(
+    name: &str,
+    usable: u32,
+    clears: &[&str],
+    ends_at: Option<&str>,
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "clears": clears,
+        "ends_at": ends_at,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
+}
+
+/// [`write_claude_limit_resets`] for a reading that carries the banked total.
+pub(crate) fn write_claude_limit_resets_banked(
+    name: &str,
+    usable: u32,
+    banked: u32,
+    clears: &[&str],
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "banked": banked,
+        "clears": clears,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
 }
 
 /// An empty scheduler activity store: the per-profile spend counts a test
@@ -2607,7 +2697,13 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
         .to_string()
 }
 
-/// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+/// Overwrite a file's or a directory's modification time — for cache-staleness,
+/// tie-break and age tests.
+///
+/// A file opens for writing. A directory opens differently per platform: unix
+/// cannot open one for writing and sets its mtime through a read-only handle;
+/// Windows needs write access to change any timestamp, plus
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle at all.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
 /// inside another thread's `MoveFileEx` replace over the same path fails with
@@ -2617,9 +2713,23 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
 /// one attempt. Bounded, so a genuinely absent file still panics with its own
 /// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
+    let mut options = std::fs::OpenOptions::new();
+    // `metadata` follows a symlink, as the open does.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+    } else {
+        options.write(true);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let file = loop {
-        match std::fs::OpenOptions::new().write(true).open(path) {
+        match options.open(path) {
             Ok(file) => break file,
             Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3532,11 +3642,15 @@ mod route_harness {
             path: path.to_string(),
             query: query.to_string(),
             bearer: bearer.map(str::to_string),
+            authorization_seen: bearer.is_some(),
             if_none_match: None,
             body: body.as_bytes().to_vec(),
             // Routing does not depend on this; the connection loop owns it.
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            // What every client of these routes declares for its body.
+            content_type: crate::daemon::api::http::SoloHeader::One("application/json".to_string()),
         }
     }
 
@@ -4079,13 +4193,24 @@ pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
     .expect("write daemon.status.json");
 }
 
+/// The hang bound `reap_bounded` gives a stop-test child to die of the
+/// SIGTERM its stop sent: the daemon's drain can wait up to
+/// [`crate::daemon::SPEND_DRAIN_BOUND`] in all, its token spend and the tick
+/// thread's exit save sharing that window, plus a margin for the loopback
+/// saves and the process's own exit. A hang detector, not a race bound:
+/// raising it weakens nothing.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const SERVE_STOP_REAP_BOUND: std::time::Duration =
+    crate::daemon::SPEND_DRAIN_BOUND.saturating_add(std::time::Duration::from_secs(10));
+
 /// Wait for a fake supervisor the code under test should have SIGTERMed to
-/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
-/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
-/// the exit status on success, which the caller asserts is SIGTERM.
+/// exit, BOUNDED by [`SERVE_STOP_REAP_BOUND`]: a red (no SIGTERM came) kills +
+/// reaps the child and panics with an assertion, never hangs the suite on an
+/// unbounded `wait`. Returns the exit status on success, which the caller
+/// asserts is SIGTERM.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + SERVE_STOP_REAP_BOUND;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status,
@@ -4670,4 +4795,23 @@ pub(crate) fn seq_of(line: &str) -> u64 {
         }
     }
     panic!("no --seq in report line: {line}");
+}
+
+/// A fetch-lease ticket the watchdog already spent: `lease` is taken (the lock
+/// file lives under the sandboxed home, so the caller holds a `HomeSandbox`),
+/// then released the way the watchdog releases a holder whose last tick is
+/// older than its bound. A later `acquire_ticket` on `lease` takes it again,
+/// under a new generation.
+pub(crate) fn spent_lease_ticket(
+    lease: &crate::daemon::FetchLease,
+) -> crate::daemon::LeaseTicket<'_> {
+    let bound = std::time::Duration::from_secs(5 * 60);
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    assert!(ticket.is_current(), "a fresh ticket is current");
+    assert!(
+        lease.release_if_stale(crate::usage::now_ms() + 2 * bound.as_millis() as u64, bound),
+        "the watchdog releases the holder"
+    );
+    assert!(!ticket.is_current(), "the release spends the ticket");
+    ticket
 }

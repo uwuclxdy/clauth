@@ -1376,6 +1376,143 @@ fn the_roster_ranks_a_credit_capped_account_last_while_its_gate_is_on() {
     }
 }
 
+/// Saves a roster of blank accounts: `disabled` ones flagged, `active` global.
+fn save_roster(names: &[&str], disabled: &[&str], active: Option<&str>) {
+    for n in names {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
+        p.disabled = disabled.contains(n);
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        active_profile: active.map(Into::into),
+        ..Default::default()
+    })
+    .expect("save state");
+}
+
+/// The session-start roster, which a model reads as the accounts it can pick
+/// from, leaves a disabled account out.
+#[test]
+fn the_roster_leaves_out_a_disabled_account() {
+    let _home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-on"));
+    let block = build_instructions();
+    assert!(
+        block.contains("- acct-on (global active, this session) [anthropic"),
+        "the enabled account stays on the roster: {block}"
+    );
+    assert!(
+        !block.contains("acct-off"),
+        "the disabled account is off the block: {block}"
+    );
+}
+
+/// Dropping a disabled active account would take the block's identity line
+/// with it, the first thing a global session reads about what it spends.
+#[test]
+fn the_roster_keeps_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("global active: `acct-off`"),
+        "the identity line survives: {block}"
+    );
+    assert!(
+        block.contains("acct-off (global active, this session; disabled)"),
+        "the roster keeps the account behind this session and says it is disabled: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
+/// A runtime session's identity line names the global account too, and a
+/// custom config dir marks it on the roster: neither loses a disabled one.
+#[test]
+fn the_roster_keeps_a_disabled_active_account_in_the_other_session_tiers() {
+    let home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-off"));
+    let runtime = home.home().join(".clauth/profiles/acct-on").join("runtime");
+    let dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-on` (anthropic) · global active: `acct-off`"),
+        "the runtime identity line names the global account: {block}"
+    );
+    assert!(
+        block.contains("acct-off (global active; disabled)"),
+        "a runtime session reads the disabled global account as disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (this session)"),
+        "the enabled runtime account carries no disabled mark: {block}"
+    );
+    drop(dir);
+    let custom = home.home().join("custom-config");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &custom);
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active; disabled)"),
+        "a custom dir still marks the global account and says it is disabled: {block}"
+    );
+}
+
+/// A shared `clauth start` runtime keeps the row and provider of the account
+/// its dir names, whatever that account's flag says: the identity line reads
+/// that row.
+#[test]
+fn the_roster_keeps_the_disabled_account_a_runtime_dir_names() {
+    let home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-on"),
+    );
+    let runtime = home
+        .home()
+        .join(".clauth/profiles/acct-off")
+        .join("runtime");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-off` (anthropic)"),
+        "the identity line keeps its provider: {block}"
+    );
+    assert!(
+        block.contains("acct-off (this session; disabled)"),
+        "the roster keeps this session's own account and says it is disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (global active)"),
+        "the enabled global account carries no disabled mark: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active, this session; disabled)"),
+        "a runtime on the disabled global account marks both and the flag: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
 /// An own-endpoint account never spends its usage credits, so its spent cap
 /// must not demote it to `Capped` — the RANK is what the credit gate governs.
 /// The in-test control first pins the same fixture WITHOUT the endpoint as
@@ -7963,6 +8100,595 @@ fn a_corpse_polled_past_the_window_is_answered_with_its_session_id_not_the_aged_
     );
 }
 
+/// A collect from a session other than the one a kept corpse is tied to never
+/// takes that session's lost wake away: the record stays for its owner, whose
+/// next turn end still adopts it and wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_lost_wake() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let _ = call_monitor(&id);
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's kept corpse"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the dead job");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. \
+                 resume it with `delegate` `session_id: d-run-1`, or run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A collect of a corpse tied to another session leaves the record and
+/// answers the crashed copy's shared arm — the existing line that reads true
+/// for a record still on disk — so the answer never claims a removal that
+/// did not happen.
+#[test]
+fn a_foreign_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the foreign collect answers the crashed copy, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A foreign corpse that never recorded a session id has no handle to name:
+/// the collect says the job died, no more, and leaves the record for its
+/// owner's wake.
+#[test]
+fn a_foreign_collect_of_a_handleless_corpse_says_it_died_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// The isolated arm of the same answer: a foreign isolated corpse's
+/// transcript left with the throwaway tree, so the collect names no resume
+/// handle it could not honour.
+#[test]
+fn a_foreign_isolated_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+        "isolated": true,
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the foreign isolated collect answers the isolated arm, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A server launched outside Claude Code resolves no host session of its
+/// own, so it owns no corpse tied to a session: the collect leaves the
+/// record for the session the corpse is tied to.
+#[test]
+fn a_collect_without_a_host_session_leaves_a_tied_corpse() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUDE_CODE_SESSION_ID", None)]);
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the sessionless collect answers the crashed copy: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "a sessionless server owns no tied corpse: the record stays"
+    );
+}
+
+/// The batch arm follows the same rule per id: a foreign corpse's row reads
+/// the crashed copy, the record stays, and the batch is an error like the
+/// one-id spelling.
+#[test]
+fn a_batch_collect_leaves_a_foreign_corpse_and_answers_its_row() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor_batch(vec![&id, "d-absent-0"]);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse makes the batch an error, like the one-id spelling"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.starts_with(&format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )),
+        "the foreign row reads the crashed copy, raw like a tombstone's: {text}"
+    );
+    assert!(
+        text.contains("job `d-absent-0` unknown"),
+        "the batch still reports its other rows: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the batch leaves the record for its owner's wake"
+    );
+}
+
+/// A crashed tombstone tied to `host_session`, with `session_id` as its resume
+/// handle when it has one, written raw as the sweep writes it.
+fn seed_tied_tombstone(id: &str, host_session: &str, session_id: Option<&str>) {
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let mut record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "host_session": host_session,
+    });
+    if let Some(sid) = session_id {
+        record["session_id"] = sid.into();
+    }
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The text of a by-id `monitor` reply, asserting it is a tool error.
+fn monitor_reply(id: &str) -> String {
+    let result = call_monitor(id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a dead job's id is a tool error"
+    );
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text")
+}
+
+/// Another session's collect of a crashed tombstone that never named a
+/// session id says the job died, no more, and leaves the record.
+#[test]
+fn a_foreign_collect_of_a_handleless_tombstone_says_it_died_and_leaves_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", None);
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(jobs::read(&id).is_some(), "the record stays for its owner");
+}
+
+/// The owning session's own collect of its tied crashed tombstone claims it:
+/// the owner's copy, raw, and the record is gone, so no later turn end wakes
+/// about a job its model already asked after.
+#[test]
+fn the_owners_collect_of_its_tied_tombstone_claims_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-owner")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", Some("d-run-1"));
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )
+    );
+    assert!(jobs::read(&id).is_none(), "the owner's collect claims it");
+}
+
+/// A dead BLOCKING run's lost wake rides its crashed tombstone; a collect from
+/// another session leaves that tombstone for its owner, whose turn end still
+/// wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_crashed_tombstone() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "a foreign collect answers the crashed copy"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's crashed tombstone"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the tombstone");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. \
+                 resume it with `delegate` `session_id: d-run-1`, or run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A `monitor` collect on a dead job the sweeps now KEEP — a collectable
+/// corpse tied to a session, inside the silence window — consumes the record
+/// itself and answers the existing orphan copy, whose "its record was
+/// removed" this collect makes true; nothing is left for a later turn end to
+/// adopt.
+#[test]
+fn a_collect_consumes_the_kept_corpse_and_answers_the_orphan_copy() {
+    let home = HomeSandbox::new();
+    // The collect consumes a kept corpse only when it is the collecting
+    // session's own; pin this collector to the corpse's host session, since
+    // the bare test process resolves no session of its own.
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-kept-1")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "sess-kept-1",
+        "host_session": "sess-kept-1",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc_running_corpses(now);
+    assert!(
+        jobs::read(&id).is_some(),
+        "the collect's own sweep keeps the tied corpse inside the window"
+    );
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a corpse's id is still a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: unknown job_id: {id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: sess-kept-1"
+        ),
+        "the collect answers the existing orphan copy: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "the collect consumed the record its copy says was removed"
+    );
+    assert!(
+        !crate::hook_jobs::own_jobs("sess-kept-1", now).contains(&id),
+        "no later turn end of the session adopts the job"
+    );
+}
+
 /// The owner ruling's fallback: a corpse whose record carries no session id (a
 /// file written before the field existed) keeps the existing aged branch,
 /// byte-for-byte as shipped — the orphan copy names a handle and must not fire
@@ -8440,9 +9166,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
     }
 }
 
-/// Slice 4: the description names the uncapped contract, the host Task parking
-/// threshold, the cost of a blocking call, and the fan-out guidance. Dropping
-/// any one during a prose edit would otherwise be silent.
+/// The description names the uncapped contract, the host Task parking
+/// threshold, the cost of a blocking call, the fan-out guidance and the
+/// long-queue recipe. Dropping any one during a prose edit would otherwise be
+/// silent.
 #[test]
 fn the_delegate_description_names_the_usage_contract() {
     let text = tool_entry_text("delegate");
@@ -8460,12 +9187,28 @@ fn the_delegate_description_names_the_usage_contract() {
         "distinct prompts",
         "fans the SAME prompt out",
         "pick the account with `profiles` first",
+        // The long-queue recipe, right after the fan-out sentence it extends.
+        "across accounts. A long queue runs the same way: keep a batch of \
+         `background: true` calls in flight and start the next as each result arrives.",
     ] {
         assert!(
             text.contains(phrase),
             "`delegate` description dropped {phrase:?}: {text}",
         );
     }
+
+    // `tool_entry_text` folds every whitespace run to one space; only the raw
+    // description shows the recipe still shares the fan-out paragraph.
+    let tools = ClauthServer::new().tool_router.list_all();
+    let raw = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .and_then(|t| t.description.as_deref())
+        .expect("the delegate tool carries a description");
+    assert!(
+        raw.contains("across accounts. A long queue runs the same way:"),
+        "the long-queue recipe left the fan-out paragraph: {raw:?}",
+    );
 }
 
 /// `which` folded into `profiles({scope: "session"})`, and the old
@@ -8982,7 +9725,7 @@ fn roster_rank_takes_the_first_live_5h_bar_when_a_label_occurs_twice() {
 /// old `usage_cache.json` from that earlier life. The leftover is not headroom:
 /// the shared cache selector says the account's figures live in the
 /// third-party cache, so the rank falls through to that arm exactly as
-/// `published_windows` drops the leftover, never sorting the account on a
+/// `published_windows_with_label` drops the leftover, never sorting the account on a
 /// stale Anthropic window its own published `windows[]` carries none of (#74).
 #[test]
 fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
@@ -9158,7 +9901,7 @@ fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
 /// An api-key account whose disk still holds a stale OAuth `usage_cache.json`
 /// from an earlier OAuth life ranks off its own provider bars, never the
 /// stale Anthropic window — the same stale-leftover read
-/// `profile_json::published_windows` guards against, and the reason
+/// `profile_json::published_windows_with_label` guards against, and the reason
 /// `load_usage` answers nothing for an api-key account, dropping the rank
 /// onto the provider's own live bars.
 #[test]
@@ -9690,6 +10433,73 @@ fn a_mid_run_401_invalid_names_the_key_dead_and_the_fix() {
     assert_eq!(
         envelope["session_id"], "sess-401-1",
         "the lane stays resumable through the pinned handle: {envelope}"
+    );
+}
+
+/// The whole failure reply after a 401 invalid key, byte for byte, on an
+/// account with no proxy claim: its fix is the api-key re-capture.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_reply_on_a_non_proxy_account_is_pinned_by_equality() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-401-4",
+        Some(42),
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(
+        envelope["result"].as_str(),
+        Some(
+            "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+             provider refused this run (401) naming the api key invalid; clauth dropped this \
+             account's cached balance — `profiles` shows no figure for 'work' until the key is \
+             re-captured (`clauth login work --api-key`). pick the run back up with \
+             `session_id: \"<session_id>\"`"
+        )
+    );
+}
+
+/// A proxy account's key is the proxy's to mint, so the same 401 reply on one
+/// names the re-capture through its proxy, the one login clauth takes for it;
+/// the rest of the reply is the non-proxy one's.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_reply_on_a_proxy_account_names_the_login_through_its_proxy() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let service = crate::proxy::Service::parse("stub").unwrap();
+    let outcome = super::classify_run_with(
+        super::Isolation::Shared,
+        None,
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "px",
+        "sess-401-5",
+        Some(42),
+        Some(&service),
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(
+        envelope["result"].as_str(),
+        Some(
+            "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+             provider refused this run (401) naming the api key invalid; clauth dropped this \
+             account's cached balance — `profiles` shows no figure for 'px' until the key is \
+             re-captured (`clauth login px --proxy stub`). pick the run back up with \
+             `session_id: \"<session_id>\"`"
+        )
     );
 }
 
@@ -11465,8 +12275,8 @@ fn a_blocking_run_is_cancellable_from_its_spawn_and_the_entry_travels_with_the_c
 }
 
 /// The attached half of the same lifecycle: a blocking run whose caller is
-/// still waiting drops the liveness record and the registry entry together at
-/// the finalize, in that order, so the id stops reading held the moment the
+/// still waiting settles its liveness record and retires the registry entry
+/// together at the finalize, so the id stops reading held the moment the
 /// record stops reading live.
 #[test]
 fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_record() {
@@ -11481,10 +12291,92 @@ fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_r
         !super::cancel_job(&id),
         "the entry retires with the liveness record it guarded"
     );
-    assert!(
-        job_files().is_empty(),
-        "and the record itself is gone too: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "the record stays under its liveness spelling only, settled"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
+    );
+}
+
+/// An attached run's finish leaves its outcome on the liveness record it
+/// already owns, and never its result: the caller took that through the join.
+#[test]
+fn an_attached_finish_leaves_its_outcome_on_its_liveness_record() {
+    for (envelope, failed) in [
+        (
+            serde_json::json!({"profile": "work", "result": "the caller got this"}),
+            false,
+        ),
+        (
+            serde_json::json!({"profile": "work", "is_error": true, "result": "refused"}),
+            true,
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        let handoff = super::Handoff::blocking(mint_spec("work"));
+        handoff.mark_spawned();
+        let id = handoff.spec().expect("liveness record").job_id;
+        handoff.finalize(&envelope);
+
+        let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+        let job = listed
+            .iter()
+            .find(|job| job.record.job_id == id)
+            .unwrap_or_else(|| panic!("the finished run is still listed: {envelope}"));
+        assert_eq!(job.kind, jobs::RecordKind::Liveness, "{envelope}");
+        assert!(
+            matches!(job.liveness, jobs::JobLiveness::Done),
+            "the record reads done: {envelope}"
+        );
+        assert!(
+            job.record.envelope.is_none() || job.record.envelope == Some(serde_json::Value::Null),
+            "no result rides the settled record: {envelope}"
+        );
+        assert_eq!(super::done_job_failed(&job.record), failed, "{envelope}");
+    }
+}
+
+/// The settled record keeps the session id the run's envelope names, as a
+/// background finish's done record does, so its row keeps the handle.
+#[test]
+fn an_attached_finish_keeps_its_session_id_on_the_settled_record() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({
+        "profile": "work",
+        "session_id": "5e55-0",
+        "result": "the caller got this",
+    }));
+
+    let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+    let job = listed
+        .iter()
+        .find(|job| job.record.job_id == id)
+        .expect("the finished run is still listed");
+    assert_eq!(job.record.session_id.as_deref(), Some("5e55-0"));
+}
+
+/// `monitor` asked for an attached run that already finished says so, rather
+/// than calling it still running or unknown.
+#[test]
+fn monitor_on_a_finished_attached_run_says_its_result_went_back_through_the_call() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
+
+    assert_eq!(
+        unknown_job_reason(&id, crate::usage::now_ms()),
+        format!(
+            "job_id {id}: the run finished, its result went back through the call that started it"
+        ),
     );
 }
 
@@ -11579,26 +12471,31 @@ fn an_abandoned_run_with_no_child_yet_mints_nothing_and_stops_instead() {
 /// finalize. The mint sits outside the state lock (so both leaves stay leaves),
 /// which is exactly what makes this window exist.
 #[test]
-fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
+fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_nothing_collectable() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "landed first"}));
-    assert!(
-        job_files().is_empty(),
-        "a run still attached to its caller writes nothing: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "a run still attached to its caller leaves only its settled liveness record"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
     );
 
     assert!(
         matches!(handoff.hand_off(), super::Abandoned::Kept),
         "and a hand-off reaching a finished run reports nothing to collect",
     );
-    assert!(
-        job_files().is_empty(),
-        "leaving no orphan behind either: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "leaving no collectable orphan behind either"
     );
 
     // The true race — the run landing while its reservation is being minted —
@@ -11686,13 +12583,13 @@ fn monitor_cannot_collect_a_blocking_run_under_either_spelling() {
 
 /// M9's half of the seam: a blocking run gets a LIVENESS record at its spawn, so
 /// an operator can watch a delegate whose caller is still holding the line — and
-/// the record goes away when that caller takes the envelope, because a record
-/// left behind promises a result nobody will ever collect.
+/// when that caller takes the envelope the record settles as done without it,
+/// under the spelling no `monitor` id reaches, so it promises no second result.
 ///
 /// The mint sits at the spawn rather than at construction because that is the
 /// boundary a child exists at; the pre-spawn arm below is what that buys.
 #[test]
-fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes() {
+fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_collectable_when_it_finishes() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     assert!(
@@ -11733,11 +12630,15 @@ fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes(
     assert_eq!(listed[0].kind, jobs::RecordKind::Liveness);
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
-    assert!(
-        job_files().is_empty(),
-        "the caller took the envelope from the join, so the record retires with \
-         it rather than offering a second delivery: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{}.live.json", spec.job_id)],
+        "the caller took the envelope from the join, so the record settles under \
+         its liveness spelling rather than offering a second delivery"
+    );
+    assert!(
+        jobs::read(&spec.job_id).is_none(),
+        "and the id still collects nothing"
     );
 }
 
@@ -12609,6 +13510,55 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             .unwrap();
         assert_eq!(row[key], serde_json::json!(want), "{id} {key}: {payload}");
     }
+}
+
+/// An orphaned row offers its session id as a resume handle only where
+/// `delegate` accepts it: an isolated run's transcript left with its throwaway
+/// tree, so its row names no resume, while a shared one beside it still does.
+#[test]
+fn the_listing_offers_no_resume_on_an_isolated_orphan() {
+    let _home = HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let started = now_ms() - 10_000;
+    for (id, isolated) in [("d-iso-0", true), ("d-shared-0", false)] {
+        let record = serde_json::json!({
+            "job_id": id,
+            "profile": "acct",
+            "state": "running",
+            "started_at": started,
+            "owner_pid": 4242,
+            "session_id": format!("{id}-sid"),
+            "isolated": isolated,
+        });
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let text = monitor_state_text();
+    let line = |id: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no row for {id}:\n{text}"))
+            .trim()
+            .to_string()
+    };
+
+    assert!(
+        line("d-iso-0").starts_with("job `d-iso-0` orphaned on `acct`, last seen "),
+        "{}",
+        line("d-iso-0")
+    );
+    assert!(
+        line("d-shared-0").starts_with(
+            "job `d-shared-0` orphaned on `acct`; resume with session id `d-shared-0-sid`, last seen "
+        ),
+        "{}",
+        line("d-shared-0")
+    );
 }
 
 /// A store at or under the bound says nothing about what it left out.
@@ -13775,4 +14725,287 @@ fn a_background_preflight_strips_the_routing_a_peer_switch_stamped_after_its_con
     assert_the_peer_switched();
     assert_eq!(result.is_error, Some(true));
     assert_eq!(result_text(&result), handler_refusal_text(REFUSES_NO_MODEL));
+}
+
+/// The proxy account `px` (proxy `stub`) for the two tests below, created the
+/// way `clauth login px --proxy stub` creates it.
+#[cfg(unix)]
+fn create_px_proxy_account() {
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "px".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        "clp_px-key".to_string(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+}
+
+/// A delegate run on proxy account `px` that dies on a 401 invalid key,
+/// through the real spawn path (`run_delegate` + `FakeClaude`'s scripted
+/// failure), names the login through its proxy.
+#[cfg(unix)]
+#[test]
+fn a_delegates_401_on_a_proxy_account_names_the_login_through_its_proxy() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    create_px_proxy_account();
+    let mut fake = FakeClaude::new(&home);
+    fake.set_scripted_failure("401 Authentication Fails, Your api_key is invalid", "1");
+    let result = run_delegate(DelegateOpts {
+        profile: "px",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    let reason = match &result {
+        Ok(envelope) => envelope["result"]
+            .as_str()
+            .unwrap_or("<no result>")
+            .to_owned(),
+        Err(e) => format!("<refused> {e}"),
+    };
+    assert_eq!(
+        reason,
+        "claude exited with 1: 401 Authentication Fails, Your api_key is invalid. the \
+         provider refused this run (401) naming the api key invalid; clauth dropped this \
+         account's cached balance — `profiles` shows no figure for 'px' until the key is \
+         re-captured (`clauth login px --proxy stub`). pick the run back up with \
+         `session_id: \"<session_id>\"`"
+    );
+}
+
+/// The next delegate to proxy account `px` after a 401 proved its key dead
+/// is refused before the spawn, naming the login through its proxy.
+#[cfg(unix)]
+#[test]
+fn the_preflight_refusal_on_a_dead_keyed_proxy_account_names_the_login_through_its_proxy() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    create_px_proxy_account();
+    let name = crate::profile::ProfileName::from("px");
+    let profile = crate::profile::load_profile(&name).expect("load");
+    assert!(
+        profile.proxy.is_some(),
+        "fixture control: the runtime proxy claim"
+    );
+    crate::profile_cache::write_dead_key(
+        &name,
+        crate::usage::profile_key_fingerprint(&profile).expect("a keyed profile"),
+    );
+    // An admitted run (a regression) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "px",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("api key rejected: px (run `clauth login px --proxy stub`)".to_string())
+    );
+}
+
+/// A delegate to a keyless proxy account the pre-flight's keyless arm reads
+/// (a recognised provider's endpoint) is refused before the spawn, naming the
+/// login through its proxy.
+#[cfg(unix)]
+#[test]
+fn the_preflight_refusal_on_a_keyless_proxy_account_names_the_login_through_its_proxy() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "pk".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-2".to_string(),
+        },
+        "https://api.deepseek.com/anthropic".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let profile =
+        crate::profile::load_profile(&crate::profile::ProfileName::from("pk")).expect("load");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            profile.is_third_party(),
+            crate::claude::has_inference_auth(&profile),
+        ),
+        (true, true, false),
+        "fixture control: (the runtime proxy claim, a recognised provider, an auth source)"
+    );
+    // An admitted run (a regression) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "pk",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("profile has no api key: pk (run `clauth login pk --proxy stub`)".to_string())
+    );
+}
+
+/// A delegate to a keyless proxy account on its proxy's loopback bind (the
+/// shape `clauth login <name> --proxy <service>` creates, its key cleared
+/// since) is refused before the spawn, naming the login through its proxy:
+/// it cannot pay, so it never spawns a run that dies on auth.
+#[cfg(unix)]
+#[test]
+fn a_delegate_to_a_keyless_proxy_account_on_its_bind_is_refused_before_the_spawn() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "pb".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-3".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let profile =
+        crate::profile::load_profile(&crate::profile::ProfileName::from("pb")).expect("load");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            crate::claude::has_inference_auth(&profile),
+        ),
+        (true, false),
+        "fixture control: (the runtime proxy claim, an auth source)"
+    );
+    // An admitted run (the defect) spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "pb",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Err("profile has no api key: pb (run `clauth login pb --proxy stub`)".to_string())
+    );
+}
+
+/// A keyless proxy account holding a stored OAuth pair loads as that OAuth
+/// login (the load boundary drops its bind), so a delegate to it runs on the
+/// login and is never refused for the key it does not need.
+#[cfg(unix)]
+#[test]
+fn a_delegate_to_a_keyless_proxy_account_the_load_reads_as_oauth_is_not_refused_for_a_key() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::load_config().expect("config");
+    crate::actions::create_proxy_profile(
+        &mut config,
+        "po".to_string(),
+        crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-4".to_string(),
+        },
+        "http://127.0.0.1:9141".to_string(),
+        String::new(),
+        Some("opus".to_string()),
+    )
+    .expect("create the proxy account");
+    let name = crate::profile::ProfileName::from("po");
+    let mut stored = crate::profile::load_profile(&name).expect("load");
+    stored.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-po".to_string(),
+            refresh_token: Some("rt-po".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&stored).expect("save the pair");
+    let profile = crate::profile::load_profile(&name).expect("reload");
+    assert_eq!(
+        (
+            profile.proxy.is_some(),
+            profile.base_url.clone(),
+            crate::claude::has_inference_auth(&profile),
+            profile.refresh_token().is_some(),
+        ),
+        (true, None, false, true),
+        "fixture control: (the runtime proxy claim, the bind, an auth source, a stored pair)"
+    );
+    // An admitted run spawns this stub, never the box's `claude`.
+    let _fake = crate::testutil::FakeClaude::new(&home);
+    let result = run_delegate(DelegateOpts {
+        profile: "po",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    assert_eq!(
+        result.map(|_| "<admitted>".to_string()),
+        Ok("<admitted>".to_string())
+    );
 }

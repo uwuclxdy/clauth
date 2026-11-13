@@ -35,8 +35,10 @@ mod list;
 mod live_sessions;
 mod lock;
 mod lockorder;
+mod login_page;
 mod logline;
 mod mcp;
+mod mcp_sync;
 mod oauth;
 mod oauth_login;
 mod out;
@@ -52,8 +54,10 @@ mod profile_json;
 mod profile_notes;
 mod providers;
 mod proxy;
+mod proxy_account;
 mod proxy_check;
 mod proxy_list;
+mod proxy_tokens;
 mod push;
 mod rex;
 mod runtime;
@@ -65,6 +69,7 @@ mod spinner;
 mod start;
 mod status;
 mod throughput;
+mod tls_roots;
 mod token_ledger;
 mod tokens;
 mod tps;
@@ -82,7 +87,7 @@ use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::format::{grapheme_cells, pad_cells};
-use crate::out::{errln, out, outln};
+use crate::out::{errln, errln_or_drop, out, outln, outln_or_drop};
 use crate::profile::{AppConfig, Profile, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
@@ -119,14 +124,15 @@ fn claude_roster_part(config: &AppConfig) -> Vec<String> {
 
 fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
     usage_error(format!(
-        "profile '{name}' not found\navailable: {}",
+        "{}\navailable: {}",
+        actions::profile_not_found_head(name),
         parts.join(", ")
     ))
 }
 
 /// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
 /// with a [`UsageError`]. Shared by every claude-only profile-naming command:
-/// `disable`/`enable`/`rolling-token`/`static-token`, which pass their own
+/// `disable`/`enable`/`rename`/`rolling-token`/`static-token`, which pass their own
 /// `verb` so a codex name is refused as what it is (a real account on the
 /// harness this verb does not reach) and a name on neither roster lists the
 /// claude roster alone, the only one these verbs take. A roster that fails to
@@ -198,6 +204,45 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
+/// A run that failed, then a signal read during its cleanup ended it (a proxy
+/// login's failure, during the cancel of its flow or the delete of the
+/// account it had just created; the signal may have arrived before the
+/// cleanup, pending from the failed step, and been read during it).
+/// [`exit_code`] still prints the failure, the reason the run stopped, and
+/// answers `128 + signal`. It reads as the failure: its text, and the
+/// failure's causes beneath it.
+#[derive(Debug)]
+pub(crate) struct InterruptedAfter {
+    pub(crate) error: anyhow::Error,
+    pub(crate) signal: i32,
+}
+
+impl std::fmt::Display for InterruptedAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for InterruptedAfter {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// A run that ended because its stdout reader left, after cleaning up what it
+/// had open (a proxy login cancelling its flow). [`exit_code`] answers 0 with
+/// no line, `out`'s rule for a reader that left.
+#[derive(Debug)]
+pub(crate) struct ReaderLeft;
+
+impl std::fmt::Display for ReaderLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout's reader left")
+    }
+}
+
+impl std::error::Error for ReaderLeft {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
@@ -205,12 +250,25 @@ fn usage_error(msg: impl Into<String>) -> anyhow::Error {
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
 /// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
-/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
-/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
-/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
-/// said what happened on stderr — so the message surface is unchanged now that
-/// `main` maps the code itself.
+/// `128 + signal` for an [`Interrupted`] or [`InterruptedAfter`] run, 0 for a
+/// [`ReaderLeft`] one, 1 for any other failure. Prints the error exactly as
+/// anyhow's `Result` `Termination` did (`Error: {:?}`) — an
+/// [`InterruptedAfter`] its failure — except the [`HelpRendered`],
+/// [`Interrupted`], [`FailureReported`] and [`ReaderLeft`] arms, whose
+/// commands already said what happened on stderr or have no reader left — so
+/// the message surface is unchanged now that `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
+    // Through `errln!`, so a test's stderr capture takes the line too.
+    let mut line = Vec::new();
+    let code = exit_code_to(result, &mut line);
+    if let Some(line) = line.strip_suffix(b"\n") {
+        errln!("{}", String::from_utf8_lossy(line));
+    }
+    code
+}
+
+/// [`exit_code`] printing its line to `stderr`, so a test reads the line.
+pub(crate) fn exit_code_to(result: Result<()>, stderr: &mut impl std::io::Write) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -220,13 +278,23 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            if e.downcast_ref::<ReaderLeft>().is_some() {
+                return 0;
+            }
             if e.downcast_ref::<FailureReported>().is_some() {
                 return 1;
             }
-            // `errln!`, so a reader that walked away from `2>&1 | head` still
-            // gets this code rather than the 101 `eprintln!` panicked with.
-            errln!("Error: {e:?}");
-            if e.downcast_ref::<UsageError>().is_some() {
+            let (e, signal) = match e.downcast::<InterruptedAfter>() {
+                Ok(cut) => (cut.error, Some(cut.signal)),
+                Err(e) => (e, None),
+            };
+            // `errln!`'s own writer, so a reader that walked away from
+            // `2>&1 | head` still gets this code rather than the 101
+            // `eprintln!` panicked with.
+            out::write_chunk(stderr, format_args!("Error: {e:?}"), true, "stderr");
+            if let Some(signal) = signal {
+                128 + signal
+            } else if e.downcast_ref::<UsageError>().is_some() {
                 2
             } else {
                 1
@@ -298,6 +366,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             force,
         } => cmd_delete(&profile, yes, force),
+        Command::Rename { profile, new_name } => cmd_rename(&profile, &new_name),
         Command::Disable { profile, yes } => cmd_disable(&profile, yes),
         Command::StaticToken {
             profile,
@@ -659,7 +728,8 @@ impl std::fmt::Display for RebindPartial {
 impl std::error::Error for RebindPartial {}
 
 /// The failure's lines were already printed to stderr (a re-bind's, one per
-/// failed account; a refused bare-item settle's `clauth:` line);
+/// failed account; a refused bare-item settle's `clauth:` line; the TUI's
+/// `Error:` line, dropped when stderr cannot take it);
 /// [`exit_code`] maps this to exit 1 with no `Error:` line, the way
 /// [`HelpRendered`] maps to 2 after help already printed.
 #[derive(Debug)]
@@ -1345,7 +1415,12 @@ fn feed_paste_piped(
 /// preamble, so the OAuth login and the Alibaba console capture cannot drift
 /// into two spellings of it again.
 fn print_browser_fallback(url: &str) {
-    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+    outln!("{}", browser_fallback(url));
+}
+
+/// [`print_browser_fallback`]'s lines, for a login that prints them itself.
+fn browser_fallback(url: &str) -> String {
+    format!("\nBrowser didn't open? Use the url below to sign in\n{url}\n")
 }
 
 /// Run an OAuth login (preamble, the links, minted tokens, login summary,
@@ -1451,7 +1526,10 @@ fn settle_bare_item_for_cli(
 /// the write lands. Neither path switches to the profile (`clauth <name>` does
 /// that). `--model` is persisted onto the account the login claimed, after the
 /// capture. Once the login claims its account, everything it reuses or writes
-/// reads that account fresh; the config read on entry only routes.
+/// reads that account fresh; the config read on entry only routes. An existing
+/// proxy account is refused before any arm runs, and again where each arm
+/// lands, changing nothing: it re-logs in through its proxy
+/// ([`actions::refuse_relogin_off_proxy`]).
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -1461,6 +1539,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         } else {
             actions::codex_login_capture(&args.profile)
         };
+    }
+    if let Some(service) = args.proxy.as_deref() {
+        return cmd_login_proxy(&args, service);
     }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
@@ -1472,6 +1553,11 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         }
     });
     let reauth = matches!(route, LoginRoute::Reauth(_));
+    if reauth {
+        // Ahead of every arm below, each of which may prompt or open a
+        // browser before it writes.
+        actions::refuse_relogin_off_proxy(&target)?;
+    }
     let is_api = args.is_api_mode();
 
     // CLA-SPLIT capture flow: `--setup-token` writes the profile's
@@ -1615,6 +1701,656 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
+/// `clauth login <name> --proxy <service>` — register `name` as an account of
+/// an ENABLED proxy and log in through the proxy's own flow: the flow's page
+/// opens (the fallback URL prints below it, whole), a TTY can paste a code
+/// through the paste door while the poll waits the flow out to its
+/// `expires_at` (first door wins), and SIGINT or SIGTERM cancels the flow and
+/// exits `128 + signal`.
+///
+/// Success creates profile `<name>` with `base_url` = the proxy's bind and the
+/// returned inference key as its api key, plus the `[proxy]` record the
+/// delete/settings/usage arms key off; a login whose key never reached clauth
+/// mints one for the account, and one whose save fails deletes the account
+/// the proxy just created ([`proxy_account::refuse_unsaved_account`]). A
+/// login the proxy completes onto an account another profile holds is refused,
+/// minting, deleting and saving nothing ([`proxy_account::held_account`]). An
+/// existing name that already holds a proxy record for the SAME service
+/// re-authenticates in place — the re-bind flow,
+/// keeping every other field and its stored key (minting a key only when it
+/// stores none or one carrying a dead-key verdict, and setting the model when
+/// `--model` names one); a re-bind
+/// the proxy completes onto another account id is refused, changing nothing.
+/// An existing name without a record, with one clauth cannot read, or with
+/// one on another service, is refused before any request, since converting a live account's credential shape silently is the
+/// overwrite the confirm gate exists for. The upstream credential never
+/// crosses: the `done` body is read for the account id and the inference key
+/// alone.
+fn cmd_login_proxy(args: &LoginArgs, raw_service: &str) -> Result<()> {
+    match login_proxy(args, raw_service) {
+        Ok(captured) => {
+            outln!("{captured}");
+            Ok(())
+        }
+        Err(e) => Err(match e.downcast::<proxy_account::LoginInterrupted>() {
+            // The login settled the flow before it returned; the interrupt's
+            // text is the line saying how it ended on the proxy, and
+            // [`exit_code`] answers the shell's `128 + signal` after it. A
+            // signal on a start that opened no flow, or a second signal,
+            // arrives as a bare [`Interrupted`] instead.
+            Ok(interrupted) => {
+                errln!("{interrupted}");
+                Interrupted(interrupted.signal()).into()
+            }
+            Err(e) => e,
+        }),
+    }
+}
+
+/// [`cmd_login_proxy`] before anything is reported: the success line comes
+/// back to print, and an interrupt as [`proxy_account::LoginInterrupted`],
+/// its flow cancel already run.
+fn login_proxy(args: &LoginArgs, raw_service: &str) -> Result<String> {
+    let service = proxy::service_arg(raw_service)?;
+    let row = proxy::Registry::load()?
+        .get(&service)
+        .cloned()
+        .ok_or_else(|| proxy::not_registered(&service))?;
+    anyhow::ensure!(
+        row.enabled,
+        "proxy {:?} is disabled; run `clauth proxy enable {service}` first",
+        service.as_str()
+    );
+
+    let mut config = load_config()?;
+    let route = login_route(&config, &args.profile);
+    let (target, rebind) = match &route {
+        LoginRoute::New(fresh) => {
+            actions::validate_profile_name(fresh, crate::harness::Harness::Claude, None)?;
+            let fresh = ProfileName::from(fresh.clone());
+            // Before the flow opens, as `capture_new_profile` refuses: the
+            // create would only refuse after the proxy made the account.
+            actions::refuse_leftover_login(&fresh)?;
+            (fresh, None)
+        }
+        LoginRoute::Reauth(existing) => {
+            let name = ProfileName::from(existing.clone());
+            match crate::profile::stored_proxy_claim(&name) {
+                crate::profile::ProxyClaim::Account(rec) if rec.service == service => {
+                    (name, Some(rec.account))
+                }
+                crate::profile::ProxyClaim::Account(rec) => anyhow::bail!(
+                    "'{existing}' is already a proxy account on {:?}; log in to proxy \
+                     {:?} under another name",
+                    rec.service.as_str(),
+                    service.as_str()
+                ),
+                // A table clauth cannot read still names an account on some
+                // proxy: "not a proxy account" would send the user to a second
+                // one under a new name, orphaning the first.
+                // `stored_proxy_claim` never answers `Unclassifiable`; the
+                // `None` below writes nothing either.
+                crate::profile::ProxyClaim::Unreadable
+                | crate::profile::ProxyClaim::Unclassifiable => {
+                    return Err(actions::unreadable_proxy_login(&name));
+                }
+                crate::profile::ProxyClaim::None => anyhow::bail!(
+                    "'{existing}' exists and is not a proxy account; `--proxy` registers a \
+                     proxy profile under a new name"
+                ),
+            }
+        }
+    };
+
+    let key_stored = || {
+        crate::profile::stored_endpoint_identity(&target)
+            .and_then(|stored| {
+                crate::usage::inference_key_fingerprint(
+                    stored.api_key.as_deref(),
+                    crate::profile::inference_env_token(&stored.env).as_deref(),
+                )
+            })
+            .is_some_and(|key| !crate::profile_cache::dead_key_matches(&target, key))
+    };
+    let holder = |account: &str| {
+        actions::proxy_account_holder(
+            &crate::profile::claude_roster_names().ok()?,
+            &crate::profile::ProxyAccount {
+                service: service.clone(),
+                account: account.to_string(),
+            },
+        )
+    };
+
+    // Before the flow opens, so a signal from the start on finds its handler
+    // and cancels the flow instead of killing clauth with it left polling.
+    let mut interrupted = login_interrupt()?;
+    let control = proxy_account::Control::connect(&service)?;
+    let mut flow = proxy_account::start_login(&control, rebind.as_deref(), &mut *interrupted)?;
+    let url = control.printable_url(&flow.start().url);
+    print_while_open(
+        &mut flow,
+        &mut *interrupted,
+        format_args!("{}", proxy_login_opening_line(&service, &target, &url)),
+        true,
+    )?;
+    print_while_open(
+        &mut flow,
+        &mut *interrupted,
+        format_args!("{}", browser_fallback(&url)),
+        true,
+    )?;
+    let _ = crate::platform::open_url(&flow.start().url);
+    // Every exit from here until the flow reads `done` cancels it on the
+    // proxy, and every exit from here on drops `paste`, which ends a prompt
+    // line it leaves open.
+    let modes = flow.start().modes.clone();
+    let paste = PromptDoor {
+        door: open_paste_door(&modes, &mut |prompt| {
+            print_while_open(&mut flow, &mut *interrupted, prompt, false)
+        })?,
+        closed: false,
+    };
+    let outcome = flow.await_done(proxy_account::AwaitLogin {
+        paste: &paste.door,
+        interrupted: &mut *interrupted,
+        wait: &|d| std::thread::sleep(d),
+        say: &login_stderr,
+        profile: target.as_str(),
+        key_stored: &key_stored,
+        holder: &holder,
+    })?;
+    let record = crate::profile::ProxyAccount {
+        service: service.clone(),
+        account: outcome.account.clone(),
+    };
+    match &route {
+        LoginRoute::New(_) => {
+            if let Some(holder) = holder(&outcome.account) {
+                return Err(proxy_account::held_account(
+                    &control,
+                    &target,
+                    &outcome.account,
+                    &holder,
+                ));
+            }
+            let Some(key) = outcome.inference_key.as_ref() else {
+                return Err(proxy_account::keyless(&service));
+            };
+            #[cfg(test)]
+            run_before_save_door();
+            if let Err(error) = actions::create_proxy_profile(
+                &mut config,
+                target.to_string(),
+                record,
+                format!("http://{}", proxy::bind(row.port)),
+                key.expose().to_string(),
+                args.model.clone(),
+            ) {
+                if let Some(held) = error.downcast_ref::<proxy_account::AccountHeld>() {
+                    return Err(proxy_account::held_account(
+                        &control,
+                        &target,
+                        &outcome.account,
+                        &held.holder,
+                    ));
+                }
+                return Err(proxy_account::refuse_unsaved_account(
+                    &control,
+                    &outcome.account,
+                    error,
+                    &mut *interrupted,
+                ));
+            }
+        }
+        LoginRoute::Reauth(_) => {
+            if let Some(own) = rebind.as_deref()
+                && own != outcome.account
+            {
+                anyhow::bail!(
+                    "proxy {:?} logged '{target}' in as account {:?}, not its own account \
+                     {:?}; nothing was changed. Run `clauth proxy check {service}` for details",
+                    service.as_str(),
+                    control.printable(&outcome.account),
+                    control.printable(own)
+                );
+            }
+            let key = outcome
+                .inference_key
+                .as_ref()
+                .map(|key| key.expose().to_string());
+            // On a reauth `--model` is an explicit override; without it the
+            // profile's existing model settings survive.
+            let model = args.model.as_deref();
+            #[cfg(test)]
+            run_before_save_door();
+            if actions::update_proxy_login(&mut config, &target, &record, key, model)?
+                == actions::ProxyRelogin::Keyless
+            {
+                // The key the flow kept on the profile's word was cleared
+                // before the save: a re-bind of a keyless profile mints one.
+                let key = proxy_account::mint_rebound_key(
+                    &control,
+                    &outcome.account,
+                    target.as_str(),
+                    &mut *interrupted,
+                )?;
+                actions::update_proxy_login(
+                    &mut config,
+                    &target,
+                    &record,
+                    Some(key.expose().to_string()),
+                    model,
+                )?;
+            }
+        }
+    }
+    let captured =
+        proxy_login_captured_line(&service, &target, &control.printable(&outcome.account));
+    Ok(paste.close_before(captured))
+}
+
+/// The proxy login's paste door and the prompt line it printed. A reader still
+/// waiting on the prompt holds its sender, so the line is still open on the
+/// terminal (the browser door won); a line the reader read ended it, and a
+/// closed door printed no prompt. Whatever the login prints next starts on a
+/// line of its own: the success line through [`Self::close_before`], every
+/// other exit's line once this drops, ahead of it.
+struct PromptDoor {
+    door: std::sync::mpsc::Receiver<String>,
+    closed: bool,
+}
+
+impl PromptDoor {
+    fn is_open(&self) -> bool {
+        matches!(
+            self.door.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        )
+    }
+
+    /// `line`, starting on a line of its own when the prompt's is still open.
+    fn close_before(mut self, line: String) -> String {
+        self.closed = true;
+        if self.is_open() {
+            format!("\n{line}")
+        } else {
+            line
+        }
+    }
+}
+
+impl Drop for PromptDoor {
+    fn drop(&mut self) {
+        if !self.closed && self.is_open() {
+            end_prompt_line();
+        }
+    }
+}
+
+/// End the paste prompt's open line, through the login's own stdout writer:
+/// it runs as the login returns, ahead of its line on stderr and its exit
+/// code, and `outln!` would end the run there at exit 0 once stdout's reader
+/// left. A newline that cannot land changes nothing the run reports, so its
+/// outcome is dropped, a write error included: a panic in this drop would
+/// take the line and the code with it.
+fn end_prompt_line() {
+    let _ = with_login_stdout(|mut stdout| {
+        crate::out::write_chunk_result(&mut stdout, format_args!(""), true)
+    });
+}
+
+/// One stdout chunk of a proxy login whose flow is still open. `outln!` ends
+/// the run at exit 0 once stdout's reader leaves, and that exit runs no
+/// destructor, so it would leave the proxy polling upstream for a login nobody
+/// finishes: a reader that left here cancels the flow first, and the run then
+/// ends at 0 through [`ReaderLeft`]. Any other write error panics as `outln!`
+/// does, and the unwind's drop cancels the flow.
+fn print_while_open(
+    flow: &mut proxy_account::LoginFlow<'_>,
+    interrupted: &mut dyn FnMut() -> Option<i32>,
+    chunk: std::fmt::Arguments<'_>,
+    newline: bool,
+) -> Result<()> {
+    match login_stdout(chunk, newline) {
+        crate::out::Wrote::Yes => Ok(()),
+        crate::out::Wrote::ReaderGone => {
+            flow.cancel(interrupted)?;
+            Err(ReaderLeft.into())
+        }
+    }
+}
+
+/// Stdout for [`print_while_open`].
+fn login_stdout(chunk: std::fmt::Arguments<'_>, newline: bool) -> crate::out::Wrote {
+    with_login_stdout(|mut stdout| crate::out::write_chunk(&mut stdout, chunk, newline, "stdout"))
+}
+
+/// `write` run on the stdout a proxy login prints to.
+#[cfg(not(test))]
+fn with_login_stdout<T>(write: impl FnOnce(&mut dyn std::io::Write) -> T) -> T {
+    write(&mut std::io::stdout().lock())
+}
+
+/// A test build hands over the calling thread's [`ProxyLoginDoors`] stdout
+/// when one is held, and the real one otherwise.
+#[cfg(test)]
+fn with_login_stdout<T>(write: impl FnOnce(&mut dyn std::io::Write) -> T) -> T {
+    PROXY_LOGIN_DOORS.with(|doors| {
+        match doors.borrow_mut().as_mut().and_then(|d| d.stdout.as_mut()) {
+            Some(held) => write(held.as_mut()),
+            None => write(&mut std::io::stdout().lock()),
+        }
+    })
+}
+
+/// One stderr line of a proxy login that keeps waiting ([`errln!`]).
+#[cfg(not(test))]
+fn login_stderr(line: std::fmt::Arguments<'_>) {
+    errln!("{line}");
+}
+
+/// A test build hands the line to the calling thread's [`ProxyLoginDoors`]
+/// stderr when one is held, and to [`errln!`] otherwise.
+#[cfg(test)]
+fn login_stderr(line: std::fmt::Arguments<'_>) {
+    PROXY_LOGIN_DOORS.with(|doors| {
+        match doors.borrow_mut().as_mut().and_then(|d| d.stderr.as_mut()) {
+            Some(held) => {
+                let _ = std::io::Write::write_fmt(held, format_args!("{line}\n"));
+            }
+            None => errln!("{line}"),
+        }
+    });
+}
+
+/// The proxy login's progress line; `url` arrives escaped.
+fn proxy_login_opening_line(service: &proxy::Service, target: &str, url: &str) -> String {
+    format!(
+        "clauth: logging in to proxy {:?} for '{target}', opening {url}...",
+        service.as_str()
+    )
+}
+
+/// The proxy login's success line; `account` arrives escaped.
+fn proxy_login_captured_line(service: &proxy::Service, target: &str, account: &str) -> String {
+    format!(
+        "clauth: captured into profile '{target}' (proxy {:?}, account {account:?}). Switch to \
+         it with:  clauth {target}",
+        service.as_str()
+    )
+}
+
+/// The proxy login's paste door, open only when the flow declares the mode
+/// and a TTY is there to type into: the prompt prints and a reader thread
+/// sends the one line it reads, so the poll keeps racing it — the browser
+/// door's `done` lands while the prompt still waits. An empty answer, an EOF
+/// or a closed door (no paste mode, no TTY) leaves the poll to wait alone.
+/// `prompt` prints the prompt, and its error is the door's.
+#[cfg(not(test))]
+fn open_paste_door(
+    modes: &[String],
+    prompt: &mut dyn FnMut(std::fmt::Arguments<'_>) -> Result<()>,
+) -> Result<std::sync::mpsc::Receiver<String>> {
+    use std::io::IsTerminal as _;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if modes.iter().any(|mode| mode == "paste") && std::io::stdin().is_terminal() {
+        prompt(format_args!(
+            "clauth: paste the code from the proxy's login page (empty to wait): "
+        ))?;
+        // Detached, like the OAuth login's piped reader: a door the browser
+        // beat keeps it parked on stdin until clauth exits.
+        let _ = std::thread::spawn(
+            move || match read_manual_code_from(std::io::stdin().lock()) {
+                Ok(Some(line)) => {
+                    let _ = tx.send(line.trim().to_string());
+                }
+                Ok(None) => {}
+                Err(e) => errln!("clauth: {e}"),
+            },
+        );
+    }
+    Ok(rx)
+}
+
+/// A test build never reads stdin: the paste door is the calling thread's
+/// [`ProxyLoginDoors`] answer when one is held and the flow offers paste,
+/// its prompt printed as a TTY's would be, and closed otherwise.
+#[cfg(test)]
+fn open_paste_door(
+    modes: &[String],
+    prompt: &mut dyn FnMut(std::fmt::Arguments<'_>) -> Result<()>,
+) -> Result<std::sync::mpsc::Receiver<String>> {
+    let held = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.paste.take())
+    });
+    match held {
+        Some(rx) if modes.iter().any(|mode| mode == "paste") => {
+            prompt(format_args!(
+                "clauth: paste the code from the proxy's login page (empty to wait): "
+            ))?;
+            Ok(rx)
+        }
+        _ => Ok(std::sync::mpsc::channel().1),
+    }
+}
+
+/// The SIGINT or SIGTERM that reached clauth since the proxy login installed
+/// its handlers, in the signal discipline `clauth start` keeps: while they
+/// are held the signal no longer kills clauth, so the login cancels its flow
+/// and exits itself. Dropping the closure does not restore the default
+/// action: `signal-hook-registry` keeps its own handler installed, so both
+/// signals stay ignored until clauth exits, right after the login.
+#[cfg(all(unix, not(test)))]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    use anyhow::Context as _;
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+        .context("failed to install signal handlers")?;
+    Ok(Box::new(move || signals.pending().next()))
+}
+
+/// Windows has no signal handling on this path, as `clauth start` has none:
+/// a Ctrl-C ends clauth and the flow expires on the proxy's own clock.
+#[cfg(all(not(unix), not(test)))]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    Ok(Box::new(|| None))
+}
+
+/// A test build installs no handler (one would hold every sibling test's
+/// signal): the interrupt is the calling thread's [`ProxyLoginDoors`] one.
+#[cfg(test)]
+fn login_interrupt() -> Result<Box<dyn FnMut() -> Option<i32>>> {
+    let held = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.interrupt.take())
+    });
+    Ok(match held {
+        Some(rx) => Box::new(move || rx.try_recv().ok()),
+        None => Box::new(|| None),
+    })
+}
+
+#[cfg(test)]
+struct HeldDoors {
+    paste: Option<std::sync::mpsc::Receiver<String>>,
+    interrupt: Option<std::sync::mpsc::Receiver<i32>>,
+    stdout: Option<Box<dyn std::io::Write>>,
+    stderr: Option<Box<dyn std::io::Write>>,
+    before_save: Option<Box<dyn FnOnce()>>,
+}
+
+/// A test build runs the calling thread's [`ProxyLoginDoors::before_save`]
+/// edit here: after a login's flow read `done`, before its save.
+#[cfg(test)]
+fn run_before_save_door() {
+    let edit = PROXY_LOGIN_DOORS.with(|doors| {
+        doors
+            .borrow_mut()
+            .as_mut()
+            .and_then(|doors| doors.before_save.take())
+    });
+    if let Some(edit) = edit {
+        edit();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROXY_LOGIN_DOORS: std::cell::RefCell<Option<HeldDoors>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_TOKEN_MODE_GUARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_TOKEN_MODE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_DELETE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_delete_claim`] here: after `clauth delete` loaded every
+/// profile, right before it reads the proxy claim, where a `config.toml`
+/// turning unreadable after the load lands.
+#[cfg(test)]
+fn run_before_delete_claim() {
+    if let Some(edit) = BEFORE_DELETE_CLAIM.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `clauth delete` on this thread runs right before its
+/// proxy-claim read.
+#[cfg(test)]
+fn set_before_delete_claim(edit: impl FnOnce() + 'static) {
+    BEFORE_DELETE_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_token_mode_guard`] here: after `static-token`'s, its
+/// `--clear`'s and `rolling-token`'s snapshot (the clear's prompt included),
+/// right before their rotation guard.
+#[cfg(test)]
+fn run_before_token_mode_guard() {
+    if let Some(edit) = BEFORE_TOKEN_MODE_GUARD.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `static-token`, `static-token --clear` or
+/// `rolling-token` on this thread runs right before its rotation guard.
+#[cfg(test)]
+fn set_before_token_mode_guard(edit: impl FnOnce() + 'static) {
+    BEFORE_TOKEN_MODE_GUARD.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// A test build runs the calling thread's edit armed by
+/// [`set_before_token_mode_landing`] here: after `static-token`'s and
+/// `rolling-token`'s read under their rotation guard, right before their stage
+/// landing, where a record the landing's state-flock wait lets in lands.
+#[cfg(test)]
+fn run_before_token_mode_landing() {
+    if let Some(edit) = BEFORE_TOKEN_MODE_LANDING.with(|edit| edit.borrow_mut().take()) {
+        edit();
+    }
+}
+
+/// Arm the edit the next `static-token` or `rolling-token` on this thread runs
+/// right before its stage landing.
+#[cfg(test)]
+fn set_before_token_mode_landing(edit: impl FnOnce() + 'static) {
+    BEFORE_TOKEN_MODE_LANDING.with(|slot| *slot.borrow_mut() = Some(Box::new(edit)));
+}
+
+/// The proxy login's outside doors for logins run on the calling thread while
+/// this guard lives: [`Self::paste`] answers the paste prompt, and
+/// [`Self::interrupt`] stands in for SIGINT/SIGTERM. Per-thread, so a parallel
+/// test's login never reads them, and `!Send` so it cannot be carried to a
+/// thread it does not serve.
+#[cfg(test)]
+pub(crate) struct ProxyLoginDoors(std::marker::PhantomData<*const ()>);
+
+#[cfg(test)]
+impl ProxyLoginDoors {
+    pub(crate) fn capture_here() -> Self {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            *doors.borrow_mut() = Some(HeldDoors {
+                paste: None,
+                interrupt: None,
+                stdout: None,
+                stderr: None,
+                before_save: None,
+            });
+        });
+        Self(std::marker::PhantomData)
+    }
+
+    /// The sender a code typed at the paste prompt arrives on, for the next
+    /// login on this thread.
+    pub(crate) fn paste(&self) -> std::sync::mpsc::Sender<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.paste = Some(rx);
+            }
+        });
+        tx
+    }
+
+    /// The sender a signal's number arrives on, for the next login on this
+    /// thread.
+    pub(crate) fn interrupt(&self) -> std::sync::mpsc::Sender<i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.interrupt = Some(rx);
+            }
+        });
+        tx
+    }
+
+    /// Where the next login on this thread writes the lines it prints while
+    /// its flow is open, in place of the real stdout.
+    pub(crate) fn stdout(&self, writer: impl std::io::Write + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.stdout = Some(Box::new(writer));
+            }
+        });
+    }
+
+    /// Where the next login on this thread writes the lines it says on
+    /// stderr while it keeps waiting, in place of the real stderr.
+    pub(crate) fn stderr(&self, writer: impl std::io::Write + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.stderr = Some(Box::new(writer));
+            }
+        });
+    }
+
+    /// An edit another writer lands while the next login on this thread sits
+    /// between its flow's `done` and its save.
+    pub(crate) fn before_save(&self, edit: impl FnOnce() + 'static) {
+        PROXY_LOGIN_DOORS.with(|doors| {
+            if let Some(doors) = doors.borrow_mut().as_mut() {
+                doors.before_save = Some(Box::new(edit));
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProxyLoginDoors {
+    fn drop(&mut self) {
+        PROXY_LOGIN_DOORS.with(|doors| *doors.borrow_mut() = None);
+    }
+}
+
 /// `clauth capture <name>`: save the login Claude Code is using now as a new
 /// profile, or into the existing profile `name` when the login is a newer pair
 /// of its account. The refusal paths (an existing name the login does not
@@ -1665,7 +2401,7 @@ fn console_login_into(
     model: Option<&str>,
     trip: impl FnOnce(profile::ConsoleSite, &'static str) -> Result<alibaba_login::ConsoleLoginOutcome>,
 ) -> Result<alibaba_login::ConsoleLoginOutcome> {
-    let account = profile::claim_profile_id(target)?;
+    let account = actions::claim_off_proxy(target)??;
     let base_url = profile::read_claimed_profile(target, &account)?
         .base_url
         .unwrap_or_default();
@@ -1691,7 +2427,7 @@ fn reauth_profile(
     confirm: impl FnOnce(&Profile) -> Result<bool>,
     collect: impl FnOnce(&Profile) -> Result<actions::CaptureSnapshot>,
 ) -> Result<Option<AppConfig>> {
-    let account = profile::claim_profile_id(target)?;
+    let account = actions::claim_off_proxy(target)??;
     if !confirm(&profile::read_claimed_profile(target, &account)?)? {
         return Ok(None);
     }
@@ -1817,7 +2553,7 @@ fn setup_token_into(
     collect: impl FnOnce() -> Result<String>,
 ) -> Result<Option<i64>> {
     let claimed = if exists {
-        Some(profile::claim_profile_id(target)?)
+        Some(actions::claim_off_proxy(target)??)
     } else {
         None
     };
@@ -1859,12 +2595,14 @@ fn setup_token_into(
         // The writers take the flock again inside this hold, so the id check
         // and the write it guards are one section.
         Some(account) => crate::lock::with_state_lock(|held| {
+            actions::refuse_relogin_off_proxy(target)?;
             profile::require_profile_id(target, account, held)?;
             write()
         })?,
         // Created just above, with no wait since.
         None => write()?,
     };
+    // After the write, whose proxy refusal must leave the model untouched too.
     if let (Some(account), Some(model)) = (&claimed, model) {
         actions::set_profile_default_model(&mut config, target, account, model)?;
     }
@@ -1899,18 +2637,19 @@ fn setup_token_into(
 /// therefore relinked in the same operation, which on Linux a live session picks
 /// up on the next mtime move.
 ///
-/// Refuses when the profile has no other login to fall back to (a name created
-/// by `--setup-token` alone stores no OAuth pair): clearing there would strip its
-/// only credential. `--yes` skips the confirm, never that guard.
+/// Refuses when clearing would remove the profile's last stored credential (a
+/// name created by `--setup-token` alone stores no OAuth pair); a flag-only
+/// account has no such credential and is not refused. `--yes` skips the confirm,
+/// never that guard.
 ///
-/// "Other login" includes an API KEY, so the fall-back is not always an OAuth
-/// pair and the copy branches on which it is (`claude::has_stored_oauth_login`).
+/// A fall-back can be an API KEY, so it is not always an OAuth pair and the copy
+/// branches on which it is (`claude::has_stored_oauth_login`,
+/// then the profile's `api_key`), with a third arm for an account holding neither.
 /// An api-key profile clears onto an absent install source, where the relink
 /// removes the live slot and, on macOS, signs the Keychain out — correct, since
 /// an active api-key profile must not leave an Anthropic login serving, but the
 /// opposite of the relink every line here used to promise.
 fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
-    use std::io::IsTerminal as _;
     platform::init();
 
     let config = load_config()?;
@@ -1919,6 +2658,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let profile = config
         .find(target)
         .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
+    actions::refuse_token_mode_on_proxy(profile)?;
     let sidecar_present = claude::session_token_status(target).is_some();
     let backup_present = claude::has_static_backup(target);
     let rolling_armed = profile.rolling_token;
@@ -1946,28 +2686,32 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
 
     let active = config.is_active(target);
     if !yes {
-        if !std::io::stdin().is_terminal() {
+        // A test's installed answer stands in for the TTY check as well as the
+        // read, so the prompt's arm runs in-process without a terminal.
+        #[cfg(test)]
+        let seam_answer = CLEAR_CONFIRM_ANSWER.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        let interactive = seam_answer.is_some();
+        #[cfg(not(test))]
+        let interactive = {
+            use std::io::IsTerminal as _;
+            std::io::stdin().is_terminal()
+        };
+        if !interactive {
             anyhow::bail!(
                 "pass --yes to clear the long-lived token for '{target}' non-interactively"
             );
         }
         // What the confirm promises has to be what happens, so it reads the same
-        // fact the relink below branches on. An api-key profile reaches here with
-        // nothing to relink ONTO, and telling it a login comes back is the one
-        // wrong thing to say before an irreversible prompt.
+        // fact the relink below branches on. A profile with no OAuth login reaches
+        // here with nothing to relink ONTO, and telling it a login comes back is
+        // the one wrong thing to say before an irreversible prompt.
         if active {
-            if claude::has_stored_oauth_login(target) {
-                outln!(
-                    "clauth: '{target}' is active. Clearing relinks the live credentials onto \
-                     its stored OAuth login, and running sessions follow."
-                );
-            } else {
-                outln!(
-                    "clauth: '{target}' is active and stores no OAuth login. Clearing signs \
-                     Claude Code out, leaving '{target}' on its api key, and running sessions \
-                     follow."
-                );
-            }
+            let has_login = claude::has_stored_oauth_login(target);
+            outln!(
+                "{}",
+                clear_active_note(target, has_login, profile.api_key.is_some())
+            );
         }
         if rolling_armed {
             outln!("{}", clear_disarm_note(target));
@@ -1976,8 +2720,14 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             outln!("{}", clear_backup_note(target));
         }
         out!("Clear the long-lived token for '{target}'? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
+        #[cfg(test)]
+        let answer = seam_answer.unwrap_or_default();
+        #[cfg(not(test))]
+        let answer = {
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            answer
+        };
         if !reauth_confirmed(&answer) {
             outln!("clauth: aborted. '{target}' left unchanged.");
             return Ok(());
@@ -1995,8 +2745,14 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
     // just reported cleared.
+    #[cfg(test)]
+    run_before_token_mode_guard();
     let guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    // The refusal above read a snapshot from before the prompt and this wait:
+    // a record that landed since is refused on a read under the guard, before
+    // anything of the account moves.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(target)?)?;
     // The relink below puts the store in front of Claude Code: a staged pair
     // lands first.
     oauth::land_stage_for_install(target, &guard)
@@ -2007,6 +2763,9 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // during it — acting on the pre-prompt `active` relinks the wrong world
     // in both directions.
     let on_disk = profile::load_profile(target)?;
+    // Asked again on this read, as the TUI clear does: the record's writer
+    // takes no rotation guard, so it can land during the landing.
+    actions::refuse_token_mode_on_proxy(&on_disk)?;
     let sidecar_present = claude::session_token_status(target).is_some();
     let backup_present = claude::has_static_backup(target);
     // The pre-prompt "nothing to clear" re-checks here on the same three facts:
@@ -2166,10 +2925,64 @@ fn clear_nothing_note(target: &str) -> String {
     format!("clauth: '{target}' holds no long-lived token, so nothing to clear.")
 }
 
+/// The pre-prompt warning of what an active account falls back to, single-caller
+/// and pinned on content for the reason [`clear_disarm_note`] gives.
+fn clear_active_note(target: &str, has_login: bool, has_api_key: bool) -> String {
+    if has_login {
+        format!(
+            "clauth: '{target}' is active. Clearing relinks the live credentials onto its \
+             stored OAuth login, and running sessions follow."
+        )
+    } else if has_api_key {
+        format!(
+            "clauth: '{target}' is active and stores no OAuth login. Clearing signs Claude Code \
+             out, leaving '{target}' on its api key, and running sessions follow."
+        )
+    } else {
+        format!(
+            "clauth: '{target}' is active and stores no login at all. Clearing signs Claude Code \
+             out, and running sessions follow."
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the answer a test's clear command confirms with, standing in
+    /// for both the TTY check and the read. Thread-local so a concurrent test's
+    /// answer never reaches this thread's command.
+    static CLEAR_CONFIRM_ANSWER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only RAII over [`CLEAR_CONFIRM_ANSWER`], cleared on drop. Tied to the
+/// `HomeSandbox` so it cannot outlive the test's home, and `!Send` because the
+/// slot is this thread's.
+#[cfg(test)]
+pub(crate) struct ClearConfirmAnswer<'a>(
+    std::marker::PhantomData<(&'a crate::testutil::HomeSandbox, *const ())>,
+);
+
+#[cfg(test)]
+impl<'a> ClearConfirmAnswer<'a> {
+    pub(crate) fn set(_home: &'a crate::testutil::HomeSandbox, answer: &str) -> Self {
+        CLEAR_CONFIRM_ANSWER.with(|slot| *slot.borrow_mut() = Some(answer.to_string()));
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClearConfirmAnswer<'_> {
+    fn drop(&mut self) {
+        CLEAR_CONFIRM_ANSWER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// The pre-prompt warning that a rolling profile's re-stamping stops with the
 /// clear. Single-caller fns, like the arm-report copy and for the same reason:
-/// there is no stdout capture, so the unit pin is on content and a deleted
-/// print orphans the fn into a dead-code error under `-D warnings`.
+/// the confirm seam reaches the print in a test, but only a content pin keeps
+/// the WORDS, and a deleted print orphans the fn into a dead-code error under
+/// `-D warnings`.
 fn clear_disarm_note(target: &str) -> String {
     format!("clauth: '{target}' is on the rolling token. Clearing also turns its re-stamping off.")
 }
@@ -2234,14 +3047,53 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!("{}", codex_collision_note(&canonical, "deletes"));
     }
-    if !confirm_profile_delete(&canonical, yes)? {
+    #[cfg(test)]
+    run_before_delete_claim();
+    // A `[proxy]` table clauth cannot read still names an upstream account,
+    // and a config.toml clauth cannot classify may hold one: deleting the
+    // profile alone would orphan it on the proxy, so refuse before the
+    // confirm, deleting nothing.
+    let proxy = match crate::profile::stored_proxy_claim_failing_closed(&canonical) {
+        crate::profile::ProxyClaim::Account(record) => Some(record),
+        crate::profile::ProxyClaim::None => None,
+        crate::profile::ProxyClaim::Unreadable => {
+            return Err(actions::unreadable_proxy_record(&canonical));
+        }
+        crate::profile::ProxyClaim::Unclassifiable => {
+            return Err(actions::unclassifiable_proxy_config(&canonical));
+        }
+    };
+    if !confirm_profile_delete(&canonical, proxy.as_ref(), yes)? {
         return Ok(());
     }
     let was_active = config.is_active(&canonical);
-    // Deleting the active profile signs the live slot out.
+    // Deleting the active profile signs the live slot out. Settled ahead of a
+    // proxy account's upstream delete, so a refused or cancelled settle
+    // deletes nothing anywhere.
     #[cfg(target_os = "macos")]
     let _placed =
         settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::SignOut)?;
+    // A proxy account deletes through its proxy: every local refusal is
+    // decided first, then the proxy deletes the account (unreachable →
+    // refuse naming it, deleting NOTHING), then the profile goes
+    // ([`actions::delete_proxy_profile`]).
+    if let Some(record) = proxy {
+        let rotation = actions::rotation_guard_for_mutation(&canonical)?;
+        actions::delete_proxy_profile(&mut config, &canonical, force, &rotation, &record)?;
+        if was_active {
+            outln!(
+                "clauth: deleted profile '{canonical}' and its account on proxy {:?} (was \
+                 active; live credentials cleared).",
+                record.service.as_str()
+            );
+        } else {
+            outln!(
+                "clauth: deleted profile '{canonical}' and its account on proxy {:?}.",
+                record.service.as_str()
+            );
+        }
+        return Ok(());
+    }
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
     actions::delete_profile(&mut config, &canonical, force, &rotation)?;
     if was_active {
@@ -2255,7 +3107,11 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
 /// The `delete` confirm gate, one spelling for both harnesses: refuse a
 /// promptless non-TTY delete, prompt on a TTY, `--yes` skips. `Ok(false)` is
 /// the clean abort.
-fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
+fn confirm_profile_delete(
+    canonical: &str,
+    proxy: Option<&crate::profile::ProxyAccount>,
+    yes: bool,
+) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -2265,7 +3121,7 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
             "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
         );
     }
-    out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+    out!("{}", delete_prompt(canonical, proxy));
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     if !reauth_confirmed(&answer) {
@@ -2273,6 +3129,20 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The delete's confirm question. A proxy account's names the upstream half
+/// too: `--yes` there also deletes the account on the proxy, which drops its
+/// provider login.
+fn delete_prompt(canonical: &str, proxy: Option<&crate::profile::ProxyAccount>) -> String {
+    match proxy {
+        None => format!("clauth: delete profile '{canonical}' and all its credentials? [y/N] "),
+        Some(record) => format!(
+            "clauth: delete profile '{canonical}', its credentials, and its account on proxy \
+             {:?} (this also signs that account out of its provider)? [y/N] ",
+            record.service.as_str()
+        ),
+    }
 }
 
 /// The CLI's `--force` tail on the codex live-session refusal: the typed
@@ -2300,7 +3170,7 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
     let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
         return Err(unknown_profile_error(config, name));
     };
-    if !confirm_profile_delete(&canonical, yes)? {
+    if !confirm_profile_delete(&canonical, None, yes)? {
         return Ok(());
     }
     let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
@@ -2339,6 +3209,52 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {
         return Err(crate::start::StartRefusal::Disabled { name: name.clone() }.into());
     }
+    Ok(())
+}
+
+/// `clauth rename <profile> <new>` — the Setup tab's rename from the shell.
+/// No confirm gate, same as the Setup tab: nothing is removed. A name that
+/// `validate_new_name` now refuses can't be renamed back to, though.
+fn cmd_rename(name: &str, new_name: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let old = resolve_or_bail(&config, name, "rename")?;
+    // A stored roster name is not re-validated on load, so a hand edit can
+    // leave a control byte in it; the lines below spell it escaped.
+    let old_shown = crate::format::escape_unless(old.as_str(), crate::actions::is_name_char);
+
+    let new_name = new_name.trim();
+    if new_name == old.as_str() {
+        outln!("clauth: '{old_shown}' already has that name.");
+        return Ok(());
+    }
+    actions::validate_profile_name(
+        new_name,
+        crate::harness::Harness::Claude,
+        Some(old.as_str()),
+    )?;
+    let new = ProfileName::from(new_name);
+    let new_shown = crate::format::escape_unless(new.as_str(), crate::actions::is_name_char);
+
+    // Renaming the active profile relinks the live slot, the same settle
+    // `commit_rename` runs before its relink.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let was_active = config.is_active(&old);
+        let placed =
+            settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::Switch)?;
+        // The settle's prompt can save an unplaced login under the name typed
+        // here, so the check above may no longer hold.
+        actions::validate_profile_name(
+            new_name,
+            crate::harness::Harness::Claude,
+            Some(old.as_str()),
+        )?;
+        placed
+    };
+    let rotation = actions::rotation_guard_for_mutation(&old)?;
+    actions::rename_profile(&mut config, &old, &new, &rotation)?;
+    outln!("clauth: renamed '{old_shown}' to '{new_shown}'.");
     Ok(())
 }
 
@@ -2439,80 +3355,54 @@ fn cmd_switch(name: &str) -> Result<()> {
 fn cmd_rolling_token(name: &str) -> Result<()> {
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "rolling-token")?;
-    // Same gate `start` and `switch` take. A disabled profile is off every
-    // operational surface, the re-stamp timer included, so arming one produces
-    // a bearer that dies in hours with nothing behind it.
-    refuse_if_disabled(&config, &canonical)?;
     // Unreachable by contract — `resolve_or_bail` just proved membership — so
     // this arm is a defensive seam, not a user-facing path (the user-facing
     // not-found already exited 2 above).
     let Some(profile) = config.find(&canonical) else {
         anyhow::bail!("profile '{canonical}' vanished between resolve and read");
     };
-
-    let Some(oauth) = profile
-        .credentials
-        .as_ref()
-        .and_then(|c| c.claude_ai_oauth.as_ref())
-    else {
-        // Third-party names the why-not and stops. A bare login WOULD mint a
-        // chain here (the browser flow; Alibaba diverts to its console), but
-        // that adds an Anthropic login to an api-key account rather than
-        // answering the request, so this arm states the missing chain and
-        // prescribes nothing. The OAuth arm keeps the tail, where the same
-        // login IS the recovery.
-        if claude::has_own_inference_endpoint(profile) {
-            anyhow::bail!("'{canonical}' has no usage OAuth chain to roll from");
+    actions::refuse_token_mode_on_proxy(profile)?;
+    // Same gate `start` and `switch` take. A disabled profile is off every
+    // operational surface, the re-stamp timer included, so arming one produces
+    // a bearer that dies in hours with nothing behind it. The shared pre-arm
+    // half re-checks this off its own fresh read; this early check answers
+    // before the settle below runs.
+    refuse_if_disabled(&config, &canonical)?;
+    // The pre-arm half: every refusal, the plan warning fact and the
+    // mis-fill quarantine run BEFORE the settle below, so a refused switch
+    // settles nothing, and the two warning lines describe facts that were
+    // true before the arm — they print first on an arm failure too.
+    let pre = match actions::precheck_rolling_token(&canonical) {
+        Ok(pre) => {
+            if pre.plan_incapable {
+                outln!("{}", plan_incapable_warning(&canonical));
+            }
+            if pre.quarantined_misfill {
+                outln!("{}", misfill_quarantined_line(&canonical));
+            }
+            pre
         }
-        anyhow::bail!(
-            "'{canonical}' has no usage OAuth chain to roll from; run \
-             `clauth login {canonical}` first"
-        );
+        Err(failure) => {
+            if failure.plan_incapable {
+                outln!("{}", plan_incapable_warning(&canonical));
+            }
+            if failure.quarantined_misfill {
+                outln!("{}", misfill_quarantined_line(&canonical));
+            }
+            match failure.refusal {
+                actions::RollingArmRefusal::Open(e) => return Err(e),
+                refusal => return Err(anyhow::anyhow!("{}", refusal.sentence(&canonical))),
+            }
+        }
     };
-    // A standing quarantine is checked BEFORE anything destructive runs: the
-    // arm below would only degrade-and-bail on a dead chain, and by then the
-    // mis-fill pre-clear would have removed the sidecar — leaving the profile
-    // with nothing at all, which is worse than the disengaged mis-fill it
-    // started in.
-    // Through the shared sentence, so this bail, the rotate toast and the
-    // quarantine's own log line cannot prescribe different commands for one
-    // state. Both third-party legs are reachable here: the load boundary
-    // re-reads a creds-and-no-key profile as OAuth, but a key that survives
-    // its emptiness test and fails `validate_api_key` keeps the endpoint and
-    // reaches the keyless leg (pinned with `rt-badkey`).
-    oauth::refuse_if_chain_dead(&config, Some(profile), &canonical)?;
-    // A chain captured without `user:profile`/`subscriptionType` mints bearers
-    // that still authenticate but may not unlock plan-gated models — warn
-    // rather than refuse, since the roll is otherwise correct.
-    let plan_capable = oauth
-        .scopes
-        .as_ref()
-        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
-        && oauth.subscription_type.is_some();
-    if !plan_capable {
-        outln!(
-            "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
-             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
-             models. A fresh `clauth login {canonical}` browser sign-in fixes that."
-        );
-    }
-    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
-    // operator intent — the evidence still goes to quarantine first.
-    if claude::quarantine_misfilled_sidecar(&canonical)? {
-        outln!(
-            "clauth: '{canonical}' had a mis-filled sidecar (a rotating pair). It was \
-             quarantined under the profile's quarantine/ dir before arming."
-        );
-    }
-    let is_active = config.is_active(&canonical);
-    let was_rolling = profile.rolling_token;
     // Above the arm, whose gate refreshes the chain an unsaved bare-item
-    // login may have succeeded, and before the flag below is set, so a
-    // refused settle leaves nothing to roll back.
+    // login may have succeeded, and before the arm half below can touch the
+    // flag, so a refused settle leaves nothing to roll back. Above the guard
+    // too: the settle takes no lock of ours.
     #[cfg(target_os = "macos")]
     let mut config = config;
     #[cfg(target_os = "macos")]
-    let _placed = if is_active {
+    let _placed = if config.is_active(&canonical) {
         let writer = claude::BareItemWriter::Switch;
         let settle =
             claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
@@ -2524,110 +3414,149 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     } else {
         None
     };
-    let handle: profile::ConfigHandle =
-        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
-    // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
-    // a failed report. Persist-after looked cleaner ("nothing durable on
-    // failure") and was wrong twice over: the gate's refresh leg stamps the
-    // sidecar through the rotation hook, and that hook is FLAG-GATED — arming
-    // with the flag still false made the very refresh the arm triggered stamp
-    // nothing — and a reader walking away from `clauth rolling-token | head`
-    // exits the process at the report, which would have left an armed rolling
-    // bearer with no flag and nothing ever re-stamping it. Rollback-on-bail
-    // keeps both invariants: the arm runs with the flag it needs, and a
-    // non-zero exit from the arm leaves the flag exactly as it was found.
-    // (After a SUCCESSFUL arm the set flag is the new truth — the live-install
-    // step at the bottom can still exit non-zero, correctly leaving it on.)
-    if profile::update_profile_config(&canonical, |p| {
-        p.rolling_token = true;
-        Ok(())
-    })?
-    .is_some()
-        && let Ok(mut cfg) = handle.lock()
-        && let Some(profile) = cfg.find_mut(&canonical)
-    {
-        profile.rolling_token = true;
-    }
-    let armed =
-        oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
-            // Re-read under the handle: the gate marks a terminally dead chain
-            // `auth_broken` on its way to degrading, and that is what separates
-            // "nothing to retry" from "the daemon will get it".
-            let chain_is_broken = handle
-                .lock()
-                .ok()
-                .is_some_and(|c| c.state.auth_broken.contains(&canonical.as_str().into()));
-            report_armed_sidecar(&canonical, chain_is_broken)
-        });
-    if let Err(e) = armed {
-        if !was_rolling {
-            // The arming error is the one the operator needs; a rollback that
-            // then cannot save its own config write must not replace it.
-            match profile::update_profile_config(&canonical, |p| {
-                p.rolling_token = false;
-                Ok(())
-            }) {
-                Ok(_) => {
-                    if let Ok(mut cfg) = handle.lock()
-                        && let Some(profile) = cfg.find_mut(&canonical)
-                    {
-                        profile.rolling_token = false;
-                    }
-                }
-                Err(save_err) => errln!("{}", rollback_stranded_warning(&canonical, &save_err)),
+    // The arm half: the flag persist, the arm and the rollback.
+    let report = match actions::arm_rolling_token(pre, oauth::refresh_result) {
+        Ok(report) => report,
+        Err(failure) => {
+            if let Some(save_err) = &failure.rollback_stranded {
+                errln!("{}", rollback_stranded_warning(&canonical, save_err));
+            }
+            match failure.refusal {
+                actions::RollingArmRefusal::Open(e) => return Err(e),
+                refusal => return Err(anyhow::anyhow!("{}", refusal.sentence(&canonical))),
             }
         }
-        return Err(e);
-    }
-    if is_active {
+    };
+    // The report lines FIRST, then the live install: a failed relink still
+    // tells the operator the arm landed (and the flag stays on), then exits
+    // non-zero.
+    print_rolling_arm_report(&canonical, &report);
+    if report.active {
         claude::force_link_profile_credentials(&canonical)?;
-        outln!("clauth: installed live. New sessions run on it immediately.");
+        outln!("{}", installed_live_line());
     } else {
-        outln!("clauth: it installs on the next switch:  clauth switch {canonical}");
+        outln!("{}", next_switch_install_line(&canonical));
     }
     Ok(())
 }
 
-/// The warning for a failed arm whose ROLLBACK also failed to save: the flag
-/// is durably on with nothing armed, and this line is the only thing telling
-/// the operator that state exists and how to leave it. A save the writer
-/// REFUSED over a line's shape is the file's problem, not the directory's, so
-/// it names the line instead of pointing at write permission. A separate fn so
-/// the copy is unit-pinned and a deleted print orphans it into a dead-code
-/// error — the warning is best-effort by design (the arming error still
-/// propagates), which is exactly what made it silently deletable.
-fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
-    if let Some(refusal) = save_err
-        .chain()
-        .find_map(|e| e.downcast_ref::<profile::ConfigEditRefusal>())
-    {
-        let key = refusal.key();
-        return format!(
-            "clauth: warning: could not roll the rolling-token flag back for \
-             '{canonical}': config.toml has `{key}` in a shape clauth cannot read. \
-             Fix or remove that line, then run `clauth static-token {canonical}` to clear it"
-        );
-    }
-    if let Some(parse) = save_err
-        .chain()
-        .find_map(|e| e.downcast_ref::<profile::ConfigParseRefusal>())
-        && let Some(position) = crate::format::parse_position(parse.position())
-    {
-        return format!(
-            "clauth: warning: could not roll the rolling-token flag back for \
-             '{canonical}': config.toml does not parse ({position}). Fix that line, then run \
-             `clauth static-token {canonical}` to clear it"
-        );
-    }
+/// The stdout warning for a chain captured without
+/// `user:profile`/`subscriptionType`: the minted bearers still authenticate
+/// but may not unlock plan-gated models, so the roll proceeds and this line
+/// says what is lost. A separate fn so the copy is unit-pinned and a deleted
+/// print orphans it into a dead-code error.
+fn plan_incapable_warning(canonical: &ProfileName) -> String {
     format!(
-        "clauth: warning: could not roll the rolling-token flag back for \
-         '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \
-         `clauth static-token {canonical}` to clear it"
+        "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
+         scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
+         models. A fresh `clauth login {canonical}` browser sign-in fixes that."
     )
 }
 
-/// The re-stamp promise `report_armed_sidecar` closes on — the DAEMON's to
-/// keep, so each health state gets its own claim and none may stand in for
+/// The stdout line for a mis-filled sidecar the arm quarantined first: the
+/// evidence is preserved under the profile's quarantine/ dir before the
+/// overwrite. A separate fn so the copy is unit-pinned and a deleted print
+/// orphans it into a dead-code error.
+fn misfill_quarantined_line(canonical: &ProfileName) -> String {
+    format!("clauth: {}", actions::misfill_quarantined_body(canonical))
+}
+
+/// The production printer of the arm's report lines, off the classification
+/// the arm half made — the same fn the tests call, so a word edited in a
+/// line reds a pin rather than drifting. The install lines stay with the
+/// caller: the live install runs between this print and them.
+fn print_rolling_arm_report(canonical: &ProfileName, report: &actions::RollingArmReport) {
+    match &report.outcome {
+        actions::RollingArmOutcome::Armed {
+            scopes,
+            plan,
+            daemon,
+        } => {
+            outln!(
+                "{}",
+                rolling_token_armed_line(canonical, scopes, plan, *daemon)
+            );
+            outln!("{}", scope_widening_disclosure(canonical));
+        }
+        actions::RollingArmOutcome::MintKept => {
+            outln!("{}", rolling_token_mint_kept_line(canonical));
+        }
+    }
+}
+
+/// The armed report line: what sessions now hold, read off the arm's
+/// classification rather than assumed. A separate fn so the copy is
+/// unit-pinned and a deleted print orphans it into a dead-code error.
+fn rolling_token_armed_line(
+    canonical: &ProfileName,
+    scopes: &[String],
+    plan: &Option<String>,
+    daemon: crate::daemon::DaemonHealth,
+) -> String {
+    // The re-stamp promise is the DAEMON's to keep, so it is only made when
+    // one is actually there to keep it.
+    let restamp = restamp_promise(daemon);
+    format!(
+        "clauth: rolling token armed for '{canonical}'. Sessions now hold the \
+         usage chain's access token: {} scope(s){}{}, and no refresh token. \
+         {restamp}",
+        scopes.len(),
+        if scopes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", scopes.join(", "))
+        },
+        if let Some(plan) = plan {
+            format!(", plan {plan}")
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// The mint-kept report line: the gate was ready but the chain could not be
+/// read, so sessions stay on the static mint while the flag's rotation hook
+/// re-stamps on its next pass. A separate fn so the copy is unit-pinned and
+/// a deleted print orphans it into a dead-code error.
+fn rolling_token_mint_kept_line(canonical: &ProfileName) -> String {
+    format!(
+        "clauth: '{canonical}' usage chain could not be read just now, so \
+         sessions stay on the static mint. The flag is set. The daemon \
+         re-stamps on its next rotation."
+    )
+}
+
+/// The install line for the active account's live install. A separate fn so
+/// the copy is unit-pinned and a deleted print orphans it into a dead-code
+/// error.
+fn installed_live_line() -> String {
+    "clauth: installed live. New sessions run on it immediately.".to_string()
+}
+
+/// The install line for an idle account: the arm lands on the next switch.
+/// A separate fn so the copy is unit-pinned and a deleted print orphans it
+/// into a dead-code error.
+fn next_switch_install_line(canonical: &ProfileName) -> String {
+    format!("clauth: it installs on the next switch:  clauth switch {canonical}")
+}
+
+/// The warning for a failed arm whose ROLLBACK also failed to save: the flag
+/// is durably on with nothing armed, and this line is the only thing telling
+/// the operator that state exists and how to leave it. The body lives in
+/// `actions::rollback_stranded_warning_body` (the TUI toasts it without the
+/// prefix); this wrapper is the CLI's `clauth: warning: ` spelling, kept as
+/// a separate fn so the copy is unit-pinned and a deleted print orphans it
+/// into a dead-code error — the warning is best-effort by design (the arming
+/// error still propagates), which is exactly what made it silently deletable.
+fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
+    format!(
+        "clauth: warning: {}",
+        actions::rollback_stranded_warning_body(canonical, save_err)
+    )
+}
+
+/// The re-stamp promise `rolling_token_armed_line` closes on — the DAEMON's
+/// to keep, so each health state gets its own claim and none may stand in for
 /// another: `Fresh` promising while no daemon runs is the arm reading as
 /// durable when nothing will re-stamp it, and `Absent`'s warning on a healthy
 /// daemon buries the one real signal in noise. A separate fn so the three
@@ -2664,84 +3593,6 @@ fn scope_widening_disclosure(canonical: &str) -> String {
     )
 }
 
-/// Say what sessions now hold, read back off disk rather than assumed.
-///
-/// The gate returns `Ready` on three paths that armed NOTHING and left the
-/// preserved mint in place (dead chain, failed sidecar write with a live mint,
-/// transient chain trouble with a live mint), and `has_session_token` is true
-/// on all of them — so a flat "armed from the usage chain" line is a lie
-/// exactly when the operator most needs the truth. `sidecar_kind` separates
-/// them exactly.
-///
-/// No confirm prompt: a security prompt on a repeatable command gets clicked
-/// through. The printed scope list plus the SECURITY.md row is the honest
-/// middle, and it is printed AFTER the fact, when it describes something real.
-fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Result<()> {
-    let Some((kind, token)) = claude::sidecar_summary(canonical) else {
-        // The gate said Ready and `has_session_token` held, yet the read-back
-        // finds nothing parseable — a race or a filesystem fault. Claiming
-        // "armed" here would be exactly the assumed-not-read report this
-        // function's contract forbids.
-        anyhow::bail!(
-            "arming reported success but '{canonical}' has no readable sidecar to verify, \
-             so nothing was confirmed. Check permissions on ~/.clauth and re-run"
-        );
-    };
-    match kind {
-        // The gate returns `Ready` on three paths that armed NOTHING and left
-        // the mint in place, and they do not deserve one message. A dead chain
-        // is not something the daemon retries out of — it needs a re-login, and
-        // a script has to be able to tell that from success.
-        claude::SidecarKind::Mint if chain_is_broken => {
-            anyhow::bail!(
-                "'{canonical}' usage chain is dead, so sessions stay on the static mint and \
-                 nothing would re-stamp a rolling token. Run `clauth login {canonical}` to \
-                 revive the chain, then re-run. The rolling-token flag was left as it was."
-            );
-        }
-        claude::SidecarKind::Mint => {
-            outln!(
-                "clauth: '{canonical}' usage chain could not be read just now, so sessions \
-                 stay on the static mint. The flag is set. The daemon re-stamps on its next \
-                 rotation."
-            );
-        }
-        claude::SidecarKind::Misfilled => {
-            // The CLI pre-cleared one before arming, so reaching this means a
-            // writer raced a fresh rotating pair back into the sidecar.
-            anyhow::bail!(
-                "'{canonical}' sidecar was re-filled with a rotating pair while arming, so \
-                 the split is disengaged and nothing was armed. Re-run, and if it repeats \
-                 find what is writing session-token.json"
-            );
-        }
-        claude::SidecarKind::Rolling => {
-            let scopes = token.scopes.clone().unwrap_or_default();
-            let plan = token.subscription_type.clone().unwrap_or_default();
-            // The re-stamp promise is the DAEMON's to keep, so it is only
-            // made when one is actually there to keep it.
-            let restamp = restamp_promise(crate::daemon::daemon_health());
-            outln!(
-                "clauth: rolling token armed for '{canonical}'. Sessions now hold the usage \
-                 chain's access token: {} scope(s){}{}, and no refresh token. {restamp}",
-                scopes.len(),
-                if scopes.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", scopes.join(", "))
-                },
-                if plan.is_empty() {
-                    String::new()
-                } else {
-                    format!(", plan {plan}")
-                },
-            );
-            outln!("{}", scope_widening_disclosure(canonical));
-        }
-    }
-    Ok(())
-}
-
 /// `clauth static-token <profile>` — put the preserved `claude setup-token`
 /// mint back in front of sessions.
 ///
@@ -2755,6 +3606,9 @@ fn cmd_static_token(name: &str) -> Result<()> {
     )]
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "static-token")?;
+    if let Some(profile) = config.find(&canonical) {
+        actions::refuse_token_mode_on_proxy(profile)?;
+    }
     // An active profile is relinked below; the settle takes no lock of ours.
     #[cfg(target_os = "macos")]
     let _placed = {
@@ -2770,12 +3624,24 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // Arriving at the error means the lock file could not be created or opened
     // — a filesystem or permissions problem under `~/.clauth` — and the
     // original error says which, so it is kept rather than replaced.
+    #[cfg(test)]
+    run_before_token_mode_guard();
     let guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // The refusal above read a snapshot from before this wait: a record that
+    // landed since is refused on a read under the guard, before anything of
+    // the account moves.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(&canonical)?)?;
     // The relink below puts the install source in front of Claude Code, the
     // store whenever the mint does not restore: a staged pair lands first.
+    #[cfg(test)]
+    run_before_token_mode_landing();
     oauth::land_stage_for_install(&canonical, &guard)
         .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
+    // Asked again after the landing, as the clear does: the record's writer
+    // takes no rotation guard, so it can land during the landing, and every
+    // write below follows this read.
+    actions::refuse_token_mode_on_proxy(&profile::load_profile(&canonical)?)?;
     // Flag OFF first, before the restore is known to land — DELIBERATE, and
     // load-bearing for every bail arm below, none of which rolls it back. The
     // command's primary effect is the disarm: with the flag still on, the
@@ -2938,7 +3804,7 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
     // fails closed with a clearer message instead; both cases still surface
     // as exit 1 via `cmd_api_key`.
     if !profile::profile_dir(&name)?.exists() {
-        anyhow::bail!("profile '{name}' not found");
+        anyhow::bail!("{}", actions::profile_not_found_head(name.as_str()));
     }
     let stored = profile::read_api_key(&name)?;
     let key = stored.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -3195,9 +4061,10 @@ fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
 ///
 /// On success stdout's first line is the one-line summary, readable as it
 /// stands, unless a name both rosters hold prints its collision note ahead of
-/// it; every failure is the returned error. Reads the store as it stands:
-/// a stale token is reported, never refreshed from here, because the store has
-/// one writer and it is not this command.
+/// it; every failure is the returned error, or `FailureReported` for an
+/// already-used grant, whose line prints before the re-read. Reads the store
+/// as it stands: a stale token is reported, never refreshed from here, because
+/// the store has one writer and it is not this command.
 fn limit_reset_with(
     name: &str,
     list: bool,
@@ -3348,6 +4215,7 @@ fn limit_reset_claude(
 ) -> Result<()> {
     use usage::claude_reset as reset;
     use usage::limit_reset_pending as pending;
+    actions::refuse_limit_reset_on_proxy(profile)?;
     let canonical = &profile.name;
     // A profile clauth holds no claude login for has nothing to spend; a
     // quarantined chain refuses the way every other claude surface does.
@@ -3362,6 +4230,10 @@ fn limit_reset_claude(
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
+    // The identity the spend runs under, captured beside the token it sends:
+    // the post-spend refresh lands its re-read only while the stored login is
+    // still this one.
+    let identity = usage::spawn_oauth_identity(canonical, access_token);
     // The spend path serializes on the account's limit-reset lock before the
     // first request, so a second run waits and re-decides on what this one
     // leaves behind; `--list` spends nothing and never takes it.
@@ -3402,17 +4274,18 @@ fn limit_reset_claude(
             )
         }
         None => {
-            let Some(grant) = status.next_grant() else {
-                anyhow::bail!("{}", reset::no_resets_available(canonical, &status));
+            let grant = match status.try_spend_grant() {
+                Ok(grant) => grant,
+                Err(reset::SpendRefusal::NoNextGrant(status)) => {
+                    anyhow::bail!("{}", reset::no_resets_available(canonical, status))
+                }
+                Err(reset::SpendRefusal::NotUsableNow(grant)) => {
+                    anyhow::bail!("{}", reset::unusable_next_line(canonical, grant))
+                }
+                Err(reset::SpendRefusal::UnsendableId) => {
+                    anyhow::bail!("{}", reset::unsendable_grant_line(canonical))
+                }
             };
-            // The server refuses any grant but its next one, and Claude Code
-            // refuses to send an id off the pattern before it spends.
-            if !grant.is_usable_now() {
-                anyhow::bail!("{}", reset::unusable_next_line(canonical, grant));
-            }
-            if !reset::grant_id_is_sendable(&grant.id) {
-                anyhow::bail!("{}", reset::unsendable_grant_line(canonical));
-            }
             let org_uuid =
                 reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
                     .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;
@@ -3433,6 +4306,7 @@ fn limit_reset_claude(
             (org_uuid, grant.id.clone(), request_id, sent_at_ms)
         }
     };
+    let this_send_at_ms = crate::usage::now_ms();
     let reply = reset::spend_reset_at(
         &reset::spend_url(&urls.claude_origin, &org_uuid),
         access_token,
@@ -3441,21 +4315,140 @@ fn limit_reset_claude(
     );
     let settled = reset::post_settles(re_send, &reply, reset::spend_settled);
     if settled && let Err(e) = pending::clear(&pending_path) {
-        errln!(
+        errln_or_drop!(
             "clauth: could not remove {} after the reset settled: {e}",
             pending_path.display()
         );
     }
-    let summary = match reply {
-        Ok(reply) => reset::spend_outcome_line(canonical, &reply, sent_at_ms)
-            .map_err(|e| anyhow::anyhow!(e))?,
-        Err(e) => {
-            return Err(anyhow::anyhow!(reset::spend_failure(
-                canonical, &e, sent_at_ms, re_send
-            )));
+    // The spend lock is a true leaf (`lockorder`'s `LimitResetSpend`), so it
+    // drops before the refresh, whose state-flock hold is a ranked lock.
+    drop(_spend_lock);
+    // A settled record is gone by here, or still re-sendable when its clear
+    // failed, so the outcome prints before the re-read: a run killed during the
+    // refresh must still have said what it spent. An already-used answer is the
+    // one error outcome that still moved the count: it prints before the
+    // re-read too, and reports through `FailureReported` after it, which
+    // `exit_code` exits without a second line. Every other error outcome
+    // prints after, from `main`'s report of the return.
+    match &reply {
+        Ok(reply) => {
+            let outcome = reset::spend_outcome_line(canonical, reply, sent_at_ms);
+            if let Ok(summary) = &outcome {
+                outln_or_drop!("{summary}");
+                outln_or_drop!("clauth: the daemon shows the new usage at its next poll.");
+            }
+            if reset::spend_moved_the_count(reply) {
+                if let Err(text) = &outcome {
+                    errln_or_drop!("Error: {text}");
+                }
+                refresh_claude_limit_resets(
+                    canonical,
+                    &urls.claude_origin,
+                    access_token,
+                    &identity,
+                    this_send_at_ms,
+                );
+                if outcome.is_err() {
+                    return Err(anyhow::Error::new(FailureReported));
+                }
+                Ok(())
+            } else {
+                outcome.map_err(|e| anyhow::anyhow!(e))?;
+                Ok(())
+            }
         }
-    };
-    outln!("{summary}");
-    outln!("clauth: the daemon shows the new usage at its next poll.");
-    Ok(())
+        Err(e) => Err(anyhow::anyhow!(reset::spend_failure(
+            canonical, e, sent_at_ms, re_send
+        ))),
+    }
+}
+
+/// The post-spend refresh: after a settled spend that moved the count, the
+/// CLI re-reads the account's resets itself and lands what the server says in
+/// the account's `limit_resets.json` under the state flock, so no surface
+/// keeps showing the spent count until the hourly side read. The write and
+/// the delete share the scheduler's side-read gate: a moved or unreadable
+/// login lands nothing and deletes nothing, and a stored count read at or
+/// after this run's send (`sent_at_ms`) stays, since a side read that
+/// already saw that send is the best count clauth holds; a count with no
+/// stamp counts as older and goes. Every failure of the refresh (the re-read,
+/// the store, the drop, the state flock) is named on stderr, one line per
+/// failure, while the spend's outcome line and exit stay what they were. The
+/// caller releases the spend lock first: it is a true leaf (`lockorder`'s
+/// `LimitResetSpend`), and the flock hold below is a ranked lock.
+fn refresh_claude_limit_resets(
+    canonical: &ProfileName,
+    origin: &str,
+    access_token: &str,
+    identity: &usage::OAuthIdentity,
+    sent_at_ms: u64,
+) {
+    match usage::claude_reset::read_status_at(&usage::claude_reset::read_url(origin), access_token)
+    {
+        Ok(status) => {
+            let reading = usage::claude_reset::status_reading(&status);
+            // `None` when the gate kept the reading off a login that moved or
+            // could not be read; otherwise whether the write landed.
+            let stored = crate::lock::with_state_lock(|_held| {
+                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
+                if unreadable || usage::oauth_changed(identity, &disk) {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    crate::profile_cache::write_profile_cache_reported_for(
+                        crate::harness::Harness::Claude,
+                        canonical,
+                        crate::profile_cache::LIMIT_RESETS_FILE,
+                        &reading,
+                    ),
+                ))
+            });
+            match stored {
+                Ok(None) | Ok(Some(true)) => {}
+                Ok(Some(false)) => {
+                    errln!("{}", usage::claude_reset::refresh_store_failure(canonical));
+                }
+                Err(_) => {
+                    errln!("{}", usage::claude_reset::refresh_lock_failure(canonical));
+                }
+            }
+        }
+        Err(e) => {
+            let drop = match crate::lock::with_state_lock(|_held| {
+                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
+                if unreadable || usage::oauth_changed(identity, &disk) {
+                    return Ok(usage::claude_reset::RefreshDrop::LoginChanged);
+                }
+                let kept = crate::profile_cache::load_profile_cache::<usage::LimitResets>(
+                    canonical,
+                    crate::profile_cache::LIMIT_RESETS_FILE,
+                )
+                .and_then(|r| r.fetched_at)
+                .is_some_and(|at| at >= sent_at_ms);
+                if kept {
+                    return Ok(usage::claude_reset::RefreshDrop::KeptNewer);
+                }
+                Ok(
+                    if crate::profile_cache::remove_profile_cache_reported(
+                        canonical,
+                        crate::profile_cache::LIMIT_RESETS_FILE,
+                    ) {
+                        usage::claude_reset::RefreshDrop::Dropped
+                    } else {
+                        usage::claude_reset::RefreshDrop::Failed
+                    },
+                )
+            }) {
+                Ok(drop) => drop,
+                Err(_) => usage::claude_reset::RefreshDrop::LockTimedOut,
+            };
+            errln!(
+                "{}",
+                usage::claude_reset::refresh_read_failure(canonical, &e, drop)
+            );
+            if drop == usage::claude_reset::RefreshDrop::Failed {
+                errln!("{}", usage::claude_reset::refresh_drop_failure(canonical));
+            }
+        }
+    }
 }

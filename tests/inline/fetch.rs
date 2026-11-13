@@ -3050,6 +3050,78 @@ fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
     );
 }
 
+/// The `/profile` ride-along is a write path of the fetch worker: one that runs
+/// under a spent lease ticket re-anchors nothing and seeds nothing, and the
+/// same read under a current ticket does.
+#[test]
+fn a_profile_read_under_a_spent_ticket_writes_no_ride_along() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    crate::testutil::register_names(&["p5"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    let anchor = || {
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string())
+    };
+    let lease = crate::daemon::FetchLease::new();
+    let read_under = |ticket: crate::daemon::LeaseTicket<'_>| {
+        let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+            (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+        });
+        let _sandbox = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision {
+            lease: Some(ticket),
+            ..ProfileFetchDecision::default()
+        };
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        decision.reanchored
+    };
+
+    assert!(
+        !read_under(crate::testutil::spent_lease_ticket(&lease)),
+        "a read under a spent ticket re-anchored"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-a"),
+        "a read under a spent ticket moved the anchor"
+    );
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "a read under a spent ticket seeded the usage cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        read_under(current),
+        "control: the same read under a current ticket re-anchors"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-b"),
+        "control: the anchor moves"
+    );
+}
+
 /// A `/profile` read that re-anchors the profile on another account drops its
 /// credit refusal, as a login as another account does: the refusal was the old
 /// account's. The control, the same read naming the anchored account, keeps
@@ -3289,4 +3361,117 @@ fn a_usage_agent_fails_a_stalled_body_at_its_whole_call_bound() {
 fn a_usage_agent_reads_a_body_served_within_its_bound() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::assert_prompt_body_reads(usage_agent(Duration::from_millis(200)));
+}
+
+/// Behind a TLS-inspecting proxy an endpoint presents a chain rooted in a CA
+/// the OS trusts but the bundled WebPKI roots do not carry (ureq's default
+/// `RootCerts::WebPki`, measured against the 3.4.2 registry source). The
+/// production agent's root decision honors `SSL_CERT_FILE` — curl/OpenSSL
+/// semantics: the env file replaces the store — so a chain rooted at the
+/// vendored CA verifies once the env names it; on the pre-change build the
+/// WebPKI store refuses it with `UnknownIssuer`.
+#[test]
+fn the_usage_agent_verifies_a_chain_whose_root_ssl_cert_file_names() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // The pin borrows the sandbox, so HOME_TEST_LOCK serializes this env
+    // mutation against every other test touching the env, and the compiler
+    // rejects dropping the sandbox first.
+    let home = crate::testutil::HomeSandbox::new();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = dir.path().join("gateway-ca.pem");
+    std::fs::write(&ca, include_str!("../fixtures/tls-root-bundle/ca.crt")).expect("write ca");
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        ureq::tls::parse_pem(include_str!("../fixtures/tls-root-bundle/leaf.crt").as_bytes())
+            .filter_map(|item| match item {
+                Ok(ureq::tls::PemItem::Certificate(cert)) => {
+                    Some(rustls::pki_types::CertificateDer::from(cert.der().to_vec()))
+                }
+                _ => None,
+            })
+            .collect();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        include_bytes!("../fixtures/tls-root-bundle/leaf.key.der").to_vec(),
+    ));
+    // Pin the provider rather than taking a process-wide default: ureq builds
+    // rustls in this binary too.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_tls = Arc::new(config);
+
+    let _env = crate::testutil::EnvPin::new(&home, &[("SSL_CERT_FILE", Some(ca.as_os_str()))]);
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("addr").port();
+
+    let answer = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // Non-blocking accept polled against a deadline: a client that never
+            // connects must fail the test, not hang the scope join in `accept`.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                if Instant::now() > deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let conn = rustls::ServerConnection::new(server_tls).expect("server conn");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            // Drain the WHOLE request before answering: a close that leaves
+            // request bytes unread sends RST, and an RST can discard the
+            // client's not-yet-read response.
+            crate::testutil::drain_http_request(&mut tls);
+            let body = br#"{"five_hour":{"utilization":1.0}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            // A client that refused our chain hangs up mid-handshake: that is
+            // the refusal under test, so it must end the server quietly and
+            // leave the verdict to the client's own result.
+            if tls.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            if tls.write_all(body).is_err() || tls.flush().is_err() {
+                return;
+            }
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            let mut discard = [0u8; 4096];
+            while tls.read(&mut discard).is_ok_and(|n| n > 0) {}
+        });
+        usage_agent(Duration::from_secs(10))
+            .get(format!("https://127.0.0.1:{port}/v1/usage"))
+            .header("User-Agent", "clauth-test")
+            .call()
+            .map(|response| response.status().as_u16())
+    });
+
+    assert_eq!(
+        answer.expect("fetch over the SSL_CERT_FILE-rooted chain"),
+        200,
+        "SSL_CERT_FILE names the root, so the inspecting-proxy chain verifies"
+    );
 }

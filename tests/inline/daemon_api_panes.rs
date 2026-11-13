@@ -58,10 +58,13 @@ fn call(ctx: &ApiContext, method: &str, path: &str) -> Response {
             path: path.to_string(),
             query: String::new(),
             bearer: Some(TOKEN.to_string()),
+            authorization_seen: true,
             if_none_match: None,
             body: Vec::new(),
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            content_type: Default::default(),
         },
         peer(),
     )

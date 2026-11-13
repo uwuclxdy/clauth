@@ -247,6 +247,12 @@ pub(crate) mod rank {
         /// codex landing's section 2, which also takes the usage stores (300/350)
         /// — so it ranks above them all as a leaf.
         CodexPolled = 1150;
+        /// Claude banked-reset side-read memo (`usage::scheduler`'s
+        /// `ClaudeResetsMemo`, one per scheduler state). The same leaf shape
+        /// as `CodexPolled`: taken alone by the leg (under `Config`, 400), the
+        /// forget and rename paths, and the landing's transition detector, so
+        /// it ranks above everything any of those nests with.
+        ClaudeResets = 1155;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
@@ -314,6 +320,29 @@ pub(crate) mod rank {
         /// acquisition is one bookkeeping step, and the warning line it decides
         /// on is written after the guard drops.
         TerminalHolders = 1902;
+        /// The sessions whose per-session Keychain item a daemon-side reader
+        /// gave up on (`runtime::ITEM_READ_GAVE_UP`), shared by the stale-copy
+        /// sweep and the MCP login sync. A true leaf: each reader copies the
+        /// set out, releases it, runs its `security` reads with nothing held,
+        /// then re-takes it to record what it gave up and pruned.
+        #[cfg(target_os = "macos")]
+        ItemReadGaveUp = 1903;
+        /// The `[serve] app_origins` texts already logged as skipped
+        /// (`daemon::api::routes::note_skipped_origin`). A true leaf: held for
+        /// one lookup and one insert, and the line it decides on is written
+        /// after the guard drops.
+        SkippedOrigins = 1904;
+        /// The last `[serve] app_origins` list that read
+        /// (`daemon::api::routes::listed_origins`), the fallback answered from
+        /// while a later read fails. A true leaf: held for one `Arc` clone or
+        /// one assignment, and the line it decides on is written after the
+        /// guard drops.
+        LastOrigins = 1905;
+        /// The live terminal tickets (`daemon::api::ticket::Tickets`). A true
+        /// leaf: every acquisition does in-memory work only (a sweep, a count,
+        /// a removal, an insert), and every check, store read, herdr call and
+        /// line that follows a removal runs after the guard drops.
+        TerminalTickets = 1906;
         /// The per-account `limit-reset` spend flock
         /// (`usage::limit_reset_pending::LimitResetLock`,
         /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend

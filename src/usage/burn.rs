@@ -197,13 +197,24 @@ pub(crate) fn funded_wallet_rate(
     history: &[WalletSample],
     rows: &[crate::providers::StatRow],
 ) -> Option<WalletRate> {
+    funded_wallet_rate_at(history, rows, crate::usage::now_ms())
+}
+
+/// Clock-injected body of [`funded_wallet_rate`]: `now_ms` is the instant
+/// the current balance is read at, so a test pins the fit by equality.
+pub(crate) fn funded_wallet_rate_at(
+    history: &[WalletSample],
+    rows: &[crate::providers::StatRow],
+    now_ms: u64,
+) -> Option<WalletRate> {
     let wallet = crate::providers::funded_wallets(rows).into_iter().next()?;
-    let per_day = compute_wallet_rate_from_history(
+    let per_day = compute_wallet_rate_from_history_at(
         history,
         &wallet,
         WALLET_BURN_LOOKBACK_MS,
         WALLET_BURN_MIN_SAMPLES,
         WALLET_BURN_GAP_CUT_MS,
+        now_ms,
     )?;
     Some(WalletRate {
         label: wallet.label,
@@ -231,18 +242,15 @@ pub(crate) fn funded_wallet_rate(
 ///
 /// The fit runs over actual sample timestamps, never an assumed cadence: the
 /// refresh interval is user-settable, so the derivation reads the spacing the
-/// series itself records.
-fn compute_wallet_rate_from_history(
+/// series itself records. `now_ms` stamps the freshest reading.
+fn compute_wallet_rate_from_history_at(
     history: &[WalletSample],
     wallet: &crate::providers::Wallet,
     lookback_ms: u64,
     min_samples: usize,
     gap_cut_ms: u64,
+    now_ms: u64,
 ) -> Option<f64> {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
     let half_life_ms = (lookback_ms as f64 / 4.0).max(1.0);
 
     let mut entries: Vec<(u64, f64)> = history
@@ -288,6 +296,27 @@ fn compute_wallet_rate_from_history(
     (per_day > 0.0).then_some(per_day)
 }
 
+/// [`compute_wallet_rate_from_history_at`] on the wall clock, for the burn
+/// tests that seed relative to it; production reads the clock once, in
+/// [`funded_wallet_rate`].
+#[cfg(test)]
+fn compute_wallet_rate_from_history(
+    history: &[WalletSample],
+    wallet: &crate::providers::Wallet,
+    lookback_ms: u64,
+    min_samples: usize,
+    gap_cut_ms: u64,
+) -> Option<f64> {
+    compute_wallet_rate_from_history_at(
+        history,
+        wallet,
+        lookback_ms,
+        min_samples,
+        gap_cut_ms,
+        crate::usage::now_ms(),
+    )
+}
+
 /// Slope of a recency-weighted least-squares fit of `y` over time, per ms.
 /// Weights decay exponentially with age relative to the newest sample:
 /// `w = 0.5^(age / half_life_ms)`, so recent samples drive the rate. Returns
@@ -331,10 +360,10 @@ fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f
 /// accumulation). The result is clamped finite so a corrupt or extreme rate
 /// can't produce NaN/overflow at the caller's `>= 100` comparison.
 ///
-/// Drives the opt-in burn-aware auto-switch decision (issue #8 follow-up b,
-/// `fallback::is_exhausted_projected`): switch the ACTIVE profile when the
-/// projected value crosses the 100% cap, instead of waiting for the static
-/// per-profile threshold.
+/// Drives the opt-in burn-aware auto-switch decision
+/// (`fallback::is_exhausted_projected`): switch the ACTIVE profile early when
+/// the projected value reaches the 100% cap, beside the static per-profile
+/// threshold, which still applies.
 pub(crate) fn project_utilization(util_pct: f64, burn_pct_per_hour: f64, interval_ms: u64) -> f64 {
     let hours = interval_ms as f64 / 3_600_000.0;
     let projected = util_pct + burn_pct_per_hour.max(0.0) * hours;

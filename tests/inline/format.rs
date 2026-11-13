@@ -717,11 +717,11 @@ fn account_tier_still_renders_every_known_tier() {
 fn the_split_state_sentences_render_their_ruled_bytes() {
     let name = crate::profile::ProfileName::from("qwen");
     assert_eq!(
-        third_party_keyless(&name),
+        third_party_keyless(&name, None),
         "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
     );
     assert_eq!(
-        third_party_dead_chain(&name),
+        third_party_dead_chain(&name, None),
         "stored OAuth chain is dead, its api key still works: qwen \
          (run `clauth login qwen --api-key <key>` to clear the quarantine)"
     );

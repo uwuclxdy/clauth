@@ -15,7 +15,7 @@ mod herdr_report;
 pub(crate) mod jobs;
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -35,12 +35,13 @@ use rmcp::{
 use serde::Deserialize;
 use sha2::Digest;
 
+use crate::hook_jobs::WatchLease;
 use crate::logline::logline;
 use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
 use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
-    write_dead_key,
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, claude_limit_resets, load_profile_cache,
+    write_auth_expired, write_dead_key,
 };
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
@@ -126,7 +127,8 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// The cached OAuth usage block for `name`, or `None` when the shared cache
 /// selector says this name's cache is third-party: a retyped profile's leftover
 /// `usage_cache.json` is a fossil from its OAuth life, not headroom, so this
-/// reader never opens it — the same cache-split `published_windows` reads by.
+/// reader never opens it — the same cache-split `published_windows_with_label`
+/// reads by.
 fn load_usage(name: &ProfileName) -> Option<UsageInfo> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
         return None;
@@ -218,10 +220,11 @@ fn dated_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
 /// it before every delegate. `stale` still rides — a stale row costs a wrong
 /// routing decision rather than a slow one — and because the figure it dates
 /// lives in this same object, it renders beside that figure rather than beside a
-/// structural none.
+/// structural none. Being a routing flag, it reads a proxy account's chain
+/// windows ([`ProfileWindows::routing_stale`]).
 fn row_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
     let mut payload = windows_payload(windows);
-    if windows.stale() {
+    if windows.routing_stale() {
         payload["stale"] = serde_json::json!(true);
     }
     payload
@@ -313,11 +316,10 @@ fn profile_row(
     if !warnings.is_empty() {
         row["throughput"] = serde_json::Value::Array(warnings);
     }
-    // A third-party profile with no inference auth source is a delegate target
-    // that refuses at the spawn gate, so this flags it before the picker spends
-    // the call. The predicate is the delegate guard's own, not the usage
-    // predicate — see `preflight_target`.
-    if p.is_third_party() && !crate::claude::has_inference_auth(p) {
+    // A keyless account is a delegate target that refuses at the spawn gate,
+    // so this flags it before the picker spends the call. The predicate is the
+    // delegate guard's own, not the usage predicate — see `preflight_target`.
+    if p.is_keyless() {
         row["keyless"] = serde_json::json!(true);
     }
     // A credential the provider already refused — a third-party api KEY, or a
@@ -378,6 +380,10 @@ fn profile_row(
         && usage.as_ref().is_some_and(|u| u.credit_capped())
     {
         row["credit_capped"] = serde_json::json!(true);
+    }
+    // Absent with no reading: a row never carries a zero nothing read.
+    if let Some(banked) = claude_limit_resets(name) {
+        row["limit_resets"] = serde_json::json!(banked);
     }
     row
 }
@@ -1287,7 +1293,8 @@ A delegate has no time limit. A long blocking call is parked by the host as a Ta
 its result arrives as a task notification. A blocking call holds this conversation's turn until \
 the delegate returns; use `background: true` plus `monitor` to collect without blocking. To run \
 N distinct prompts, issue N parallel calls; `profiles` with one prompt fans the SAME prompt out \
-across accounts."
+across accounts. A long queue runs the same way: keep a batch of `background: true` calls in \
+flight and start the next as each result arrives."
     )]
     async fn delegate(
         &self,
@@ -1988,7 +1995,7 @@ across accounts."
             // so the run went on as a background job instead of throwing its
             // result away.
             //
-            // This reply is never sent: rmcp (3.4.0, `service.rs`) removes the
+            // This reply is never sent: rmcp (`service.rs`, 3.4.0-3.9.0) removes the
             // request from `local_ct_pool` when the `notifications/cancelled`
             // arrives, and the response path drops any message whose id is no
             // longer in that pool — "dropping response for cancelled request" —
@@ -2020,10 +2027,7 @@ across accounts."
             now_epoch_secs(),
             delegate_digest_mode(&self.digest, abandoned),
         );
-        let is_error = payload
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_error = envelope_reports_failure(&payload);
         if result_file {
             // The blocking run mints no job file on the happy path, so mint a
             // result id from the same start time the hand-off would. A failed
@@ -2771,7 +2775,7 @@ const LISTING_MAX: usize = 10;
 ///
 /// **This is safe to return a blocking run's content from, and the reason is
 /// structural**: [`jobs::list_banded`] takes NO id, and neither does the
-/// [`jobs::list`] it sorts. They enumerate the directory and return what they
+/// [`jobs::list_readable`] walk it sorts. They enumerate the directory and return what they
 /// find, so nothing a caller spells selects a file, which is
 /// what [`jobs::RecordKind`] documents as the condition a new reader has to
 /// meet. Filtering this listing by a caller-supplied id would be the exact
@@ -2801,7 +2805,9 @@ fn fold_jobs_listing(payload: &mut serde_json::Value, now: u64) {
 /// One listing row. A live run is dated by how long it has been going, a
 /// finished or orphaned one by how long since its record last mattered — two
 /// different questions, so two different keys rather than one that means
-/// whichever the state implies.
+/// whichever the state implies. An isolated record's row also carries the
+/// only-when-true `isolated` flag, so the listing prose can drop the resume
+/// sentence whose handle an isolated transcript cannot honour.
 fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
     let phase = job.phase();
     let mut row = serde_json::json!({
@@ -2817,6 +2823,9 @@ fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
     }
     if let Some(sid) = &job.record.session_id {
         row["session_id"] = serde_json::json!(sid);
+    }
+    if job.record.isolated {
+        row["isolated"] = serde_json::json!(true);
     }
     row
 }
@@ -2870,22 +2879,26 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
     // path component.
     debug_assert!(jobs::is_safe_job_id(&job_id));
     let now = now_ms();
-    // READ FIRST: the sweep below destroys the very record this call came for
-    // when that record is a corpse, and the `session_id` it carried is the
-    // handle the caller needs. Captured before the sweep, it is what answers
-    // the `Unknown` arm below instead of the aged branch.
+    // READ FIRST: the sweep below reaps this call's very record when that
+    // record is an untied or silent corpse, and the collect consumes it when
+    // it is a kept one this session owns; the `session_id` it carried is the
+    // handle the caller needs either way. Captured before both, it is what
+    // answers the `Unknown` arm below instead of the aged branch. A kept
+    // corpse another session owns is neither swept nor consumed, and its
+    // answer reads the record itself, not this capture.
     let before_sweep = jobs::read(&job_id);
     // A collect is the other moment a corpse matters — see
     // `jobs::gc_running_corpses`.
     jobs::gc_running_corpses(now);
-    let outcome = read_collectable(&job_id);
+    let outcome = collect_one(&job_id, now);
 
     match outcome {
         WaitOutcome::Unknown => {
-            // A corpse the sweep just reaped answers with the handle it carried;
-            // anything else keeps the hedged branches. The silence check is the
-            // sweep's own predicate, so this arm names exactly what the sweep
-            // removed and nothing a concurrent collect made vanish.
+            // A corpse the sweep reaped or this collect consumed answers with
+            // the handle it carried; anything else keeps the hedged branches.
+            // The corpse check is the sweep's own predicate, so this arm names
+            // exactly the record the sweep or the collect removed and nothing
+            // a concurrent collect made vanish.
             let reason = match &before_sweep {
                 Some(record)
                     if record.state == jobs::JobState::Running
@@ -2896,6 +2909,17 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
                 }
                 _ => unknown_job_reason(&job_id, now),
             };
+            let payload = serde_json::json!({
+                "is_error": true,
+                "result": reason,
+            });
+            let prose = render::monitor_job_prose(&payload);
+            Ok(CallToolResult::error(single_block(prose)))
+        }
+        WaitOutcome::Foreign(record) => {
+            // The record stays on disk for its owner's wake, so the orphan
+            // copy's "its record was removed" must not fire.
+            let reason = foreign_job_reason(&job_id, &record);
             let payload = serde_json::json!({
                 "is_error": true,
                 "result": reason,
@@ -2939,10 +2963,12 @@ async fn monitor_batch(
 
     let now = now_ms();
     // READ FIRST, for the same reason the one-id arm does: the sweep below
-    // reaps a corpse before the read, and the handle it carried is the whole
-    // point of polling the id. An unsafe id can never name a job file and
-    // resolves `Unknown` like the read resolves it, so it is not read at all
-    // here — the path join below must stay off a caller's string.
+    // reaps a corpse before the read, and the collect consumes a kept one this
+    // session owns; the handle it carried is the whole point of polling the
+    // id. An unsafe id can never name a job file and resolves `Unknown` like
+    // the read resolves it, so it is not read at all here — the path join
+    // below must stay off a caller's string. A kept corpse another session
+    // owns is left and its answer reads the record itself, not this capture.
     let before_sweep: Vec<Option<jobs::JobRecord>> = job_ids
         .iter()
         .map(|id| jobs::is_safe_job_id(id).then(|| jobs::read(id)).flatten())
@@ -2953,7 +2979,7 @@ async fn monitor_batch(
         .iter()
         .map(|id| {
             let outcome = if jobs::is_safe_job_id(id) {
-                read_collectable(id)
+                collect_one(id, now)
             } else {
                 WaitOutcome::Unknown
             };
@@ -2964,10 +2990,11 @@ async fn monitor_batch(
     let mut results = Vec::with_capacity(outcomes.len());
     let mut any_error = false;
     let mut unknown_job_id_count = 0u64;
-    // The owner-ruled orphan copy, one line per reaped corpse with a handle,
-    // in the order asked. Rendered after the rows because the row for a
-    // missing file is the batch's bare `unknown` verdict — which stays TRUE,
-    // the sweep did remove it — and this line says why it is missing.
+    // The owner-ruled orphan copy, one line per reaped or consumed corpse
+    // with a handle, in the order asked. Rendered after the rows because the
+    // row for a missing file is the batch's bare `unknown` verdict — which
+    // stays TRUE, the sweep or the collect did remove it — and this line says
+    // why it is missing.
     let mut orphan_reasons: Vec<String> = Vec::new();
     for ((id, outcome), prior) in outcomes.into_iter().zip(&before_sweep) {
         let entry = match outcome {
@@ -2983,6 +3010,13 @@ async fn monitor_batch(
                 serde_json::json!({ "job_id": echo_name(&id), "status": "unknown" })
             }
             WaitOutcome::Running(record) => running_payload(&echo_name(&id), &record, now_ms()),
+            WaitOutcome::Foreign(record) => {
+                // Same rule as the one-id arm, rendered raw like a crashed
+                // tombstone's.
+                let reason = foreign_job_reason(&id, &record);
+                any_error = true;
+                serde_json::json!({ "crashed": true, "result": reason })
+            }
             WaitOutcome::Done(record) => {
                 // An owned record's file is already evicted by its claim; a
                 // refused one (mismatched self-report) was renamed back and
@@ -3095,6 +3129,7 @@ fn fold_done_envelope(
     record: &jobs::JobRecord,
     digest: DigestMode<'_>,
 ) -> (serde_json::Value, bool) {
+    let is_error = done_job_failed(record);
     // A crashed tombstone renders the owner's copy raw, never the envelope
     // fallback: the run's lifetime ended, just with no result to collect.
     if record.crashed
@@ -3102,7 +3137,7 @@ fn fold_done_envelope(
     {
         return (
             serde_json::json!({ "crashed": true, "result": reason }),
-            true,
+            is_error,
         );
     }
     // A shared tombstone with no session id has no handle to promise, so
@@ -3125,11 +3160,40 @@ fn fold_done_envelope(
         now_epoch_secs(),
         digest,
     );
-    let is_error = payload
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     (payload, is_error)
+}
+
+/// Whether an envelope reports the run failed: `is_error: true`, false for
+/// every other shape. The one spelling of the rule, so the blocking reply, the
+/// settled liveness record and the stored-envelope delivery never split their
+/// verdicts.
+pub(crate) fn envelope_reports_failure(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a finished job failed: a crashed tombstone that names its end, a
+/// settled liveness record whose `outcome` the finalize stamped, or an
+/// envelope reporting `is_error: true`. The one rule every stored-record
+/// delivery's error flag and the TUI's delegate-finish cue read; the fold's
+/// live-usage footer never touches the flag, so it is judged off the stored
+/// envelope.
+pub(crate) fn done_job_failed(record: &jobs::JobRecord) -> bool {
+    if record.crashed && crashed_job_reason(&record.job_id, record).is_some() {
+        return true;
+    }
+    // The settled liveness record: the join was the delivery, so the outcome
+    // the finalize stamped is the verdict. A record an older server wrote
+    // carries no `outcome` and reads failed here, the old rule's verdict.
+    if record.envelope.is_none() && !record.crashed {
+        return !record.outcome;
+    }
+    record
+        .envelope
+        .as_ref()
+        .is_none_or(envelope_reports_failure)
 }
 
 /// Render a finished job's envelope into its response blocks and error flag.
@@ -3168,20 +3232,30 @@ fn render_done_envelope(
 
 /// Poll cadence the `mcp-await-job` hook's wait runs at.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Self-deadline for the `mcp-await-job` hook.
+/// How often a session's watcher re-lists the store. A hook that finds a
+/// watcher in place leaves its job to it and exits, so this bounds how late the
+/// watcher sees that job.
+const AWAIT_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// The `mcp-await-job` hook's wait limit: a safety net, never the delivery
+/// bound — the job's own end ends the wait, whatever it takes. A live job
+/// reaches it only where nothing else ended the wait first (no idle wake on a
+/// non-1 h prompt cache, a busy session or `[plugin] idle_wake = false`, no
+/// silence window): the limit line then wakes the model with a nudge to call
+/// `monitor`.
 ///
-/// A delivery window, NOT a bound on the delegate: a streaming run has no wall
-/// clock, so no hook deadline can promise to outlast one and this number must
-/// not be read as trying to. It buys the common case — a run that finishes
-/// inside it is delivered without the model spending a turn — and on expiry the
-/// hook still exits 2, waking the model with a nudge to call `monitor`, so a
-/// longer run costs one deliberate check rather than a lost result.
+/// `plugins/hooks/hooks.json` carries the outer `timeout` at 86460 s on both
+/// events running the hook, and this must stay under it: the host kills the hook
+/// at that bound, and a kill delivers nothing.
+const AWAIT_JOB_DEADLINE_SECS: u64 = 24 * 60 * 60;
+/// How long a session sits idle past a turn end, a job of its own still running,
+/// before one wake: the prompt cache expires 1 h after its last use, a miss in a
+/// long context is expensive, and five minutes leaves room for the wake's own
+/// turn to reach the API.
 ///
-/// Its own literal rather than a `MAX_RUN_TIMEOUT_SECS` offset, because that
-/// constant now bounds only what a caller may type. `plugins/hooks/hooks.json`
-/// carries the outer bound at 4260 s, and this must stay under it: the hook
-/// process is killed at that one, and a kill delivers nothing.
-const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
+/// The wake ends the hook, and that turn's `Stop` starts the next watcher, so
+/// this counts one idle stretch rather than bounding the wait. It sits inside
+/// the manifest bound [`AWAIT_JOB_DEADLINE_SECS`] names.
+pub(crate) const AWAIT_IDLE_WAKE_SECS: u64 = 55 * 60;
 
 /// Result of one read of a collectable job file.
 #[derive(Debug)]
@@ -3190,15 +3264,32 @@ enum WaitOutcome {
     /// Present but not yet finished. Carries the record so the caller can
     /// report `elapsed_secs`.
     Running(jobs::JobRecord),
-    /// No such job file: never created, already evicted, or claimed by a
-    /// sibling collect — the hedged unknown copy answers all three.
+    /// No such job file: never created, already evicted, claimed by a
+    /// sibling collect, or a corpse this call's sweep reaped or its collect
+    /// removed — a reaped or collected corpse is answered with the orphan
+    /// copy when it carried a session id, the rest with the hedged unknown
+    /// one.
     Unknown,
+    /// A dead job tied to ANOTHER session — a kept corpse, or a blocking
+    /// run's crashed tombstone: left on disk for its owner's lost wake, and
+    /// answered with the crashed copy, which reads true for a record still on
+    /// disk.
+    Foreign(jobs::JobRecord),
 }
 
 /// Read one collectable record, claiming a done file so exactly one delivery
-/// owns it. An absent file is `Unknown`; a running file is `Running`.
+/// owns it. An absent file is `Unknown`; a running file is `Running`. A
+/// crashed tombstone carries its owner's lost wake, so one tied to another
+/// session is left unclaimed as `Foreign`.
 fn read_collectable(job_id: &str) -> WaitOutcome {
     match jobs::read(job_id) {
+        Some(r)
+            if r.state == jobs::JobState::Done
+                && r.crashed
+                && !corpse_reports_to(&r, host_session(host_pid()).as_deref()) =>
+        {
+            WaitOutcome::Foreign(r)
+        }
         Some(r) if r.state == jobs::JobState::Done => {
             match jobs::claim(job_id, jobs::Claimant::Monitor) {
                 jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
@@ -3208,6 +3299,40 @@ fn read_collectable(job_id: &str) -> WaitOutcome {
         Some(r) => WaitOutcome::Running(r),
         None => WaitOutcome::Unknown,
     }
+}
+
+/// Whether a corpse's lost wake is `session`'s to carry: the record is tied
+/// to that session, or it is tied to no session and a session is asking. The
+/// watcher's [`poll_job`] and a `monitor` collect ([`collect_one`]) share it,
+/// so one session can consume exactly what it may report — a corpse tied to
+/// another session is that session's to wake about.
+fn corpse_reports_to(record: &jobs::JobRecord, session: Option<&str>) -> bool {
+    record.host_session.as_deref() == session
+        || (session.is_some() && record.host_session.is_none())
+}
+
+/// A collect answering a dead job by id consumes the record the sweep kept
+/// when the corpse is this session's to report, and the orphan copy answers
+/// "its record was removed" — this collect is the removal the copy names.
+/// Consuming it also keeps any later turn end of the session from adopting
+/// the job. A corpse tied to ANOTHER session is left on disk for its owner's
+/// wake and answered as [`WaitOutcome::Foreign`]; a live record passes
+/// through untouched.
+fn collect_one(job_id: &str, now: u64) -> WaitOutcome {
+    let outcome = read_collectable(job_id);
+    if let WaitOutcome::Running(record) = &outcome
+        && jobs::running_is_corpse(record, now)
+    {
+        // The watcher's own ownership test: a session may consume exactly
+        // what it may report, so a foreign corpse stays for its owner's turn
+        // end instead of being collected out from under it.
+        if corpse_reports_to(record, host_session(host_pid()).as_deref()) {
+            jobs::remove(job_id);
+            return WaitOutcome::Unknown;
+        }
+        return WaitOutcome::Foreign(record.clone());
+    }
+    outcome
 }
 
 /// The running-check payload both `monitor` arms render, so the one-id and
@@ -3287,7 +3412,10 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// branch unchanged (owner ruling 2026-09-02), since the orphan copy names a
 /// handle it has nothing to put there.
 ///
-/// The copy is owner-ruled (2026-09-02, verbatim), never reworded. The split is
+/// The copy is owner-ruled (2026-09-02, verbatim), never reworded. The removal
+/// the copy names is the sweep's for an untied or silent corpse and this
+/// collect's own for a kept one ([`collect_one`]); either way the copy answers
+/// only a record that is already gone. The split is
 /// the record's own isolation flag: a shared run's transcript is in the global
 /// store and its handle resolves, an isolated one's left with its throwaway
 /// tree — the crash skipped the rescue — so offering that handle would promise
@@ -3307,13 +3435,14 @@ fn orphan_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
     })
 }
 
-/// The owner-ruled copy (verbatim, never reworded) for a crashed run whose
-/// tombstone is STILL ON DISK ([`jobs::JobRecord::crashed`]): the sweep
-/// converted the silent blocking run's liveness record into a `Done` record
-/// with no envelope, keeping the handle and isolation flag. The shared arm
-/// names the handle; the isolated arm cannot, because its transcript left with
-/// the throwaway tree. A shared tombstone with no `session_id` returns `None` —
-/// it has no handle to promise — and the caller keeps the envelope fallback.
+/// The owner-ruled copy (verbatim, never reworded) for a dead job whose
+/// record is STILL ON DISK: a crashed tombstone ([`jobs::JobRecord::crashed`]),
+/// which the sweep converted from the silent blocking run's liveness record,
+/// and a foreign kept corpse a collect leaves for its owner's wake. The
+/// shared arm names the handle; the isolated arm cannot, because its
+/// transcript left with the throwaway tree. A shared record with no
+/// `session_id` returns `None` — it has no handle to promise — and the caller
+/// keeps its own fallback.
 fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
     Some(if record.isolated {
         format!(
@@ -3327,6 +3456,16 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
              it's still resumable from its session id: {session_id}"
         )
     })
+}
+
+/// The answer to a collect of a dead job tied to another session, whose record
+/// stays on disk for its owner's wake: the crashed copy, which reads true for a
+/// record still on disk, and for a shared record with no `session_id` (it died
+/// before naming one) the same first sentence alone, since there is no handle
+/// to promise.
+fn foreign_job_reason(job_id: &str, record: &jobs::JobRecord) -> String {
+    crashed_job_reason(job_id, record)
+        .unwrap_or_else(|| format!("job {job_id} died without finishing and left no result."))
 }
 
 /// Why an id names no job file, and what the caller can do about it.
@@ -3347,8 +3486,8 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
 /// older than [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain —
 /// neither reap runs from less than a day back ([`jobs::RUNNING_TTL_MS`] adds
 /// a 600 s grace on top), so a younger id cannot have been swept — and
-/// collection leads there because every collect evicts while the sweep runs at
-/// startup alone.
+/// collection leads there because a collect evicts what it delivers while the
+/// sweep runs at startup alone.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // Checked FIRST, because it is the one cause this function can actually
     // know. Everything below hedges; this does not. A blocking delegate's record
@@ -3356,7 +3495,14 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // never collected, never dropped, and certainly minted — and answering an id
     // clauth is holding a live run under with "clauth may never have minted it"
     // is the mirror of the M5 defect where it asserted a mint it could not know.
+    // A run already finished with its caller attached left its settled record,
+    // which answers with the finished fact instead of the live one.
     if jobs::liveness_exists(job_id) {
+        if jobs::liveness_is_done(job_id) {
+            return format!(
+                "job_id {job_id}: the run finished, its result went back through the call that started it"
+            );
+        }
         return format!(
             "job_id {job_id} names a blocking `delegate` that is still running: \
              its result goes back through the call that started it, so there is \
@@ -4413,6 +4559,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         opts.profile,
         &session_id,
         dead_key_fp,
+        target.proxy.as_ref().map(|record| &record.service),
     ) {
         RunOutcome::Exited {
             envelope,
@@ -4520,8 +4667,8 @@ enum RunOutcome {
 }
 
 /// The classifier the inline tests pose directly: a shared run with no
-/// `--agent`, the shape whose failure reason never gains the isolated-agent
-/// clause. The spawn path classifies through [`classify_run_with`]. Unix-only
+/// `--agent` on an account with no proxy claim, the shape whose failure reason
+/// never gains the isolated-agent clause. The spawn path classifies through [`classify_run_with`]. Unix-only
 /// because every caller builds an `ExitStatus` through
 /// `ExitStatusExt::from_raw`.
 #[cfg(all(test, unix))]
@@ -4542,11 +4689,13 @@ fn classify_run(
         profile,
         session_id,
         dead_key_fp,
+        None,
     )
 }
 
 /// [`classify_run`] carrying the run's own isolation and `--agent` spelling:
-/// the two facts the isolated-agent clause keys on, known only at the spawn.
+/// the two facts the isolated-agent clause keys on, known only at the spawn;
+/// and the target's proxy service, which the dead-key clause's fix names.
 #[allow(clippy::too_many_arguments)]
 fn classify_run_with(
     isolation: Isolation,
@@ -4557,6 +4706,7 @@ fn classify_run_with(
     profile: &str,
     session_id: &str,
     dead_key_fp: Option<u64>,
+    proxy: Option<&crate::proxy::Service>,
 ) -> RunOutcome {
     let stdout = capture.envelope_src();
     let stderr = String::from_utf8_lossy(stderr_bytes);
@@ -4581,7 +4731,7 @@ fn classify_run_with(
             reason.push_str(&clause);
         }
         if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
-            reason.push_str(&dead_key_clause(profile));
+            reason.push_str(&dead_key_clause(profile, proxy));
         }
         if let Some(clause) = isolated_agent_clause(isolation, subagent_type, &stderr) {
             reason.push_str(&clause);
@@ -4609,7 +4759,7 @@ fn classify_run_with(
                 reason.push_str(&clause);
             }
             if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
-                reason.push_str(&dead_key_clause(profile));
+                reason.push_str(&dead_key_clause(profile, proxy));
             }
             RunOutcome::Unparseable(
                 salvage_envelope(profile, reason, capture, Some(session_id)),
@@ -4874,18 +5024,19 @@ fn delegate_families(
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
-/// operator disabled, a recognised third-party profile whose inference has
-/// nothing to authenticate with (which
-/// would spawn a `claude` that dies on an empty envelope), an api-key profile
-/// (recognised or generic) whose key the provider already refused, an OAuth
-/// account whose setup token it refused that the account's sessions run on, or
-/// a quarantined one with nothing but that dead chain to authenticate with. The keyless test is
+/// operator disabled, a profile whose inference needs a key it does not
+/// carry, which would spawn a `claude` that dies on an empty envelope
+/// ([`Profile::is_keyless`]: a recognised provider, or a proxy account on its
+/// bind), an api-key profile (recognised or generic) whose key the provider
+/// already refused, an OAuth account whose setup token it refused that the
+/// account's sessions run on, or a quarantined one with nothing but that dead
+/// chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
 /// predicate `third_party_credentialed`, whose Alibaba exemption reads the
-/// console session that authenticates the quota gateway only. `is_third_party`
-/// scopes the check: an OAuth account has no provider.
+/// console session that authenticates the quota gateway only. `is_keyless`
+/// scopes the check: an OAuth account needs no key.
 ///
 /// A refusal a command can fix names that command, because the reader is a
 /// model that can run it: an unnamed one costs a turn to look up.
@@ -4903,7 +5054,7 @@ fn delegate_families(
 /// the exemption is for an account that demonstrably routes and authenticates
 /// on its own, never a judgement that the others have nothing. The keyless arm
 /// sits ABOVE it and is load-bearing
-/// there: a keyless third-party target fails that predicate too, and must be
+/// there: a keyless target fails that predicate too, and must be
 /// told about the key rather than sent to a browser login.
 ///
 /// Called from every path that refuses before a spawn: the single-background
@@ -4933,8 +5084,9 @@ fn preflight_target(
     // stopped by the missing key, and a key is what its fix has to name. The
     // quarantine sentence below would send it to a browser login that leaves
     // the key missing.
-    if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-        return Err(crate::format::third_party_keyless(name));
+    let proxy = profile.proxy.as_ref().map(|record| &record.service);
+    if profile.is_keyless() {
+        return Err(crate::format::third_party_keyless(name, proxy));
     }
     // After the keyless arm (a profile with no credential has none to reject)
     // and before quarantine: its browser-login fix leaves the refused
@@ -4943,7 +5095,7 @@ fn preflight_target(
         return Err(if crate::usage::dead_login_is_setup_token(profile) {
             crate::format::setup_token_rejected(name)
         } else {
-            crate::format::api_key_rejected(name)
+            crate::format::api_key_rejected(name, proxy)
         });
     }
     // A quarantined target whose own endpoint and credential serve inference
@@ -4954,9 +5106,13 @@ fn preflight_target(
     // whether inference works against it. What is left is the account with
     // nothing but the dead chain, refused with `switch`'s own sentence
     // (`actions.rs`, its AUTH-1 arm) so the two surfaces cannot spell that
-    // quarantine two ways.
+    // quarantine two ways. A proxy account takes no browser login, so it is
+    // told the quarantine's own copy, which names the login through its proxy.
     if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
-        return Err(crate::format::login_expired(name).line());
+        return Err(
+            crate::oauth::third_party_dead_chain_copy(Some(profile), name)
+                .unwrap_or_else(|| crate::format::login_expired(name).line()),
+        );
     }
     // The provider's own verdict, not clauth's guess at a figure: the freshest
     // cached third-party stats say this account cannot fund a call, so the
@@ -4964,11 +5120,16 @@ fn preflight_target(
     // setup spend. A missing cache is no verdict — an OAuth member, or a
     // provider clauth has never fetched for — and passes. The age rides so a
     // reader can discount a verdict the provider's next fetch may replace.
-    // Bounded to third-party profiles: a hand-edited config can strand a
-    // stale verdict on a profile that no longer runs third-party, where no
-    // fetch leg would ever refresh it away, and the guard keeps that file
-    // inert here the way it was before this arm existed.
-    if profile.is_third_party()
+    // Bounded to the accounts whose usage leg writes that verdict: a
+    // recognised provider, and a proxy account (its `[proxy]` record) the leg
+    // polls — the leg's own credential test, so a keyless one is out — whose
+    // leg rewrites the cache on every read that lands: the proxy arm, or the
+    // generic arm polling the same bind while the proxy has no registry row.
+    // A hand-edited config can strand a stale verdict on a profile outside
+    // both, where no fetch leg would ever refresh it away, and the guard keeps
+    // that file inert there the way it was before this arm existed.
+    if (profile.is_third_party()
+        || (profile.proxy.is_some() && crate::usage::third_party_credentialed(profile)))
         && let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
         && !stats.is_available
     {
@@ -5844,13 +6005,14 @@ impl Handoff {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// The run is over: write its envelope into the job file, if it owns one.
+    /// The run is over: write its envelope into the job file when it owns one,
+    /// or settle the blocking run's liveness record with its outcome.
     ///
     /// `Finished` is set under the state lock before anything else, so every
     /// beat resolving its destination from here writes nothing; the in-flight
     /// count is then drained before any of the IO below, so no beat write can
     /// land after it — recreating the liveness file or overwriting the
-    /// `write_done` a beat would otherwise race.
+    /// settle/`write_done` a beat would otherwise race.
     ///
     /// Inline result mode, test-only: the production spawn passes its own
     /// `result_file` through [`Self::finalize_with`].
@@ -5882,15 +6044,14 @@ impl Handoff {
         let owned = match previous {
             HandoffState::Converted(job) => Some(job),
             // A caller is still holding the join and takes the envelope from
-            // there, so this run's liveness record has no result left to offer.
-            // Leaving it would advertise a job nothing will ever collect, and
-            // writing a `done` record into it would deliver one result twice.
-            // The record goes first — it is what makes the id visible as a
-            // blocking run at all — then the registry entry, both outside the
-            // lock like every other write here.
+            // there, so the liveness record settles with the run's outcome and
+            // nothing else: writing the envelope into it would deliver one
+            // result twice. The record settles first — it is what makes the id
+            // visible as a blocking run at all — then the registry entry
+            // retires, both outside the lock like every other write here.
             HandoffState::Attached(mut run) => {
                 if let Some(spec) = run.live {
-                    jobs::remove_liveness(&spec.job_id);
+                    let _ = jobs::write_done_liveness(&spec, envelope);
                 }
                 drop(run.cancel_guard.take());
                 None
@@ -6051,8 +6212,9 @@ fn spawn_delegate(
         // `run_delegate` has returned, so the child has exited; any reader
         // beat still in flight is landed by `finalize`'s counter drain, and a
         // beat resolving later writes nothing. A run still attached to a
-        // waiting caller writes nothing and hands the envelope back below
-        // instead.
+        // waiting caller settles its liveness record, when it has one, as done
+        // with the run's outcome and no envelope, and hands the envelope back
+        // below instead.
         handoff.finalize_with(&envelope, result_file);
         // Dropped explicitly so the completion signal below is genuinely this
         // task's last action. A guard bound in the closure drops in reverse
@@ -6304,12 +6466,18 @@ fn dead_key_fingerprint(scan: &str, fp: Option<u64>) -> Option<u64> {
 
 /// The reply clause for a proven dead key. The provider's words here ARE the
 /// final verdict — unlike a 402, nothing re-checks — so the clause states the
-/// invalidation that ran and the fix, never a re-check.
-fn dead_key_clause(name: &str) -> String {
+/// invalidation that ran and the fix, never a re-check. A proxy account's key
+/// is the proxy's to mint (`proxy` is its service), so its fix is the one
+/// login clauth takes for it.
+fn dead_key_clause(name: &str, proxy: Option<&crate::proxy::Service>) -> String {
+    let login = match proxy {
+        Some(service) => crate::actions::proxy_login_command(name, service),
+        None => format!("clauth login {name} --api-key"),
+    };
     format!(
         ". the provider refused this run (401) naming the api key invalid; clauth dropped \
          this account's cached balance — `profiles` shows no figure for '{name}' until the \
-         key is re-captured (`clauth login {name} --api-key`)"
+         key is re-captured (`{login}`)"
     )
 }
 
@@ -6341,8 +6509,9 @@ fn isolated_agent_clause(
 /// cache IO, no lock taken. `fp` is the run's credential fingerprint
 /// ([`profile_credential_fingerprint`]); the dead-key record is keyed on the
 /// stored key alone, written only while the stored credential is still `fp`'s.
-/// Only a live body from a fetch that sent the key clears the records, and a
-/// re-captured key leaves them inert (`profile_cache.rs`'s contract).
+/// A live body from a fetch that sent the key or a proxy re-login's saved key
+/// clears the records, and a re-captured key leaves them inert
+/// (`profile_cache.rs`'s contract).
 fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64>) {
     // Gate on the third-party identity the delegate was launched with: a dead
     // key fired for the OLD key must not drop a NEW key's cache. An identity
@@ -6535,10 +6704,11 @@ impl ServerHandler for ClauthServer {
         // default `Implementation` reads its OWN build env, so the server
         // introduces itself to every client as "rmcp".
         //
-        // The protocol version stays at rmcp's default. It is only the fallback
-        // for an `initialize` caller asking for a revision this SDK does not
-        // know — a legacy client, which a 2026-07-28 answer would break —
-        // while `server/discover` advertises the full supported set instead.
+        // The protocol version stays at rmcp's default, `LATEST`, a revision
+        // with no `initialize`: rmcp answers an `initialize` caller asking
+        // for a revision this SDK does not know with the newest version that
+        // has one — a legacy client, which a 2026-07-28 answer would break —
+        // while `server/discover` advertises the full supported set.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -6596,20 +6766,31 @@ fn build_instructions() -> String {
             Call `profiles` for live usage figures."
             .to_string();
     };
+    let auth = crate::which::session_auth();
+    let runtime_name = match &auth {
+        crate::which::SessionAuth::IsolatedRuntime(name) => Some(name.as_str()),
+        crate::which::SessionAuth::Global | crate::which::SessionAuth::IsolatedCustom => None,
+    };
+    // A disabled account leaves this roster unless the block still reads its row:
+    // the active account's identity line and marker, and the shared runtime's own
+    // account, which the identity line names.
     let snapshots: Vec<ProfileSnapshot> = config
         .profiles
         .iter()
+        .filter(|p| {
+            !p.is_disabled() || config.is_active(&p.name) || runtime_name == Some(p.name.as_str())
+        })
         .map(|p| ProfileSnapshot {
             name: p.name.to_string(),
             active: config.is_active(&p.name),
             provider: provider_label(p),
             base_url: p.base_url.clone(),
             sub_type: tier_label(p),
+            disabled: p.is_disabled(),
             rank: roster_rank_for(p),
         })
         .collect();
 
-    let auth = crate::which::session_auth();
     let probe = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
     render::instructions_block(&snapshots, &auth, probe)
 }
@@ -6758,36 +6939,315 @@ pub(crate) fn serve() -> Result<()> {
 }
 
 async fn run_server(delegate_dot: bool) -> Result<()> {
-    use rmcp::{ServiceExt, transport::stdio};
+    use rmcp::{ServiceExt, service::ServerInitializeError, transport::stdio};
     // Resolve the pane reporter once, at startup: the pane env is what this
     // process inherited from herdr, and a per-call re-read would race a
     // delegate with a changed environment.
     let server =
         ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve(delegate_dot));
-    let service = server.serve(stdio()).await?;
+    let service = match server.serve(stdio()).await {
+        Ok(service) => service,
+        // rmcp answers `server/discover`, pings and malformed requests before
+        // it selects a lifecycle, so a client may get every reply it asked for
+        // and close stdin without one existing. Its transport ending there is
+        // the same client exit that ends an established session cleanly.
+        Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+        // A client that stops reading first leaves the reply to its probe on a
+        // closed pipe: the reader leaving, which `out` ends at exit 0 too.
+        Err(ServerInitializeError::TransportError { error, .. }) if is_broken_pipe(&error) => {
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     service.waiting().await?;
     Ok(())
 }
 
-pub(crate) fn await_job() -> ! {
+/// Whether any error in `error`'s source chain is an `EPIPE` write.
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |e| e.source()).any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// What one hook run waits on.
+struct AwaitWatch {
+    /// The ids a `delegate` result carried: one call's fan-out, delivered
+    /// together.
+    held: Vec<String>,
+    /// The session's other jobs, each delivered at its own end: holding one back
+    /// for a job from another call could cost it a day.
+    adopted: Vec<String>,
+    /// Present on the session's one watcher, the only hook that re-lists the
+    /// store or wakes an idle session.
+    lease: Option<WatchLease>,
+    /// The payload's session id, kept even without a lease (print mode): the
+    /// lost-job ownership test and the reported-lost once key on it, so a
+    /// print-mode wait reports a lost job once like an interactive one.
+    /// Adoption and the idle wake still gate on the lease alone.
+    session: Option<String>,
+}
+
+/// The wait's bounds, split from the constants so a test can run them short.
+struct AwaitLimits {
+    deadline: Duration,
+    idle_wake_ms: u64,
+    poll: Duration,
+    rescan: Duration,
+}
+
+const AWAIT_LIMITS: AwaitLimits = AwaitLimits {
+    deadline: Duration::from_secs(AWAIT_JOB_DEADLINE_SECS),
+    idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+    poll: JOB_POLL_INTERVAL,
+    rescan: AWAIT_RESCAN_INTERVAL,
+};
+
+/// One job the wake reports as lost: its id, the record's own session id (the
+/// `delegate({session_id})` resume handle), whether the run was isolated — an
+/// isolated run's transcript left with its throwaway tree, so that id is no
+/// resume handle — and the record's last-seen stamp at the poll that found it,
+/// what the wake derives "how long ago" from.
+#[derive(Debug, Clone, PartialEq)]
+struct LostJob {
+    id: String,
+    session_id: Option<String>,
+    isolated: bool,
+    last_seen_ms: u64,
+}
+
+/// How a wait ended.
+#[derive(Debug, PartialEq)]
+struct AwaitOutcome {
+    /// Folded the way every collect folds them ([`fold_done_envelope`]).
+    delivered: Vec<serde_json::Value>,
+    /// The ids still running.
+    pending: Vec<String>,
+    /// The jobs whose server died with their result: reported as lost, never
+    /// as still running. A wake names each once, and again under a later
+    /// host only while the reporting host never confirmed it (the session's
+    /// reported-lost set).
+    dead: Vec<LostJob>,
+    /// The wait ran out rather than ending on a job or an idle session.
+    at_limit: bool,
+}
+
+/// Read one hook payload from `input`, capped at
+/// [`crate::hook_note::MAX_PAYLOAD_BYTES`], parsed ONCE: the raw value feeds
+/// the job-id scan ([`extract_job_ids`]) and the typed payload everything
+/// else, so nothing parses the same bytes twice. A payload the cap truncates
+/// fails to parse and the hook exits 0, the same outcome as any other
+/// malformed input.
+fn read_await_payload(
+    input: &mut impl std::io::Read,
+) -> (Option<serde_json::Value>, Option<crate::hook_note::Payload>) {
     use std::io::Read;
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let job_ids = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let mut text = String::new();
+    let _ = input
+        .take(crate::hook_note::MAX_PAYLOAD_BYTES)
+        .read_to_string(&mut text);
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok();
+    let payload = value
         .as_ref()
+        .and_then(crate::hook_note::payload_from_value);
+    (value, payload)
+}
+
+pub(crate) fn await_job() -> ! {
+    let (value, payload) = read_await_payload(&mut std::io::stdin());
+    let event = value
+        .as_ref()
+        .and_then(|v| v.get("hook_event_name"))
+        .and_then(serde_json::Value::as_str);
+    let watch = if event.is_some_and(|event| turn_end_event(event) || event == "SubagentStop") {
+        turn_end_watch(payload.as_ref())
+    } else {
+        tool_result_watch(value.as_ref(), payload.as_ref())
+    };
+    // Bound for the rest of the process: the lease inside lets go at exit.
+    let Some(watch) = watch else {
+        std::process::exit(0);
+    };
+
+    let outcome = await_job_outcomes(
+        &watch,
+        &AWAIT_LIMITS,
+        &crate::hook_jobs::prompt_cache_is_1h,
+        &crate::hook_jobs::host_session_moved,
+    );
+    let (exit_code, lines) = await_wake_lines(&outcome);
+    // A wake starts a turn no `UserPromptSubmit` announces, and a watcher ending
+    // in silence leaves nothing to count for.
+    if (exit_code == 2 || watch.lease.is_some())
+        && let Some(payload) = &payload
+    {
+        crate::hook_jobs::clear_turn_end(&payload.session_id);
+    }
+    for line in &lines {
+        outln!("{line}");
+    }
+    // A synchronous hook run builds its blocking error from stderr alone
+    // (measured on CC 2.1.319), so a claimed result on stdout alone would
+    // reach nobody in print mode: on exit 2 every delivered line and the
+    // reminder go to both streams, identical.
+    if exit_code == 2 {
+        for line in &lines {
+            crate::out::errln!("{line}");
+        }
+    }
+    std::process::exit(exit_code);
+}
+
+/// The turn-end events whose payloads arm the watcher: a turn ends with
+/// `Stop`, and with `StopFailure` when it ended in an API error, where Claude
+/// Code fires no `Stop` (measured 2026-11-07 on CC 2.1.319). `SubagentStop`
+/// routes through [`turn_end_watch`] too, where the `agent_id` gate drops it.
+fn turn_end_event(event: &str) -> bool {
+    matches!(event, "Stop" | "StopFailure")
+}
+
+/// Whether this hook process runs under print mode: the host sets
+/// `CLAUDE_CODE_ENTRYPOINT` to `sdk-*` for the SDK CLI and `cli` for an
+/// interactive session (measured 2026-11-07 on CC 2.1.319). On a print-mode
+/// turn end the host runs an `asyncRewake` hook SYNCHRONOUSLY and builds its
+/// blocking error from stderr alone, so a wait there would hold the `claude -p`
+/// run for up to a day and its exit 2 would claim a result the host then
+/// discards: [`turn_end_watch`] exits 0 at once, nothing read, claimed or
+/// stamped, no lease. A `PostToolUse` fire under print mode takes no lease
+/// either ([`tool_result_watch`]), because the session has no turn-end watcher
+/// to hand a job to: each hook waits on its own ids, so a streaming-input SDK
+/// session's results are not lost to a sibling hook's wait.
+fn print_mode_stop() -> bool {
+    std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|entrypoint| entrypoint.starts_with("sdk-"))
+}
+
+/// A turn-end payload names no job, and its prose can quote one, so its watched
+/// set comes from the store alone. `None` ends the hook: print mode (see
+/// [`print_mode_stop`]); a subagent's turn end writes its own cache, not the
+/// session's; nothing of this session's is out; every job of this session's
+/// that is out was already reported lost; or a live watcher already holds the
+/// session.
+fn turn_end_watch(payload: Option<&crate::hook_note::Payload>) -> Option<AwaitWatch> {
+    let payload = payload.filter(|p| turn_end_event(&p.event) && p.agent_id.is_none())?;
+    if print_mode_stop() {
+        return None;
+    }
+    let now = crate::usage::now_ms();
+    let mut adopted = crate::hook_jobs::own_jobs(&payload.session_id, now);
+    // A kept corpse stays in the store for up to the silence window after
+    // the wake already reported it lost; the reported-lost sidecar is what
+    // keeps that report to once. A turn end under the host that wrote the
+    // entry confirms it told before deciding what to adopt, whichever turn
+    // that is.
+    let host = crate::hook_jobs::claude_pid();
+    if let Some(pid) = host {
+        crate::hook_jobs::confirm_reported_lost(&payload.session_id, pid);
+    }
+    // Drop the ids this turn end must not adopt: a told entry was already
+    // confirmed (a bare id list reads as told), and a pending entry from
+    // this host was just confirmed. A pending entry from another host stays
+    // adopted, so the watcher this turn end arms re-reports it; without a
+    // host pid no entry is confirmed and none re-reported, so every id the
+    // sidecar names is dropped. A turn end whose only adopted jobs fall out
+    // here ends the hook at once — no watcher process, no lease — instead of
+    // starting a watcher that would find nothing left to say.
+    let reports = crate::hook_jobs::lost_reports(&payload.session_id);
+    adopted.retain(|id| {
+        !reports.iter().any(|report| {
+            &report.id == id && (report.told || host.is_none() || report.host == host)
+        })
+    });
+    if adopted.is_empty() {
+        return None;
+    }
+    let lease = crate::hook_jobs::mark_turn_end(payload, now)?;
+    Some(AwaitWatch {
+        held: Vec::new(),
+        adopted,
+        lease: Some(lease),
+        session: Some(payload.session_id.clone()),
+    })
+}
+
+/// A `delegate` result carries its ids. Under a living watcher this hook keeps
+/// only what that watcher cannot find; under print mode it takes no lease,
+/// because the session has no turn-end watcher to hand a job to, and each hook
+/// waits on its own ids, whatever overlaps. A payload naming no session gets
+/// the wait alone.
+fn tool_result_watch(
+    value: Option<&serde_json::Value>,
+    payload: Option<&crate::hook_note::Payload>,
+) -> Option<AwaitWatch> {
+    let mut held = value
         .map(extract_job_ids)
         .unwrap_or_default()
         .into_iter()
         .filter(|id| jobs::is_safe_job_id(id))
         .collect::<Vec<_>>();
-    if job_ids.is_empty() {
-        std::process::exit(0); // sync delegate or unparseable input: nothing to deliver
+    if held.is_empty() {
+        return None; // sync delegate or unparseable input: nothing to deliver
     }
+    let lease = payload.filter(|_| !print_mode_stop()).and_then(|payload| {
+        // A running turn is not idle, whatever started it.
+        if payload.agent_id.is_none() {
+            crate::hook_jobs::clear_turn_end(&payload.session_id);
+        }
+        let lease = WatchLease::take(&payload.session_id);
+        if lease.is_none() {
+            held.retain(|id| !crate::hook_jobs::is_session_job(id, &payload.session_id));
+        }
+        lease
+    });
+    (!held.is_empty()).then_some(AwaitWatch {
+        held,
+        adopted: Vec::new(),
+        lease,
+        session: payload.map(|payload| payload.session_id.clone()),
+    })
+}
 
-    let (delivered, pending) =
-        await_job_outcomes(&job_ids, Duration::from_secs(AWAIT_JOB_DEADLINE_SECS));
-    for envelope in &delivered {
+/// The wake split into its parts: the exit code, the lost line, and the
+/// reminder. [`await_job_wake`] is the joined view; the print path needs the
+/// split so the lost line leads.
+fn await_wake_parts(outcome: &AwaitOutcome) -> (i32, Option<String>, Option<String>) {
+    let lost = (!outcome.dead.is_empty()).then(|| await_lost_line(&outcome.dead));
+    let (code, reminder) = if outcome.at_limit {
+        (2, Some(await_limit_line(&outcome.pending)))
+    } else {
+        await_job_verdict(!outcome.delivered.is_empty(), &outcome.pending)
+    };
+    // A lost line is a wake of its own: exit 2 carries it to both streams
+    // whatever the delivered/pending verdict said.
+    let code = if lost.is_some() { 2 } else { code };
+    (code, lost, reminder)
+}
+
+/// The hook's exit code and reminder for a finished wait. A lost job leads
+/// with its own line, joined by one space to whatever reminder follows, so a
+/// wake carrying both never claims a lost job is still working. The print
+/// path needs the split ([`await_wake_lines`]); this joined view is what the
+/// tests pin.
+#[cfg(test)]
+fn await_job_wake(outcome: &AwaitOutcome) -> (i32, Option<String>) {
+    let (code, lost, reminder) = await_wake_parts(outcome);
+    match (lost, reminder) {
+        (Some(lost), Some(reminder)) => (2, Some(format!("{lost} {reminder}"))),
+        (Some(lost), None) => (2, Some(lost)),
+        (None, reminder) => (code, reminder),
+    }
+}
+
+/// The wake's printed lines in order: the lost line first, then the delivered
+/// envelopes, then the reminder — a lost line never follows the results it
+/// warns about.
+fn await_wake_lines(outcome: &AwaitOutcome) -> (i32, Vec<String>) {
+    let (exit_code, lost, reminder) = await_wake_parts(outcome);
+    let mut lines = Vec::new();
+    if let Some(lost) = lost {
+        lines.push(lost);
+    }
+    for envelope in &outcome.delivered {
         // One line per delivered envelope, each opening with its account: a
         // fan-out delivers N lines in one hook run; a bare cost figure names
         // nobody to charge it to.
@@ -6796,19 +7256,20 @@ pub(crate) fn await_job() -> ! {
             .and_then(|lu| lu.get("profile"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        outln!(
+        lines.push(format!(
             "delegate to `{profile}` {}",
             render::envelope_prose(envelope)
-        );
+        ));
     }
-    let (exit_code, reminder) = await_job_verdict(!delivered.is_empty(), &pending);
     if let Some(reminder) = reminder {
-        outln!("{reminder}");
+        lines.push(reminder);
     }
-    std::process::exit(exit_code);
+    (exit_code, lines)
 }
 
-/// Choose the hook's exit code and reminder after the wait returns.
+/// Choose the hook's exit code and reminder for a wait that did not run out.
+/// A job still pending here is one a later turn end picks up, so the reminder
+/// promises the wake.
 fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String>) {
     if !delivered && pending.is_empty() {
         return (0, None); // every id already gone: nothing was delivered
@@ -6816,57 +7277,497 @@ fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String
     if pending.is_empty() {
         return (2, None); // wake the model with the result(s)
     }
-    let noun = if pending.len() == 1 { "job" } else { "jobs" };
-    let reminder = format!(
-        "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
-        pending.join("`, `"),
-        if pending.len() == 1 { "it" } else { "them" }
-    );
+    let ids = pending.join("`, `");
+    let reminder = if pending.len() == 1 {
+        format!(
+            "delegate job `{ids}` is still working. no action needed yet; clauth will wake this session when it finishes."
+        )
+    } else {
+        format!(
+            "delegate jobs `{ids}` are still working. no action needed yet; clauth will wake this session when they finish."
+        )
+    };
     (2, Some(reminder))
 }
 
-/// Poll every id in `job_ids` until each is `done` or gone, or `deadline`
-/// passes. Returns the delivered envelopes, folded the way every collect
-/// folds them ([`fold_done_envelope`]: live-usage footer, cost endpoint, and
-/// the no-envelope fallback), plus the ids still `running` at the deadline.
-/// A delivery claims its record ([`jobs::claim`]), so a `monitor` collect
-/// racing this wait owns the delivery and the hook drops that id; an absent
-/// id is dropped the same way (its file was GC'd or already collected).
-/// Blocking; the hook calls it directly on its own thread.
-fn await_job_outcomes(
-    job_ids: &[String],
-    deadline: Duration,
-) -> (Vec<serde_json::Value>, Vec<String>) {
-    let start = Instant::now();
-    let mut delivered = Vec::new();
-    let mut pending: Vec<&String> = job_ids.iter().collect();
-    loop {
-        pending.retain(|id| match jobs::read(id) {
-            Some(r) if r.state == jobs::JobState::Done => {
-                // The claim owns the delivery: a `monitor` collect that reads
-                // `Done` in the same instant finds the file gone and answers
-                // its hedged unknown copy, so exactly one full envelope
-                // reaches the conversation.
-                match jobs::claim(id, jobs::Claimant::Hook) {
-                    jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
-                        let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
-                        delivered.push(envelope);
-                        false
-                    }
-                    // Claimed between the read and the claim: a `monitor`
-                    // collect owns the delivery. Nothing to print, nothing
-                    // to wake — the collect's own reply reaches the model.
-                    jobs::Claim::Lost => false,
-                }
-            }
-            Some(_) => true, // still running: the loop exit decides on the deadline
-            None => false,
-        });
-        if pending.is_empty() || start.elapsed() >= deadline {
-            return (delivered, pending.into_iter().cloned().collect());
-        }
-        std::thread::sleep(JOB_POLL_INTERVAL);
+/// The line a job past the 24 h limit earns: the wait's deadline has passed,
+/// so the watcher points the caller at `monitor` instead of promising a wake
+/// it can no longer deliver.
+fn await_limit_line(pending: &[String]) -> String {
+    if let [job] = pending {
+        format!(
+            "24 hours have passed and delegate job `{job}` is still running; call `monitor` to check on it."
+        )
+    } else {
+        let ids = pending.join("`, `");
+        format!(
+            "24 hours have passed and delegate jobs `{ids}` are still running; call `monitor` to check on them."
+        )
     }
+}
+
+/// A wake names how long ago the record last moved once that is past five
+/// minutes: an orphan found after the fact (a session resumed after its
+/// server died) says when, a fresher one names no age.
+const LOST_AGE_AFTER_SECS: u64 = 5 * 60;
+
+/// The line a lost job's wake carries: the server died with the result, and
+/// nothing can deliver it. One job names its resume handle when its record
+/// carries one and its run was not isolated — an isolated run's transcript
+/// left with its throwaway tree, so that id is no handle `delegate` accepts,
+/// and the line reads as a record with none — and, when the wake comes more
+/// than [`LOST_AGE_AFTER_SECS`] after the record last moved, how long ago that
+/// was, in the same duration spelling the listing's orphaned row dates "last
+/// seen" with ([`crate::format::humanize_span`]). Several share the plural
+/// line, which carries no ages and offers the resume arm only when every job
+/// names a session id and none ran isolated: one job without a handle would
+/// make the offer false for the rest.
+fn await_lost_line(dead: &[LostJob]) -> String {
+    if let [lost] = dead {
+        let age_secs = crate::usage::now_ms().saturating_sub(lost.last_seen_ms) / 1000;
+        let ago = if age_secs > LOST_AGE_AFTER_SECS {
+            format!(" {} ago", crate::format::humanize_span(age_secs))
+        } else {
+            String::new()
+        };
+        let resume = match &lost.session_id {
+            Some(sid) if !lost.isolated => {
+                format!(" resume it with `delegate` `session_id: {sid}`, or run the task again.")
+            }
+            None | Some(_) => " run the task again.".to_string(),
+        };
+        format!(
+            "delegate job `{}` ended with its server{ago}; its result is lost.{resume}",
+            lost.id
+        )
+    } else {
+        let ids = dead
+            .iter()
+            .map(|lost| lost.id.as_str())
+            .collect::<Vec<_>>()
+            .join("`, `");
+        let resume = if dead
+            .iter()
+            .all(|lost| lost.session_id.is_some() && !lost.isolated)
+        {
+            " resume each with `delegate` and its session id from `monitor`, or run them again."
+        } else {
+            " run them again."
+        };
+        format!("delegate jobs `{ids}` ended with their server; their results are lost.{resume}")
+    }
+}
+
+/// What one poll found of a watched id.
+enum WatchedJob {
+    Finished,
+    Running {
+        /// A later turn end can find it. An untied job has this hook alone, so
+        /// the hook must not end ahead of it.
+        rearmable: bool,
+    },
+    /// Running but silent past [`jobs::RUNNING_TTL_MS`] under a live owner:
+    /// hung, so the wait ends with the `monitor` limit line instead of
+    /// polling it for the deadline.
+    Silent,
+    /// Orphaned — a running record whose server is gone, or a crashed done
+    /// record — and this session's to report: the wake names it as lost.
+    Dead(LostJob),
+    /// Collected, reaped, an orphan some other session owns, or an orphan
+    /// this session already reported: nothing more to say.
+    Gone,
+}
+
+/// Whether a polled record reads [`jobs::JobPhase::Orphaned`]: the same two
+/// legs [`jobs::StoredJob::phase`] matches for it — a `crashed` done record,
+/// or a running record the store's [`jobs::running_is_corpse`] reads as dead
+/// — shared predicates, re-matched over the bare record a poll reads. A phase
+/// the store later derives from anything else does not carry here: the poll
+/// reads a [`jobs::JobRecord`], and the store builds its [`jobs::StoredJob`]
+/// only inside [`jobs::list`], so a single-record classified read would need
+/// a new store entry point.
+fn orphaned(record: &jobs::JobRecord, now: u64) -> bool {
+    (record.state == jobs::JobState::Done && record.crashed)
+        || (record.state == jobs::JobState::Running && jobs::running_is_corpse(record, now))
+}
+
+/// The stamp a record was last alive at: the same retention anchor the store
+/// keeps the record by — a done record's finish, a running one's freshest of
+/// its last output, its last write and its mint. Re-derived here from the
+/// bare record a poll reads (the store computes the anchor inside
+/// `jobs::list`), so the wake's "how long ago" is the same stamp the
+/// listing's orphaned row dates "last seen" from.
+fn last_seen_ms(record: &jobs::JobRecord) -> u64 {
+    match record.state {
+        jobs::JobState::Done => {
+            if record.done_at > 0 {
+                record.done_at
+            } else {
+                record.started_at
+            }
+        }
+        jobs::JobState::Running => record
+            .last_output_at
+            .max(record.recorded_at)
+            .max(record.started_at),
+    }
+}
+
+fn poll_job(
+    job_id: &str,
+    session: Option<&str>,
+    report_session: Option<&str>,
+    now: u64,
+    reported: &[String],
+) -> WatchedJob {
+    let Some(record) = jobs::read(job_id) else {
+        return WatchedJob::Gone;
+    };
+    if reported.contains(&record.job_id) {
+        return WatchedJob::Gone; // told once already: nothing left to say
+    }
+    if orphaned(&record, now) {
+        // The wake keys on the phase alone. A job tied to another session is
+        // that session's to report; an untied one has this hook alone. The
+        // ownership test reads the payload's session, lease or not, so a
+        // print-mode wait reports the same lost jobs an interactive one would
+        // — and it is the same predicate the collect gates on.
+        let ours = corpse_reports_to(&record, report_session);
+        return if ours {
+            WatchedJob::Dead(LostJob {
+                id: record.job_id.clone(),
+                session_id: record.session_id.clone(),
+                isolated: record.isolated,
+                last_seen_ms: last_seen_ms(&record),
+            })
+        } else {
+            WatchedJob::Gone
+        };
+    }
+    if record.state == jobs::JobState::Done {
+        return WatchedJob::Finished;
+    }
+    if jobs::running_is_silent(&record, now) {
+        return WatchedJob::Silent;
+    }
+    WatchedJob::Running {
+        rearmable: session.is_some() && record.host_session.as_deref() == session,
+    }
+}
+
+/// What one poll moved out of the watched sets, by where each id went.
+#[derive(Default)]
+struct WatchedMoves {
+    finished: Vec<String>,
+    silent: Vec<String>,
+    dead: Vec<LostJob>,
+}
+
+/// One poll over `ids`: keeps the running ones and moves the rest into
+/// `moved`, reporting whether a finished one moved. Clears `rearmable` for a
+/// running job only this hook can deliver.
+fn poll_jobs(
+    ids: &mut Vec<String>,
+    session: Option<&str>,
+    report_session: Option<&str>,
+    now: u64,
+    reported: &[String],
+    moved: &mut WatchedMoves,
+    rearmable: &mut bool,
+) -> bool {
+    let finished_before = moved.finished.len();
+    ids.retain(
+        |id| match poll_job(id, session, report_session, now, reported) {
+            WatchedJob::Finished => {
+                moved.finished.push(id.clone());
+                false
+            }
+            WatchedJob::Running { rearmable: tied } => {
+                *rearmable &= tied;
+                true
+            }
+            WatchedJob::Silent => {
+                moved.silent.push(id.clone());
+                false
+            }
+            WatchedJob::Dead(lost) => {
+                moved.dead.push(lost);
+                false
+            }
+            WatchedJob::Gone => false,
+        },
+    );
+    moved.finished.len() > finished_before
+}
+
+/// Add the session's jobs this wait has not met. `seen` outlives each job, so a
+/// record whose stored id reads back as nothing cannot be adopted twice.
+fn adopt_own_jobs(session: &str, seen: &mut HashSet<String>, adopted: &mut Vec<String>) {
+    for id in crate::hook_jobs::own_jobs(session, crate::usage::now_ms()) {
+        if seen.insert(id.clone()) {
+            adopted.push(id);
+        }
+    }
+}
+
+/// Claim every finished id and report what remains. A finished job stays in
+/// the store until here, so a day's wait holds no claimed result in memory for
+/// a killed hook to lose, and a `monitor` collect can still reach it.
+///
+/// A wait ended by silence names only the hung ids as pending: the still-live
+/// rest stays in the store for the next turn end, whose watcher picks it up,
+/// and [`crate::hook_jobs::own_jobs`] keeps later turn ends from re-adopting
+/// the hung ones. At the limit the pending set chains them all, because this
+/// wait is the last thing watching the untied rest, and a name dropped here is
+/// named nowhere again. A lost id never joins the pending set: nothing is
+/// still running for it to claim.
+fn settle_await(
+    finished: &[String],
+    held: &[String],
+    adopted: &[String],
+    at_limit: bool,
+    silent: &[String],
+    dead: &[LostJob],
+) -> AwaitOutcome {
+    let delivered = finished
+        .iter()
+        .filter_map(|id| {
+            // The claim owns the delivery: a `monitor` collect that reads `Done`
+            // in the same instant finds the file gone and answers its hedged
+            // unknown copy, so exactly one full envelope reaches the
+            // conversation.
+            match jobs::claim(id, jobs::Claimant::Hook) {
+                jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
+                    Some(fold_done_envelope(&r, DigestMode::Skip).0)
+                }
+                // Claimed since the read: a `monitor` collect owns the delivery,
+                // and its own reply reaches the model.
+                jobs::Claim::Lost => None,
+            }
+        })
+        .collect();
+    let pending = if !silent.is_empty() && !at_limit {
+        silent.to_vec()
+    } else {
+        silent.iter().chain(held).chain(adopted).cloned().collect()
+    };
+    AwaitOutcome {
+        delivered,
+        pending,
+        dead: dead.to_vec(),
+        at_limit: at_limit || !silent.is_empty(),
+    }
+}
+
+/// Poll the watched jobs until the wait can end: a call's whole fan-out is
+/// finished, any adopted job is, nothing remains, a watched job turns silent
+/// past the store's corpse window, a watched job's server dies with its
+/// result (the lost wake, once per session and again under a later host only
+/// when the reporting host never confirmed it), the session has sat idle past
+/// `limits.idle_wake_ms` on a 1 h prompt cache with `[plugin] idle_wake` on
+/// (read before the TTL, once per idle stretch), or
+/// `limits.deadline` passes. The idle wake needs the session the payload
+/// named to still be the host's current one (`session_moved`): `/clear`,
+/// `/fork` and `/branch` move the id while the process lives, and a wake then
+/// would fire mid-turn with no turn end of the old id left to re-arm the
+/// watcher, so the hook keeps waiting and delivers at the job's own end. A
+/// delivery claims its record ([`jobs::claim`]), so a `monitor` collect racing
+/// this wait owns the delivery and the hook drops that id. Blocking; the hook
+/// calls it directly on its own thread.
+fn await_job_outcomes(
+    watch: &AwaitWatch,
+    limits: &AwaitLimits,
+    cache_is_1h: &dyn Fn() -> bool,
+    session_moved: &dyn Fn(&str) -> bool,
+) -> AwaitOutcome {
+    let start = Instant::now();
+    let session = watch.lease.as_ref().map(WatchLease::session_id);
+    // The ownership test and the reported-lost once key on the payload's
+    // session even without a lease (print mode), so a lost job is reported
+    // once there too; adoption and the idle wake keep the lease as their
+    // gate.
+    let report_session = session.or(watch.session.as_deref());
+    // The sidecar ids this wait must stay silent about: a told entry never
+    // wakes again, and a pending entry this host reported is this host's to
+    // confirm, never to repeat. A pending entry from another host is the
+    // wake the other host owed and may never have delivered, so this wait
+    // carries it. Without a host pid no entry can be judged
+    // pending-from-another, so the whole sidecar stays silent, as it always
+    // did.
+    let host = crate::hook_jobs::claude_pid();
+    let reported = report_session
+        .map(|session| {
+            crate::hook_jobs::lost_reports(session)
+                .into_iter()
+                .filter(|report| report.told || host.is_none() || report.host == host)
+                .map(|report| report.id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut held = watch.held.clone();
+    let mut adopted = watch.adopted.clone();
+    let mut seen: HashSet<String> = held.iter().chain(&adopted).cloned().collect();
+    let mut moved = WatchedMoves::default();
+    let mut adopted_finished = false;
+    let mut judged_turn_end = None;
+    let mut last_scan = start;
+    loop {
+        if let Some(session) = session
+            && last_scan.elapsed() >= limits.rescan
+        {
+            adopt_own_jobs(session, &mut seen, &mut adopted);
+            last_scan = Instant::now();
+        }
+        let now = crate::usage::now_ms();
+        let mut rearmable = true;
+        poll_jobs(
+            &mut held,
+            session,
+            report_session,
+            now,
+            &reported,
+            &mut moved,
+            &mut rearmable,
+        );
+        adopted_finished |= poll_jobs(
+            &mut adopted,
+            session,
+            report_session,
+            now,
+            &reported,
+            &mut moved,
+            &mut rearmable,
+        );
+
+        let deliverable = (held.is_empty() && !moved.finished.is_empty()) || adopted_finished;
+        // A moved id has no later turn end to find what this hook leaves, so
+        // the rest stays here, as an untied job does.
+        if (deliverable || !moved.silent.is_empty() || !moved.dead.is_empty())
+            && session.is_some_and(session_moved)
+        {
+            rearmable = false;
+        }
+
+        // A watched job turning silent past the store's corpse window ends the
+        // wait here: the limit line names the hung job once, and `is_awaited`
+        // keeps later turn ends from waking for it again. Only while every
+        // watched job is tied: an untied job has this hook alone, so its wait
+        // must not end on a tied one's silence.
+        if !moved.silent.is_empty() && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+
+        // A watched job whose server died ends the wait the same way: the
+        // wake names it as lost, and the session's reported-lost set keeps
+        // this host's later waits silent about it, and every host's once
+        // confirmed.
+        if !moved.dead.is_empty() && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+
+        if deliverable && rearmable {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                false,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+        if held.is_empty() && adopted.is_empty() {
+            // A hook that stepped aside for this watcher is trusting it to find
+            // that job, and no turn end may follow: look once more under the
+            // lease before letting it go.
+            if let Some(session) = session {
+                adopt_own_jobs(session, &mut seen, &mut adopted);
+            }
+            if adopted.is_empty() {
+                return settle_watched(
+                    report_session,
+                    &moved.finished,
+                    &held,
+                    &adopted,
+                    false,
+                    &moved.silent,
+                    &moved.dead,
+                );
+            }
+            continue;
+        }
+        if let Some(session) = session.filter(|_| rearmable) {
+            let turn_end = crate::hook_jobs::turn_ended_at(session);
+            if turn_end != judged_turn_end
+                && crate::hook_jobs::idle_wake_due(turn_end, now, limits.idle_wake_ms)
+                && !session_moved(session)
+            {
+                if crate::profile::idle_wake_enabled() && cache_is_1h() {
+                    return settle_watched(
+                        report_session,
+                        &moved.finished,
+                        &held,
+                        &adopted,
+                        false,
+                        &moved.silent,
+                        &moved.dead,
+                    );
+                }
+                judged_turn_end = turn_end;
+            }
+        }
+        if start.elapsed() >= limits.deadline {
+            return settle_watched(
+                report_session,
+                &moved.finished,
+                &held,
+                &adopted,
+                true,
+                &moved.silent,
+                &moved.dead,
+            );
+        }
+        std::thread::sleep(limits.poll);
+    }
+}
+
+/// [`settle_await`] plus the once-record: a lost job the wake reports is
+/// written to the session's reported-lost set before the outcome leaves, so
+/// no later wait of this host names it again, nor any once it is told.
+/// Nothing else writes or claims the job record itself, so `monitor` and the
+/// job store answer exactly as before.
+fn settle_watched(
+    session: Option<&str>,
+    finished: &[String],
+    held: &[String],
+    adopted: &[String],
+    at_limit: bool,
+    silent: &[String],
+    dead: &[LostJob],
+) -> AwaitOutcome {
+    if !dead.is_empty()
+        && let Some(session) = session
+    {
+        let ids = dead.iter().map(|lost| lost.id.clone()).collect::<Vec<_>>();
+        crate::hook_jobs::record_lost(session, &ids);
+    }
+    settle_await(finished, held, adopted, at_limit, silent, dead)
 }
 
 /// Extract every background job id from a hook payload, preferring the
@@ -6964,6 +7865,14 @@ mod profiles_tool_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_format.rs"]
 mod format_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6_delegate.rs"]
+mod proxy_p6_delegate_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_await_job.rs"]
+mod await_job_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_delegate_args.rs"]

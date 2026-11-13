@@ -240,7 +240,7 @@ pub(crate) enum SessionKind {
     responses(
         (status = 200, description = "every herdr pane on this host with the clauth sessions running inside it, joined on process ids (the foreground process group leader is the pane's own session, as is a listed `clauth` running `start` or `resume` under a wrapper; any other listed process is a delegate; the display tag never joins; on Windows herdr lists only the pane's agent root, so no session joins there); at most 1 + N herdr calls at 2 s each", body = PanesBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))

@@ -168,7 +168,9 @@ fn active_of(d: &Daemon) -> Option<String> {
 
 /// The drain marks the daemon's own skip store; the refresher's scan must read
 /// the SAME `Arc`, or a mark is invisible to every scan and N4 returns while the
-/// suite stays green. Pinned through the refresher's test-only recording seam.
+/// suite stays green. The drain's lease guard must read the same `FetchLease`
+/// the refresher's watchdog watches, or a release is invisible to it. Pinned
+/// through the refresher's test-only recording seam.
 #[test]
 fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     let _home = HomeSandbox::new();
@@ -187,6 +189,13 @@ fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     assert!(
         std::sync::Arc::ptr_eq(&recorded, &daemon.skipped_unreadable),
         "the refresher's scan must read the same store the drain marks"
+    );
+    let (watchdog_lease, _) = crate::usage::LAST_REFRESHER_START
+        .with(|slot| slot.borrow().clone())
+        .expect("the refresher records the lease it hands its watchdog");
+    assert!(
+        std::sync::Arc::ptr_eq(&watchdog_lease, &daemon.fetch_lease),
+        "the watchdog must release the same lease the drain reads"
     );
 }
 
@@ -566,6 +575,377 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         active_of(&daemon).as_deref(),
         Some("beta"),
         "an idle, clean, installable target must be switched to"
+    );
+}
+
+/// A queued switch must not execute once the daemon lost the fetch lease:
+/// the decision was queued under a ticket the watchdog then released, and
+/// the holder that took over owns every switch decision. The record clears
+/// with the skip.
+#[test]
+fn drain_pending_switch_does_not_execute_once_the_daemon_lost_the_lease() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    // The daemon held the lease when the decision was queued, then lost it
+    // the watchdog's way.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    stage_switch(&daemon, "beta");
+    // A first deferral stages the backoff record the skip must clear.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+    daemon.drain_pending_switch();
+    assert!(
+        daemon.switch_backoff.is_some(),
+        "fixture control: the mid-fetch drain stages a backoff"
+    );
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon must not execute the queued switch"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the record clears with the skip"
+    );
+    assert!(
+        daemon.switch_backoff.is_none(),
+        "the skip clears the backoff the deferral staged"
+    );
+}
+
+/// A watchdog release landing while the switch's AUTH-1 gate runs refuses both
+/// the gate's refresh and the apply: the decision came from the queue, and the
+/// holder that took over decides. The release rides the gate's own seam.
+#[test]
+fn drain_pending_switch_applies_nothing_when_the_lease_dies_inside_its_gate() {
+    let home = HomeSandbox::new();
+    let beta = expired_profile_with_creds("beta", "at-beta");
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+            beta,
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    // A spending gate is the failure, so the stub takes one more request than
+    // a refusing run would ever send.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    // A real backoff for a DIFFERENT target: a gamma mid-fetch defers, and the
+    // skip's reset is unconditional. The beta drain below never gates on it.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("gamma"),
+        ProfileActivity::Fetching,
+    );
+    stage_switch(&daemon, "gamma");
+    daemon.drain_pending_switch();
+    assert!(
+        daemon
+            .switch_backoff
+            .as_ref()
+            .is_some_and(|b| b.target == "gamma"),
+        "fixture control: the mid-fetch gamma drain stages a backoff"
+    );
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate runs"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        Vec::<String>::new(),
+        "a stood-down gate sent a token request"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the record clears with the skip"
+    );
+    assert!(
+        daemon.switch_backoff.is_none(),
+        "the skip clears the backoff the gamma deferral staged"
+    );
+}
+
+/// A watchdog release landing before the switch gate's adopt refuses the gate
+/// before that durable write: the stood-down daemon adopts nothing and lifts no
+/// quarantine. The live-lease control adopts the moved pair, so the assertions
+/// mean the lease.
+#[test]
+fn drain_pending_switch_adopts_nothing_when_the_lease_dies_before_its_gate() {
+    let _home = HomeSandbox::new();
+    let beta = expired_profile_with_creds("beta", "at-beta");
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), beta],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let beta_name = crate::profile::ProfileName::from("beta");
+    // The store moved past the entry's token (a peer's advance), and the
+    // entry's token is on the spent record: a rotation past it ADOPTS the store.
+    crate::oauth::record_spent(&beta_name, "rt-at-beta");
+    {
+        let mut moved = crate::profile::load_profile(&beta_name).expect("load the fixture store");
+        let oauth = moved
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture's pair");
+        oauth.access_token = "at-moved".to_string();
+        oauth.refresh_token = Some("rt-moved".to_string());
+        oauth.expires_at = Some(future_expiry());
+        crate::profile::save_profile(&moved).expect("save the moved store");
+    }
+    let mut daemon = daemon_for(config);
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .set_auth_broken(&beta_name, true);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate waits"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&beta_name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-at-beta"),
+        "a stood-down gate adopted the newer disk pair"
+    );
+    assert!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "a stood-down gate lifted the quarantine"
+    );
+
+    // Control: the same fixture under a live lease adopts the moved pair and
+    // lifts the quarantine, so the assertions above mean the lease.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&beta_name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-moved"),
+        "control: a live-lease gate adopts the newer disk pair"
+    );
+    assert!(
+        !daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "control: the adopt lifts the quarantine"
+    );
+}
+
+/// A watchdog release landing before the gate's quarantine refuses the gate
+/// before that durable write: the stood-down daemon leaves the unrefreshable
+/// target unquarantined. The same fixture under a live lease quarantines it.
+#[test]
+fn drain_pending_switch_quarantines_nothing_when_the_lease_dies_before_its_gate() {
+    let _home = HomeSandbox::new();
+    let mut beta = expired_profile_with_creds("beta", "at-beta");
+    let beta_name = crate::profile::ProfileName::from("beta");
+    if let Some(oauth) = beta
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.refresh_token = None;
+    }
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), beta],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let lease = std::sync::Arc::clone(&daemon.fetch_lease);
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder while the gate waits"
+        );
+    })));
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    crate::oauth::set_rotation_park_hook(None);
+
+    assert!(
+        !daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "a stood-down gate quarantined the target"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon applied the queued switch"
+    );
+
+    // Control: the same fixture under a live lease quarantines the target.
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert!(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .is_auth_broken(&beta_name),
+        "control: a live-lease gate quarantines the unrefreshable login"
+    );
+}
+
+/// The same gate on the switch-off drain: a queued switch-off must not
+/// execute once the daemon lost the lease, and the flag clears with the skip.
+#[test]
+fn drain_pending_switch_off_does_not_execute_once_the_daemon_lost_the_lease() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a stood-down daemon must not switch off"
+    );
+    assert!(
+        !*daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the record clears with the skip"
     );
 }
 
@@ -1278,6 +1658,61 @@ fn drain_pending_switch_off_strips_the_outgoing_oauth_account() {
     assert!(
         after.get("oauthAccount").is_none(),
         "the daemon wrap-off drain must strip the outgoing identity block"
+    );
+}
+
+/// The daemon's wrap-off over an account whose `config.toml` turned
+/// unclassifiable after it loaded, holding a first login, is held: the login
+/// stays in `~/.claude`, the account stays active, and the line goes out once
+/// per login however often the scheduler queues the switch-off.
+#[test]
+fn a_spent_chain_holds_the_daemon_switch_off_over_an_unclassifiable_first_login() {
+    use crate::claude::tests::Unclassifiable;
+    let mut outcomes = Vec::new();
+    for (i, shape) in Unclassifiable::BOTH.into_iter().enumerate() {
+        let _home = HomeSandbox::new();
+        let config = persist(
+            vec![blank_profile(&crate::profile::ProfileName::from("alpha"))],
+            Some("alpha"),
+            90_000,
+        );
+        crate::testutil::write_live_creds(&oauth_creds(&format!("at-hold-daemon-{i}")));
+        let live_path = crate::claude::claude_credentials_path().unwrap();
+        let live = std::fs::read(&live_path).unwrap();
+        let mut daemon = daemon_for(config);
+        shape.pose("alpha");
+
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        for _ in 0..2 {
+            *daemon
+                .pending_switch_off
+                .lock()
+                .expect("pending_switch_off") = true;
+            daemon.drain_pending_switch_off();
+        }
+        drop(capture);
+
+        outcomes.push((
+            active_of(&daemon),
+            std::fs::read(&live_path).ok() == Some(live),
+            lines.snapshot(),
+        ));
+    }
+    let held = (
+        Some("alpha".to_string()),
+        true,
+        vec![
+            "clauth daemon: switch-off failed: can't read the config of 'alpha', so clauth can't \
+             tell whether Claude Code's current login belongs in it; fix its config.toml, and \
+             clauth switches off at its next check"
+                .to_string(),
+        ],
+    );
+    assert_eq!(
+        outcomes,
+        vec![held.clone(), held],
+        "(active, live login kept, log lines) per shape"
     );
 }
 
@@ -2598,7 +3033,7 @@ fn a_copy_back_moves_the_next_usage_bearer_to_the_stored_token() {
     let requests = server.join().expect("listener");
     let bearers: Vec<String> = requests
         .iter()
-        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter(|raw| crate::testutil::request_path(raw) == "/api/oauth/usage")
         .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
         .collect();
     assert_eq!(
@@ -4796,7 +5231,7 @@ fn the_daemon_logs_an_unaddressable_account_name_once_per_change() {
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
     let line = "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth \
-                prints for it fail; rename it on the TUI's Setup tab";
+                prints for it fail; rename it with `clauth rename -- -x <new-name>`";
 
     daemon.log_name_notices(None);
     assert_eq!(lines.snapshot(), vec![line.to_string()]);
@@ -4949,8 +5384,8 @@ fn the_daemon_logs_a_name_in_both_rosters_once() {
         lines.snapshot(),
         vec![
             "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch \
-             to this account; switch with `clauth switch list`, or rename it on the TUI's \
-             Setup tab"
+             to this account; switch with `clauth switch list`, or rename it with \
+             `clauth rename list <new-name>`"
                 .to_string()
         ],
         "a name both rosters hold logs once"
@@ -5904,6 +6339,53 @@ fn an_account_deleted_from_the_roster_re_arms_the_headless_bell() {
         profile.bell_threshold = Some(90.0);
         cfg.profiles = vec![profile];
         cfg.state.profiles = vec!["alpha".into()];
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+        ]
+    );
+}
+
+/// The forget is about the roster, not the bell's delivery: an account deleted
+/// while no `bell_command` is set is still gone, so re-creating it past the
+/// line under a command rings a fresh crossing.
+#[test]
+fn an_account_deleted_with_no_bell_command_set_re_arms_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    // The command goes, then the account goes under it.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.state.bell_command = None;
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    d.write_status();
+    // The account comes back past the line with the command set again.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-bell");
+        profile.bell_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.bell_command = Some("notify-send %s".to_string());
     }
     d.write_status();
     assert_eq!(
@@ -7805,6 +8287,15 @@ fn tree_store(tree: &std::path::Path) -> Option<std::path::PathBuf> {
     std::fs::canonicalize(tree.join(".credentials.json")).ok()
 }
 
+/// Whether `sid`'s row names `member` as the session's current member. A swap
+/// moves the link before it writes the row, and `run_switch` and the rotation
+/// gate decide off the row, so a wait ahead of either holds this beside the
+/// link. The gate reads `launch_store`, which that same row write sets here.
+#[cfg(target_os = "linux")]
+fn row_names_member(sid: &str, member: &str) -> bool {
+    crate::live_sessions::get(sid).is_some_and(|row| row.current_member.as_deref() == Some(member))
+}
+
 /// A `--with-fallback` background launch hands its session on
 /// instead of ending it. Once the launcher exits, the row of the tree a job
 /// names stays, with its chain opt-in and launch account; only the launcher's
@@ -8093,7 +8584,9 @@ fn session_moved_round_three_accounts(
         crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
         let store = member_store_of(member);
         tick_until(&mut first, "moved the session", |d| {
-            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+            tree_store(&tree).as_ref() == Some(&store)
+                && daemon_holds_session(d, &sid, member)
+                && row_names_member(&sid, member)
         });
     }
     drop(first);
@@ -9530,10 +10023,7 @@ fn an_adopted_with_fallback_session_moves_along_the_chain() {
     let wfs_store = member_store_of("wfs");
     tick_until(&mut daemon, "moved the session onto wfs", |d| {
         tree_store(&tree).as_ref() == Some(&wfs_store)
-            && crate::live_sessions::get(&sid)
-                .and_then(|row| row.current_member)
-                .as_deref()
-                == Some("wfs")
+            && row_names_member(&sid, "wfs")
             && daemon_holds_session(d, &sid, "wfs")
     });
     assert!(
@@ -9580,11 +10070,7 @@ fn an_adoption_holds_the_member_the_session_last_moved_onto() {
         .expect("intent back onto wfl");
     let wfl_store = member_store_of("wfl");
     tick_until(&mut daemon, "moved the session back onto wfl", |_| {
-        tree_store(&tree).as_ref() == Some(&wfl_store)
-            && crate::live_sessions::get(&sid)
-                .and_then(|row| row.current_member)
-                .as_deref()
-                == Some("wfl")
+        tree_store(&tree).as_ref() == Some(&wfl_store) && row_names_member(&sid, "wfl")
     });
 }
 
@@ -10002,7 +10488,9 @@ fn an_adopted_session_blocks_a_macos_rotation_of_its_account_while_its_job_runs(
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut daemon, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     let wfs = crate::profile::ProfileName::from("wfs");
 
@@ -10332,7 +10820,9 @@ fn a_handed_off_session_keeps_every_account_it_ran_on_live() {
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut first, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
     let wfl_store = member_store_of("wfl");
@@ -10380,7 +10870,9 @@ fn a_held_marker_of_a_visited_account_refuses_the_adoption_cleanly() {
     crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
     let wfs_store = member_store_of("wfs");
     tick_until(&mut first, "moved the session onto wfs", |d| {
-        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && daemon_holds_session(d, &sid, "wfs")
+            && row_names_member(&sid, "wfs")
     });
     crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
     let wfl_store = member_store_of("wfl");
@@ -10452,7 +10944,9 @@ fn a_refused_adoption_rolls_back_the_markers_it_claimed_first() {
         crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
         let store = member_store_of(member);
         tick_until(&mut first, "moved the session", |d| {
-            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+            tree_store(&tree).as_ref() == Some(&store)
+                && daemon_holds_session(d, &sid, member)
+                && row_names_member(&sid, member)
         });
     }
     drop(first);
@@ -10526,7 +11020,7 @@ fn a_daemons_spend_drain_waits_on_its_own_schedulers_claims() {
     let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
         &daemon.activity,
         &name,
-        &daemon.shutting_down,
+        daemon.shutting_down.as_ref(),
     )
     .expect("an unset flag admits the spend");
 
@@ -10807,7 +11301,10 @@ fn the_tick_loop_switch_then_copy_back_follows_the_store() {
     let _home = HomeSandbox::new();
     crate::plugin_host::arm_heal_throttle_for_test();
     crate::herdr::arm_heal_throttle_for_test();
-    let (base, server) = crate::testutil::serve_endpoints_raw(8, |path, _| {
+    // Three accounts × (usage + profile) + the three claude banked-reset side
+    // reads the tick fires for them: nine requests. Eleven leaves room to
+    // record a tenth (a duplicated poll) instead of refusing it unseen.
+    let (base, server) = crate::testutil::serve_endpoints_raw(11, |path, _| {
         if path.starts_with("/api/oauth/usage") {
             (
                 200,
@@ -10865,7 +11362,7 @@ fn the_tick_loop_switch_then_copy_back_follows_the_store() {
     let requests = server.join().expect("listener");
     let mut bearers: Vec<String> = requests
         .iter()
-        .filter(|raw| crate::testutil::request_path(raw).starts_with("/api/oauth/usage"))
+        .filter(|raw| crate::testutil::request_path(raw) == "/api/oauth/usage")
         .filter_map(|raw| crate::testutil::request_header(raw, "authorization"))
         .collect();
     bearers.sort();
@@ -11192,4 +11689,231 @@ fn a_daemon_reload_seeds_a_dead_login_another_process_recorded() {
             "fixture control: without the seed the walk takes the account (load fails: {load_fails})"
         );
     }
+}
+
+// ── stop-gate wiring pin ─────────────────────────────────────────────────────
+
+/// The stop gate a daemon builds carries the tick thread its scheduler start
+/// returned, so the drain's wake and wait reach that thread.
+#[cfg(unix)]
+#[test]
+fn a_daemons_stop_gate_carries_its_scheduler_tick_thread() {
+    let _home = HomeSandbox::new();
+    let daemon = daemon_for(persist(vec![], None, 60_000));
+    daemon.spawn_scheduler();
+    let drain = daemon.spend_drain();
+    let scheduler = drain
+        .scheduler
+        .as_ref()
+        .expect("the stop gate carries the scheduler's tick thread");
+    assert!(
+        std::sync::Arc::ptr_eq(&scheduler.shutting_down, &daemon.shutting_down),
+        "the gate must wake the same flag the tick thread reads"
+    );
+}
+
+/// A daemon stop waits for a tick that outlasts the children's stop budget
+/// but ends inside the drain's bound, so that tick's exit save still runs.
+#[cfg(unix)]
+#[test]
+fn a_daemon_stop_waits_for_a_tick_longer_than_the_child_stop_budget() {
+    // The give-up line a red logs stays out of the real home.
+    let _home = HomeSandbox::new();
+    let tick = crate::daemon::gateway::DAEMON_STOP_BUDGET + Duration::from_secs(1);
+    assert!(
+        tick < crate::daemon::SPEND_DRAIN_BOUND,
+        "fixture: the tick must end inside the drain's bound"
+    );
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raised = std::sync::Arc::clone(&flag);
+    let seen = std::sync::Arc::clone(&ended);
+    let sleeper = std::thread::spawn(move || {
+        while !raised.load(Ordering::SeqCst) {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+        std::thread::sleep(tick);
+        seen.store(true, Ordering::SeqCst);
+    });
+    let thread = crate::daemon::TickThread::new(Some(sleeper), std::sync::Arc::clone(&flag));
+    let spends = crate::daemon::SpendDrain::new(crate::testutil::fresh_activity(), flag)
+        .with_scheduler(thread);
+
+    spends.drain(crate::daemon::SPEND_DRAIN_BOUND);
+
+    assert!(
+        ended.load(Ordering::SeqCst),
+        "the drain abandoned a tick that ends inside its bound"
+    );
+}
+
+/// A stop whose token spend and tick both outrun the drain's bound ends at
+/// that one bound: the tick thread's wait shares the spend wait's window, so
+/// the two never add and `--replace`'s force kill still lands after the
+/// drain.
+#[cfg(unix)]
+#[test]
+fn a_stop_with_a_stuck_spend_and_a_stuck_tick_ends_at_one_bound() {
+    // The give-up lines a stop logs stay out of the real home.
+    let _home = HomeSandbox::new();
+    let bound = Duration::from_secs(2);
+    let activity = crate::testutil::fresh_activity();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let name = crate::profile::ProfileName::from("stuck-spend");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, flag.as_ref())
+            .expect("an unset flag admits the spend");
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = std::sync::Arc::clone(&release);
+    let stuck = std::thread::spawn(move || {
+        while !released.load(Ordering::SeqCst) {
+            std::thread::park_timeout(Duration::from_millis(50));
+        }
+    });
+    let thread = crate::daemon::TickThread::new(Some(stuck), std::sync::Arc::clone(&flag));
+    let spends = crate::daemon::SpendDrain::new(std::sync::Arc::clone(&activity), flag)
+        .with_scheduler(thread);
+
+    let started = std::time::Instant::now();
+    let cleared = spends.drain(bound);
+    let waited = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+    drop(held);
+
+    assert!(
+        !cleared,
+        "a spend still in flight at the bound reads as not cleared"
+    );
+    assert!(
+        waited >= bound && waited < bound + bound / 2,
+        "the spend and the tick share one bound: {waited:?}"
+    );
+}
+
+/// The `next_refresh_at` the daemon's last `status.json` write published for
+/// `name`.
+fn published_next_refresh(daemon: &Daemon, name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(&daemon.status_path).expect("status.json written");
+    let feed: serde_json::Value = serde_json::from_str(&raw).expect("status.json parses");
+    feed["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} entry in {feed}"))["next_refresh_at"]
+        .clone()
+}
+
+/// A daemon that stood down from the usage-fetch lease runs no countdown, so
+/// the feed publishes `next_refresh_at: null` for it rather than a stamp its
+/// mirror derived from another instance's cache clock; the holder's own armed
+/// stamp is published as before.
+#[test]
+fn a_stood_down_daemon_publishes_no_next_refresh_and_a_holder_keeps_its_stamp() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+
+    daemon.tick();
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder publishes its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    daemon.tick();
+
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down instance publishes no countdown it does not run"
+    );
+}
+
+/// The feed's API republish path takes the daemon's live snapshot, so it must
+/// publish the same stood-down null the tick's writer does: the flag rides
+/// the snapshot, and no writer that passes it can forget it.
+#[test]
+fn a_republish_from_a_stood_down_daemon_publishes_no_next_refresh() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let daemon = daemon_for(config.clone());
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+    // The context's live stores share the daemon's lease `Arc`, so one context
+    // sees the holder's state now and the stood-down state after the release.
+    let ctx = std::sync::Arc::new(crate::daemon::api::routes::ApiContext::for_tests(
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config)),
+        daemon.status_path.clone(),
+        Some(daemon.live_stores()),
+        crate::daemon::api::panes::absent_probe(),
+    ));
+
+    crate::daemon::api::routes::republish(&ctx);
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder's republish keeps its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    crate::daemon::api::routes::republish(&ctx);
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down republish publishes no countdown it does not run"
+    );
 }

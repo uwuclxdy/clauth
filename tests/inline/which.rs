@@ -49,6 +49,8 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -82,6 +84,8 @@ fn endpoint_profile(name: &str) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -115,6 +119,8 @@ fn blank_profile(name: &str) -> Profile {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 

@@ -195,6 +195,13 @@ pub(crate) enum ProfileWindows {
     ThirdParty {
         stats: Option<ThirdPartyStats>,
         age_secs: Option<u64>,
+        /// Seconds since a proxy copy's chain windows were read
+        /// ([`crate::profile_cache::ThirdPartyCopy::chain_read_at`]), what
+        /// [`ProfileWindows::fresh`] decides on; `None` without one, and then
+        /// `age_secs` decides; `Some(None)` for a chain date ahead of the
+        /// clock, undated as [`cache_age_secs`] reads a future stamp. Never
+        /// shown: the age a surface shows is `age_secs`, the stalest figure's.
+        chain_age_secs: Option<Option<u64>>,
         /// The recognised provider, so the prose can decide the 5h/7d denial
         /// from what the PROVIDER publishes rather than from what one response
         /// carried. `None` for a generic endpoint.
@@ -302,20 +309,39 @@ impl ProfileWindows {
         }
     }
 
+    /// [`Self::stale`] as a routing decision reads it: a proxy copy is judged
+    /// by its chain windows' date, as [`Self::fresh`] judges it (an undated
+    /// one is stale, as [`OauthAge::Undated`] is), and every other reading as
+    /// `stale` does.
+    pub(crate) fn routing_stale(&self) -> bool {
+        match self {
+            Self::ThirdParty {
+                chain_age_secs: Some(chain),
+                ..
+            } => chain.is_none_or(|age| age.saturating_mul(1000) > STALE_AFTER_MS),
+            Self::Oauth { .. } | Self::ThirdParty { .. } => self.stale(),
+        }
+    }
+
     /// Whether these figures carry a DATED reading no older than
     /// [`STALE_AFTER_MS`] — pass one of the start walk's freshness PREFERENCE.
     /// Stricter than [`Self::stale`] on purpose: an absent or undated reading
     /// says nothing trustworthy, so it is not fresh even though `stale` may be
-    /// false for it.
+    /// false for it. A proxy copy is judged by its chain windows' date, the
+    /// figures the walk acts on, never a stale display figure beside them.
     pub(crate) fn fresh(&self) -> bool {
         match self {
             Self::Oauth { age, .. } => match age {
                 OauthAge::Dated(ms) => *ms <= STALE_AFTER_MS,
                 OauthAge::Absent | OauthAge::Undated => false,
             },
-            Self::ThirdParty { age_secs, .. } => {
-                age_secs.is_some_and(|age| age.saturating_mul(1000) <= STALE_AFTER_MS)
-            }
+            Self::ThirdParty {
+                age_secs,
+                chain_age_secs,
+                ..
+            } => chain_age_secs
+                .unwrap_or(*age_secs)
+                .is_some_and(|age| age.saturating_mul(1000) <= STALE_AFTER_MS),
         }
     }
 }
@@ -339,15 +365,18 @@ pub(crate) fn profile_windows_for(name: &ProfileName) -> ProfileWindows {
 fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>) -> ProfileWindows {
     let file = cache_file_of(third_party);
     if third_party {
-        // The provider leg's only writer is a fetch outcome, so its file mtime
-        // IS its read time and it keeps dating off the file.
-        let stats = load_profile_cache::<ThirdPartyStats>(name, file);
+        // The file's mtime is the age shown: its read time, or for a proxy
+        // copy its stalest figure's. A proxy copy's chain windows carry their
+        // own date inside it, which the freshness decisions read.
+        let (stats, chain_read_at) = crate::profile_cache::load_third_party_copy(name)
+            .map_or((None, None), |copy| (Some(copy.stats), copy.chain_read_at));
         let wallet_rate = stats.as_ref().and_then(|s| {
             crate::usage::funded_wallet_rate(&crate::profile::load_wallet_history(name), &s.rows)
         });
         return ProfileWindows::ThirdParty {
             stats,
             age_secs: cache_age_secs(name, file),
+            chain_age_secs: chain_read_at.map(|at| now_ms().checked_sub(at).map(|ms| ms / 1000)),
             provider,
             wallet_rate,
         };
@@ -447,7 +476,7 @@ pub(crate) fn live_bar<'a>(
 /// inference quota (`30d`) when present, then one entry per weekly model
 /// window (`7d <model>`). Serves both cache shapes: an OAuth read
 /// directly, and a third-party read through the derivation
-/// [`published_windows`] maps it with. A window whose `resets_at` has passed
+/// [`published_profile_windows_with_label`] maps it with. A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last
 /// utilization, not a current reading, and a lapsed 5h at `100%` read as a
 /// permanently spent account. A window with no parseable `resets_at` stays —
@@ -536,10 +565,10 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
     }
 }
 
-/// The profile's usage windows, read fresh from the disk cache; empty when
-/// there is no cache. The rows of the published `status.json` `windows` array —
-/// hence this flat spelling rather than [`ProfileWindows`]'s discriminated one,
-/// which the MCP surface renders.
+/// [`published_profile_windows_with_label`] by name: the same rows and label,
+/// empty when there is no cache, classified off the stored config instead of
+/// a loaded profile. The rows are the flat [`Window`] spelling, not
+/// [`ProfileWindows`]'s discriminated one the MCP surface renders.
 ///
 /// Each account is read from ITS OWN cache, on the shared cache selector's
 /// name-only form ([`crate::profile::stored_usage_cache_is_third_party`]) — an
@@ -550,8 +579,14 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
 /// describing a window that account no longer has; keeping the two files apart
 /// is what makes publishing the third-party figures safe rather than a second
 /// way to render that same leftover.
-pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
-    published_windows_with_label(name).0
+#[cfg(test)]
+pub(crate) fn published_windows_with_label(
+    name: &ProfileName,
+) -> (Vec<Window>, Option<&'static str>) {
+    published_windows_of(
+        name,
+        crate::profile::stored_usage_cache_is_third_party(name),
+    )
 }
 
 /// The profile's published `windows` rows AND the label of its LONG window,
@@ -562,11 +597,19 @@ pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
 /// provider-marked monthly quota — decided by PRESENCE off the account's own
 /// cache (the accessor's rule), never by which row survived the published
 /// liveness filter. Codex accounts have no monthly window and read their 7d
-/// separately.
-pub(crate) fn published_windows_with_label(
-    name: &ProfileName,
+/// separately. Classified off the loaded profile ([`usage_cache_file`]'s
+/// selector), so the per-tick build reads no `config.toml`.
+pub(crate) fn published_profile_windows_with_label(
+    p: &Profile,
 ) -> (Vec<Window>, Option<&'static str>) {
-    if crate::profile::stored_usage_cache_is_third_party(name) {
+    published_windows_of(&p.name, p.usage_cache_is_third_party())
+}
+
+fn published_windows_of(
+    name: &ProfileName,
+    third_party: bool,
+) -> (Vec<Window>, Option<&'static str>) {
+    if third_party {
         let info = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
             .as_ref()
             .and_then(ThirdPartyStats::to_usage_info);

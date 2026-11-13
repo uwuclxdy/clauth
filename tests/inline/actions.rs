@@ -1755,6 +1755,10 @@ fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
         "an own-roster collision is this flavor's business to allow"
     );
     assert!(validate_foreign_harness_free("cx", Harness::Claude).is_err());
+    assert!(
+        validate_foreign_harness_free("CX", Harness::Claude).is_err(),
+        "names fold case across the rosters, so `CX` is the codex `cx`"
+    );
 }
 
 // ── codex CRUD: switch + delete against codex-profiles.toml ────────────────
@@ -3906,6 +3910,55 @@ fn capture_refuses_a_login_whose_account_an_existing_profile_holds() {
     );
 }
 
+/// `clauth capture b` over a login whose account a proxy account holds refuses
+/// through its proxy and writes nothing: no id lands in its `config.toml`, as
+/// the TUI's save goes through the same claim guard.
+#[test]
+fn capture_into_an_id_matched_proxy_owner_refuses_and_mints_no_id() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let b = ProfileName::from("b");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    };
+    crate::profile::write_proxy_record(&b, &record).expect("write the proxy record");
+    config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name == b)
+        .expect("b")
+        .proxy = Some(record);
+    let toml = crate::profile::profile_subpath(&b, "config.toml").expect("config path");
+    let before = std::fs::read(&toml).expect("read config");
+    assert!(
+        matches!(live_capture_owner(&config), CaptureOwner::LooksLike(_)),
+        "fixture control: the login reads as b's"
+    );
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'b' is an account on proxy \"stub\": log in to it again with `clauth login b --proxy \
+         stub`, or delete it with `clauth delete b` first"
+    );
+    assert!(
+        std::fs::read(&toml).expect("read config") == before,
+        "no id lands in the proxy account's config.toml"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
 /// Two profiles anchored to the login's account id: neither is named as the
 /// owner, so no capture saves into one of them (the account may be another
 /// org's); the capture falls back to the token tier alone.
@@ -4808,6 +4861,103 @@ fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
             t0 + 120_000
         ),
         "a rename is not an account swap — the new name reuses the durable stamp"
+    );
+}
+
+/// A rename of the ACTIVE profile whose relink is refused (a regular live file
+/// holding another login) has still landed: the error says so and the roster
+/// holds the new name.
+#[test]
+fn a_landed_rename_whose_relink_is_refused_says_so() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rl-old");
+    let new = crate::profile::ProfileName::from("rl-new");
+    let creds = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    crate::testutil::register_names(&["rl-old"]);
+    let mut profile = Profile::new("rl-old".to_string(), None, None);
+    profile.credentials = Some(creds("rl-old-access"));
+    save_profile(&profile).expect("save profile");
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&creds("someone-elses-access")).unwrap(),
+    )
+    .unwrap();
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["rl-old".into()],
+            active_profile: Some("rl-old".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("rl-old"))
+        .expect_err("the relink refuses the foreign live login");
+
+    assert_eq!(
+        err.to_string(),
+        "renamed 'rl-old' to 'rl-new', but the live credentials were not relinked"
+    );
+    let landed = err
+        .downcast_ref::<RenamedButNotRelinked>()
+        .expect("callers tell a landed rename apart by its type");
+    assert!(
+        landed
+            .relink
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "the relink refusal rides as the source: {}",
+        landed.relink
+    );
+    let source = std::error::Error::source(landed).expect("the relink refusal rides as the source");
+    assert!(
+        source
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "{source}"
+    );
+    assert_eq!(config.canonical_name("rl-new").as_deref(), Some("rl-new"));
+    let on_disk = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        (
+            on_disk
+                .profiles
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>(),
+            on_disk.active_profile.as_ref().map(|n| n.as_str())
+        ),
+        (vec!["rl-new"], Some("rl-new")),
+        "the landed rename is on disk, active pick included"
+    );
+}
+
+/// A stored name a hand edit gave a control byte prints escaped in the landed
+/// rename's own line, so the refusal cannot drive the terminal.
+#[test]
+fn a_landed_rename_error_escapes_a_control_byte_in_the_old_name() {
+    let landed = RenamedButNotRelinked {
+        old: crate::profile::ProfileName::from("a\u{1b}x"),
+        new: crate::profile::ProfileName::from("b"),
+        relink: anyhow::anyhow!("boom"),
+    };
+    assert_eq!(
+        landed.to_string(),
+        "renamed 'a\\u{001b}x' to 'b', but the live credentials were not relinked"
     );
 }
 
@@ -5982,6 +6132,51 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
             .find(&crate::profile::ProfileName::from("ren-new"))
             .is_some(),
         "a released lock must let the same rename complete"
+    );
+}
+
+/// A comment written above an account in `profiles.toml` describes that
+/// account: after a rename it stays on the new name, never on a neighbour.
+#[test]
+fn a_rename_keeps_the_comment_above_the_account_in_both_lists() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in ["a", "b"] {
+        create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+            None,
+        )
+        .expect("create profile");
+    }
+    let path = home.home().join(".clauth").join("profiles.toml");
+    std::fs::write(
+        &path,
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"a\",\n  \"b\",\n]\n",
+    )
+    .expect("hand edit");
+    config.state = crate::profile::load_app_state().expect("load");
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile::ProfileName::from("z"),
+        &rotation_guard("a"),
+    )
+    .expect("rename");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"z\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"z\",\n  \"b\",\n]\n"
     );
 }
 
@@ -7382,6 +7577,65 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
             ..crate::profile::OAuthToken::default_extra()
         }),
     }
+}
+
+/// A proxy claim landing after the log out picked the login arm, readable or
+/// not, blanks the key and keeps the stored chain: the claim is read under the
+/// hold that writes. The plain account beside them loses its login and keeps
+/// its key.
+#[test]
+fn a_proxy_claim_landing_after_the_log_out_picked_its_arm_keeps_the_stored_chain() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let names = ["landed-record", "landed-unreadable", "landed-plain"];
+    for name in names {
+        let mut profile = crate::profile::Profile::new(
+            name.to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        profile.credentials = Some(oauth_creds(&format!("at-{name}")));
+        save_profile(&profile).expect("save");
+    }
+    crate::testutil::register_names(&names);
+    let mut stale = crate::profile::load_config().expect("the caller's read");
+    for name in ["landed-record", "landed-unreadable"] {
+        crate::profile::write_proxy_record(
+            &ProfileName::from(name),
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+    }
+    crate::claude::tests::break_proxy_record("landed-unreadable");
+
+    let outcomes: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let name_of = ProfileName::from(name);
+            let store = crate::profile::profile_subpath(&name_of, "credentials.json").unwrap();
+            let stored = std::fs::read(&store).unwrap();
+            let answer = clear_profile_credentials(&mut stale, &name_of).map_err(|e| e.to_string());
+            (
+                name,
+                answer,
+                std::fs::read(&store).ok() == Some(stored),
+                load_profile(&name_of).unwrap().api_key,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            ("landed-record", Ok(()), true, None),
+            ("landed-unreadable", Ok(()), true, None),
+            ("landed-plain", Ok(()), false, Some("clp_key".to_string())),
+        ],
+        "(account, the log out's answer, store kept byte for byte, api key)"
+    );
 }
 
 /// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
@@ -10590,6 +10844,132 @@ fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
     );
 }
 
+/// Every path under `dir` with its bytes, a directory holding none.
+fn tree_bytes(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    let mut entries = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .expect("read the dir")
+                    .map(|entry| entry.expect("read the entry").path()),
+            );
+            entries.push((path, None));
+        } else {
+            let bytes = std::fs::read(&path).expect("read the file");
+            entries.push((path, Some(bytes)));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// A proxy claim landing after the shared delete's lock-free read refuses in
+/// the hold the removal runs under, with that claim's own sentence: the stored
+/// chain, the profile's every other byte, the roster, the active mark and the
+/// live link stay as the landing left them.
+#[test]
+fn a_proxy_claim_landing_after_the_deletes_read_refuses_in_its_hold() {
+    use crate::claude::tests::{Unclassifiable, break_proxy_record};
+    use crate::profile::{ProfileName, ProxyAccount};
+    type Land = fn(&ProfileName);
+    fn record(name: &ProfileName) {
+        let account = ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        };
+        crate::profile::write_proxy_record(name, &account).expect("write the record");
+    }
+    fn table(name: &ProfileName) {
+        record(name);
+        break_proxy_record(name.as_str());
+    }
+    fn directory(name: &ProfileName) {
+        Unclassifiable::Directory.pose(name.as_str());
+    }
+    fn noted_header(name: &ProfileName) {
+        Unclassifiable::NotedProxyHeader.pose(name.as_str());
+    }
+    let unclassifiable = "can't read the config of 'work', so clauth can't tell whether it is \
+                          an account on a proxy; fix its config.toml, then delete it again";
+
+    // `None`: the sentence naming the record's path, which the sandbox picks.
+    let cases: [(Option<&str>, Land); 4] = [
+        (
+            Some(
+                "'work' is an account on proxy \"stub\": delete it with `clauth delete work`, \
+                 which also deletes it on the proxy",
+            ),
+            record,
+        ),
+        (None, table),
+        (Some(unclassifiable), directory),
+        (Some(unclassifiable), noted_header),
+    ];
+    for (refusal, land) in cases {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("work");
+        let work = crate::testutil::oauth_profile("work", "rt-work");
+        crate::testutil::persist_profiles(std::slice::from_ref(&work));
+        let mut config = crate::profile::load_config().expect("load the config");
+        config.state.active_profile = Some(name.clone());
+        crate::profile::save_app_state(&config.state).expect("persist the active mark");
+        crate::claude::link_profile_credentials(&name).expect("link the live slot");
+
+        let dir = crate::profile::profile_dir(&name).expect("profile dir");
+        let store = dir.join("credentials.json");
+        let stored = std::fs::read(&store).expect("the stored chain");
+        let roster_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml");
+        let roster = std::fs::read(&roster_path).expect("the roster");
+        let live = crate::claude::claude_credentials_path().expect("live slot");
+        let live_login = std::fs::read(&live).expect("the live login");
+
+        let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&landed);
+        let (landing, tree) = (name.clone(), dir.clone());
+        crate::gateway_tokens::set_pre_hold_hook(
+            "work",
+            std::sync::Arc::new(move || {
+                land(&landing);
+                *seen.lock().expect("lock") = tree_bytes(&tree);
+            }),
+        );
+
+        let refused = delete(&mut config, "work");
+
+        let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+        let refusal = refusal.map_or_else(
+            || {
+                format!(
+                    "profile 'work' has a [proxy] table in {path:?} that clauth cannot read, so \
+                     its account on the proxy cannot be deleted; nothing was deleted. Give the \
+                     table a valid `service` and `account`, or remove it to delete the profile \
+                     alone"
+                )
+            },
+            str::to_string,
+        );
+        assert_eq!(refused, Err(refusal));
+        let landed = landed.lock().expect("lock").clone();
+        assert_eq!(
+            (
+                !landed.is_empty(),
+                tree_bytes(&dir) == landed,
+                std::fs::read(&store).expect("the stored chain") == stored,
+                std::fs::read(&roster_path).expect("the roster") == roster,
+                config.find(&name).is_some(),
+                std::fs::read(&live).ok() == Some(live_login),
+            ),
+            (true, true, true, true, true, true),
+            "(the landing ran, the profile dir, the store, the roster on disk, in memory, the \
+             live login)"
+        );
+    }
+}
+
 fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
     delete_profile(
         config,
@@ -11084,6 +11464,7 @@ fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_m
         crate::usage::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
 }
@@ -17521,7 +17902,8 @@ fn the_detaching_capture_never_reads_as_an_older_clauths_switch() {
         login_snapshot("a-again", None),
         true,
     )
-    .expect("detaching capture of a");
+    .expect("detaching capture of a")
+    .expect("a is no proxy account");
     assert_eq!(live_endpoint().as_deref(), Some("user"));
 }
 
@@ -17843,7 +18225,8 @@ fn a_detaching_capture_after_an_older_clauths_cover_never_leaves_its_value_as_th
         login_snapshot("b-again", None),
         true,
     )
-    .expect("detaching capture of b");
+    .expect("detaching capture of b")
+    .expect("b is no proxy account");
     config = crate::profile::load_config().expect("re-read");
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
@@ -18842,11 +19225,11 @@ fn a_duplicate_of_a_source_missing_from_memory_names_it() {
     assert_eq!(err.to_string(), "profile 'a' not found");
 }
 
-/// `save_new_profile(` is called only by the four creates, once each: a
+/// `save_new_profile(` is called only by the five creates, once each: a
 /// whole-profile write of a caller-held profile anywhere else reds here. A call
 /// spelled through a `use .. as` alias is the known residual.
 #[test]
-fn every_save_new_profile_call_is_one_of_the_four_creates() {
+fn every_save_new_profile_call_is_one_of_the_five_creates() {
     fn enclosing_fn(before: &str) -> Option<&str> {
         before.lines().rev().find_map(|line| {
             let (qualifiers, rest) = line.trim_start().split_once("fn ")?;
@@ -18893,6 +19276,7 @@ fn every_save_new_profile_call_is_one_of_the_four_creates() {
             "capture_into_profile",
             "create_blank_profile",
             "create_profile_from_login",
+            "create_proxy_profile",
             "duplicate_profile",
         ]
         .map(|f| ("actions.rs".to_string(), f.to_string()))
@@ -19463,7 +19847,7 @@ fn every_save_app_state_call_under_src_is_a_known_site() {
     assert_eq!(
         sites,
         std::collections::BTreeMap::from([
-            ("actions.rs".to_string(), 14),
+            ("actions.rs".to_string(), 15),
             ("profile.rs".to_string(), 2),
             ("testutil.rs".to_string(), 3),
         ]),
@@ -19791,7 +20175,8 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
     let (_, out) = through_handle(stale, |h| switch_profile_reconciled(h, &b, Some(&a)));
     assert_eq!(
         out.expect_err("the switch refuses").to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+        "'a' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
     );
     assert_eq!(
         live_regular_refresh().as_deref(),
@@ -19814,6 +20199,47 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
             .active_profile,
         Some(a),
         "nothing switched"
+    );
+}
+
+/// A capture that writes nothing refuses as the generic unsaved-login text
+/// instead of reporting success: the live login and both stores stay, so the
+/// relink riding on it never drops the login. Driven at the helper level with
+/// a stale config naming `a` while disk names `b`; no caller passes such a
+/// state (the reconciled arms mirror the disk marker under their hold first,
+/// the TUI arm runs under `while_disk_names_active`), so this post-check has
+/// no caller-level pin.
+#[test]
+fn a_capture_whose_sink_cannot_land_refuses_as_unsaved() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut stale = crate::profile::load_config().expect("stale read");
+    assert_eq!(
+        stale.state.active_profile.as_ref(),
+        Some(&a),
+        "fixture: the copy names a"
+    );
+    peer_switches_to(&b);
+    relogin_live("y5");
+    let err = crate::actions::force_capture_live_login(&mut stale)
+        .expect_err("the capture refuses rather than report success");
+    assert_eq!(
+        err.to_string(),
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(store_refresh("a").as_deref(), Some("a"), "a's store");
+    assert_eq!(store_refresh("b").as_deref(), Some("b"), "b's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-y5"),
+        "the live login stays"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(b),
+        "disk keeps b active"
     );
 }
 
@@ -20214,7 +20640,7 @@ fn leftover_login_refusal(name: &str) -> String {
 #[test]
 fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
     type Create = fn(&mut AppConfig) -> Result<()>;
-    let creates: [(&str, Create); 4] = [
+    let creates: [(&str, Create); 5] = [
         ("blank", |config| {
             create_blank_profile(
                 config,
@@ -20245,6 +20671,19 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 None,
                 oauth_pair("minted"),
                 None,
+                None,
+            )
+        }),
+        ("proxy", |config| {
+            create_proxy_profile(
+                config,
+                "left".to_string(),
+                crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-left".to_string(),
+                },
+                "http://127.0.0.1:9141".to_string(),
+                "clp_left-key".to_string(),
                 None,
             )
         }),
@@ -20569,6 +21008,134 @@ fn a_switch_off_a_long_lived_account_never_offers_to_save_into_it() {
             "Error: 'a' runs on a long-lived token and cannot hold this login; save it as \
              another account first: `clauth capture <new name>`"
         )
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
+/// A headless switch whose `Overwrite` default lands on an outgoing account
+/// running on a long-lived token refuses with the long-lived line — that
+/// account's store cannot hold the login, the same sentence the CLI's prompt
+/// path refuses with — never the generic unsaved-login text, and changes
+/// nothing.
+#[test]
+fn a_headless_overwrite_off_a_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &b,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
+/// A headless switch whose `Overwrite` default lands on the already-active
+/// account running on a long-lived token refuses with the long-lived line —
+/// that account's store cannot hold the login — never the generic
+/// unsaved-login text, and changes nothing.
+#[test]
+fn a_headless_overwrite_onto_the_active_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, _) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &a,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
     );
     assert_eq!(
         store_refresh("a").as_deref(),
@@ -21993,4 +22560,442 @@ fn the_cli_keeps_the_exemption_with_no_peer_write() {
         "a stays flagged"
     );
     crate::testutil::switch_race_seam::assert_empty();
+}
+
+// ── the shared rolling-token arm ────────────────────────────────────────────
+
+/// The shared arm action rolls the flag back on a failed arm WITHOUT
+/// rewinding a concurrent edit to another `config.toml` key made between the
+/// flag write and the failure: the rollback re-reads the profile fresh, so
+/// the peer's edit survives it.
+#[test]
+fn a_failed_arm_rolls_the_flag_back_without_rewinding_a_mid_arm_edit() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-midarm");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-expiring".to_string(),
+            refresh_token: Some("rt-expiring".to_string()),
+            // Within the gate's refresh grace, so the arm calls the refresher
+            // instead of stamping from the stored chain.
+            expires_at: Some(crate::usage::now_ms() as i64 + 60_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let edited = name.clone();
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, move |_rt: &str, _scopes: Option<&str>| {
+        // A peer's edit landing between the flag write and the arm's failure:
+        // the refresher edits another config key through the same fresh-disk
+        // writer the rollback uses, then fails the refresh.
+        crate::profile::update_profile_config(&edited, |p| {
+            p.models.default = Some("claude-sonnet-4-5".to_string());
+            Ok(())
+        })
+        .expect("the mid-arm edit lands");
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    })
+    .expect_err("the failed refresh fails the arm");
+
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "the failed arm rolls the flag back");
+    assert_eq!(
+        after.models.default.as_deref(),
+        Some("claude-sonnet-4-5"),
+        "the mid-arm edit survives the rollback"
+    );
+}
+
+/// A pre-armed profile keeps its flag on a failed arm: the rollback restores
+/// the PRIOR value, never a hardcoded off. The unrecorded grant refuses the
+/// stamp without touching the network, so the panic refresher proves the
+/// refresh never ran.
+#[test]
+fn a_pre_armed_profile_keeps_its_flag_on_a_failed_arm() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-prearmed");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-unrecorded".to_string(),
+            refresh_token: Some("rt-unrecorded".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("an unrecorded grant refuses before any refresh")
+    })
+    .expect_err("the unrecorded grant refuses the arm");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(
+        after.rolling_token,
+        "a flag that was already on is left on — the rollback restores the PRIOR value"
+    );
+}
+
+/// An account that left the roster between the pre-arm read and the flag
+/// write refuses the arm as a typed refusal: the write silently wrote
+/// nothing, so the arm must not run for it (and report a success nothing
+/// will re-stamp).
+#[test]
+fn an_account_that_left_the_roster_refuses_the_arm_typed() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-gone");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-gone".to_string(),
+            refresh_token: Some("rt-gone".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes on the roster");
+    // The account leaves the roster after the pre-arm read, before the flag
+    // write.
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![],
+        ..AppState::default()
+    })
+    .expect("the account leaves the roster");
+
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("the arm must not run for an account that left the roster")
+    })
+    .expect_err("the flag write refused");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::GoneFromRoster),
+        "{:?}",
+        failure.refusal
+    );
+    assert_eq!(
+        failure.refusal.sentence(&name),
+        "profile 'roll-gone' not found",
+        "the off-roster sentence is the CLI's own not-found head"
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "no flag was ever written");
+}
+
+/// The roster a rename acts on is the one read under the flock. A racing rename
+/// took `rs-old` after the caller loaded its config, so this one refuses with
+/// the CLI's own not-found head instead of reporting a rename that moved nothing.
+#[test]
+fn a_rename_whose_old_name_left_the_fresh_roster_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rs-old");
+    let new = crate::profile::ProfileName::from("rs-new");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rs-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rs-taken".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rs-old"))
+        .expect_err("the fresh roster no longer holds the old name");
+
+    assert_eq!(err.to_string(), "profile 'rs-old' not found");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![crate::profile::ProfileName::from("rs-taken")]
+    );
+}
+
+/// A name the fresh roster holds under another case is taken: every resolution
+/// site folds, so landing it would leave one of the two unaddressable. The
+/// caller's own check ran on a config loaded before the racing rename landed.
+#[test]
+fn a_rename_onto_a_name_the_fresh_roster_holds_by_case_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rc-old");
+    let new = crate::profile::ProfileName::from("rc-new");
+    crate::testutil::register_names(&["rc-old"]);
+    save_profile(&Profile::new("rc-old".to_string(), None, None)).expect("save profile");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rc-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rc-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rc-old".into(), "RC-NEW".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rc-old"))
+        .expect_err("the fresh roster holds the new name under another case");
+
+    assert_eq!(err.to_string(), "a profile named 'rc-new' already exists");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![
+            crate::profile::ProfileName::from("rc-old"),
+            crate::profile::ProfileName::from("RC-NEW"),
+        ]
+    );
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A racing rename took the name and moved its directory there: that directory
+/// holds a live account, so the loser hears the name is taken and is never told
+/// to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_rename_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rw-old");
+    let new = crate::profile::ProfileName::from("rw-new");
+    crate::testutil::register_names(&["rw-old", "rw-new"]);
+    save_profile(&Profile::new("rw-old".to_string(), None, None)).expect("save old");
+    save_profile(&Profile::new("rw-new".to_string(), None, None)).expect("save winner");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rw-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rw-old".into(), "rw-new".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rw-old"))
+        .expect_err("the fresh roster holds the new name");
+
+    assert_eq!(err.to_string(), "a profile named 'rw-new' already exists");
+    assert!(
+        crate::profile::profile_dir(&new).unwrap().exists(),
+        "the winner's directory stays put"
+    );
+}
+
+/// A codex create took the name and wrote its store: that directory holds a
+/// single-use login, so the rename hears the name is a codex account and is
+/// never told to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_codex_create_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cw-old");
+    let new = crate::profile::ProfileName::from("cw-new");
+    crate::testutil::register_names(&["cw-old"]);
+    save_profile(&Profile::new("cw-old".to_string(), None, None)).expect("save old");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["cw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cw-old".to_string(), None, None)],
+    };
+    let store = crate::profile::profile_dir(&new).unwrap().join("auth.json");
+    let written = store.clone();
+    crate::gateway_tokens::set_pre_hold_hook(
+        "cw-old",
+        std::sync::Arc::new(move || {
+            crate::testutil::write_codex_roster(&["cw-new"]);
+            std::fs::create_dir_all(written.parent().unwrap()).expect("create the codex directory");
+            std::fs::write(&written, "{}").expect("write the codex store");
+        }),
+    );
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("cw-old"))
+        .expect_err("the codex roster holds the new name");
+
+    assert_eq!(
+        err.to_string(),
+        "'cw-new' is a codex profile. Profile names span both harnesses, so pick another"
+    );
+    assert!(store.exists(), "the codex store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A codex capture whose roster save failed left the only copy of its
+/// single-use login in a directory no account claims: the rename keeps its
+/// hands off and never advises deleting it.
+#[test]
+fn a_rename_onto_a_codex_store_no_account_claims_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cs-old");
+    let new = crate::profile::ProfileName::from("cs-new");
+    crate::testutil::register_names(&["cs-old"]);
+    save_profile(&Profile::new("cs-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cs-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cs-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cs-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A dangling `auth.json` link still marks a codex store: the name is refused
+/// the same way, never read as an empty orphan.
+#[cfg(unix)]
+#[test]
+fn a_rename_onto_a_dangling_codex_store_link_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cl-old");
+    let new = crate::profile::ProfileName::from("cl-new");
+    crate::testutil::register_names(&["cl-old"]);
+    save_profile(&Profile::new("cl-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cl-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cl-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::os::unix::fs::symlink(new_dir.join("gone"), new_dir.join("auth.json"))
+        .expect("link the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cl-old"))
+        .expect_err("the directory holds a codex store's link");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cl-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+}
+
+/// A record whose directory is gone is no half-done rename of a codex store:
+/// that path's retry would hand the store to a claude account, whose delete
+/// then destroys the only copy of the login.
+#[test]
+fn a_rename_of_a_record_with_no_directory_never_adopts_a_codex_store() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cd-old");
+    let new = crate::profile::ProfileName::from("cd-new");
+    crate::testutil::register_names(&["cd-old"]);
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cd-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cd-old".to_string(), None, None)],
+    };
+    assert!(
+        !crate::profile::profile_dir(&old).unwrap().exists(),
+        "precondition: the record has no directory"
+    );
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cd-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cd-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("reload state")
+            .profiles
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
+        ["cd-old"],
+        "the record keeps its name"
+    );
 }

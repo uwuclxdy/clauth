@@ -617,6 +617,11 @@ fn fetch_feed_at(url: &str) -> anyhow::Result<Vec<Incident>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(fetch_timeout()))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into();
 

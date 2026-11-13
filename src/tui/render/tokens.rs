@@ -1,7 +1,7 @@
 //! Tokens tab — global Claude Code token usage read from `~/.claude`. Claude
 //! Code only: a codex session writes no transcript here, so its spend is
 //! absent from every figure below rather than folded in silently.
-//! (`stats-cache.json` + recent transcript top-up; see `crate::tokens`).
+//! (the frozen stats base + recent transcript top-up; see `crate::tokens`).
 //!
 //! Two views. The **dashboard** (landing page) is a fixed grid of bordered
 //! cards — today, lifetime totals, daily trend, top models, token composition,

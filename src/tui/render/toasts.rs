@@ -161,7 +161,7 @@ const MAX_ROWS: usize = 3;
 /// (the toast title), the head's continuation rows stay `TEXT` without bold,
 /// and the detail rows dim; past [`MAX_ROWS`] the first rows stay and the last
 /// kept one ends in `…`.
-fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
+pub(crate) fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
     let title = Style::default().fg(theme::text_color()).bold();
     let title_rest = Style::default().fg(theme::text_color());
     let detail = Style::default().fg(theme::text_dim_color());

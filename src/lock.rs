@@ -15,10 +15,12 @@
 //!
 //! Acquiring the cross-process flock is bounded by [`STATE_LOCK_TIMEOUT`]. A
 //! blocking flock has no deadline, so a lease-holding fetcher whose rotation path
-//! waits on a lock another clauth process holds forever would pin the usage-fetch
-//! lease and stand every TUI down permanently (no watchdog covers the scheduler
-//! thread). A bounded wait turns that silent wedge into a [`StateLockTimeout`] the
-//! caller retries instead of a hang.
+//! waits on a lock another clauth process holds forever would stall its tick and
+//! stand the other instances down with it. The bounded wait is the first defence:
+//! one tick returns a [`StateLockTimeout`] the caller retries instead of hanging.
+//! A wedge that outlives it is the scheduler lease watchdog's to break — it
+//! releases the lease once a tick has completed nothing for its bound (5 min of
+//! running time).
 
 use std::cell::Cell;
 use std::fs::File;

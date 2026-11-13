@@ -48,7 +48,11 @@ fn await_job_verdict_wakes_for_pending_jobs_without_a_delivery() {
         await_job_verdict(false, &["d-pending-0".into()]),
         (
             2,
-            Some("delegate job `d-pending-0` still running; call `monitor` to retrieve it".into()),
+            Some(
+                "delegate job `d-pending-0` is still working. no action needed yet; \
+                 clauth will wake this session when it finishes."
+                    .into()
+            ),
         ),
     );
 }
@@ -61,10 +65,43 @@ fn await_job_verdict_lists_all_pending_jobs_with_or_without_a_delivery() {
             (
                 2,
                 Some(
-                    "delegate jobs `d-pending-0`, `d-pending-1` still running; call `monitor` to retrieve them"
+                    "delegate jobs `d-pending-0`, `d-pending-1` are still working. \
+                     no action needed yet; clauth will wake this session when they finish."
                         .into(),
                 ),
             ),
+        );
+    }
+}
+
+/// The hook process outlives its own wait: the host kills it at the manifest's
+/// `timeout`, and a kill delivers nothing.
+#[test]
+fn the_wait_runs_a_day_inside_the_hook_manifests_bound() {
+    assert_eq!(AWAIT_JOB_DEADLINE_SECS, 24 * 60 * 60);
+    assert_eq!(AWAIT_IDLE_WAKE_SECS, 55 * 60);
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json")).expect("manifest");
+    for event in ["PostToolUse", "Stop", "StopFailure"] {
+        let hook = manifest["hooks"][event]
+            .as_array()
+            .expect("the event is registered")
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().expect("hooks"))
+            .find(|hook| hook["command"] == "clauth mcp-await-job")
+            .unwrap_or_else(|| panic!("{event} runs the await hook"));
+        assert_eq!(hook["asyncRewake"], true, "{event} can wake the session");
+        assert!(
+            hook["timeout"].as_u64().expect("timeout") > AWAIT_JOB_DEADLINE_SECS,
+            "{event}'s bound outlasts the wait",
+        );
+        assert_eq!(
+            hook["rewakeMessage"], "A clauth delegate result or status update follows.",
+            "{event}'s wake names what follows",
+        );
+        assert_eq!(
+            hook["rewakeSummary"], "clauth delegate update",
+            "{event}'s wake never shows the host's placeholder",
         );
     }
 }

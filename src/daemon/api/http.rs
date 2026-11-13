@@ -39,6 +39,10 @@ pub(crate) struct Request {
     pub(crate) query: String,
     /// The `Authorization: Bearer <token>` value, if one was presented.
     pub(crate) bearer: Option<String>,
+    /// Whether any `Authorization` line was presented, whatever it held. A
+    /// presented bearer decides alone, so the ticket arm runs only when none
+    /// was: `bearer` alone cannot tell a line holding no bearer from no line.
+    pub(crate) authorization_seen: bool,
     /// The `If-None-Match` value, verbatim including its quotes. It is compared
     /// against a tag this server produced, so any normalizing would have to be
     /// done identically on both sides to be worth doing; the status routes —
@@ -53,6 +57,10 @@ pub(crate) struct Request {
     /// route reads. `requested` is the `Connection: Upgrade` token; the rest
     /// are the eponymous headers, kept verbatim for the accept computation.
     pub(crate) ws: WsHeaders,
+    /// The browser half; see [`CrossOrigin`].
+    pub(crate) cross_origin: CrossOrigin,
+    /// The `Content-Type` header. Only the pairing redemption reads it.
+    pub(crate) content_type: SoloHeader,
 }
 
 /// The WebSocket half of a [`Request`]. Defaults to "no upgrade asked for", so
@@ -63,9 +71,151 @@ pub(crate) struct WsHeaders {
     pub(crate) protocol: Option<String>,
     pub(crate) key: Option<String>,
     pub(crate) version: Option<String>,
+    /// What `Sec-WebSocket-Protocol` offered, every line of it, reduced to
+    /// what the upgrade reads: a ticket's digest, never its text.
+    pub(crate) offer: super::ticket::Offer,
+}
+
+/// The browser half of a [`Request`]. Defaults to "not from a page".
+#[derive(Default)]
+pub(crate) struct CrossOrigin {
+    pub(crate) origin: SoloHeader,
+    /// `Access-Control-Request-Method` was sent. Its value is never read: the
+    /// answer to a preflight is the same for every method.
+    pub(crate) asks_method: bool,
+    /// The connection loop found `origin` present and outside a non-empty
+    /// `[serve] app_origins`, so neither a bearer nor a ticket gets a handler.
+    pub(crate) refused: bool,
+}
+
+/// A header that means something only when it appears once, as UTF-8. A second
+/// copy, or bytes that are not text, can never satisfy a comparison.
+#[derive(Default)]
+pub(crate) enum SoloHeader {
+    #[default]
+    Absent,
+    One(String),
+    Unusable,
+}
+
+impl SoloHeader {
+    fn see(&mut self, value: &[u8]) {
+        *self = match (&*self, std::str::from_utf8(value)) {
+            (Self::Absent, Ok(text)) => Self::One(text.to_string()),
+            _ => Self::Unusable,
+        };
+    }
+
+    fn is_present(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+/// What one answer tells a browser, decided against `[serve] app_origins`. A
+/// value here is always a list entry: comparing moves the entry out of the
+/// list, so no request byte reaches a response head.
+#[derive(Default)]
+pub(crate) enum Cors {
+    /// The list is empty: no header at all.
+    #[default]
+    Off,
+    /// The list is non-empty and the request's `Origin` is absent or unlisted.
+    VaryOnly,
+    Allow(String),
+    Preflight(String),
+}
+
+impl Cors {
+    /// Byte-exact against each entry: no case folding, no port rule, no prefix
+    /// or suffix test.
+    pub(crate) fn judge(listed: &[String], cross_origin: &CrossOrigin) -> Self {
+        if listed.is_empty() {
+            return Self::Off;
+        }
+        let SoloHeader::One(origin) = &cross_origin.origin else {
+            return Self::VaryOnly;
+        };
+        listed
+            .iter()
+            .find(|entry| entry.as_str() == origin.as_str())
+            .map_or(Self::VaryOnly, |entry| Self::Allow(entry.clone()))
+    }
+
+    /// The `Allow` of an `OPTIONS` asking a method is a preflight. Anything
+    /// else stays an ordinary request, judged by the route table.
+    pub(crate) fn settle_preflight(self, request: &Request) -> Self {
+        match self {
+            Self::Allow(entry)
+                if request.method == "OPTIONS" && request.cross_origin.asks_method =>
+            {
+                Self::Preflight(entry)
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn is_preflight(&self) -> bool {
+        matches!(self, Self::Preflight(_))
+    }
+
+    /// Whether this verdict stops a bearer: a present `Origin` the list lacks.
+    pub(crate) fn refuses(&self, cross_origin: &CrossOrigin) -> bool {
+        matches!(self, Self::VaryOnly) && cross_origin.origin.is_present()
+    }
+
+    /// The per-request log line's field, in fixed forms: the entry, one word,
+    /// or nothing. The raw header never reaches the log.
+    pub(crate) fn log_field(&self, cross_origin: &CrossOrigin) -> String {
+        match self {
+            Self::Allow(entry) | Self::Preflight(entry) => {
+                format!(" origin={}", sanitize_for_log(entry))
+            }
+            Self::Off | Self::VaryOnly if cross_origin.origin.is_present() => {
+                " origin=unlisted".to_string()
+            }
+            Self::Off | Self::VaryOnly => String::new(),
+        }
+    }
+
+    fn head_lines(&self) -> String {
+        match self {
+            Self::Off => String::new(),
+            Self::VaryOnly => "Vary: Origin\r\n".to_string(),
+            Self::Allow(entry) => format!(
+                "Access-Control-Allow-Origin: {entry}\r\n\
+                 Access-Control-Expose-Headers: ETag\r\n\
+                 Vary: Origin\r\n"
+            ),
+            Self::Preflight(entry) => format!(
+                "Access-Control-Allow-Origin: {entry}\r\n\
+                 Access-Control-Allow-Methods: {}\r\n\
+                 Access-Control-Allow-Headers: Authorization, Content-Type, If-None-Match\r\n\
+                 Access-Control-Max-Age: 7200\r\n\
+                 Vary: Origin\r\n",
+                super::routes::advertised_methods()
+            ),
+        }
+    }
 }
 
 impl Request {
+    /// Whether any `Authorization` line was presented, a bearer or not. A
+    /// parsed bearer implies one; a hand-built request that sets `bearer` alone
+    /// counts as one.
+    pub(crate) fn presented_authorization(&self) -> bool {
+        self.authorization_seen || self.bearer.is_some()
+    }
+
+    /// Whether the body is declared `application/json`, parameters and case
+    /// aside. A page cannot send that type without passing a preflight first.
+    pub(crate) fn sends_json(&self) -> bool {
+        let SoloHeader::One(value) = &self.content_type else {
+            return false;
+        };
+        let media_type = value.split(';').next().unwrap_or_default();
+        trim_ows(media_type.as_bytes()).eq_ignore_ascii_case(b"application/json")
+    }
+
     /// True when `key` appears in the query string as `key`, `key=1`, or
     /// `key=true`. The API has exactly one flag (`?all=1`), so this stays a
     /// scan rather than a parsed map.
@@ -277,11 +427,14 @@ impl<S: Read> RequestReader<S> {
         };
 
         let mut bearer = None;
+        let mut authorization_seen = false;
         let mut if_none_match = None;
         let mut content_length: Option<usize> = None;
         let mut close_requested = false;
         let mut keep_alive_requested = false;
         let mut ws = WsHeaders::default();
+        let mut cross_origin = CrossOrigin::default();
+        let mut content_type = SoloHeader::default();
         for header in parsed.headers.iter() {
             if header.name.eq_ignore_ascii_case("transfer-encoding") {
                 // Refused rather than implemented. With persistent connections
@@ -300,6 +453,7 @@ impl<S: Read> RequestReader<S> {
                 content_length = Some(value);
             }
             if header.name.eq_ignore_ascii_case("authorization") {
+                authorization_seen = true;
                 bearer = std::str::from_utf8(header.value)
                     .ok()
                     .and_then(strip_bearer)
@@ -348,6 +502,21 @@ impl<S: Read> RequestReader<S> {
             {
                 ws.version = Some(value.trim().to_string());
             }
+            if header.name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                ws.offer.see(header.value);
+            }
+            if header.name.eq_ignore_ascii_case("origin") {
+                cross_origin.origin.see(header.value);
+            }
+            if header
+                .name
+                .eq_ignore_ascii_case("access-control-request-method")
+            {
+                cross_origin.asks_method = true;
+            }
+            if header.name.eq_ignore_ascii_case("content-type") {
+                content_type.see(header.value);
+            }
         }
 
         // Phase 3: the body, exactly Content-Length bytes. Anything past it is
@@ -368,11 +537,14 @@ impl<S: Read> RequestReader<S> {
             path,
             query,
             bearer,
+            authorization_seen,
             if_none_match,
             body,
             // HTTP/1.1 persists by default; HTTP/1.0 does not unless asked.
             keep_alive: !close_requested && (http_11 || keep_alive_requested),
             ws,
+            cross_origin,
+            content_type,
         }))
     }
 }
@@ -407,7 +579,7 @@ fn parse_content_length(value: &[u8]) -> Option<usize> {
 
 /// Strip leading and trailing OWS — ASCII space and horizontal tab, per RFC
 /// 9110 — and nothing else.
-fn trim_ows(mut value: &[u8]) -> &[u8] {
+pub(super) fn trim_ows(mut value: &[u8]) -> &[u8] {
     while let [b' ' | b'\t', rest @ ..] = value {
         value = rest;
     }
@@ -450,6 +622,9 @@ pub(crate) struct Response {
     pub(crate) challenge: bool,
     /// Emit `ETag`, so the next request can be conditional.
     pub(crate) etag: Option<String>,
+    /// The connection loop stamps this on every answer the router returned, so
+    /// a route never decides what a browser may read.
+    pub(crate) cors: Cors,
 }
 
 /// One error body for every refused or failed answer, so a client generates a
@@ -484,6 +659,7 @@ impl Response {
             content_type: "application/json",
             challenge: false,
             etag: None,
+            cors: Cors::Off,
         }
     }
 
@@ -505,6 +681,7 @@ impl Response {
             content_type: "application/json",
             challenge: false,
             etag: Some(etag),
+            cors: Cors::Off,
         }
     }
 
@@ -518,6 +695,7 @@ impl Response {
             content_type,
             challenge: false,
             etag: None,
+            cors: Cors::Off,
         }
     }
 
@@ -623,6 +801,7 @@ pub(crate) fn write_response<W: Write>(
         if resp.challenge {
             head.push_str("WWW-Authenticate: Bearer\r\n");
         }
+        head.push_str(&resp.cors.head_lines());
         head.push_str("\r\n");
         w.write_all(head.as_bytes())?;
         w.flush()?;
@@ -661,6 +840,7 @@ pub(crate) fn write_response<W: Write>(
     if let Some(etag) = &resp.etag {
         head.push_str(&format!("ETag: {etag}\r\n"));
     }
+    head.push_str(&resp.cors.head_lines());
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(&resp.body)?;
@@ -691,15 +871,23 @@ pub(crate) fn accept_key(client_key: &str) -> Option<String> {
 
 /// The `101 Switching Protocols` head that opens an upgraded connection. No
 /// `Content-Length` — the rest of the connection is the upgraded protocol, not
-/// a body this server could frame.
-pub(crate) fn write_upgrade_head<W: Write>(w: &mut W, accept: &str) -> std::io::Result<()> {
-    let head = format!(
+/// a body this server could frame. `selected` is a constant of this crate,
+/// never an offered value, so no request byte reaches the head.
+pub(crate) fn write_upgrade_head<W: Write>(
+    w: &mut W,
+    accept: &str,
+    selected: Option<&'static str>,
+) -> std::io::Result<()> {
+    let mut head = format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\
-         \r\n"
+         Sec-WebSocket-Accept: {accept}\r\n"
     );
+    if let Some(protocol) = selected {
+        head.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+    }
+    head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.flush()
 }
@@ -754,6 +942,7 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",

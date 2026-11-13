@@ -9,7 +9,7 @@
 //! `fetch_status` and
 //! `next_refresh_at` — live only in the scheduler's in-memory stores; when a
 //! live daemon passes [`LiveSignals`] they come from there, otherwise they are
-//! derived from the cache-file mtime so the single-shot `status --json` still
+//! derived from the account's cache so the single-shot `status --json` still
 //! produces a coherent shape.
 
 use std::collections::{BTreeMap, HashMap};
@@ -20,14 +20,11 @@ use utoipa::ToSchema;
 use super::gateway::{GatewaySlot, slot_or_record};
 use super::proxies::ProxySlot;
 use crate::profile::{AppConfig, Profile, ProfileName};
-use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
-};
+use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{
-    OauthAge, Window, oauth_age, provider_label, published_windows, published_windows_with_label,
-    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_profile_windows_with_label,
+    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file, usage_windows,
 };
-use crate::providers::ThirdPartyStats;
 use crate::usage::{
     FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
     selected_next_refresh, windows_maxed,
@@ -40,7 +37,7 @@ pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Live scheduler signals a running daemon has that the single-shot
 /// `clauth status --json` cannot see. When absent, freshness and next-refresh
-/// are derived from the cache-file mtime instead.
+/// are derived from the account's cache instead.
 ///
 /// These are already-snapshotted plain maps, not the live `Arc<RankedMutex<…>>`
 /// stores. [`build_status`] runs holding NO lock at all — the config it takes is
@@ -49,6 +46,12 @@ pub(crate) const SCHEMA_VERSION: u64 = 2;
 /// across those reads would both invert lock order and stall every other config
 /// user for the duration.
 pub(crate) struct LiveSignals<'a> {
+    /// Whether the daemon this snapshot came from holds the usage-fetch lease.
+    /// A stood-down daemon runs no fetch: its live countdown stamps are
+    /// another instance's cache-clock estimates, so the feed publishes
+    /// `next_refresh_at: null` for them rather than a countdown this daemon
+    /// will not run. Part of the snapshot itself, so no writer can forget it.
+    pub(crate) fetches_here: bool,
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
     /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
@@ -237,8 +240,9 @@ pub(crate) struct ProfileEntry {
     pub(crate) has_live_session: bool,
     /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
     pub(crate) auth_status: String,
-    /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
-    /// when there is no cache at all.
+    /// Freshness: a live daemon's verdict or a derivation off the clock
+    /// `fetched_at` names; `None` when there is no cache at all, or a codex
+    /// cache that does not parse.
     #[schema(required = true)]
     pub(crate) fetch_status: Option<String>,
     /// Additive: true when this reading is distrusted, by
@@ -247,13 +251,25 @@ pub(crate) struct ProfileEntry {
     /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
     /// treating it as current truth.
     pub(crate) stale: bool,
+    /// `stale` as the 5h bell and the window push judge it, carried in-memory
+    /// only: the same arms, except that a proxy copy's age arm reads when its
+    /// chain windows were read
+    /// ([`crate::profile_cache::ThirdPartyCopy::chain_read_at`]), so a stale
+    /// display figure beside a fresh chain window silences neither alert.
+    /// Never published: `stale` keeps meaning the stalest figure's age.
+    #[serde(skip)]
+    pub(crate) alert_stale: bool,
     /// ISO-8601 UTC stamp of when the published figures were last fetched
-    /// (OAuth: the body's `fetched_at`; third-party: the cache write);
-    /// `None` when there is no cache or the body is undated.
+    /// (OAuth: the body's `fetched_at`; third-party: the cache write; codex:
+    /// the body's `fetched_at`, or the cache write where that stamp is missing
+    /// or in the future); `None` when there is no cache, a codex cache that
+    /// does not parse, or an undated OAuth body.
     #[schema(required = true)]
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
-    /// pending (a spent skipped account, or no cache).
+    /// pending: a never-cached profile, a single-shot reading whose derived
+    /// stamp is past, a spent account skipped under `refresh_spent_accounts`
+    /// off, or a keyless proxy profile the third-party leg serves.
     #[schema(required = true)]
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
@@ -299,6 +315,26 @@ pub(crate) struct ProfileEntry {
     /// daemon's body lacks it, so a reader defaults it to `false`.
     #[serde(default)]
     pub(crate) credit_capped: bool,
+    /// The banked usage-limit reset count clauth last read: a claude account's
+    /// `limit_resets.json`, a codex account's usage cache. `null` with no
+    /// reading, never a zero nothing read. Never required: an older daemon's
+    /// body lacks it.
+    #[serde(default)]
+    pub(crate) limit_resets: Option<u32>,
+    /// When that count was read, in the feed's `+00:00` form: a claude
+    /// account's off `limit_resets.json`'s own read stamp, a codex account's
+    /// off its own `fetched_at`. `null` with no reading, or a
+    /// claude reading with no stamp or one stamped in the future. A claude
+    /// entry's `fetched_at`/`stale` date only the usage cache, so they never
+    /// stand in for this. Never required: an older daemon's body lacks it.
+    #[serde(default)]
+    pub(crate) limit_resets_read_at: Option<String>,
+    /// The account is user-disabled. Absence from `profiles[]` cannot say so:
+    /// the active account is listed either way.
+    /// Never required: an older daemon's body lacks it, so a reader defaults
+    /// it to `false`.
+    #[serde(default)]
+    pub(crate) disabled: bool,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -404,8 +440,15 @@ pub(crate) fn build_profile_entries(
             } else {
                 load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
             };
+            // The third-party copy, loaded once for the clocks, the
+            // availability dot and the alerts' age arm below.
+            let third_party_copy = if p.usage_cache_is_third_party() {
+                crate::profile_cache::load_third_party_copy(name)
+            } else {
+                None
+            };
 
-            // The clock both mtime derivations below read. A DATED OAuth body
+            // The clocks the two derivations below read. A DATED OAuth body
             // dates off its own `fetched_at` stamp — the same age contract
             // (`oauth_age`) every other surface reads — because a plan-only
             // cache rewrite (`apply_outcome`'s `plan_refresh` write, the
@@ -416,18 +459,36 @@ pub(crate) fn build_profile_entries(
             // trust, so the mtime is the only clock left (known-movable; the
             // account it describes carries no fetch to date), as does a
             // third-party cache: that file's only writer is a fetch outcome.
-            let derived_clock_ms = if p.usage_cache_is_third_party() {
-                mtime_ms
+            // A proxy copy dates its file back to its stalest figure, so the
+            // two clocks split there, the way the startup seed splits them:
+            // its status reads its chain windows' date when it carries one,
+            // and its next refresh the write instant it records. The status
+            // clock is read as an age, `None` inside for a chain dated ahead
+            // of the clock: undated, as the seed reads it.
+            let (status_age_ms, next_clock_ms) = if p.usage_cache_is_third_party() {
+                match (third_party_copy.as_ref(), mtime_ms) {
+                    (Some(copy), Some(mtime)) => (
+                        Some(
+                            copy.chain_read_at
+                                .map_or(Some(now.saturating_sub(mtime)), |chain| {
+                                    now.checked_sub(chain)
+                                }),
+                        ),
+                        Some(copy.written_ms(mtime, now)),
+                    ),
+                    _ => (mtime_ms.map(|at| Some(now.saturating_sub(at))), mtime_ms),
+                }
             } else {
-                match oauth_age(oauth_usage.as_ref(), now) {
+                let clock = match oauth_age(oauth_usage.as_ref(), now) {
                     OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
                     OauthAge::Absent | OauthAge::Undated => mtime_ms,
-                }
+                };
+                (clock.map(|at| Some(now.saturating_sub(at))), clock)
             };
 
             // fetch_status: the live stores when a daemon is running, else
-            // derive from the last real fetch's recency (Fresh within one
-            // interval, else Cached) off `derived_clock_ms`. A name in NEITHER
+            // derive it off `status_age_ms` (Fresh within one interval,
+            // else Cached; an undated chain is never Fresh). A name in NEITHER
             // live store (a just-started daemon, the single-shot
             // `status --json`) falls back to that derivation rather than
             // reading as never-fetched; null = no cache at all.
@@ -442,8 +503,8 @@ pub(crate) fn build_profile_entries(
             // stale cache published `Fresh` — a dead session reading as live,
             // which is the outcome this status exists to prevent.
             let derived_status = || {
-                derived_clock_ms.map(|at| {
-                    if now.saturating_sub(at) < interval_ms {
+                status_age_ms.map(|age| {
+                    if age.is_some_and(|age| age < interval_ms) {
                         "Fresh"
                     } else {
                         "Cached"
@@ -500,7 +561,7 @@ pub(crate) fn build_profile_entries(
             // other. That predicate also pins the constant below: the `&&`
             // reaches it only where `usage_cache_file` resolves to that file.
             let derived_next = || {
-                derived_clock_ms.and_then(|at| {
+                next_clock_ms.and_then(|at| {
                     let stamp = at.saturating_add(interval_ms);
                     (stamp > now).then_some(stamp)
                 })
@@ -509,10 +570,23 @@ pub(crate) fn build_profile_entries(
                 && oauth_usage
                     .as_ref()
                     .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
-            let next_refresh_ms: Option<u64> = if spent_skipped {
+            // A proxy account no fetch leg admits (a keyless one fails the
+            // third-party leg's credential test, and the OAuth leg never polls
+            // a stored pair beside its record, readable or not) has no refresh
+            // pending from the moment it left the last leg, whatever its
+            // copy's clock or a countdown left from before says.
+            let never_polled = !p.spends_oauth_chain() && !crate::usage::any_fetch_leg_admits(p);
+            let next_refresh_ms: Option<u64> = if spent_skipped || never_polled {
                 None
             } else {
                 match live {
+                    // A stood-down daemon runs no fetch, so its live stamps
+                    // (re-derived from another instance's cache clocks) must
+                    // not publish as a countdown this daemon will run — null,
+                    // and never the derived form either, which would read as
+                    // a scheduled refresh on the same evidence. The holder's
+                    // arm is unchanged: its own countdown is real.
+                    Some(sig) if !sig.fetches_here => None,
                     Some(sig) => selected_next_refresh(sig.next_refresh, p).or_else(derived_next),
                     None => derived_next(),
                 }
@@ -539,9 +613,10 @@ pub(crate) fn build_profile_entries(
             // feed's `stale`, the TUI cue and the MCP payloads cannot answer
             // differently about the same file. `fetch_status` and
             // `next_refresh_at` above are a separate question (the last fetch
-            // OUTCOME, not the reading's age) and read `derived_clock_ms`. The
-            // third-party leg dates off that mtime too, its only writer being
-            // a fetch outcome. An OAuth body with no stamp or a future one is
+            // OUTCOME, not the reading's age) and read the two clocks above.
+            // A third-party age is its cache's mtime, which a proxy copy dates
+            // to its stalest figure, so a shown age is never younger than that
+            // figure. An OAuth body with no stamp or a future one is
             // stale with no age published: its figures stay visible, and
             // nothing claims to date them.
             let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
@@ -566,7 +641,20 @@ pub(crate) fn build_profile_entries(
                 )
             };
             let age_stale = !spent_skipped && past_threshold;
-            let stale = match live {
+            // The alerts judge a proxy copy by its chain windows, the figures
+            // they ring on; every other profile by the same age as `stale`. A
+            // chain dated ahead of the clock is undated, so stale, as an
+            // undated OAuth body is.
+            let alert_age_stale = match third_party_copy.as_ref().and_then(|c| c.chain_read_at) {
+                Some(chain) => {
+                    !spent_skipped
+                        && now
+                            .checked_sub(chain)
+                            .is_none_or(|age| age > stale_after_ms(interval_ms))
+                }
+                None => age_stale,
+            };
+            let stuck = match live {
                 Some(sig) => match sig.status.get(name.as_str()).copied() {
                     Some(s) => is_stuck_rate_limited(
                         s,
@@ -587,7 +675,9 @@ pub(crate) fn build_profile_entries(
                         }),
                 },
                 None => false,
-            } || age_stale;
+            };
+            let stale = stuck || age_stale;
+            let alert_stale = stuck || alert_age_stale;
 
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
@@ -598,16 +688,10 @@ pub(crate) fn build_profile_entries(
             // `is_third_party` it published a null dot for every generic api-key
             // endpoint while `fetched_at` beside it dated that account's provider
             // cache: one object, two answers about the same file.
-            let third_party = if p.usage_cache_is_third_party() {
-                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE).map(|s| {
-                    ThirdPartyAvailability {
-                        available: s.is_available,
-                    }
-                })
-            } else {
-                None
-            };
-            let (windows, long_window_label) = published_windows_with_label(name);
+            let third_party = third_party_copy.map(|copy| ThirdPartyAvailability {
+                available: copy.stats.is_available,
+            });
+            let (windows, long_window_label) = published_profile_windows_with_label(p);
             // The credit cap: the block the cache already loaded carries
             // (`oauth_usage`), published as `{enabled, percent}` — never a
             // dollar amount, and `percent` stays `null` when the wire sent
@@ -627,6 +711,9 @@ pub(crate) fn build_profile_entries(
                     percent: e.utilization,
                 });
             let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
+            // One load for the count and its stamp: a second read could pair a
+            // new count with an old date.
+            let banked_resets = crate::profile_cache::claude_limit_resets_reading(name);
 
             ProfileEntry {
                 name: name.clone(),
@@ -643,6 +730,7 @@ pub(crate) fn build_profile_entries(
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
+                alert_stale,
                 fetched_at: age_source_ms.map(ms_to_iso),
                 next_refresh_at: next_refresh_ms.map(ms_to_iso),
                 auto_start: p.auto_start,
@@ -661,6 +749,13 @@ pub(crate) fn build_profile_entries(
                 spend,
                 extra_usage,
                 credit_capped,
+                limit_resets: banked_resets.as_ref().map(|r| r.usable),
+                limit_resets_read_at: banked_resets
+                    .as_ref()
+                    .and_then(|r| r.fetched_at)
+                    .filter(|at| *at <= now_ms())
+                    .map(ms_to_iso),
+                disabled: p.is_disabled(),
             }
         })
         .collect()
@@ -673,12 +768,15 @@ pub(crate) fn build_profile_entries(
 /// disagree) plus the per-profile usage cache the codex leg writes, and
 /// nothing else: a codex profile has no `Profile` record (the file split
 /// leaves `profiles.toml` untouched), so every claude-only field is its
-/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
-/// — the polled one, else the id_token's claim — never a `Claude <tier>`
-/// label, which is what `tier_label` would produce.
+/// no-data form rather than a fabricated one. `fetches_here` is the claude
+/// half's null rule: a stood-down daemon runs no codex poll, so its derived
+/// stamp publishes as `null`, never a countdown it will not run. `tier`
+/// carries the ChatGPT plan — the polled one, else the id_token's claim —
+/// never a `Claude <tier>` label, which is what `tier_label` would produce.
 pub(crate) fn build_codex_entries(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
+    fetches_here: bool,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     let active = codex.active_profile();
@@ -686,8 +784,14 @@ pub(crate) fn build_codex_entries(
         .profiles()
         .iter()
         .map(|name| {
-            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
             let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            #[cfg(test)]
+            run_codex_entry_load_hook(name);
+            let clock_ms = crate::usage::usage_cache_clock_of(name, cached.as_ref());
+            let banked_resets = cached
+                .as_ref()
+                .and_then(|u| u.limit_resets.as_ref())
+                .map(|r| r.usable);
             ProfileEntry {
                 name: name.clone(),
                 active: active.is_some_and(|a| a == name),
@@ -717,7 +821,7 @@ pub(crate) fn build_codex_entries(
                     "unknown"
                 }
                 .to_string(),
-                fetch_status: mtime_ms.map(|mt| {
+                fetch_status: clock_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
                         "Fresh"
                     } else {
@@ -726,14 +830,19 @@ pub(crate) fn build_codex_entries(
                     .to_string()
                 }),
                 stale: false,
-                fetched_at: mtime_ms.map(ms_to_iso),
-                next_refresh_at: mtime_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
+                alert_stale: false,
+                fetched_at: clock_ms.map(ms_to_iso),
+                // A stood-down daemon runs no codex poll: its stamp would be
+                // the holder's cache clock, a countdown it does not run.
+                next_refresh_at: clock_ms
+                    .filter(|_| fetches_here)
+                    .map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
                 bell_threshold: None,
                 fallback: None,
-                windows: published_windows(name),
+                windows: cached.as_ref().map(usage_windows).unwrap_or_default(),
                 // Codex windows are always 5h/7d; the push reads its 7d label
                 // directly (no monthly), so the presence label is never needed.
                 long_window_label: None,
@@ -744,9 +853,45 @@ pub(crate) fn build_codex_entries(
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: banked_resets,
+                // A codex count rides the usage cache, so the clock read off the
+                // body that carries it dates it, as it dates the entry; no count
+                // dates nothing.
+                limit_resets_read_at: banked_resets.and(clock_ms).map(ms_to_iso),
+                // The codex roster has no disabled state.
+                disabled: false,
             }
         })
         .collect()
+}
+
+/// One landing to run right after a codex entry's cache load, keyed by account:
+/// the moment a poll can land under a feed build, with no thread and no sleep.
+#[cfg(test)]
+type CodexEntryLoadHook = Box<dyn FnOnce(&ProfileName) + Send>;
+
+#[cfg(test)]
+static CODEX_ENTRY_LOAD_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, CodexEntryLoadHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_codex_entry_load_hook(name: &str, hook: CodexEntryLoadHook) {
+    CODEX_ENTRY_LOAD_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_string(), hook);
+}
+
+#[cfg(test)]
+fn run_codex_entry_load_hook(name: &ProfileName) {
+    let hook = CODEX_ENTRY_LOAD_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// The full `status.json` body. Field order is the published key order, and
@@ -929,8 +1074,13 @@ pub(crate) fn build_status_impl(
     let fallback = crate::codex_profiles::CodexState::default();
     let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
-    // prefix it always took.
-    profiles.extend(build_codex_entries(body_codex, interval_ms));
+    // prefix it always took. A single-shot or daemonless writer (`live: None`)
+    // keeps the derived stamp: it vouches for no poll of its own either way.
+    profiles.extend(build_codex_entries(
+        body_codex,
+        interval_ms,
+        live.is_none_or(|sig| sig.fetches_here),
+    ));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();

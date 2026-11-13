@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
+use crate::proxy_tokens::{ProxyProfiles, TokenRecord};
 use crate::session_record::LenientString;
 
 pub(crate) const TPS_CACHE_FILE: &str = "tps_cache.json";
@@ -43,6 +44,34 @@ pub(crate) const H1_WINDOW_MS: u64 = 60 * 60_000;
 /// speed responses older than this are settled once and re-derived only when a
 /// line touches them, so a tick never re-sweeps a whole day.
 const SETTLE_LAG_MS: u64 = 10 * 60_000;
+/// A change to the applied token records alone saves the attribution file at
+/// most this often: records land every few seconds and the file holds every
+/// one of the live and owed days. A tick where a fold could land after the
+/// save (a day held or a rebuild waiting, the speed ledger usable and its
+/// saves landing) saves them at once, and an entry's save carries them along.
+/// A clean stop of the lease holder saves what is still unsaved through the
+/// same save, unless its last tick outruns the stop's wait — the daemon's
+/// [`SPEND_DRAIN_BOUND`](crate::daemon::SPEND_DRAIN_BOUND) (20 s), or, for a
+/// TUI quit or stop signal, the later of its own waits and the child stop
+/// budget (4 s). A clean daemon stop skips one last proxy poll — the stop
+/// flag ends the tick loop first — and stops the proxies concurrently, so a
+/// record a proxy finished after the last tick (about 1 s) and a record
+/// still waiting for its transcript twin are lost: no stop saves them. Every
+/// other end loses the records applied since the last save that landed, at
+/// most this span while saves land: a crash, a panic, a SIGKILL, a signal
+/// landing before the daemon's watcher is installed, a signal the TUI does
+/// not watch (SIGINT, SIGQUIT), a Windows console close, and every Windows
+/// daemon stop, which is a `taskkill /F` (there the span is 60 s). The next
+/// life's first poll, sent with no cursor, gets back only what the proxy's
+/// ring still retains: none once the proxy restarted, which a daemon's stop
+/// does to every proxy it supervises and the next daemon's start does to one
+/// a crash left running.
+///
+/// Unix: every clean stop runs the exit save, a TUI stop signal on a closed
+/// terminal included, so the cadence alone bounds what a crash loses. Windows:
+/// every daemon stop is a force kill, so no exit save runs there: the cadence
+/// alone bounds what a stop loses, and 60 s keeps it small.
+const RECORDS_SAVE_INTERVAL_MS: u64 = if cfg!(windows) { 60_000 } else { 10 * 60_000 };
 /// A cache older than this reads as no producer.
 pub(crate) const STALE_AFTER_MS: u64 = 30_000;
 
@@ -368,13 +397,18 @@ struct TimelineEntry {
     member: String,
 }
 
-/// `~/.clauth/tps_attribution.json`: every entry in the order it was added.
+/// `~/.clauth/tps_attribution.json`: every entry in the order it was added,
+/// and every applied proxy token record. `records` is additive at version 1:
+/// an older clauth ignores it, and its own save drops it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TimelineWire {
     #[serde(default)]
     version: u16,
     #[serde(default)]
     entries: Vec<TimelineEntry>,
+    /// Read one by one, so a record off its shape costs only itself.
+    #[serde(default)]
+    records: Vec<serde_json::Value>,
 }
 
 /// [`TimelineWire`] borrowed, for the save.
@@ -382,6 +416,8 @@ struct TimelineWire {
 struct TimelineWireRef<'a> {
     version: u16,
     entries: Vec<&'a TimelineEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    records: Vec<&'a TokenRecord>,
 }
 
 /// How a producer-only file (the attribution timeline, the owed-day list) read.
@@ -412,6 +448,15 @@ struct Timeline {
     unsaved: bool,
     /// The "not saving" line was logged for the current failure state.
     save_failed_logged: bool,
+    /// Every proxy token record applied to a response whose day is live or
+    /// still owed, by message id: re-applied wherever a response takes its
+    /// shape or account, so a restart re-derives what the proxy no longer
+    /// holds.
+    records: HashMap<String, TokenRecord>,
+    /// A record was applied or pruned since the last save that landed.
+    records_unsaved: bool,
+    /// When the last save landed this life; `None` before the first.
+    records_saved_at: Option<u64>,
 }
 
 impl Timeline {
@@ -436,6 +481,12 @@ impl Timeline {
         for entry in wire.entries {
             timeline.push(entry);
         }
+        timeline.records = wire
+            .records
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<TokenRecord>(v).ok())
+            .map(|record| (record.id.clone(), record))
+            .collect();
         timeline.unsaved = false;
         timeline
     }
@@ -489,13 +540,13 @@ impl Timeline {
             .map_or(UNATTRIBUTED, |e| e.member.as_str())
     }
 
-    /// Persist the timeline (0600) when an entry was added since the last
-    /// save. A file that did not parse is renamed aside first (0600); an
-    /// unreadable or newer file is never saved over. Failures are logged once
-    /// per failure state and retried on the next call; `unsaved` stays set
-    /// until a save lands.
+    /// Persist the timeline and its records (0600) when either changed since
+    /// the last save. A file that did not parse is renamed aside first (0600);
+    /// an unreadable or newer file is never saved over. Failures are logged
+    /// once per failure state and retried on the next call; `unsaved` and
+    /// `records_unsaved` stay set until a save lands.
     fn save_if_changed(&mut self, dir: &Path) {
-        if !self.unsaved {
+        if !self.unsaved && !self.records_unsaved {
             return;
         }
         if matches!(self.disk, DiskState::Unreadable | DiskState::Newer) {
@@ -531,9 +582,14 @@ impl Timeline {
                 entry
             })
             .collect();
+        let mut records: Vec<&TokenRecord> = self.records.values().collect();
+        records.sort_by(|a, b| (a.end_ms, &a.id).cmp(&(b.end_ms, &b.id)));
+        #[cfg(test)]
+        attribution_writes::count();
         let wire = TimelineWireRef {
             version: ATTRIBUTION_VERSION,
             entries,
+            records,
         };
         let written = serde_json::to_vec(&wire)
             .map_err(|e| e.to_string())
@@ -543,6 +599,7 @@ impl Timeline {
         match written {
             Ok(()) => {
                 self.unsaved = false;
+                self.records_unsaved = false;
                 if self.save_failed_logged {
                     crate::logline::logline!("clauth: tps_attribution.json saves recovered");
                     self.save_failed_logged = false;
@@ -563,7 +620,7 @@ impl Timeline {
 /// Move an unparseable producer file `dir/name` aside to
 /// `name.corrupt-<epoch_ms>` (0600), so the next save never writes over it.
 /// False when the rename failed.
-fn move_aside(dir: &Path, name: &str) -> bool {
+pub(crate) fn move_aside(dir: &Path, name: &str) -> bool {
     let aside = dir.join(format!("{name}.corrupt-{}", crate::usage::now_ms()));
     if std::fs::rename(dir.join(name), &aside).is_err() {
         return false;
@@ -858,6 +915,20 @@ pub(crate) struct Producer {
     last_reload_ms: u64,
     /// When the last whole-tree walk ran.
     last_discover_ms: u64,
+    /// The proxies serving token records, polled every tick.
+    poller: crate::proxy_tokens::Poller,
+    /// Records whose transcript twin has not been read yet, by message id,
+    /// each with its arrival rank: held in memory until the twin's line
+    /// applies it, dropped once the settle lag passed its end.
+    pending: HashMap<String, (u64, TokenRecord)>,
+    /// The last arrival rank handed to a pending record.
+    pending_rank: u64,
+    /// The proxies whose unmatched-record line was raised this life.
+    unmatched_logged: HashSet<String>,
+    /// Which profile holds each proxy account, read on the refresh cadence.
+    proxy_profiles: ProxyProfiles,
+    /// When `proxy_profiles` was last read; `None` before the first read.
+    proxy_profiles_at: Option<u64>,
 }
 
 impl Producer {
@@ -930,13 +1001,29 @@ impl Producer {
     }
 
     /// One pass at `now_ms`: tail every transcript store under the home dir,
-    /// attribute each session, save the owed-day list's additions, save the
+    /// overlay the token records the proxies answer, attribute each session,
+    /// save the owed-day list's additions, save the
     /// attribution timeline, fold the days that left the window, save the
     /// list's removals, and rebuild the snapshot from the responses' current
     /// state. The timeline lands before anything that reflects it: while a
     /// save is pending no fold runs. The snapshot is output only, so it is
     /// published either way.
-    pub(crate) fn tick(&mut self, now_ms: u64) -> Snapshot {
+    ///
+    /// `lease` is the fetch tick's ticket, checked before every write this
+    /// pass makes (the owed-day list, the timeline, the speed ledger): the
+    /// tail pass can stall past the holder's watchdog release, and a pass that
+    /// resumes after it must not write over the files the new holder owns. The
+    /// pass still builds its snapshot; the caller decides whether to publish it.
+    ///
+    /// The check is not a lock: a release landing between a check and its write
+    /// still lets one stale tps file land. The days list self-heals on the next
+    /// pass, which re-derives a dropped owed day from the transcripts.
+    pub(crate) fn tick_leased(
+        &mut self,
+        now_ms: u64,
+        lease: Option<crate::daemon::LeaseTicket<'_>>,
+    ) -> Snapshot {
+        let current = || lease.is_none_or(crate::daemon::LeaseTicket::is_current);
         self.store_mtime = store_mtime_now();
         let cutoff = cutoff_ms(now_ms);
         let today = day_of_ms(now_ms);
@@ -957,7 +1044,9 @@ impl Producer {
                 self.reload_timeline(dir, now_ms);
             }
             self.refresh_speed_ledger(dir, now_ms);
-            self.speed_ledger.claim(dir);
+            if current() {
+                self.speed_ledger.claim(dir);
+            }
         }
         // An owed-day list read back (at start, or once an unreadable one
         // reads): each past day it names, back to `OWED_DAYS_BACK`, is rebuilt
@@ -980,7 +1069,7 @@ impl Producer {
             && self.folds_can_land()
             && dir
                 .as_deref()
-                .is_some_and(|dir| self.speed_ledger.saves_land(dir))
+                .is_some_and(|dir| current() && self.speed_ledger.saves_land(dir))
         {
             std::mem::take(&mut self.unbuilt)
         } else {
@@ -1014,11 +1103,15 @@ impl Producer {
                 }
             }
         }
+        if !self.timeline.records.is_empty() || !self.pending.is_empty() {
+            self.refresh_proxy_profiles(now_ms);
+        }
         // Observe before reading, so every line this tick reads takes the
         // member in force at its span start.
         self.observe_sessions(now_ms);
         self.tail_all(now_ms, floor);
         self.whole_since = Some(self.whole_since.map_or(floor, |w| w.min(floor)));
+        self.take_token_records(now_ms);
 
         // Live: today, yesterday and every future day holding a response. A
         // day that left the window keeps its last derived state in `held`
@@ -1033,14 +1126,14 @@ impl Producer {
         // A newly owed day lands in the list before the timeline save, so a
         // life dying between the two writes still leaves it owed.
         self.owed.extend(live.iter().cloned());
-        if let Some(dir) = dir.as_deref() {
+        if let Some(dir) = dir.as_deref().filter(|_| current()) {
             self.days_file.save(dir, &self.owed);
         }
         #[cfg(test)]
         if halt_seam::armed() {
             return Snapshot::default();
         }
-        let attribution_saved = self.save_timeline(dir.as_deref());
+        let attribution_saved = self.save_timeline(dir.as_deref().filter(|_| current()), now_ms);
 
         let leaving: BTreeSet<String> = self
             .live_days
@@ -1083,7 +1176,7 @@ impl Producer {
         };
         // A fold derived from an entry no file holds would disagree with what
         // a restart re-derives from the saved timeline.
-        if attribution_saved {
+        if attribution_saved && current() {
             self.fold_days(&today, &yesterday, dir);
             // The fold may have landed held days: the snapshot holds what is
             // still held after it.
@@ -1092,48 +1185,140 @@ impl Producer {
             snap.rate_peaks
                 .retain(|d, _| self.live_days.contains(d) || self.held_rate_peaks.contains_key(d));
         }
+        self.prune_records();
         // The days a landed fold dropped leave the list only now.
-        self.days_file.save(dir, &self.owed);
+        if current() {
+            self.days_file.save(dir, &self.owed);
+        }
         snap
     }
 
+    /// [`Self::tick_leased`] outside a fetch tick: no lease ticket.
+    #[cfg(test)]
+    pub(crate) fn tick(&mut self, now_ms: u64) -> Snapshot {
+        self.tick_leased(now_ms, None)
+    }
+
+    /// Re-join the shared files after this process re-took the fetch lease:
+    /// while it stood down, another holder wrote `token_speed.json`,
+    /// `tps_attribution.json` and `tps_days.json`, and this life's copies
+    /// must not be saved back over them. Unsaved timeline entries are
+    /// dropped with the old copy — never written over the new holder's file;
+    /// a session's live rows restore through the re-observation below. A
+    /// timeline that cannot be read here keeps the old copy, which stays
+    /// unsaveable until a retry reload replaces it.
+    pub(crate) fn rejoin_files(&mut self, now_ms: u64) {
+        let Ok(dir) = crate::profile::clauth_dir() else {
+            return;
+        };
+        self.speed_ledger = crate::token_ledger::SpeedLedger::load(&dir);
+        self.reload_timeline(&dir, now_ms);
+        let (file, owed) = DaysFile::load(&dir);
+        self.days_file = file;
+        self.loaded_owed = owed;
+        self.ledger_ever = None;
+        self.ever_dirty = true;
+    }
+
+    /// Save what the attribution file still owes as the life ends: a pending
+    /// entry or records change lands now, the records cadence skipped,
+    /// through the same refusals as a tick's save. A spent ticket skips it;
+    /// as on a tick's save, the check is not a lock, so a release landing
+    /// between it and the write still lands this copy.
+    pub(crate) fn save_before_exit(
+        &mut self,
+        now_ms: u64,
+        lease: Option<crate::daemon::LeaseTicket<'_>>,
+    ) {
+        let pending = self.timeline.unsaved || self.timeline.records_unsaved;
+        if !pending || !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return;
+        }
+        let Ok(dir) = crate::profile::clauth_dir() else {
+            return;
+        };
+        self.timeline.save_if_changed(&dir);
+        if !self.timeline.unsaved && !self.timeline.records_unsaved {
+            self.timeline.records_saved_at = Some(now_ms);
+        }
+    }
+
     /// True when a fold of a rebuilt day could land this tick: the speed
-    /// ledger may be saved over and no attribution save is pending or
-    /// refused.
+    /// ledger may be saved over and no attribution save (entries or records)
+    /// is pending or refused.
     fn folds_can_land(&self) -> bool {
         !self.speed_ledger.unusable()
             && !self.timeline.unsaved
+            && !self.timeline.records_unsaved
             && !matches!(self.timeline.disk, DiskState::Unreadable | DiskState::Newer)
     }
 
-    /// Save the attribution timeline when an entry was added since the last
-    /// save landed; true when nothing is left unsaved.
-    fn save_timeline(&mut self, dir: Option<&Path>) -> bool {
-        if !self.timeline.unsaved {
-            return true;
+    /// Save the attribution file when an entry was added since the last save
+    /// landed, or when records changed and their save is due: on the records'
+    /// cadence, or at once on a tick where a fold could land right after the
+    /// save — a day is held or a rebuild waits, the speed ledger is usable
+    /// and its saves land, and no attribution save is refused. A held day
+    /// outlasting a broken ledger rewrites the file on the cadence, not every
+    /// tick. True when nothing is left unsaved.
+    fn save_timeline(&mut self, dir: Option<&Path>, now_ms: u64) -> bool {
+        let fold_waits = !self.held.is_empty() || !self.unbuilt.is_empty();
+        let disk_ok = !matches!(self.timeline.disk, DiskState::Unreadable | DiskState::Newer);
+        let fold_can_land = fold_waits
+            && !self.timeline.unsaved
+            && disk_ok
+            && dir.is_some_and(|dir| {
+                !self.speed_ledger.unusable() && self.speed_ledger.saves_land(dir)
+            });
+        let records_due = self.timeline.records_unsaved
+            && (fold_can_land
+                || self
+                    .timeline
+                    .records_saved_at
+                    .is_none_or(|at| now_ms < at || now_ms - at >= RECORDS_SAVE_INTERVAL_MS));
+        if !self.timeline.unsaved && !records_due {
+            return !self.timeline.records_unsaved;
         }
         let Some(dir) = dir else {
             return false;
         };
         self.timeline.save_if_changed(dir);
-        !self.timeline.unsaved
+        let saved = !self.timeline.unsaved && !self.timeline.records_unsaved;
+        if saved {
+            self.timeline.records_saved_at = Some(now_ms);
+        }
+        saved
     }
 
     /// The attribution file could not be read at start: read it again (each
     /// tick, whether or not an entry waits to be saved, since an owed day's
     /// rebuild waits for it). Once it reads, it replaces this life's timeline,
-    /// and every session this life holds is observed against it the way a
-    /// restart's first read observes it (a change at its stamp, or a seed for
-    /// a session it does not know); the responses take their members again.
+    /// its records joined by the ones this life applied, and every session
+    /// this life holds is observed against it the way a restart's first read
+    /// observes it (a change at its stamp, or a seed for a session it does not
+    /// know); the responses take their members and records again.
     fn reload_timeline(&mut self, dir: &Path, now_ms: u64) {
         let fresh = Timeline::load(dir);
         if fresh.disk == DiskState::Unreadable {
+            // The kept copy is the old holder's: it must not be saved until a
+            // retry reads the file. Marking it unreadable is what makes
+            // `save_if_changed` refuse and the per-tick retry come back here.
+            self.timeline.disk = DiskState::Unreadable;
             return;
         }
         let sessions: HashSet<String> = self.timeline.by_session.keys().cloned().collect();
         let logged = self.timeline.save_failed_logged;
+        let held = std::mem::take(&mut self.timeline.records);
         self.timeline = fresh;
         self.timeline.save_failed_logged = logged;
+        // A record is a fact about one response whoever applied it, so the
+        // ones this life applied join the file's instead of being dropped
+        // with the old copy.
+        for (id, record) in held {
+            if let Entry::Vacant(slot) = self.timeline.records.entry(id) {
+                slot.insert(record);
+                self.timeline.records_unsaved = true;
+            }
+        }
         for session in &sessions {
             let observed = self.observe_sources(session);
             self.observe_first(session, &observed, now_ms);
@@ -1795,16 +1980,26 @@ impl Producer {
                     .responses
                     .get(&msg_key)
                     .is_some_and(|r| r.file != file.rank && file.rank.before(&r.file));
-                let account = self
-                    .timeline
-                    .member_for(&file.session, start_ms.unwrap_or(ts))
-                    .to_owned();
+                // A record polled before its twin was read applies from the
+                // twin's first line on.
+                if let Some(id) = id.as_deref()
+                    && let Some((_, record)) = self.pending.remove(id)
+                {
+                    self.timeline.records.insert(id.to_owned(), record);
+                    self.timeline.records_unsaved = true;
+                }
+                let record = id.as_deref().and_then(|id| self.timeline.records.get(id));
+                // The stored response's leftmost support point, read before
+                // the line and any record change it: a record apply owes the
+                // settled re-derive only when the support before or after the
+                // change starts below the boundary.
+                let prev_left = self.responses.get(&msg_key).map(leftmost);
                 let resp = upsert_response(
                     &mut self.responses,
                     msg_key,
                     Resp {
                         session: file.session.clone(),
-                        account,
+                        account: String::new(),
                         model,
                         start_ms,
                         end_ms: ts,
@@ -1816,17 +2011,18 @@ impl Producer {
                     resp.session.clone_from(&file.session);
                     resp.file = Arc::clone(&file.rank);
                     resp.start_ms = start_ms;
-                    let account = self
-                        .timeline
-                        .member_for(&file.session, start_ms.unwrap_or(resp.end_ms));
-                    account.clone_into(&mut resp.account);
-                    // The owner's span start and member may differ from the
-                    // copy's: the live days' settled values re-derive.
-                    self.settle_rederive.insert(day_of_ms(now_ms));
-                    self.settle_rederive
-                        .insert(day_of_ms(now_ms.saturating_sub(DAY_MS)));
-                    self.peaks_dirty = true;
                 }
+                // A new or re-owned response takes its account; one a record
+                // overlays takes the record's figures back from whatever this
+                // line set.
+                let overlaid = (!existed || reown || record.is_some())
+                    && attribute(resp, record, &self.timeline, &self.proxy_profiles)
+                    && record.is_some();
+                // A re-owned response changed file and account outside a
+                // record, so its settled re-derive stays unconditional; a
+                // record apply owes it only when the response's support
+                // before or after the change starts below the settled
+                // boundary.
                 // The recompute is owed only when the response's shape changed:
                 // it is new, or its output or end moved. A smaller duplicate
                 // partial changes nothing and owes nothing.
@@ -1887,6 +2083,14 @@ impl Producer {
                             }
                         }
                     }
+                }
+                let lowest = if reown {
+                    0
+                } else {
+                    prev_left.map_or(leftmost(resp), |p| p.min(leftmost(resp)))
+                };
+                if reown || overlaid {
+                    self.owe_rederive(lowest, now_ms);
                 }
                 // A success line is never uuid-deduped, so a shrink or a walk
                 // miss that re-reads it under a bound below its end folds it
@@ -2016,29 +2220,166 @@ impl Producer {
     }
 
     /// The responses of every session in `changed` take their member from
-    /// the timeline again.
+    /// the timeline again, or their record's.
     fn reattribute(&mut self, changed: &HashSet<String>, now_ms: u64) {
         if changed.is_empty() {
             return;
         }
         let mut moved = false;
-        for r in self.responses.values_mut() {
+        for (key, r) in &mut self.responses {
             if !changed.contains(&r.session) {
                 continue;
             }
-            let member = self
-                .timeline
-                .member_for(&r.session, r.start_ms.unwrap_or(r.end_ms));
-            if r.account != member {
-                member.clone_into(&mut r.account);
-                moved = true;
-            }
+            moved |= attribute(
+                r,
+                self.timeline.records.get(key),
+                &self.timeline,
+                &self.proxy_profiles,
+            );
         }
+        // A member change owes the settled re-derive whatever the changed
+        // sessions' responses span: the timeline decides accounts across the
+        // whole settled range.
         if moved {
-            self.peaks_dirty = true;
+            self.owe_rederive(0, now_ms);
+        }
+    }
+
+    /// A response changed account or shape outside a line that grew it: the
+    /// peaks recompute, and — when the change's leftmost support point
+    /// (`lowest_ms`) sits below the settle boundary — both live days'
+    /// settled values re-derive from scratch. A response whose support
+    /// before and after the change starts at or above the boundary owes only
+    /// the peaks recompute, so a tick never re-sweeps a whole day for a
+    /// change the settled values cannot see.
+    fn owe_rederive(&mut self, lowest_ms: u64, now_ms: u64) {
+        self.peaks_dirty = true;
+        if lowest_ms < self.settled_through {
+            #[cfg(test)]
+            settle_rederives::count();
             self.settle_rederive.insert(day_of_ms(now_ms));
             self.settle_rederive
                 .insert(day_of_ms(now_ms.saturating_sub(DAY_MS)));
+        }
+    }
+
+    /// Read which profile holds each proxy account again once the refresh
+    /// cadence passed; a change re-applies every record to its response.
+    fn refresh_proxy_profiles(&mut self, now_ms: u64) {
+        let due = self.proxy_profiles_at.is_none_or(|at| {
+            now_ms < at || now_ms - at >= crate::proxy_tokens::REFRESH_INTERVAL_MS
+        });
+        if !due {
+            return;
+        }
+        self.proxy_profiles_at = Some(now_ms);
+        let fresh = crate::proxy_tokens::proxy_profiles();
+        if fresh == self.proxy_profiles {
+            return;
+        }
+        self.proxy_profiles = fresh;
+        let mut moved = false;
+        let mut lowest = u64::MAX;
+        for (id, record) in &self.timeline.records {
+            if let Some(resp) = self.responses.get_mut(id) {
+                let before = leftmost(resp);
+                if attribute(resp, Some(record), &self.timeline, &self.proxy_profiles) {
+                    moved = true;
+                    lowest = lowest.min(before).min(leftmost(resp));
+                }
+            }
+        }
+        if moved {
+            self.owe_rederive(lowest, now_ms);
+        }
+    }
+
+    /// Poll the proxies and apply each new record: to its twin when the
+    /// response is held, else held until the twin's line is read. Records
+    /// already applied or held (a `dropped` re-delivery, a poll after a lease
+    /// handover) are skipped by message id. Then drop every held record whose
+    /// twin never came.
+    fn take_token_records(&mut self, now_ms: u64) {
+        let polled = self.poller.poll(now_ms);
+        if !polled.is_empty() {
+            self.refresh_proxy_profiles(now_ms);
+        }
+        let mut moved = false;
+        let mut lowest = u64::MAX;
+        for record in polled {
+            if self.timeline.records.contains_key(&record.id)
+                || self.pending.contains_key(&record.id)
+            {
+                continue;
+            }
+            match self.responses.get_mut(&record.id) {
+                Some(resp) => {
+                    let before = leftmost(resp);
+                    if attribute(resp, Some(&record), &self.timeline, &self.proxy_profiles) {
+                        moved = true;
+                        lowest = lowest.min(before).min(leftmost(resp));
+                    }
+                    self.timeline.records.insert(record.id.clone(), record);
+                    self.timeline.records_unsaved = true;
+                }
+                None => {
+                    self.pending_rank += 1;
+                    self.pending
+                        .insert(record.id.clone(), (self.pending_rank, record));
+                }
+            }
+        }
+        if moved {
+            self.owe_rederive(lowest, now_ms);
+        }
+        self.drop_unmatched(now_ms);
+    }
+
+    /// Drop every held record whose end is more than the settle lag behind
+    /// `now_ms` with no transcript twin read. A record is never a response of
+    /// its own (it has no session or file), so it counts nowhere. The first
+    /// drop per proxy this life raises one line naming the oldest record
+    /// dropped on that tick; later drops raise none.
+    fn drop_unmatched(&mut self, now_ms: u64) {
+        let mut oldest: BTreeMap<String, (u64, String)> = BTreeMap::new();
+        self.pending.retain(|id, (rank, record)| {
+            if now_ms <= record.end_ms.saturating_add(SETTLE_LAG_MS) {
+                return true;
+            }
+            let slot = oldest
+                .entry(record.service.clone())
+                .or_insert_with(|| (*rank, id.clone()));
+            if *rank < slot.0 {
+                *slot = (*rank, id.clone());
+            }
+            false
+        });
+        for (service, (_, id)) in oldest {
+            if self.unmatched_logged.insert(service.clone()) {
+                crate::logline::logline!(
+                    "clauth: proxy {service:?}: token record {id:?} matches no transcript response; dropping it and every later unmatched record of this proxy without a line"
+                );
+            }
+        }
+    }
+
+    /// Drop every applied record whose response's day folded and whose
+    /// response left the tail: the tail keeps a folded day's last
+    /// `LIVE_WINDOW_MS` of responses for yesterday's first windows, so a
+    /// record overlaying one of those stays until its response goes. An
+    /// unreadable owed-day list names no owed day this life can trust, so
+    /// nothing is pruned until it reads.
+    fn prune_records(&mut self) {
+        if self.days_file.disk == DiskState::Unreadable {
+            return;
+        }
+        let before = self.timeline.records.len();
+        let owed = &self.owed;
+        self.timeline.records.retain(|id, record| {
+            owed.contains(&day_of_ms(record.end_ms)) || self.responses.contains_key(id)
+        });
+        if self.timeline.records.len() != before {
+            self.timeline.records_unsaved = true;
         }
     }
 
@@ -2773,6 +3114,12 @@ fn response_key(session: &str, id: Option<&str>, user_ts: u64) -> String {
     }
 }
 
+/// A response's leftmost support point: its span start, or its end when
+/// span-less.
+fn leftmost(r: &Resp) -> u64 {
+    r.start_ms.unwrap_or(r.end_ms)
+}
+
 /// The shared fold both [`process_line`] and [`transcript_speed`] drive, so the
 /// span/attribution/partial rules cannot drift between them. A line whose output
 /// is at least the largest seen so far updates `output` and moves `end_ms` to the
@@ -2791,6 +3138,46 @@ fn upsert_response(
         resp.end_ms = resp.end_ms.max(end_ms);
     }
     resp
+}
+
+/// Give `resp` the account that spent it and, when a proxy token record
+/// overlays it, the record's span, output and model (an absent model keeps
+/// the transcript's). Every site that sets a response's shape or account goes
+/// through here, so neither a later transcript line nor a re-derive restores
+/// what the record replaced. The record's `(service, account)` names the
+/// account when a profile holds it, else the timeline's member at the span
+/// start does. True when the response changed.
+fn attribute(
+    resp: &mut Resp,
+    record: Option<&TokenRecord>,
+    timeline: &Timeline,
+    proxy_profiles: &ProxyProfiles,
+) -> bool {
+    let mut changed = false;
+    let mut profile = None;
+    if let Some(record) = record {
+        let shape = (Some(record.start_ms), record.end_ms, record.output);
+        if (resp.start_ms, resp.end_ms, resp.output) != shape {
+            (resp.start_ms, resp.end_ms, resp.output) = shape;
+            changed = true;
+        }
+        if let Some(model) = record.model.as_deref().filter(|m| *m != resp.model) {
+            model.clone_into(&mut resp.model);
+            changed = true;
+        }
+        profile = proxy_profiles
+            .get(&record.service)
+            .and_then(|accounts| accounts.get(&record.account));
+    }
+    let member = match profile {
+        Some(profile) => profile.as_str(),
+        None => timeline.member_for(&resp.session, resp.start_ms.unwrap_or(resp.end_ms)),
+    };
+    if resp.account != member {
+        member.clone_into(&mut resp.account);
+        changed = true;
+    }
+    changed
 }
 
 /// RFC 3339 (with or without a `Z`/offset, milliseconds) → epoch milliseconds.
@@ -3793,6 +4180,56 @@ pub(crate) mod ledger_walks {
     }
 }
 
+/// Test seam: how many times a tick reached the attribution file's write, so
+/// a test can tell a save that landed from one the cadence skipped. A
+/// process-global counter: a test reads a delta from a baseline taken at its
+/// own start.
+#[cfg(test)]
+pub(crate) mod attribution_writes {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn count() {
+        WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn taken() -> u64 {
+        WRITES.load(Ordering::Relaxed)
+    }
+}
+
+/// Test seam: how many times `owe_rederive` owed the settled days'
+/// from-scratch re-derive (a record apply, a profile-map refresh, a
+/// reattribute, a reown), so a test can tell a record apply whose support
+/// starts above the settle boundary from one below it. The line path's own
+/// bounded inserts and a clock step back are not counted. Thread-local: a
+/// test reads a delta from a baseline taken at its own start.
+#[cfg(test)]
+pub(crate) mod settle_rederives {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn taken() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/tps.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/inline/tps_proxy.rs"]
+mod proxy_tests;
+
+#[cfg(test)]
+#[path = "../tests/inline/tps_proxy_more.rs"]
+mod proxy_more_tests;

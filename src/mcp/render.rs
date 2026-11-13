@@ -7,21 +7,25 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use serde_json::Value;
 
-use crate::format::{format_pct, humanize_span, local_stamp};
+use crate::format::{format_pct, humanize_span, local_stamp, plural};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
-/// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
-/// provider, tier, base url). Volatile usage figures rot within a turn, so they are
-/// served fresh per call by `profiles`, never baked into the boot-time block.
+/// Per-profile snapshot fed to [`instructions_block`]: stable identity (name,
+/// provider, tier, base url), the active and disabled flags, and a sort key.
+/// Volatile usage figures rot within a turn, so they are served fresh per call by
+/// `profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
+    /// Whether the account is disabled. A disabled row the roster keeps says so in
+    /// its marker, since the header tells a reader disabled ones are left out.
+    pub(crate) disabled: bool,
     /// Where this profile sorts in the roster. See [`RosterRank`].
     pub(crate) rank: RosterRank,
 }
@@ -270,20 +274,35 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
 /// runtime marks the profile the session is pinned to and the account the global
 /// link points at separately; a global session IS the global link, so the active
 /// profile carries both names; a custom config dir holds no clauth session
-/// profile, so only the global link gets a name. The old bare `(active)` read as
+/// profile, so only the global link gets a name. A bare `active` would read as
 /// "this session's account" where a `clauth start` session does not spend the
 /// active profile at all.
 fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
     match auth {
         SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime && p.active => {
-            Some(" (global active, this session)")
+            Some("global active, this session")
         }
-        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some(" (this session)"),
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some("this session"),
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom if p.active => {
-            Some(" (global active)")
+            Some("global active")
         }
-        SessionAuth::Global if p.active => Some(" (global active, this session)"),
+        SessionAuth::Global if p.active => Some("global active, this session"),
         SessionAuth::Global | SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => None,
+    }
+}
+
+/// A roster member as the block spells it: the name, then one paren holding the
+/// [`marker`] and, for a kept disabled account, `disabled`. Composed here once so
+/// every marker arm carries the flag.
+fn member_label(p: &ProfileSnapshot, auth: &SessionAuth) -> String {
+    let tags: Vec<&str> = marker(p, auth)
+        .into_iter()
+        .chain(p.disabled.then_some("disabled"))
+        .collect();
+    if tags.is_empty() {
+        p.name.clone()
+    } else {
+        format!("{} ({})", p.name, tags.join("; "))
     }
 }
 
@@ -318,10 +337,7 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 
     let mut out = String::new();
     for (bracket, members) in &groups {
-        let names: Vec<String> = members
-            .iter()
-            .map(|p| marker(p, auth).map_or_else(|| p.name.clone(), |m| format!("{}{m}", p.name)))
-            .collect();
+        let names: Vec<String> = members.iter().map(|p| member_label(p, auth)).collect();
         out.push_str("- ");
         out.push_str(&names.join(", "));
         out.push(' ');
@@ -600,8 +616,8 @@ state).\n\n",
         switch_router_clause(auth),
     ));
     out.push_str(
-        "Profiles, most headroom first (session-start snapshot; call `profiles` for live usage \
-and anything added since):\n",
+        "Profiles, most headroom first (session-start snapshot, disabled accounts left out; call \
+`profiles` for live usage and anything added since):\n",
     );
     out.push_str(&roster_lines(profiles, auth));
     out
@@ -739,7 +755,9 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 /// One age per row and no tail, no quota and no deadline countdown: this
 /// enumerates so a caller can NAME a job, and `monitor({job_ids})` is the check
 /// that reports what one is doing. Ten rows of the full running line would cost
-/// more than the reply it rides on.
+/// more than the reply it rides on. An isolated orphan's row names no resume:
+/// its transcript left with the throwaway tree, so the session id is no handle
+/// `delegate` accepts.
 fn jobs_listing_prose(p: &Value) -> String {
     let Some(rows) = p.get("jobs").and_then(Value::as_array) else {
         return String::new();
@@ -772,8 +790,16 @@ fn jobs_listing_prose(p: &Value) -> String {
         // for an orphaned row (the only handle left) and a done one (the
         // completion's own id, stamped by every completion arm). On a running
         // row it would invite resuming a session the live run still holds, so
-        // it stays unsaid there — the JSON row still carries the key either way.
+        // it stays unsaid there — the JSON row still carries the key either
+        // way. An isolated orphan's id is no handle either (its transcript
+        // left with the throwaway tree), so its row says nothing about
+        // resuming; a done row keeps the sentence whatever its run was.
+        let isolated = row
+            .get("isolated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if matches!(state, "orphaned" | "done")
+            && !(state == "orphaned" && isolated)
             && let Some(sid) = row.get("session_id").and_then(Value::as_str)
         {
             out.push_str(&format!("; resume with session id `{sid}`"));
@@ -1094,6 +1120,14 @@ fn profile_line(row: &Value) -> String {
     let api_key_account = row["windows"].get("kind").and_then(Value::as_str) == Some("third_party");
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
+    }
+    if let Some(available) = row.get("limit_resets").and_then(Value::as_u64)
+        && available > 0
+    {
+        out.push_str(&format!(
+            "; {available} limit reset{} available",
+            plural(available as usize)
+        ));
     }
     // One snapshot per call, the Overview live column's per-account slice.
     if let Some(sessions) = row.get("live_sessions").and_then(Value::as_u64)

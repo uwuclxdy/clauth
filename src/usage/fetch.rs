@@ -75,7 +75,10 @@ pub(crate) fn clear_usage_endpoint_override() {
     *guard = None;
 }
 
-fn usage_endpoint() -> std::borrow::Cow<'static, str> {
+/// The `/usage` URL every OAuth leg resolves through, so a test's
+/// `testutil::EndpointSandbox` redirects the poll and the claude banked-reset
+/// side read alike.
+pub(crate) fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
         if let Some(url) = USAGE_ENDPOINT_OVERRIDE
@@ -727,18 +730,29 @@ impl PlanInfo {
 /// `/profile` sends no such status.
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
-/// One provider-neutral banked limit-reset reading. Only a codex poll fills it
-/// today, `usable` alone (its body names no windows and no end); the claude
-/// poll does not read the reset block yet, so a claude row carries no reading
-/// until it does. `None` means the harness carried no reading, never that the
-/// count was zero.
+/// One provider-neutral banked limit-reset reading. A codex poll fills
+/// `usable` alone (its body names no windows, no end and no `banked`); the
+/// claude scheduler's hourly side read and the CLI's post-spend refresh fill
+/// every field, read `usable` as 0 while the server's next reset cannot be
+/// spent, and count every grant in `banked`. The enclosing `None` means the
+/// harness carried no reading, never that the count was zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct LimitResets {
     pub(crate) usable: u32,
+    /// Every grant's resets left, usable or not: the Usage row counts `usable`
+    /// against this total. Absent from a reading that never carried it (a
+    /// codex poll, an older file), so those cache bytes do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) banked: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) clears: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ends_at: Option<String>,
+    /// Epoch ms of the read that produced this reading, the reading's own
+    /// stamp. `None` on a codex reading (its poll stamps the surrounding
+    /// [`UsageInfo`] instead), so codex cache bytes do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fetched_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -775,9 +789,9 @@ pub(crate) struct UsageInfo {
     pub(crate) codex_limit_reached: Option<String>,
     /// Banked usage-limit resets the account can spend to reopen a window
     /// early. A codex poll fills it from its reset-credits block, which rides
-    /// the same response; the claude poll does not read the claude reset block
-    /// yet. The poll only reads it; spending one is `clauth limit-reset`, run
-    /// by the operator, which reads the block directly.
+    /// the same response; the claude arm's side read writes `limit_resets.json`
+    /// and never fills this field. The poll only reads it; spending one is
+    /// `clauth limit-reset`, run by the operator, which reads the block directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) limit_resets: Option<LimitResets>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
@@ -1355,6 +1369,11 @@ pub(super) fn usage_config(
         // Without this flag those branches are unreachable and every HTTP error
         // collapses into `Network`.
         .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 /// A usage-style agent with `whole` as its end-to-end bound — built once for
@@ -1645,7 +1664,11 @@ pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> b
 /// the durable stamp and memo gate on the landing's identity rather than the
 /// worker's own writes.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct ProfileFetchDecision {
+pub(crate) struct ProfileFetchDecision<'a> {
+    /// The fetch tick's lease ticket, when the worker runs under one: the
+    /// ride-along's writes check it inside their state-flock hold, so a worker
+    /// that resumes after the tick lost the lease writes none of them.
+    pub(crate) lease: Option<crate::daemon::LeaseTicket<'a>>,
     /// [`decide_profile_fetch`] elected a `/profile` fetch.
     pub(crate) wanted: bool,
     /// The attempt instant the durable stamp + memo record, when `wanted`.
@@ -1704,7 +1727,7 @@ pub(crate) fn fetch_profile_plan(
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> Option<PlanInfo> {
     let now = now_ms();
     if !decide_profile_fetch(name, force_profile, now) {
@@ -1736,8 +1759,13 @@ pub(crate) fn fetch_profile_plan(
     // same hold: `forget_disk`, the disk seed of this body's plan, the anchor
     // write, then the `/profile` stamp re-written (its `forget_disk` removed it).
     let tier = raw_rate_limit_tier(&p);
+    let lease = decision.lease;
     let ride_along = crate::lock::with_state_lock(|held| {
-        if !crate::profile::stored_token_matches(name, &token) {
+        // A tick that lost the fetch lease leaves the identity, plan and tier
+        // writes to the new holder's own `/profile` read.
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current)
+            || !crate::profile::stored_token_matches(name, &token)
+        {
             return Ok(());
         }
         let uuid = p
@@ -1897,7 +1925,7 @@ pub(crate) fn fetch_raw(
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
         usage_endpoint().as_ref(),

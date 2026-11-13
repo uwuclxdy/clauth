@@ -116,6 +116,7 @@ fn save_state(creation: bool) {
     let state = crate::profile::AppState {
         serve: crate::profile::ServeSettings {
             session_creation: creation,
+            ..Default::default()
         },
         profiles: vec!["acme".into()],
         ..Default::default()
@@ -359,6 +360,7 @@ fn bare_claude_starts_kind_claude_and_reads_back_blocked() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -467,6 +469,7 @@ fn a_profile_runs_clauth_start_and_answers_null_status() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -1192,6 +1195,82 @@ fn background_id_reads_the_first_word_after_the_dot() {
     }
 }
 
+/// `FORCE_COLOR` in the daemon's env wraps the id in colour codes (the first
+/// line's bytes measured on Claude Code 2.1.319); the id still reads, and a
+/// word that is not 8 lowercase hex stays refused once the codes are gone.
+#[test]
+fn background_id_reads_through_colour_codes() {
+    assert_eq!(
+        background_id(
+            b"backgrounded \xc2\xb7 \x1b[36m97441de9\x1b[39m\x1b[2m \
+              (idle \xe2\x80\x94 send a prompt to start)\x1b[22m\n"
+        ),
+        Some("97441de9".to_string())
+    );
+    assert_eq!(
+        background_id("\x1b[1mbackgrounded · \x1b[22m3fde53e3\n".as_bytes()),
+        Some(BG_ID.to_string())
+    );
+    for stdout in [
+        "backgrounded · \x1b[38;5;75m3fde53e3\x1b[0m\n",
+        "backgrounded · \x1b[38;2;1;2;3m3fde53e3\x1b[0m\n",
+        "backgrounded · \x1b[0;36m3fde53e3\x1b[0m\n",
+        "Starting background service\n\x1b[2mnote\x1b[22m\nbackgrounded · \x1b[36m3fde53e3\x1b[39m\n",
+    ] {
+        assert_eq!(
+            background_id(stdout.as_bytes()),
+            Some(BG_ID.to_string()),
+            "{stdout:?}"
+        );
+    }
+    for stdout in [
+        "backgrounded · \x1b[36m3fde53e\x1b[39m\n",
+        "backgrounded · \x1b[36m3FDE53E3\x1b[39m\n",
+        "backgrounded · \x1b[36m\x1b[39m\n",
+    ] {
+        assert_eq!(background_id(stdout.as_bytes()), None, "{stdout:?}");
+    }
+}
+
+/// The route answers both ids over a coloured launch, never a 502 over a
+/// session that is running.
+#[test]
+fn background_with_colour_in_its_stdout_answers_both_ids() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _calls) = herdr_untouched();
+    let (spawn, _launches) = launch_seam(Some((
+        true,
+        "backgrounded · \x1b[36m3fde53e3\x1b[39m\x1b[2m (idle)\x1b[22m\n",
+        "",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+}
+
 /// A create with no prompt starts an idle session and answers both ids, never
 /// a 502 over a session that is running.
 #[test]
@@ -1218,6 +1297,7 @@ fn background_with_no_prompt_answers_both_ids() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -1388,6 +1468,7 @@ fn background_on_a_profile_launches_clauth_start_bg_and_answers_both_ids() {
         (
             200,
             serde_json::json!({
+                "type": "background",
                 "ok": true,
                 "background_id": BG_ID,
                 "session_id": BG_SESSION,
@@ -1523,6 +1604,7 @@ fn pane_with_fallback_runs_clauth_start_with_fallback() {
         (
             200,
             serde_json::json!({
+                "type": "pane",
                 "ok": true,
                 "workspace_id": "w1",
                 "tab_id": "w1:t2",
@@ -1840,7 +1922,12 @@ fn a_record_that_never_reads_answers_a_null_session_id() {
         (resp.status, body_json(&resp)),
         (
             200,
-            serde_json::json!({"ok": true, "background_id": BG_ID, "session_id": null})
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": null,
+            })
         )
     );
     assert!(
@@ -1883,6 +1970,171 @@ fn the_background_audit_line_names_ids_and_prompt_length_only() {
             "clauth api: device 'test' created a background session form='profile:acme' \
              with_fallback=false cwd='{cwd}' background_id='{BG_ID}' session_id='{BG_SESSION}' \
              prompt_len=11"
+        )]
+    );
+}
+
+/// A successful launch's stderr — where `clauth start` names each store it
+/// could not create — reaches the daemon log one line per line of stderr, so
+/// no note hides another behind the per-line bound, and the 200 answer carries
+/// no new field.
+#[test]
+fn a_successful_background_launch_logs_each_stderr_line() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((
+        true,
+        BG_IDLE_STDOUT,
+        "clauth: could not create /home/u/.claude/jobs: Permission denied (os error 13); this session's background jobs stay in its own tree\n\
+         clauth: could not create /home/u/.claude/projects: Permission denied (os error 13); this session's transcripts stay in its own tree\n\
+         \n\
+         clauth: could not create /home/u/.claude/sessions: Permission denied (os error 13); this session's background sessions stay there\n\
+         a\x07b\n",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    let said = "clauth api: device 'test' background launch said:";
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            format!(
+                "{said} clauth: could not create /home/u/.claude/jobs: Permission denied (os \
+                 error 13); this session's background jobs stay in its own t..."
+            ),
+            format!(
+                "{said} clauth: could not create /home/u/.claude/projects: Permission denied (os \
+                 error 13); this session's transcripts stay in its own t..."
+            ),
+            format!(
+                "{said} clauth: could not create /home/u/.claude/sessions: Permission denied (os \
+                 error 13); this session's background sessions stay ther..."
+            ),
+            format!("{said} a b"),
+            format!(
+                "clauth api: device 'test' created a background session form='profile:acme' \
+                 with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+                 session_id='{BG_SESSION}' prompt_len=0"
+            ),
+        ]
+    );
+}
+
+/// A child printing more than the cap costs a bounded number of log lines.
+#[test]
+fn a_chatty_background_launch_logs_a_bounded_number_of_lines() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((
+        true,
+        BG_IDLE_STDOUT,
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    let mut expected: Vec<String> = (1..=8)
+        .map(|n| format!("clauth api: device 'test' background launch said: {n}"))
+        .collect();
+    expected.push(format!(
+        "clauth api: device 'test' created a background session form='profile:acme' \
+         with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+         session_id='{BG_SESSION}' prompt_len=0"
+    ));
+    assert_eq!(lines.snapshot(), expected,);
+}
+
+/// A launch that prints nothing on stderr adds no such line: the audit line is
+/// the only one.
+#[test]
+fn a_silent_background_launch_logs_no_stderr_line() {
+    let sb = HomeSandbox::new();
+    let cwd = cwd(&sb);
+    seed_accounts(&["acme"], &[], &[]);
+    crate::testutil::write_claude_job(sb.home(), BG_ID, &sb.home().join(".claude"));
+    let (probe, _) = herdr_untouched();
+    let (spawn, _) = launch_seam(Some((true, BG_IDLE_STDOUT, "")));
+    let ctx = ctx_bg(probe, spawn);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            path(),
+            Some(TOKEN),
+            &body_with(&cwd, r#"{"profile":"acme","background":true}"#),
+        ),
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            200,
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": BG_SESSION,
+            })
+        )
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth api: device 'test' created a background session form='profile:acme' \
+             with_fallback=false cwd='{cwd}' background_id='{BG_ID}' \
+             session_id='{BG_SESSION}' prompt_len=0"
         )]
     );
 }
@@ -2119,7 +2371,12 @@ fn a_session_id_that_is_not_a_uuid_is_never_relayed() {
         (resp.status, body_json(&resp)),
         (
             200,
-            serde_json::json!({"ok": true, "background_id": BG_ID, "session_id": null})
+            serde_json::json!({
+                "type": "background",
+                "ok": true,
+                "background_id": BG_ID,
+                "session_id": null,
+            })
         )
     );
     assert_eq!(

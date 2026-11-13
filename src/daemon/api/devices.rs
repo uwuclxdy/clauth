@@ -6,11 +6,13 @@
 //! mints it, so a read of the store yields nothing a client could present.
 //!
 //! Every request re-reads the store, so a revoke or a new device reaches a
-//! running daemon at once. Every write runs under the state flock, through the
+//! running daemon at once, and every open stream re-reads it on a clock
+//! ([`RowWatch`]). Every write runs under the state flock, through the
 //! owner-only writer, and reaches the disk before anything that depends on it
 //! moves ([`write_store`]).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -284,7 +286,11 @@ fn legacy_path() -> Result<PathBuf> {
 ///
 /// The hash is not there to protect the seed (nothing sees it); it fixes the
 /// token at exactly 64 hex characters however the seed is drawn.
-fn generate() -> Result<String> {
+pub(super) fn generate() -> Result<String> {
+    #[cfg(test)]
+    if FAIL_NEXT_GENERATE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        bail!("injected CSPRNG failure");
+    }
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("CSPRNG failure: {e}"))?;
     Ok(hex::encode(<[u8; 32]>::from(Sha256::digest(seed))))
@@ -295,7 +301,7 @@ fn digest_hex(token: &str) -> String {
 }
 
 /// True for the exact shape [`generate`] emits.
-fn is_well_formed(token: &str) -> bool {
+pub(super) fn is_well_formed(token: &str) -> bool {
     token.len() == TOKEN_LEN
         && token
             .bytes()
@@ -371,6 +377,18 @@ pub(crate) fn fail_next_write() {
     FAIL_NEXT_WRITE.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Test seam: fail the next [`generate`] before it draws, so a test can hold a
+/// caller to answering a CSPRNG failure with nothing minted. One-shot; every
+/// test that arms it holds a sandbox, whose lock serializes them.
+#[cfg(test)]
+static FAIL_NEXT_GENERATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_generate() {
+    FAIL_NEXT_GENERATE.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// Test seam: fail the next [`delete_legacy_if_holding`] delete before it
 /// touches the disk, so a test can hold the revoke to deleting the plaintext
 /// copy of the token it removed. One-shot; every test that arms it holds a
@@ -423,6 +441,96 @@ pub(crate) fn authenticate(presented: Option<&str>) -> Result<Option<Device>> {
         .devices
         .into_iter()
         .find(|device| device.verifies(&digest)))
+}
+
+/// The device whose [`Device::pairing_id`] this is, read fresh. Its name can
+/// have been edited by hand; a revoke and a new device under the name cannot
+/// reach this id.
+pub(crate) fn by_pairing_id(id: &str) -> Result<Option<Device>> {
+    #[cfg(all(test, unix))]
+    ROW_READS.with(|reads| reads.set(reads.get() + 1));
+    Ok(read_store()?
+        .devices
+        .into_iter()
+        .find(|device| device.pairing_id() == id))
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    /// How many [`by_pairing_id`] reads the calling thread has made.
+    static ROW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`by_pairing_id`] reads the calling thread has made (test seam).
+#[cfg(all(test, unix))]
+pub(crate) fn row_reads_here() -> usize {
+    ROW_READS.with(std::cell::Cell::get)
+}
+
+/// How often an open stream looks for its device's row.
+const ROW_CHECK: Duration = Duration::from_secs(5);
+
+/// One open stream's watch on the row that authorized it. A revoke is a CLI
+/// writing a file, so this read is how a stream learns of one; it costs one
+/// `devices.json` read per stream per [`ROW_CHECK`], never one per frame.
+pub(crate) struct RowWatch {
+    pairing_id: String,
+    next_read: Instant,
+}
+
+/// What one due [`RowWatch`] check found.
+pub(crate) enum RowCheck {
+    /// The row is there, or no read was due.
+    Present,
+    /// No row carries the pairing id: the device was revoked.
+    Gone,
+    /// The list did not read, so the row's state is unknown; the error says why.
+    Unreadable(anyhow::Error),
+}
+
+impl RowWatch {
+    pub(crate) fn new(device: &Device, now: Instant) -> Self {
+        Self {
+            pairing_id: device.pairing_id(),
+            next_read: now + ROW_CHECK,
+        }
+    }
+
+    /// Whether a [`Self::check`] at `now` would read the store.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        now >= self.next_read
+    }
+
+    /// The row's state, asked as often as the stream likes and read at most once
+    /// per [`ROW_CHECK`]. A revoke and a list that stopped reading are told
+    /// apart: both end the stream, the second as a server fault with an error to
+    /// name.
+    pub(crate) fn check(&mut self, now: Instant) -> RowCheck {
+        self.check_by(now, by_pairing_id)
+    }
+
+    fn check_by(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce(&str) -> Result<Option<Device>>,
+    ) -> RowCheck {
+        if !self.due(now) {
+            return RowCheck::Present;
+        }
+        self.next_read = now + ROW_CHECK;
+        match read(&self.pairing_id) {
+            Ok(Some(_)) => RowCheck::Present,
+            Ok(None) => RowCheck::Gone,
+            Err(e) => RowCheck::Unreadable(e),
+        }
+    }
+
+    /// Test seam for the interval pin: whether this check ends the stream,
+    /// which both a gone row and an unreadable list do.
+    #[cfg(test)]
+    fn lost_by(&mut self, now: Instant, read: impl FnOnce(&str) -> Result<Option<Device>>) -> bool {
+        !matches!(self.check_by(now, read), RowCheck::Present)
+    }
 }
 
 pub(super) fn refuse_taken(store: &Store, name: &DeviceName) -> Result<()> {
@@ -489,7 +597,8 @@ pub(crate) struct RevokeOutcome {
     pub(crate) legacy_deleted: bool,
 }
 
-/// Remove the device named `name`; its next request finds no row to verify.
+/// Remove the device named `name`; its next request finds no row to verify,
+/// and its open streams find none at their next [`RowWatch`] read.
 /// Both leftovers go after the device, in the same hold: its push
 /// subscription, and the plaintext `auth_token.json` copy of its token when
 /// the file still holds it. Each is tried even when the other fails. A
@@ -824,8 +933,8 @@ fn delete_legacy_if_holding(device: &Device) -> Result<LegacyDelete> {
 pub(crate) fn note_at_start() {
     match read_store() {
         Ok(store) if store.devices.is_empty() => logline!(
-            "clauth daemon: no device is paired yet, so every REST request but a pairing is \
-             refused; pair one with `clauth devices pair <name>`"
+            "clauth daemon: no device is paired yet, so every REST request but a pairing or a \
+             CORS preflight is refused; pair one with `clauth devices pair <name>`"
         ),
         Ok(_) => {}
         Err(e) => logline!(
@@ -988,7 +1097,8 @@ pub(crate) fn run_revoke(name: &str) -> Result<()> {
     match revoke(name) {
         Ok(outcome) => {
             outln!(
-                "clauth: revoked device '{}'; its next request is refused.",
+                "clauth: revoked device '{}'; its next request is refused and its open streams \
+                 close within seconds.",
                 outcome.name
             );
             if outcome.legacy_deleted {
@@ -1005,7 +1115,8 @@ pub(crate) fn run_revoke(name: &str) -> Result<()> {
                 .filter(|left| left.legacy_deleted)
             {
                 outln!(
-                    "clauth: revoked device '{}'; its next request is refused.",
+                    "clauth: revoked device '{}'; its next request is refused and its open \
+                     streams close within seconds.",
                     left.device
                 );
                 outln!("clauth: deleted ~/.clauth/{LEGACY_FILE}, which still held its token.");

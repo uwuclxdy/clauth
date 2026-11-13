@@ -1220,15 +1220,24 @@ pub(super) fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
                 Span::styled(part, if c == '─' { theme::line() } else { state })
             })
             .collect(),
-        theme::Tier::Compatible => {
-            let word = glyph.trim_start_matches('[').trim_end_matches(']');
-            vec![
-                Span::styled("[", theme::dim()),
-                Span::styled(word, state),
-                Span::styled("]", theme::dim()),
-            ]
-        }
+        theme::Tier::Compatible => compatible_toggle_spans(glyph, state),
     }
+}
+
+/// The compatible tier's toggle frame: the glyph's word between dim brackets.
+/// Only the outermost bracket pair is the frame's — a glyph carrying its own
+/// (`[[on]]`) keeps the inner pair in the word, so the glyph renders whole
+/// instead of shedding every bracket it has.
+pub(super) fn compatible_toggle_spans(glyph: &'static str, state: Style) -> Vec<Span<'static>> {
+    let word = glyph
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(glyph);
+    vec![
+        Span::styled("[", theme::dim()),
+        Span::styled(word, state),
+        Span::styled("]", theme::dim()),
+    ]
 }
 
 /// Rounded box with contract-compliant chrome.

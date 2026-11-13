@@ -1734,6 +1734,27 @@ fn list_stays_empty_on_an_unlistable_registry() {
     assert!(list().is_empty());
 }
 
+/// A staging sibling a row write leaves (a crashed writer's whole copy of the
+/// row) is no row: `list` reads the session once, and the registry still
+/// reads whole, so every reader agrees on what a row is.
+#[test]
+fn a_staging_sibling_is_no_row_for_any_reader() {
+    let _home = HomeSandbox::new();
+    let live = row("4343-0", "work");
+    register(&live).expect("register");
+    let bytes = serde_json::to_vec(&live).expect("row json");
+    std::fs::write(
+        registry_dir()
+            .expect("registry dir")
+            .join(".4343-0.json.tmp.999.0"),
+        bytes,
+    )
+    .expect("a staging sibling");
+
+    assert_eq!(list().len(), 1, "the session is read once");
+    assert!(registry_reads_whole(), "the staging sibling is skipped");
+}
+
 /// The rule one level below an unlistable dir: an ENTRY the OS fails to yield
 /// leaves the tally's registry listing unknown, so the fleet total reads unread
 /// rather than shorter. `list` and `live_rows` stay lenient on purpose — the
@@ -1811,4 +1832,21 @@ fn a_failing_registry_listing_leaves_the_tally_unread() {
         None,
         "an entry the OS fails to yield leaves the fleet total unread"
     );
+}
+
+/// The tally keeps each registry row's id with the account the row runs on —
+/// the row's `current_member`, else its start account — so a reader can tell
+/// a session starting from one moving accounts; an unread tally names none,
+/// so a failed read never reads as every session ending.
+#[test]
+fn the_tally_names_each_rows_member_and_an_unread_one_names_none() {
+    let mut moved = row("4242-1", "a");
+    moved.current_member = Some("b".to_string());
+    let rows = [row("4242-0", "a"), moved];
+    let want = std::collections::BTreeMap::from([
+        ("4242-0".to_string(), "a".to_string()),
+        ("4242-1".to_string(), "b".to_string()),
+    ]);
+    assert_eq!(LiveTally::of(rows.clone()).session_members(), Some(&want));
+    assert_eq!(LiveTally::partly_read(rows).session_members(), None);
 }

@@ -529,7 +529,7 @@ fn the_probe_sends_the_one_messages_request() {
         serve_endpoints_raw_with_headers(2, move |_, _| (200, headers.clone(), "{}".into()));
     let _endpoints = EndpointSandbox::new(&home, &base);
 
-    let info = reading_of(probe("sk-ant-oat01-TEST", || {}));
+    let info = reading_of(probe("sk-ant-oat01-TEST", || true).expect("the probe sent"));
     assert_eq!(info.seven_day.as_ref().expect("7d").utilization, 20.0);
 
     let raw = server.join().expect("listener");
@@ -590,12 +590,18 @@ fn a_probe_the_server_refuses_reads_rejected() {
     });
     let _endpoints = EndpointSandbox::new(&home, &base);
     assert!(
-        matches!(probe("sk-ant-oat01-DEAD", || {}), ProbeAnswer::Rejected),
+        matches!(
+            probe("sk-ant-oat01-DEAD", || true),
+            Some(ProbeAnswer::Rejected)
+        ),
         "a 401 whose Anthropic error body refuses the credential refuses the token"
     );
     crate::usage::reset_request_slots();
     assert!(
-        matches!(probe("sk-ant-oat01-DEAD", || {}), ProbeAnswer::Rejected),
+        matches!(
+            probe("sk-ant-oat01-DEAD", || true),
+            Some(ProbeAnswer::Rejected)
+        ),
         "a 403 whose Anthropic error body refuses the credential refuses the token"
     );
     assert_eq!(server.join().expect("listener").len(), 2);
@@ -626,7 +632,7 @@ fn a_403_that_is_no_anthropic_refusal_fails_the_probe() {
     let _endpoints = EndpointSandbox::new(&home, &base);
     for body in bodies {
         crate::usage::reset_request_slots();
-        let answer = probe("sk-ant-oat01-TEST", || {});
+        let answer = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
         assert!(matches!(answer, ProbeAnswer::Failed), "{body}: {answer:?}");
     }
     assert_eq!(server.join().expect("listener").len(), bodies.len());
@@ -642,7 +648,7 @@ fn a_403_naming_the_organization_is_no_refused_token() {
     let (base, server) =
         serve_endpoints_raw_with_headers(2, move |_, _| (403, Vec::new(), body.to_string()));
     let _endpoints = EndpointSandbox::new(&home, &base);
-    let answer = probe("sk-ant-oat01-TEST", || {});
+    let answer = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
     assert_eq!(server.join().expect("listener").len(), 1);
     assert!(
         matches!(answer, ProbeAnswer::OrgRefused { canceled: true }),
@@ -659,7 +665,7 @@ fn a_403_naming_an_organization_on_hold_is_no_canceled_plan() {
     let (base, server) =
         serve_endpoints_raw_with_headers(2, move |_, _| (403, Vec::new(), body.to_string()));
     let _endpoints = EndpointSandbox::new(&home, &base);
-    let answer = probe("sk-ant-oat01-TEST", || {});
+    let answer = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
     assert_eq!(server.join().expect("listener").len(), 1);
     assert!(
         matches!(answer, ProbeAnswer::OrgRefused { canceled: false }),
@@ -686,9 +692,9 @@ fn a_401_that_is_no_anthropic_refusal_fails_the_probe() {
         )
     });
     let _endpoints = EndpointSandbox::new(&home, &base);
-    let proxy = probe("sk-ant-oat01-TEST", || {});
+    let proxy = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
     crate::usage::reset_request_slots();
-    let server_refusal = probe("sk-ant-oat01-TEST", || {});
+    let server_refusal = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
     assert_eq!(server.join().expect("listener").len(), bodies.len());
     assert!(matches!(proxy, ProbeAnswer::Failed), "{proxy:?}");
     assert!(
@@ -743,7 +749,7 @@ fn only_a_403_is_read_for_the_organization_code() {
     let (base, server) =
         serve_endpoints_raw_with_headers(2, move |_, _| (401, Vec::new(), body.to_string()));
     let _endpoints = EndpointSandbox::new(&home, &base);
-    let answer = probe("sk-ant-oat01-TEST", || {});
+    let answer = probe("sk-ant-oat01-TEST", || true).expect("the probe sent");
     assert_eq!(server.join().expect("listener").len(), 1);
     assert!(matches!(answer, ProbeAnswer::Rejected), "{answer:?}");
 }
@@ -812,7 +818,10 @@ fn the_probe_calls_on_turn_once() {
     let (base, server) = serve_endpoints_raw_with_headers(2, |_, _| (200, Vec::new(), "{}".into()));
     let _endpoints = EndpointSandbox::new(&home, &base);
     let turned = std::cell::Cell::new(0);
-    let _ = probe("sk-ant-oat01-TEST", || turned.set(turned.get() + 1));
+    let _ = probe("sk-ant-oat01-TEST", || {
+        turned.set(turned.get() + 1);
+        true
+    });
     assert_eq!(turned.get(), 1);
     assert_eq!(server.join().expect("listener").len(), 1);
 }
@@ -831,6 +840,7 @@ fn the_probe_turns_once_it_holds_its_slot() {
         held.set(crate::usage::reserved_request_slot(
             crate::usage::ANTHROPIC_ORIGIN,
         ));
+        true
     });
     assert_eq!(server.join().expect("listener").len(), 1);
     assert!(held.get().is_some(), "the turn came before the slot");
@@ -859,7 +869,7 @@ fn a_probe_that_reaches_no_server_reads_failed() {
     drop(closed);
     let _endpoints = EndpointSandbox::new(&home, &format!("http://127.0.0.1:{port}"));
     assert!(matches!(
-        probe("sk-ant-oat01-TEST", || {}),
-        ProbeAnswer::Failed
+        probe("sk-ant-oat01-TEST", || true),
+        Some(ProbeAnswer::Failed)
     ));
 }

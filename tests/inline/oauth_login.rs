@@ -140,7 +140,11 @@ fn callback_accepts_matching_state_and_extracts_the_code() {
         verdict.expect("valid callback").as_deref(),
         Some("authcode-1")
     );
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
@@ -153,7 +157,11 @@ fn callback_aborts_on_a_state_mismatch() {
         .expect_err("a state mismatch must abort the login")
         .to_string();
     assert!(err.contains("state mismatch"), "err was: {err}");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 /// Bytes only the browser redirect could have supplied.
@@ -176,10 +184,15 @@ fn callback_aborts_on_an_oauth_error_param_without_echoing_it() {
         .expect_err("an OAuth error param is fatal")
         .to_string();
     assert_eq!(err, "you declined the authorization request");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
     assert!(
         !response.contains(CALLBACK_CANARY),
-        "the page must not reflect it either: {response}"
+        "the page must not reflect it either: {}",
+        response.lines().next().unwrap_or("")
     );
 
     // An `error` code outside RFC 6749's set is where the bytes are least
@@ -354,19 +367,31 @@ fn callback_ignores_unrelated_requests_and_keeps_waiting() {
     // A favicon probe is answered 404 and is NOT fatal — the login keeps waiting.
     let (verdict, response) = callback_roundtrip("GET /favicon.ico HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("non-callback path is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 
     // /callback with no code at all → 400, still not fatal.
     let (verdict, response) = callback_roundtrip("GET /callback?state=STATE HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("missing code is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
 fn callback_pages_are_distinct_and_never_reflect_query_values() {
     // Success: styled page that attempts a tab auto-close.
     let (_, ok) = callback_roundtrip("GET /callback?code=c&state=STATE HTTP/1.1\r\n", "STATE");
-    assert!(ok.contains("You're logged in"), "got: {ok}");
+    assert!(
+        ok.contains("You're logged in"),
+        "got: {}",
+        ok.lines().next().unwrap_or("")
+    );
     assert!(
         ok.contains("window.close"),
         "the success page attempts a tab auto-close"
@@ -378,7 +403,11 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
         "GET /callback?error=access_denied&error_description=evil-marker HTTP/1.1\r\n",
         "STATE",
     );
-    assert!(denied.contains("Login canceled"), "got: {denied}");
+    assert!(
+        denied.contains("Login canceled"),
+        "got: {}",
+        denied.lines().next().unwrap_or("")
+    );
     assert!(
         !denied.contains("evil-marker"),
         "untrusted query values must never be reflected into the page"
@@ -386,10 +415,33 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
 
     // Any other OAuth error keeps the generic failure page, with no auto-close.
     let (_, failed) = callback_roundtrip("GET /callback?error=server_error HTTP/1.1\r\n", "STATE");
-    assert!(failed.contains("Login failed"), "got: {failed}");
+    assert!(
+        failed.contains("Login failed"),
+        "got: {}",
+        failed.lines().next().unwrap_or("")
+    );
     assert!(
         !failed.contains("window.close"),
         "only the success page auto-closes"
+    );
+}
+
+/// The page a callback writes needs no follow-up request, so a stray request
+/// on the same listener is answered as the not-found page and never taken for
+/// the callback.
+#[test]
+fn a_stray_request_is_answered_as_not_found_and_never_takes_a_code() {
+    let (verdict, response) = callback_roundtrip("GET /assets/login.css HTTP/1.1\r\n", "STATE");
+    assert!(verdict.expect("a non-callback is not a callback").is_none());
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("Nothing at this address"),
+        "the not-found page: {}",
+        response.lines().next().unwrap_or("")
     );
 }
 

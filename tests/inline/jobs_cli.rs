@@ -333,6 +333,50 @@ fn an_isolated_runs_row_is_marked_isolated() {
     );
 }
 
+/// A finished attached run's settled liveness record reads done, and its
+/// row says no `monitor` call can collect it; a background run's done row can.
+#[test]
+fn a_finished_attached_runs_json_row_is_done_and_not_collectable() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-att-0.live.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-att-0",
+            "profile": "work",
+            "state": "done",
+            "started_at": NOW - 600_000,
+            "done_at": NOW - 120_000,
+            "outcome": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_done("d-fin-0", NOW - 600_000, NOW - 120_000);
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows(NOW))).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+    assert_eq!(by_id("d-att-0")["state"], by_id("d-fin-0")["state"]);
+    assert_eq!(
+        by_id("d-att-0")["collectable"],
+        serde_json::json!(false),
+        "an attached run's result went back through its call"
+    );
+    assert_eq!(
+        by_id("d-fin-0")["collectable"],
+        serde_json::json!(true),
+        "control: a background run's done row is collectable"
+    );
+}
+
 /// The `--json` field set is FIXED: every key is present on every row, and a
 /// figure the record does not have is `null`.
 ///

@@ -301,6 +301,47 @@ fn verify_minisign_malformed_signature_fails() {
     assert!(verify_minisign(TEST_PUBKEY, b"test", "untrusted comment: x\nzzz").is_err());
 }
 
+/// The refusal the signature check itself gives: a parse or key-id refusal
+/// reads differently, so a test pinning this text proves which check refused.
+const SIGNATURE_CHECK_REFUSAL: &str =
+    "minisign signature did not verify; refusing update: The signature verification failed";
+
+/// The global signature covers the trusted comment: an edited comment over an
+/// untouched payload signature no longer verifies.
+#[test]
+fn verify_minisign_tampered_trusted_comment_fails() {
+    let sig = TEST_SIG.replace("timestamp:1633700835", "timestamp:1633700836");
+    assert_ne!(sig, TEST_SIG, "the tamper must change the signature text");
+    let err = verify_minisign(TEST_PUBKEY, b"test", &sig).expect_err("an edited comment refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
+/// The global signature is checked, not only the payload signature.
+#[test]
+fn verify_minisign_tampered_global_signature_fails() {
+    let sig = TEST_SIG.replace("wLMDjy9F", "xLMDjy9F");
+    assert_ne!(sig, TEST_SIG, "the tamper must change the signature text");
+    let err = verify_minisign(TEST_PUBKEY, b"test", &sig).expect_err("an edited signature refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
+/// A key carrying the signature's key id but other key bytes parses, matches
+/// the id, and still refuses: the id alone authenticates nothing.
+#[test]
+fn verify_minisign_other_key_with_the_same_id_fails() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut raw = engine.decode(TEST_PUBKEY).expect("the test key decodes");
+    // Layout: 2-byte algorithm, 8-byte key id, 32-byte Ed25519 key.
+    raw[10] ^= 0x01;
+    let key = engine.encode(&raw);
+    assert_ne!(key, TEST_PUBKEY, "the tamper must change the key");
+    PublicKey::from_base64(&key)
+        .expect("the altered key still parses, so the refusal is the signature check");
+    let err = verify_minisign(&key, b"test", TEST_SIG).expect_err("another key refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
 #[test]
 fn pinned_public_key_parses_when_set() {
     // A pinned key must decode — a typo would fail-close EVERY auto-update.

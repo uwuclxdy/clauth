@@ -536,7 +536,7 @@ fn failed(caller: &Caller<'_>, what: &str, e: &anyhow::Error) -> Response {
     responses(
         (status = 200, description = "the VAPID public key a browser subscribes with, minted on first need and stable after", body = PushKeyBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 503, description = "the key is not minted yet and the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the key does not read (`internal`)", body = ErrorBody)
     ),
@@ -564,7 +564,7 @@ pub(crate) fn key(_: &ApiContext, _: &Request, caller: &Caller<'_>) -> Response 
         (status = 200, description = "the subscription is stored, replacing the device's earlier one; the events it pushes, in canonical order", body = PushSubscriptionOk),
         (status = 400, description = "the body is not a subscription, names an unknown event, or carries a p256dh that is not base64url of an uncompressed P-256 point or an auth that is not base64url of 16 bytes (`bad_request`), or the endpoint is not an https URL on the default port with no user part whose host is exactly fcm.googleapis.com, web.push.apple.com or updates.push.services.mozilla.com (`push_endpoint_not_allowed`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the subscription waits on the state flock (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the subscription list does not read, the key check could not run, or the write failed (`internal`)", body = ErrorBody)
     ),
@@ -643,7 +643,7 @@ pub(crate) fn subscribe(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> R
     responses(
         (status = 200, description = "the device's subscription is dropped", body = PushSubscriptionDropped),
         (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the drop waits on the state flock (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "the device holds no subscription (`no_push_subscription`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the subscription list does not read, or the write failed (`internal`)", body = ErrorBody)

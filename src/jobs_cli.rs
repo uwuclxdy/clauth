@@ -17,7 +17,7 @@
 use anyhow::Result;
 
 use crate::format::{col_width, humanize_span, pad_cells, terminal_safe, truncate};
-use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
+use crate::mcp::jobs::{self, JobPhase, RecordKind, RunningLiveness, StoredJob};
 use crate::usage::now_ms;
 use crate::{out, outln};
 
@@ -91,6 +91,11 @@ pub(crate) struct JobRow {
     /// finished record: its envelope carries the whole result, so a tail beside
     /// it says nothing new.
     pub(crate) tail: String,
+    /// Whether a `monitor` call naming this id could collect a result from it:
+    /// [`JobPhase::is_collectable`] plus the spelling. A settled liveness
+    /// record reads done but no id reaches it, so its row says false whatever
+    /// its phase.
+    pub(crate) collectable: bool,
 }
 
 /// Every stored job as a row, live ones first and each band newest-mattering
@@ -122,6 +127,7 @@ fn row(job: &StoredJob, now: u64) -> JobRow {
             JobPhase::Done => String::new(),
             _ => record.tail.clone(),
         },
+        collectable: phase.is_collectable() && job.kind == RecordKind::Collectable,
     }
 }
 
@@ -314,7 +320,7 @@ fn row_json(row: &JobRow) -> serde_json::Value {
         "job_id": row.job_id,
         "profile": row.profile,
         "state": row.phase.label(),
-        "collectable": row.phase.is_collectable(),
+        "collectable": row.collectable,
         "session_id": row.session_id,
         "isolated": row.isolated,
         "age_secs": row.age_secs,

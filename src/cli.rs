@@ -138,6 +138,18 @@ pub(crate) enum Command {
         force: bool,
     },
 
+    /// Rename a profile, keeping its credentials, chain slot, and settings
+    ///
+    /// The same rename as the TUI's Setup tab. Stops the profile's background
+    /// supervisors first. Refused while a live `clauth start` session holds the
+    /// profile or a supervisor can't be stopped, and for a codex profile.
+    Rename {
+        /// Profile to rename.
+        profile: String,
+        /// The new name.
+        new_name: String,
+    },
+
     /// Hide a profile from auto-switch, usage polling, and the status feed
     ///
     /// Its dir and credentials stay on disk untouched. Refused for the active
@@ -161,8 +173,8 @@ pub(crate) enum Command {
     /// the preserved mint backup, and the rolling-token flag together, so the
     /// profile's stored OAuth login is what switches install again and
     /// nothing re-creates a sidecar afterwards. The live credentials are
-    /// relinked when the profile is active, and the clear is refused when the
-    /// profile stores no other login.
+    /// relinked when the profile is active, and the clear is refused when it
+    /// would remove the profile's last stored credential.
     #[command(name = "static-token")]
     StaticToken {
         /// Profile whose long-lived token to operate on.
@@ -347,7 +359,7 @@ pub(crate) enum Command {
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
     /// `--listen` also serves the REST API to the devices `clauth devices`
-    /// pairs (see the Daemon wiki page); `--status` prints and exits without
+    /// pairs (see the REST API wiki page); `--status` prints and exits without
     /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
@@ -370,8 +382,8 @@ pub(crate) enum Command {
         /// another. TLS comes from this host's lego certificate: from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
-        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
-        /// device's token; see `clauth devices`.
+        /// ~/.clauth/tls.json. Every request but a pairing or a CORS preflight
+        /// needs a paired device's token; see `clauth devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
         /// flag is for: a client on another machine. It is the same exposure
@@ -418,11 +430,11 @@ pub(crate) enum Command {
     /// Pair, list, grant sessions to, and revoke the devices that may call the
     /// REST API
     ///
-    /// Every `clauth daemon --listen` request but a pairing authenticates as
-    /// one named device, and each device holds a tier fixed here, on this
-    /// machine: `view` reads the status feed, `control` may also switch
-    /// accounts and, with the `sessions` grant, create sessions through the API
-    /// while `[serve] session_creation` is on.
+    /// Every `clauth daemon --listen` request but a pairing or a CORS preflight
+    /// authenticates as one named device, and each device holds a tier fixed
+    /// here, on this machine: `view` reads the status feed, `control` may also
+    /// switch accounts and, with the `sessions` grant, create sessions through
+    /// the API while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
     #[command(args_conflicts_with_subcommands = true)]
@@ -548,8 +560,8 @@ pub(crate) enum Command {
         session_id: String,
     },
 
-    /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
-    /// on stdin, wait for a background delegate, and wake the model.
+    /// The bundled PostToolUse and Stop `asyncRewake` hook body: read the hook
+    /// payload on stdin, wait for a background delegate, and wake the model.
     #[command(hide = true)]
     McpAwaitJob,
 
@@ -723,6 +735,16 @@ pub(crate) struct LoginArgs {
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
+    /// Register the profile on a clauth proxy instead of logging in to any
+    /// provider directly. Runs the proxy's login flow (its page opens, paste
+    /// accepted), then stores the proxy-local inference key as the profile's
+    /// api key. The upstream credential stays in the proxy's own state dir.
+    #[arg(
+        long,
+        value_name = "SERVICE",
+        conflicts_with_all = ["base_url", "api_key", "setup_token", "codex", "browser"]
+    )]
+    pub(crate) proxy: Option<String>,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
@@ -741,6 +763,7 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--setup-token",
     "--codex",
     "--browser",
+    "--proxy",
     "--yes",
     "-y",
     "--model",
@@ -953,7 +976,7 @@ pub(crate) enum DevicesCommand {
         sessions: bool,
     },
 
-    /// Remove a device; its next request is refused
+    /// Remove a device; its next request is refused and its open streams close within seconds
     Revoke {
         /// Device to remove.
         name: String,

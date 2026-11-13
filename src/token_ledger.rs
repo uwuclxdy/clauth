@@ -2,11 +2,12 @@
 //!
 //! # Why
 //!
-//! The tab's base is CC's `stats-cache.json`, authoritative only up to its
-//! `lastComputedDate`; the [`crate::tokens`] top-up bridges the gap by reading
-//! `~/.claude/projects/` transcripts strictly newer than that date. That bridge
-//! is load-bearing precisely because the base can stay frozen for weeks — but CC
-//! also prunes transcripts past `cleanupPeriodDays`. Once a day sits BOTH after a
+//! The tab's base is `~/.clauth/stats-base.json`, a frozen copy of CC's
+//! `stats-cache.json`, authoritative only up to its `lastComputedDate`; the
+//! [`crate::tokens`] top-up bridges the gap by reading `~/.claude/projects/`
+//! transcripts strictly newer than that date. That bridge is load-bearing
+//! precisely because the base stays frozen for good — but CC also prunes
+//! transcripts past `cleanupPeriodDays`. Once a day sits BOTH after a
 //! frozen `lastComputedDate` and before the retention horizon, it lives in
 //! neither source and is counted nowhere (the "shows too little" report).
 //!
@@ -24,8 +25,10 @@
 //!   day; the monotonic watermark makes each day record exactly once, so a
 //!   later re-read can never lower or double-count a stored day.
 //! - [`Ledger::apply_to_base`] folds only days strictly after the base's
-//!   `lastComputedDate`, so if CC's own aggregation later catches up past a ledger
-//!   day, the ledger never double-counts against the base.
+//!   `lastComputedDate`, so the ledger never double-counts against the base. The
+//!   global `stats-cache.json` catching up past a ledger day changes nothing: the
+//!   frozen copy's date is the one compared, and ledger days keep their cache
+//!   split, hours and served-model correction.
 //!
 //! # Schema
 //!
@@ -248,8 +251,7 @@ impl Ledger {
     /// same shape the top-up produces, so the Tokens views need no ledger
     /// awareness. Each pushed row also carries the stored per-hour buckets when
     /// the ledger day has them. Only days strictly after `last_computed_date`
-    /// are folded, so a base that later advances past a ledger day never
-    /// double-counts.
+    /// are folded, so a base past a ledger day never double-counts it.
     pub(crate) fn apply_to_base(&self, base: &mut TokenStats, last_computed_date: Option<&str>) {
         let floor = last_computed_date.unwrap_or("");
         let mut model_map: HashMap<String, ModelTokens> = base
