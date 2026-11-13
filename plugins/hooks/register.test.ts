@@ -1873,6 +1873,108 @@ test('U9: an unheld permission ask answered after a /clear closes under the sess
   expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.by, b.session])).toEqual([['desk', 'sid-1']])
 })
 
+// A held ask whose wait reports `remote: false` (the last control stream is
+// gone) is released to Claude Code's own dialog: the phone keeps listing it,
+// read-only, until that dialog is answered, so the mod closes it only once the
+// call settles.
+test('RL1: a held permission ask released to the desk closes once its call settles, not at the release', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  bridge.wait.remote = false
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-1' })
+  await clock.settle()
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  expect(dialog).toHaveLength(1)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+  dialog[0]!('allow')
+  expect(await p).toEqual({ result: 'ok' })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.ask, b.by])).toEqual([[opened[0]!.ask, 'desk']])
+})
+
+test('RL2: a held AskUserQuestion released to the desk closes once the desk answered it, not at the release', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let answerDesk: (() => void) | null = null
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    await new Promise<void>(release => {
+      answerDesk = release
+    })
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  bridge.wait.remote = false
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  expect(answerDesk).not.toBeNull()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+  answerDesk!()
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.ask, b.by])).toEqual([[opened[0]!.ask, 'desk']])
+})
+
+// A wait the daemon failed (a 5xx) is no release: the daemon's view of the ask
+// is unknown, so the mod still closes it at once, and only once.
+test('RL3: a held ask whose wait fails closes at once, and not again when its call settles', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  bridge.wait.fail = 'error'
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-1' })
+  await clock.settle()
+  const opened = bridge.events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  expect(dialog).toHaveLength(1)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed').map(b => [b.ask, b.by])).toEqual([[opened[0]!.ask, 'desk']])
+  dialog[0]!('allow')
+  expect(await p).toEqual({ result: 'ok' })
+  await clock.settle()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+// `remote: false` beside `closed: true` is no release: the daemon already
+// closed the ask, so the mod closes it at once while Claude Code's dialog is
+// still up, and only once.
+test('RL4: a held ask whose wait reports remote:false and closed closes at once, not at its call settle', async ($, on) => {
+  const { clock } = installBoilerplate(on, { HOME: '/home/u' })
+  const events: EventBody[] = []
+  on('http.fetch', ($, e, next) => {
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined) events.push(body)
+    if (e.url.includes('/wait')) return res(200, JSON.stringify({ remote: false, answer: null, closed: true }))
+    if (e.url.includes('/poll')) return res(200, JSON.stringify({ remote: true, commands: [] }))
+    if (body !== undefined && body.kind === 'ask_opened') return res(200, JSON.stringify({ ok: true, remote: true, hold: true }))
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  on('tool.check', ($, e, next) => ASK)
+  const dialog = gatedDialog(on)
+  toolBottom(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ ...toolCall(), tool_use_id: 'tu-1' })
+  await clock.settle()
+  const opened = events.filter(b => b.kind === 'ask_opened')
+  expect(opened).toHaveLength(1)
+  expect(dialog).toHaveLength(1)
+  expect(events.filter(b => b.kind === 'ask_closed').map(b => [b.ask, b.by])).toEqual([[opened[0]!.ask, 'desk']])
+  dialog[0]!('allow')
+  expect(await p).toEqual({ result: 'ok' })
+  await clock.settle()
+  expect(events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
 // A `/clear` ends the conversation and fires no `session.start`: the next
 // conversation's turns reach the same module directly.
 test('PQ7: a conversation end clears the queue, so nothing queued reaches the next conversation', async ($, on) => {

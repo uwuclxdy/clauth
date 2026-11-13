@@ -212,6 +212,7 @@ fn a_transient_unreadable_record_keeps_the_instance() {
     let start = "1".to_string();
     let (t, r) = table(&[(me, instance("s1", &start))]);
     let hub = Hub::new(true, r);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     assert_eq!(
         ev(&hub, me, json!({"session":"s1","seq":1,"kind":"start"})).0,
         200
@@ -689,17 +690,24 @@ fn proc_start_matches_reads_the_tests_own_start_time() {
     ));
 }
 
-/// MB-1: the hold flag reads the device store fresh per call — pairing a
-/// control device after the hub starts flips the next ask and poll.
+/// MB-1: the poll's `remote` flag reads the device store fresh per call —
+/// pairing a control device after the hub starts flips the next poll. Pairing
+/// alone holds no ask: a hold needs that device's live `/events` stream.
 #[test]
-fn the_hold_flag_reads_the_device_store_fresh() {
+fn the_poll_remote_flag_reads_the_device_store_fresh() {
     let _home = HomeSandbox::new();
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
     start(&hub, 100, "s-one");
+    let (_, unpaired) = hub.poll(100, "s-one", Duration::ZERO);
+    assert_eq!(unpaired["remote"], false);
     assert_eq!(open_ask(&hub, 100, "s-one", 2, "a1")["hold"], false);
     seed_device(DEVICE, Tier::Control, TOKEN);
-    assert_eq!(open_ask(&hub, 100, "s-one", 3, "a2")["hold"], true);
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 3, "a2")["hold"],
+        false,
+        "paired, no stream"
+    );
     let (_, polled) = hub.poll(100, "s-one", Duration::ZERO);
     assert_eq!(polled["remote"], true);
 }
@@ -889,6 +897,7 @@ fn the_answer_and_interrupt_audit_lines_carry_no_text() {
     // mod side: two answer forms and an interrupt.
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     let question = json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}, {"question": "Other?"}]});
     assert_eq!(hub.event(100, question.to_string().as_bytes()).0, 200);
@@ -994,6 +1003,7 @@ fn the_answer_audit_line_carries_no_note_count_without_a_note() {
 
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     let question = json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
     assert_eq!(hub.event(100, question.to_string().as_bytes()).0, 200);

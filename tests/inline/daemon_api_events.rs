@@ -613,6 +613,8 @@ fn a_keepalive_is_written_after_the_injected_interval() {
         None,
         #[cfg(unix)]
         None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     let text = String::from_utf8(sink).expect("utf8");
@@ -666,7 +668,9 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
             &StreamConfig::DEFAULT,
             None,
             #[cfg(unix)]
-            Some(stream_hub.as_ref()),
+            Some(&stream_hub),
+            #[cfg(unix)]
+            None,
         )
     });
 
@@ -712,7 +716,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         .expect("an ask frame");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&ask.2).expect("ask json"),
-        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null})
+        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null, "held": false})
     );
     // The snapshot sits right after the herdr frame and before the first status
     // frame, so a client sees the sessions before the feed or any relayed frame.
@@ -782,7 +786,9 @@ fn a_dropped_subscription_ends_the_stream() {
             &StreamConfig::DEFAULT,
             None,
             #[cfg(unix)]
-            Some(stream_hub.as_ref()),
+            Some(&stream_hub),
+            #[cfg(unix)]
+            None,
         );
         done_stream.store(true, Ordering::SeqCst);
         result
@@ -994,6 +1000,8 @@ fn a_pane_created_mid_stream_resubscribes_and_a_pane_closed_reopens_silently() {
         None,
         #[cfg(unix)]
         None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1140,6 +1148,8 @@ fn a_failed_reopen_keeps_the_live_connection_and_retries() {
         None,
         #[cfg(unix)]
         None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1238,6 +1248,8 @@ fn a_retry_after_absence_hands_back_the_snapshot() {
         None,
         #[cfg(unix)]
         None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1305,6 +1317,8 @@ fn the_herdr_socket_is_resolved_once_even_as_retries_keep_connecting() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
         None,
         #[cfg(unix)]
         None,
@@ -1388,6 +1402,8 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
         seam.as_ref(),
         &TerminalHolders::new(),
         &StreamConfig::DEFAULT,
+        None,
+        #[cfg(unix)]
         None,
         #[cfg(unix)]
         None,
@@ -1589,7 +1605,9 @@ fn a_revoke_ends_a_stream_whose_bridge_drain_never_empties() {
         &StreamConfig::DEFAULT,
         Some(&mut row),
         #[cfg(unix)]
-        Some(hub.as_ref()),
+        Some(&hub),
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     assert!(
@@ -1616,7 +1634,9 @@ fn a_bridge_drain_that_never_empties_still_ends_at_the_deadline() {
         &StreamConfig::DEFAULT,
         None,
         #[cfg(unix)]
-        Some(hub.as_ref()),
+        Some(&hub),
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     assert!(

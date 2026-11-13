@@ -286,6 +286,7 @@ fn an_ask_is_answered_once() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     assert_eq!(open_ask(&hub, 100, "s-one", 2, "a1")["hold"], true);
     let ctx = ctx_over(&hub);
@@ -361,14 +362,26 @@ fn answer_question(
     )
 }
 
-fn question_hub() -> (Arc<Hub>, Arc<ApiContext>, Table) {
+/// What a [`question_hub`] test keeps alive beside the hub: the resolver's
+/// table, and the control device's `/events` subscription its asks hold on.
+struct Kept {
+    _table: Table,
+    _stream: Subscription,
+}
+
+fn question_hub() -> (Arc<Hub>, Arc<ApiContext>, Kept) {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     open_question(&hub, 100, "s-one", 2, "q1");
     let ctx = ctx_over(&hub);
-    (hub, ctx, t)
+    let kept = Kept {
+        _table: t,
+        _stream: stream,
+    };
+    (hub, ctx, kept)
 }
 
 /// An `AskUserQuestion` ask takes its answers keyed by each question's exact
@@ -543,6 +556,7 @@ fn a_question_text_compares_byte_for_byte() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     let spaced = "  Which colour?  ";
     let multiline = "Which font?\nWhich weight?";
@@ -647,6 +661,7 @@ fn a_null_answers_reads_as_absent() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     open_ask(&hub, 100, "s-one", 2, "a1");
     let ctx = ctx_over(&hub);
@@ -672,6 +687,7 @@ fn answers_to_a_permission_ask_are_the_wrong_form() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     open_ask(&hub, 100, "s-one", 2, "a1");
     let ctx = ctx_over(&hub);
@@ -779,6 +795,7 @@ fn an_asks_kind_comes_from_its_tool() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     let lookalike = serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "mcp__forms__ask", "input": [{"question": LOGO}]});
     assert_eq!(hub.event(100, lookalike.to_string().as_bytes()).0, 200);
@@ -854,11 +871,12 @@ fn a_desk_answer_closes_the_ask() {
     assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
 }
 
-/// The mod holds only when a remote answer is possible: a bound listener
-/// and a paired control device. Each half alone answers `hold: false`, and
-/// the poll carries the same flag as `remote`.
+/// The poll's `remote` flag gates the mod running phone prompts and
+/// interrupts, so it needs a bound listener and a paired control device and
+/// never a live stream: a script posting a prompt opens no stream. With no
+/// `/events` stream open, no row holds an ask.
 #[test]
-fn the_hold_flag_needs_a_listener_and_a_control_device() {
+fn the_poll_remote_flag_needs_a_listener_and_a_control_device() {
     for (listening, tier, want) in [
         (true, Some(Tier::Control), true),
         (true, Some(Tier::View), false),
@@ -873,7 +891,10 @@ fn the_hold_flag_needs_a_listener_and_a_control_device() {
         let hub = Hub::new(listening, resolver);
         start(&hub, 100, "s-one");
         let answer = open_ask(&hub, 100, "s-one", 2, "a1");
-        assert_eq!(answer["hold"], want, "listening={listening} tier={tier:?}");
+        assert_eq!(
+            answer["hold"], false,
+            "no stream: listening={listening} tier={tier:?}"
+        );
         let (_, polled) = hub.poll(100, "s-one", Duration::ZERO);
         assert_eq!(
             polled["remote"], want,
@@ -1030,4 +1051,339 @@ fn the_socket_resolves_the_connecting_process() {
         "another session is refused"
     );
     server.stop();
+}
+
+/// A sink keeping every byte a stream writes, so a test can wait for a frame.
+#[derive(Clone)]
+struct StreamLog(Arc<(Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+impl StreamLog {
+    fn new() -> Self {
+        Self(Arc::new((
+            Mutex::new(Vec::new()),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    /// Whether `needle` reached the sink within `timeout`.
+    fn wait_for(&self, needle: &[u8], timeout: Duration) -> bool {
+        let (bytes, written) = &*self.0;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut seen = bytes.lock().unwrap();
+        while !seen.windows(needle.len()).any(|w| w == needle) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            seen = written.wait_timeout(seen, deadline - now).unwrap().0;
+        }
+        true
+    }
+}
+
+impl Write for StreamLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (bytes, written) = &*self.0;
+        bytes.lock().unwrap().extend_from_slice(buf);
+        written.notify_all();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Open `GET /api/v1/events` as `token`'s device through the router, on a
+/// thread, for `lifetime`; returns once the stream has subscribed to the hub
+/// (it subscribes before it writes the bridge snapshot).
+fn open_stream(hub: &Arc<Hub>, token: &str, lifetime: Duration) -> std::thread::JoinHandle<()> {
+    let ctx = ctx_over(hub);
+    let handled = crate::daemon::api::routes::handle(
+        &ctx,
+        &req("GET", "/api/v1/events", Some(token), ""),
+        std::net::SocketAddr::from(([192, 0, 2, 7], 50_000)),
+    );
+    assert_eq!(
+        handled.response.status, 200,
+        "the events route answers a stream"
+    );
+    let stream = handled.response.stream.expect("a stream");
+    let log = StreamLog::new();
+    let mut sink = log.clone();
+    let deadline = std::time::Instant::now() + lifetime;
+    let thread = std::thread::spawn(move || stream(&mut sink, deadline).expect("stream"));
+    assert!(
+        log.wait_for(b"event: session.snapshot", Duration::from_secs(5)),
+        "the stream subscribed to the hub"
+    );
+    thread
+}
+
+/// The mod holds a question for a phone only while a control device has a
+/// live `/events` stream: a paired control device with no stream (only a push
+/// subscription, or the app closed) answers `hold: false`, so the desk dialog
+/// shows at once; its stream opening makes the next ask held.
+#[test]
+fn an_ask_holds_only_while_a_control_stream_is_open() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let unheld = open_ask(&hub, 100, "s-one", 2, "a1");
+    assert_eq!(unheld["hold"], false, "no stream: {unheld}");
+    assert_eq!(unheld["remote"], false, "no stream: {unheld}");
+    let stream = open_stream(&hub, TOKEN, Duration::from_secs(2));
+    let held = open_ask(&hub, 100, "s-one", 3, "a2");
+    assert_eq!(held["hold"], true, "a live control stream: {held}");
+    assert_eq!(held["remote"], true, "a live control stream: {held}");
+    stream.join().expect("stream thread");
+}
+
+/// A view-tier stream cannot answer, so it never makes an ask held, even
+/// beside a paired control device that has no stream of its own.
+#[test]
+fn a_view_stream_never_holds_an_ask() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    seed_device("viewer", Tier::View, OTHER_TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let stream = open_stream(&hub, OTHER_TOKEN, Duration::from_secs(2));
+    let answer = open_ask(&hub, 100, "s-one", 2, "a1");
+    assert_eq!(answer["hold"], false, "a view stream alone: {answer}");
+    stream.join().expect("stream thread");
+}
+
+/// A control stream with no listener behind the hub holds nothing: the mod
+/// socket binds only under `--listen`.
+#[test]
+fn a_control_stream_without_a_listener_holds_nothing() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(false, resolver);
+    start(&hub, 100, "s-one");
+    let stream = open_stream(&hub, TOKEN, Duration::from_secs(2));
+    let answer = open_ask(&hub, 100, "s-one", 2, "a1");
+    assert_eq!(answer["hold"], false, "not listening: {answer}");
+    stream.join().expect("stream thread");
+}
+
+/// The daemon ends every stream at its lifetime and the app reconnects about a
+/// second later: a control device counts as connected until 5 s after its last
+/// stream closed, so the routine reconnect never sends a question to the desk.
+/// The grace runs on the hub's clock.
+#[test]
+fn a_closed_control_stream_still_holds_for_five_seconds() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    open_stream(&hub, TOKEN, Duration::from_millis(200))
+        .join()
+        .expect("stream thread");
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 2, "a1")["hold"],
+        true,
+        "just closed"
+    );
+    // The close is stamped on the hub clock as the stream ends, so the real
+    // time this test spends after it counts too: 3 s leaves it a 2 s margin.
+    hub.advance_clock(Duration::from_secs(3));
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 3, "a2")["hold"],
+        true,
+        "3 s after the close"
+    );
+    hub.advance_clock(Duration::from_millis(2_100));
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 4, "a3")["hold"],
+        false,
+        "5.1 s after the close"
+    );
+}
+
+/// A second control stream still open keeps the hold when the first closes:
+/// the grace starts at the LAST control stream's close.
+#[test]
+fn the_grace_starts_when_the_last_control_stream_closes() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let long = open_stream(&hub, TOKEN, Duration::from_secs(3));
+    open_stream(&hub, TOKEN, Duration::from_millis(200))
+        .join()
+        .expect("short stream thread");
+    hub.advance_clock(Duration::from_secs(10));
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 2, "a1")["hold"],
+        true,
+        "one stream still open"
+    );
+    long.join().expect("long stream thread");
+    // The grace runs from the long stream's close, not the short one's (10 s
+    // back on the hub clock).
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 3, "a2")["hold"],
+        true,
+        "just after the last close"
+    );
+    hub.advance_clock(Duration::from_millis(5_100));
+    assert_eq!(
+        open_ask(&hub, 100, "s-one", 4, "a3")["hold"],
+        false,
+        "5.1 s after the last close"
+    );
+}
+
+/// A held question releases to the desk once the last control stream is gone
+/// past the grace: the ask's parked wait answers `remote: false` then, well
+/// before its own bound, and the mod hands the check to Claude Code's own
+/// dialog. While a stream is open, time passing releases nothing: that negative
+/// is checked over a 300 ms real-time window after the hub clock jumps past
+/// the grace, so it catches a release on the jump, not one minutes later.
+#[test]
+fn a_held_ask_releases_once_the_last_control_stream_is_gone() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let stream = open_stream(&hub, TOKEN, Duration::from_secs(5));
+    assert_eq!(open_ask(&hub, 100, "s-one", 2, "a1")["hold"], true);
+    let waiter = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let answer = hub.wait_ask(100, "s-one", "a1", Duration::from_secs(30));
+            (answer, started.elapsed())
+        })
+    };
+    assert!(
+        hub.wait_until_wait_parked(100, "a1", Duration::from_secs(5)),
+        "the wait parked"
+    );
+    hub.advance_clock(Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !waiter.is_finished(),
+        "the wait answered while a control stream was open"
+    );
+    assert_eq!(
+        hub.snapshot()["asks"][0]["held"],
+        true,
+        "held while the stream is open"
+    );
+    // No clock advance after the close: the stream's own close must wake the
+    // parked wait, which then releases on the real 5 s grace.
+    stream.join().expect("stream thread");
+    let ((status, answer), elapsed) = waiter.join().expect("waiter");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["remote"], false, "released: {answer}");
+    assert_eq!(answer["answer"], serde_json::Value::Null, "{answer}");
+    // A release, not a close: the mod keeps the question listed on `closed: false`.
+    assert_eq!(answer["closed"], false, "{answer}");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the wait answered at {elapsed:?}, not on the release"
+    );
+    // The released question stays open at the desk, and a phone reconnecting
+    // now reads it as one it cannot answer.
+    assert_eq!(
+        hub.snapshot()["asks"][0]["held"],
+        false,
+        "released to the desk"
+    );
+    // The question went back to the desk: a device answer arriving now is
+    // refused, never taken and then dropped by a mod that holds nothing.
+    let late = call(
+        &ctx_over(&hub),
+        &req(
+            "POST",
+            "/api/v1/sessions/s-one/asks/a1",
+            Some(TOKEN),
+            r#"{"decision":"allow"}"#,
+        ),
+    );
+    assert_eq!(late.status, 404, "a released ask takes no answer");
+    assert_eq!(body_json(&late)["error"], "ask_not_found");
+    assert_eq!(commands(&hub, 100, "s-one"), serde_json::json!([]));
+}
+
+/// A wait parked on the grace releases as soon as the hub clock passes the
+/// grace end, not when the real clock gets there: the clock seam wakes it.
+#[test]
+fn moving_the_clock_past_the_grace_releases_a_parked_wait() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let stream = open_stream(&hub, TOKEN, Duration::from_millis(200));
+    assert_eq!(open_ask(&hub, 100, "s-one", 2, "a1")["hold"], true);
+    stream.join().expect("stream thread");
+    let waiter = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let answer = hub.wait_ask(100, "s-one", "a1", Duration::from_secs(30));
+            (answer, started.elapsed())
+        })
+    };
+    assert!(
+        hub.wait_until_wait_parked(100, "a1", Duration::from_secs(5)),
+        "the wait parked"
+    );
+    hub.advance_clock(Duration::from_millis(5_100));
+    let ((status, answer), elapsed) = waiter.join().expect("waiter");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["remote"], false, "released: {answer}");
+    assert_eq!(answer["closed"], false, "{answer}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the wait answered at {elapsed:?}, on the real clock's grace end"
+    );
+}
+
+/// A wait that starts once the grace already lapsed answers `remote: false` at
+/// once instead of parking to its bound.
+#[test]
+fn a_wait_after_the_grace_lapsed_releases_at_once() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let stream = open_stream(&hub, TOKEN, Duration::from_millis(200));
+    assert_eq!(open_ask(&hub, 100, "s-one", 2, "a1")["hold"], true);
+    stream.join().expect("stream thread");
+    hub.advance_clock(Duration::from_millis(5_100));
+    let started = std::time::Instant::now();
+    let (status, answer) = hub.wait_ask(100, "s-one", "a1", Duration::from_secs(20));
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["remote"], false, "released: {answer}");
+    assert_eq!(answer["closed"], false, "{answer}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the wait parked for {:?}",
+        started.elapsed()
+    );
+    let late = call(
+        &ctx_over(&hub),
+        &req(
+            "POST",
+            "/api/v1/sessions/s-one/asks/a1",
+            Some(TOKEN),
+            r#"{"decision":"allow"}"#,
+        ),
+    );
+    assert_eq!(late.status, 404, "a released ask takes no answer");
+    assert_eq!(body_json(&late)["error"], "ask_not_found");
+    assert_eq!(hub.snapshot()["asks"][0]["held"], false, "released");
 }

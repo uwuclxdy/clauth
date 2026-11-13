@@ -332,9 +332,11 @@ pub(super) fn read_store() -> Result<Store> {
 }
 
 /// Whether a control-tier device is paired, read fresh: the flag the bridge's
-/// `remote`/`hold` answers and the mod's hold decision rides (SB-9, MB-1). An
-/// unreadable store reads as "no" — a poll answers `remote: false` rather than
-/// failing. The bridge is unix-only, so on Windows nothing reads it.
+/// poll `remote` and a wait's closed-ask and session-gone `remote` ride (SB-9,
+/// MB-1); holding a question needs a control-tier stream open or closed under
+/// 5 s instead. An unreadable store reads as "no" — a poll answers
+/// `remote: false` rather than failing. The bridge is unix-only, so on Windows
+/// nothing reads it.
 #[cfg(unix)]
 pub(crate) fn has_control_device() -> bool {
     read_store()

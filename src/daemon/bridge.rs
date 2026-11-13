@@ -48,6 +48,12 @@ const RECORD_LIMIT: usize = 1024 * 1024;
 /// reconnects for a fresh snapshot (SB-10).
 pub(crate) const SUBSCRIBER_BOUND: usize = 64;
 
+/// How long a control-tier device keeps counting as connected after its last
+/// `/events` stream closed: the daemon ends every stream at its lifetime and the
+/// app reconnects about a second later (`retry: 1000`), so the routine reconnect
+/// never releases a held question to the desk.
+const CONTROL_GRACE: Duration = Duration::from_secs(5);
+
 /// How often the sweep closes silent instances, so a silent session's end
 /// frames go out near the silence bound, never at the next interaction.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -158,15 +164,27 @@ pub(crate) struct Instance {
 /// with a table it can rewrite mid-test.
 pub(crate) type PeerResolver = Box<dyn Fn(u32) -> Option<Instance> + Send + Sync>;
 
-/// One `/events` subscriber: a bounded channel of `(event, data)` frames. A
-/// full channel drops the subscription — the stream ends and the client
-/// reconnects for a fresh snapshot (SB-10).
 /// The hub dropped a subscription: its channel filled and was removed (SB-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Dropped;
 
+/// One `/events` subscriber: a bounded channel of `(event, data)` frames. A
+/// full channel drops the subscription — the stream ends and the client
+/// reconnects for a fresh snapshot (SB-10). A control-tier subscription makes
+/// its device count as connected while it is live; once it drops or the hub
+/// drops its channel, [`Hub::control_presence`]'s grace keeps the device
+/// counted for [`CONTROL_GRACE`] more. Dropped with no hub lock held: the drop
+/// takes the hub lock to wake the parked waits.
 pub(crate) struct Subscription {
     rx: Receiver<(String, Value)>,
+    hub: Arc<Hub>,
+    id: u64,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.hub.unsubscribe(self.id);
+    }
 }
 
 impl Subscription {
@@ -199,8 +217,10 @@ struct OpenAsk {
     /// The 1-based line the mod found an `Edit`'s `old_string` on, see
     /// [`posted_start_line`]. The daemon opens no file for it.
     start_line: Option<u64>,
-    /// Whether the mod held this check for a device answer: `remote_flag()` at
-    /// open time. An unheld ask is shown and closed, but never answered (SB-19).
+    /// Whether the mod held this check for a device answer:
+    /// [`Hub::control_presence`] at each `ask_opened` post, where a re-post
+    /// only ever turns it on; cleared when a wait releases the ask to the
+    /// desk. An unheld ask is shown and closed, but never answered (SB-19).
     held: bool,
 }
 
@@ -256,15 +276,81 @@ pub(crate) struct Hub {
     changed: Condvar,
     /// Live `/events` subscribers; a full channel is dropped on the next
     /// broadcast (SB-10).
-    subs: Mutex<Vec<SyncSender<(String, Value)>>>,
+    subs: Mutex<Subscribers>,
     /// The push sender's inbox, wired by the daemon after it stands: an ask
-    /// opening a new wait announces the session's `blocked` transition through
-    /// it (WP-8).
+    /// opening while no open ask is held for the phone announces the session's
+    /// `blocked` transition through it (WP-8).
     push: Mutex<Option<crate::push::Queue>>,
     /// Test-only: the virtual clock's offset past [`Instant::now`], so a test
     /// pins the silence close without sleeping 40 s.
     #[cfg(test)]
     clock_offset: std::sync::atomic::AtomicU64,
+}
+
+/// The live `/events` subscribers, and when the last control-tier one closed.
+#[derive(Default)]
+struct Subscribers {
+    live: Vec<Subscriber>,
+    next_id: u64,
+    /// When a control-tier subscription last closed, on the hub's clock: the
+    /// start of the [`CONTROL_GRACE`] once none is live.
+    last_control_close: Option<Instant>,
+}
+
+struct Subscriber {
+    id: u64,
+    tx: SyncSender<(String, Value)>,
+    control: bool,
+}
+
+impl Subscribers {
+    /// Drop every subscriber `keep` refuses, stamping `now` as the last
+    /// control close when a control-tier one goes. Returns whether the drop
+    /// removed the last control subscriber: the moment a held ask's wait must
+    /// re-read [`Hub::control_presence`].
+    fn retain(&mut self, now: Instant, mut keep: impl FnMut(&Subscriber) -> bool) -> bool {
+        let mut closed_control = false;
+        self.live.retain(|sub| {
+            let kept = keep(sub);
+            closed_control |= !kept && sub.control;
+            kept
+        });
+        if closed_control {
+            self.last_control_close = Some(now);
+        }
+        closed_control && !self.live.iter().any(|sub| sub.control)
+    }
+
+    /// Whether a control-tier device counts as connected at `now`.
+    fn control_presence(&self, now: Instant) -> ControlPresence {
+        if self.live.iter().any(|sub| sub.control) {
+            return ControlPresence::Open;
+        }
+        match self.last_control_close.map(|closed| closed + CONTROL_GRACE) {
+            Some(lapses) if now < lapses => ControlPresence::Grace(lapses),
+            _ => ControlPresence::Absent,
+        }
+    }
+}
+
+/// Whether a control-tier device counts as connected, the condition the hub
+/// holds a question for a device answer under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPresence {
+    /// A control-tier `/events` stream is open.
+    Open,
+    /// The last control-tier stream closed inside the grace, which ends at
+    /// this instant on the hub's clock.
+    Grace(Instant),
+    /// No control-tier stream is open or closed inside the grace, or the
+    /// daemon is not listening.
+    Absent,
+}
+
+impl ControlPresence {
+    fn holds(self) -> bool {
+        self != Self::Absent
+    }
 }
 
 #[derive(Default)]
@@ -296,11 +382,11 @@ struct Live {
     /// delivers the answer drops the payload, keeping only the id, so a live
     /// instance never accumulates an answer per closed ask (W4).
     closed_asks: HashMap<String, Value>,
-    /// Whether the current wait's `blocked` push is reserved: set in the same
-    /// lock hold that decides to push, rolled back by [`Hub::note_ask_opened`]
-    /// when no push queue is wired, and cleared when the last open ask closes.
-    /// A second ask of the same wait reads the reservation and pushes nothing
-    /// (WP-8).
+    /// Whether this instance sent (or reserved) a `blocked` push: set in the
+    /// same lock hold that decides to push, cleared only by
+    /// [`Hub::note_ask_opened`]'s rollback when no push queue is wired. Beside
+    /// an open held ask, while a device counts as connected, it suppresses the
+    /// next question's push; beside only unheld asks it decides nothing (WP-8).
     announced: bool,
     /// The `start` event's cwd and interactive, for the snapshot.
     cwd: Value,
@@ -682,7 +768,7 @@ impl Hub {
             prompt_nonce: mint_prompt_nonce(),
             inner: Mutex::new(Inner::default()),
             changed: Condvar::new(),
-            subs: Mutex::new(Vec::new()),
+            subs: Mutex::new(Subscribers::default()),
             push: Mutex::new(None),
             #[cfg(test)]
             clock_offset: std::sync::atomic::AtomicU64::new(0),
@@ -703,11 +789,17 @@ impl Hub {
     }
 
     /// Move the hub's virtual clock forward, so a test drives the silence close
-    /// ([`SILENCE_LIMIT`]) without sleeping.
+    /// ([`SILENCE_LIMIT`]) and the end of [`CONTROL_GRACE`] without sleeping.
+    /// The move happens under the hub lock and wakes every parked wait, as a
+    /// real clock reaching a parked wait's grace end would.
     #[cfg(test)]
     pub(crate) fn advance_clock(&self, delta: Duration) {
-        self.clock_offset
-            .fetch_add(delta.as_nanos() as u64, Ordering::Relaxed);
+        let _inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        self.clock_offset.fetch_add(
+            u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.changed.notify_all();
     }
 
     /// Test-only: wait until a poll has parked on `pid`'s instance — its poll
@@ -738,19 +830,83 @@ impl Hub {
         true
     }
 
-    /// Open a bounded frame subscription. A full channel is dropped on the next
-    /// broadcast, ending the client's stream (SB-10).
-    pub(crate) fn subscribe(&self) -> Subscription {
+    /// Test-only: wait until a wait has parked on `pid`'s instance for `ask` —
+    /// its `parked_waits` entry exists — signalled through `changed`, so a test
+    /// orders a broadcast against a parked wait rather than a sleep. Returns
+    /// `false` when the timeout elapses first. Sound because a wait holds the
+    /// hub mutex from its `parked_waits` insertion through
+    /// `Condvar::wait_timeout`, so the entry is visible here exactly once the
+    /// wait is parked.
+    #[cfg(test)]
+    pub(crate) fn wait_until_wait_parked(&self, pid: u32, ask: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        while guard
+            .instances
+            .get(&pid)
+            .is_none_or(|live| !live.parked_waits.contains_key(ask))
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, _) = self
+                .changed
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            guard = g;
+        }
+        true
+    }
+
+    /// Open a bounded frame subscription for a stream authenticated as `tier`;
+    /// only a [`Tier::Control`] one counts toward [`Hub::control_presence`]. A
+    /// full channel is dropped on the next broadcast, ending the client's stream
+    /// (SB-10).
+    ///
+    /// [`Tier::Control`]: crate::daemon::api::devices::Tier::Control
+    pub(crate) fn subscribe_as(
+        self: &Arc<Self>,
+        tier: Option<&crate::daemon::api::devices::Tier>,
+    ) -> Subscription {
+        let control = tier == Some(&crate::daemon::api::devices::Tier::Control);
         let (tx, rx) = sync_channel(SUBSCRIBER_BOUND);
-        self.subs.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
-        Subscription { rx }
+        let id = {
+            let mut subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+            let id = subs.next_id;
+            subs.next_id += 1;
+            subs.live.push(Subscriber { id, tx, control });
+            id
+        };
+        Subscription {
+            rx,
+            hub: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// A frame tap that never counts as a connected device.
+    #[cfg(test)]
+    pub(crate) fn subscribe(self: &Arc<Self>) -> Subscription {
+        self.subscribe_as(None)
     }
 
     /// Broadcast one frame to every live subscriber, dropping any whose channel
-    /// is full — never blocking the hub on a slow client (SB-10).
+    /// is full — never blocking the hub on a slow client (SB-10). A dropped
+    /// control-tier channel counts as that stream's close, and dropping the
+    /// last control subscriber wakes every parked wait, so a held ask's wait
+    /// re-reads [`Hub::control_presence`] now rather than at its own bound.
     fn broadcast(&self, event: &str, data: Value) {
+        let now = self.now();
         let mut subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
-        subs.retain(|tx| tx.try_send((event.to_string(), data.clone())).is_ok());
+        if subs.retain(now, |sub| {
+            sub.tx.try_send((event.to_string(), data.clone())).is_ok()
+        }) {
+            // Every caller holds `inner`, so the wake lands under the hub
+            // lock: a wait reads presence under that lock, so it is either
+            // past this close or already parked.
+            self.changed.notify_all();
+        }
     }
 
     /// Drop every live subscription now, so a test ends a stream on a frame it
@@ -759,7 +915,52 @@ impl Hub {
     /// end by filling their own channel (SB-10).
     #[cfg(test)]
     pub(crate) fn drop_subscriptions(&self) {
-        self.subs.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let now = self.now();
+        let last_control_gone = self
+            .subs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(now, |_| false);
+        if last_control_gone {
+            // As `unsubscribe`: the wake lands under the hub lock a wait reads
+            // presence under, so it is either past this close or already
+            // parked.
+            let _inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            self.changed.notify_all();
+        }
+    }
+
+    /// A subscription's drop: its subscriber leaves (unless a broadcast already
+    /// dropped it, which stamped the close then), and a control-tier one that
+    /// leaves no control-tier subscriber behind wakes every parked wait, so a
+    /// held ask's wait re-reads [`Hub::control_presence`] now rather than at
+    /// its own bound.
+    fn unsubscribe(&self, id: u64) {
+        let now = self.now();
+        let last_control_gone = {
+            let mut subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+            subs.retain(now, |sub| sub.id != id)
+        };
+        if last_control_gone {
+            // The wake is sent under the hub lock: a wait reads presence under
+            // that lock, so it is either past this close or already parked.
+            let _inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            self.changed.notify_all();
+        }
+    }
+
+    /// Whether a control-tier device counts as connected: the daemon is
+    /// listening and a control-tier `/events` stream is open or closed less
+    /// than [`CONTROL_GRACE`] ago. An ask is held for a device answer only
+    /// under it, and a held ask's wait releases it to the desk once it lapses.
+    fn control_presence(&self, now: Instant) -> ControlPresence {
+        if !self.listening {
+            return ControlPresence::Absent;
+        }
+        self.subs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_presence(now)
     }
 
     /// The end frames for a closing instance: every open ask closes `by:
@@ -825,6 +1026,7 @@ impl Hub {
                     "input": info.input,
                     "agent_id": info.agent_id,
                     "start_line": info.start_line,
+                    "held": info.held,
                 }));
             }
         }
@@ -848,8 +1050,8 @@ impl Hub {
     }
 
     /// Wire the push sender's inbox (production, after the sender starts): an
-    /// ask opening a new wait announces the session's `blocked` transition
-    /// through it (WP-8).
+    /// ask opening while no open ask is held for the phone announces the
+    /// session's `blocked` transition through it (WP-8).
     pub(crate) fn wire_push(&self, queue: crate::push::Queue) {
         *self.push.lock().unwrap_or_else(|p| p.into_inner()) = Some(queue);
     }
@@ -915,10 +1117,6 @@ impl Hub {
         } else {
             None
         };
-
-        // The device store is read once per `ask_opened` (A#15), before any hub
-        // lock is taken, so the read never stalls the hub (SB-10).
-        let ask_hold = (kind == "ask_opened").then(|| self.remote_flag());
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = self.now();
@@ -1068,50 +1266,63 @@ impl Hub {
             }
             "ask_opened" => {
                 let ask = value.get("ask").and_then(Value::as_str).unwrap_or_default();
-                // The device store was read before the lock (A#15, SB-10); the
-                // flag rides the response for the mod's hold decision (SB-9,
-                // MB-1).
-                let hold = ask_hold.unwrap_or(false);
+                // The flag rides the response for the mod's hold decision
+                // (SB-9, MB-1).
+                let hold = self.control_presence(now).holds();
                 let tool = value.get("tool").cloned().unwrap_or(Value::Null);
                 let input = value.get("input").cloned().unwrap_or(Value::Null);
                 let agent_id = value.get("agent_id").cloned().unwrap_or(Value::Null);
                 let start_line = posted_start_line(&value);
-                // A wait announces its `blocked` push once: the decision and the
-                // reservation share this lock hold, so a second ask of the same
-                // wait handled before the push queues reads the reservation and
-                // pushes nothing. `note_ask_opened` rolls the reservation back
-                // when no push queue is wired, so an ask opened before the queue
-                // still announces once it is (WP-8).
-                let announce = !live.announced;
+                // A new question announces its `blocked` push unless one already
+                // went out (or is reserved) beside an ask held for the phone:
+                // the decision and the reservation share this lock hold, so a
+                // second ask beside a held one pushes nothing. With no device
+                // counted as connected (`hold` false), a held ask whose wait has
+                // not yet released it holds nothing for the phone either. An
+                // unheld or released ask stays open until its tool call settles,
+                // long after the desk answered it, so the reservation alone would
+                // swallow the next question's push (WP-8). A re-post of an open
+                // ask is no new question. `note_ask_opened` rolls the reservation
+                // back when no push queue is wired, so a wait opened before the
+                // queue still announces once one is.
+                let reposted = live.open_asks.iter().any(|(id, _)| id == ask);
+                let announce = !reposted
+                    && (!live.announced
+                        || !hold
+                        || !live.open_asks.iter().any(|(_, info)| info.held));
                 if announce {
                     live.announced = true;
                 }
                 live.closed_asks.remove(ask);
-                match live.open_asks.iter_mut().find(|(id, _)| id == ask) {
+                let held = match live.open_asks.iter_mut().find(|(id, _)| id == ask) {
                     Some((_, info)) => {
                         info.tool = tool.clone();
                         info.input = input.clone();
                         info.agent_id = agent_id.clone();
                         info.start_line = start_line;
                         info.held |= hold;
+                        info.held
                     }
-                    None => live.open_asks.push((
-                        ask.to_string(),
-                        OpenAsk {
-                            tool: tool.clone(),
-                            input: input.clone(),
-                            agent_id: agent_id.clone(),
-                            start_line,
-                            held: hold,
-                        },
-                    )),
-                }
+                    None => {
+                        live.open_asks.push((
+                            ask.to_string(),
+                            OpenAsk {
+                                tool: tool.clone(),
+                                input: input.clone(),
+                                agent_id: agent_id.clone(),
+                                start_line,
+                                held: hold,
+                            },
+                        ));
+                        hold
+                    }
+                };
                 self.broadcast(
                     "session.ask",
-                    json!({"session": named, "ask": ask, "state": "opened", "tool": tool, "input": input, "agent_id": agent_id, "start_line": start_line}),
+                    json!({"session": named, "ask": ask, "state": "opened", "tool": tool, "input": input, "agent_id": agent_id, "start_line": start_line, "held": held}),
                 );
                 opened_wait = announce;
-                (200, json!({ "ok": true, "remote": hold, "hold": hold }))
+                (200, json!({ "ok": true, "remote": held, "hold": held }))
             }
             "ask_closed" => {
                 let ask = value.get("ask").and_then(Value::as_str).unwrap_or_default();
@@ -1126,11 +1337,6 @@ impl Hub {
                 if !live.closed_asks.contains_key(ask) {
                     live.open_asks.retain(|(id, _)| id != ask);
                     live.closed_asks.insert(ask.to_string(), Value::Null);
-                    // The last open ask closed: the wait ends, so the next ask
-                    // opens a new wait and announces again (WP-8).
-                    if live.open_asks.is_empty() {
-                        live.announced = false;
-                    }
                     // Wake a wait parked on this ask (and the poll, which finds
                     // nothing to drain): a desk close queues no command, so this
                     // notify is the close's only wake.
@@ -1190,24 +1396,22 @@ impl Hub {
     }
 
     /// The ask-open half of the `blocked` push (WP-8): the mod is the only push
-    /// source for its session, so a new wait announces through the wired inbox,
-    /// with no pane probe. The account resolve runs off every hub lock — it
-    /// reads the registry, which must never stall the hub (SB-10). The wait
-    /// latch is the instance's `announced`, reserved in the `ask_opened` arm
-    /// under the same lock hold that decided to push: this sends through the
-    /// wired inbox, or rolls the reservation back when none is wired, so an ask
-    /// opened before the queue does not spend the wait (the last ask closing or
-    /// the instance ending clears it).
+    /// source for its session, so a question opening with no open ask held for
+    /// the phone announces through the wired inbox, with no pane probe. The
+    /// account resolve runs off every hub lock — it reads the registry, which
+    /// must never stall the hub (SB-10). The push latch is the instance's
+    /// `announced`, reserved in the `ask_opened` arm under the same lock hold that
+    /// decided to push: this sends through the wired inbox, or rolls the
+    /// reservation back when none is wired, so a wait opened before the queue
+    /// still announces once one is.
     fn note_ask_opened(&self, peer_pid: u32, generation: u64) {
         let queue = self.push.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let Some(queue) = queue else {
-            // No push queue wired: roll the reservation back. Only while the
-            // instance is unchanged (a replaced instance owns its own latch) and
-            // the wait is still open (a closed wait was already reset) (WP-8).
+            // No push queue wired: roll the reservation back, unless a
+            // replacement instance owns its own latch (WP-8).
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(live) = inner.instances.get_mut(&peer_pid)
                 && live.generation == generation
-                && !live.open_asks.is_empty()
             {
                 live.announced = false;
             }
@@ -1674,10 +1878,13 @@ impl Hub {
     }
 
     /// Park one `GET /wait` on its own open ask until that ask closes, its
-    /// bound elapses, or the instance dies — never touching the session's
-    /// parked poll. Unlike a poll, a wait drains nothing, never bumps
-    /// `poll_epoch`, and never mints an instance: it always follows an
-    /// `ask_opened`, so an absent instance reads as an ask never opened.
+    /// bound elapses, the instance dies, or [`Hub::control_presence`] lapses —
+    /// never touching the session's parked poll. A lapse answers `remote:
+    /// false` for the still-open ask, releasing it to the desk; so does a wait
+    /// arriving after the lapse, without parking. Unlike a poll, a wait drains
+    /// nothing, never bumps `poll_epoch`, and never mints an instance: it
+    /// always follows an `ask_opened`, so an absent instance reads as an ask
+    /// never opened.
     pub(crate) fn wait_ask(
         &self,
         peer_pid: u32,
@@ -1688,8 +1895,11 @@ impl Hub {
         if let Err((status, body)) = self.resolve_peer(peer_pid, session, "wait") {
             return (status, body);
         }
-        // The device store is read once per wait answer (A#15), before the hub
-        // lock, so the read never stalls the hub (SB-10).
+        // A closed ask's answer carries the paired-device flag, as the poll
+        // does: the mod reads `remote` before the answer, so a device answer
+        // queued before its stream closed still reaches the mod. The device
+        // store is read once per wait answer (A#15), before the hub lock, so
+        // the read never stalls the hub (SB-10).
         let remote = self.remote_flag();
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1705,20 +1915,36 @@ impl Hub {
         if !live.open_asks.iter().any(|(id, _)| id == ask) {
             return (404, error_value("ask_not_found"));
         }
+        let mut presence = self.control_presence(self.now());
+        if !presence.holds() {
+            release_ask(live, ask);
+            return (200, wait_body(false, None, false));
+        }
         if live.parked_waits.values().sum::<usize>() >= MAX_WAITS_PER_INSTANCE {
             return (503, error_value("busy"));
         }
         *live.parked_waits.entry(ask.to_string()).or_default() += 1;
+        // A park is a state change the shared condvar carries: wake a watcher
+        // of `parked_waits` so it re-reads the entry now, not at its bound.
+        self.changed.notify_all();
         let deadline = Instant::now() + wait;
         loop {
             let now = Instant::now();
             if now >= deadline {
                 leave_wait(&mut inner, peer_pid, generation, ask);
-                return (200, wait_body(remote, None, false));
+                return (200, wait_body(presence.holds(), None, false));
             }
+            // A grace lapsing wakes nothing, so the park ends at the lapse; a
+            // control stream closing wakes the park through `unsubscribe`.
+            let park = match presence {
+                ControlPresence::Grace(lapses) => {
+                    (deadline - now).min(lapses.saturating_duration_since(self.now()))
+                }
+                ControlPresence::Open | ControlPresence::Absent => deadline - now,
+            };
             let (guard, _timed_out) = self
                 .changed
-                .wait_timeout(inner, deadline - now)
+                .wait_timeout(inner, park)
                 .unwrap_or_else(|p| p.into_inner());
             inner = guard;
             let Some(live) = inner.instances.get(&peer_pid) else {
@@ -1730,8 +1956,21 @@ impl Hub {
                 return (200, wait_body(remote, None, true));
             }
             let Some(answer) = live.closed_asks.get(ask).cloned() else {
-                // Still open — a spurious wake or another ask's event woke the
-                // shared condvar: park again.
+                // Still open: release it once presence lapsed, else a
+                // spurious wake or another ask's event woke the shared
+                // condvar, so park again.
+                presence = self.control_presence(self.now());
+                if !presence.holds() {
+                    leave_wait(&mut inner, peer_pid, generation, ask);
+                    release_ask(
+                        inner
+                            .instances
+                            .get_mut(&peer_pid)
+                            .unwrap_or_else(|| unreachable!("the parked wait holds the instance")),
+                        ask,
+                    );
+                    return (200, wait_body(false, None, false));
+                }
                 continue;
             };
             leave_wait(&mut inner, peer_pid, generation, ask);
@@ -1937,9 +2176,9 @@ impl Hub {
                 match live.open_asks.iter().find(|(id, _)| id == ask) {
                     Some((_, info)) => {
                         // Only a held ask is answerable (SB-19): the mod holds
-                        // the check only when a remote answer was possible at
-                        // open time, and an unheld ask is never answerable
-                        // whatever the device state at answer time.
+                        // the check only while a control-tier device counted as
+                        // connected at open time, and an unheld ask is never
+                        // answerable whatever the device state at answer time.
                         if !info.held {
                             return AskOutcome::AskNotFound;
                         }
@@ -1955,11 +2194,6 @@ impl Hub {
                         // `kind`/`ask` wire wrapper the poll command keeps).
                         live.closed_asks
                             .insert(ask.to_string(), answer_value(&command));
-                        // The last open ask closed: the wait ends, so the next
-                        // ask opens a new wait and announces again (WP-8).
-                        if live.open_asks.is_empty() {
-                            live.announced = false;
-                        }
                         live.commands.push_back(command);
                         self.changed.notify_all();
                         self.broadcast(
@@ -1999,8 +2233,11 @@ impl Hub {
             .collect()
     }
 
-    /// Whether a remote answer is possible: the daemon's listener is bound and a
-    /// control-tier device is paired, read fresh on every call (SB-9, MB-1).
+    /// Whether a device can drive the session: the daemon's listener is bound
+    /// and a control-tier device is paired, read fresh on every call (SB-9,
+    /// MB-1). It gates the mod running phone prompts and interrupts, so it
+    /// needs no live stream: a script posting a prompt opens none. Holding a
+    /// question needs more, see [`Hub::control_presence`].
     fn remote_flag(&self) -> bool {
         self.listening && crate::daemon::api::devices::has_control_device()
     }
@@ -2194,9 +2431,10 @@ fn poll_body(remote: bool, commands: &[Value]) -> Value {
     json!({ "remote": remote, "commands": commands })
 }
 
-/// One `GET /wait` answer: the device flag, the ask's answer (`null` when the
-/// ask closed without one or the bound elapsed with it still open), and
-/// whether the ask is closed.
+/// One `GET /wait` answer: `remote` (whether the mod keeps the hold: control
+/// presence while the ask is open, the paired-device flag once it closed or its
+/// session is gone), the ask's answer (`null` when the ask closed without one
+/// or the bound elapsed with it still open), and whether the ask is closed.
 fn wait_body(remote: bool, answer: Option<Value>, closed: bool) -> Value {
     json!({ "remote": remote, "answer": answer, "closed": closed })
 }
@@ -2274,6 +2512,15 @@ fn leave_wait(inner: &mut Inner, peer_pid: u32, generation: u64, ask: &str) {
         } else {
             *parked -= 1;
         }
+    }
+}
+
+/// A release to the desk ends the ask's answerability: clear `held` so a
+/// device answer arriving after the release is refused, never queued into a
+/// mod that holds nothing (SB-19).
+fn release_ask(live: &mut Live, ask: &str) {
+    if let Some((_, info)) = live.open_asks.iter_mut().find(|(id, _)| id == ask) {
+        info.held = false;
     }
 }
 
