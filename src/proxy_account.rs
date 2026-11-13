@@ -2053,14 +2053,14 @@ enum BalanceUnit {
     Named(Option<String>),
 }
 
-/// One balance pool: every `balance` figure of one `id` that carries the
-/// grant and left of the set's unit.
+/// One balance pool: every `balance` figure of one `id` that carries a
+/// positive grant and a left, of the set's unit.
 #[derive(Default)]
 struct BalancePool {
     label: String,
     /// The unit the first figure to enter the set named: a figure of another
     /// unit names another balance and never enters this bar's figures. `None`
-    /// until a figure carries both a grant and a left.
+    /// until a figure carries both a positive grant and a left.
     unit: Option<BalanceUnit>,
     granted: f64,
     /// The summed `remaining` of the same figures that published a grant.
@@ -2071,10 +2071,11 @@ struct BalancePool {
 
 /// One bar per balance pool, in the order the pools first appear. A pool with
 /// no finite granted total (or a non-positive one) gets no bar: its share is
-/// not a figure the proxy published. Grant, left, spent and expiry come from
-/// one set — the figures carrying a finite `limit` AND a finite `remaining`,
-/// of the unit the first such figure named — so no side of the bar, nor its
-/// `resets in` countdown, names a figure another side did not read.
+/// not a figure the proxy published. Grant, left, spent, expiry and the bar's
+/// name come from one set — the figures carrying a finite, positive `limit`
+/// AND a finite `remaining`, of the unit the first such figure named — so no
+/// side of the bar, nor its `resets in` countdown, names a figure another side
+/// did not read.
 fn balance_bars(
     accounts: &[PoolAccount<'_>],
     text: &dyn Fn(&str) -> String,
@@ -2091,25 +2092,20 @@ fn balance_bars(
         let index = match pools.iter().position(|(pool_id, _)| pool_id == id) {
             Some(index) => index,
             None => {
-                pools.push((
-                    id.to_string(),
-                    BalancePool {
-                        label: balance_label(figure, text),
-                        ..BalancePool::default()
-                    },
-                ));
+                pools.push((id.to_string(), BalancePool::default()));
                 pools.len() - 1
             }
         };
         let pool = &mut pools[index].1;
-        // A figure naming only one side of the bar is no member of its set:
-        // the grant and the left must both be figures this read produced, so
-        // it never fixes the unit and never times the bar either.
+        // A figure naming only one side of the bar, or carrying no positive
+        // grant, is no member of its set: the grant and the left must both be
+        // figures this read produced, so it never fixes the unit, never names
+        // the bar and never times it either.
         let (Some(limit), Some(remaining)) = (
             figure
                 .get("limit")
                 .and_then(Value::as_f64)
-                .filter(|limit| limit.is_finite()),
+                .filter(|limit| limit.is_finite() && *limit > 0.0),
             figure
                 .get("remaining")
                 .and_then(Value::as_f64)
@@ -2117,14 +2113,17 @@ fn balance_bars(
         ) else {
             continue;
         };
-        // The first figure to enter the set owns the unit: a grantless figure
-        // first in the pool never fixes it, and another unit's figure keeps its
-        // own account line rather than entering this bar's figures.
+        // The first figure to enter the set owns the unit and names the bar: a
+        // figure with no positive grant never fixes either, and another unit's
+        // figure keeps its own account line rather than entering this bar's.
         let unit = balance_unit(figure, text);
         if let Some(owned) = pool.unit.as_ref()
             && *owned != unit
         {
             continue;
+        }
+        if pool.unit.is_none() {
+            pool.label = balance_label(figure, text);
         }
         pool.unit.get_or_insert(unit);
         // The countdown comes from the same set as the sums.
@@ -2216,24 +2215,16 @@ fn balance_unit(figure: &Value, text: &dyn Fn(&str) -> String) -> BalanceUnit {
 }
 
 /// One side of a pool bar's `left of` phrase or a balance line's `left`: a
-/// token count compacts; every other amount keeps its exact value, grouped
-/// with thousands separators — whole amounts as integers, fractional ones at
-/// two decimals — and names the unit word its figure spells.
+/// token count compacts; every other amount keeps its exact value, grouped and
+/// spelled by [`crate::format::format_amount_grouped`], and names the unit
+/// word its figure spells.
 fn balance_amount(amount: f64, unit: &BalanceUnit) -> String {
-    // `group_thousands` expects a non-negative figure and would put its comma
-    // right after a minus sign; the sign stays this caller's.
-    let grouped = |amount: f64| {
-        let sign = if amount < 0.0 { "-" } else { "" };
-        let decimals = if amount.fract() == 0.0 { 0 } else { 2 };
-        format!(
-            "{sign}{}",
-            crate::format::group_thousands(amount.abs(), decimals)
-        )
-    };
     match unit {
         BalanceUnit::Tokens => crate::format::format_compact(amount),
-        BalanceUnit::Named(Some(word)) => format!("{} {word}", grouped(amount)),
-        BalanceUnit::Named(None) => grouped(amount),
+        BalanceUnit::Named(Some(word)) => {
+            format!("{} {word}", crate::format::format_amount_grouped(amount))
+        }
+        BalanceUnit::Named(None) => crate::format::format_amount_grouped(amount),
     }
 }
 

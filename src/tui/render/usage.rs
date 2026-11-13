@@ -1009,27 +1009,34 @@ impl Stat {
             0
         };
         let pct_cells = Span::raw(pct_str.as_ref()).width();
-        // The eyebrow shares its row with the rate column and, when they fit,
-        // the amount + `%`. A bar label carrying its own figures (`… | 205M
-        // left of 300M`) is cut to the room those leave, so the granted total
-        // cannot reach the pane edge as a smaller number there; the cut ends
-        // on the house `…`. A rate section that alone fills the row leaves the
-        // label uncut on the fallback line (the pinned OAuth shape).
-        let full_room = pct_col
-            .saturating_sub(max_rate_w)
+        // The amount column carries its own two-cell gap; without one, the `%`
+        // needs its own or a label ending in a figure runs into it (`20M95%`).
+        let pct_gap = if max_amount_w > 0 { 0 } else { 2 };
+        // The room the label has on its own line, beside the rate section only.
+        let label_room = pct_col.saturating_sub(max_rate_w);
+        // What is left for the label on the `%`'s line, after the rate, amount
+        // and gap. A bar label carrying its own figures (`… | 205M left of
+        // 300M`) is cut to this, so its `%` stays beside it and the granted
+        // total cannot reach the pane edge as a smaller number; the cut ends
+        // on the house `…`, never flushed against the figure.
+        let full_room = label_room
             .saturating_sub(amount_section_w)
+            .saturating_sub(pct_gap)
             .saturating_sub(pct_cells);
         // Under three cells the cut would leave dots where the label's name
         // was; a row that tight drops the `%` pair to its own line (the fit
         // fallback below) whenever the label cannot sit beside it, so there
         // the label keeps the room the rate section leaves instead.
-        let label_room = if full_room >= 3 {
+        let cut_room = if full_room >= 3 {
             full_room
         } else {
-            pct_col.saturating_sub(max_rate_w)
+            label_room
         };
+        // A label that fits its own line stays whole and the `%` drops a line;
+        // a wider one is cut, to `full_room` when that leaves a name and
+        // otherwise to its own line's room, so the eyebrow never overruns.
         let label = if label_room > 0 && grapheme_cells(&self.label) > label_room {
-            truncate(&self.label, label_room)
+            truncate(&self.label, cut_room)
         } else {
             self.label.clone()
         };
@@ -1115,7 +1122,7 @@ impl Stat {
             label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
-        let fits = label_cells + max_rate_w + amount_section_w + pct_cells <= pct_col;
+        let fits = label_cells + max_rate_w + amount_section_w + pct_gap + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
         if fits {
             out.push(Line::from({

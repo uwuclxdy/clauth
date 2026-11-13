@@ -11324,3 +11324,57 @@ fn a_bare_profile_targets_the_pool_on_its_bind() {
         other => panic!("expected the pool target, got {other:?}"),
     }
 }
+
+/// A negative and a fractional non-token amount group with the sign outside
+/// the digits: `-1,234.50 USD`, never `-,1234.50` or `-1234.50`.
+#[test]
+fn a_pool_groups_a_negative_and_fractional_amount() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": -1234.5, "limit": 2000.0, "used": 3234.5,
+                "unit": "currency", "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "credit | -1,234.50 USD left of 2,000 USD"
+    );
+}
+
+/// A zero-grant figure never fixes the pool's unit: the first figure carrying
+/// a POSITIVE grant and a left owns the bar.
+#[test]
+fn a_zero_grant_figure_never_fixes_the_pool_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 0.0, "limit": 0.0, "used": 0.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "the counting unit draws the bar");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// The bar's name comes from the figure it counts, never a grantless figure
+/// that merely arrived first with the same id.
+#[test]
+fn a_pool_label_comes_from_a_counted_figure() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "grantless label",
+                "remaining": 5.0, "unit": "currency", "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}

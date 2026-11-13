@@ -8405,9 +8405,11 @@ fn a_pool_account_id_wider_than_the_key_column_still_fits_its_value() {
     );
 }
 
-/// A pool bar's label is fitted to the pane like a row's value: at 41 cells
-/// the drawn line stays inside the interior and the cut label ends on `…`, so
-/// the granted total never appears truncated as a smaller number.
+/// A pool bar's label is fitted to the pane like a row's value: every drawn
+/// line stays inside the interior, a cut label ends on `…`, and whenever the
+/// `%` shares the label's line at least two cells separate the label's last
+/// character from it — a figure never runs into the percentage. A label that
+/// fits its own line stays whole and drops the `%` to its own line instead.
 #[test]
 fn a_pool_bar_label_fits_a_narrow_interior() {
     let profile = crate::profile::Profile::new(
@@ -8428,32 +8430,59 @@ fn a_pool_bar_label_fits_a_narrow_interior() {
         })
         .expect("the pool body builds stats");
     let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
-    let lines: Vec<String> = build_tp_rows(
-        &profile,
-        41,
-        &readings,
-        false,
-        false,
-        ResetFmt::default(),
-        None,
-    )
-    .iter()
-    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
-    .collect();
-    for line in &lines {
-        assert!(
-            line.chars().count() <= 41,
-            "every drawn line stays inside the 41-cell interior: {line:?}"
-        );
-    }
-    let label_line = lines
+    let label = "campaign balance flash | 205M left of 300M";
+    for width in [41u16, 42, 44, 45] {
+        let lines: Vec<String> = build_tp_rows(
+            &profile,
+            width,
+            &readings,
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
         .iter()
-        .find(|line| line.contains("campaign balance flash"))
-        .expect("the bar label is drawn");
-    assert!(
-        label_line.contains('…'),
-        "a cut bar label ends on an ellipsis, never a truncated figure: {label_line:?}"
-    );
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+        for line in &lines {
+            assert!(
+                line.chars().count() <= width as usize,
+                "every drawn line stays inside the {width}-cell interior: {line:?}"
+            );
+        }
+        let label_line = lines
+            .iter()
+            .find(|line| line.contains("campaign balance flash"))
+            .expect("the bar label is drawn");
+        let whole = label_line.contains(label);
+        let cut = label_line.contains('…');
+        assert!(
+            whole || cut,
+            "the label is drawn whole or cut with an ellipsis at {width}: {label_line:?}"
+        );
+        if !whole {
+            assert!(
+                cut,
+                "a cut label ends on an ellipsis at {width}: {label_line:?}"
+            );
+        }
+        if let Some(pct_at) = label_line.rfind('%') {
+            // The percentage is one span (`31.67%`): the reserved gap sits
+            // before the figure, never between its last digit and the `%`.
+            let before =
+                label_line[..pct_at].trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+            let gap = before.chars().rev().take_while(|c| *c == ' ').count();
+            assert!(
+                gap >= 2,
+                "at {width} the label keeps at least two cells before the `%`: {label_line:?}"
+            );
+        } else {
+            assert!(
+                whole,
+                "the `%` leaves the line only for a whole label at {width}: {label_line:?}"
+            );
+        }
+    }
 }
 
 /// A single-part value wider than the column ends on an ellipsis at exactly the

@@ -1025,11 +1025,20 @@ pub(crate) fn format_pct(pct: f64) -> String {
 /// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
 /// a surface-local twin of this is a drift, not a specialization.
 pub(crate) fn format_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
-    }
+    let decimals = amount_decimals(n);
+    format!("{n:.decimals$}")
+}
+
+/// Whole amounts print bare, fractions at two decimals.
+fn amount_decimals(n: f64) -> usize {
+    if n.fract() == 0.0 { 0 } else { 2 }
+}
+
+/// [`format_amount`], grouped with `,` thousands separators and the sign ahead
+/// of the first group (`-1,234.50`).
+pub(crate) fn format_amount_grouped(n: f64) -> String {
+    let sign = if n < 0.0 { "-" } else { "" };
+    format!("{sign}{}", group_thousands(n.abs(), amount_decimals(n)))
 }
 
 /// A token threshold in its display form: exact millions as `{n}M` (`2M`),
