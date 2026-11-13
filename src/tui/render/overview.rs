@@ -1248,7 +1248,7 @@ fn push_chip_slot(spans: &mut Vec<Span<'static>>, widths: &OverviewWidths, count
 
 /// The phase a row's identity wave samples: the animation clock, or under
 /// `reduce_motion` the row's rest gap, where the wave draws the plain label.
-/// Only the wave stills: the clock keeps running for spinners and gauges.
+/// Only the wave's phase stills: the row's spinners turn on the tick count.
 fn wave_phase_ms(still: bool, anim_ms: u64, position: usize) -> u64 {
     if still {
         identity_wave_rest_ms(position)

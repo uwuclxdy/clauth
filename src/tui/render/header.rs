@@ -90,6 +90,8 @@ const PULSE_SWEEP_MS: u64 = 900;
 const PULSE_REST_MS: u64 = 1700;
 const PULSE_DEPTH: f32 = 0.4;
 const PULSE_CYCLE_MS: u64 = PULSE_SWEEP_MS + PULSE_REST_MS;
+/// A phase inside the pulse's rest gap, where it draws the plain name.
+const PULSE_REST_PHASE_MS: u64 = PULSE_SWEEP_MS;
 /// The identity wave's crest is the provider's own color, not a tint toward it.
 const IDENTITY_DEPTH: f32 = 1.0;
 /// A row's step into the cycle, as a fraction of it: the golden ratio, so any
@@ -582,9 +584,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
             gauge_rung.age_w = age_w;
         }
     }
+    let name_ms = if app.config().state.reduce_motion {
+        PULSE_REST_PHASE_MS
+    } else {
+        app.anim_ms()
+    };
     let gauge_spans_vec = match g {
         Some(g) if gauge_rung.visible => {
-            gauge_spans(gauge_rung, &g.name, pct, g.age.as_deref(), app.anim_ms())
+            gauge_spans(gauge_rung, &g.name, pct, g.age.as_deref(), name_ms)
         }
         _ => Vec::new(),
     };

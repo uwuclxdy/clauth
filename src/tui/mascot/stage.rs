@@ -7,10 +7,10 @@
 //! [`Cue`] plays the animation the mascot answers it with, and a key after
 //! five quiet minutes plays a small hello from the mascot's own pool (the
 //! `reduce_motion` setting stands in for the source's `prefersReducedMotion`
-//! check: it holds the mascot on its rest pose). A running animation is never
-//! cut: one waiting slot keeps the highest-ranked cue behind it, a cue that
-//! waited past three seconds drops, and one animation plays at most once per
-//! twenty seconds, counted from its last start (the launch included; a
+//! check: it holds the mascot on its rest pose). A cue never cuts a running
+//! animation: one waiting slot keeps the highest-ranked cue behind it, a cue
+//! that waited past three seconds drops, and one animation plays at most once
+//! per twenty seconds, counted from its last start (the launch included; a
 //! dropped request does not restart it). While the header draws no art, cues
 //! drop and the clock stops: the launch waits for the first shown tick, and
 //! hiding drops the playing and the waiting animation. Frames advance on the

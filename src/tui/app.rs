@@ -878,8 +878,9 @@ pub(crate) enum GlobalConfigRow {
     /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
-    /// `AppState.reduce_motion`: space/⏎ stills the header mascot and the
-    /// Overview's provider wave, or lets them move again.
+    /// `AppState.reduce_motion`: space/⏎ stills the header mascot, the header
+    /// gauge's account name and the Overview's provider wave, or lets them
+    /// move again.
     ReduceMotion,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.

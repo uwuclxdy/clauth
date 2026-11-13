@@ -1489,10 +1489,11 @@ pub(crate) struct AppState {
     /// through [`AppState::home_tab`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) home_tab: Option<HomeTab>,
-    /// Holds the header mascot on its rest pose and the Overview's provider
-    /// names flat (the Config tab's `reduce motion` row); spinners and the
-    /// saving shimmers keep moving, since they mark work in flight. `false` is
-    /// skipped, so an untouched profiles.toml carries no key.
+    /// Holds the header mascot on its rest pose, and the header gauge's account
+    /// name and the Overview's provider names flat (the Config tab's
+    /// `reduce motion` row); spinners and the saving shimmers keep moving, since
+    /// they mark work in flight. `false` is skipped, so an untouched
+    /// profiles.toml carries no key.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) reduce_motion: bool,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden

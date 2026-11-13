@@ -6211,8 +6211,9 @@ fn spawn_delegate(
         // `run_delegate` has returned, so the child has exited; any reader
         // beat still in flight is landed by `finalize`'s counter drain, and a
         // beat resolving later writes nothing. A run still attached to a
-        // waiting caller writes nothing and hands the envelope back below
-        // instead.
+        // waiting caller settles its liveness record, when it has one, as done
+        // with the run's outcome and no envelope, and hands the envelope back
+        // below instead.
         handoff.finalize_with(&envelope, result_file);
         // Dropped explicitly so the completion signal below is genuinely this
         // task's last action. A guard bound in the closure drops in reverse

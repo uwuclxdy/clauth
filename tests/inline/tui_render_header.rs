@@ -2645,3 +2645,44 @@ fn row1_overdue_age_sheds_before_the_speed_suffix() {
         "one age wider, the age draws beside the kept suffix"
     );
 }
+
+/// `reduce_motion` holds the header gauge's active name on its resting `TEXT`
+/// colour at every phase of the pulse cycle, read off the drawn row-1 cells.
+#[test]
+fn reduce_motion_holds_the_header_gauge_name_on_its_resting_colour() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = "alpha";
+    let name_fgs = |still: bool, phase: u64| -> Vec<Color> {
+        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
+        app.tab = Tab::Usage;
+        app.config().state.reduce_motion = still;
+        app.anim_phase_ms = Some(phase);
+        let mut term = Terminal::new(TestBackend::new(100, HEADER_TEST_ROWS)).unwrap();
+        let readings = app.readings_snapshot();
+        term.draw(|f| {
+            let area = f.area();
+            super::draw(f, area, &app, &readings);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let start = (0..100 - 5)
+            .find(|&x| (0..5).all(|i| buf[(x + i, 1)].symbol() == &name[i as usize..=i as usize]))
+            .expect("row 1 carries the active name");
+        (start..start + 5).map(|x| buf[(x, 1)].fg).collect()
+    };
+    let resting = vec![theme::text_color(); 5];
+    for phase in (0..PULSE_CYCLE_MS).step_by(25) {
+        assert_eq!(
+            name_fgs(true, phase),
+            resting,
+            "the name moved under reduce_motion at {phase}ms"
+        );
+    }
+    assert!(
+        (0..PULSE_CYCLE_MS)
+            .step_by(25)
+            .any(|phase| name_fgs(false, phase) != resting),
+        "control: with motion on the name pulse tints a cell somewhere in the cycle"
+    );
+}
